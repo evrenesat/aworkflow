@@ -166,6 +166,18 @@ input::placeholder, textarea::placeholder {
   width: 100%;
 }
 
+.sr-only {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  margin: -1px;
+  overflow: hidden;
+  clip: rect(0, 0, 0, 0);
+  white-space: nowrap;
+  border: 0;
+}
+
 .input {
   width: 100%;
   min-height: var(--tap-target);
@@ -516,8 +528,10 @@ input::placeholder, textarea::placeholder {
 }
 
 .checkpoint-history-summary,
+.checkpoint-history-at-a-glance,
 .checkpoint-history-checkpoint-meta,
 .checkpoint-history-event-meta,
+.checkpoint-history-time-summary,
 .checkpoint-history-evidence-meta {
   display: grid;
   grid-template-columns: repeat(auto-fit, minmax(11rem, 1fr));
@@ -529,23 +543,29 @@ input::placeholder, textarea::placeholder {
 }
 
 .checkpoint-history-summary div,
+.checkpoint-history-at-a-glance div,
 .checkpoint-history-checkpoint-meta div,
 .checkpoint-history-event-meta div,
+.checkpoint-history-time-summary div,
 .checkpoint-history-evidence-meta div {
   min-width: 0;
 }
 
 .checkpoint-history-summary dt,
+.checkpoint-history-at-a-glance dt,
 .checkpoint-history-checkpoint-meta dt,
 .checkpoint-history-event-meta dt,
+.checkpoint-history-time-summary dt,
 .checkpoint-history-evidence-meta dt {
   color: var(--color-text-dim);
   font-size: 0.75rem;
 }
 
 .checkpoint-history-summary dd,
+.checkpoint-history-at-a-glance dd,
 .checkpoint-history-checkpoint-meta dd,
 .checkpoint-history-event-meta dd,
+.checkpoint-history-time-summary dd,
 .checkpoint-history-evidence-meta dd {
   margin: var(--spacing-xs) 0 0;
   overflow-wrap: anywhere;
@@ -664,6 +684,53 @@ input::placeholder, textarea::placeholder {
   background: var(--color-surface-hover);
 }
 
+.checkpoint-history-event-disclosure {
+  min-width: 0;
+}
+
+.checkpoint-history-event-disclosure > summary {
+  display: flex;
+  align-items: baseline;
+  flex-wrap: wrap;
+  gap: var(--spacing-xs) var(--spacing-sm);
+  min-height: var(--tap-target);
+  cursor: pointer;
+  list-style: none;
+}
+
+.checkpoint-history-event-disclosure > summary::-webkit-details-marker {
+  display: none;
+}
+
+.checkpoint-history-event-disclosure > summary::before {
+  content: '▸';
+  color: var(--color-text-dim);
+}
+
+.checkpoint-history-event-disclosure[open] > summary::before {
+  content: '▾';
+}
+
+.checkpoint-history-event-summary > * {
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+.checkpoint-history-event-summary strong {
+  font-weight: 600;
+}
+
+.checkpoint-history-event-executor {
+  flex: 1 1 10rem;
+}
+
+.checkpoint-history-event-body {
+  display: flex;
+  flex-direction: column;
+  gap: var(--spacing-sm);
+  padding-top: var(--spacing-sm);
+}
+
 .checkpoint-history-event::before {
   counter-increment: checkpoint-event;
   content: counter(checkpoint-event);
@@ -688,12 +755,36 @@ input::placeholder, textarea::placeholder {
   gap: var(--spacing-sm);
 }
 
+.checkpoint-history-delivery-summary {
+  display: flex;
+  align-items: baseline;
+  flex-wrap: wrap;
+  gap: var(--spacing-xs) var(--spacing-md);
+  min-width: 0;
+  margin: 0;
+  padding: var(--spacing-xs) 0;
+  border-top: 1px solid var(--color-border);
+}
+
+.checkpoint-history-delivery-summary > span {
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+.checkpoint-history-delivery-summary a {
+  white-space: nowrap;
+}
+
 .checkpoint-history-disclosure {
   display: flex;
   flex-direction: column;
   gap: var(--spacing-sm);
   border-top: 1px solid var(--color-border);
   padding-top: var(--spacing-sm);
+}
+
+.checkpoint-history-run-details {
+  margin-top: calc(-1 * var(--spacing-sm));
 }
 
 .checkpoint-history-disclosure > summary {
@@ -719,6 +810,40 @@ input::placeholder, textarea::placeholder {
 }
 
 .checkpoint-history-delivery-list li > * {
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+.checkpoint-history-time-group {
+  display: flex;
+  flex-direction: column;
+  gap: var(--spacing-xs);
+}
+
+.checkpoint-history-time-group h6 {
+  margin: 0;
+}
+
+.checkpoint-history-time-list {
+  display: flex;
+  flex-direction: column;
+  gap: var(--spacing-xs);
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.checkpoint-history-time-list li {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: space-between;
+  gap: var(--spacing-xs) var(--spacing-md);
+  min-width: 0;
+  padding: var(--spacing-xs) 0;
+  border-bottom: 1px solid var(--color-border);
+}
+
+.checkpoint-history-time-list li > * {
   min-width: 0;
   overflow-wrap: anywhere;
 }
@@ -804,6 +929,7 @@ input::placeholder, textarea::placeholder {
 .run-list-item.selected {
   background: var(--color-surface-hover);
   border-color: var(--color-primary);
+  box-shadow: inset 3px 0 0 var(--color-primary);
 }
 
 .compact-run-progress {
@@ -881,6 +1007,20 @@ input::placeholder, textarea::placeholder {
 .compact-run-progress-bar.unknown > span { background: repeating-linear-gradient(135deg, var(--color-border), var(--color-border) 3px, var(--color-surface-hover) 3px, var(--color-surface-hover) 6px); }
 .compact-run-progress.unavailable,
 .compact-run-progress.not_applicable { color: var(--color-text-dim); }
+
+.run-row-meta,
+.global-run-row-meta {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--spacing-xs) var(--spacing-md);
+  min-width: 0;
+}
+
+.run-row-meta > span:not(:last-child)::after,
+.global-run-row-meta > span:not(:last-child)::after {
+  content: ' ·';
+  margin-left: var(--spacing-md);
+}
 
 .status-pill {
   display: inline-flex;
@@ -1928,6 +2068,28 @@ input::placeholder, textarea::placeholder {
 .run-search-field { display: flex; flex-direction: column; gap: var(--spacing-xs); max-width: 34rem; }
 .run-list-context { display: flex; align-items: center; gap: var(--spacing-sm); flex-wrap: wrap; min-width: 0; }
 .run-list-title { flex: 1 1 10rem; min-width: 0; overflow-wrap: anywhere; }
+.global-run-row-title,
+.run-list-title {
+  display: -webkit-box;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 2;
+  overflow: hidden;
+}
+.run-title-date {
+  flex: 0 0 auto;
+  color: var(--color-text-dim);
+  font-size: 0.75rem;
+  white-space: nowrap;
+}
+.run-id-copy {
+  display: inline-flex;
+  align-items: baseline;
+  gap: var(--spacing-sm);
+}
+.copy-full-id-label {
+  font-family: inherit;
+  font-size: 0.75rem;
+}
 .global-settings textarea { min-width: 0; width: 100%; }
 
 .changelog-settings {

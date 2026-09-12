@@ -234,12 +234,13 @@ describe('GlobalRunOverview project context', () => {
     }))
 
     render(<GlobalRunOverview projects={[primary]} onOpen={vi.fn()} />)
-    expect(await screen.findByRole('button', { name: /Primary project · Completed · Visible · visible-run/ })).toBeTruthy()
+    expect(await screen.findByRole('button', { name: /Primary project · Completed · Visible · Checkpoint progress unavailable/ })).toBeTruthy()
 
     fireEvent.change(screen.getByLabelText('Run history'), { target: { value: 'archived' } })
-    expect(await screen.findByRole('button', { name: /Primary project · Completed · Archived · archived-run/ })).toBeTruthy()
+    expect(await screen.findByRole('button', { name: /Primary project · Completed · Archived · Checkpoint progress unavailable/ })).toBeTruthy()
     expect(screen.queryByRole('button', { name: /Primary project · Completed · Visible · visible-run/ })).toBeNull()
-    expect(screen.getByText('Plan: plans/archived.md · Run: archived-run')).toBeTruthy()
+    expect(screen.queryByText('Plan: plans/archived.md · Run: archived-run')).toBeNull()
+    expect(screen.getByText(/^Duration /)).toBeTruthy()
     expect(api.listControlPlaneRuns).toHaveBeenLastCalledWith('primary', expect.objectContaining({ history: 'archived' }), expect.anything())
   })
 
@@ -254,8 +255,8 @@ describe('GlobalRunOverview project context', () => {
     const onOpen = vi.fn()
 
     render(<GlobalRunOverview projects={[primary, child]} onOpen={onOpen} />)
-    expect(await screen.findByRole('button', { name: /Primary project · Completed · Shared · primary-run/ })).toBeTruthy()
-    expect(screen.getByRole('button', { name: /Primary project · Worktree: Feature worktree · Completed · Shared · child-run-same-name/ })).toBeTruthy()
+    expect(await screen.findByRole('button', { name: /Primary project · Completed · Shared · Checkpoint progress unavailable/ })).toBeTruthy()
+    expect(screen.getByRole('button', { name: /Primary project · Worktree: Feature worktree · Completed · Shared · Checkpoint progress unavailable/ })).toBeTruthy()
 
     fireEvent.click(screen.getByRole('button', { name: /child-run-same-name/ }))
     expect(onOpen).toHaveBeenCalledWith('child', 'child-run-same-name')
@@ -274,9 +275,10 @@ describe('GlobalRunOverview project context', () => {
 
     render(<GlobalRunOverview projects={[primary]} onOpen={onOpen} />)
 
-    expect(await screen.findByText('4 / 11 approved')).toBeTruthy()
-    expect(screen.getByText(/Implementing CP5 of 11/)).toBeTruthy()
-    expect(screen.getByText('Plan: /srv/plans/canonical-plan.md · Run: canonical-run')).toBeTruthy()
+    expect(await screen.findByText('4 of 11 checkpoints approved')).toBeTruthy()
+    expect(screen.getByText(/CP5 of 11 · Implementing/)).toBeTruthy()
+    expect(screen.queryByText('Plan: /srv/plans/canonical-plan.md · Run: canonical-run')).toBeNull()
+    expect(screen.getByText(/^Duration /)).toBeTruthy()
     fireEvent.click(screen.getByRole('button', { name: /canonical-run/ }))
     expect(onOpen).toHaveBeenCalledWith('primary', 'canonical-run')
     expect(api.listControlPlaneRuns).toHaveBeenCalledTimes(1)

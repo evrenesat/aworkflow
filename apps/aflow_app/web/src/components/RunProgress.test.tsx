@@ -52,15 +52,16 @@ function run(overrides: Partial<RunStatus> = {}): RunStatus {
 }
 
 describe('RunProgress', () => {
-  it('shows approved progress separately from the active checkpoint and recorded executor', () => {
+  it('shows approval separately from active position and compact turn usage', () => {
     const { container } = render(<RunProgress run={run()} now={Date.parse('2026-09-11T12:00:00Z')} />)
 
-    expect(screen.getByText('4 / 11 approved')).toBeTruthy()
-    expect(screen.getByText(/Implementing CP5 of 11/)).toBeTruthy()
+    expect(screen.getByText('4 of 11 checkpoints approved')).toBeTruthy()
+    expect(screen.getByText(/CP5 of 11 · Implementing/)).toBeTruthy()
     expect(screen.getByText(/Checkpoint 5: A very long title/)).toBeTruthy()
-    expect(screen.getByText(/Executor Worker · Model display 52 · selector\.5-repair · 2m/)).toBeTruthy()
-    expect(screen.getByText('8 worker attempts · 3 repair passes · 7 reviews · 1 runtime retry · 2 upgrades · 4 recorded-complete checkpoints')).toBeTruthy()
-    expect(screen.getByText('Latest evidence 1m ago')).toBeTruthy()
+    expect(screen.getByText('8 of 12 turns used')).toBeTruthy()
+    expect(screen.queryByText(/Executor/)).toBeNull()
+    expect(screen.queryByText(/worker attempts/)).toBeNull()
+    expect(screen.queryByText(/Latest evidence/)).toBeNull()
     expect(container.querySelectorAll('.compact-run-progress-segment')).toHaveLength(11)
   })
 
@@ -75,13 +76,13 @@ describe('RunProgress', () => {
       }),
     })} now={Date.parse('2026-09-11T12:00:00Z')} />)
 
-    expect(screen.getByText('0 / 11 approved')).toBeTruthy()
-    expect(screen.getByText('Paused · No current checkpoint reported')).toBeTruthy()
-    expect(screen.getByText('0 worker attempts · 0 repair passes · 0 reviews · 0 runtime retries · 0 upgrades · 0 recorded-complete checkpoints')).toBeTruthy()
+    expect(screen.getByText('0 of 11 checkpoints approved')).toBeTruthy()
+    expect(screen.getByText('Current checkpoint not reported')).toBeTruthy()
+    expect(screen.getByText('8 of 12 turns used')).toBeTruthy()
     expect(screen.queryByText(/Executor/)).toBeNull()
   })
 
-  it('renders the canonical successor last executor when no worker is active', () => {
+  it('keeps executor identity out of the collapsed row', () => {
     render(<RunProgress run={run({
       activity: 'inactive',
       progress: progress({
@@ -90,7 +91,7 @@ describe('RunProgress', () => {
       }),
     })} />)
 
-    expect(screen.getByText(/Executor Worker · Model display 52 · successor\.worker/)).toBeTruthy()
+    expect(screen.queryByText(/successor\.worker/)).toBeNull()
   })
 
   it('labels partial and recorded-complete evidence without upgrading it to approval', () => {
@@ -101,21 +102,22 @@ describe('RunProgress', () => {
       }),
     })} now={Date.parse('2026-09-11T12:00:00Z')} />)
 
-    expect(screen.getByText('At least 4 / 11 approved')).toBeTruthy()
-    expect(screen.getByText(/Awaiting review CP5 of 11/)).toBeTruthy()
-    expect(screen.getByText('Progress evidence partial')).toBeTruthy()
-    expect(screen.getByText(/At least 5 recorded-complete checkpoints/)).toBeTruthy()
+    expect(screen.getByText('At least 4 of 11 checkpoints approved')).toBeTruthy()
+    expect(screen.getByText(/CP5 of 11 · Awaiting review/)).toBeTruthy()
+    expect(screen.getByText('Some progress history is partial · see Details for limits')).toBeTruthy()
+    expect(screen.queryByText(/recorded-complete/)).toBeNull()
   })
 
   it('labels a complete recorded checkpoint as awaiting review', () => {
     render(<RunProgress run={run({
       status: 'waiting_for_input', activity: 'inactive', progress: progress({
-        phase: null, activity: null, approved_checkpoints: count(4), recorded_complete_checkpoints: count(5),
+        phase: null, activity: null, current_checkpoint_id: null, current_checkpoint_ordinal: null, current_checkpoint_title: null,
+        checkpoint_states: { '5': 'recorded_complete' }, approved_checkpoints: count(4), recorded_complete_checkpoints: count(5),
       }),
     })} />)
 
-    expect(screen.getByText('Recorded complete · awaiting review')).toBeTruthy()
-    expect(screen.getByText('4 / 11 approved')).toBeTruthy()
+    expect(screen.getByText('4 of 11 checkpoints approved')).toBeTruthy()
+    expect(screen.getByRole('img', { name: /recorded complete/ })).toBeTruthy()
   })
 
   it('renders unavailable and non-checkpoint modes without an empty success state', () => {
@@ -126,7 +128,7 @@ describe('RunProgress', () => {
 
     view.rerender(<RunProgress run={run({ progress: progress({ availability: 'not_applicable', reason_codes: ['non_checkpoint_plan'] }) })} />)
     expect(screen.getByText('Non-checkpoint workflow')).toBeTruthy()
-    expect(screen.getByText('Checkpoint progress unavailable')).toBeTruthy()
+    expect(screen.queryByText('Checkpoint progress unavailable')).toBeNull()
   })
 
   it('keeps missing and stale projections visibly unavailable or partial', () => {
@@ -134,7 +136,7 @@ describe('RunProgress', () => {
     expect(screen.getByText('Checkpoint progress unavailable')).toBeTruthy()
 
     view.rerender(<RunProgress run={run({ progress: progress({ reason_codes: ['history_partial'] }) })} />)
-    expect(screen.getByText('Earlier progress history unavailable')).toBeTruthy()
+    expect(screen.getByText('Some progress history is partial · see Details for limits')).toBeTruthy()
 
     view.rerender(<RunProgress run={run({ progress: progress({
       total_checkpoints: count(null, 'unavailable'), approved_checkpoints: count(null, 'unavailable'),
@@ -142,16 +144,18 @@ describe('RunProgress', () => {
       runtime_retries: count(null, 'unavailable'), applied_upgrades: count(null, 'unavailable'),
     }) })} />)
     expect(screen.getByText('Approval progress unknown')).toBeTruthy()
-    expect(screen.getByText(/Unknown worker attempts · Unknown repair passes/)).toBeTruthy()
+    expect(screen.getByText('Approval progress unknown')).toBeTruthy()
   })
 
-  it.each([
-    ['waiting_for_input', 'Waiting for input'],
-    ['failed', 'Failed'],
-    ['owner_stopped', 'Stopped'],
-  ] as const)('keeps the %s run state visible alongside progress', (status, label) => {
+  it('keeps an active waiting run position visible', () => {
+    render(<RunProgress run={run({ status: 'waiting_for_input', activity: 'inactive', progress: progress({ phase: null, activity: null }) })} />)
+    expect(screen.getByText(/CP5 of 11/)).toBeTruthy()
+  })
+
+  it.each(['failed', 'owner_stopped'] as const)('removes current-position placeholders from terminal %s rows', (status) => {
     render(<RunProgress run={run({ status, activity: 'inactive', progress: progress({ phase: null, activity: null }) })} />)
-    expect(screen.getByText(new RegExp(`${label} CP5`))).toBeTruthy()
+    expect(screen.getByText('4 of 11 checkpoints approved')).toBeTruthy()
+    expect(screen.queryByText(/current checkpoint/i)).toBeNull()
   })
 
   it('uses a continuous bar for capped checkpoint lists', () => {

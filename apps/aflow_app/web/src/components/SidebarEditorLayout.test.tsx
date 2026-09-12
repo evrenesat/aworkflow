@@ -1,6 +1,6 @@
 import { act, cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react'
 import { useState } from 'react'
-import { afterEach, describe, expect, it } from 'vitest'
+import { afterEach, describe, expect, it, vi } from 'vitest'
 import { SIDEBAR_EDITOR_COMPACT_QUERY, SidebarEditorLayout } from './SidebarEditorLayout'
 
 type MediaController = { setMatches: (matches: boolean) => void }
@@ -60,6 +60,7 @@ function DemoLayout({ detailEntry = false, initialItems = ['one', 'two'] }: { de
 
 const originalMatchMedia = window.matchMedia
 const originalScrollTo = window.scrollTo
+const originalScrollIntoView = HTMLElement.prototype.scrollIntoView
 
 afterEach(() => {
   cleanup()
@@ -67,6 +68,8 @@ afterEach(() => {
   else delete (window as Window & { matchMedia?: typeof window.matchMedia }).matchMedia
   if (originalScrollTo) Object.defineProperty(window, 'scrollTo', { configurable: true, value: originalScrollTo })
   else delete (window as Window & { scrollTo?: typeof window.scrollTo }).scrollTo
+  if (originalScrollIntoView) Object.defineProperty(HTMLElement.prototype, 'scrollIntoView', { configurable: true, value: originalScrollIntoView })
+  else delete (HTMLElement.prototype as HTMLElement & { scrollIntoView?: typeof HTMLElement.prototype.scrollIntoView }).scrollIntoView
   document.body.innerHTML = ''
 })
 
@@ -147,6 +150,19 @@ describe('SidebarEditorLayout compact presentation', () => {
     act(() => media.setMatches(true))
     await waitFor(() => expect((container.querySelector('.sidebar-editor-navigation') as HTMLElement).hidden).toBe(false))
     expect((container.querySelector('.sidebar-editor-detail') as HTMLElement).hidden).toBe(true)
+  })
+
+  it('reveals an explicitly selected row in the existing wide list without moving focus', async () => {
+    installMedia(false)
+    const scrollIntoView = vi.fn()
+    Object.defineProperty(HTMLElement.prototype, 'scrollIntoView', { configurable: true, value: scrollIntoView })
+    render(<DemoLayout />)
+
+    const second = screen.getByRole('button', { name: 'two' })
+    second.focus()
+    fireEvent.click(second)
+    await waitFor(() => expect(scrollIntoView).toHaveBeenCalledWith({ block: 'nearest', inline: 'nearest' }))
+    expect(document.activeElement).toBe(second)
   })
 
   it('removes inactive controls from the accessibility surface with hidden semantics', () => {

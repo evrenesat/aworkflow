@@ -99,6 +99,8 @@ export function SidebarEditorLayout({
   const userOpenedRef = useRef(detailEntry)
   const pendingOpenRef = useRef(detailEntry)
   const restorePointRef = useRef<ListRestorePoint | null>(null)
+  const previousRevealRef = useRef({ navigationVersion, selection, detailEntry: false })
+  const revealPendingRef = useRef(false)
 
   function requestDetailOpen(itemId: string | null): void {
     if (restorePointRef.current === null) {
@@ -166,6 +168,24 @@ export function SidebarEditorLayout({
     focusWithoutScroll(heading)
     pendingOpenRef.current = false
   }, [active, children, detailOpen, selection, navigationVersion])
+
+  // Explicit wide-screen selection changes reveal the already-rendered row in
+  // its existing list owner. Passive refreshes do not change either signal,
+  // so they preserve the user's scroll position and selection without moving
+  // focus into the navigation list.
+  useEffect(() => {
+    const previous = previousRevealRef.current
+    const versionChanged = navigationVersion !== previous.navigationVersion
+    const deepLinkEntry = detailEntry && (!previous.detailEntry || selection !== previous.selection)
+    previousRevealRef.current = { navigationVersion, selection, detailEntry }
+    if (versionChanged || deepLinkEntry) revealPendingRef.current = true
+    if (!active || compact || !selection || !revealPendingRef.current) return
+    const item = Array.from(navigationRef.current?.querySelectorAll<HTMLElement>('[data-sidebar-editor-item]') ?? [])
+      .find(candidate => candidate.dataset.sidebarEditorItem === selection)
+    if (!item) return
+    item.scrollIntoView?.({ block: 'nearest', inline: 'nearest' })
+    revealPendingRef.current = false
+  }, [active, compact, detailEntry, navigation, navigationVersion, selection])
 
   // Back restores the document position captured before the row click. A row
   // may disappear after refresh/delete, so the labelled navigation surface is

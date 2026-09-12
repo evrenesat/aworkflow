@@ -7,11 +7,22 @@ import type {
   RunProgressDetailCheckpoint,
   RunProgressDetailEvent,
   RunProgressExecutor,
+  RunProgressEventAssociation,
   RunProgressSummary,
   RunStatus,
 } from '../types'
 import { formatMachineLabel } from '../label'
-import { executionDuration, statusLabel } from '../runPresentation'
+import {
+  checkpointApprovalText,
+  executionDuration,
+  formatLocalTimestamp,
+  isRunActive,
+  isTerminalInactiveRun,
+  progressHistoryNotice,
+  runFinishText,
+  runFinishTimestamp,
+  runTurnBudgetText,
+} from '../runPresentation'
 import { SidebarEditorLayout } from './SidebarEditorLayout'
 
 interface CheckpointHistoryProps {
@@ -27,6 +38,7 @@ interface HistoryEntry {
   events: RunProgressDetailEvent[]
   title: string
   synthetic: boolean
+  association: RunProgressEventAssociation
 }
 
 export interface CheckpointSelectionState {
@@ -89,12 +101,6 @@ function countShort(count: RunProgressCount | null | undefined): string {
   return `${count?.coverage === 'partial' ? '≥' : ''}${value}`
 }
 
-function approvalText(progress: RunProgressSummary): string {
-  const approved = countShort(progress.approved_checkpoints)
-  const total = countShort(progress.total_checkpoints)
-  return `${approved} / ${total} approved`
-}
-
 function availabilityText(availability: RunProgressSummary['availability']): string {
   switch (availability) {
     case 'complete': return 'Complete evidence'
@@ -135,9 +141,238 @@ function formatDuration(seconds: number | null | undefined): string | null {
 }
 
 function formatTimestamp(value: string | null | undefined): string | null {
-  if (!value) return null
-  const date = new Date(value)
-  return Number.isNaN(date.getTime()) ? value : date.toLocaleString()
+  return formatLocalTimestamp(value)
+}
+
+type TimingRole = 'worker' | 'reviewer'
+
+interface InvocationTiming {
+  key: string
+  role: TimingRole
+  executor: RunProgressExecutor
+  sourceRunId: string | null
+  turnNumber: number | null
+  durationSeconds: number | null
+  startedAt: string | null
+  endedAt: string | null
+  startedAtMs: number | null
+  endedAtMs: number | null
+}
+
+interface TimeBreakdown {
+  groups: Record<TimingRole, InvocationTiming[]>
+  runElapsedSeconds: number | null
+  intervalCoverageSeconds: number | null
+  runScopedRecords: InvocationTiming[]
+  incompleteRunScopedRecords: number
+  unidentifiableRecords: number
+  unscopedRecords: number
+  hasDurationOnlyRecords: boolean
+  canComputeRemainder: boolean
+  unattributedSeconds: number | null
+}
+
+const INVOCATION_EVENT_KINDS = new Set([
+  'worker_attempt',
+  'repair_attempt',
+  'review',
+  'review_rejection',
+  'checkpoint_approval',
+])
+
+function positiveDuration(value: number | null | undefined): number | null {
+  return typeof value === 'number' && Number.isFinite(value) && value >= 0 ? value : null
+}
+
+function timestampMillis(value: string | null | undefined): number | null {
+  if (!value || !Number.isFinite(Date.parse(value))) return null
+  return Date.parse(value)
+}
+
+function firstTimestamp(...values: Array<string | null | undefined>): { text: string | null; millis: number | null } {
+  for (const value of values) {
+    const text = trimmed(value)
+    const millis = timestampMillis(text)
+    if (text && millis !== null) return { text, millis }
+  }
+  return { text: null, millis: null }
+}
+
+function timingRole(executor: RunProgressExecutor): TimingRole | null {
+  const role = trimmed(executor.role)?.toLowerCase()
+  return role === 'worker' || role === 'reviewer' ? role : null
+}
+
+function timingSourceRunId(event: RunProgressDetailEvent, executor: RunProgressExecutor): string | null {
+  return trimmed(executor.source_run_id)
+    ?? trimmed(event.source_run_id)
+    ?? referenceValue(event.source_reference, 'run_id', 'source_run_id')
+}
+
+function timingIdentity(
+  event: RunProgressDetailEvent,
+  executor: RunProgressExecutor,
+  role: TimingRole,
+  sourceRunId: string | null,
+): string | null {
+  const invocationId = trimmed(executor.invocation_id)
+  if (invocationId) return `${sourceRunId ?? 'unknown'}|${role}|invocation|${invocationId}`
+  const turnNumber = executor.turn_number ?? event.turn_number
+  if (sourceRunId && turnNumber !== null && Number.isSafeInteger(turnNumber) && turnNumber > 0) {
+    return `${sourceRunId}|${role}|turn|${turnNumber}`
+  }
+  return null
+}
+
+function mergeBoundary(
+  currentText: string | null,
+  currentMillis: number | null,
+  nextText: string | null,
+  nextMillis: number | null,
+  chooseEarlier: boolean,
+): { text: string | null; millis: number | null } {
+  if (currentMillis === null) return { text: nextText, millis: nextMillis }
+  if (nextMillis === null) return { text: currentText, millis: currentMillis }
+  const useNext = chooseEarlier ? nextMillis < currentMillis : nextMillis > currentMillis
+  return useNext ? { text: nextText, millis: nextMillis } : { text: currentText, millis: currentMillis }
+}
+
+function mergeInvocationTiming(current: InvocationTiming, next: InvocationTiming): InvocationTiming {
+  const started = mergeBoundary(current.startedAt, current.startedAtMs, next.startedAt, next.startedAtMs, true)
+  const ended = mergeBoundary(current.endedAt, current.endedAtMs, next.endedAt, next.endedAtMs, false)
+  return {
+    ...current,
+    executor: current.executor,
+    sourceRunId: current.sourceRunId ?? next.sourceRunId,
+    turnNumber: current.turnNumber ?? next.turnNumber,
+    durationSeconds: current.durationSeconds ?? next.durationSeconds,
+    startedAt: started.text,
+    endedAt: ended.text,
+    startedAtMs: started.millis,
+    endedAtMs: ended.millis,
+  }
+}
+
+function intervalSeconds(timing: InvocationTiming): number | null {
+  if (timing.startedAtMs === null || timing.endedAtMs === null || timing.endedAtMs < timing.startedAtMs) return null
+  return (timing.endedAtMs - timing.startedAtMs) / 1000
+}
+
+function unionIntervalSeconds(records: InvocationTiming[]): number | null {
+  const intervals = records
+    .map(record => record.startedAtMs !== null && record.endedAtMs !== null && record.endedAtMs >= record.startedAtMs
+      ? [record.startedAtMs, record.endedAtMs] as const
+      : null)
+    .filter((value): value is readonly [number, number] => value !== null)
+    .sort((left, right) => left[0] - right[0] || left[1] - right[1])
+  if (intervals.length === 0) return null
+  let total = 0
+  let currentStart = intervals[0][0]
+  let currentEnd = intervals[0][1]
+  for (const [start, end] of intervals.slice(1)) {
+    if (start <= currentEnd) {
+      currentEnd = Math.max(currentEnd, end)
+      continue
+    }
+    total += currentEnd - currentStart
+    currentStart = start
+    currentEnd = end
+  }
+  return (total + currentEnd - currentStart) / 1000
+}
+
+function runElapsedSeconds(run: RunStatus, now = Date.now()): number | null {
+  const start = timestampMillis(run.started_at)
+  const finish = timestampMillis(runFinishTimestamp(run))
+  const end = finish ?? (isRunActive(run) ? now : null)
+  if (start === null || end === null || end < start) return null
+  return (end - start) / 1000
+}
+
+function timingEvidenceIsComplete(detail: RunProgressDetail): boolean {
+  const truncation = detail.truncation
+  return detail.availability === 'complete'
+    && (truncation?.omitted_records ?? 0) === 0
+    && (truncation?.omitted_checkpoints ?? 0) === 0
+    && (truncation?.response_limit_records ?? 0) === 0
+    && (truncation?.response_limit_checkpoints ?? 0) === 0
+    && (truncation?.notices?.length ?? 0) === 0
+}
+
+function buildTimeBreakdown(run: RunStatus, detail: RunProgressDetail): TimeBreakdown {
+  const byIdentity = new Map<string, InvocationTiming>()
+  let unidentifiableRecords = 0
+  for (const event of detail.events) {
+    if (!INVOCATION_EVENT_KINDS.has(event.kind) || !event.executor) continue
+    const role = timingRole(event.executor)
+    if (!role) continue
+    const sourceRunId = timingSourceRunId(event, event.executor)
+    const key = timingIdentity(event, event.executor, role, sourceRunId)
+    if (!key) {
+      unidentifiableRecords += 1
+      continue
+    }
+    const started = firstTimestamp(event.started_at, event.executor.started_at)
+    const ended = firstTimestamp(event.ended_at, event.executor.ended_at)
+    const timing: InvocationTiming = {
+      key,
+      role,
+      executor: event.executor,
+      sourceRunId,
+      turnNumber: event.executor.turn_number ?? event.turn_number,
+      durationSeconds: positiveDuration(event.duration_seconds) ?? positiveDuration(event.executor.duration_seconds),
+      startedAt: started.text,
+      endedAt: ended.text,
+      startedAtMs: started.millis,
+      endedAtMs: ended.millis,
+    }
+    const existing = byIdentity.get(key)
+    byIdentity.set(key, existing ? mergeInvocationTiming(existing, timing) : timing)
+  }
+
+  const records = [...byIdentity.values()]
+  const groups: Record<TimingRole, InvocationTiming[]> = { worker: [], reviewer: [] }
+  records.forEach(record => groups[record.role].push(record))
+  const runScopedRecords = records.filter(record => record.sourceRunId === run.run_id)
+  const intervalCoverageSeconds = unionIntervalSeconds(runScopedRecords)
+  const incompleteRunScopedRecords = runScopedRecords.filter(record => intervalSeconds(record) === null).length
+  const unscopedRecords = records.filter(record => record.sourceRunId === null).length
+  const hasDurationOnlyRecords = records.some(record => record.durationSeconds !== null && intervalSeconds(record) === null)
+  const runElapsed = runElapsedSeconds(run)
+  const completeCoverage = timingEvidenceIsComplete(detail)
+    && unidentifiableRecords === 0
+    && unscopedRecords === 0
+    && runScopedRecords.length > 0
+    && incompleteRunScopedRecords === 0
+  const canComputeRemainder = completeCoverage
+    && runElapsed !== null
+    && intervalCoverageSeconds !== null
+    && intervalCoverageSeconds <= runElapsed
+  return {
+    groups,
+    runElapsedSeconds: runElapsed,
+    intervalCoverageSeconds,
+    runScopedRecords,
+    incompleteRunScopedRecords,
+    unidentifiableRecords,
+    unscopedRecords,
+    hasDurationOnlyRecords,
+    canComputeRemainder,
+    unattributedSeconds: canComputeRemainder && runElapsed !== null && intervalCoverageSeconds !== null
+      ? runElapsed - intervalCoverageSeconds
+      : null,
+  }
+}
+
+function relativeAge(timestamp: string | null, now = Date.now()): string | null {
+  if (!timestamp) return null
+  const value = Date.parse(timestamp)
+  if (!Number.isFinite(value)) return null
+  const seconds = Math.max(0, Math.floor((now - value) / 1000))
+  if (seconds < 60) return 'just now'
+  if (seconds < 3600) return `${Math.floor(seconds / 60)}m ago`
+  if (seconds < 86400) return `${Math.floor(seconds / 3600)}h ago`
+  return `${Math.floor(seconds / 86400)}d ago`
 }
 
 function executorParts(executor: RunProgressExecutor | null): string[] {
@@ -154,10 +389,10 @@ function executorParts(executor: RunProgressExecutor | null): string[] {
   return [...new Set(parts.filter((value): value is string => Boolean(value)))]
 }
 
-function executorText(executor: RunProgressExecutor | null): string {
+function executorText(executor: RunProgressExecutor | null, currentRunId?: string): string {
   if (!executor) return 'Not reported'
   const parts = executorParts(executor)
-  if (executor.source_run_id) parts.push(`source run ${executor.source_run_id}`)
+  if (executor.source_run_id && executor.source_run_id !== currentRunId) parts.push(`source run ${executor.source_run_id}`)
   if (executor.invocation_id) parts.push(`invocation ${executor.invocation_id}`)
   if (executor.turn_number !== null) parts.push(`turn ${executor.turn_number}`)
   return parts.length > 0 ? parts.join(' · ') : 'Identity not reported'
@@ -180,10 +415,47 @@ function eventKindText(kind: string): string {
 }
 
 function eventSourceText(event: RunProgressDetailEvent, runId: string): string | null {
-  const sourceRun = trimmed(event.source_run_id)
+  const sourceRun = trimmed(event.source_run_id) ?? trimmed(event.executor?.source_run_id)
   if (sourceRun && sourceRun !== runId) return `Inherited from run ${sourceRun}`
-  if (sourceRun) return `Recorded by run ${sourceRun}`
   return null
+}
+
+function eventAssociation(event: RunProgressDetailEvent): RunProgressEventAssociation {
+  if (
+    event.association === 'checkpoint'
+    || event.association === 'whole_plan'
+    || event.association === 'outside_returned'
+    || event.association === 'unassigned'
+  ) return event.association
+  return event.checkpoint_id ? 'checkpoint' : 'unassigned'
+}
+
+function syntheticHistoryTitle(association: RunProgressEventAssociation): string {
+  switch (association) {
+    case 'whole_plan': return 'Whole-plan review history'
+    case 'outside_returned': return 'History outside returned checkpoints'
+    case 'unassigned': return 'Unassigned history'
+    case 'checkpoint': return 'Checkpoint history'
+  }
+}
+
+function syntheticHistoryStatus(association: RunProgressEventAssociation): string {
+  switch (association) {
+    case 'whole_plan': return 'Whole-plan review'
+    case 'outside_returned': return 'Outside returned page'
+    case 'unassigned': return 'Unassigned'
+    case 'checkpoint': return 'Checkpoint history'
+  }
+}
+
+function syntheticHistoryDescription(association: RunProgressEventAssociation, count: number): string {
+  const events = `${count} event${count === 1 ? '' : 's'}`
+  switch (association) {
+    case 'whole_plan': return `${events} are run-level reviews; they do not prove checkpoint approval`
+    case 'outside_returned': return `${events} reference checkpoints outside this returned page`
+    case 'unassigned': return `${events} have no proven checkpoint association`
+    case 'checkpoint': return events
+  }
 }
 
 function referenceValue(reference: Record<string, unknown> | null, ...keys: string[]): string | null {
@@ -238,10 +510,12 @@ function changeTransition(oldValue: string | null, newValue: string | null): str
 
 function sourceReferenceText(reference: Record<string, unknown> | null): string | null {
   if (!reference) return null
+  const run = referenceValue(reference, 'run_id', 'source_run_id')
   const artifact = referenceValue(reference, 'artifact', 'relative_path')
   const turn = referenceValue(reference, 'turn_number')
   const decision = referenceValue(reference, 'decision_number')
   const parts = [
+    run ? `run ${run}` : null,
     artifact ? `evidence ${artifact}` : null,
     turn ? `turn ${turn}` : null,
     decision ? `decision ${decision}` : null,
@@ -289,27 +563,48 @@ function CheckpointRow({ entry, selected, onSelect }: { entry: HistoryEntry; sel
     className={`sidebar-entry checkpoint-history-entry${selected ? ' selected' : ''}`}
     data-sidebar-editor-item={entry.key}
     aria-pressed={selected}
+    aria-current={selected ? 'true' : undefined}
     onClick={() => onSelect(entry.key)}
   >
     <span className="checkpoint-history-entry-title">
       <strong>{entry.title}</strong>
-      <span className="status-pill">{checkpoint ? checkpointStatusText(checkpoint) : 'History not assigned'}</span>
+      <span className="status-pill">{checkpoint ? checkpointStatusText(checkpoint) : syntheticHistoryStatus(entry.association)}</span>
     </span>
     {checkpoint
       ? <span className="text-xs text-dim">{countShort(checkpoint.worker_attempts)} worker attempts · {countShort(checkpoint.repair_passes)} repairs · {countShort(checkpoint.reviews)} reviews</span>
-      : <span className="text-xs text-dim">{entry.events.length} event{entry.events.length === 1 ? '' : 's'} outside a returned checkpoint</span>}
+      : <span className="text-xs text-dim">{syntheticHistoryDescription(entry.association, entry.events.length)}</span>}
   </button>
 }
 
-function ExecutorRow({ label, executor }: { label: string; executor: RunProgressExecutor | null }): JSX.Element {
+function ExecutorRow({ label, executor, runId }: { label: string; executor: RunProgressExecutor | null; runId?: string }): JSX.Element {
   const duration = formatDuration(executor?.duration_seconds)
   return <div>
     <dt>{label}</dt>
-    <dd>{executorText(executor)}{duration ? ` · ${duration}` : ''}</dd>
+    <dd>{executorText(executor, runId)}{duration ? ` · ${duration}` : ''}</dd>
   </div>
 }
 
+function eventExecutorSummary(executor: RunProgressExecutor | null): string {
+  if (!executor) return 'Executor not reported'
+  const model = trimmed(executor.model_display) || trimmed(executor.model)
+  const readable = [trimmed(executor.selector), model, trimmed(executor.team)]
+    .filter((value): value is string => Boolean(value))
+  if (readable.length > 0) return [...new Set(readable)].join(' · ')
+  return executor.role ? formatMachineLabel(executor.role) : 'Executor identity not reported'
+}
+
+function eventRecordedText(event: RunProgressDetailEvent): string | null {
+  const started = formatTimestamp(event.started_at)
+  const ended = formatTimestamp(event.ended_at)
+  const parts = [
+    started ? `started ${started}` : null,
+    ended ? `ended ${ended}` : null,
+  ].filter((value): value is string => Boolean(value))
+  return parts.length > 0 ? parts.join(' · ') : null
+}
+
 function EventTimeline({ events, runId }: { events: RunProgressDetailEvent[]; runId: string }): JSX.Element {
+  const [openEventIds, setOpenEventIds] = useState<Set<string>>(() => new Set())
   if (events.length === 0) return <p className="text-sm text-dim">No attempt or review events are reported for this selection.</p>
   const eventIds = new Set(events.map(event => event.event_id))
   return <ol className="checkpoint-history-timeline">
@@ -319,31 +614,60 @@ function EventTimeline({ events, runId }: { events: RunProgressDetailEvent[]; ru
       const completionTurn = retryReference ? null : retryCompletionTurn(event)
       const completionTarget = completionTurn === null ? null : retryCompletionTarget(event, events, completionTurn)
       const source = eventSourceText(event, runId)
-      const duration = formatDuration(event.duration_seconds)
-      const recordedAt = formatTimestamp(event.started_at ?? event.ended_at)
+      const duration = formatDuration(event.duration_seconds) ?? formatDuration(event.executor?.duration_seconds)
+      const recordedAt = eventRecordedText({
+        ...event,
+        started_at: event.started_at ?? event.executor?.started_at ?? null,
+        ended_at: event.ended_at ?? event.executor?.ended_at ?? null,
+      })
       const sourceReference = sourceReferenceText(event.source_reference)
+      const outcome = trimmed(event.outcome) ? formatMachineLabel(event.outcome as string) : 'Outcome not reported'
+      const role = event.executor?.role ? formatMachineLabel(event.executor.role) : 'Role not reported'
       return <li className="checkpoint-history-event" id={`checkpoint-event-${event.event_id}`} key={event.event_id}>
-        <div className="checkpoint-history-event-heading">
-          <strong>{eventKindText(event.kind)}</strong>
-          <span className="status-pill">{trimmed(event.outcome) ? formatMachineLabel(event.outcome as string) : 'Outcome not reported'}</span>
-        </div>
-        <dl className="checkpoint-history-event-meta">
-          {event.turn_number !== null && <div><dt>Turn</dt><dd>{event.turn_number}</dd></div>}
-          {event.decision_number !== null && <div><dt>Decision</dt><dd>{event.decision_number}</dd></div>}
-          <div><dt>Executor</dt><dd>{executorText(event.executor)}</dd></div>
-          <div><dt>Duration</dt><dd>{duration ?? 'Not reported'}</dd></div>
-          {recordedAt && <div><dt>Recorded</dt><dd>{recordedAt}</dd></div>}
-          {source && <div><dt>History</dt><dd>{source}</dd></div>}
-        </dl>
-        <p className="text-sm">Reason: {trimmed(event.reason) ?? 'Not reported'}</p>
-        {retryTarget
-          ? <p className="text-xs text-dim"><a href={`#checkpoint-event-${retryTarget}`}>Retry of recorded event</a></p>
-          : completionTurn !== null
-            ? completionTarget
-              ? <p className="text-xs text-dim"><a href={`#checkpoint-event-${completionTarget.event_id}`}>Retried invocation: turn {completionTurn}</a></p>
-              : <p className="text-xs text-dim">Retried invocation: turn {completionTurn} (no unique invocation returned in this view).</p>
-            : event.kind === 'runtime_retry' && <p className="text-xs text-dim">Retry relationship not established by the evidence.</p>}
-        {sourceReference && <p className="text-xs text-dim">Source reference: <span className="mono">{sourceReference}</span></p>}
+        <details
+          className="checkpoint-history-event-disclosure"
+          open={openEventIds.has(event.event_id)}
+          onToggle={toggleEvent => {
+            const isOpen = toggleEvent.currentTarget.open
+            setOpenEventIds(current => {
+              if (current.has(event.event_id) === isOpen) return current
+              const next = new Set(current)
+              if (isOpen) next.add(event.event_id)
+              else next.delete(event.event_id)
+              return next
+            })
+          }}
+        >
+          <summary className="checkpoint-history-event-summary">
+            {event.turn_number !== null && <span>Turn {event.turn_number}</span>}
+            <span>{role}</span>
+            <strong>{eventKindText(event.kind)}</strong>
+            <span className="checkpoint-history-event-executor">{eventExecutorSummary(event.executor)}</span>
+            <span>{duration ?? 'Duration not reported'}</span>
+            <span className="status-pill">{outcome}</span>
+          </summary>
+          <div className="checkpoint-history-event-body">
+            <dl className="checkpoint-history-event-meta">
+              <div><dt>Event identity</dt><dd className="mono">{event.event_id}</dd></div>
+              {event.checkpoint_id && <div><dt>Checkpoint</dt><dd className="mono">{event.checkpoint_id}</dd></div>}
+              {event.scope_id && <div><dt>Scope</dt><dd className="mono">{event.scope_id}</dd></div>}
+              {event.turn_number !== null && <div><dt>Turn</dt><dd>{event.turn_number}</dd></div>}
+              {event.decision_number !== null && <div><dt>Decision</dt><dd>{event.decision_number}</dd></div>}
+              <div><dt>Executor</dt><dd>{executorText(event.executor, runId)}</dd></div>
+              <div><dt>Duration</dt><dd>{duration ?? 'Not reported'}</dd></div>
+              <div><dt>Recorded</dt><dd>{recordedAt ?? 'Not reported'}</dd></div>
+              <div><dt>Provenance</dt><dd>{[source, sourceReference].filter((value): value is string => Boolean(value)).join(' · ') || 'Not reported'}</dd></div>
+            </dl>
+            <p className="text-sm">Reason: {trimmed(event.reason) ?? 'Not reported'}</p>
+            {retryTarget
+              ? <p className="text-xs text-dim"><a href={`#checkpoint-event-${retryTarget}`}>Retry of recorded event</a></p>
+              : completionTurn !== null
+                ? completionTarget
+                  ? <p className="text-xs text-dim"><a href={`#checkpoint-event-${completionTarget.event_id}`}>Retried invocation: turn {completionTurn}</a></p>
+                  : <p className="text-xs text-dim">Retried invocation: turn {completionTurn} (no unique invocation returned in this view).</p>
+                : event.kind === 'runtime_retry' && <p className="text-xs text-dim">Retry relationship not established by the evidence.</p>}
+          </div>
+        </details>
       </li>
     })}
   </ol>
@@ -377,20 +701,145 @@ function ChangeDisclosure({ title, changes, emptyText }: { title: string; change
   </section>
 }
 
+const DELIVERY_SUMMARY_STAGES = [
+  { key: 'final_review', label: 'Final review' },
+  { key: 'merge', label: 'Merge' },
+  { key: 'publish', label: 'Publication' },
+  { key: 'ci', label: 'CI' },
+  { key: 'live', label: 'Live' },
+] as const
+
+function normalizeDeliveryStage(value: string): string {
+  return value.trim().toLowerCase().replace(/[_-]+/g, ' ').replace(/\s+/g, ' ')
+}
+
+function deliveryStageKey(value: string): string | null {
+  const normalized = normalizeDeliveryStage(value)
+  if (normalized === 'final review') return 'final_review'
+  if (normalized === 'merge') return 'merge'
+  if (normalized === 'publish' || normalized === 'publication') return 'publish'
+  if (normalized === 'ci' || normalized === 'continuous integration') return 'ci'
+  if (normalized === 'live' || normalized === 'live verification') return 'live'
+  return null
+}
+
+function deliveryStageLabel(value: string): string {
+  const key = deliveryStageKey(value)
+  return DELIVERY_SUMMARY_STAGES.find(stage => stage.key === key)?.label ?? formatMachineLabel(value)
+}
+
+function deliveryStageStatus(stages: RunProgressDeliveryStage[], key: string): string {
+  const matching = stages.filter(stage => deliveryStageKey(stage.stage) === key)
+  if (matching.length === 0) return 'Not reported'
+  const statuses = [...new Set(matching.map(stage => stage.status))]
+  return statuses.length === 1 ? formatMachineLabel(statuses[0]) : 'Conflicting evidence'
+}
+
+function DeliverySummary({ stages, onDetails }: { stages: RunProgressDeliveryStage[] | null; onDetails: () => void }): JSX.Element {
+  if (stages === null) return <p className="checkpoint-history-delivery-summary"><strong>Delivery</strong> Evidence not loaded</p>
+  const known = DELIVERY_SUMMARY_STAGES.map(stage => `${stage.label}: ${deliveryStageStatus(stages, stage.key)}`)
+  const other = stages
+    .filter(stage => deliveryStageKey(stage.stage) === null)
+    .map(stage => `${deliveryStageLabel(stage.stage)}: ${formatMachineLabel(stage.status)}`)
+  return <div className="checkpoint-history-delivery-summary">
+    <span><strong>Delivery</strong> {known.concat(other).join(' · ')}</span>
+    <a href="#checkpoint-history-delivery-evidence" onClick={onDetails}>View detailed receipts</a>
+  </div>
+}
+
 function DeliveryDisclosure({ stages }: { stages: RunProgressDeliveryStage[] }): JSX.Element {
   return <section>
     <h6>Delivery stages</h6>
     {stages.length > 0
-      ? <ul className="checkpoint-history-delivery-list">{stages.map((stage, index) => <li key={`${stage.stage}-${index}`}>
-        <span><strong>{stage.stage === 'ci' ? 'CI' : formatMachineLabel(stage.stage)}</strong> · {formatMachineLabel(stage.status)}</span>
-        {stage.reason && <span className="text-xs text-dim">{stage.reason}</span>}
-        {stage.recorded_at && <span className="text-xs text-dim">{formatTimestamp(stage.recorded_at)}</span>}
-      </li>)}</ul>
+      ? <ul className="checkpoint-history-delivery-list">{stages.map((stage, index) => {
+        const sourceReference = sourceReferenceText(stage.source_reference)
+        return <li key={`${stage.stage}-${index}`}>
+          <span><strong>{deliveryStageLabel(stage.stage)}</strong> · {formatMachineLabel(stage.status)}</span>
+          {stage.reason && <span className="text-xs text-dim">{stage.reason}</span>}
+          {stage.recorded_at && <span className="text-xs text-dim">{formatTimestamp(stage.recorded_at)}</span>}
+          {sourceReference && <span className="text-xs text-dim">Receipt: <span className="mono">{sourceReference}</span></span>}
+        </li>
+      })}</ul>
       : <p className="text-sm text-dim">Delivery evidence not reported.</p>}
   </section>
 }
 
-function CheckpointDetail({ entry, run, runId, allEvents }: { entry: HistoryEntry | null; run: RunStatus; runId: string; allEvents: RunProgressDetailEvent[] }): JSX.Element {
+function invocationLabel(timing: InvocationTiming, runId: string): string {
+  const invocationId = trimmed(timing.executor.invocation_id)
+  const identity = invocationId
+    ? `Invocation ${invocationId}`
+    : timing.turnNumber !== null
+      ? `Turn ${timing.turnNumber} invocation`
+      : 'Invocation identity not reported'
+  const source = timing.sourceRunId === null
+    ? ' · source run not reported'
+    : timing.sourceRunId !== runId ? ` · source run ${timing.sourceRunId}` : ''
+  return `${identity}${source}`
+}
+
+function timingDuration(timing: InvocationTiming): number | null {
+  return timing.durationSeconds ?? intervalSeconds(timing)
+}
+
+function TimeDisclosure({ run, detail }: { run: RunStatus; detail: RunProgressDetail }): JSX.Element {
+  const breakdown = buildTimeBreakdown(run, detail)
+  const currentIntervals = breakdown.runScopedRecords.filter(record => intervalSeconds(record) !== null)
+  const coverage = breakdown.intervalCoverageSeconds === null
+    ? 'Interval coverage not reported'
+    : formatDuration(breakdown.intervalCoverageSeconds) ?? 'Interval coverage not reported'
+  const partialReasons = [
+    detail.availability !== 'complete' ? 'history is partial or unavailable' : null,
+    breakdown.incompleteRunScopedRecords > 0
+      ? `${breakdown.incompleteRunScopedRecords} current-run invocation${breakdown.incompleteRunScopedRecords === 1 ? '' : 's'} lack complete boundaries`
+      : null,
+    breakdown.unidentifiableRecords > 0
+      ? `${breakdown.unidentifiableRecords} invocation record${breakdown.unidentifiableRecords === 1 ? '' : 's'} lack a proven identity`
+      : null,
+    breakdown.unscopedRecords > 0
+      ? `${breakdown.unscopedRecords} invocation record${breakdown.unscopedRecords === 1 ? '' : 's'} lack a source run`
+      : null,
+  ].filter((value): value is string => Boolean(value))
+  const hasRecords = Object.values(breakdown.groups).some(group => group.length > 0)
+  const inheritedRecords = Object.values(breakdown.groups)
+    .flat()
+    .filter(record => record.sourceRunId !== null && record.sourceRunId !== run.run_id)
+  const totalDurations = (records: InvocationTiming[]): number | null => {
+    const values = records.map(timingDuration).filter((value): value is number => value !== null)
+    return values.length > 0 ? values.reduce((total, value) => total + value, 0) : null
+  }
+  return <details className="checkpoint-history-disclosure">
+    <summary>Time details</summary>
+    <dl className="checkpoint-history-time-summary">
+      <div><dt>Total run elapsed</dt><dd>{formatDuration(breakdown.runElapsedSeconds) ?? 'Not reported'}</dd></div>
+      <div><dt>Known invocation coverage</dt><dd>{coverage}{currentIntervals.length > 0 && breakdown.incompleteRunScopedRecords > 0 ? ' · partial' : ''}</dd></div>
+      {breakdown.unattributedSeconds !== null && <div><dt>Unattributed time</dt><dd>{formatDuration(breakdown.unattributedSeconds) ?? 'Not reported'}</dd></div>}
+    </dl>
+    {(['worker', 'reviewer'] as const).map(role => {
+      const records = breakdown.groups[role]
+      const total = totalDurations(records)
+      return <section className="checkpoint-history-time-group" key={role}>
+        <h6>{formatMachineLabel(role)} invocations</h6>
+        {records.length > 0
+          ? <>
+            <ul className="checkpoint-history-time-list">{records.map(record => <li key={record.key}>
+              <span>{invocationLabel(record, run.run_id)} · {eventExecutorSummary(record.executor)}</span>
+              <span>{timingDuration(record) !== null ? formatDuration(timingDuration(record)) : 'Duration not reported'}</span>
+            </li>)}</ul>
+            <p className="text-xs text-dim">Recorded duration total: {formatDuration(total) ?? 'Not reported'}</p>
+          </>
+          : <p className="text-sm text-dim">No {role} invocation durations are reported.</p>}
+      </section>
+    })}
+    {!hasRecords && <p className="notice">No worker or reviewer invocation timing evidence was returned.</p>}
+    {inheritedRecords.length > 0 && <p className="text-xs text-dim">Inherited invocation records remain listed, but are excluded from the selected run&apos;s elapsed coverage.</p>}
+    {partialReasons.length > 0 && <p className="notice">Timing breakdown is partial: {partialReasons.join(' · ')}. Elapsed remainder is not computed from incomplete coverage.</p>}
+    {breakdown.hasDurationOnlyRecords && <p className="notice">Individual durations are shown, but records without both boundaries are not subtracted from total elapsed.</p>}
+    {breakdown.canComputeRemainder && <p className="text-xs text-dim">Unattributed time is the elapsed remainder after the union of complete, non-overlapping current-run invocation intervals.</p>}
+    <p className="text-xs text-dim">Workflow runtime is separate from browser data-load latency; this view does not measure page-loading time.</p>
+  </details>
+}
+
+function CheckpointDetail({ entry, run, runId }: { entry: HistoryEntry | null; run: RunStatus; runId: string }): JSX.Element {
   if (!entry) return <div className="checkpoint-history-empty-detail"><p className="text-sm text-dim">Select a returned checkpoint to inspect its evidence.</p></div>
   const checkpoint = entry.checkpoint
   return <div className="checkpoint-history-detail">
@@ -410,15 +859,87 @@ function CheckpointDetail({ entry, run, runId, allEvents }: { entry: HistoryEntr
       <div className="section-heading"><h6>Attempt and review timeline</h6><span className="text-xs text-dim">{entry.events.length} unique event{entry.events.length === 1 ? '' : 's'}</span></div>
       <EventTimeline events={entry.events} runId={runId} />
     </section>
-    {entry.synthetic && allEvents.some(event => event.source_run_id && event.source_run_id !== runId) && <p className="notice">Some history is inherited from another run or could not be assigned to a returned checkpoint.</p>}
+    {entry.synthetic && entry.association === 'whole_plan' && <p className="notice">Whole-plan review history is kept at run level; it does not prove approval for a returned checkpoint.</p>}
+    {entry.synthetic && entry.association === 'outside_returned' && <p className="notice">These events reference checkpoints outside the returned page; no placeholder checkpoint was created.</p>}
+    {entry.synthetic && entry.association === 'unassigned' && <p className="notice">No stable checkpoint, scope, or generation reference proved an association for these events.</p>}
+    {entry.synthetic && entry.association === 'unassigned' && entry.events.some(event => event.source_run_id && event.source_run_id !== runId) && <p className="notice">Some unassigned history is inherited from another run; each event keeps its source-run label.</p>}
     {run.restarted_from_run_id && <p className="text-xs text-dim">This run is a successor of <span className="mono">{run.restarted_from_run_id}</span>; inherited events remain labelled by their source run.</p>}
   </div>
 }
 
+function RunProgressDetails({
+  run,
+  progress,
+  runElapsed,
+  delivery,
+  onDeliveryDetails,
+}: {
+  run: RunStatus
+  progress: RunProgressSummary
+  runElapsed: string | null
+  delivery: RunProgressDeliveryStage[] | null
+  onDeliveryDetails: () => void
+}): JSX.Element {
+  const terminalInactive = isTerminalInactiveRun(run)
+  const currentExecutor = progress.current_executor
+  const currentAttempt = currentExecutor
+    ? [currentExecutor.turn_number !== null ? `turn ${currentExecutor.turn_number}` : null, formatDuration(currentExecutor.duration_seconds)].filter(Boolean).join(' · ')
+    : null
+  const activity = trimmed(progress.activity) || trimmed(progress.phase) || trimmed(progress.run_status)
+  const finish = runFinishText(run)
+  const notice = progressHistoryNotice(progress)
+
+  return <>
+    <dl className="checkpoint-history-at-a-glance">
+      <div><dt>Checkpoint result</dt><dd>{checkpointApprovalText(progress)}</dd></div>
+      <div><dt>Turns</dt><dd>{runTurnBudgetText(run)}</dd></div>
+      <div><dt>Elapsed</dt><dd>{runElapsed ?? 'Not reported'}</dd></div>
+      {terminalInactive
+        ? <div><dt>Finished</dt><dd>{finish ?? 'Finish time not reported'}</dd></div>
+        : <div><dt>Current work</dt><dd>{positionText(progress)}</dd></div>}
+    </dl>
+    <DeliverySummary stages={delivery} onDetails={onDeliveryDetails} />
+    {notice && <p className="notice" role="status">{notice}</p>}
+    <details className="checkpoint-history-disclosure checkpoint-history-run-details">
+      <summary>Details</summary>
+      <dl className="checkpoint-history-summary">
+        <div><dt>Availability</dt><dd>{availabilityText(progress.availability)}</dd></div>
+        <div><dt>Recorded complete</dt><dd>{countText(progress.recorded_complete_checkpoints, 'checkpoint', 'checkpoints')}</dd></div>
+        <div><dt>Worker attempts</dt><dd>{countText(progress.worker_attempts, 'attempt', 'attempts')}</dd></div>
+        <div><dt>Repair passes</dt><dd>{countText(progress.repair_passes, 'repair pass', 'repair passes')}</dd></div>
+        <div><dt>Reviews</dt><dd>{countText(progress.reviews, 'review', 'reviews')}</dd></div>
+        <div><dt>Runtime retries</dt><dd>{countText(progress.runtime_retries, 'runtime retry', 'runtime retries')}</dd></div>
+        <div><dt>Applied upgrades</dt><dd>{countText(progress.applied_upgrades, 'upgrade', 'upgrades')}</dd></div>
+        <div><dt>Turn budget</dt><dd>{runTurnBudgetText(run)}</dd></div>
+        {!terminalInactive && <>
+          <div><dt>Checkpoint position</dt><dd>{positionText(progress)}</dd></div>
+          <div><dt>Run activity</dt><dd>{activity ? formatMachineLabel(activity) : 'Activity not reported'}</dd></div>
+          <ExecutorRow label="Current executor" executor={currentExecutor} runId={run.run_id} />
+          <div><dt>Current attempt</dt><dd>{currentAttempt ?? 'Not reported'}</dd></div>
+        </>}
+        <ExecutorRow label="Last executor" executor={progress.last_executor} runId={run.run_id} />
+        <div><dt>Reason codes</dt><dd>{progress.reason_codes.length > 0 ? progress.reason_codes.join(', ') : 'None reported'}</dd></div>
+      </dl>
+    </details>
+  </>
+}
+
 function EvidenceDisclosure({ progress, detail }: { progress: RunProgressSummary; detail: RunProgressDetail | null }): JSX.Element {
   const truncation = detail?.truncation
-  const omitted = (truncation?.omitted_records ?? 0) + (truncation?.omitted_checkpoints ?? 0)
+  const responseLimitRecords = truncation?.response_limit_records ?? 0
+  const responseLimitCheckpoints = truncation?.response_limit_checkpoints ?? 0
+  const responseLimitParts = [
+    responseLimitRecords > 0 ? `${responseLimitRecords} record${responseLimitRecords === 1 ? '' : 's'}` : null,
+    responseLimitCheckpoints > 0 ? `${responseLimitCheckpoints} checkpoint${responseLimitCheckpoints === 1 ? '' : 's'}` : null,
+  ].filter((value): value is string => Boolean(value))
+  const responseLimitNotice = responseLimitParts.length > 0
+    ? `History omitted by the response limit: ${responseLimitParts.join(' and ')}.`
+    : null
   const notices = truncation?.notices ?? []
+  const evidenceAge = relativeAge(progress.evidence_at)
+  const evidenceTimestamp = progress.evidence_at ? Date.parse(progress.evidence_at) : NaN
+  const evidenceIsStale = Number.isFinite(evidenceTimestamp) && Date.now() - evidenceTimestamp > 15 * 60 * 1000
+  const evidenceTimestampInvalid = Boolean(progress.evidence_at) && !Number.isFinite(evidenceTimestamp)
   return <details className="checkpoint-history-disclosure">
     <summary>Count definitions &amp; evidence</summary>
     <p>Counts come from the bounded canonical evidence projection. Partial values are lower bounds; unavailable values are not zero.</p>
@@ -426,14 +947,17 @@ function EvidenceDisclosure({ progress, detail }: { progress: RunProgressSummary
       <div><dt>Availability</dt><dd>{availabilityText(progress.availability)}</dd></div>
       <div><dt>Observed</dt><dd>{formatTimestamp(progress.observed_at) ?? 'Not reported'}</dd></div>
       <div><dt>Latest evidence</dt><dd>{formatTimestamp(progress.evidence_at) ?? 'Not reported'}</dd></div>
+      <div><dt>Evidence age</dt><dd>{evidenceAge ?? 'Not reported'}</dd></div>
       <div><dt>Original plan</dt><dd>{progress.original_plan_display_name ?? 'Not reported'}</dd></div>
       <div><dt>Plan identity</dt><dd className="mono">{progress.original_plan_identity ?? 'Not reported'}</dd></div>
       <div><dt>Reason codes</dt><dd>{progress.reason_codes.length > 0 ? progress.reason_codes.join(', ') : 'None reported'}</dd></div>
     </dl>
-    {(progress.availability === 'partial' || omitted > 0 || notices.length > 0) && <div className="notice">
+    {(progress.availability === 'partial' || responseLimitNotice !== null || notices.length > 0) && <div className="notice">
       {notices.length > 0 ? notices.join(' · ') : 'Some earlier progress history is unavailable in this bounded view.'}
-      {omitted > 0 ? ` Omitted records/checkpoints: ${omitted}.` : ''}
+      {responseLimitNotice && <span> {responseLimitNotice}</span>}
     </div>}
+    {evidenceIsStale && <div className="notice" role="status">Latest evidence is older than 15 minutes; status may be stale. Refresh to request a newer snapshot.</div>}
+    {evidenceTimestampInvalid && <div className="notice" role="status">The latest evidence timestamp could not be parsed; freshness is unknown.</div>}
   </details>
 }
 
@@ -447,18 +971,31 @@ export function CheckpointHistory({ projectId, run, progress, detail }: Checkpoi
     const checkpointEntries = checkpoints.map((checkpoint, index): HistoryEntry => ({
       key: checkpointKey(checkpoint, index),
       checkpoint,
-      events: detailEvents.filter(event => eventMatchesCheckpoint(event, checkpoint)),
+      events: detailEvents.filter(event => eventAssociation(event) === 'checkpoint' && eventMatchesCheckpoint(event, checkpoint)),
       title: checkpointTitle(checkpoint),
       synthetic: false,
+      association: 'checkpoint',
     }))
-    const unassignedEvents = detailEvents.filter(event => event.checkpoint_id === null || !checkpointIds.has(event.checkpoint_id))
-    if (unassignedEvents.length > 0) checkpointEntries.push({
-      key: 'history:unassigned',
-      checkpoint: null,
-      events: unassignedEvents,
-      title: 'Unassigned or omitted history',
-      synthetic: true,
-    })
+    const assignedEventIds = new Set(
+      checkpointEntries.flatMap(entry => entry.events.map(event => event.event_id)),
+    )
+    const syntheticAssociations: RunProgressEventAssociation[] = ['unassigned', 'whole_plan', 'outside_returned']
+    for (const association of syntheticAssociations) {
+      const groupedEvents = detailEvents.filter(event => {
+        if (assignedEventIds.has(event.event_id)) return false
+        const kind = eventAssociation(event)
+        if (kind === association) return true
+        return kind === 'checkpoint' && (!event.checkpoint_id || !checkpointIds.has(event.checkpoint_id)) && association === 'unassigned'
+      })
+      if (groupedEvents.length > 0) checkpointEntries.push({
+        key: `history:${association}`,
+        checkpoint: null,
+        events: groupedEvents,
+        title: syntheticHistoryTitle(association),
+        synthetic: true,
+        association,
+      })
+    }
     return checkpointEntries
   }, [checkpoints, detailEvents])
   const currentEntryKey = useMemo(() => {
@@ -480,6 +1017,7 @@ export function CheckpointHistory({ projectId, run, progress, detail }: Checkpoi
   }, [currentEntryKey, entries])
   const [navigationVersion, setNavigationVersion] = useState(0)
   const [selection, setSelection] = useState<CheckpointSelectionState>({ runKey: null, key: null, notice: null })
+  const [deliveryOpen, setDeliveryOpen] = useState(false)
   const entryKeys = useMemo(() => new Set(entries.map(entry => entry.key)), [entries])
 
   useEffect(() => {
@@ -494,11 +1032,7 @@ export function CheckpointHistory({ projectId, run, progress, detail }: Checkpoi
   const selectedEntryKey = selectionIsCurrent ? selection.key : null
   const selectedEntry = entries.find(entry => entry.key === selectedEntryKey) ?? null
   const runElapsed = executionDuration(run, Date.now())
-  const currentExecutor = summary?.current_executor ?? null
-  const lastExecutor = summary?.last_executor ?? null
-  const currentAttempt = currentExecutor
-    ? [currentExecutor.turn_number !== null ? `turn ${currentExecutor.turn_number}` : null, formatDuration(currentExecutor.duration_seconds)].filter(Boolean).join(' · ')
-    : null
+  const terminalInactive = isTerminalInactiveRun(run)
 
   function selectEntry(key: string): void {
     setSelection(current => current.runKey === runKey && current.key === key && current.notice === null
@@ -524,26 +1058,17 @@ export function CheckpointHistory({ projectId, run, progress, detail }: Checkpoi
     <div className="section-heading checkpoint-history-heading">
       <div>
         <h4>Checkpoint progress</h4>
-        <p className="text-xs text-dim">{approvalText(summary)} · {positionText(summary)}</p>
+        <p className="text-xs text-dim">{checkpointApprovalText(summary)} · {terminalInactive ? runFinishText(run) ?? 'Finished; finish time not reported' : positionText(summary)}</p>
       </div>
       <span className="status-pill">{availabilityText(summary.availability)}</span>
     </div>
-    <dl className="checkpoint-history-summary">
-      <div><dt>Checkpoint position</dt><dd>{positionText(summary)}</dd></div>
-      <div><dt>Approved / total</dt><dd>{approvalText(summary)}</dd></div>
-      <div><dt>Recorded complete</dt><dd>{countText(summary.recorded_complete_checkpoints, 'checkpoint', 'checkpoints')}</dd></div>
-      <div><dt>Worker attempts</dt><dd>{countText(summary.worker_attempts, 'attempt', 'attempts')}</dd></div>
-      <div><dt>Repair passes</dt><dd>{countText(summary.repair_passes, 'repair pass', 'repair passes')}</dd></div>
-      <div><dt>Reviews</dt><dd>{countText(summary.reviews, 'review', 'reviews')}</dd></div>
-      <div><dt>Runtime retries</dt><dd>{countText(summary.runtime_retries, 'runtime retry', 'runtime retries')}</dd></div>
-      <div><dt>Applied upgrades</dt><dd>{countText(summary.applied_upgrades, 'upgrade', 'upgrades')}</dd></div>
-      <div><dt>Run activity</dt><dd>{summary.activity ? formatMachineLabel(summary.activity) : statusLabel(run)}</dd></div>
-      <div><dt>Run elapsed</dt><dd>{runElapsed ?? 'Not reported'}</dd></div>
-      <div><dt>Turn budget</dt><dd>{run.turns_completed !== null ? `${run.turns_completed} completed` : 'Completed turns unknown'}{run.max_turns !== null ? ` · ceiling ${run.max_turns}` : ' · ceiling not reported'}</dd></div>
-      <ExecutorRow label="Current executor" executor={currentExecutor} />
-      <ExecutorRow label="Last executor" executor={lastExecutor} />
-      <div><dt>Current attempt</dt><dd>{currentAttempt ?? 'Not reported'}</dd></div>
-    </dl>
+    <RunProgressDetails
+      run={run}
+      progress={summary}
+      runElapsed={runElapsed}
+      delivery={detail?.delivery ?? null}
+      onDeliveryDetails={() => setDeliveryOpen(true)}
+    />
     {selectionIsCurrent && selection.notice && <p className="notice" role="status">{selection.notice}</p>}
     {!detailAvailable && <p className="notice" role="status">Detailed checkpoint history is loading or unavailable; summary facts remain from the selected-run record.</p>}
     {detailAvailable && <div className="checkpoint-history-layout">
@@ -553,17 +1078,17 @@ export function CheckpointHistory({ projectId, run, progress, detail }: Checkpoi
         navigationVersion={navigationVersion}
         listLabel="Checkpoints"
         navigation={<div className="checkpoint-history-navigation">
-          <div className="section-heading"><h5>Checkpoints</h5><button type="button" className="btn btn-secondary btn-sm" disabled={!currentEntryKey} onClick={selectCurrent}>Current checkpoint</button></div>
+          <div className="section-heading"><h5>Checkpoints</h5>{!terminalInactive && <button type="button" className="btn btn-secondary btn-sm" disabled={!currentEntryKey} onClick={selectCurrent}>Current checkpoint</button>}</div>
           {entries.length > 0
             ? entries.map(entry => <CheckpointRow entry={entry} selected={entry.key === selectedEntryKey} onSelect={selectEntry} key={entry.key} />)
             : <p className="text-sm text-dim">No checkpoint entries were returned.</p>}
         </div>}
         detailHeading={<div className="checkpoint-history-detail-heading">
           <h5>{selectedEntry?.title ?? 'Checkpoint detail'}</h5>
-          {selectedEntry && <p className="text-xs text-dim">{selectedEntry.checkpoint ? checkpointStatusText(selectedEntry.checkpoint) : 'Unassigned or omitted checkpoint association'}{selectedEntry.checkpoint?.checkpoint_id ? ` · ${selectedEntry.checkpoint.checkpoint_id}` : ''}</p>}
+          {selectedEntry && <p className="text-xs text-dim">{selectedEntry.checkpoint ? checkpointStatusText(selectedEntry.checkpoint) : syntheticHistoryStatus(selectedEntry.association)}{selectedEntry.checkpoint?.checkpoint_id ? ` · ${selectedEntry.checkpoint.checkpoint_id}` : ''}</p>}
         </div>}
       >
-        <CheckpointDetail entry={selectedEntry} run={run} runId={run.run_id} allEvents={detailEvents} />
+        <CheckpointDetail entry={selectedEntry} run={run} runId={run.run_id} />
       </SidebarEditorLayout>
     </div>}
     {detail && <div className="checkpoint-history-disclosures">
@@ -572,10 +1097,16 @@ export function CheckpointHistory({ projectId, run, progress, detail }: Checkpoi
         <ChangeDisclosure title="Applied changes" changes={detail.applied_changes ?? []} emptyText="No applied team/profile changes were returned." />
         <ChangeDisclosure title="Pending changes" changes={detail.pending_changes ?? []} emptyText="No pending team/profile changes were returned." />
       </details>
-      <details className="checkpoint-history-disclosure">
+      <details
+        id="checkpoint-history-delivery-evidence"
+        className="checkpoint-history-disclosure"
+        open={deliveryOpen}
+        onToggle={event => setDeliveryOpen(event.currentTarget.open)}
+      >
         <summary>Delivery evidence</summary>
         <DeliveryDisclosure stages={detail.delivery ?? []} />
       </details>
+      <TimeDisclosure run={run} detail={detail} />
       <EvidenceDisclosure progress={summary} detail={detail} />
     </div>}
   </section>

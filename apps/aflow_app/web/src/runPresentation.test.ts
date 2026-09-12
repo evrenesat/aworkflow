@@ -1,16 +1,25 @@
 import { describe, expect, it } from 'vitest'
-import type { GuidedFormProjection, RunStatus } from './types'
+import type { GuidedFormProjection, RunProgressCount, RunProgressSummary, RunStatus } from './types'
 import {
+  checkpointApprovalText,
   executionDuration,
+  formatLocalTimestamp,
   launchTeamFamilyGroups,
   launchTeamFamilyHint,
   launchTeamFamilyLabel,
   launchTeamFamilyRoute,
   launchTeamUpgradeRoute,
   launchTeamStageLabel,
+  progressHistoryNotice,
+  runActivityText,
+  runFinishText,
   runPlanDisplayName,
   runPlanDisplayNameForRun,
+  runPlanPresentation,
+  runPlanPresentationForRun,
   runPlanPath,
+  runTurnBudgetText,
+  shortRunId,
   statusLabel,
 } from './runPresentation'
 
@@ -66,6 +75,81 @@ describe('run plan presentation', () => {
     } as RunStatus
     expect(runPlanPath(run)).toBe('/srv/original/canonical-plan.md')
     expect(runPlanDisplayNameForRun(run)).toBe('Canonical plan')
+  })
+
+  it('separates a valid machine date suffix from a readable title', () => {
+    const presentation = runPlanPresentation('/srv/plans/run-history-readable-evidence-20260912.md', 'run-1')
+    expect(presentation.label).toBe('Run history readable evidence')
+    expect(presentation.date).toContain('2026')
+    expect(runPlanPresentation('/srv/plans/title-20261301.md', 'run-2').label).toBe('Title 20261301')
+  })
+
+  it('keeps canonical custom titles and exact identities distinct', () => {
+    const custom = {
+      run_id: 'run-custom',
+      status: 'completed',
+      ownership: 'control_plane',
+      evidence: {},
+      progress: {
+        original_plan_display_name: 'Quarterly review',
+        original_plan_path: '/srv/plans/quarterly-review-20260912.md',
+      },
+    } as RunStatus
+    expect(runPlanPresentationForRun(custom)).toMatchObject({ label: 'Quarterly review', date: null, machineDerived: false })
+    expect(shortRunId('abcdefghijklmnop-qrstuvwxyz')).toBe('abcdefgh…stuvwxyz')
+  })
+})
+
+const progressCount = (value: number | null, coverage: RunProgressCount['coverage'] = 'complete'): RunProgressCount => ({ value, coverage })
+const progressSummary = (overrides: Partial<RunProgressSummary> = {}): RunProgressSummary => ({
+  schema_version: 1,
+  availability: 'complete',
+  observed_at: null,
+  evidence_at: null,
+  reason_codes: [],
+  original_plan_identity: null,
+  original_plan_display_name: null,
+  original_plan_path: null,
+  total_checkpoints: progressCount(8),
+  approved_checkpoints: progressCount(2),
+  recorded_complete_checkpoints: progressCount(3),
+  current_checkpoint_id: null,
+  current_checkpoint_ordinal: null,
+  current_checkpoint_title: null,
+  activity: null,
+  phase: null,
+  run_status: null,
+  current_executor: null,
+  last_executor: null,
+  worker_attempts: progressCount(0),
+  repair_passes: progressCount(0),
+  reviews: progressCount(0),
+  runtime_retries: progressCount(0),
+  applied_upgrades: progressCount(0),
+  ...overrides,
+})
+
+describe('readable run evidence labels', () => {
+  it('never turns unknown approval into a zero or slash placeholder', () => {
+    expect(checkpointApprovalText(progressSummary())).toBe('2 of 8 checkpoints approved')
+    expect(checkpointApprovalText(progressSummary({ approved_checkpoints: progressCount(null), total_checkpoints: progressCount(8) }))).toBe('8 checkpoints · approval unknown')
+    expect(checkpointApprovalText(progressSummary({ approved_checkpoints: progressCount(2), total_checkpoints: progressCount(null) }))).toBe('2 approved · total unknown')
+    expect(checkpointApprovalText(progressSummary({ availability: 'not_applicable' }))).toBe('Non-checkpoint workflow')
+    expect(checkpointApprovalText(progressSummary({ approved_checkpoints: progressCount(2, 'partial'), total_checkpoints: progressCount(8, 'partial') }))).toBe('At least 2 of at least 8 checkpoints approved')
+  })
+
+  it('keeps turn limits, finish boundaries, and freshness explicit', () => {
+    expect(runTurnBudgetText({ ...run, turns_completed: 2, max_turns: 8 })).toBe('2 of 8 turns used')
+    expect(runTurnBudgetText({ ...run, turns_completed: 0, max_turns: 8 })).toBe('0 of 8 turns used')
+    expect(runTurnBudgetText({ ...run, turns_completed: 2, max_turns: null })).toBe('2 turns used · turn limit unknown')
+    expect(runTurnBudgetText({ ...run, turns_completed: 2, max_turns: 0 })).toBe('2 turns used · turn limit unknown')
+    expect(runTurnBudgetText({ ...run, turns_completed: null, max_turns: 8 })).toBe('8-turn limit · turns used unknown')
+    expect(runTurnBudgetText({ ...run, turns_completed: null, max_turns: null })).toBe('Turns used unknown · turn limit unknown')
+    const failed = { ...run, status: 'failed', activity: 'inactive' as const, ended_at: '2026-09-12T12:00:00Z' }
+    expect(runFinishText(failed)).toMatch(/^Finished /)
+    expect(runActivityText(failed)).toMatch(/^Finished /)
+    expect(formatLocalTimestamp('2026-09-12T12:00:00Z')).toMatch(/2026.*(?:UTC|GMT|[A-Z]{2,5})/)
+    expect(progressHistoryNotice(progressSummary({ availability: 'partial' }))).toContain('partial')
   })
 })
 

@@ -1,8 +1,13 @@
 import { useEffect, useState } from 'react'
 import { fetchGlobalRuns, matchesGlobalRun, selectGlobalRuns, useRecentRunsLimit } from '../globalRuns'
 import type { ProjectInfo, RunStatus } from '../types'
-import { executionDuration, runPlanDisplayNameForRun, runPlanPath, statusLabel } from '../runPresentation'
-import { formatMachineLabel } from '../label'
+import {
+  checkpointApprovalText,
+  runActivityText,
+  runDurationText,
+  runPlanPresentationForRun,
+  statusLabel,
+} from '../runPresentation'
 import { projectContextLabel } from '../projectPresentation'
 import { useHeaderSlots } from './HeaderSlots'
 import { RunProgress } from './RunProgress'
@@ -103,23 +108,26 @@ export function GlobalRunOverview({ projects, onOpen, registryLoading = false, r
     const project = projects.find(candidate => candidate.id === projectId)
     const projectLabel = project ? projectContextLabel(project, projects) : projectId
     const status = statusLabel(run)
-    const exactPath = runPlanPath(run)
-    const displayName = runPlanDisplayNameForRun(run)
+    const title = runPlanPresentationForRun(run)
+    const displayName = title.label
     return <li key={JSON.stringify([projectId, run.run_id])}>
       <button
         className="card global-run-row"
-        aria-label={`${projectLabel} · ${status} · ${displayName} · ${run.run_id}`}
+        aria-label={`${projectLabel} · ${status} · ${displayName} · ${run.progress ? checkpointApprovalText(run.progress) : 'Checkpoint progress unavailable'} · ${runDurationText(run)} · ${runActivityText(run)} · ${run.run_id}`}
         onClick={() => onOpen(projectId, run.run_id)}
       >
         <span className="global-run-row-heading">
-          <strong className="global-run-row-title">{displayName}</strong>
+          <strong className="global-run-row-title" title={displayName}>{displayName}</strong>
+          {title.date && <span className="run-title-date">{title.date}</span>}
           <span className="global-run-row-project">{projectLabel}</span>
           <span className="status-pill">{status}</span>
           {run.history_state === 'archived' && <span className="status-pill">Archived</span>}
         </span>
-        <span className="text-sm text-dim">{[run.workflow_name ? formatMachineLabel(run.workflow_name) : null, run.team ? formatMachineLabel(run.team) : null, run.current_step ? formatMachineLabel(run.current_step) : null, executionDuration(run, Date.now())].filter(Boolean).join(' · ') || 'No execution details reported'}</span>
+        <span className="global-run-row-meta text-sm text-dim">
+          <span>{runDurationText(run)}</span>
+          <span>{runActivityText(run)}</span>
+        </span>
         <RunProgress run={run} />
-        <span className="text-xs text-dim mono">Plan: {exactPath ?? 'Not reported'} · Run: {run.run_id}</span>
       </button>
     </li>
   }

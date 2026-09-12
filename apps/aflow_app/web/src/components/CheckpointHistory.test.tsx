@@ -145,16 +145,17 @@ describe('CheckpointHistory', () => {
   it('shows the worker, rejection, repair and upgrade evidence without inventing delivery', () => {
     render(<CheckpointHistory projectId="project-current" run={run} progress={summary()} detail={detail()} />)
 
-    expect(screen.getByText('1 / 3 approved')).toBeDefined()
+    expect(screen.getByText('1 of 3 checkpoints approved')).toBeDefined()
     expect(screen.getAllByText(/CP2 of 3 · Reviewing/).length).toBeGreaterThan(0)
     expect(screen.getAllByText(/codex.reviewer/).length).toBeGreaterThan(0)
+    fireEvent.click(screen.getByText('Details'))
     expect(screen.getByText('Current attempt')).toBeDefined()
 
     fireEvent.click(screen.getByRole('button', { name: /Checkpoint 2: Repair/ }))
     expect(screen.getByText('Review rejection')).toBeDefined()
     expect(screen.getByText('Repair attempt')).toBeDefined()
     expect(screen.getByRole('link', { name: 'Retry of recorded event' }).getAttribute('href')).toBe('#checkpoint-event-repair-1')
-    expect(screen.getByText('Unassigned or omitted history')).toBeDefined()
+    expect(screen.getByText('Unassigned history')).toBeDefined()
     fireEvent.click(screen.getByRole('button', { name: /Checkpoint 1: Build/ }))
     expect(screen.getByText(/Inherited from run run-predecessor/)).toBeDefined()
 
@@ -225,7 +226,7 @@ describe('CheckpointHistory', () => {
     expect(screen.getByText('Last executor').parentElement?.textContent).toContain('successor.worker')
     fireEvent.click(screen.getByRole('button', { name: /Checkpoint 1: Build/ }))
     expect(screen.getByText(/Inherited from run predecessor-run/)).toBeDefined()
-    expect(screen.getByText(/predecessor\.reviewer/)).toBeDefined()
+    expect(within(document.getElementById('checkpoint-event-inherited-review') as HTMLElement).getAllByText(/predecessor\.reviewer/).length).toBeGreaterThan(0)
   })
 
   it('retains an earlier checkpoint through progress refresh and resets on a new run', () => {
@@ -431,12 +432,45 @@ describe('CheckpointHistory', () => {
     view.unmount()
   })
 
+  it('separates unassigned, whole-plan, and outside-page history', () => {
+    const grouped = detail({
+      events: [
+        event({ event_id: 'whole-plan-review', checkpoint_id: null, association: 'whole_plan', kind: 'review' }),
+        event({ event_id: 'outside-review', checkpoint_id: null, association: 'outside_returned', kind: 'review' }),
+        event({ event_id: 'unknown-history', checkpoint_id: null, association: 'unassigned', kind: 'history' }),
+      ],
+      truncation: {
+        evidence_bytes: 100,
+        records_read: 10,
+        checkpoints_read: 3,
+        events_read: 3,
+        omitted_records: 4,
+        omitted_checkpoints: 2,
+        response_limit_records: 4,
+        response_limit_checkpoints: 2,
+        notices: ['Earlier history unavailable in this bounded view'],
+      },
+    })
+    render(<CheckpointHistory projectId="project-current" run={run} progress={grouped} detail={grouped} />)
+
+    expect(screen.getByRole('button', { name: /Unassigned history/ })).toBeDefined()
+    expect(screen.getByRole('button', { name: /Whole-plan review history/ })).toBeDefined()
+    expect(screen.getByRole('button', { name: /History outside returned checkpoints/ })).toBeDefined()
+
+    fireEvent.click(screen.getByRole('button', { name: /Whole-plan review history/ }))
+    expect(screen.getByText(/does not prove approval for a returned checkpoint/)).toBeDefined()
+    fireEvent.click(screen.getByRole('button', { name: /History outside returned checkpoints/ }))
+    expect(screen.getByText(/no placeholder checkpoint was created/)).toBeDefined()
+    fireEvent.click(screen.getByText('Count definitions & evidence'))
+    expect(screen.getByText(/History omitted by the response limit: 4 records and 2 checkpoints\./)).toBeDefined()
+  })
+
   it('deduplicates repeated event identities and keeps unknown fields explicit', () => {
     const duplicate = event({ event_id: 'duplicate-1', kind: 'review', outcome: null, executor: null, duration_seconds: null, reason: null })
     const repeated = detail({ events: [duplicate, duplicate], availability: 'unavailable', reason_codes: ['missing_plan'], checkpoints: [] })
     render(<CheckpointHistory projectId="project-current" run={run} progress={repeated} detail={repeated} />)
     expect(screen.getAllByText('Evidence unavailable').length).toBeGreaterThan(0)
-    fireEvent.click(screen.getByRole('button', { name: /Unassigned or omitted history/ }))
+    fireEvent.click(screen.getByRole('button', { name: /Unassigned history/ }))
     expect(screen.getByText('1 unique event')).toBeDefined()
     expect(screen.getByText('Outcome not reported')).toBeDefined()
     expect(document.querySelector('.checkpoint-history-event-meta')?.textContent).toContain('Not reported')
@@ -449,5 +483,209 @@ describe('CheckpointHistory', () => {
     fireEvent.click(screen.getByText('Delivery evidence'))
     expect(screen.getByText('Delivery evidence not reported.')).toBeDefined()
     expect(screen.queryByText('Succeeded')).toBeNull()
+  })
+
+  it('renders compact event disclosures and retains an expanded event through refresh', () => {
+    const initial = detail({
+      events: [event({
+        event_id: 'stable-review', checkpoint_id: 'cp-2', kind: 'review_rejection', outcome: 'rejected', turn_number: 3,
+        executor: executor({ role: 'reviewer', selector: 'codex.reviewer', invocation_id: 'review-stable', turn_number: 3 }),
+        started_at: '2026-09-11T10:03:00Z', ended_at: '2026-09-11T10:04:00Z', duration_seconds: 60,
+        reason: 'Review requested a repair.', source_reference: { run_id: 'run-current', artifact: 'turns/turn-003/result.json', turn_number: 3 },
+      })],
+    })
+    const view = render(<CheckpointHistory projectId="project-current" run={run} progress={initial} detail={initial} />)
+    fireEvent.click(screen.getByRole('button', { name: /Checkpoint 2: Repair/ }))
+
+    const eventDisclosure = document.querySelector('#checkpoint-event-stable-review details') as HTMLDetailsElement
+    expect(eventDisclosure.querySelector('summary')?.textContent).toContain('Turn 3')
+    expect(eventDisclosure.querySelector('summary')?.textContent).toContain('Reviewer')
+    expect(eventDisclosure.querySelector('summary')?.textContent).toContain('codex.reviewer')
+    expect(eventDisclosure.querySelector('summary')?.textContent).toContain('1m 0s')
+    expect(eventDisclosure.querySelector('summary')?.textContent).toContain('Rejected')
+
+    // jsdom does not run the native <details> toggle default action; dispatch
+    // the toggle event after setting the property to model a browser toggle.
+    eventDisclosure.open = true
+    fireEvent(eventDisclosure, new Event('toggle'))
+    expect(eventDisclosure.hasAttribute('open')).toBe(true)
+    expect(within(eventDisclosure).getByText('Event identity', { selector: 'dt' })).toBeDefined()
+    expect(within(eventDisclosure).getByText(/run run-current · evidence turns\/turn-003\/result\.json · turn 3/)).toBeDefined()
+    expect(within(eventDisclosure).getByText(/Reason: Review requested a repair\./)).toBeDefined()
+    expect(within(eventDisclosure).getAllByText(/UTC|GMT/).length).toBeGreaterThan(0)
+
+    const refreshed = detail({ ...initial, events: [{ ...initial.events[0], outcome: 'rejected' }] })
+    view.rerender(<CheckpointHistory projectId="project-current" run={run} progress={refreshed} detail={refreshed} />)
+    expect((document.querySelector('#checkpoint-event-stable-review details') as HTMLDetailsElement).hasAttribute('open')).toBe(true)
+  })
+
+  it('summarizes each delivery gate and opens the selected run receipts', () => {
+    const delivered = detail({
+      delivery: [
+        { stage: 'Final review', status: 'succeeded', recorded_at: '2026-09-11T10:07:00Z', reason: null, source_reference: { run_id: 'run-current', artifact: 'review/result.json' } },
+        { stage: 'Merge', status: 'succeeded', recorded_at: '2026-09-11T10:08:00Z', reason: null, source_reference: { run_id: 'run-current', artifact: 'merge/receipt.json' } },
+        { stage: 'Publish', status: 'unknown', recorded_at: null, reason: 'Publication receipt is pending.', source_reference: null },
+        { stage: 'CI', status: 'failed', recorded_at: '2026-09-11T10:09:00Z', reason: 'CI receipt failed.', source_reference: { run_id: 'run-current', artifact: 'ci/receipt.json' } },
+        { stage: 'Live verification', status: 'not_applicable', recorded_at: null, reason: 'No live verification receipt.', source_reference: null },
+      ],
+    })
+    render(<CheckpointHistory projectId="project-current" run={run} progress={delivered} detail={delivered} />)
+
+    const summaryLine = document.querySelector('.checkpoint-history-delivery-summary') as HTMLElement
+    expect(summaryLine.textContent).toContain('Final review: Succeeded')
+    expect(summaryLine.textContent).toContain('Merge: Succeeded')
+    expect(summaryLine.textContent).toContain('Publication: Unknown')
+    expect(summaryLine.textContent).toContain('CI: Failed')
+    expect(summaryLine.textContent).toContain('Live: Not applicable')
+    expect(summaryLine.textContent).toContain('View detailed receipts')
+
+    fireEvent.click(screen.getByRole('link', { name: 'View detailed receipts' }))
+    expect(document.getElementById('checkpoint-history-delivery-evidence')?.hasAttribute('open')).toBe(true)
+    expect(screen.getByText('CI receipt failed.')).toBeDefined()
+    expect(screen.getByText(/ci\/receipt\.json/)).toBeDefined()
+  })
+
+  it('deduplicates overlapping worker and reviewer intervals before computing unattributed time', () => {
+    const terminalRun = {
+      ...run,
+      status: 'done' as const,
+      activity: 'inactive' as const,
+      started_at: '2026-09-11T09:00:00Z',
+      ended_at: '2026-09-11T10:30:00Z',
+    }
+    const timed = detail({
+      events: [
+        event({
+          event_id: 'worker-timing', checkpoint_id: 'cp-2', turn_number: 1,
+          executor: executor({ role: 'worker', selector: 'codex.worker', invocation_id: 'worker-timing', turn_number: 1, started_at: '2026-09-11T10:00:00Z', ended_at: '2026-09-11T10:10:00Z', duration_seconds: 600 }),
+          started_at: '2026-09-11T10:00:00Z', ended_at: '2026-09-11T10:10:00Z', duration_seconds: 600,
+        }),
+        event({
+          event_id: 'worker-timing-duplicate', checkpoint_id: 'cp-2', turn_number: 1,
+          executor: executor({ role: 'worker', selector: 'codex.worker', invocation_id: 'worker-timing', turn_number: 1, started_at: '2026-09-11T10:00:00Z', ended_at: '2026-09-11T10:10:00Z', duration_seconds: 600 }),
+          started_at: '2026-09-11T10:00:00Z', ended_at: '2026-09-11T10:10:00Z', duration_seconds: 600,
+        }),
+        event({
+          event_id: 'reviewer-timing', checkpoint_id: 'cp-2', kind: 'review', turn_number: 2,
+          executor: executor({ role: 'reviewer', selector: 'codex.reviewer', invocation_id: 'reviewer-timing', turn_number: 2, started_at: '2026-09-11T10:05:00Z', ended_at: '2026-09-11T10:20:00Z', duration_seconds: 900 }),
+          started_at: '2026-09-11T10:05:00Z', ended_at: '2026-09-11T10:20:00Z', duration_seconds: 900,
+        }),
+      ],
+    })
+    render(<CheckpointHistory projectId="project-current" run={terminalRun} progress={timed} detail={timed} />)
+    fireEvent.click(screen.getByText('Time details'))
+
+    expect(screen.getByText('Total run elapsed', { selector: 'dt' }).parentElement?.textContent).toContain('1h 30m')
+    expect(screen.getByText('Known invocation coverage', { selector: 'dt' }).parentElement?.textContent).toContain('20m 0s')
+    expect(screen.getByText('Unattributed time', { selector: 'dt' }).parentElement?.textContent).toContain('1h 10m')
+    expect(screen.getByText('Recorded duration total: 10m 0s')).toBeDefined()
+    expect(screen.getByText('Recorded duration total: 15m 0s')).toBeDefined()
+    expect(screen.getAllByText(/Invocation worker-timing ·/)).toHaveLength(1)
+    expect(screen.getByText(/union of complete, non-overlapping/)).toBeDefined()
+    expect(screen.getByText(/separate from browser data-load latency/)).toBeDefined()
+  })
+
+  it('deduplicates review and approval timing for the same legacy turn', () => {
+    const terminalRun = {
+      ...run,
+      status: 'completed' as const,
+      activity: 'inactive' as const,
+      started_at: '2026-09-12T13:00:00Z',
+      ended_at: '2026-09-12T13:11:23Z',
+    }
+    const workerInterval = {
+      started_at: '2026-09-12T13:00:03Z',
+      ended_at: '2026-09-12T13:03:50Z',
+    }
+    const reviewerInterval = {
+      started_at: '2026-09-12T13:08:57Z',
+      ended_at: '2026-09-12T13:11:23Z',
+    }
+    const legacyWorker = event({
+      event_id: 'legacy-worker-timing', checkpoint_id: 'cp-2', kind: 'worker_attempt', turn_number: 1,
+      executor: executor({ role: 'worker', source_run_id: 'run-current', invocation_id: null, turn_number: 1, ...workerInterval, duration_seconds: null }),
+      ...workerInterval, duration_seconds: null,
+    })
+    const legacyReview = event({
+      event_id: 'legacy-review-timing', checkpoint_id: 'cp-2', kind: 'review', turn_number: 2,
+      executor: executor({ role: 'reviewer', source_run_id: 'run-current', invocation_id: null, turn_number: 2, ...reviewerInterval, duration_seconds: null }),
+      ...reviewerInterval, duration_seconds: null,
+    })
+    const legacyApproval = event({
+      event_id: 'legacy-approval-timing', checkpoint_id: 'cp-2', kind: 'checkpoint_approval', turn_number: 2,
+      executor: executor({ role: 'reviewer', source_run_id: 'run-current', invocation_id: null, turn_number: 2, ...reviewerInterval, duration_seconds: null }),
+      ...reviewerInterval, duration_seconds: null,
+    })
+    const otherSourceReview = event({
+      event_id: 'other-source-review', checkpoint_id: 'cp-2', kind: 'review', turn_number: 2,
+      source_run_id: 'other-run', started_at: null, ended_at: null, duration_seconds: null,
+      executor: executor({ role: 'reviewer', source_run_id: 'other-run', invocation_id: null, turn_number: 2, started_at: null, ended_at: null, duration_seconds: null }),
+    })
+    const sameTurnWorker = event({
+      event_id: 'same-turn-worker', checkpoint_id: 'cp-2', kind: 'worker_attempt', turn_number: 2,
+      source_run_id: 'run-current', started_at: null, ended_at: null, duration_seconds: null,
+      executor: executor({ role: 'worker', source_run_id: 'run-current', invocation_id: null, turn_number: 2, started_at: null, ended_at: null, duration_seconds: null }),
+    })
+    const timed = detail({
+      events: [legacyWorker, legacyReview, legacyApproval, otherSourceReview, sameTurnWorker],
+    })
+    render(<CheckpointHistory projectId="project-current" run={terminalRun} progress={timed} detail={timed} />)
+    fireEvent.click(screen.getByText('Time details'))
+
+    expect(screen.getByText('Known invocation coverage', { selector: 'dt' }).parentElement?.textContent).toContain('6m 13s')
+    expect(screen.getByText('Recorded duration total: 3m 47s')).toBeDefined()
+    expect(screen.getByText('Recorded duration total: 2m 26s')).toBeDefined()
+    expect(screen.queryByText('Recorded duration total: 4m 52s')).toBeNull()
+
+    const workerGroup = screen.getByRole('heading', { name: 'Worker invocations' }).parentElement as HTMLElement
+    const reviewerGroup = screen.getByRole('heading', { name: 'Reviewer invocations' }).parentElement as HTMLElement
+    const workerRows = within(workerGroup).getAllByRole('listitem')
+    const reviewerRows = within(reviewerGroup).getAllByRole('listitem')
+    expect(workerRows).toHaveLength(2)
+    expect(workerRows.some(row => row.textContent?.includes('Turn 2 invocation'))).toBe(true)
+    expect(reviewerRows).toHaveLength(2)
+    expect(reviewerRows.filter(row => !row.textContent?.includes('source run other-run'))).toHaveLength(1)
+    expect(reviewerRows.some(row => row.textContent?.includes('2m 26s'))).toBe(true)
+    expect(document.getElementById('checkpoint-event-legacy-review-timing')).toBeDefined()
+    expect(document.getElementById('checkpoint-event-legacy-approval-timing')).toBeDefined()
+  })
+
+  it('labels missing timing boundaries and duration-only records without inventing a remainder', () => {
+    const partial = detail({
+      availability: 'partial',
+      reason_codes: ['history_partial'],
+      events: [
+        event({
+          event_id: 'duration-only', checkpoint_id: 'cp-2', started_at: null, ended_at: null, duration_seconds: 45,
+          executor: executor({ invocation_id: 'duration-only', started_at: null, ended_at: null, duration_seconds: 45 }),
+        }),
+        event({
+          event_id: 'missing-end', checkpoint_id: 'cp-2', started_at: '2026-09-11T10:03:00Z', ended_at: null, duration_seconds: null,
+          executor: executor({ invocation_id: 'missing-end', started_at: '2026-09-11T10:03:00Z', ended_at: null, duration_seconds: null }),
+        }),
+      ],
+      truncation: { evidence_bytes: 100, records_read: 3, checkpoints_read: 3, events_read: 2, omitted_records: 1, omitted_checkpoints: 0, notices: ['Some timing history is missing'] },
+    })
+    render(<CheckpointHistory projectId="project-current" run={run} progress={partial} detail={partial} />)
+    fireEvent.click(screen.getByText('Time details'))
+
+    expect(screen.getByText(/Timing breakdown is partial/)).toBeDefined()
+    expect(screen.getByText(/Individual durations are shown/)).toBeDefined()
+    expect(screen.queryByText('Unattributed time', { selector: 'dt' })).toBeNull()
+    expect(screen.getByText(/records without both boundaries/)).toBeDefined()
+  })
+
+  it('keeps terminal rows outcome-focused and removes current-work placeholders', () => {
+    const terminal = { ...run, status: 'failed', activity: 'inactive' as const, ended_at: '2026-09-12T12:00:00Z' }
+    render(<CheckpointHistory projectId="project-current" run={terminal} progress={summary()} detail={detail()} />)
+
+    expect(screen.getByText(/^Finished /)).toBeDefined()
+    expect(screen.getByText('Elapsed')).toBeDefined()
+    expect(screen.queryByText('Current checkpoint', { selector: 'button' })).toBeNull()
+    expect(screen.queryByText('Current executor', { selector: 'dt' })).toBeNull()
+    expect(screen.queryByText('Current attempt', { selector: 'dt' })).toBeNull()
+    expect(screen.queryByText('Run activity', { selector: 'dt' })).toBeNull()
+    expect(screen.queryByText('Checkpoint position', { selector: 'dt' })).toBeNull()
+    expect(screen.getByText('Last executor', { selector: 'dt' })).toBeDefined()
   })
 })

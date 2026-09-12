@@ -1,5 +1,26 @@
 # DEVLOG
 
+## 2026-09-12 — Make run history readable without losing evidence
+
+- Compact run rows and terminal summaries show truthful checkpoint approval,
+  turn usage, duration and finish evidence. Details retain full identities,
+  counters and provenance; explicit selection reveals the loaded row while
+  refresh preserves selection and disclosures. Machine title dates and local
+  timestamp zones remain distinct from stored identities.
+- Canonical history distinguishes checkpoint, whole-plan, outside-page and
+  unassigned evidence, with exact response-limit omissions where known.
+  Approval deduplication preserves distinct checkpoint/decision records;
+  unknown turn ceilings remain unknown.
+- Compact timeline disclosures retain individual events. Delivery reports
+  review, merge, publication, CI and live evidence separately. Time details
+  deduplicate invocation identities, including legacy review/approval pairs,
+  and use interval union coverage without inventing missing timing.
+- Focused canonical, transport and web checks, the production build and
+  retained Chromium/WebKit journeys cover the 16 acceptance mappings,
+  screenshot-shaped two-turn run, responsive navigation and 101-run density.
+  The reviewer timing is 2m 26s with 6m 13s union coverage. Publication,
+  exact-SHA CI and live acceptance remain coordinator-owned delivery gates.
+
 ## 2026-09-12 — Retain unfinished family wizard across guided tabs
 
 - GlobalSettings now keeps the existing TeamFamiliesSettings owner mounted for

@@ -356,7 +356,6 @@ function deferred<T>() {
 }
 
 type ResumeComparisonSetup = 'accepted-baseline' | 'pending'
-type ResumeComparisonTiming = 'before-detail-settlement' | 'after-detail-settlement'
 
 function installResumeComparisonSetup(setup: ResumeComparisonSetup) {
   const locationBefore = window.location.href
@@ -749,7 +748,7 @@ describe('RunDashboard', () => {
     renderDashboard()
 
     expect(await screen.findByRole('button', { name: /Checkpoint 5: Active/ })).toBeDefined()
-    expect((await screen.findAllByText('4 / 11 approved')).length).toBeGreaterThan(0)
+    expect((await screen.findAllByText('4 of 11 checkpoints approved')).length).toBeGreaterThan(0)
     expect(screen.getByText('All 4 checkpoints complete')).toBeDefined()
     expect(screen.getByText('Current turn: turn 4 · Implement · starting')).toBeDefined()
     expect(screen.getByText('Last finished turn: turn 3 · Review · completed')).toBeDefined()
@@ -2310,7 +2309,7 @@ describe('RunDashboard', () => {
     fireEvent.click(screen.getByRole('button', { name: 'Recover with selected worker' }))
 
     await screen.findByText('Recovery was rejected: Durable recovery requires confirmed inactive source ownership; source activity is unknown or active.')
-    expect(screen.getByTitle('Copy run ID').textContent).toBe(source.run_id)
+    expect(screen.getByTitle('Copy full run ID').textContent).toContain(source.run_id)
     expect((screen.getByLabelText('Recovery worker') as HTMLInputElement).value).toBe('harness/impl-b')
     expect(screen.getByRole('button', { name: 'Recover with selected worker' })).toBeDefined()
     expect(api.resumeControlPlaneRun).toHaveBeenCalledTimes(1)
@@ -2983,9 +2982,9 @@ describe('RunDashboard', () => {
 
     renderDashboard()
 
-    expect((await screen.findAllByText('4 / 11 approved')).length).toBeGreaterThan(0)
-    expect(screen.getByText(/Implementing CP5 of 11/)).toBeDefined()
-    expect(screen.getByText('Plan: /workspace/alpha/plans/run-owned.md · Run: run-owned')).toBeDefined()
+    expect((await screen.findAllByText('4 of 11 checkpoints approved')).length).toBeGreaterThan(0)
+    expect(screen.getAllByText(/CP5 of 11 · Implementing/).length).toBeGreaterThan(0)
+    expect(screen.queryByText('Plan: /workspace/alpha/plans/run-owned.md · Run: run-owned')).toBeNull()
     expect(api.getRunContext).toHaveBeenCalledTimes(1)
     expect(api.getRunContext).toHaveBeenCalledWith('control-project', 'run-owned', 'lite', false, expect.objectContaining({ signal: expect.any(AbortSignal) }))
   })
@@ -3124,7 +3123,7 @@ describe('RunDashboard', () => {
 
     fireEvent.click(screen.getByRole('button', { name: 'Copy link' }))
     await waitFor(() => expect(writeText).toHaveBeenCalledTimes(1))
-    fireEvent.click(screen.getByRole('button', { name: /other\.md/ }))
+    fireEvent.click(screen.getByRole('button', { name: /run-other Completed/ }))
     await screen.findByRole('button', { name: 'run-other' })
     expect(screen.queryByText('Link copied to the clipboard.')).toBeNull()
 

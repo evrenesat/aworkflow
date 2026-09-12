@@ -28,6 +28,7 @@ import { NewRunPage, WorktreePreflightPanel, type WorktreePreflightLoadState } f
 import { Combobox } from './Combobox'
 import { useHeaderSlots } from './HeaderSlots'
 import {
+  checkpointApprovalText,
   launchTeamFamilyGroups,
   launchTeamFamilyHint,
   launchTeamFamilyLabel,
@@ -35,9 +36,13 @@ import {
   launchTeamUpgradeRoute,
   launchTeamStageLabel,
   launchTeamRoleSummary,
-  runPlanDisplayName,
-  runPlanDisplayNameForRun,
-  runPlanPath,
+  formatLocalTimestamp,
+  runPlanPresentation,
+  runPlanPresentationForRun,
+  runActivityText,
+  runDurationText,
+  runFinishText,
+  shortRunId,
   statusLabel,
   executionDuration,
 } from '../runPresentation'
@@ -257,9 +262,7 @@ function upsertRun(current: RunStatus[], next: RunStatus): RunStatus[] {
 }
 
 function timestamp(value: unknown): string {
-  if (typeof value !== 'string') return 'Not reported'
-  const date = new Date(value)
-  return Number.isNaN(date.getTime()) ? value : date.toLocaleString()
+  return formatLocalTimestamp(typeof value === 'string' ? value : null) ?? 'Not reported'
 }
 
 function conciseRunText(value: unknown, limit = 240): string | null {
@@ -694,7 +697,8 @@ function runActorSummary(lastExecuted: LastExecutedEvidence | null): string {
 
 function runTimingSummary(run: RunStatus, elapsed: string | null): string {
   if (elapsed) return `${run.status === 'running' ? 'Running for' : 'Duration'} ${elapsed}`
-  if (run.ended_at) return `Completed ${timestamp(run.ended_at)}`
+  const finish = runFinishText(run)
+  if (finish) return finish
   if (run.started_at) return `Started ${timestamp(run.started_at)}; duration not reported`
   return 'Not reported'
 }
@@ -1030,6 +1034,7 @@ export function RunDashboard({ visible = true, page, onNewRun, onCancelNewRun, o
   const [technicalOpen, setTechnicalOpen] = useState(false)
   const technicalId = useId()
   const [copyState, setCopyState] = useState<'idle' | 'copied' | 'failed'>('idle')
+  const [copyKind, setCopyKind] = useState<'link' | 'run-id' | null>(null)
   const copyRequestRef = useRef(0)
   const [refreshNonce, setRefreshNonce] = useState(0)
   const selectedRunRef = useRef<string | null>(selectedRunId)
@@ -1162,11 +1167,12 @@ export function RunDashboard({ visible = true, page, onNewRun, onCancelNewRun, o
     }
   }, [requestedRunId])
 
-  // Clipboard feedback describes one link; a new selection starts a new one
-  // and invalidates completions from older writes.
+  // Clipboard feedback describes the most recent identity copy; a new
+  // selection starts a new one and invalidates completions from older writes.
   useEffect(() => {
     copyRequestRef.current += 1
     setCopyState('idle')
+    setCopyKind(null)
   }, [projectId, selectedRunId])
 
   useEffect(() => {
@@ -1545,6 +1551,7 @@ export function RunDashboard({ visible = true, page, onNewRun, onCancelNewRun, o
   }
   useEffect(() => { if (projectAvailable) void loadDashboard(projectId) }, [historyFilter]) // eslint-disable-line react-hooks/exhaustive-deps
   const listedRuns = runs.filter(run => !deletedIds.has(run.run_id) && (run.history_state ?? 'visible') !== 'deleted' && (historyFilter === 'all' || (run.history_state ?? 'visible') === historyFilter))
+  const selectedRunOutsideLoadedHistory = Boolean(selectedRun && !listedRuns.some(run => run.run_id === selectedRun.run_id))
   function invalidateCopyFeedback() {
     copyRequestRef.current += 1
   }
@@ -1597,19 +1604,30 @@ export function RunDashboard({ visible = true, page, onNewRun, onCancelNewRun, o
     }
   }
 
-  /** Copy only project/run identities confirmed by the server, never ambient URL data. */
-  async function handleCopyLink() {
+  async function copyText(value: string, kind: 'link' | 'run-id'): Promise<void> {
     const copyRequest = ++copyRequestRef.current
     try {
-      const href = workspaceHref({ project: projectId, view: 'runs', run: selectedRun?.run_id ?? null })
-      const url = new URL(window.location.pathname + href, window.location.origin)
-      await navigator.clipboard.writeText(url.href)
+      await navigator.clipboard.writeText(value)
       if (copyRequest !== copyRequestRef.current) return
+      setCopyKind(kind)
       setCopyState('copied')
     } catch {
       if (copyRequest !== copyRequestRef.current) return
+      setCopyKind(kind)
       setCopyState('failed')
     }
+  }
+
+  /** Copy only project/run identities confirmed by the server, never ambient URL data. */
+  async function handleCopyLink(): Promise<void> {
+    const href = workspaceHref({ project: projectId, view: 'runs', run: selectedRun?.run_id ?? null })
+    const url = new URL(window.location.pathname + href, window.location.origin)
+    await copyText(url.href, 'link')
+  }
+
+  async function handleCopyRunId(): Promise<void> {
+    if (!selectedRun) return
+    await copyText(selectedRun.run_id, 'run-id')
   }
 
   function hasSafeControl(control: string): boolean {
@@ -2516,9 +2534,16 @@ export function RunDashboard({ visible = true, page, onNewRun, onCancelNewRun, o
       : planPathFromContext(context))
     : 'Not reported'
   // The header names the plan; the full path stays under Technical details.
-  const selectedPlanFileName = selectedRun
-    ? runPlanDisplayName(selectedPlanPath === 'Not reported' ? null : selectedPlanPath, selectedRun.run_id)
-    : 'Not reported'
+  // Canonical custom names remain unchanged, while path-derived names use the
+  // same readable presentation as the history row.
+  const selectedPlanPresentation = selectedRun
+    ? selectedRun.progress?.original_plan_display_name?.trim()
+      ? runPlanPresentationForRun(selectedRun)
+      : selectedPlanPath === 'Not reported'
+        ? null
+        : runPlanPresentation(selectedPlanPath, selectedRun.run_id)
+    : null
+  const selectedPlanFileName = selectedPlanPresentation?.label ?? 'Not reported'
   const roleChoices = capabilities?.roles ?? []
   const savedOverrides = selectedRun?.evidence.overrides as { state?: string; revision?: number; max_turns?: number; team?: string; role_selectors?: Record<string, string>; owner_stop?: boolean } | null
   const pendingBoundaryStop = Boolean(
@@ -2869,8 +2894,8 @@ export function RunDashboard({ visible = true, page, onNewRun, onCancelNewRun, o
         </div>
       </div>}
 
-      {copyState === 'copied' && <div className="success-message" role="status">Link copied to the clipboard.</div>}
-      {copyState === 'failed' && <div className="notice" role="status">Clipboard access failed — copy the address from the browser address bar instead.</div>}
+      {copyState === 'copied' && <div className="success-message" role="status">{copyKind === 'run-id' ? 'Full run ID copied to the clipboard.' : 'Link copied to the clipboard.'}</div>}
+      {copyState === 'failed' && <div className="notice" role="status">Clipboard access failed — {copyKind === 'run-id' ? 'copy the full run ID from Diagnostics instead.' : 'copy the address from the browser address bar instead.'}</div>}
       {projectReadError && <div className="error-message" role="alert">{projectReadError}</div>}
       {dashboardReadError && <div className="error-message" role="alert">{dashboardReadError}</div>}
       {selectedRunReadError && <div className="error-message" role="alert">{selectedRunReadError}</div>}
@@ -2931,25 +2956,27 @@ export function RunDashboard({ visible = true, page, onNewRun, onCancelNewRun, o
           <section className="card run-list" aria-label="Project runs">
             <div className="section-heading"><h3>Project runs</h3><span className="text-xs text-dim">{listedRuns.length} recorded</span></div>
             {!hosted && <label>Run history<select className="input" aria-label="Run history" value={historyFilter} onChange={event => setHistoryFilter(event.target.value as typeof historyFilter)}><option value="visible">Visible</option><option value="archived">Archived</option><option value="all">All history</option></select></label>}
+            {selectedRunOutsideLoadedHistory && selectedRun && <p className="notice text-sm" role="status">
+              Selected run: {runPlanPresentationForRun(selectedRun).label} · {statusLabel(selectedRun)} · {shortRunId(selectedRun.run_id)}. It is outside the loaded history page; this view will not fetch more runs automatically.
+            </p>}
             {listedRuns.length === 0 ? <p className="text-sm text-dim">No runs yet</p> : listedRuns.map((run) => {
-              const exactPath = runPlanPath(run)
-              const displayName = runPlanDisplayNameForRun(run)
+              const plan = runPlanPresentationForRun(run)
               const status = statusLabel(run)
               return <button
                 data-sidebar-editor-item={run.run_id}
                 className={`content-button run-list-item ${selectedRunId === run.run_id ? 'selected' : ''}`}
-                aria-label={`${run.run_id} ${status} · ${displayName} · ${exactPath ?? 'Plan not reported'}`}
+                aria-current={selectedRunId === run.run_id ? 'true' : undefined}
+                aria-label={`${run.run_id} ${status} · ${plan.label} · ${run.progress ? checkpointApprovalText(run.progress) : 'Checkpoint progress unavailable'} · ${runDurationText(run)} · ${runActivityText(run)}`}
                 key={run.run_id}
                 onClick={() => selectRun(run.run_id)}
               >
-                <span className="run-list-context"><strong className="run-list-title">{displayName}</strong><span className="status-pill">{status}</span></span>
-                <span className="text-xs text-dim">
-                  {run.restarted_from_run_id ? '↻ successor · ' : ''}
-                  {formatMachineLabel(run.workflow_name ?? '')}{run.current_step ? ` · ${formatMachineLabel(run.current_step)}` : ''}
-                  {run.skipped_steps.length > 0 ? ` · ${run.skipped_steps.length} skipped` : ''}
+                <span className="run-list-context">
+                  <strong className="run-list-title" title={plan.label}>{plan.label}</strong>
+                  {plan.date && <span className="run-title-date">{plan.date}</span>}
+                  <span className="status-pill">{status}</span>
                 </span>
+                <span className="run-row-meta text-xs text-dim"><span>{runDurationText(run)}</span><span>{runActivityText(run)}</span></span>
                 <RunProgress run={run} />
-                <span className="text-xs text-dim mono">Plan: {exactPath ?? 'Not reported'} · Run: {run.run_id}</span>
               </button>
             })}
             {nextRunCursor && <button className="btn btn-secondary" disabled={refreshing} onClick={() => void loadMoreRuns()}>Load more runs</button>}
@@ -2960,8 +2987,9 @@ export function RunDashboard({ visible = true, page, onNewRun, onCancelNewRun, o
               <div className="run-progress-header">
                 <div className="section-heading">
                   <div>
-                    <h3>{selectedPlanFileName === 'Not reported' ? `Run ${selectedRun.run_id}` : selectedPlanFileName}</h3>
-                    <button className="text-xs text-dim mono" title="Copy run ID" onClick={() => void navigator.clipboard?.writeText(selectedRun.run_id)}>{selectedRun.run_id}</button>
+                    <h3>{selectedPlanFileName === 'Not reported' ? `Run ${selectedRun.run_id}` : selectedPlanFileName}{selectedPlanPresentation?.date && <span className="run-title-date">{selectedPlanPresentation.date}</span>}</h3>
+                    <button className="text-xs text-dim mono run-id-copy" title="Copy full run ID" aria-label={selectedRun.run_id} aria-describedby={`${technicalId}-copy-run-id`} onClick={() => void handleCopyRunId()}>{shortRunId(selectedRun.run_id)}<span className="copy-full-id-label">Copy full ID</span></button>
+                    <span id={`${technicalId}-copy-run-id`} className="sr-only">Copy full run ID</span>
                   </div>
                   <span className="status-pill">{statusLabel(selectedRun)}</span>
                   {selectedRun.history_state === 'archived' && <span className="status-pill">Archived</span>}
@@ -2987,9 +3015,10 @@ export function RunDashboard({ visible = true, page, onNewRun, onCancelNewRun, o
                       <div><dt>Elapsed / completion</dt><dd>{selectedRunTiming}</dd></div>
                     </dl>
                     <dl className="run-progress-strip">
-                      {selectedRun.current_step && <div><dt>Current step / turns</dt><dd>{formatMachineLabel(selectedRun.current_step)} · {selectedRun.turns_completed ?? 0}</dd></div>}
+                      {selectedRun.current_step && <div><dt>Current step / turns</dt><dd>{formatMachineLabel(selectedRun.current_step)} · {selectedRun.turns_completed === null ? 'turns used unknown' : selectedRun.turns_completed}</dd></div>}
                       {selectedRun.workflow_name && <div><dt>Workflow</dt><dd>{formatMachineLabel(selectedRun.workflow_name)}</dd></div>}
-                      <div><dt>Team</dt><dd>{selectedRun.team ? formatMachineLabel(selectedRun.team) : 'Not recorded'}</dd></div><div><dt>Max turns</dt><dd>{selectedRun.max_turns ?? 'Not recorded'}</dd></div>
+                      <div><dt>Team</dt><dd>{selectedRun.team ? formatMachineLabel(selectedRun.team) : 'Not recorded'}</dd></div>
+                      <div><dt>Max turns</dt><dd>{selectedRun.max_turns ?? 'Not reported'}</dd></div>
                       {lastExecuted && <div><dt>Last executed</dt><dd>{lastExecuted.turnNumber !== null ? `turn ${lastExecuted.turnNumber}` : 'Not reported'}</dd></div>}
                       {startTime ? <div><dt>Started</dt><dd>{timestamp(startTime)}{elapsed ? ` · ${selectedRunIsActive ? 'running for' : 'duration'} ${elapsed}` : ''}</dd></div>
                         : selectedRun.evidence.manifest_created_at ? <div><dt>Submitted</dt><dd>{timestamp(selectedRun.evidence.manifest_created_at)}</dd></div> : null}
@@ -3305,7 +3334,7 @@ export function RunDashboard({ visible = true, page, onNewRun, onCancelNewRun, o
         preview={launchPreview}
         worktreePreflight={worktreePreflightPanel}
         restartActions={restartActions}
-        onCancel={() => { if (!restartInProgress && !pendingSuccessorStart) { setRestartPhase(null); setRestartSource(null) }; setLocalPage('runs'); onCancelNewRun?.() }}
+        onCancel={() => { if (!restartInProgress && !pendingSuccessorStart) { setRestartPhase(null); setRestartSource(null) } setLocalPage('runs'); onCancelNewRun?.() }}
         advancedOpen={advancedOpen}
         setAdvancedOpen={setAdvancedOpen}
         startStep={startStep}

@@ -1535,3 +1535,95 @@ and live acceptance remain separate coordinator gates.
 No material findings
 
 ---
+
+## Run history readable evidence — cumulative review v01: rejected
+
+Base: `304a39fd24b2d330d2533d041f3eb2776504086c`. HEAD: `88c18a31875fa8d8d068c006066ca19faef2d3f7`. Four new / four total commits: cp1 v01 through cp4 v01. Original and active plans are identical; no earlier findings exist. Full accumulated implementation and all 16 acceptance mappings reviewed under material-code-review admission and proportionate-fix rules.
+
+- F1, P1/high confidence, `aflow/control_plane/run_progress.py:4581-4584` (cp2 `fa3a656e`): counting now consumes approval mappings after deduplication whose fallback omits checkpoint/decision identity. Four distinct ordinal approvals collapse to one. Same disposable input returns four at base and one at HEAD. Correct approval-specific deduplication and event identity without losing conflicting-scope rejection; restore browser expectations changed to accept the regression.
+- F2, P2/high confidence, `apps/aflow_app/web/src/runPresentation.ts:71-73` (cp1 `1e7af2ea`): null max_turns is rendered as no turn limit, although legacy repository projection returns null for absent evidence. Use unknown ceiling wording and retain known usage/ceiling behavior.
+
+Reviewer verification: 56 focused web tests passed across RunProgress, CheckpointHistory, runPresentation and SidebarEditorLayout; 11 projection tests passed (28 deselected); TypeScript/Vite build passed; cumulative whitespace check passed. Differential base/HEAD reproduction confirms F1. CP4 completed parent-repository transport receipts record seven Chromium and seven WebKit passes; their approval assertions encoded the regression and must be corrected. Full suites were not run.
+
+Exactly one non-checkpoint fix overlay written: `plans/in-progress/run-history-readable-evidence-20260912-cp01-v01.md`. Original tracking updated, base unchanged. No squash, implementation edits, publication or service changes. Coordinator retains serialized integration, exact-SHA CI and live activation.
+
+Material fixes required
+
+---
+
+## Run history readable evidence — cumulative review v02: rejected
+
+Unchanged base: `304a39fd24b2d330d2533d041f3eb2776504086c`. Reviewed HEAD: `e8ffb46f47f7d9f86fb27c12173a6af0eca25f5b`. One new / five total commits: cp1 v01 `1e7af2ea`, cp2 v01 `fa3a656e`, cp3 v01 `10741c81`, cp4 v01 `88c18a31`, cp1 v02 `e8ffb46f`. Read the active overlay/prior findings first, verified F1/F2, then reviewed the full base-through-HEAD implementation and all 16 original mappings.
+
+F1 resolved: approval-specific identity retains checkpoint/decision dimensions, four distinct approvals/events and duplicate suppression, with contradictory scopes still unassigned. Browser expectations restored to 4/11 and 11/11. F2 resolved: absent/invalid turn ceilings are unknown, retaining known usage and ceilings. No previous finding remains unresolved.
+
+F3, P2/high confidence, `apps/aflow_app/web/src/components/CheckpointHistory.tsx:220-222`, introduced by cp3 v01 `10741c81`: fallback timing identity includes event kind, splitting review and approval evidence for the same source-run/role/turn without an invocation ID. The committed screenshot-shaped fixture projects one turn-2 review plus its approval, each spanning 146 seconds. Calling actual buildTimeBreakdown on that canonical output gives two reviewer rows and a 292-second recorded total instead of 146 seconds; union coverage remains 373 seconds. Deduplicate timing by proven invocation identity across those evidence kinds, preserving separate timeline evidence and source-run/role separation. This fails original mapping 16 and meets the material finding admission gate.
+
+Retained final worker command receipts inspected under `/root/code/agent_flow/.aflow/runs/20260912t123805z-e00bbfa8/turns/turn-006/`: 12 canonical tests, 48 focused web tests, TypeScript/Vite build, seven browser cases collected, Chromium desktop-short/desktop 2 passed, WebKit phone 1 passed. Inspected retained Chromium dark completed and WebKit light history screenshots. Reviewer used the existing fixture and canonical projector with disposable state, then transpiled the unchanged TS implementation in memory to call buildTimeBreakdown; output is two distinct kind-based keys for reviewer turn 2 and total 292. Disposable projection: `/tmp/aflow-review-timing-tfmdcd0y/projection.json`. Cumulative git diff --check passed; no full suites or live actions.
+
+Created exactly one self-contained non-checkpoint overlay at `plans/in-progress/run-history-readable-evidence-20260912-cp01-v02.md`, removed superseded cp01-v01, and updated original tracking without changing the base. No implementation edits, DEVLOG compaction, squash, publication or service changes. Existing reviewer records preserved. Coordinator retains serialized integration, exact-SHA CI and live activation.
+
+Material fixes required
+
+
+---
+
+## Run history readable evidence — cumulative review v03: approved
+
+Unchanged Pre-Handoff Base HEAD: `304a39fd24b2d330d2533d041f3eb2776504086c`.
+Reviewed implementation HEAD: `19e47db3e2bea6d70566cbdd07957ee569a02b64`.
+One new / six total commits: cp1 v01 `1e7af2ea`, cp2 v01 `fa3a656e`,
+cp3 v01 `10741c81`, cp4 v01 `88c18a31`, cp1 v02 `e8ffb46f`, cp1 v03
+`19e47db3`. Read the active cp01-v02 overlay and prior findings first, then
+reviewed the complete unchanged-base range, all 21 changed files and all four
+original checkpoints under the material finding admission/exclusion rules.
+
+F1 resolved: approval-specific checkpoint/decision identity preserves four
+distinct approvals and events, duplicate suppression and conflicting-scope
+rejection. F2 resolved: absent/invalid turn ceilings remain unknown. F3 resolved:
+the legacy source-run/role/turn timing key merges review and approval evidence
+without merging separate source runs or roles; explicit invocation IDs and both
+timeline events remain intact. The canonical screenshot fixture now renders one
+146-second reviewer invocation and unchanged 373-second union coverage. No prior
+finding remains unresolved and no further material finding passes admission.
+
+All 16 original mappings retained: 1 approval wording; 2 terminal fields;
+3 partial-history disclosure; 4 status summary; 5 row density; 6 full identity
+access/copy; 7 terminal current-action removal; 8 labelled state strip;
+9 explicit selection and refresh retention; 10 independent delivery stages;
+11 durable review association; 12 omitted/unassigned distinction; 13 compact
+expandable timeline; 14 truthful turn budget; 15 machine dates/local timestamps;
+16 deduplicated duration and partial/overlap handling. No new per-row requests,
+state mutation, service changes or competing schema were introduced.
+
+Verification: reused final raw command receipts and completed result.json under
+`/root/code/agent_flow/.aflow/runs/20260912t123805z-e00bbfa8/turns/turn-008/`:
+
+- Focused CheckpointHistory, RunProgress and runPresentation tests: 49 passed.
+- TypeScript/Vite production build passed; seven browser cases collected.
+- Canonical visual journey `[desktop]`, isolated temporary artifacts and
+  --basetemp: Chromium 1 passed (20.50s), WebKit 1 passed (26.94s).
+- Reviewer inspected retained Chromium light and WebKit dark completed-run
+  screenshots in `/tmp/aflow-timing-fix-chromium-artifacts.J6iT2I/` and
+  `/tmp/aflow-timing-fix-webkit-artifacts.XJHrgY/`, including expanded timing.
+- Reused unchanged canonical evidence from turn-006: 12 passed for
+  `review or scope or truncat or inherited or preserves_distinct_approval_records`;
+  corrected Chromium desktop-short/desktop 2 passed and WebKit phone 1 passed.
+- Reviewer ran `uv run --frozen --project apps/aflow_app/server pytest -q`
+  on `test_control_plane_api.py::test_transport_models_match_canonical_control_plane_models`
+  and `::test_progress_transport_models_keep_optional_status_and_full_detail_shapes`
+  with external --basetemp: 2 passed. Cumulative `git diff --check` passed.
+
+Approval finalization consolidates this handoff's DEVLOG entries, includes all
+intentional tracked reviewer records in one unpublished commit, removes the
+resolved private fix overlay, and preserves the 20 reviewed implementation/test
+blobs. No private plans/evidence are force-added. Verify exactly one commit above
+the unchanged base and clean tracked state. Record the final approved SHA only
+in ignored original-plan tracking after committing; keep that plan in place for
+engine finalization. No empty follow-up plan is created.
+
+Coordinator owns serialized integration, publication, exact-SHA CI and live
+activation, preserving concurrent ui-data-latency-discovery work. These delivery
+gates and physical-mobile acceptance are not claimed by this local review.
+
+No material findings

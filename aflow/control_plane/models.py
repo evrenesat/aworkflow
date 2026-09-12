@@ -123,6 +123,12 @@ ProgressDeliveryStatus = Literal[
     "not_applicable",
 ]
 ProgressChangeStatus = Literal["applied", "pending", "failed", "unknown"]
+ProgressEventAssociation = Literal[
+    "checkpoint",
+    "whole_plan",
+    "outside_returned",
+    "unassigned",
+]
 
 
 def _progress_safe(value: Any, *, key: str | None = None, depth: int = 0) -> Any:
@@ -243,6 +249,7 @@ class RunProgressEvent:
     duration_seconds: float | None = None
     reason: str | None = None
     source_reference: Mapping[str, Any] | None = None
+    association: ProgressEventAssociation = "unassigned"
 
     def to_dict(self) -> dict[str, Any]:
         return _progress_safe(asdict(self))
@@ -299,6 +306,8 @@ class RunProgressTruncation:
     events_read: int = 0
     omitted_records: int = 0
     omitted_checkpoints: int = 0
+    response_limit_records: int = 0
+    response_limit_checkpoints: int = 0
     notices: tuple[str, ...] = ()
 
     def to_dict(self) -> dict[str, Any]:

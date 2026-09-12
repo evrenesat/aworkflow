@@ -505,6 +505,7 @@ export type CanonicalRunProgressCheckpointStatus =
   | 'unknown'
 export type RunProgressDeliveryStatus = 'pending' | 'running' | 'succeeded' | 'failed' | 'unknown' | 'not_applicable'
 export type RunProgressChangeStatus = 'applied' | 'pending' | 'failed' | 'unknown'
+export type RunProgressEventAssociation = 'checkpoint' | 'whole_plan' | 'outside_returned' | 'unassigned'
 
 export interface RunProgressCount {
   value: number | null
@@ -561,6 +562,8 @@ export interface RunProgressDetailEvent {
   duration_seconds: number | null
   reason: string | null
   source_reference: Record<string, unknown> | null
+  /** Optional for compatibility with older detail payloads. */
+  association?: RunProgressEventAssociation
 }
 
 export interface RunProgressChange {
@@ -599,6 +602,9 @@ export interface RunProgressTruncation {
   events_read: number
   omitted_records: number
   omitted_checkpoints: number
+  /** Exact portions omitted by the projection's response limits. */
+  response_limit_records?: number
+  response_limit_checkpoints?: number
   notices: string[]
 }
 

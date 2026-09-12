@@ -727,6 +727,60 @@ def test_canonical_projection_distinguishes_known_zero_partial_and_cache_invalid
     assert not hasattr(summary, "events")
 
 
+def test_canonical_progress_preserves_distinct_approval_records(
+    tmp_path: Path,
+) -> None:
+    run_dir, original, _ = _run(tmp_path)
+    original.write_text(_canonical_plan(total=4, checked={1, 2, 3, 4}), encoding="utf-8")
+    approvals = [
+        {"checkpoint_index": index, "status": "approved", "decision_number": index}
+        for index in range(1, 5)
+    ]
+    detail = project_run_progress_detail(
+        run_dir,
+        metadata={
+            "run_id": "run-1",
+            "repo_root": str(original.parents[2]),
+            "original_plan_path": str(original),
+            "history_complete": True,
+            "approved_checkpoints": [*approvals, dict(approvals[2])],
+        },
+        use_cache=False,
+    )
+    summary = project_run_progress_summary(
+        run_dir,
+        metadata={
+            "run_id": "run-1",
+            "repo_root": str(original.parents[2]),
+            "original_plan_path": str(original),
+            "history_complete": True,
+            "approved_checkpoints": [*approvals, dict(approvals[2])],
+        },
+        use_cache=False,
+    )
+
+    expected_states = {str(index): "approved" for index in range(1, 5)}
+    approval_events = [event for event in detail.events if event.kind == "checkpoint_approval"]
+    assert detail.approved_checkpoints == RunProgressCount(value=4, coverage="complete")
+    assert summary.approved_checkpoints == RunProgressCount(value=4, coverage="complete")
+    assert detail.to_dict()["approved_checkpoints"] == {"value": 4, "coverage": "complete"}
+    assert summary.to_dict()["approved_checkpoints"] == {"value": 4, "coverage": "complete"}
+    assert detail.checkpoint_states == expected_states
+    assert summary.checkpoint_states == expected_states
+    assert [checkpoint.status for checkpoint in detail.checkpoints] == [
+        "approved",
+        "approved",
+        "approved",
+        "approved",
+    ]
+    assert len(approval_events) == 4
+    assert {event.decision_number for event in approval_events} == {1, 2, 3, 4}
+    assert {event.checkpoint_id for event in approval_events} == {
+        checkpoint.checkpoint_id for checkpoint in detail.checkpoints
+    }
+    assert len({event.event_id for event in approval_events}) == 4
+
+
 def test_canonical_manager_routing_acceptance_is_not_checkpoint_approval(
     tmp_path: Path,
 ) -> None:
@@ -1595,6 +1649,7 @@ def test_canonical_progress_enforces_combined_latest_first_budget(
     assert cold.truncation.records_read <= 8
     assert cold.truncation.omitted_records > 0
     assert any(event.reason is not None and "event-6" in event.reason for event in cold.events)
+    assert cold.truncation.response_limit_records > 0
     assert any(
         executor.selector == "turn-6"
         for executor in (cold.current_executor, cold.last_executor)
@@ -2020,6 +2075,7 @@ def test_canonical_progress_merges_production_reviewer_rejection(tmp_path: Path)
     assert detail.reviews.value == 1
     assert detail.checkpoints[0].reviews.value == 1
     assert len(rejected) == 1
+    assert rejected[0].association == "checkpoint"
     assert rejected[0].outcome == "rejected"
     assert rejected[0].reason == "The implementation needs a repair."
     assert rejected[0].executor is not None
@@ -2058,6 +2114,7 @@ def test_canonical_progress_merges_production_reviewer_rejection(tmp_path: Path)
     )
     inherited_event = next(event for event in inherited.events if event.kind == "review_rejection")
     assert inherited_event.source_run_id == "run-predecessor"
+    assert inherited_event.association == "checkpoint"
     assert inherited.reviews.value == 0
 
 
@@ -2256,6 +2313,11 @@ def test_canonical_progress_preserves_repartition_history(tmp_path: Path) -> Non
     assert before.pending_changes == ()
     assert all(
         event.checkpoint_id is None
+        for event in before.events
+        if event.event_id in {"ambiguous-1", "ambiguous-2"}
+    )
+    assert all(
+        event.association == "unassigned"
         for event in before.events
         if event.event_id in {"ambiguous-1", "ambiguous-2"}
     )
@@ -2569,6 +2631,7 @@ def test_canonical_progress_approves_proven_successful_review_transitions(
     assert complete.current_checkpoint_ordinal == 2
     assert len(approvals) == 1
     assert approvals[0].checkpoint_id == complete.checkpoints[0].checkpoint_id
+    assert approvals[0].association == "checkpoint"
     assert approvals[0].turn_number == 2
     assert summary.approved_checkpoints == complete.approved_checkpoints
     assert complete.to_dict()["approved_checkpoints"] == {"value": 1, "coverage": "complete"}
@@ -2839,6 +2902,7 @@ def test_canonical_progress_distinguishes_awaiting_review(tmp_path: Path) -> Non
     assert historical.checkpoints[1].reviews.value == 0
     historical_review = next(event for event in historical.events if event.kind == "review")
     assert historical_review.checkpoint_id == historical.checkpoints[0].checkpoint_id
+    assert historical_review.association == "checkpoint"
     assert historical_review.scope_id == scope.scope_id
     assert historical_review.executor is not None
     assert historical_review.executor.selector == "codex.reviewer"
@@ -3032,9 +3096,11 @@ def test_canonical_progress_distinguishes_awaiting_review(tmp_path: Path) -> Non
         },
         use_cache=False,
     )
-    assert next(
+    conflicting_closed_event = next(
         event for event in conflicting_closed.events if event.turn_number == 2
-    ).checkpoint_id is None
+    )
+    assert conflicting_closed_event.checkpoint_id is None
+    assert conflicting_closed_event.association == "unassigned"
 
     _write_production_turn(
         conflict_dir,
@@ -3087,6 +3153,7 @@ def test_canonical_progress_distinguishes_awaiting_review(tmp_path: Path) -> Non
     )
     conflict_event = next(event for event in conflicting.events if event.turn_number == 3)
     assert conflict_event.checkpoint_id is None
+    assert conflict_event.association == "unassigned"
 
     _write_production_turn(
         run_dir,
@@ -3107,3 +3174,140 @@ def test_canonical_progress_distinguishes_awaiting_review(tmp_path: Path) -> Non
     )
     unproven_event = next(event for event in unproven.events if event.turn_number == 4)
     assert unproven_event.checkpoint_id is None
+    assert unproven_event.association == "unassigned"
+
+
+def test_canonical_progress_separates_whole_plan_unknown_and_outside_history(
+    tmp_path: Path,
+) -> None:
+    run_dir, original, _ = _run(tmp_path / "whole-plan")
+    original.write_text(_plan(total=2, current=None), encoding="utf-8")
+    worker_snapshot = PlanSnapshot(
+        current_checkpoint_name="Checkpoint 1: Stage 1",
+        unchecked_checkpoint_count=1,
+        current_checkpoint_unchecked_step_count=1,
+        is_complete=False,
+        total_checkpoint_count=2,
+        current_checkpoint_index=1,
+    )
+    complete_snapshot = PlanSnapshot(
+        current_checkpoint_name=None,
+        unchecked_checkpoint_count=0,
+        current_checkpoint_unchecked_step_count=0,
+        is_complete=True,
+        total_checkpoint_count=2,
+        current_checkpoint_index=None,
+    )
+    _write_production_turn(
+        run_dir,
+        1,
+        selector="codex.worker",
+        original_plan_path=original,
+        snapshot_before=worker_snapshot,
+    )
+    _write_production_turn(
+        run_dir,
+        2,
+        role="reviewer",
+        selector="codex.whole-plan-reviewer",
+        original_plan_path=original,
+        snapshot_before=complete_snapshot,
+    )
+    (run_dir / "events.jsonl").write_text(
+        json.dumps({
+            "event_id": "unknown-history",
+            "kind": "history",
+            "turn_number": 3,
+            "reason": "association was not recorded",
+        })
+        + "\n",
+        encoding="utf-8",
+    )
+    metadata = {
+        "run_id": "run-1",
+        "repo_root": str(original.parents[2]),
+        "original_plan_path": str(original),
+        "history_complete": True,
+    }
+
+    detail = project_run_progress_detail(run_dir, metadata=metadata, use_cache=False)
+    whole_plan_review = next(event for event in detail.events if event.turn_number == 2)
+    unknown_history = next(event for event in detail.events if event.event_id == "unknown-history")
+    assert whole_plan_review.association == "whole_plan"
+    assert whole_plan_review.checkpoint_id is None
+    assert unknown_history.association == "unassigned"
+    assert detail.checkpoints[0].reviews == RunProgressCount(value=0, coverage="complete")
+    assert detail.reviews == RunProgressCount(value=1, coverage="complete")
+    assert detail.approved_checkpoints == RunProgressCount(value=0, coverage="complete")
+    assert "whole_plan_review" in detail.reason_codes
+    assert "unassigned_history" in detail.reason_codes
+
+    outside_dir, outside_original, _ = _run(tmp_path / "outside-returned")
+    outside_original.write_text(_plan(total=501, current=None), encoding="utf-8")
+    (outside_dir / "events.jsonl").write_text(
+        json.dumps({
+            "event_id": "outside-review",
+            "kind": "review",
+            "role": "reviewer",
+            "turn_number": 2,
+            "checkpoint_index": 501,
+            "checkpoint_name": "Checkpoint 501: Stage 501",
+            "scope_id": "original::checkpoint-501",
+            "original_plan_path": str(outside_original),
+        })
+        + "\n",
+        encoding="utf-8",
+    )
+    outside = project_run_progress_detail(
+        outside_dir,
+        metadata={
+            "run_id": "run-1",
+            "repo_root": str(outside_original.parents[2]),
+            "original_plan_path": str(outside_original),
+            "history_complete": True,
+        },
+        use_cache=False,
+    )
+    outside_event = next(event for event in outside.events if event.event_id == "outside-review")
+    assert outside_event.association == "outside_returned"
+    assert outside_event.checkpoint_id is None
+    assert outside.truncation.omitted_checkpoints == 1
+    assert outside.truncation.response_limit_checkpoints == 1
+    assert outside.checkpoints[-1].reviews == RunProgressCount(value=0, coverage="partial")
+    assert outside.approved_checkpoints == RunProgressCount(value=None, coverage="unavailable")
+    assert "history_outside_returned" in outside.reason_codes
+    assert "unassigned_history" not in outside.reason_codes
+
+    ambiguous_dir, ambiguous_original, _ = _run(tmp_path / "ambiguous-approval")
+    ambiguous_original.write_text(_plan(total=2, current=None), encoding="utf-8")
+    (ambiguous_dir / "events.jsonl").write_text(
+        json.dumps({
+            "event_id": "ambiguous-scope-history",
+            "kind": "history",
+            "scope_id": "ambiguous-scope",
+            "checkpoint_index": 2,
+        })
+        + "\n",
+        encoding="utf-8",
+    )
+    ambiguous = project_run_progress_detail(
+        ambiguous_dir,
+        metadata={
+            "run_id": "run-1",
+            "repo_root": str(ambiguous_original.parents[2]),
+            "original_plan_path": str(ambiguous_original),
+            "history_complete": True,
+            "approved_checkpoints": [{
+                "approved": True,
+                "scope_id": "ambiguous-scope",
+                "checkpoint_index": 1,
+            }],
+        },
+        use_cache=False,
+    )
+    assert ambiguous.approved_checkpoints == RunProgressCount(value=0, coverage="complete")
+    assert all(checkpoint.status != "approved" for checkpoint in ambiguous.checkpoints)
+    ambiguous_approval = next(
+        event for event in ambiguous.events if event.kind == "checkpoint_approval"
+    )
+    assert ambiguous_approval.association == "unassigned"

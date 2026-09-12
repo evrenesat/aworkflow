@@ -29,6 +29,7 @@ from test_responsive_browser import (
     _double_visible_text,
     _set_theme_preference,
 )
+from aflow.control_plane import LaunchManifest, create_launch_manifest
 from aflow.run_state import CheckpointRepartitionRecord, FinalizedTurnBoundary
 from aflow.hotplug import HotplugTransactionV1, hotplug_transaction_id
 
@@ -38,6 +39,9 @@ VISUAL_PROGRESS_TERMINAL_ID = "visual-progress-terminal"
 VISUAL_PROGRESS_STALE_ID = "visual-progress-stale"
 VISUAL_PROGRESS_UNKNOWN_ID = "visual-progress-unknown"
 REVIEW_EVIDENCE_RUN_ID = "visual-review-evidence"
+SCREENSHOT_COMPLETED_RUN_ID = "visual-progress-screenshot-completed"
+VISUAL_MANY_RUN_PREFIX = "visual-progress-many"
+VISUAL_TOTAL_RUN_COUNT = 101
 
 VISUAL_CHECKPOINT_NAMES = {
     1: "Checkpoint 1: Establish the bounded evidence contract",
@@ -212,6 +216,163 @@ def _write_successful_visual_review(
         }
     )
     _write_json(result_path, result)
+
+
+def _write_screenshot_completed_turn(
+    run_dir: Path,
+    turn: int,
+    *,
+    role: str,
+    selector: str,
+    started_at: str,
+    finished_at: str,
+) -> None:
+    _write_json(
+        run_dir / "turns" / f"turn-{turn:03d}" / "result.json",
+        {
+            "turn_number": turn,
+            "step_name": "implement" if role == "worker" else "review",
+            "step_role": role,
+            "selector": selector,
+            "status": "completed",
+            "outcome": "completed",
+            "started_at": started_at,
+            "finished_at": finished_at,
+            "returncode": 0,
+        },
+    )
+
+
+def _seed_screenshot_shaped_completed_fixture(root: Path) -> dict[str, object]:
+    """Create the one-checkpoint, two-turn completed record from the screenshot."""
+    plan = root / "plans" / "done" / "startup-gate-failure-evidence-20260912.md"
+    plan.parent.mkdir(parents=True, exist_ok=True)
+    plan.write_text(
+        "# Startup gate failure evidence 20260912\n\n"
+        "### [x] Checkpoint 1: Preserve the startup assertion and add failure evidence\n"
+        "- [x] record the completed run evidence\n",
+        encoding="utf-8",
+    )
+    create_launch_manifest(
+        root,
+        LaunchManifest(
+            run_id=SCREENSHOT_COMPLETED_RUN_ID,
+            project_root=str(root),
+            plan_path=str(plan.resolve()),
+            workflow_name="managed",
+            max_turns=8,
+            start_step="implement",
+            created_at="2026-09-12T13:00:00Z",
+        ),
+    )
+    _write_json(
+        root / ".aflow" / "launches" / f"{SCREENSHOT_COMPLETED_RUN_ID}.state.json",
+        {
+            "schema_version": 1,
+            "run_id": SCREENSHOT_COMPLETED_RUN_ID,
+            "phase": "completed",
+            "updated_at": "2026-09-12T13:11:23Z",
+        },
+    )
+    run_dir = root / ".aflow" / "runs" / SCREENSHOT_COMPLETED_RUN_ID
+    run_dir.mkdir(parents=True, exist_ok=True)
+    _write_json(
+        run_dir / "run.json",
+        {
+            "run_id": SCREENSHOT_COMPLETED_RUN_ID,
+            "status": "completed",
+            "repo_root": str(root),
+            "original_plan_path": str(plan),
+            "active_plan_path": str(plan),
+            "plan_path": str(plan),
+            "workflow_name": "managed",
+            "team": "base-team",
+            "current_step_name": "done",
+            "turns_completed": 2,
+            "max_turns": 8,
+            "run_started_at": "2026-09-12T13:00:00Z",
+            "activity": "inactive",
+            "phase": "completed",
+            "history_complete": True,
+            "progress_history_complete": True,
+            "approved_checkpoints": [{
+                "checkpoint_index": 1,
+                "status": "approved",
+                "decision_number": 2,
+                "source_run_id": SCREENSHOT_COMPLETED_RUN_ID,
+                "role": "reviewer",
+                "selector": "codex.astra-medium",
+                "model_display": "Astra Medium",
+                "turn_number": 2,
+                "started_at": "2026-09-12T13:08:57Z",
+                "recorded_at": "2026-09-12T13:11:23Z",
+                "reason": "The recorded review approved the checkpoint evidence.",
+            }],
+        },
+    )
+    _write_screenshot_completed_turn(
+        run_dir,
+        1,
+        role="worker",
+        selector="codex.worker",
+        started_at="2026-09-12T13:00:03Z",
+        finished_at="2026-09-12T13:03:50Z",
+    )
+    _write_screenshot_completed_turn(
+        run_dir,
+        2,
+        role="reviewer",
+        selector="codex.astra-medium",
+        started_at="2026-09-12T13:08:57Z",
+        finished_at="2026-09-12T13:11:23Z",
+    )
+    _write_json(
+        run_dir / "publication.json",
+        {
+            "stages": {
+                "Final review": {"status": "succeeded", "recorded_at": "2026-09-12T13:11:23Z"},
+                "Merge": {"status": "not_applicable", "reason": "No merge receipt"},
+                "Publish": {"status": "pending", "reason": "Publication remains owner-controlled"},
+                "CI": {"status": "unknown", "reason": "No CI receipt"},
+                "Live verification": {"status": "unknown", "reason": "No live verification receipt"},
+            }
+        },
+    )
+    return {"run_id": SCREENSHOT_COMPLETED_RUN_ID, "run_dir": run_dir, "plan": plan}
+
+
+def _seed_visual_many_run_fixture(root: Path) -> dict[str, object]:
+    """Add 101 total visual records so list pagination is exercised in-browser."""
+    plan = root / "plans" / "done" / "visual-many-run-plan.md"
+    plan.parent.mkdir(parents=True, exist_ok=True)
+    plan.write_text(
+        "# Visual many-run fixture\n\n"
+        "### [x] Checkpoint 1: Retain a readable run row\n"
+        "- [x] record the bounded evidence\n",
+        encoding="utf-8",
+    )
+    # The canonical fixture already contains four records; the completed
+    # screenshot-shaped record makes five. Fill the remaining slots so the
+    # project contains exactly the 101 records represented by the reference.
+    count = VISUAL_TOTAL_RUN_COUNT - 5
+    for index in range(count):
+        run_id = f"{VISUAL_MANY_RUN_PREFIX}-{index:03d}"
+        run_dir = root / ".aflow" / "runs" / run_id
+        run_dir.mkdir(parents=True, exist_ok=True)
+        _write_json(
+            run_dir / "run.json",
+            {
+                "run_id": run_id,
+                "status": "completed",
+                "repo_root": str(root),
+                "workflow_name": "managed",
+                "current_step_name": "done",
+                "turns_completed": 2,
+                "max_turns": 8,
+                "run_started_at": f"2026-09-10T{index // 60:02d}:{index % 60:02d}:00Z",
+            },
+        )
+    return {"prefix": VISUAL_MANY_RUN_PREFIX, "count": count}
 
 
 def _write_visual_boundary(
@@ -518,14 +679,20 @@ def _seed_visual_progress_fixture(root: Path) -> dict[str, object]:
             "workflow_name": "managed",
         },
     )
+    screenshot_fixture = _seed_screenshot_shaped_completed_fixture(root)
+    many_fixture = _seed_visual_many_run_fixture(root)
     return {
         "run_dir": run_dir,
         "run_json": run_dir / "run.json",
         "initial_metadata": metadata,
         "active": True,
+        "screenshot_run_id": screenshot_fixture["run_id"],
         "terminal_id": VISUAL_PROGRESS_TERMINAL_ID,
         "stale_id": VISUAL_PROGRESS_STALE_ID,
         "unknown_id": VISUAL_PROGRESS_UNKNOWN_ID,
+        "many_prefix": many_fixture["prefix"],
+        "many_count": many_fixture["count"],
+        "total_run_count": VISUAL_TOTAL_RUN_COUNT,
     }
 
 
@@ -994,6 +1161,11 @@ def _assert_selected_run_identity(page, run_id: str) -> None:
     ).to_be_visible()
 
 
+def _global_run_row(page, run_id: str):
+    """Find a global row through its accessible name, including its run ID."""
+    return page.get_by_role("button", name=re.compile(re.escape(run_id))).first
+
+
 def test_checkpoint_history_review_evidence_and_generation_refresh(
     control_client,  # noqa: F811
     monkeypatch: pytest.MonkeyPatch,
@@ -1033,9 +1205,7 @@ def test_checkpoint_history_review_evidence_and_generation_refresh(
             page.get_by_role("heading", name="All runs", exact=True).wait_for()
             search = page.get_by_label("Search loaded runs", exact=True)
             search.fill(REVIEW_EVIDENCE_RUN_ID)
-            row = page.locator("button.global-run-row").filter(
-                has_text=REVIEW_EVIDENCE_RUN_ID
-            ).first
+            row = _global_run_row(page, REVIEW_EVIDENCE_RUN_ID)
             row.wait_for()
             markers = row.locator(".compact-run-progress-segment")
             expect(markers).to_have_count(11)
@@ -1329,6 +1499,10 @@ def test_canonical_run_progress_visual_journey(
     """Exercise the integrated overview → history → checkpoint journey."""
     _, root, _, _ = control_client
     fixture = _seed_visual_progress_fixture(root)
+    screenshot_run_id = fixture["screenshot_run_id"]
+    many_prefix = fixture["many_prefix"]
+    assert isinstance(screenshot_run_id, str)
+    assert isinstance(many_prefix, str)
 
     from aflow.control_plane import repository as repository_module
 
@@ -1366,7 +1540,7 @@ def test_canonical_run_progress_visual_journey(
                 page.get_by_role("heading", name="All runs", exact=True).wait_for()
                 search = page.get_by_label("Search loaded runs", exact=True)
                 search.fill(VISUAL_PROGRESS_RUN_ID)
-                row = page.locator("button.global-run-row").filter(has_text=VISUAL_PROGRESS_RUN_ID).first
+                row = _global_run_row(page, VISUAL_PROGRESS_RUN_ID)
                 row.wait_for()
                 page.screenshot(
                     path=str(_screenshot_path(tmp_path, f"{theme}-overview", width, height)),
@@ -1376,7 +1550,8 @@ def test_canonical_run_progress_visual_journey(
 
                 history = page.locator('.checkpoint-history[aria-label="Checkpoint history"]')
                 history.wait_for()
-                expect(history).to_contain_text("4 / 11 approved")
+                expect(history.locator(".checkpoint-history-at-a-glance")).to_contain_text("Current work")
+                expect(history).to_contain_text("4 of 11 checkpoints approved")
                 expect(history).to_contain_text(re.compile(r"CP5 of 11\s+·\s+Implementing"))
                 expect(history).to_contain_text("6 attempts")
                 expect(history).to_contain_text("1 repair pass")
@@ -1416,7 +1591,7 @@ def test_canonical_run_progress_visual_journey(
                 )
                 delivery.locator("summary").click()
                 expect(delivery).to_contain_text("CI · Unknown")
-                expect(delivery).to_contain_text("Live verification · Unknown")
+                expect(delivery).to_contain_text("Live · Unknown")
                 assert "CI · Succeeded" not in delivery.inner_text()
                 assert "Live verification · Succeeded" not in delivery.inner_text()
 
@@ -1426,6 +1601,12 @@ def test_canonical_run_progress_visual_journey(
                 evidence.locator("summary").click()
                 expect(evidence).to_contain_text("Counts come from the bounded canonical evidence projection")
                 expect(evidence).to_contain_text("Complete evidence")
+                time_details = history.locator("details.checkpoint-history-disclosure").filter(
+                    has_text="Time details"
+                )
+                time_details.locator("summary").click()
+                expect(time_details).to_contain_text("Total run elapsed")
+                expect(time_details).to_contain_text("Workflow runtime is separate from browser data-load latency")
                 _assert_document_moves(page)
                 _assert_last_action_hit_test(page)
                 if (width, height) == (390, 844) and theme == "light":
@@ -1466,11 +1647,24 @@ def test_canonical_run_progress_visual_journey(
                     checkpoint_four.click()
                     expect(detail_heading).to_contain_text("Checkpoint 4: Retain earlier history")
 
+                checkpoint_four_event = history.locator(
+                    ".checkpoint-history-detail details.checkpoint-history-event-disclosure"
+                ).first
+                checkpoint_four_event.locator("summary").click()
+                expect(checkpoint_four_event).to_contain_text("Event identity")
+                expect(checkpoint_four_event).to_contain_text("Reason:")
+
                 _advance_visual_progress(fixture)
                 page.get_by_role("button", name="More", exact=True).click()
                 page.get_by_role("menuitem", name="Refresh", exact=True).click()
                 expect(history).to_contain_text(re.compile(r"CP6 of 11\s+·\s+Reviewing"))
                 expect(detail_heading).to_contain_text("Checkpoint 4: Retain earlier history")
+                assert checkpoint_four_event.get_attribute("open") == ""
+                assert team_changes.get_attribute("open") == ""
+                assert delivery.get_attribute("open") == ""
+                assert time_details.get_attribute("open") == ""
+                assert evidence.get_attribute("open") == ""
+                _assert_no_horizontal_overflow(page)
 
                 if _compact(page):
                     page.get_by_role("button", name="← Back to Checkpoints", exact=True).click()
@@ -1481,45 +1675,172 @@ def test_canonical_run_progress_visual_journey(
                     page.get_by_role("button", name="← Back to Checkpoints", exact=True).click()
                     navigation.wait_for(state="visible")
 
+                if (width, height) == (1440, 900):
+                    page.goto(f"{url}/?view=all-runs")
+                    page.get_by_role("heading", name="All runs", exact=True).wait_for()
+                    search = page.get_by_label("Search loaded runs", exact=True)
+                    search.fill(many_prefix)
+                    many_rows = page.locator("button.global-run-row")
+                    many_rows.first.wait_for()
+                    loaded_many_rows = many_rows.evaluate_all(
+                        """rows => rows.filter(row => row.closest('.global-run-results')).length"""
+                    )
+                    assert loaded_many_rows >= 5, {
+                        "loaded": many_rows.count(),
+                        "list_area": loaded_many_rows,
+                        "viewport": page.viewport_size,
+                    }
+                    visible_many_rows = many_rows.evaluate_all(
+                        """
+                        rows => {
+                            const list = rows[0]?.closest('.global-run-results');
+                            const listRect = list?.getBoundingClientRect();
+                            const top = Math.max(listRect?.top ?? 0, 0);
+                            const bottom = Math.min(
+                                listRect?.bottom ?? window.innerHeight,
+                                window.innerHeight,
+                            );
+                            return rows.filter(row => {
+                                const rect = row.getBoundingClientRect();
+                                return rect.bottom > top && rect.top < bottom;
+                            }).length;
+                        }
+                        """
+                    )
+                    assert visible_many_rows >= 5, {
+                        "loaded": loaded_many_rows,
+                        "visible": visible_many_rows,
+                        "viewport": page.viewport_size,
+                    }
+                    _assert_no_horizontal_overflow(page)
+                    page.screenshot(
+                        path=str(_screenshot_path(tmp_path, f"{theme}-many-runs", width, height)),
+                        full_page=True,
+                    )
+
+                    search.fill(screenshot_run_id)
+                    screenshot_row = _global_run_row(page, screenshot_run_id)
+                    screenshot_row.wait_for()
+                    screenshot_row.click()
+                    screenshot_history = page.locator(
+                        '.checkpoint-history[aria-label="Checkpoint history"]'
+                    )
+                    screenshot_history.wait_for()
+                    expect(
+                        page.get_by_role(
+                            "heading", name=re.compile(r"Startup gate failure evidence")
+                        )
+                    ).to_be_visible()
+                    terminal_summary = screenshot_history.locator(
+                        ".checkpoint-history-at-a-glance"
+                    )
+                    expect(terminal_summary).to_contain_text("1 of 1 checkpoint approved")
+                    expect(terminal_summary).to_contain_text("2 of 8 turns used")
+                    expect(terminal_summary).to_contain_text("11m 23s")
+                    expect(terminal_summary).to_contain_text("Finished")
+                    assert "Current work" not in terminal_summary.inner_text()
+                    screenshot_delivery = screenshot_history.locator(
+                        ".checkpoint-history-delivery-summary"
+                    )
+                    expect(screenshot_delivery).to_contain_text("Final review: Succeeded")
+                    expect(screenshot_delivery).to_contain_text("CI: Unknown")
+                    screenshot_time = screenshot_history.locator(
+                        "details.checkpoint-history-disclosure"
+                    ).filter(has_text="Time details")
+                    screenshot_time.locator("summary").click()
+                    reviewer_time = screenshot_time.locator(
+                        ".checkpoint-history-time-group"
+                    ).filter(has_text="Reviewer invocations")
+                    expect(reviewer_time.locator("li")).to_have_count(1)
+                    expect(reviewer_time).to_contain_text("Turn 2 invocation")
+                    expect(reviewer_time).to_contain_text("2m 26s")
+                    expect(screenshot_time).to_contain_text("Known invocation coverage")
+                    expect(screenshot_time).to_contain_text("6m 13s")
+                    assert "Recorded duration total: 4m 52s" not in screenshot_time.inner_text()
+                    screenshot_navigation = screenshot_history.locator(
+                        ".checkpoint-history-navigation"
+                    )
+                    unassigned = screenshot_navigation.get_by_role(
+                        "button", name=re.compile(r"Unassigned history")
+                    )
+                    unassigned.click()
+                    screenshot_detail_heading = screenshot_history.locator(
+                        ".checkpoint-history-detail-heading h5"
+                    )
+                    expect(screenshot_detail_heading).to_contain_text(
+                        "Unassigned history"
+                    )
+                    screenshot_timeline = screenshot_history.locator(
+                        ".checkpoint-history-detail .checkpoint-history-timeline"
+                    )
+                    expect(screenshot_timeline).to_contain_text("Turn 1")
+                    expect(screenshot_timeline).to_contain_text("Turn 2")
+                    screenshot_event = screenshot_timeline.locator(
+                        "details.checkpoint-history-event-disclosure"
+                    ).first
+                    screenshot_event.locator("summary").click()
+                    expect(screenshot_event).to_contain_text("Event identity")
+                    expect(screenshot_event).to_contain_text("Executor")
+
+                    screenshot_evidence = screenshot_history.locator(
+                        "details.checkpoint-history-disclosure"
+                    ).filter(has_text="Count definitions & evidence")
+                    screenshot_evidence.locator("summary").click()
+                    expect(screenshot_evidence).to_contain_text("Complete evidence")
+                    _assert_no_horizontal_overflow(page)
+                    page.screenshot(
+                        path=str(_screenshot_path(tmp_path, f"{theme}-completed", width, height)),
+                        full_page=True,
+                    )
+
+                    selected_url = page.url
+                    assert page.evaluate(
+                        "() => new URL(location.href).searchParams.get('run')"
+                    ) == screenshot_run_id
+                    page.goto(selected_url)
+                    expect(
+                        page.get_by_role(
+                            "heading", name=re.compile(r"Startup gate failure evidence")
+                        )
+                    ).to_be_visible()
+                    selected_row = page.locator(
+                        f"button.run-list-item[data-sidebar-editor-item='{screenshot_run_id}']"
+                    )
+                    expect(selected_row).to_have_attribute("aria-current", "true")
+
                 if width == 1280 and height == 720 and theme == "light":
                     page.goto(f"{url}/?view=all-runs")
                     search = page.get_by_label("Search loaded runs", exact=True)
                     search.fill(str(fixture["terminal_id"]))
-                    terminal_row = page.locator("button.global-run-row").filter(
-                        has_text=str(fixture["terminal_id"])
-                    ).first
+                    terminal_row = _global_run_row(page, str(fixture["terminal_id"]))
                     terminal_row.wait_for()
                     terminal_row.click()
                     terminal_history = page.locator('.checkpoint-history[aria-label="Checkpoint history"]')
                     terminal_history.wait_for()
-                    expect(terminal_history).to_contain_text("11 / 11 approved")
+                    expect(terminal_history).to_contain_text("11 of 11 checkpoints approved")
                     terminal_delivery = terminal_history.locator(
                         "details.checkpoint-history-disclosure"
                     ).filter(has_text="Delivery evidence")
                     terminal_delivery.locator("summary").click()
-                    expect(terminal_delivery).to_contain_text("Publish · Pending")
+                    expect(terminal_delivery).to_contain_text("Publication · Pending")
                     expect(terminal_delivery).to_contain_text("CI · Unknown")
                     assert "CI · Succeeded" not in terminal_delivery.inner_text()
 
                     page.goto(f"{url}/?view=all-runs")
                     search = page.get_by_label("Search loaded runs", exact=True)
                     search.fill(str(fixture["stale_id"]))
-                    stale_row = page.locator("button.global-run-row").filter(
-                        has_text=str(fixture["stale_id"])
-                    ).first
+                    stale_row = _global_run_row(page, str(fixture["stale_id"]))
                     stale_row.wait_for()
                     stale_row.click()
                     stale_history = page.locator('.checkpoint-history[aria-label="Checkpoint history"]')
                     stale_history.wait_for()
                     expect(stale_history).to_contain_text("Partial evidence")
-                    expect(stale_history).to_contain_text("Unknown / 11 approved")
+                    expect(stale_history).to_contain_text("11 checkpoints · approval unknown")
 
                     page.goto(f"{url}/?view=all-runs")
                     search = page.get_by_label("Search loaded runs", exact=True)
                     search.fill(str(fixture["unknown_id"]))
-                    unknown_row = page.locator("button.global-run-row").filter(
-                        has_text=str(fixture["unknown_id"])
-                    ).first
+                    unknown_row = _global_run_row(page, str(fixture["unknown_id"]))
                     unknown_row.wait_for()
                     unknown_row.click()
                     unknown_history = page.locator('.checkpoint-history[aria-label="Checkpoint history"]')

@@ -29,6 +29,7 @@ from .models import (
     RunProgressDeliveryStage,
     RunProgressDetail,
     RunProgressEvent,
+    ProgressEventAssociation,
     RunProgressExecutor,
     RunProgressSummary,
     RunProgressTruncation,
@@ -975,6 +976,8 @@ class _ProgressBudget:
     events_read: int = 0
     omitted_records: int = 0
     omitted_checkpoints: int = 0
+    response_limit_records: int = 0
+    response_limit_checkpoints: int = 0
     unreadable_turn_numbers: set[int] = field(default_factory=set)
     unreadable_turn_order_unknown: bool = False
     notices: list[str] | None = None
@@ -1009,6 +1012,7 @@ class _ProgressBudget:
     def reserve_record(self, *, label: str) -> bool:
         if self.records_read >= _PROGRESS_MAX_RECORDS:
             self.omitted_records += 1
+            self.response_limit_records += 1
             self.notice("Earlier history unavailable in this bounded view")
             return False
         self.records_read += 1
@@ -1022,6 +1026,8 @@ class _ProgressBudget:
             events_read=self.events_read,
             omitted_records=self.omitted_records,
             omitted_checkpoints=self.omitted_checkpoints,
+            response_limit_records=self.response_limit_records,
+            response_limit_checkpoints=self.response_limit_checkpoints,
             notices=tuple(self.notices or ()),
         )
 
@@ -1043,6 +1049,7 @@ class _CanonicalPlan:
     reason: str | None = None
     complete: bool | None = None
     captured: bool = False
+    total_sections: int | None = None
 
 
 @dataclass(frozen=True)
@@ -1677,6 +1684,12 @@ def _canonical_resolve_plan(
         elif captured_present and isinstance(captured, Mapping):
             raw_names = captured.get("checkpoints")
             if isinstance(raw_names, (list, tuple)):
+                total_sections = len(raw_names)
+                omitted_sections = max(0, total_sections - _PROGRESS_MAX_CHECKPOINTS)
+                if omitted_sections:
+                    budget.omitted_checkpoints += omitted_sections
+                    budget.response_limit_checkpoints += omitted_sections
+                    budget.notice("Earlier checkpoints unavailable in this bounded view")
                 sections: list[Mapping[str, Any]] = []
                 for item in raw_names[:_PROGRESS_MAX_CHECKPOINTS]:
                     if isinstance(item, Mapping) and isinstance(item.get("name"), str):
@@ -1696,6 +1709,7 @@ def _canonical_resolve_plan(
                             else None
                         ),
                         captured=True,
+                        total_sections=total_sections,
                     )
 
     if raw is None:
@@ -1713,7 +1727,8 @@ def _canonical_resolve_plan(
             reason=parsed.reason or "invalid_evidence",
         )
     if len(parsed.parsed.sections) > _PROGRESS_MAX_CHECKPOINTS:
-        budget.omitted_checkpoints = len(parsed.parsed.sections) - _PROGRESS_MAX_CHECKPOINTS
+        budget.omitted_checkpoints += len(parsed.parsed.sections) - _PROGRESS_MAX_CHECKPOINTS
+        budget.response_limit_checkpoints += len(parsed.parsed.sections) - _PROGRESS_MAX_CHECKPOINTS
         budget.notice("Earlier checkpoints unavailable in this bounded view")
     sections = tuple(
         {
@@ -1737,6 +1752,7 @@ def _canonical_resolve_plan(
         ),
         display_name=path.name if path is not None else None,
         complete=parsed.parsed.snapshot.is_complete,
+        total_sections=len(parsed.parsed.sections),
     )
 
 
@@ -1803,6 +1819,7 @@ def _canonical_turns(
     selected = children[: max(0, budget.remaining_records - reserved_for_later)]
     if len(selected) < len(children):
         budget.omitted_records += len(children) - len(selected)
+        budget.response_limit_records += len(children) - len(selected)
         budget.notice("Earlier history unavailable in this bounded view")
     for child in selected:
         path = child / "result.json"
@@ -1862,6 +1879,7 @@ def _canonical_manager_records(
     for position, child in enumerate(children):
         if budget.remaining_records <= reserved_for_later:
             budget.omitted_records += len(children) - position
+            budget.response_limit_records += len(children) - position
             budget.notice("Earlier manager history unavailable in this bounded view")
             break
         result_path = child / "result.json"
@@ -1947,6 +1965,7 @@ def _canonical_events(
     selected = lines[-budget.remaining_records:] if budget.remaining_records else []
     if len(selected) < len(lines):
         budget.omitted_records += len(lines) - len(selected)
+        budget.response_limit_records += len(lines) - len(selected)
         budget.notice("Earlier event history unavailable in this bounded view")
     records: list[Mapping[str, Any]] = []
     for line in selected:
@@ -1980,6 +1999,61 @@ def _canonical_scope_checkpoint_index(scope_id: str | None) -> int | None:
         return None
 
 
+def _canonical_original_plan_matches(
+    record: Mapping[str, Any], *, plan: _CanonicalPlan
+) -> bool:
+    if plan.path is None:
+        return False
+    original_path = _canonical_text(
+        record.get("original_plan_path"), limit=_MAX_PATH_LENGTH
+    )
+    if original_path is None:
+        return False
+    try:
+        candidate = Path(original_path)
+        return (
+            candidate.is_absolute()
+            and candidate.resolve(strict=False) == plan.path.resolve(strict=False)
+        )
+    except (OSError, RuntimeError, ValueError):
+        return False
+
+
+def _canonical_whole_plan_review(
+    record: Mapping[str, Any], *, plan: _CanonicalPlan, current_run_id: str
+) -> bool:
+    """Recognize a reviewer that ran after a complete, identity-bound plan."""
+    if _canonical_turn_role(record) != "reviewer":
+        return False
+    if (
+        _canonical_source_run_id(
+            record.get("source_run_id") or record.get("run_id"),
+            current_run_id=current_run_id,
+        )
+        != current_run_id
+        or _canonical_scope_id(record) is not None
+        or _canonical_checkpoint_index(record) is not None
+        or _canonical_checkpoint_name(record) is not None
+        or not _canonical_original_plan_matches(record, plan=plan)
+    ):
+        return False
+    snapshot = record.get("snapshot_before")
+    if not isinstance(snapshot, Mapping):
+        return False
+    total = _canonical_int(snapshot.get("total_checkpoint_count"), positive=True)
+    current_name = snapshot.get("current_checkpoint_name")
+    return (
+        snapshot.get("is_complete") is True
+        and snapshot.get("current_checkpoint_index") is None
+        and (current_name is None or current_name == "")
+        and snapshot.get("unchecked_checkpoint_count") == 0
+        and snapshot.get("current_checkpoint_unchecked_step_count") == 0
+        and total is not None
+        and plan.total_sections is not None
+        and total == plan.total_sections
+    )
+
+
 def _canonical_historical_turn_association(
     record: Mapping[str, Any], *, plan: _CanonicalPlan, current_run_id: str
 ) -> tuple[int, str | None] | None:
@@ -1992,14 +2066,7 @@ def _canonical_historical_turn_association(
     )
     if source_run_id != current_run_id:
         return None
-    original_path = _canonical_text(record.get("original_plan_path"), limit=_MAX_PATH_LENGTH)
-    if original_path is None:
-        return None
-    try:
-        candidate = Path(original_path)
-        if not candidate.is_absolute() or candidate.resolve(strict=False) != plan.path.resolve(strict=False):
-            return None
-    except (OSError, RuntimeError, ValueError):
+    if not _canonical_original_plan_matches(record, plan=plan):
         return None
     snapshot = record.get("snapshot_before")
     if not isinstance(snapshot, Mapping):
@@ -2447,6 +2514,32 @@ def _canonical_record_identity(
             )
         )
     return hashlib.sha256(token.encode("utf-8")).hexdigest()
+
+
+def _canonical_approval_record_identity(
+    record: Mapping[str, Any],
+    *,
+    source_run_id: str,
+    scope_id: str | None,
+    turn_number: int | None,
+) -> str:
+    """Deduplicate approvals without dropping checkpoint decision identity."""
+    identity = _canonical_record_identity(
+        record,
+        kind="checkpoint_approval",
+        source_run_id=source_run_id,
+        scope_id=scope_id,
+        turn_number=turn_number,
+    )
+    checkpoint_index = _canonical_checkpoint_index(record)
+    decision_number = _canonical_int(record.get("decision_number"), positive=True)
+    if checkpoint_index is None and decision_number is None:
+        return identity
+    return hashlib.sha256(
+        f"{identity}|checkpoint:{checkpoint_index}|decision:{decision_number}".encode(
+            "utf-8"
+        )
+    ).hexdigest()
 
 
 def _canonical_executor(
@@ -3153,10 +3246,26 @@ def _canonical_collect_invocations(
                     scope_id, checkpoint_index, checkpoint_name = reviewer_scope
                     record = {**dict(record), "scope_id": scope_id}
                 else:
+                    association_hint: ProgressEventAssociation = "unassigned"
+                    if _canonical_whole_plan_review(
+                        record, plan=plan, current_run_id=current_run_id
+                    ):
+                        association_hint = "whole_plan"
+                    elif _canonical_outside_returned_page(
+                        record,
+                        plan=plan,
+                        budget=budget,
+                        scope_indices={},
+                        ambiguous_scopes=set(),
+                    ):
+                        association_hint = "outside_returned"
+                    original_scope_id = _canonical_scope_id(record)
+                    original_checkpoint_index = _canonical_checkpoint_index(record)
+                    original_checkpoint_name = _canonical_checkpoint_name(record)
                     scope_id = None
                     checkpoint_index = None
                     checkpoint_name = None
-                    record = {
+                    stripped_record = {
                         key: value
                         for key, value in record.items()
                         if key not in {
@@ -3171,6 +3280,20 @@ def _canonical_collect_invocations(
                             "title",
                         }
                     }
+                    if association_hint in {"whole_plan", "outside_returned"}:
+                        record = {
+                            **stripped_record,
+                            "_progress_association": association_hint,
+                        }
+                        if association_hint == "outside_returned":
+                            if original_scope_id is not None:
+                                record["_scope_id"] = original_scope_id
+                            if original_checkpoint_index is not None:
+                                record["_checkpoint_index"] = original_checkpoint_index
+                            if original_checkpoint_name is not None:
+                                record["_checkpoint_name"] = original_checkpoint_name
+                    else:
+                        record = stripped_record
             identity = _canonical_record_identity(
                 record,
                 kind="reviewer",
@@ -3360,9 +3483,8 @@ def _canonical_approval_records(
     reviewers: tuple[_Invocation, ...],
     manager_records: tuple[Mapping[str, Any], ...],
     current_run_id: str,
-) -> tuple[set[int], set[str], tuple[Mapping[str, Any], ...]]:
+) -> tuple[set[int], tuple[Mapping[str, Any], ...]]:
     approved_ordinals: set[int] = set()
-    approved_scopes: set[str] = set()
     records: list[Mapping[str, Any]] = []
 
     def collect(value: object, *, manager_source: bool = False) -> None:
@@ -3385,12 +3507,6 @@ def _canonical_approval_records(
             ):
                 continue
             records.append(dict(item))
-            index = _canonical_checkpoint_index(item)
-            scope_id = _canonical_scope_id(item)
-            if index is not None:
-                approved_ordinals.add(index)
-            if scope_id is not None:
-                approved_scopes.add(scope_id)
 
     for key in (
         "approved_checkpoints",
@@ -3427,9 +3543,8 @@ def _canonical_approval_records(
     deduped: list[Mapping[str, Any]] = []
     seen: set[str] = set()
     for record in records:
-        identity = _canonical_record_identity(
+        identity = _canonical_approval_record_identity(
             record,
-            kind="checkpoint_approval",
             source_run_id=_canonical_source_run_id(
                 record.get("source_run_id"), current_run_id=current_run_id
             ),
@@ -3439,7 +3554,7 @@ def _canonical_approval_records(
         if identity not in seen:
             seen.add(identity)
             deduped.append(record)
-    return approved_ordinals, approved_scopes, tuple(deduped)
+    return approved_ordinals, tuple(deduped)
 
 
 def _canonical_record_text(
@@ -3653,6 +3768,85 @@ def _canonical_checkpoint_association(
     return ordinal, scope_id, generation_id, parent_scope_id, True
 
 
+def _canonical_referenced_checkpoint_index(
+    record: Mapping[str, Any],
+    *,
+    scope_indices: Mapping[str, int],
+    ambiguous_scopes: set[str],
+) -> int | None:
+    """Return a non-conflicting durable checkpoint reference, if present."""
+    scope_id = _canonical_scope_id(record)
+    if scope_id is not None and scope_id in ambiguous_scopes:
+        return None
+    explicit = _canonical_int(
+        record.get("_checkpoint_index")
+        if isinstance(record.get("_checkpoint_index"), int)
+        else _canonical_checkpoint_index(record),
+        positive=True,
+    )
+    mapped = scope_indices.get(scope_id) if scope_id is not None else None
+    suffix = _canonical_scope_checkpoint_index(scope_id)
+    for candidate in (mapped, suffix):
+        if explicit is not None and candidate is not None and explicit != candidate:
+            return None
+    if mapped is not None and suffix is not None and mapped != suffix:
+        return None
+    return explicit or mapped or suffix
+
+
+def _canonical_outside_returned_page(
+    record: Mapping[str, Any],
+    *,
+    plan: _CanonicalPlan,
+    budget: _ProgressBudget,
+    scope_indices: Mapping[str, int],
+    ambiguous_scopes: set[str],
+) -> bool:
+    """Recognize a stable checkpoint that the bounded plan page omitted."""
+    if (
+        plan.total_sections is None
+        or len(plan.sections) >= plan.total_sections
+        or budget.omitted_checkpoints <= 0
+    ):
+        return False
+    ordinal = _canonical_referenced_checkpoint_index(
+        record,
+        scope_indices=scope_indices,
+        ambiguous_scopes=ambiguous_scopes,
+    )
+    return ordinal is not None and len(plan.sections) < ordinal <= plan.total_sections
+
+
+def _canonical_event_association(
+    record: Mapping[str, Any],
+    *,
+    assigned: bool,
+    plan: _CanonicalPlan,
+    budget: _ProgressBudget,
+    current_run_id: str,
+    scope_indices: Mapping[str, int],
+    ambiguous_scopes: set[str],
+) -> ProgressEventAssociation:
+    if assigned:
+        return "checkpoint"
+    hinted = record.get("_progress_association")
+    if isinstance(hinted, str) and hinted in {"whole_plan", "outside_returned"}:
+        return hinted  # type: ignore[return-value]
+    if _canonical_whole_plan_review(
+        record, plan=plan, current_run_id=current_run_id
+    ):
+        return "whole_plan"
+    if _canonical_outside_returned_page(
+        record,
+        plan=plan,
+        budget=budget,
+        scope_indices=scope_indices,
+        ambiguous_scopes=ambiguous_scopes,
+    ):
+        return "outside_returned"
+    return "unassigned"
+
+
 def _canonical_count(value: int | None, coverage: str) -> RunProgressCount:
     if coverage not in _PROGRESS_COVERAGES:
         coverage = "unavailable"
@@ -3714,13 +3908,21 @@ def _canonical_event_id(
     turn_number: int | None,
     ordinal: int | None,
 ) -> str:
-    identity = _canonical_record_identity(
-        record,
-        kind=kind,
-        source_run_id=source_run_id,
-        scope_id=scope_id,
-        turn_number=turn_number,
-    )
+    if kind == "checkpoint_approval":
+        identity = _canonical_approval_record_identity(
+            record,
+            source_run_id=source_run_id,
+            scope_id=scope_id,
+            turn_number=turn_number,
+        )
+    else:
+        identity = _canonical_record_identity(
+            record,
+            kind=kind,
+            source_run_id=source_run_id,
+            scope_id=scope_id,
+            turn_number=turn_number,
+        )
     suffix = f"|cp:{ordinal}" if ordinal is not None else ""
     return hashlib.sha256(f"{kind}|{identity}{suffix}".encode("utf-8")).hexdigest()
 
@@ -4253,7 +4455,7 @@ def _canonical_detail_uncached(
         active_scope=scope,
         activity=collection_activity,
     )
-    approved_ordinals, approved_scopes, approval_records = _canonical_approval_records(
+    approved_ordinals, approval_records = _canonical_approval_records(
         metadata=metadata,
         manager_context=manager_context,
         turns=turns,
@@ -4340,6 +4542,27 @@ def _canonical_detail_uncached(
             ambiguous_scopes=ambiguous_scopes,
         )
 
+    def event_association(
+        record: Mapping[str, Any], *, assigned: bool
+    ) -> ProgressEventAssociation:
+        return _canonical_event_association(
+            record,
+            assigned=assigned,
+            plan=plan,
+            budget=budget,
+            current_run_id=current_run_id,
+            scope_indices=scope_indices,
+            ambiguous_scopes=ambiguous_scopes,
+        )
+
+    def event_reason(
+        record: Mapping[str, Any], *, association_kind: ProgressEventAssociation
+    ) -> str | None:
+        reason = _canonical_record_reason(record)
+        if association_kind == "unassigned":
+            return f"{reason}; Unassigned history" if reason else "Unassigned history"
+        return reason
+
     worker_by_checkpoint: dict[int, list[_Invocation]] = {}
     reviewer_by_checkpoint: dict[int, list[_Invocation]] = {}
     retry_by_checkpoint: dict[int, list[Mapping[str, Any]]] = {}
@@ -4383,10 +4606,15 @@ def _canonical_detail_uncached(
         if assigned and ordinal is not None and explicit_status is not None:
             explicit_statuses.setdefault(ordinal, []).append(explicit_status)
 
-    approved_set = set(approved_ordinals)
-    for scope_id in approved_scopes:
-        if scope_id in scope_indices:
-            approved_set.add(scope_indices[scope_id])
+    approved_set = {
+        index
+        for index in approved_ordinals
+        if plan.total_sections is None or index <= plan.total_sections
+    }
+    for record in approval_records:
+        ordinal, _scope_id, _generation_id, _parent, assigned = association(record)
+        if assigned and ordinal is not None:
+            approved_set.add(ordinal)
 
     active_worker: _Invocation | None = None
     active_reviewer: _Invocation | None = None
@@ -4578,6 +4806,7 @@ def _canonical_detail_uncached(
     def invocation_event(invocation: _Invocation) -> None:
         record = _canonical_invocation_record(invocation)
         ordinal, scope_id, generation_id, _parent, assigned = association(record)
+        association_kind = event_association(record, assigned=assigned)
         event_kind = (
             "review_rejection"
             if invocation.kind == "reviewer" and _canonical_recorded_rejection(record)
@@ -4587,9 +4816,7 @@ def _canonical_detail_uncached(
             if invocation.repair
             else "worker_attempt"
         )
-        reason = _canonical_record_reason(record)
-        if not assigned:
-            reason = f"{reason}; Unassigned history" if reason else "Unassigned history"
+        reason = event_reason(record, association_kind=association_kind)
         turn_number = invocation.turn_number
         default_artifact = (
             f"turns/turn-{turn_number:03d}/result.json" if turn_number is not None else None
@@ -4641,6 +4868,7 @@ def _canonical_detail_uncached(
                         positive=True,
                     ),
                 ),
+                association=association_kind,
             )
         )
 
@@ -4649,13 +4877,12 @@ def _canonical_detail_uncached(
 
     for retry in retries:
         ordinal, scope_id, generation_id, _parent, assigned = association(retry)
+        association_kind = event_association(retry, assigned=assigned)
         source_run_id = _canonical_source_run_id(
             retry.get("_source_run_id"), current_run_id=current_run_id
         )
         turn_number = _canonical_int(retry.get("_turn_number"), positive=True)
-        reason = _canonical_record_reason(retry)
-        if not assigned:
-            reason = f"{reason}; Unassigned history" if reason else "Unassigned history"
+        reason = event_reason(retry, association_kind=association_kind)
         source_reference = dict(
             _canonical_source_reference(
                 retry,
@@ -4702,17 +4929,17 @@ def _canonical_detail_uncached(
                 duration_seconds=_canonical_duration(retry),
                 reason=reason,
                 source_reference=source_reference,
+                association=association_kind,
             )
         )
 
     for record in approval_records:
         ordinal, scope_id, generation_id, _parent, assigned = association(record)
+        association_kind = event_association(record, assigned=assigned)
         source_run_id = _canonical_source_run_id(
             record.get("source_run_id"), current_run_id=current_run_id
         )
-        reason = _canonical_record_reason(record)
-        if not assigned:
-            reason = f"{reason}; Unassigned history" if reason else "Unassigned history"
+        reason = event_reason(record, association_kind=association_kind)
         decision_number = _canonical_int(record.get("decision_number"), positive=True)
         turn_number = _canonical_turn_number(record)
         append_event(
@@ -4761,6 +4988,7 @@ def _canonical_detail_uncached(
                     turn_number=turn_number,
                     decision_number=decision_number,
                 ),
+                association=association_kind,
             )
         )
 
@@ -4785,6 +5013,7 @@ def _canonical_detail_uncached(
                 ended_at=change.recorded_at,
                 reason=change.reason,
                 source_reference=change.source_reference,
+                association=("checkpoint" if change.checkpoint_id is not None else "unassigned"),
             )
         )
 
@@ -4801,13 +5030,12 @@ def _canonical_detail_uncached(
         else:
             event_kind = "history"
         ordinal, scope_id, generation_id, _parent, assigned = association(raw)
+        association_kind = event_association(raw, assigned=assigned)
         source_run_id = _canonical_source_run_id(
             raw.get("source_run_id"), current_run_id=current_run_id
         )
         turn_number = _canonical_turn_number(raw)
-        reason = _canonical_record_reason(raw)
-        if not assigned:
-            reason = f"{reason}; Unassigned history" if reason else "Unassigned history"
+        reason = event_reason(raw, association_kind=association_kind)
         append_event(
             RunProgressEvent(
                 event_id=_canonical_text(raw.get("event_id"), limit=300)
@@ -4851,12 +5079,14 @@ def _canonical_detail_uncached(
                     turn_number=turn_number,
                     decision_number=_canonical_int(raw.get("decision_number"), positive=True),
                 ),
+                association=association_kind,
             )
         )
 
     events.sort(key=lambda item: (_canonical_event_time(item), item.turn_number or 0, item.event_id))
     if len(events) > _PROGRESS_MAX_VISIBLE_EVENTS:
         budget.omitted_records += len(events) - _PROGRESS_MAX_VISIBLE_EVENTS
+        budget.response_limit_records += len(events) - _PROGRESS_MAX_VISIBLE_EVENTS
         budget.notice("Earlier history unavailable in this bounded view")
         events = events[-_PROGRESS_MAX_VISIBLE_EVENTS:]
     budget.events_read = max(budget.events_read, len(events))
@@ -4944,8 +5174,12 @@ def _canonical_detail_uncached(
         reason_codes.append("evidence_truncated")
     if not history_complete and sections:
         reason_codes.append("history_partial")
-    if any(item.checkpoint_id is None for item in events):
+    if any(item.association == "unassigned" for item in events):
         reason_codes.append("unassigned_history")
+    if any(item.association == "whole_plan" for item in events):
+        reason_codes.append("whole_plan_review")
+    if any(item.association == "outside_returned" for item in events):
+        reason_codes.append("history_outside_returned")
     if any("malformed" in notice.casefold() for notice in budget.notices or ()):
         reason_codes.append("malformed_optional_evidence")
     reason_codes = list(dict.fromkeys(reason_codes))

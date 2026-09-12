@@ -23,7 +23,9 @@ from aflow.control_plane import (
     RunProgressChange,
     LaunchManifest,
     RunProgressDetail,
+    RunProgressEvent,
     RunProgressSummary,
+    RunProgressTruncation,
     RunControlRequest,
     RunStatus,
     StartRunResult,
@@ -909,14 +911,22 @@ def test_progress_transport_models_keep_optional_status_and_full_detail_shapes()
         RunProgressDetail(
             checkpoint_states={"2": "approved"},
             checkpoints=(RunProgressCheckpoint("checkpoint-1", awaiting_review=True),),
+            events=(RunProgressEvent("whole-plan", association="whole_plan"),),
             applied_changes=(RunProgressChange("change-1", generation_id="generation-1"),),
+            truncation=RunProgressTruncation(
+                response_limit_records=3,
+                response_limit_checkpoints=2,
+            ),
         )
     )
     assert summary_response.model_dump(mode="json")["availability"] == "unavailable"
     assert summary_response.model_dump(mode="json")["checkpoint_states"] == {}
     assert detail_response.model_dump(mode="json")["checkpoint_states"] == {"2": "approved"}
     assert detail_response.model_dump(mode="json")["checkpoints"][0]["awaiting_review"] is True
+    assert detail_response.model_dump(mode="json")["events"][0]["association"] == "whole_plan"
     assert detail_response.model_dump(mode="json")["applied_changes"][0]["generation_id"] == "generation-1"
+    assert detail_response.model_dump(mode="json")["truncation"]["response_limit_records"] == 3
+    assert detail_response.model_dump(mode="json")["truncation"]["response_limit_checkpoints"] == 2
 
 
 def test_openapi_documents_control_plane_operations_and_models() -> None:
