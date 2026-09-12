@@ -2,6 +2,7 @@ import { act, fireEvent, render, screen, waitFor, within } from '@testing-librar
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 import * as api from '../api'
 import { GlobalSettings } from './GlobalSettings'
+import { HeaderSlotsProvider } from './HeaderSlots'
 import type { GuidedConfigAction, GuidedFormProjection, ProjectConfigFormRequest, ProjectConfigFormResponse } from '../types'
 
 vi.mock('../api', () => ({ getGlobalConfig: vi.fn(), postGlobalConfigForm: vi.fn(), getSettings: vi.fn(), patchGlobalConfig: vi.fn(), saveSettings: vi.fn(), validateGlobalConfig: vi.fn(), projectSettingsText: vi.fn(), listSkills: vi.fn(), readSkill: vi.fn(), saveSkill: vi.fn(), validateSkills: vi.fn(), installSkills: vi.fn() }))
@@ -156,6 +157,19 @@ function installSettingsHeaderMedia(initialMatches: boolean) {
   }
 }
 
+function renderHostedGlobalSettings() {
+  return render(
+    <HeaderSlotsProvider renderHeader={slots => <header>
+      <div className="header-slot-context">{slots.context}</div>
+      <div className="header-slot-local">{slots.local}</div>
+      <div className="header-slot-primary">{slots.primary}</div>
+      <div className="header-slot-more">{slots.more}</div>
+    </header>}>
+      <GlobalSettings onDirtyChange={() => {}} onSaved={() => {}} />
+    </HeaderSlotsProvider>,
+  )
+}
+
 describe('GlobalSettings', () => {
   beforeEach(() => {
     vi.resetAllMocks()
@@ -244,6 +258,62 @@ describe('GlobalSettings', () => {
       view.unmount()
       headerMedia.restore()
     }
+  })
+  it('announces fallback preview pending state without an in-flow layout notice', async () => {
+    const pending = deferred<ProjectConfigFormResponse>()
+    vi.mocked(api.postGlobalConfigForm).mockImplementation(async request => request.action ? pending.promise : familyResponse)
+    render(<GlobalSettings onDirtyChange={() => {}} onSaved={() => {}} />)
+    await screen.findByLabelText('Effort codex.worker')
+    fireEvent.click(screen.getByRole('tab', { name: 'Teams' }))
+    fireEvent.click(screen.getByRole('button', { name: 'Product', exact: true }))
+
+    const worker = screen.getByLabelText('Worker')
+    fireEvent.focus(worker)
+    fireEvent.change(worker, { target: { value: 'codex.deep' } })
+    fireEvent.keyDown(worker, { key: 'Enter' })
+
+    const pendingIndicator = await screen.findByRole('img', { name: 'Preview refresh pending', exact: true })
+    expect(screen.getByText('Unsaved changes')).toBeTruthy()
+    const announcement = screen.getByText('Refreshing effective team and workflow projections…', { exact: true })
+    expect(announcement.getAttribute('role')).toBe('status')
+    expect(announcement.textContent).toBe('Refreshing effective team and workflow projections…')
+    expect(pendingIndicator.closest('.settings-fallback-controls')).toBeTruthy()
+
+    await act(async () => {
+      pending.resolve({
+        ...familyResponse,
+        form: familyProjectionAfterAction({ type: 'set_team_role', team: 'product', role: 'worker', selector: 'codex.deep' }, familyForm),
+      })
+      await pending.promise
+    })
+    await waitFor(() => expect(screen.getByRole('img', { name: 'Preview settled', exact: true })).toBeTruthy())
+    expect(screen.queryByText('Refreshing effective team and workflow projections…', { exact: true })).toBeNull()
+    expect(screen.queryByText(/current settings preview is unavailable/)).toBeNull()
+  })
+  it('keeps hosted preview status in the header while preserving preview errors', async () => {
+    const pending = deferred<ProjectConfigFormResponse>()
+    vi.mocked(api.postGlobalConfigForm).mockImplementation(async request => request.action ? pending.promise : familyResponse)
+    const view = renderHostedGlobalSettings()
+    await screen.findByLabelText('Effort codex.worker')
+    fireEvent.click(screen.getByRole('tab', { name: 'Teams' }))
+    fireEvent.click(screen.getByRole('button', { name: 'Product', exact: true }))
+
+    const worker = screen.getByLabelText('Worker')
+    fireEvent.focus(worker)
+    fireEvent.change(worker, { target: { value: 'codex.deep' } })
+    fireEvent.keyDown(worker, { key: 'Enter' })
+
+    const pendingIndicator = await screen.findByRole('img', { name: 'Preview refresh pending', exact: true })
+    expect(screen.getByText('Unsaved changes')).toBeTruthy()
+    expect(pendingIndicator.closest('.header-slot-primary')).toBeTruthy()
+    await act(async () => {
+      pending.reject(new Error('preview unavailable'))
+      await pending.promise.catch(() => undefined)
+    })
+    await screen.findByText(/current settings preview is unavailable: preview unavailable/)
+    expect(screen.getByRole('img', { name: 'Preview unavailable', exact: true })).toBeTruthy()
+    expect(screen.queryByText('Refreshing effective team and workflow projections…', { exact: true })).toBeNull()
+    expect(view.container.querySelector('.header-slot-primary .settings-preview-status')).toBeTruthy()
   })
   it('hides all guided navigation in raw mode and retains invalid raw text', async () => {
     render(<GlobalSettings onDirtyChange={() => {}} onSaved={() => {}} />)

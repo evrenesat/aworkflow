@@ -686,6 +686,22 @@ export function GlobalSettings({ onDirtyChange, onSaved }: { onDirtyChange: (dir
   const headerCompact = useSettingsHeaderCompact()
   const tabRefs = useRef<Array<HTMLButtonElement | null>>([])
   const changelogReadOnly = !advanced && tab === 'Changelog'
+  const previewIndicatorLabel = draftPreviewState.pending
+    ? 'Preview refresh pending'
+    : draftPreviewState.error ? 'Preview unavailable' : 'Preview settled'
+  // Keep preview feedback in the existing header footprint. The live status
+  // announcement is visually hidden so its full message cannot affect the
+  // geometry of settings content while the canonical preview resolves.
+  const previewStatus = <span className="settings-preview-status">
+    {dirty && <span className="text-xs text-dim header-dirty-state">Unsaved changes</span>}
+    <span
+      className={`settings-preview-indicator${draftPreviewState.pending ? ' is-pending' : ''}${draftPreviewState.error ? ' has-error' : ''}`}
+      role="img"
+      aria-label={previewIndicatorLabel}
+      title={previewIndicatorLabel}
+    />
+    {draftPreviewState.pending && <span className="settings-preview-announcement" role="status" aria-atomic="true">Refreshing effective team and workflow projections…</span>}
+  </span>
   const sectionNavigation = advanced ? <span className="header-local-label">Advanced TOML</span> : headerCompact ? <label className="header-section-select">
     <span>Section</span>
     <select aria-label="Settings section" value={tab} onChange={event => setTab(event.target.value as typeof tabs[number])}>
@@ -700,7 +716,7 @@ export function GlobalSettings({ onDirtyChange, onSaved }: { onDirtyChange: (dir
     local: sectionNavigation,
     primary: <>
       {!changelogReadOnly && <button className="btn btn-primary btn-sm" disabled={!saveableDirty || busy} onClick={() => void save()}>{busy ? 'Working…' : 'Save all changes'}</button>}
-      {dirty && <span className="text-xs text-dim header-dirty-state">Unsaved changes</span>}
+      {previewStatus}
     </>,
     more: <MoreMenu label="More settings actions" triggerLabel="More">
       {!changelogReadOnly && <MenuItem disabled={busy} onClick={() => { if (!dirty || window.confirm('Discard unsaved settings and reload?')) void discardAndReload() }}>Reload server settings</MenuItem>}
@@ -715,14 +731,13 @@ export function GlobalSettings({ onDirtyChange, onSaved }: { onDirtyChange: (dir
       {!changelogReadOnly && <button className="btn btn-secondary btn-sm" disabled={busy} onClick={() => { if (!dirty || window.confirm('Discard unsaved settings and reload?')) void discardAndReload() }}>Reload server settings</button>}
       <div className="settings-fallback-controls">
         {sectionNavigation}
-        {dirty && <span className="text-xs text-dim">Unsaved changes</span>}
+        {previewStatus}
         {!changelogReadOnly && <button className="btn btn-primary btn-sm" disabled={!saveableDirty || busy} onClick={() => void save()}>{busy ? 'Working…' : 'Save all changes'}</button>}
       </div>
     </>}
     {error && <p className="error-message" role="alert">{error}</p>}
     {notice && <p className="success-message" role="status">{notice}</p>}
     {projectionError && <div className="error-message" role="alert">The guided settings view is unavailable: {projectionError} <button className="btn btn-secondary btn-sm" onClick={() => void retryProjection()} disabled={busy || !snapshot}>Retry</button> The saved documents stay editable under Advanced TOML.</div>}
-    {draftPreviewState.pending && <p className="notice" role="status">Refreshing effective team and workflow projections…</p>}
     {draftPreviewState.error && <p className="error-message" role="alert">The current settings preview is unavailable: {draftPreviewState.error.message} Your edits remain in the draft; edit again or save to retry.</p>}
     <fieldset disabled={busy} className="settings-body" id="settings-domain-panel" role={advanced ? 'region' : 'tabpanel'} aria-label={advanced ? 'Advanced TOML editor' : undefined} aria-labelledby={advanced ? undefined : `settings-tab-${tabs.indexOf(tab)}`}>
     {advanced ? <div className="settings-fields">{texts.map((text, index) => <div className="text-editor-field" key={index}><span className="text-editor-label">{index ? 'workflows.toml' : 'aflow.toml'}</span><TextEditor className="mono config-textarea" aria-label={index ? 'workflows.toml contents' : 'aflow.toml contents'} value={text} onChange={e => { draftPreviewCoordinator.invalidate(); setDraftPreviewState(draftPreviewCoordinator.state()); const next: [string, string] = [...texts]; next[index] = e.target.value; setTexts(next); if (!rawEdited) { const form = candidate().form; setBaseline(form); setDraft(form); if (form) draftPreviewCoordinator.updateDraft(form); setPendingNames({}); setNewProfile({ harness: '', profile: '', model: '', effort: '' }); setNewProfileError(null); setNewRole({ role: '', selector: '' }); setNewRoleError(null); setNewTeamName(''); setNewTeamError(null); setPendingFocusTeam(null) } setRawEdited(true) }} /></div>)}</div> : <><div className="settings-retained-skills" hidden={tab !== 'Skills'} aria-hidden={tab !== 'Skills' || undefined}><SkillsSettings

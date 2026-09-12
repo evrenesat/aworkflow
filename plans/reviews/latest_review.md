@@ -1091,3 +1091,45 @@ there after committing. Verify one final commit and clean tracked Git state.
 Publication, exact-SHA CI and live activation remain downstream delivery gates.
 
 No material findings
+
+---
+
+# Stable family preview controls — cumulative review approved
+
+Reviewed unchanged base `6e379a9c15b8d1a9c4d0760debf1e946f25b58d6`
+through `d7d3633a3eec765e9372e9bda6a9ce0a8a96b86f`: 1 new / 1 total
+commit, `cp1 v01`, covering the entire original handoff. No previous findings
+or fix overlays apply to this handoff. Earlier records concern other handoffs.
+
+The shared hosted/fallback status retains a constant indicator footprint,
+dirty wording, reduced-motion feedback and the full accessible pending message.
+Actionable errors and draft/save ownership are preserved. The new held-response
+regression checks pointer geometry, successful stage selection and distinct
+child/Base reviewer declarations. The existing family journey is unchanged.
+
+Verification:
+
+- Reviewer reran the exact focused GlobalSettings preview/resize selection:
+  15 passed, 60 skipped, including both added pending/error tests.
+- Retained worker command receipts confirm the production build passed;
+  Chromium and WebKit each passed 3 controlled pointer cases and all 7 family
+  journey viewports. Receipts are in run `20260912t022113z-83b39f89`, turn 001,
+  under the registered parent checkout's `.aflow` directory; the prompt's
+  worktree-relative receipt is absent.
+- Inspected retained desktop pending/settled and reduced-motion phone images.
+  All six controlled geometry JSON artifacts show identical pointerdown and
+  settled bounds, successful child selection, `review_child` on the child and
+  `review_final` on Base. External evidence directories are
+  `family-preview-cp1-{chromium,webkit}-final-*` and
+  `family-preview-cp1-journey-{chromium,webkit}-*`.
+- Cumulative `git diff --check` passed. Only the five planned implementation
+  files changed before this reviewer record. Private artifact paths are passed
+  through pytest options, not embedded in portable test code.
+
+Approved for one final handoff commit at the unchanged base, preserving reviewed
+implementation blobs and including this tracked record. The original private
+plan stays in place for engine finalization and records the final approved SHA.
+No fix plan or DEVLOG compaction is needed. Publication, exact-SHA CI and live
+activation remain downstream gates; physical mobile checks are unverified.
+
+No material findings

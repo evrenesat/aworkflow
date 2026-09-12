@@ -586,6 +586,243 @@ def _assert_action_hit_test(page: Page, action) -> None:
     assert observation["is_target"], box
 
 
+@pytest.mark.parametrize(
+    ("width", "height"),
+    (
+        pytest.param(320, 568, id="phone-portrait"),
+        pytest.param(768, 1024, id="tablet"),
+        pytest.param(1280, 720, id="desktop"),
+    ),
+)
+def test_family_stage_click_survives_preview_completion(
+    control_client,
+    monkeypatch,
+    tmp_path,
+    width: int,
+    height: int,
+):
+    """Keep a pressed family stage target stable while its preview resolves."""
+    _, root, _, _ = control_client
+    _seed_team_family_fixture(root)
+    dist = Path(__file__).resolve().parents[2] / "web" / "dist"
+    monkeypatch.setenv("AFLOW_APP_WEB_DIST", str(dist))
+    browser_name = os.environ.get("AFLOW_TEST_BROWSER", "chromium").strip().lower()
+    reduced_motion = width == 320
+    held_response = None
+    response_released = False
+
+    def intercept_preview(route) -> None:
+        nonlocal held_response
+        action = (route.request.post_data_json or {}).get("action") or {}
+        if action == {
+            "type": "set_team_role",
+            "team": "product",
+            "role": "reviewer",
+            "selector": "codex.review_final",
+        } and held_response is None:
+            held_response = {"route": route, "action": action}
+            return
+        route.continue_()
+
+    def choose_profile(page: Page, label: str, selector: str) -> None:
+        field = page.get_by_role("combobox", name=label, exact=True)
+        field.click()
+        field.fill(selector)
+        with page.expect_response("**/api/config/form"):
+            page.get_by_role("option").filter(has_text=selector).first.click()
+
+    def stage_snapshot(page: Page, x: float, y: float) -> dict[str, object]:
+        return page.evaluate(
+            """([x, y]) => {
+                const target = [...document.querySelectorAll('.team-family-stage-selector button')]
+                    .find(button => button.getAttribute('aria-label') === 'Stronger worker');
+                const rect = target?.getBoundingClientRect();
+                const hit = document.elementFromPoint(x, y);
+                const hitButton = hit instanceof Element ? hit.closest('button') : null;
+                return {
+                    box: rect ? {x: rect.x, y: rect.y, width: rect.width, height: rect.height} : null,
+                    hit: hit ? {
+                        tag: hit.tagName,
+                        buttonLabel: hitButton?.getAttribute('aria-label') ?? null,
+                        text: hit.textContent?.trim() ?? '',
+                    } : null,
+                    pressed: [...document.querySelectorAll('.team-family-stage-selector button')]
+                        .map(button => ({
+                            label: button.getAttribute('aria-label'),
+                            pressed: button.getAttribute('aria-pressed'),
+                        })),
+                    pending: Boolean(document.querySelector('[aria-label="Preview refresh pending"]')),
+                    announcement: [...document.querySelectorAll('[role="status"]')]
+                        .map(node => node.textContent?.trim() ?? '')
+                        .find(text => text.includes('Refreshing effective team and workflow projections')) ?? null,
+                };
+            }""",
+            [x, y],
+        )
+
+    with live_server() as url, sync_playwright() as playwright:
+        browser = _browser(playwright)
+        page = browser.new_page(viewport={"width": width, "height": height})
+        if reduced_motion:
+            page.emulate_media(reduced_motion="reduce")
+        page.route("**/api/config/form", intercept_preview)
+        page.add_init_script(
+            """(() => {
+                window.__familyStageEvents = [];
+                for (const kind of ['pointerdown', 'pointerup', 'click']) {
+                    document.addEventListener(kind, event => {
+                        const node = event.target instanceof Element ? event.target : null;
+                        const button = node?.closest('button');
+                        window.__familyStageEvents.push({
+                            kind,
+                            target: button?.getAttribute('aria-label') ?? node?.tagName ?? null,
+                            x: event.clientX,
+                            y: event.clientY,
+                        });
+                    }, true);
+                }
+            })();"""
+        )
+        try:
+            _login(page, url)
+            _open_destination(page, "Settings")
+            page.get_by_role("heading", name="Settings", exact=True).wait_for()
+            _select_settings_section(page, "Teams")
+            page.locator(".team-families-settings").wait_for()
+
+            page.get_by_role("navigation", name="Team families", exact=True).get_by_role(
+                "button", name="Product development", exact=True
+            ).click()
+            detail = page.locator(".team-family-detail")
+            detail.wait_for()
+            detail.get_by_role("button", name="Base product", exact=True).click()
+            choose_profile(page, "Reviewer", "codex.review_alt")
+            detail.get_by_role("button", name="Stronger worker", exact=True).click()
+            inherited_roles = detail.locator("details").filter(has_text=re.compile(r"Inherited roles")).first
+            if inherited_roles.get_attribute("open") is None:
+                inherited_roles.locator("summary").click()
+            reviewer_row = detail.locator(".team-family-role-row").filter(has_text="Reviewer").first
+            expect(reviewer_row).to_contain_text("codex.review_alt")
+            reviewer_row.get_by_role("button", name="Override role", exact=True).click()
+            choose_profile(page, "Reviewer", "codex.review_child")
+            expect(reviewer_row).to_contain_text("codex.review_child")
+            detail.get_by_role("button", name="Base product", exact=True).click()
+
+            field = page.get_by_role("combobox", name="Reviewer", exact=True)
+            field.click()
+            field.fill("codex.review_final")
+            page.get_by_role("option").filter(has_text="codex.review_final").first.click()
+            expect(page.get_by_role("img", name="Preview refresh pending", exact=True)).to_be_visible()
+            assert held_response is not None, "final reviewer preview was not intercepted"
+
+            target = detail.get_by_role("button", name="Stronger worker", exact=True)
+            target.scroll_into_view_if_needed()
+            before_box = target.bounding_box()
+            assert before_box is not None
+            assert 0 <= before_box["x"] and before_box["x"] + before_box["width"] <= width, before_box
+            assert 0 <= before_box["y"] and before_box["y"] + before_box["height"] <= height, before_box
+            x = before_box["x"] + before_box["width"] / 2
+            y = before_box["y"] + before_box["height"] / 2
+            before_snapshot = stage_snapshot(page, x, y)
+            assert before_snapshot["hit"]["buttonLabel"] == "Stronger worker", before_snapshot
+            pending_animation = page.evaluate(
+                """() => {
+                    const indicator = document.querySelector('[aria-label="Preview refresh pending"]');
+                    return indicator ? getComputedStyle(indicator, '::before').animationName : null;
+                }"""
+            )
+            if reduced_motion:
+                assert pending_animation == "none", pending_animation
+            else:
+                assert pending_animation == "spin", pending_animation
+
+            pending_screenshot = tmp_path / f"family-stage-click-{browser_name}-{width}x{height}-pending.png"
+            page.mouse.move(x, y)
+            page.screenshot(path=str(pending_screenshot), full_page=True)
+            page.mouse.down()
+            # Native focus can settle the surrounding fieldset as the prior
+            # combobox blurs; compare the held preview response from the
+            # pointer-down geometry through settlement.
+            down_box = target.bounding_box()
+            down_snapshot = stage_snapshot(page, x, y)
+            assert down_box is not None
+            assert down_snapshot["hit"]["buttonLabel"] == "Stronger worker", down_snapshot
+            assert down_snapshot["pending"] is True, down_snapshot
+            assert down_snapshot["announcement"] == "Refreshing effective team and workflow projections…", down_snapshot
+
+            held_response["response"] = held_response["route"].fetch()
+            held_response["route"].fulfill(response=held_response["response"])
+            response_released = True
+            expect(page.get_by_role("img", name="Preview refresh pending", exact=True)).to_have_count(0)
+            expect(page.get_by_role("img", name="Preview settled", exact=True)).to_be_visible()
+            settled_box = target.bounding_box()
+            assert settled_box is not None
+            settled_screenshot = tmp_path / f"family-stage-click-{browser_name}-{width}x{height}-settled.png"
+            page.screenshot(path=str(settled_screenshot), full_page=True)
+            settled_snapshot = stage_snapshot(page, x, y)
+            assert settled_snapshot["hit"]["buttonLabel"] == "Stronger worker", settled_snapshot
+            assert settled_snapshot["pending"] is False, settled_snapshot
+            assert settled_snapshot["announcement"] is None, settled_snapshot
+            for key in ("x", "y", "width", "height"):
+                assert abs(settled_box[key] - down_box[key]) <= 0.5, {
+                    "key": key,
+                    "pointerdown": down_box,
+                    "settled": settled_box,
+                    "pointerdown_snapshot": down_snapshot,
+                    "settled_snapshot": settled_snapshot,
+                }
+
+            page.mouse.up()
+            expect(target).to_have_attribute("aria-pressed", "true")
+            reviewer_row = detail.locator(".team-family-role-row").filter(has_text="Reviewer").first
+            expect(reviewer_row).to_contain_text("codex.review_child")
+            stronger_worker_pressed = target.get_attribute("aria-pressed")
+            child_reviewer_text = reviewer_row.text_content()
+            events = page.evaluate("() => window.__familyStageEvents ?? []")
+            assert [event["kind"] for event in events[-3:]] == ["pointerdown", "pointerup", "click"], events
+            assert all(event["target"] == "Stronger worker" for event in events[-3:]), events
+
+            detail.get_by_role("button", name="Base product", exact=True).click()
+            base = detail.get_by_role("button", name="Base product", exact=True)
+            expect(base).to_have_attribute("aria-pressed", "true")
+            base_reviewer = detail.locator(".team-family-role-row").filter(has_text="Reviewer").first
+            expect(base_reviewer).to_contain_text("codex.review_final")
+
+            artifact = {
+                "viewport": {"width": width, "height": height},
+                "browser": browser_name,
+                "reduced_motion": reduced_motion,
+                "pending_animation": pending_animation,
+                "before_box": before_box,
+                "pointerdown_box": down_box,
+                "settled_box": settled_box,
+                "before": before_snapshot,
+                "pointerdown": down_snapshot,
+                "settled": settled_snapshot,
+                "after_click": {
+                    "stronger_worker_pressed": stronger_worker_pressed,
+                    "reviewer_text": child_reviewer_text,
+                },
+                "base_after_click": {
+                    "base_pressed": base.get_attribute("aria-pressed"),
+                    "reviewer_text": base_reviewer.text_content(),
+                },
+                "events": events[-3:],
+                "held_action": held_response["action"],
+            }
+            artifact_path = tmp_path / f"family-stage-click-{browser_name}-{width}x{height}.json"
+            artifact_path.write_text(json.dumps(artifact, indent=2), encoding="utf-8")
+            print("FAMILY_STAGE_CLICK_ARTIFACT", artifact_path)
+            print("FAMILY_STAGE_CLICK_SCREENSHOT", pending_screenshot)
+            print("FAMILY_STAGE_CLICK_SCREENSHOT", settled_screenshot)
+        finally:
+            if held_response is not None and not response_released:
+                held_response["response"] = held_response["route"].fetch()
+                held_response["route"].fulfill(response=held_response["response"])
+            page.unroute("**/api/config/form", intercept_preview)
+            browser.close()
+
+
 def _create_live_control_fixture(control_client, root: Path, monkeypatch) -> tuple[str, dict[str, object]]:
     """Create one real control-plane run while keeping later browser writes intercepted."""
     client, _, units, _ = control_client

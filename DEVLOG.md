@@ -1,5 +1,20 @@
 # DEVLOG
 
+## 2026-09-12 — Keep family stage clicks stable during preview refresh
+
+- Replaced the in-flow settings preview paragraph with one shared hosted/fallback
+  status fragment: a fixed-size visible indicator, reduced-motion static state,
+  and a layout-neutral full live announcement. Existing dirty wording, preview
+  errors, draft guards and Save ownership remain unchanged.
+- Added a held-response pointer regression for the Base reviewer projection.
+  Chromium and WebKit passed 320px reduced-motion phone, tablet and desktop
+  cases; the controlled click selected Stronger worker, retained its child
+  reviewer override, and returned to Base with `codex.review_final`. The retained
+  seven-viewport family journeys also passed in both engines.
+- Focused component tests selected 15 cases and the production web build passed.
+  Screenshots and geometry artifacts are retained under
+  `/root/code/evidence/aflow-dogfood-20260909/family-preview-cp1-*-final-*`.
+
 ## 2026-09-12 — Observe startup errors through wrapper exit
 
 - Stabilized persistent-unit startup failure coverage with bounded eventual
