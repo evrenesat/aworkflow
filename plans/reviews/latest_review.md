@@ -1889,3 +1889,42 @@ normal publication, exact-SHA CI and live verification; these remain pending.
 No material findings
 
 ---
+
+## CI readable browser contracts — cumulative review approved, 2026-09-12
+
+Base: `f193dddf32e87377e77f2920804f462780c0b0be` (unchanged).
+Reviewed HEAD: `3953a1b76267d1b01b943660cf539ebd5afabbb8`.
+Coverage: 1 new / 1 total commit, `cp1 v01`, all eight original checkpoint
+steps and the full four-file cumulative diff. No previous findings or fix
+overlays apply to this handoff.
+
+No material findings under the admission gate and proportionate-fix discipline.
+Exact full-ID accessibility controls, unique terminal-ID global row matching,
+separate exact context/title/status checks, canonical original-plan progress,
+and explicit retry source/target disclosure agree with the current product.
+The retry anchor is clicked normally and its exact hash and open target checked.
+Recovery lineage, source immutability, exact requests, history, navigation,
+geometry and refresh assertions remain. No production changes.
+
+Reused raw completed command receipts in the registered parent repository:
+`/root/code/agent_flow/.aflow/runs/20260912t205711z-dc203a92/turns/turn-001/transport.stdout`.
+Build passed. Chromium initial run: three passed and parity failed on duplicated
+canonical summary text; the scoped Current work selector correction passed its
+focused rerun (1 passed, 4.36s). WebKit: 3 passed, 30.33s. A retained desktop
+route rerun also passed (1 passed, 9.30s). Thus all four planned Chromium and
+three planned WebKit nodes have passing evidence. Pytest used external
+--basetemp options; no host-specific artifact paths entered portable test code.
+Completed result.json confirms checkpoint completion. Reviewer independently
+compared AST test names/decorators across the base and HEAD: unchanged inventory
+and parametrization in all three modules. Cumulative git diff --check passed.
+No full local suites or matrices were run; navigation/recovery CI remains pending.
+
+Approval includes this tracked record in the single unpublished handoff commit,
+preserving all four reviewed blobs and the single DEVLOG entry. No fix plan is
+needed or created. Leave the ignored original plan for engine finalization and
+record the final SHA there after committing. Verify one commit above the
+unchanged base and clean tracked state. Coordinator/controller owns serialized
+integration, normal publication, exact-SHA CI and live activation; those gates
+are not claimed complete. Concurrent performance work remains untouched.
+
+No material findings

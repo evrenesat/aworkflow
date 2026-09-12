@@ -6,6 +6,7 @@ from playwright.sync_api import expect, sync_playwright
 from test_control_plane_api import control_client, live_server, TOKEN, PROJECT_ID  # noqa: F401
 from test_responsive_browser import (
     _assert_document_moves,
+    _assert_global_run_row,
     _assert_header_and_flow,
     _assert_last_action_hit_test,
     _assert_run_detail,
@@ -92,10 +93,11 @@ def test_run_navigation_scroll_selection_and_history(control_client, monkeypatch
             # run detail while retaining the canonical URL identity.
             page.set_viewport_size({'width': 390, 'height': 844})
             page.goto(f'{url}/?view=all-runs')
-            all_run = page.get_by_role(
-                'button',
-                name='Test project · Completed · History 000 · history-000',
-                exact=True,
+            all_run = _assert_global_run_row(
+                page,
+                'history-000',
+                project_label='Test project',
+                title='History 000',
             )
             all_run.wait_for()
             for attempt in range(2):
@@ -226,7 +228,7 @@ def test_run_navigation_scroll_selection_and_history(control_client, monkeypatch
             page.get_by_role('button', name='More run actions').click()
             page.get_by_role('menuitem', name='Archive', exact=True).click()
             page.get_by_role('button', name='Restore', exact=True).wait_for()
-            assert page.locator('.run-list-item').filter(has_text='history-069.md').count() == 0
+            assert page.locator("[data-sidebar-editor-item='history-069']").count() == 0
             page.get_by_role('button', name='Restore', exact=True).click()
             page.wait_for_function('window.__restoreResponseHeld === true')
             page.get_by_role('button', name='More run actions').click()
@@ -330,11 +332,11 @@ def test_complete_navigation_and_launch_journeys(control_client, monkeypatch, tm
                     _assert_theme(page, theme)
                     page.get_by_role('heading', name='All runs', exact=True).wait_for()
                     page.get_by_label('Search loaded runs', exact=True).fill(run_id)
-                    exact_row = page.get_by_role(
-                        'button',
-                        name=re.compile(
-                            rf'^{re.escape(parent_name)} · Completed · Journey ready · {re.escape(run_id)}$'
-                        ),
+                    exact_row = _assert_global_run_row(
+                        page,
+                        run_id,
+                        project_label=parent_name,
+                        title='Journey ready',
                     )
                     exact_row.wait_for()
                     page.get_by_label('Search loaded runs', exact=True).fill('')
@@ -666,15 +668,20 @@ def test_remaining_journeys_keep_compact_actions_and_drafts_reachable(control_cl
             page.unroute(f'**/api/control-plane/projects/{PROJECT_ID}/runs', launch_route)
             page.get_by_role('button', name='Menu', exact=True).click()
             page.get_by_role('menuitem', name='All runs', exact=True).click()
-            exact_global_row = page.get_by_role(
-                'button',
-                name='Test project · Completed · Ready cp5 · global-cp5',
-                exact=True,
+            exact_global_row = _assert_global_run_row(
+                page,
+                'global-cp5',
+                project_label='Test project',
+                title='Ready cp5',
             )
             exact_global_row.wait_for()
             assert_compact_geometry(page, 844, 390)
             exact_global_row.click()
             _assert_run_detail(page, 'Ready cp5', 'global-cp5')
+            page.wait_for_function(
+                "new URL(location.href).searchParams.get('project') === 'test-project' && "
+                "new URL(location.href).searchParams.get('run') === 'global-cp5'"
+            )
             page.get_by_role('button', name='← Back to Run history', exact=True).wait_for()
             page.get_by_role('button', name='← Back to Run history', exact=True).click()
             _run_history_navigation(page).wait_for()

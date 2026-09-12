@@ -2607,3 +2607,10 @@ HISTORY: Published clipboard history `c14f1f2`/`cd78d53` remains separate and mu
   focused test passed, and the outer caller remained free of `.aflow`.
 - Verification: focused CLI test passed (`1 passed, 156 deselected`); full CLI
   module passed (`157 passed, 129 subtests`); no production changes were made.
+
+## 2026-09-12 — Readable browser acceptance contracts
+
+- Migrated browser acceptance selectors to readable run titles, exact full-ID
+  accessibility controls and explicit event-disclosure interaction. Exact URLs,
+  project/worktree context, status, recovery lineage and retry evidence remain
+  asserted without restoring private paths or abbreviated identities to row text.

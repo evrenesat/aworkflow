@@ -1162,8 +1162,14 @@ def _assert_selected_run_identity(page, run_id: str) -> None:
 
 
 def _global_run_row(page, run_id: str):
-    """Find a global row through its accessible name, including its run ID."""
-    return page.get_by_role("button", name=re.compile(re.escape(run_id))).first
+    """Find the one global row ending in the exact full run identity."""
+    row = page.locator("button.global-run-row").and_(
+        page.get_by_role(
+            "button", name=re.compile(rf" · {re.escape(run_id)}$")
+        )
+    )
+    expect(row).to_have_count(1)
+    return row
 
 
 def test_checkpoint_history_review_evidence_and_generation_refresh(
@@ -1328,22 +1334,47 @@ def test_checkpoint_history_review_evidence_and_generation_refresh(
                     has_text="Runtime retry"
                 )
             ).to_have_count(1)
-            retry_event = history.locator(
-                ".checkpoint-history-timeline .checkpoint-history-event"
-            ).filter(has_text="Runtime retry")
-            retry_link = retry_event.get_by_role(
+            retry_event = history.locator(f"#checkpoint-event-{retry_event_id}")
+            expect(retry_event).to_have_count(1)
+            retry_details = retry_event.locator(
+                ":scope > details.checkpoint-history-event-disclosure"
+            )
+            if retry_details.get_attribute("open") is None:
+                retry_details.locator("summary").click()
+            expect(retry_details).to_have_attribute("open", "")
+            retry_link = retry_details.get_by_role(
                 "link", name="Retried invocation: turn 10", exact=True
             )
+            expect(retry_link).to_be_visible()
             expect(retry_link).to_have_attribute("href", re.compile(r"^#checkpoint-event-"))
             retry_target = retry_link.get_attribute("href")
             assert retry_target is not None
-            expect(history.locator(retry_target)).to_contain_text("Worker attempt")
-            target_turn = history.locator(retry_target).locator("dt").filter(
+            target_event = history.locator(retry_target)
+            expect(target_event).to_have_count(1)
+            target_details = target_event.locator(
+                ":scope > details.checkpoint-history-event-disclosure"
+            )
+            if target_details.get_attribute("open") is None:
+                target_details.locator("summary").click()
+            expect(target_details).to_have_attribute("open", "")
+            expect(target_details.locator("summary")).to_contain_text("Worker attempt")
+            target_turn = target_details.locator("dt").filter(
                 has_text=re.compile(r"^Turn$")
             )
             expect(target_turn).to_have_count(1)
-            expect(target_turn.locator("xpath=following-sibling::dd[1]")).to_have_text("10")
-            expect(history.locator(retry_target)).to_contain_text("codex.worker-repair")
+            target_turn_value = target_turn.locator("xpath=following-sibling::dd[1]")
+            expect(target_turn_value).to_be_visible()
+            expect(target_turn_value).to_have_text("10")
+            expect(target_details.locator(".checkpoint-history-event-body")).to_contain_text(
+                "codex.worker-repair"
+            )
+            retry_link.scroll_into_view_if_needed()
+            retry_link.click()
+            page.wait_for_function(
+                "expectedHash => location.hash === expectedHash", arg=retry_target
+            )
+            expect(target_event).to_be_visible()
+            expect(target_details).to_have_attribute("open", "")
 
             page.get_by_role("button", name="← Back to Checkpoints", exact=True).click()
             expect(first_checkpoint).to_contain_text("2 reviews")
@@ -1419,14 +1450,17 @@ def test_run_progress_transport_and_browser_parity(
             page = browser.new_page(viewport={"width": width, "height": height})
             _login(page, url)
             page.goto(f"{url}/?project={PROJECT_ID}&view=runs&run={run_id}")
-            page.get_by_role("heading", name="Repair overlay", exact=True).wait_for()
+            page.get_by_role("heading", name="Issue35 original", exact=True).wait_for()
             _assert_selected_run_identity(page, run_id)
 
-            expect(
-                page.get_by_text(
-                    "CP4 of 14 · Unknown — Checkpoint 4: Stage 4", exact=True
-                )
-            ).to_be_visible()
+            current_work = page.locator(".checkpoint-history-at-a-glance dt").filter(
+                has_text=re.compile(r"^Current work$")
+            ).locator("xpath=following-sibling::dd[1]")
+            expect(current_work).to_have_count(1)
+            expect(current_work).to_have_text(
+                "CP4 of 14 · Unknown — Checkpoint 4: Stage 4"
+            )
+            expect(current_work).to_be_visible()
             expect(
                 page.get_by_text(
                     "Legacy execution record. Workflow controls are unavailable; history controls remain available.",
@@ -1445,11 +1479,10 @@ def test_run_progress_transport_and_browser_parity(
             _close_issue35_repair_scope(fixture)
             page.get_by_role("button", name="More", exact=True).click()
             page.get_by_role("menuitem", name="Refresh", exact=True).click()
-            expect(
-                page.get_by_text(
-                    "CP5 of 14 · Unknown — Checkpoint 5: Stage 5", exact=True
-                )
-            ).to_be_visible()
+            expect(current_work).to_have_text(
+                "CP5 of 14 · Unknown — Checkpoint 5: Stage 5"
+            )
+            expect(current_work).to_be_visible()
             detail_text = page.locator(".run-detail").inner_text()
             assert "? of 0" not in detail_text
             assert "All 0 checkpoints complete" not in detail_text
@@ -1651,8 +1684,13 @@ def test_canonical_run_progress_visual_journey(
                     ".checkpoint-history-detail details.checkpoint-history-event-disclosure"
                 ).first
                 checkpoint_four_event.locator("summary").click()
-                expect(checkpoint_four_event).to_contain_text("Event identity")
-                expect(checkpoint_four_event).to_contain_text("Reason:")
+                expect(checkpoint_four_event).to_have_attribute("open", "")
+                checkpoint_four_body = checkpoint_four_event.locator(
+                    ".checkpoint-history-event-body"
+                )
+                expect(checkpoint_four_body).to_be_visible()
+                expect(checkpoint_four_body).to_contain_text("Event identity")
+                expect(checkpoint_four_body).to_contain_text("Reason:")
 
                 _advance_visual_progress(fixture)
                 page.get_by_role("button", name="More", exact=True).click()
@@ -1779,8 +1817,13 @@ def test_canonical_run_progress_visual_journey(
                         "details.checkpoint-history-event-disclosure"
                     ).first
                     screenshot_event.locator("summary").click()
-                    expect(screenshot_event).to_contain_text("Event identity")
-                    expect(screenshot_event).to_contain_text("Executor")
+                    expect(screenshot_event).to_have_attribute("open", "")
+                    screenshot_event_body = screenshot_event.locator(
+                        ".checkpoint-history-event-body"
+                    )
+                    expect(screenshot_event_body).to_be_visible()
+                    expect(screenshot_event_body).to_contain_text("Event identity")
+                    expect(screenshot_event_body).to_contain_text("Executor")
 
                     screenshot_evidence = screenshot_history.locator(
                         "details.checkpoint-history-disclosure"
@@ -1890,7 +1933,7 @@ def test_run_summary_wraps_without_document_overflow(
             page = browser.new_page(viewport={"width": width, "height": height})
             _login(page, url)
             page.goto(f"{url}/?project={PROJECT_ID}&view=runs&run={run_id}")
-            page.get_by_role("heading", name="Repair overlay", exact=True).wait_for()
+            page.get_by_role("heading", name="Issue35 original", exact=True).wait_for()
             checkpoint_navigation = page.locator(
                 '[data-sidebar-editor-list="Checkpoints"] > .sidebar-editor-navigation'
             )
@@ -1937,7 +1980,9 @@ def test_run_summary_wraps_without_document_overflow(
             assert LONG_SUMMARY_TOKEN in page.locator(".run-detail").inner_text()
 
             run_detail = page.locator(".run-detail")
-            expect(run_detail.get_by_title("Copy run ID", exact=True)).to_be_visible()
+            run_identity = run_detail.get_by_title("Copy full run ID", exact=True)
+            expect(run_identity).to_be_visible()
+            expect(run_identity).to_have_attribute("aria-label", run_id)
             actions = run_detail.get_by_role("button", name="More run actions", exact=True)
             expect(actions).to_be_visible()
             actions.click()

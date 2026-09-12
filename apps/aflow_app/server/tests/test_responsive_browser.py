@@ -34,7 +34,6 @@ VIEWPORTS = (
 )
 
 RESPONSIVE_FIXTURE_RUN_ID = "responsive-run-39"
-RESPONSIVE_FIXTURE_PLAN_PATH = "plans/todo/long-plan-39.md"
 RESPONSIVE_FIXTURE_TITLE = "Long plan 39"
 RESPONSIVE_GLOBAL_RUN_ID = "responsive-run-00"
 RESPONSIVE_GLOBAL_TITLE = "Long plan 00"
@@ -523,11 +522,37 @@ def _assert_run_detail(page: Page, expected_title: str, expected_run_id: str) ->
     detail = page.locator(".run-detail:visible").first
     detail.wait_for()
     expect(detail.locator("h3")).to_have_text(expected_title)
-    expect(detail.get_by_title("Copy run ID", exact=True)).to_have_text(expected_run_id)
+    identity = detail.get_by_title("Copy full run ID", exact=True)
+    expect(identity).to_be_visible()
+    expect(identity).to_have_attribute("aria-label", expected_run_id)
     page.wait_for_function(
         "expectedRunId => new URL(location.href).searchParams.get('run') === expectedRunId",
         arg=expected_run_id,
     )
+
+
+def _assert_global_run_row(
+    page: Page,
+    run_id: str,
+    *,
+    project_label: str,
+    title: str,
+    status: str = "Completed",
+):
+    """Return the one global row ending in the exact full run identity."""
+    row = page.locator("button.global-run-row").and_(
+        page.get_by_role(
+            "button", name=re.compile(rf" · {re.escape(run_id)}$")
+        )
+    )
+    expect(row).to_have_count(1)
+    expect(row.locator(".global-run-row-project")).to_have_text(project_label)
+    expect(row.locator(".global-run-row-title")).to_have_text(title)
+    exact_status = row.locator(".global-run-row-heading > .status-pill").filter(
+        has_text=re.compile(rf"^{re.escape(status)}$")
+    )
+    expect(exact_status).to_have_count(1)
+    return row
 
 
 def _visible_dashboard(page: Page):
@@ -1067,7 +1092,12 @@ def test_project_worktree_presentation(control_client, monkeypatch, width: int, 
                     f".run-list-item[data-sidebar-editor-item='{RESPONSIVE_FIXTURE_RUN_ID}']"
                 )
                 history_row.wait_for()
-                expect(history_row).to_contain_text(RESPONSIVE_FIXTURE_PLAN_PATH)
+                expect(history_row).to_have_attribute(
+                    "data-sidebar-editor-item", RESPONSIVE_FIXTURE_RUN_ID
+                )
+                expect(history_row.locator(".run-list-title")).to_have_text(
+                    RESPONSIVE_FIXTURE_TITLE
+                )
                 _assert_document_moves(page)
                 history_row.click()
                 _assert_run_detail(page, RESPONSIVE_FIXTURE_TITLE, RESPONSIVE_FIXTURE_RUN_ID)
@@ -1087,14 +1117,21 @@ def test_project_worktree_presentation(control_client, monkeypatch, width: int, 
 
                 page.goto(f"{url}/?view=all-runs")
                 page.get_by_role("heading", name="All runs", exact=True).wait_for()
-                child_global_row = page.get_by_role(
-                    "button",
-                    name=re.compile(
-                        rf"^Test project · Worktree: Feature worktree · Completed · "
-                        rf"{re.escape(RESPONSIVE_GLOBAL_TITLE)} · {re.escape(RESPONSIVE_GLOBAL_RUN_ID)}$"
-                    ),
+                child_global_row = _assert_global_run_row(
+                    page,
+                    RESPONSIVE_GLOBAL_RUN_ID,
+                    project_label="Test project · Worktree: Feature worktree",
+                    title=RESPONSIVE_GLOBAL_TITLE,
                 )
                 child_global_row.wait_for()
+                child_global_row.click()
+                _assert_run_detail(page, RESPONSIVE_GLOBAL_TITLE, RESPONSIVE_GLOBAL_RUN_ID)
+                page.wait_for_function(
+                    "({ projectId, runId }) => "
+                    "new URL(location.href).searchParams.get('project') === projectId && "
+                    "new URL(location.href).searchParams.get('run') === runId",
+                    arg={"projectId": child_id, "runId": RESPONSIVE_GLOBAL_RUN_ID},
+                )
                 _assert_header_and_flow(page)
         finally:
             browser.close()
@@ -1285,7 +1322,12 @@ def test_responsive_route_matrix(control_client, monkeypatch, width: int, height
                 f".run-list-item[data-sidebar-editor-item='{RESPONSIVE_FIXTURE_RUN_ID}']"
             )
             run_row.scroll_into_view_if_needed()
-            expect(run_row).to_contain_text(RESPONSIVE_FIXTURE_PLAN_PATH)
+            expect(run_row).to_have_attribute(
+                "data-sidebar-editor-item", RESPONSIVE_FIXTURE_RUN_ID
+            )
+            expect(run_row.locator(".run-list-title")).to_have_text(
+                RESPONSIVE_FIXTURE_TITLE
+            )
             run_row.click()
             _assert_run_detail(page, RESPONSIVE_FIXTURE_TITLE, RESPONSIVE_FIXTURE_RUN_ID)
             detail_box = _run_history_detail(page).bounding_box()
@@ -1298,16 +1340,21 @@ def test_responsive_route_matrix(control_client, monkeypatch, width: int, height
 
             _open_destination(page, "All runs")
             page.get_by_role("heading", name="All runs", exact=True).wait_for()
-            all_run = page.get_by_role(
-                "button",
-                name=re.compile(
-                    rf"^Test project · Completed · {re.escape(RESPONSIVE_GLOBAL_TITLE)} · "
-                    rf"{re.escape(RESPONSIVE_GLOBAL_RUN_ID)}$"
-                ),
+            all_run = _assert_global_run_row(
+                page,
+                RESPONSIVE_GLOBAL_RUN_ID,
+                project_label="Test project",
+                title=RESPONSIVE_GLOBAL_TITLE,
             )
             all_run.wait_for()
             all_run.click()
             _assert_run_detail(page, RESPONSIVE_GLOBAL_TITLE, RESPONSIVE_GLOBAL_RUN_ID)
+            page.wait_for_function(
+                "({ projectId, runId }) => "
+                "new URL(location.href).searchParams.get('project') === projectId && "
+                "new URL(location.href).searchParams.get('run') === runId",
+                arg={"projectId": PROJECT_ID, "runId": RESPONSIVE_GLOBAL_RUN_ID},
+            )
             _assert_header_and_flow(page)
             if _compact(page):
                 page.get_by_role("button", name="← Back to Run history", exact=True).click()
@@ -2947,7 +2994,12 @@ def test_durable_recovery_ui_journey(control_client, monkeypatch, tmp_path):
                 dashboard.get_by_role(
                     "heading", name="Replacement worker started", exact=True
                 ).wait_for()
-                successor_id = dashboard.get_by_title("Copy run ID", exact=True).inner_text()
+                successor_identity = dashboard.get_by_title(
+                    "Copy full run ID", exact=True
+                )
+                expect(successor_identity).to_be_visible()
+                successor_id = successor_identity.get_attribute("aria-label")
+                assert successor_id
                 assert successor_id != source_id
                 page.wait_for_function(
                     "expected => new URL(location.href).searchParams.get('run') === expected",
