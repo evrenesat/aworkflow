@@ -767,10 +767,14 @@ def handle_ui_worker_command(args) -> int:
         )
     except OSError:
         # A child with no durable identity cannot safely outlive its wrapper.
-        try:
-            os.killpg(child.pid, signal.SIGKILL)
-        except ProcessLookupError:
-            pass
+        if child.poll() is None:
+            try:
+                os.killpg(child.pid, signal.SIGKILL)
+            except OSError:
+                # A signal error is safe to ignore only when this Popen now
+                # proves that the same child has already terminated.
+                if child.poll() is None:
+                    raise
         child.wait()
         child.stdout.close()
         child.stderr.close()

@@ -1173,3 +1173,43 @@ committing. Verify exactly one commit and clean tracked state. Publication,
 exact-SHA CI and live activation remain downstream engine delivery gates.
 
 No material findings
+
+
+---
+
+# Worker receipt exit race — cumulative review v01: approved
+
+Unchanged Pre-Handoff Base HEAD: `e77470fb59fc6aa990a351a0f0e126e085764d72`.
+Reviewed implementation HEAD: `bae3a2638864dbdca90e97efcfa345c4853a5584`.
+Range: 1 new / 1 total commit, `cp1 v01`, covering the full original plan
+and all three changed files. Original and active plan are
+`worker-receipt-exit-race-20260912.md`; no previous findings or fix overlays apply.
+
+The same Popen is polled before signalling and after a signalling OSError.
+Terminal observations allow the existing wait/pipe close and nonce-bound
+error/exit receipts; a live child signal failure propagates without waiting
+or fabricating terminal evidence. Receipt failure still returns 1 when the
+child exits 0. Owned-group targeting and receipt schema remain unchanged.
+The three controlled regressions stub every signal and cover exit-before,
+exit-during PermissionError, and live PermissionError. Original real-child
+cases remain intact. No material defects admitted under material-code-review.
+
+Verification: reused final worker command evidence from
+`/root/code/agent_flow/.aflow/runs/20260912t032724z-45174513/turns/turn-001/transport.stdout`
+and its completed result.json (the worktree-relative receipt is absent).
+`uv run pytest -q tests/test_worker_diagnostics.py --tb=short` passed all
+17 tests on final content (8.97 seconds, exit 0). Worker Ruff passed after
+removing the unused import. Reviewer independently ran
+`uv run ruff check aflow/ui_cli.py tests/test_worker_diagnostics.py`,
+`git diff --check`, and cumulative `git diff --check` successfully.
+No full suites, shared-runtime changes, or live services were needed.
+Exact historical macOS timing remains unproven; macOS CI is a separate gate.
+
+Approval finalization includes this tracked reviewer record in one final
+handoff commit above the unchanged base and preserves all three reviewed
+implementation blobs. One DEVLOG entry requires no compaction. No fix plan
+is created; the ignored original plan stays in place for engine finalization
+and records the final approved SHA outside the commit. Publication, exact-SHA
+CI and live activation remain downstream controller delivery gates.
+
+No material findings

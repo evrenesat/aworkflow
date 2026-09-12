@@ -1,5 +1,18 @@
 # DEVLOG
 
+## 2026-09-12 — Preserve receipts across child-exit cleanup races
+
+- The `aflow ui-worker` startup-receipt failure path now polls its direct child
+  before signalling the owned process group and re-polls after any signal
+  error. It suppresses an error only when that same `Popen` proves terminal;
+  a still-live permission failure remains visible.
+- Deterministic coverage exercises exit-before-signal, exit-during-signal,
+  and live-signal-denial cases without emitting an OS signal. The exact
+  historical macOS scheduling remains unproven; ownership and receipt schema
+  are unchanged, and full-suite/build/browser checks remain downstream gates.
+- Verification: the focused worker-diagnostics module passed all 17 tests,
+  including the original real-child cases; Ruff and `git diff --check` passed.
+
 ## 2026-09-12 — Wait for the exact restart action in dashboard tests
 
 - The CI failure in `ci-378278-mac-failed.log` showed the restart journey

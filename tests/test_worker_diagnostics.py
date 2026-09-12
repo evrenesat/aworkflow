@@ -2,7 +2,6 @@
 
 import json
 import os
-from pathlib import Path
 import shutil
 import sys
 import time
@@ -132,6 +131,137 @@ def test_foreign_launch_claim_never_establishes_failure(tmp_path, change):
     status = RunRepository(tmp_path).get_run_status(run.name)
     assert status.status == "needs_attention"
     assert status.worker_exit is None
+
+
+class _FakeStream:
+    def __init__(self):
+        self.closed = False
+
+    def close(self):
+        self.closed = True
+
+
+class _ControlledChild:
+    def __init__(self, poll_results):
+        self.pid = 424242
+        self.returncode = None
+        self.stdout = _FakeStream()
+        self.stderr = _FakeStream()
+        self._poll_results = list(poll_results)
+        self.poll_calls = 0
+        self.wait_calls = 0
+
+    def poll(self):
+        self.poll_calls += 1
+        result = self._poll_results.pop(0)
+        if result is not None:
+            self.returncode = result
+        return result
+
+    def wait(self):
+        self.wait_calls += 1
+        assert self.returncode is not None
+        return self.returncode
+
+
+def _prepare_child_json_failure(tmp_path, monkeypatch, child):
+    from types import SimpleNamespace
+    from aflow import ui_cli
+
+    unit, run = reserve(tmp_path)
+    receipts = run / "units"
+    receipts.mkdir()
+    (receipts / "start.json").write_text(json.dumps({"schema": 1, "run_id": run.name, "unit": unit, "nonce": "owned"}))
+    original = ui_cli._write_worker_receipt
+
+    def fail_child(directory, name, payload):
+        if name == "child.json":
+            raise OSError("fixture child receipt failure")
+        return original(directory, name, payload)
+
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(ui_cli, "_write_worker_receipt", fail_child)
+    monkeypatch.setattr(ui_cli.subprocess, "Popen", lambda *_args, **_kwargs: child)
+    monkeypatch.setattr(ui_cli, "process_birth_identity", lambda _pid: "fake-birth")
+    return ui_cli, SimpleNamespace(
+        receipt_dir=receipts,
+        nonce="owned",
+        worker_argv=["fake-worker"],
+    ), run, receipts
+
+
+def _assert_child_failure_receipts(run, receipts):
+    error = json.loads((receipts / "error.json").read_text())
+    exit_record = json.loads((receipts / "exit.json").read_text())
+    assert error["schema"] == 1
+    assert error["nonce"] == "owned"
+    assert error["stage"] == "wrapper_receipt"
+    assert error["message"] == "Could not persist worker process identity"
+    assert exit_record["schema"] == 1
+    assert exit_record["nonce"] == "owned"
+    assert exit_record["returncode"] == 0
+    assert RunRepository(run.parent.parent.parent).get_run_status(run.name).status == "failed"
+
+
+def test_child_receipt_failure_observes_exit_before_signalling(tmp_path, monkeypatch):
+    child = _ControlledChild([0])
+    ui_cli, args, run, receipts = _prepare_child_json_failure(tmp_path, monkeypatch, child)
+    signal_calls = []
+
+    def unexpected_signal(*call_args):
+        signal_calls.append(call_args)
+        pytest.fail("an already-exited child must not be signalled")
+
+    monkeypatch.setattr(ui_cli.os, "killpg", unexpected_signal)
+
+    assert ui_cli.handle_ui_worker_command(args) == 1
+    assert signal_calls == []
+    assert child.poll_calls == 1
+    assert child.wait_calls == 1
+    assert child.stdout.closed and child.stderr.closed
+    _assert_child_failure_receipts(run, receipts)
+
+
+def test_child_receipt_failure_rechecks_exit_after_signal_error(tmp_path, monkeypatch):
+    child = _ControlledChild([None, 0])
+    ui_cli, args, run, receipts = _prepare_child_json_failure(tmp_path, monkeypatch, child)
+    signal_calls = []
+
+    def signal_after_exit(pid, sig):
+        signal_calls.append((pid, sig))
+        raise PermissionError("signal raced with child exit")
+
+    monkeypatch.setattr(ui_cli.os, "killpg", signal_after_exit)
+
+    assert ui_cli.handle_ui_worker_command(args) == 1
+    assert signal_calls == [(child.pid, ui_cli.signal.SIGKILL)]
+    assert child.poll_calls == 2
+    assert child.wait_calls == 1
+    assert child.stdout.closed and child.stderr.closed
+    _assert_child_failure_receipts(run, receipts)
+
+
+def test_child_receipt_failure_propagates_signal_error_while_live(tmp_path, monkeypatch):
+    child = _ControlledChild([None, None])
+    ui_cli, args, run, receipts = _prepare_child_json_failure(tmp_path, monkeypatch, child)
+    signal_calls = []
+
+    def deny_live_signal(pid, sig):
+        signal_calls.append((pid, sig))
+        raise PermissionError("live child signal denied")
+
+    monkeypatch.setattr(ui_cli.os, "killpg", deny_live_signal)
+
+    with pytest.raises(PermissionError, match="live child signal denied"):
+        ui_cli.handle_ui_worker_command(args)
+    assert signal_calls == [(child.pid, ui_cli.signal.SIGKILL)]
+    assert child.poll_calls == 2
+    assert child.wait_calls == 0
+    assert not child.stdout.closed and not child.stderr.closed
+    assert not (receipts / "error.json").exists()
+    assert not (receipts / "exit.json").exists()
+    child.stdout.close()
+    child.stderr.close()
 
 
 @pytest.mark.parametrize("failed_file", ["diagnostic.json", "child.json"])
