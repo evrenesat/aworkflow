@@ -298,12 +298,23 @@ async function openNewRun() {
   await screen.findByLabelText('Run plan')
 }
 
-async function waitForPreflightReady(expectedRequest: Record<string, unknown> = {}) {
+type PreflightAction = 'start' | 'successor'
+
+const preflightActionLabels: Record<PreflightAction, string> = {
+  start: 'Start run',
+  successor: 'Confirm stop and start successor',
+}
+
+async function waitForPreflightReady(
+  intendedAction: PreflightAction = 'start',
+  expectedRequest: Record<string, unknown> = {},
+): Promise<HTMLElement> {
+  let validatedButton: HTMLElement | null = null
   await waitFor(() => {
     expect(screen.getByText('No uncommitted changes detected.')).toBeDefined()
-    const successorButton = screen.queryByRole('button', { name: 'Confirm stop and start successor' })
-    const actionButton = successorButton ?? screen.getByRole('button', { name: 'Start run' })
+    const actionButton = screen.getByRole('button', { name: preflightActionLabels[intendedAction], exact: true })
     expect(actionButton.getAttribute('disabled')).toBeNull()
+    validatedButton = actionButton
     if (Object.keys(expectedRequest).length > 0) {
       expect(api.preflightControlPlaneRun).toHaveBeenLastCalledWith(
         'control-project',
@@ -312,6 +323,7 @@ async function waitForPreflightReady(expectedRequest: Record<string, unknown> = 
       )
     }
   })
+  return validatedButton!
 }
 
 async function waitForControlAdmission(selectorLabel?: string) {
@@ -501,8 +513,7 @@ describe('RunDashboard', () => {
     expect((await screen.findByLabelText('Run workflow') as HTMLInputElement).value).toBe('Managed')
     openAdvanced()
     fireEvent.change(screen.getByLabelText('Run max turns'), { target: { value: '12' } })
-    await waitForPreflightReady()
-    fireEvent.click(screen.getByRole('button', { name: 'Confirm stop and start successor' }))
+    fireEvent.click(await waitForPreflightReady('successor'))
     await waitFor(() => expect(api.startControlPlaneRun).toHaveBeenCalledWith(project.project_id, expect.objectContaining({ workflow_name: 'managed', max_turns: 12, restarted_from_run_id: failed.run_id }), expect.any(String)))
     expect(api.ownerStopControlPlaneRun).not.toHaveBeenCalled()
   })
@@ -1740,18 +1751,16 @@ describe('RunDashboard', () => {
     await screen.findByLabelText('Run plan')
     choose('Run plan', 'plans/in-progress/demo.md')
     choose('Run workflow', 'other')
-    await waitForPreflightReady({
+    const confirmationButton = await waitForPreflightReady('successor', {
       plan_path: 'plans/in-progress/demo.md',
       workflow_name: 'other',
       restarted_from_run_id: 'run-owned',
     })
-    const confirmation = screen
-      .getByRole('button', { name: 'Confirm stop and start successor', exact: true })
-      .closest('.confirmation')
+    const confirmation = confirmationButton.closest('.confirmation')
     expect(confirmation?.textContent).toContain('and start')
     expect(confirmation?.textContent).toContain('successor workflow')
     expect(screen.getAllByText('run-owned').length).toBeGreaterThanOrEqual(2)
-    fireEvent.click(screen.getByRole('button', { name: 'Confirm stop and start successor' }))
+    fireEvent.click(confirmationButton)
 
     await waitFor(() => expect(api.startControlPlaneRun).toHaveBeenCalledWith(
       'control-project',
@@ -1804,8 +1813,7 @@ describe('RunDashboard', () => {
     fireEvent.click(screen.getByRole('button', { name: 'More', exact: true }))
     fireEvent.click(screen.getByRole('menuitem', { name: 'Cancel', exact: true }))
     fireEvent.click(screen.getByRole('button', { name: 'Restart with changes' }))
-    await waitForPreflightReady()
-    fireEvent.click(screen.getByRole('button', { name: 'Confirm stop and start successor' }))
+    fireEvent.click(await waitForPreflightReady('successor'))
 
     await screen.findByText(/Successor outcome is unknown/)
     expect(screen.getByLabelText('Run workflow').getAttribute('disabled')).not.toBeNull()
@@ -1852,8 +1860,7 @@ describe('RunDashboard', () => {
     choose('Run workflow', 'other')
     fireEvent.click(screen.getByRole('button', { name: 'Cancel' }))
     fireEvent.click(screen.getByRole('button', { name: 'Restart with changes' }))
-    await waitForPreflightReady()
-    fireEvent.click(screen.getByRole('button', { name: 'Confirm stop and start successor' }))
+    fireEvent.click(await waitForPreflightReady('successor'))
     await screen.findByRole('button', { name: 'Retry exact successor request' })
     fireEvent.click(screen.getByRole('button', { name: 'Retry exact successor request' }))
 
@@ -1896,8 +1903,7 @@ describe('RunDashboard', () => {
     choose('Run workflow', 'other')
     fireEvent.click(screen.getByRole('button', { name: 'Cancel' }))
     fireEvent.click(screen.getByRole('button', { name: 'Restart with changes' }))
-    await waitForPreflightReady()
-    fireEvent.click(screen.getByRole('button', { name: 'Confirm stop and start successor' }))
+    fireEvent.click(await waitForPreflightReady('successor'))
 
     await waitFor(() => expect(screen.getByText(/Restart stopped without a confirmed successor: stop rejected by server/)).toBeDefined())
     expect(api.startControlPlaneRun).not.toHaveBeenCalled()
@@ -1919,8 +1925,7 @@ describe('RunDashboard', () => {
     choose('Run workflow', 'other')
     fireEvent.click(screen.getByRole('button', { name: 'Cancel' }))
     fireEvent.click(screen.getByRole('button', { name: 'Restart with changes' }))
-    await waitForPreflightReady()
-    fireEvent.click(screen.getByRole('button', { name: 'Confirm stop and start successor' }))
+    fireEvent.click(await waitForPreflightReady('successor'))
 
     await waitFor(() => expect(screen.getByText(/Source inactivity could not be confirmed/)).toBeDefined())
     expect(screen.getByText(/No successor was started/)).toBeDefined()
@@ -1939,8 +1944,7 @@ describe('RunDashboard', () => {
     choose('Run workflow', 'other')
     fireEvent.click(screen.getByRole('button', { name: 'Cancel' }))
     fireEvent.click(screen.getByRole('button', { name: 'Restart with changes' }))
-    await waitForPreflightReady()
-    fireEvent.click(screen.getByRole('button', { name: 'Confirm stop and start successor' }))
+    fireEvent.click(await waitForPreflightReady('successor'))
 
     await waitFor(() => expect(screen.getByText(/Source inactivity could not be confirmed/)).toBeDefined())
     expect(vi.mocked(api.getControlPlaneRun).mock.calls.length).toBeGreaterThanOrEqual(31)
@@ -3511,7 +3515,7 @@ describe('RunDashboard', () => {
     // Choosing a stage keeps the exact child ID in the request, not its
     // display name or the family root.
     choose('Run team stage', 'product_fast')
-    await waitForPreflightReady({ team: 'product_fast' })
+    await waitForPreflightReady('start', { team: 'product_fast' })
     fireEvent.click(screen.getByRole('button', { name: 'Start run' }))
     await waitFor(() => expect(api.startControlPlaneRun).toHaveBeenCalledTimes(1))
     expect(api.startControlPlaneRun).toHaveBeenLastCalledWith(

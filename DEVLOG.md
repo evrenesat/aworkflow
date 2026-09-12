@@ -1,5 +1,19 @@
 # DEVLOG
 
+## 2026-09-12 — Wait for the exact restart action in dashboard tests
+
+- The CI failure in `ci-378278-mac-failed.log` showed the restart journey
+  reaching `RunDashboard.test.tsx:1749` while `Start run` was already rendered
+  but `Confirm stop and start successor` was not. The shared preflight helper
+  therefore could report readiness at the wrong action boundary.
+- Kept production behavior and request assertions unchanged. The test helper
+  now requires the intended enabled action, and every restart confirmation path
+  explicitly waits for the successor action while ordinary launches wait for
+  `Start run`.
+- Verification: the bounded `RunDashboard.test.tsx` command passed all 114
+  tests and `git diff --check` passed. No build, browser, or full-suite repeat
+  is needed for this test-only correction.
+
 ## 2026-09-12 — Keep family stage clicks stable during preview refresh
 
 - Replaced the in-flow settings preview paragraph with one shared hosted/fallback

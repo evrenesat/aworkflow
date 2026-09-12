@@ -1133,3 +1133,43 @@ No fix plan or DEVLOG compaction is needed. Publication, exact-SHA CI and live
 activation remain downstream gates; physical mobile checks are unverified.
 
 No material findings
+
+
+---
+
+# Restart action readiness — cumulative review v01: approved
+
+Unchanged base `378278a8e3974cc6eda9bb8c7411a585ca305a19` → reviewed HEAD
+`4f237dbe93cfb8fd51f20ccf7114f5046413aeb4`: 1 new / 1 total commit,
+`cp1 v01`, covering the entire original checkpoint and cumulative implementation.
+Original and active plan are restart-action-readiness-20260912.md. No previous
+findings or follow-up overlays apply to this handoff.
+
+Reviewed the complete two-file diff, every readiness caller, successor recovery
+and negative assertions, and production preflight/confirmation rendering.
+The helper requires the exact connected accessible action and its enabled state;
+all seven successor paths select successor explicitly, ordinary launches select
+Start, and existing exact preflight request assertions remain. Source ownership,
+stop-before-start ordering, inactivity, lineage and idempotency checks survive.
+No production changes, relaxed assertions, sleeps or timeout inflation.
+The retained CI log confirms the missing confirmation at the original line 1749;
+this is a test-readiness correction, not a reproduced production restart defect
+or proof of the precise asynchronous scheduling that caused CI failure.
+
+Reused completed worker result and raw command receipt from
+`/root/code/agent_flow/.aflow/runs/20260912t030941z-5b40bc70/turns/turn-001/`.
+The prompt's worktree-relative receipt is absent; the parent controller receipt
+is available. After resolving initially absent vitest dependencies, the final
+`npm --prefix apps/aflow_app/web test -- --run src/components/RunDashboard.test.tsx`
+passed 114/114 at 03:13:24 UTC (exit 0). Independent cumulative
+`git diff --check 378278a8e3974cc6eda9bb8c7411a585ca305a19 HEAD` passed.
+No repeated full suite, build/browser run, or shared runtime change.
+
+Approval finalization includes this tracked review record in one unpublished
+handoff commit above the unchanged base, preserving both reviewed blobs.
+DEVLOG has one handoff entry; no compaction or fix plan is needed. Keep the
+ignored original plan in place and record the final approved SHA there after
+committing. Verify exactly one commit and clean tracked state. Publication,
+exact-SHA CI and live activation remain downstream engine delivery gates.
+
+No material findings
