@@ -76,6 +76,15 @@ def fake_aflow(tmp_path: Path) -> Path:
                 write("error.json", {"schema": 1, "nonce": args.nonce, "error": inner[1]})
                 sys.exit(127)
 
+            if inner and inner[0] == "FAIL_UNTIL_RELEASE":
+                ready_path = Path(inner[1])
+                release_path = Path(inner[2])
+                write("error.json", {"schema": 1, "nonce": args.nonce, "error": inner[3]})
+                ready_path.touch()
+                while not release_path.exists():
+                    time.sleep(0.05)
+                sys.exit(127)
+
             child = subprocess.Popen(
                 inner, stdin=subprocess.DEVNULL,
                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
@@ -130,6 +139,17 @@ def _wait_until(predicate, timeout: float = 10.0) -> bool:
             return True
         time.sleep(0.05)
     return False
+
+
+def _process_owned(pid: int, birth: str) -> bool:
+    from aflow.process_identity import process_birth_identity
+
+    return process_birth_identity(pid) == birth
+
+
+def _unit_is_inactive(manager: PersistentUnitManager, name: str) -> bool:
+    state = manager.get(name)
+    return state is not None and not state.is_active
 
 
 def test_start_writes_receipts_and_reports_active(tmp_path, fake_aflow, repo, monkeypatch):
@@ -195,8 +215,51 @@ def test_startup_failure_yields_actionable_error_without_active_unit(tmp_path, f
     unit = "aflow-run-20260908t000000z-0000000d.service"
     with pytest.raises(PersistentUnitError, match="boom"):
         manager.start(unit, ("FAIL", "boom"), cwd=repo)
+    assert _wait_until(lambda: _unit_is_inactive(manager, unit))
     state = manager.get(unit)
     assert state is not None and not state.is_active
+
+
+def test_startup_failure_observes_live_wrapper_until_release(tmp_path, fake_aflow, repo):
+    _harness(repo)
+    manager = PersistentUnitManager(executable=fake_aflow)
+    unit = "aflow-run-20260908t000000z-0000000d-barrier.service"
+    receipts = repo / ".aflow" / "runs" / "20260908t000000z-0000000d-barrier" / "units"
+    ready = repo / "startup-error-ready"
+    release = repo / "startup-error-release"
+    wrapper_pid = None
+    wrapper_birth = None
+    try:
+        with pytest.raises(PersistentUnitError, match="boom"):
+            manager.start(
+                unit,
+                ("FAIL_UNTIL_RELEASE", str(ready), str(release), "boom"),
+                cwd=repo,
+            )
+        start = json.loads((receipts / "start.json").read_text())
+        wrapper_pid = start["wrapper_pid"]
+        wrapper_birth = start["wrapper_birth"]
+        assert _wait_until(ready.exists)
+        assert _process_owned(wrapper_pid, wrapper_birth)
+
+        held = manager.get(unit)
+        assert held is not None and held.is_active
+        assert held.sub_state == "start-post"
+
+        release.touch()
+        assert _wait_until(lambda: _unit_is_inactive(manager, unit))
+        state = manager.get(unit)
+        assert state is not None and not state.is_active
+    finally:
+        release.touch()
+        if isinstance(wrapper_pid, int) and isinstance(wrapper_birth, str):
+            if not _wait_until(lambda: not _process_owned(wrapper_pid, wrapper_birth)):
+                if _process_owned(wrapper_pid, wrapper_birth):
+                    try:
+                        os.kill(wrapper_pid, signal.SIGTERM)
+                    except ProcessLookupError:
+                        pass
+                assert _wait_until(lambda: not _process_owned(wrapper_pid, wrapper_birth))
 
 
 def test_duplicate_start_is_refused(tmp_path, fake_aflow, repo, monkeypatch):

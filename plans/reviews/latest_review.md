@@ -1013,3 +1013,42 @@ Publication, exact-SHA CI and live activation remain downstream engine delivery
 gates, not claims of this local approval. Physical-device acceptance is unverified.
 
 No material findings
+
+
+---
+
+# Startup error observation — cumulative review v01: approved
+
+Unchanged Pre-Handoff Base HEAD: `837fdc458ea0aa5b5124e6f58241cc20073c4f8c`.
+Reviewed HEAD: `0767a332a15e6c13408dc73bfddaca4d742b9d38`.
+Coverage: 1 new / 1 total commit, `cp1 v01`, original checkpoint 1 in full.
+Original and active plan are `ci-startup-error-observation-20260912.md`;
+no previous findings or fix overlays apply to this handoff.
+
+Reviewed the complete two-file diff, fixture ownership and cleanup, manager
+startup/observation, process-birth identity, and actual wrapper error contract.
+The original actionable-error and final inactivity assertions are preserved.
+Bounded observation permits actual wrapper exit; the explicit release barrier
+proves the same owned wrapper remains active/start-post after its error receipt.
+Finally releases the private barrier and guards fallback signaling by recorded
+process-birth identity. Production lifecycle and schema are unchanged.
+No material findings pass the admission gate.
+
+Retained completed worker transport command receipts at
+`/root/code/agent_flow/.aflow/runs/20260912t014644z-490f4a4b/turns/turn-001/transport.stdout`
+confirm both changed tests passed (2 in 0.46s), followed by
+`uv run pytest -q tests/test_persistent_units.py --tb=short`
+(9 passed in 2.15s, exit 0). The controller-root result confirms completion;
+the prompt's worktree-relative result is absent. Reused valid evidence without
+repeating tests. Independent `git diff --check 837fdc458ea0aa5b5124e6f58241cc20073c4f8c HEAD`
+passed. No full suite, build, or shared runtime changes.
+
+Approval finalization includes this tracked record in exactly one unpublished
+handoff commit after the unchanged base. Preserve both reviewed implementation
+blobs and the single handoff DEVLOG entry; no compaction or fix plan is needed.
+Leave the ignored original plan in place for engine finalization and record
+the approved SHA there after committing. Verify one commit and clean tracked
+state. Publication, exact-SHA CI and live activation remain controller delivery
+gates and are not claimed by this local review.
+
+No material findings

@@ -1,5 +1,13 @@
 # DEVLOG
 
+## 2026-09-12 — Observe startup errors through wrapper exit
+
+- Stabilized persistent-unit startup failure coverage with bounded eventual
+  inactivity observation and a held test wrapper proving that `error.json` is
+  not process-exit evidence. Production observation remains authoritative on
+  the recorded process-birth identity; no production lifecycle or schema
+  changed.
+
 ## 2026-09-12 — Keep dirty settings headers within two rows
 
 - Use the compact settings section selector through 1399px so all seven
