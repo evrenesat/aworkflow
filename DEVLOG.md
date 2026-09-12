@@ -1,5 +1,14 @@
 # DEVLOG
 
+## 2026-09-12 — Retain unfinished family wizard across guided tabs
+
+- GlobalSettings now keeps the existing TeamFamiliesSettings owner mounted for
+  every guided Settings tab, exposing it only on Teams through native hidden
+  semantics. The wizard remains a local draft owner, stays in the shared dirty
+  guard, and still resets on explicit reload.
+- Added focused GlobalSettings and desktop Chromium/390×844 WebKit coverage for
+  exact wizard name, IDs, source, stage, hidden accessibility and reset behavior.
+
 ## 2026-09-12 — Capture startup admission failure evidence
 
 - Added failure-only evidence around the existing Chromium startup boundary.

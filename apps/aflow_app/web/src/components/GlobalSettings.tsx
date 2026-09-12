@@ -761,7 +761,30 @@ export function GlobalSettings({ onDirtyChange, onSaved }: { onDirtyChange: (dir
       onCloseInstall={() => setInstallDisclosureOpen(false)}
       hosted={hosted}
       visible={tab === 'Skills'}
-    /></div>{tab === 'Changelog' ? <ChangelogSettings /> : tab === 'General' ? <div className="settings-fields">
+    /></div>{draft && <div className="settings-retained-team-families" hidden={tab !== 'Teams'} aria-hidden={tab !== 'Teams' || undefined}>
+      <TeamFamiliesSettings
+        draft={draft}
+        baseline={baseline}
+        selectedTeam={selectedTeam || teamNames[0] || ''}
+        navigationVersion={navigationVersion}
+        active={tab === 'Teams'}
+        wizardResetVersion={teamWizardResetVersion}
+        onSelectTeam={setSelectedTeam}
+        onNavigate={() => setNavigationVersion(value => value + 1)}
+        onChange={changeDraft}
+        previewPending={draftPreviewState.pending}
+        previewError={draftPreviewState.error?.message ?? null}
+        previewReady={draftPreviewState.current}
+        newTeamName={newTeamName}
+        newTeamError={newTeamError}
+        onNewTeamNameChange={value => { setNewTeamName(value); setNewTeamError(null) }}
+        onAddTeam={addTeam}
+        onOpenPrompt={(team, role) => { setSelectedPrompt(JSON.stringify(['role', team, role])); setTab('Prompts') }}
+        onPreviewConversion={previewFamilyConversion}
+        onAddFamily={addFamilyToDraft}
+        onWizardDirtyChange={setTeamWizardDirty}
+      />
+    </div>}{tab === 'Changelog' ? <ChangelogSettings /> : tab === 'General' ? <div className="settings-fields">
       <AppearanceSelector /><RecentRunsLimit />
       <h3>Server settings</h3>
       {server && Object.values(server.restart).some(Boolean) && <p role="status">Saved server binding or root changes require a server restart.</p>}
@@ -806,30 +829,6 @@ export function GlobalSettings({ onDirtyChange, onSaved }: { onDirtyChange: (dir
           <span className="inline-action"><button type="button" className="btn btn-secondary" onClick={addRole}>Add role</button>{newRoleError && <span role="alert" className="text-sm add-team-error">{newRoleError}</span>}</span>
         </div>
       </>}
-      <div className="settings-retained-team-families" hidden={tab !== 'Teams'} aria-hidden={tab !== 'Teams' || undefined}>
-        <TeamFamiliesSettings
-          draft={draft}
-          baseline={baseline}
-          selectedTeam={selectedTeam || teamNames[0] || ''}
-          navigationVersion={navigationVersion}
-          active={tab === 'Teams'}
-          wizardResetVersion={teamWizardResetVersion}
-          onSelectTeam={setSelectedTeam}
-          onNavigate={() => setNavigationVersion(value => value + 1)}
-          onChange={changeDraft}
-          previewPending={draftPreviewState.pending}
-          previewError={draftPreviewState.error?.message ?? null}
-          previewReady={draftPreviewState.current}
-          newTeamName={newTeamName}
-          newTeamError={newTeamError}
-          onNewTeamNameChange={value => { setNewTeamName(value); setNewTeamError(null) }}
-          onAddTeam={addTeam}
-          onOpenPrompt={(team, role) => { setSelectedPrompt(JSON.stringify(['role', team, role])); setTab('Prompts') }}
-          onPreviewConversion={previewFamilyConversion}
-          onAddFamily={addFamilyToDraft}
-          onWizardDirtyChange={setTeamWizardDirty}
-        />
-      </div>
       {tab === 'Workflows' && <SidebarEditorLayout selection={selectedWorkflow} navigationVersion={navigationVersion} listLabel="Workflows" navigation={<div>{['Defaults', ...workflowNames].map(name => <button data-sidebar-editor-item={name} className={`btn sidebar-entry ${selectedWorkflow === name ? 'btn-primary' : 'btn-secondary'}`} aria-pressed={selectedWorkflow === name} key={name} onClick={() => { setSelectedWorkflow(name); setNavigationVersion(value => value + 1) }}>{name === 'Defaults' ? name : formatMachineChoice(name, workflowNames)}</button>)}</div>}><div className="settings-fields">{selectedWorkflow === 'Defaults' && <><h3>Defaults</h3><Combobox label="Default workflow" value={draft.default_workflow ?? ''} options={workflowNames} optionLabel={value => formatMachineChoice(value, workflowNames)} onChange={value => change(next => { next.default_workflow = value })} /><label>Max turns<input className="input" type="number" min="1" value={draft.max_turns ?? ''} onChange={e => change(next => { next.max_turns = e.target.value === '' ? null : Number(e.target.value) })} /></label><label>Manager supervision<select className="input" aria-label="Default manager supervision" value={draft.default_manager_enabled == null ? 'unset' : draft.default_manager_enabled ? 'enabled' : 'disabled'} onChange={e => change(next => { const raw = e.target.value; next.default_manager_enabled = raw === 'unset' ? null : raw === 'enabled' })}><option value="enabled">Enabled</option><option value="disabled">Disabled</option><option value="unset">Disabled (default)</option></select></label><p className="text-xs text-dim">Applies to new runs in every workflow without its own override. Omitted means disabled.</p></>}{Object.entries(draft.workflows).filter(([name]) => name === selectedWorkflow).map(([workflow, value]) => <div className="card" key={workflow}><h3>{formatMachineChoice(workflow, workflowNames)}</h3><p>{(value.executable_steps ?? value.declared_steps).map(formatMachineLabel).join(' → ')}</p><label>Default team<select className="input" value={draft.workflow_default_teams[workflow] ?? ''} onChange={e => change(next => { next.workflow_default_teams[workflow] = e.target.value || null })}><option value="">Unset</option>{teamNames.map(team => <option key={team} value={team}>{formatMachineChoice(team, teamNames)}</option>)}</select></label><label>Manager supervision<select className="input" aria-label={`Manager supervision for workflow ${formatMachineChoice(workflow, workflowNames)}`} value={value.manager_enabled == null ? 'inherit' : value.manager_enabled ? 'enabled' : 'disabled'} onChange={e => change(next => { const raw = e.target.value; next.workflows[workflow].manager_enabled = raw === 'inherit' ? null : raw === 'enabled' })}><option value="inherit">Inherit</option><option value="enabled">Enabled</option><option value="disabled">Disabled</option></select></label><p className="text-xs text-dim">Effective supervision: {(value.effective_manager_enabled ?? false) ? 'Enabled' : 'Disabled'} ({managerSourceLabel(value.manager_enabled_source)}). Applies to new runs; the launch-default workflow does not affect inheritance.</p></div>)}</div></SidebarEditorLayout>}
       {tab === 'Prompts' && <PromptsSettings selected={selectedPrompt} onSelect={setSelectedPrompt} draft={draft} change={change} names={pendingNames} rename={(name, target) => setPendingNames({ ...pendingNames, [name]: target })}
         deleted={deletedPrompts}

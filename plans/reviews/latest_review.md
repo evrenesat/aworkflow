@@ -1492,3 +1492,46 @@ are force-added.
 Publication, exact-SHA CI and live activation remain separate coordinator gates.
 
 No material findings
+## Family wizard tab retention — cumulative review v01: approved
+
+Base: `524b002ad9d6ad68410c1675711f661f025c463f` (unchanged).
+Reviewed HEAD: `0608c6435d763abe024762433e642456f20c0f84`.
+Coverage: 1 new / 1 total commit, `cp1 v01`, all five changed files and
+the entire original/active family-wizard-tab-retention-20260912 plan.
+No previous findings or fix overlays apply to this handoff.
+
+Applied material-code-review admission, exclusions and proportionate-fix rules.
+The single existing owner now occupies a stable guided-fragment position beside
+Skills, retaining draft, preview, reset, active and dirty callbacks inside the
+busy-disabled fieldset. Native hidden semantics and the existing hidden CSS
+exclude inactive controls from layout and accessibility. Advanced behavior and
+the shared save owner remain intact. Component coverage checks modified stages,
+exact name/ID/source, tab retention, dirty state, no writes and confirmed reload.
+The existing browser journey retains its subsequent identity/save/layout checks.
+
+Reused final successful worker receipts from the registered parent checkout:
+`/root/code/agent_flow/.aflow/runs/20260912t115928z-541e34c2/turns/turn-001/transport.stdout`
+and completed result.json; the worktree-relative receipt is absent.
+
+- `npm --prefix apps/aflow_app/web test -- --run src/components/GlobalSettings.test.tsx -t 'wizard'`: 1 passed, 76 skipped.
+- `npm --prefix apps/aflow_app/web run build`: TypeScript/Vite passed.
+- `AFLOW_TEST_BROWSER=chromium uv run --frozen --project apps/aflow_app/server pytest -q 'apps/aflow_app/server/tests/test_responsive_browser.py::test_responsive_team_family_journey[desktop]' --tb=short --basetemp "$family_cp1_chromium_tmp"`: 1 passed, 16.58s.
+- Corresponding WebKit `phone-tall` (390×844) node with fresh external
+  `--basetemp "$family_cp1_webkit_tmp"`: 1 passed, 19.03s.
+- Pre-move regression failed at the missing retained wizard lookup. Intermediate
+  assertions were corrected to inspect Base inputs on the Base step; final tests
+  retain stage and exact Base/source checks.
+- Reviewer inspected retained Chromium light and WebKit dark family screenshots
+  under `/tmp/aflow-family-cp1-chromium.0QvOTd/` and
+  `/tmp/aflow-family-cp1-webkit.RobSGX/`; cumulative diff whitespace check passed.
+
+No full suites or live writes. One DEVLOG entry needs no compaction. Approval
+includes this tracked record in one unpublished final commit above the original
+base, preserving all five reviewed blobs. No fix plan is needed. Leave the
+ignored original plan in place, recording the final SHA after commit creation;
+verify one accumulated commit and clean tracked state. Publication, exact-SHA CI
+and live acceptance remain separate coordinator gates.
+
+No material findings
+
+---

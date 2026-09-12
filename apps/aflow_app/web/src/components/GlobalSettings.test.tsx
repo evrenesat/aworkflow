@@ -999,6 +999,67 @@ describe('GlobalSettings', () => {
     expect(api.patchGlobalConfig).not.toHaveBeenCalled()
   })
 
+  it('retains an unfinished wizard across guided tabs and resets it on reload', async () => {
+    const onDirty = vi.fn()
+    const confirm = vi.spyOn(window, 'confirm').mockReturnValue(true)
+    vi.mocked(api.postGlobalConfigForm).mockResolvedValue(familyResponse)
+    try {
+      render(<GlobalSettings onDirtyChange={onDirty} onSaved={() => {}} />)
+      await screen.findByLabelText('Effort codex.worker')
+      fireEvent.click(screen.getByRole('tab', { name: 'Teams', exact: true }))
+      fireEvent.click(screen.getByRole('button', { name: 'New family', exact: true }))
+
+      const wizard = screen.getByLabelText('Create team family')
+      fireEvent.change(within(wizard).getByLabelText('Family display name'), { target: { value: 'Retained family draft' } })
+      fireEvent.click(within(wizard).getByText('Technical details', { exact: true }))
+      fireEvent.change(within(wizard).getByLabelText('Stable Base ID'), { target: { value: 'retained_family' } })
+      fireEvent.change(within(wizard).getByLabelText('Base assignment source'), { target: { value: 'product' } })
+      fireEvent.click(within(wizard).getByRole('button', { name: 'Next: stages', exact: true }))
+      fireEvent.click(within(wizard).getByRole('button', { name: 'Add upgrade stage', exact: true }))
+      const stageId = (within(wizard).getByLabelText('Stable ID for stage 1') as HTMLInputElement).value
+      fireEvent.change(within(wizard).getByLabelText('Stage 1 display name'), { target: { value: 'Modified stage' } })
+
+      for (const tab of ['Changelog', 'General', 'Skills'] as const) {
+        fireEvent.click(screen.getByRole('tab', { name: tab, exact: true }))
+        if (tab === 'Changelog') await screen.findByRole('heading', { name: 'Changelog', exact: true })
+        if (tab === 'General') await screen.findByLabelText('Bind host')
+        if (tab === 'Skills') await screen.findByLabelText('SKILL.md for aflow-manager')
+        expect(screen.queryByLabelText('Family display name')).toBeNull()
+        expect(screen.queryByRole('button', { name: 'Next: review', exact: true })).toBeNull()
+      }
+
+      fireEvent.click(screen.getByRole('tab', { name: 'Teams', exact: true }))
+      const retainedWizard = screen.getByLabelText('Create team family')
+      expect(within(retainedWizard).getByRole('heading', { name: 'Stages', exact: true })).toBeTruthy()
+      expect(retainedWizard.textContent).toContain('Base · Retained family draft')
+      expect(retainedWizard.textContent).toContain('retained_family')
+      expect(retainedWizard.querySelector('.team-family-wizard-steps .current')?.textContent).toContain('2')
+      expect((within(retainedWizard).getByLabelText('Stage 1 display name') as HTMLInputElement).value).toBe('Modified stage')
+      expect((within(retainedWizard).getByLabelText('Stable ID for stage 1') as HTMLInputElement).value).toBe(stageId)
+      fireEvent.click(within(retainedWizard).getByRole('button', { name: 'Back', exact: true }))
+      expect((within(retainedWizard).getByLabelText('Family display name') as HTMLInputElement).value).toBe('Retained family draft')
+      expect((within(retainedWizard).getByLabelText('Stable Base ID') as HTMLInputElement).value).toBe('retained_family')
+      expect((within(retainedWizard).getByLabelText('Base assignment source') as HTMLSelectElement).value).toBe('product')
+      fireEvent.click(within(retainedWizard).getByRole('button', { name: 'Next: stages', exact: true }))
+      expect(within(retainedWizard).getByRole('heading', { name: 'Stages', exact: true })).toBeTruthy()
+      expect((within(retainedWizard).getByLabelText('Stage 1 display name') as HTMLInputElement).value).toBe('Modified stage')
+      await waitFor(() => expect(onDirty).toHaveBeenLastCalledWith(true))
+      expect((screen.getByRole('button', { name: 'Save all changes', exact: true }) as HTMLButtonElement).disabled).toBe(true)
+      expect(api.patchGlobalConfig).not.toHaveBeenCalled()
+      expect(api.saveSettings).not.toHaveBeenCalled()
+
+      fireEvent.click(screen.getByRole('button', { name: 'Reload server settings', exact: true }))
+      expect(confirm).toHaveBeenCalledWith('Discard unsaved settings and reload?')
+      await waitFor(() => expect(api.getGlobalConfig).toHaveBeenCalledTimes(2))
+      await screen.findByRole('button', { name: 'New family', exact: true })
+      expect(screen.queryByLabelText('Family display name')).toBeNull()
+      expect(screen.queryByRole('heading', { name: 'Stages', exact: true })).toBeNull()
+      await waitFor(() => expect(onDirty).toHaveBeenLastCalledWith(false))
+    } finally {
+      confirm.mockRestore()
+    }
+  })
+
   it('refreshes unsaved family role and prompt projections from the owner preview', async () => {
     familyPreviewState = null
     vi.mocked(api.postGlobalConfigForm).mockImplementation(async request => familyPreviewResponse(request))
