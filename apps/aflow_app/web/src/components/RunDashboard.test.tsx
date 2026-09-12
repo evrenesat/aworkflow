@@ -3175,6 +3175,37 @@ describe('RunDashboard', () => {
     expect(api.getRunContext).toHaveBeenCalledWith('control-project', 'run-owned', 'lite', false, expect.objectContaining({ signal: expect.any(AbortSignal) }))
   })
 
+  it('keeps owner actions ahead of the complete canonical checkpoint evidence', async () => {
+    const listed = { ...ownedRun, evidence: {}, plan_path: null, progress: canonicalListProgress() }
+    const canonicalDetail = canonicalDetailProgress()
+    vi.mocked(api.listControlPlaneRuns).mockResolvedValue({ runs: [listed], next_cursor: null, schema_version: 1 })
+    vi.mocked(api.getControlPlaneRun).mockResolvedValue(listed)
+    vi.mocked(api.getRunContext).mockResolvedValue({
+      run_id: listed.run_id,
+      level: 'lite',
+      schema_version: 1,
+      data: { progress: canonicalDetail },
+    })
+
+    const { container } = renderDashboard()
+    const detail = await screen.findByLabelText('Run details')
+    const currentCheckpoint = await within(detail).findByRole('button', { name: /Checkpoint 5: Active/ })
+    const identity = container.querySelector('.run-progress-header')
+    const adjust = within(detail).getByText('Adjust run', { selector: 'summary' }).closest('details')
+    const ownerActions = within(detail).getByRole('button', { name: 'Stop after current turn', exact: true }).closest('section')
+    const evidence = within(detail).getByLabelText('Checkpoint history')
+
+    expect(identity).not.toBeNull()
+    expect(adjust).not.toBeNull()
+    expect(ownerActions).not.toBeNull()
+    expect(identity!.compareDocumentPosition(adjust!) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy()
+    expect(adjust!.compareDocumentPosition(ownerActions!) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy()
+    expect(ownerActions!.compareDocumentPosition(evidence) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy()
+    expect(currentCheckpoint.getAttribute('aria-current')).toBe('true')
+    expect(within(detail).getByRole('button', { name: /Checkpoint 4: Reviewed/ })).toBeDefined()
+    expect(within(detail).getByText('Team & change history', { selector: 'summary' })).toBeDefined()
+  })
+
   it('inspects selected checkpoint history while preserving full diagnostics on refresh', async () => {
     const listed = { ...ownedRun, evidence: {}, plan_path: null, progress: canonicalListProgress() }
     const canonicalDetail = canonicalDetailProgress()

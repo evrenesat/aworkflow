@@ -422,7 +422,8 @@ input::placeholder, textarea::placeholder {
   flex-wrap: wrap;
 }
 
-.run-progress-header {
+.run-progress-header,
+.run-progress-evidence {
   display: flex;
   flex-direction: column;
   gap: var(--spacing-sm);

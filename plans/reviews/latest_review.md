@@ -2242,3 +2242,46 @@ state. Publication, exact-SHA CI, activation and live timing remain separate
 controller/coordinator delivery gates and are not claimed by this review.
 
 No material findings
+
+
+---
+
+## Owner controls before context — cumulative review approved
+
+Review base: `cd718ed859a86bd3fbd68866d0b6f103e01e5004` (unchanged Pre-Handoff Base HEAD).
+Reviewed HEAD: `d8b8579c9da1ed110bf0fecc5321f54b3dbbb439`.
+Coverage: 1 new / 1 total commit, `cp1 v01`, all six changed files and the
+complete original one-checkpoint plan. No previous findings or fix overlays
+apply to this handoff; unrelated historical review records remain preserved.
+
+No material findings. Existing identity and owner controls precede canonical
+summary/detail in document flow. The move preserves control conditions,
+handlers, drafts, pending admission, legacy exclusions and complete evidence.
+No loader, backend, scrolling or focus implementation changed. The held-history
+probe awaits initial phone heading focus before positioning its pointer, then
+real canonical layout plus the exact Unassigned history selected row/detail
+reconciliation after release. Original coordinates, 1px geometry, scroll,
+focus, hit identity and one native click remain enforced on both viewports.
+
+Retained worker command results were inspected and reused:
+`/root/code/agent_flow/.aflow/runs/20260912t234608z-33f419e3/turns/turn-001/transport.stdout`
+and its completed `result.json` (the controller owns these outside the worktree).
+
+- RunDashboard and CheckpointHistory: 144 passed (122 + 22); build passed.
+- Chromium: 5 passed, desktop/phone pointer, desktop restart and both early
+  selected-detail cases; basetemp `/tmp/aflow-cp1-chromium.ZwGksg`.
+- WebKit: 3 passed, desktop/phone pointer and phone restart;
+  basetemp `/tmp/aflow-cp1-webkit.8fIHNG`.
+- Retained desktop light and phone dark live-control screenshots inspected.
+- Independent full-range `git diff --check` passed; tracked worktree clean
+  before reviewer bookkeeping. No full suite repeated or portable tests changed.
+
+Approve as one final unpublished handoff commit including this tracked record.
+Preserve every reviewed implementation blob and the single DEVLOG entry; no
+compaction or fix-plan cleanup is needed. Keep the ignored original plan in
+place for engine finalization and record the final approved SHA there only.
+Finalization verifies one commit above the unchanged base and clean tracked
+state. Publication, exact-SHA CI, deployment and live timings remain separate
+coordinator gates; this review does not claim them complete.
+
+No material findings

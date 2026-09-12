@@ -3062,6 +3062,54 @@ export function RunDashboard({ visible = true, page, onNewRun, onCancelNewRun, o
                   <button className="btn btn-danger" disabled={busyAction === 'history' || (selectedRun.activity === 'active' && !acknowledgeActive)} onClick={() => void mutateHistory(historyConfirm)}>Confirm {historyConfirm}</button>
                   <button className="btn btn-secondary" onClick={() => setHistoryConfirm(null)}>Cancel</button>
                 </div>}
+              </div>
+
+              {selectedRunHasLiveControls && <details className="dashboard-section"><summary>Adjust run</summary>
+                {!canMutate && loading && <div className="notice">Initial run controls are pending admission. Actions stay disabled until loading finishes.</div>}
+                <div className="notice">
+                  Changes are saved now and apply at the next safe turn or when the run resumes. Refresh after saving Settings to use newly saved teams and profiles; restarting is not required.
+                </div>
+                <div className="dashboard-form-grid">
+                  <label className="dashboard-field"><span>Max turns</span><input className="input" aria-label="Control max turns" type="number" min="1" value={controlMaxTurns} disabled={!canMutate || !hasSafeControl('max_turns')} onChange={(event) => setControlMaxTurns(event.target.value)} /></label>
+                  <label className="dashboard-field"><span>Team</span><select className="input" aria-label="Control team" value={controlTeam} disabled={!canMutate || !hasSafeControl('team')} onChange={(event) => setControlTeam(event.target.value)}><option value="">No team</option>{(capabilities?.teams ?? []).map((team) => <option key={team} value={team}>{formatMachineChoice(team, capabilities?.teams ?? [])}</option>)}</select></label>
+                </div>
+                {roleChoices.map((role) => {
+                  const admitted = capabilities?.admitted_role_selectors?.[role] ?? []
+                  return (
+                    <label className="dashboard-field" key={role}>
+                      <span>Selector for {formatMachineChoice(role, roleChoices)}{overrideRoles(controlOverride)[role] ? ` (current override: ${overrideRoles(controlOverride)[role]})` : ''}</span>
+                      <select
+                        className="input"
+                        aria-label={`Selector for ${formatMachineChoice(role, roleChoices)}`}
+                        value={roleSelectors[role] ?? ''}
+                        disabled={!canMutate || !hasSafeControl('role_selectors') || admitted.length === 0}
+                        onChange={(event) => setRoleSelectors((current) => ({ ...current, [role]: event.target.value }))}
+                      >
+                        <option value="">No change</option>
+                        {admitted.map((selector) => <option key={selector} value={selector}>{selector}</option>)}
+                      </select>
+                    </label>
+                  )
+                })}
+                <div className="dashboard-actions"><button className="btn btn-secondary" onClick={() => void handleControl()} disabled={!canMutate || busyAction === 'control'}>{busyAction === 'control' ? 'Applying…' : 'Save run settings'}</button></div>
+              </details>}
+
+              <section className="dashboard-section dashboard-actions">
+                {hasSafeControl('owner_stop') && selectedRunHasLiveControls && <>
+                  {!pendingBoundaryStop && <button className="btn btn-primary" disabled={!canMutate || busyAction !== null || restartInProgress} onClick={() => void handleBoundaryStop()}>Stop after current turn</button>}
+                  <p className="text-sm text-dim">The current worker or reviewer call can finish at the next safe boundary. Stopping does not approve the checkpoint.</p>
+                  {!confirmOwnerStop ? <button className="btn btn-secondary" disabled={!canMutate || busyAction !== null || restartInProgress} onClick={() => setConfirmOwnerStop(true)}>Stop now…</button> : <div className="confirmation"><span>Stop {selectedRun.run_id} immediately? This interrupts the active worker/reviewer call; it does not approve the checkpoint.</span><button className="btn btn-danger" disabled={!canMutate || busyAction === 'owner-stop' || restartInProgress} onClick={() => void handleOwnerStop()}>Stop now</button><button className="btn btn-secondary" onClick={() => setConfirmOwnerStop(false)}>Cancel</button></div>}
+                </>}
+                {!selectedRunIssue && canResume && <>
+                  {!confirmResume ? <button className="btn btn-primary" disabled={restartInProgress} onClick={() => setConfirmResume(true)}>Resume as new run…</button> : <div className="confirmation"><span>Confirm explicit resume. Source {selectedRun.run_id} remains visible; the server creates a distinct continuation run with the same workflow and current configuration source.</span><button className="btn btn-primary" disabled={busyAction === 'resume'} onClick={() => void handleResume()}>Confirm resume</button><button className="btn btn-secondary" onClick={() => setConfirmResume(false)}>Cancel</button></div>}
+                </>}
+              </section>
+
+              {canRestart && !selectedRunIssue && <button className="btn btn-secondary" onClick={openRestart}>Restart with changes</button>}
+              {!canResume && selectedRun.evidence.no_agent_started === true && <p className="text-sm">No execution state is available to Resume.</p>}
+              {!canRestart && restartAdmission?.reason && <p className="text-sm">Restart unavailable: {restartAdmission.reason}</p>}
+
+              <div className="run-progress-evidence">
                 {canonicalProgress
                   ? <CheckpointHistory projectId={projectId} run={selectedRun} progress={canonicalProgress} detail={canonicalDetail} />
                   : <>
@@ -3219,51 +3267,6 @@ export function RunDashboard({ visible = true, page, onNewRun, onCancelNewRun, o
                   {savedOverrides.state === 'pending' && <p>Saved controls apply at the next turn or when the run resumes.</p>}
                 </div>}
               </details>}
-
-              {selectedRunHasLiveControls && <details className="dashboard-section"><summary>Adjust run</summary>
-                {!canMutate && loading && <div className="notice">Initial run controls are pending admission. Actions stay disabled until loading finishes.</div>}
-                <div className="notice">
-                  Changes are saved now and apply at the next safe turn or when the run resumes. Refresh after saving Settings to use newly saved teams and profiles; restarting is not required.
-                </div>
-                <div className="dashboard-form-grid">
-                  <label className="dashboard-field"><span>Max turns</span><input className="input" aria-label="Control max turns" type="number" min="1" value={controlMaxTurns} disabled={!canMutate || !hasSafeControl('max_turns')} onChange={(event) => setControlMaxTurns(event.target.value)} /></label>
-                  <label className="dashboard-field"><span>Team</span><select className="input" aria-label="Control team" value={controlTeam} disabled={!canMutate || !hasSafeControl('team')} onChange={(event) => setControlTeam(event.target.value)}><option value="">No team</option>{(capabilities?.teams ?? []).map((team) => <option key={team} value={team}>{formatMachineChoice(team, capabilities?.teams ?? [])}</option>)}</select></label>
-                </div>
-                {roleChoices.map((role) => {
-                  const admitted = capabilities?.admitted_role_selectors?.[role] ?? []
-                  return (
-                    <label className="dashboard-field" key={role}>
-                      <span>Selector for {formatMachineChoice(role, roleChoices)}{overrideRoles(controlOverride)[role] ? ` (current override: ${overrideRoles(controlOverride)[role]})` : ''}</span>
-                      <select
-                        className="input"
-                        aria-label={`Selector for ${formatMachineChoice(role, roleChoices)}`}
-                        value={roleSelectors[role] ?? ''}
-                        disabled={!canMutate || !hasSafeControl('role_selectors') || admitted.length === 0}
-                        onChange={(event) => setRoleSelectors((current) => ({ ...current, [role]: event.target.value }))}
-                      >
-                        <option value="">No change</option>
-                        {admitted.map((selector) => <option key={selector} value={selector}>{selector}</option>)}
-                      </select>
-                    </label>
-                  )
-                })}
-                <div className="dashboard-actions"><button className="btn btn-secondary" onClick={() => void handleControl()} disabled={!canMutate || busyAction === 'control'}>{busyAction === 'control' ? 'Applying…' : 'Save run settings'}</button></div>
-              </details>}
-
-              <section className="dashboard-section dashboard-actions">
-                {hasSafeControl('owner_stop') && selectedRunHasLiveControls && <>
-                  {!pendingBoundaryStop && <button className="btn btn-primary" disabled={!canMutate || busyAction !== null || restartInProgress} onClick={() => void handleBoundaryStop()}>Stop after current turn</button>}
-                  <p className="text-sm text-dim">The current worker or reviewer call can finish at the next safe boundary. Stopping does not approve the checkpoint.</p>
-                  {!confirmOwnerStop ? <button className="btn btn-secondary" disabled={!canMutate || busyAction !== null || restartInProgress} onClick={() => setConfirmOwnerStop(true)}>Stop now…</button> : <div className="confirmation"><span>Stop {selectedRun.run_id} immediately? This interrupts the active worker/reviewer call; it does not approve the checkpoint.</span><button className="btn btn-danger" disabled={!canMutate || busyAction === 'owner-stop' || restartInProgress} onClick={() => void handleOwnerStop()}>Stop now</button><button className="btn btn-secondary" onClick={() => setConfirmOwnerStop(false)}>Cancel</button></div>}
-                </>}
-                {!selectedRunIssue && canResume && <>
-                  {!confirmResume ? <button className="btn btn-primary" disabled={restartInProgress} onClick={() => setConfirmResume(true)}>Resume as new run…</button> : <div className="confirmation"><span>Confirm explicit resume. Source {selectedRun.run_id} remains visible; the server creates a distinct continuation run with the same workflow and current configuration source.</span><button className="btn btn-primary" disabled={busyAction === 'resume'} onClick={() => void handleResume()}>Confirm resume</button><button className="btn btn-secondary" onClick={() => setConfirmResume(false)}>Cancel</button></div>}
-                </>}
-              </section>
-
-              {canRestart && !selectedRunIssue && <button className="btn btn-secondary" onClick={openRestart}>Restart with changes</button>}
-              {!canResume && selectedRun.evidence.no_agent_started === true && <p className="text-sm">No execution state is available to Resume.</p>}
-              {!canRestart && restartAdmission?.reason && <p className="text-sm">Restart unavailable: {restartAdmission.reason}</p>}
 
               <section className="dashboard-section">
                 <h4>

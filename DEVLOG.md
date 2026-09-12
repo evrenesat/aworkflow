@@ -2703,3 +2703,15 @@ HISTORY: Published clipboard history `c14f1f2`/`cd78d53` remains separate and mu
   phone held-history/live-control journeys (2 tests). These cover early exact
   detail, pointer identity, one native click, compact navigation, draft retention
   and existing restart semantics.
+
+## 2026-09-12 — Owner controls before canonical checkpoint evidence
+
+- Split selected-run identity from canonical checkpoint evidence and placed the
+  existing Adjust run, stop, resume and restart actions between them. Late
+  canonical detail and selection reconciliation now grow below those controls
+  without changing their admission, labels, handlers or draft ownership.
+- The held-history browser proof now waits for initial compact focus, real
+  checkpoint layout, and the fixture's exact `Unassigned history` current/detail
+  reconciliation before enforcing the original 1px pointer, scroll and focus
+  checks and issuing one native click. Focused component tests also retain full
+  canonical evidence and prove the owner-action DOM order.

@@ -1376,6 +1376,9 @@ def test_history_completion_preserves_live_controls_pointer_target(
             dashboard = _visible_dashboard(page)
             identity = dashboard.get_by_title("Copy full run ID", exact=True)
             expect(identity).to_have_attribute("aria-label", run_id)
+            detail_heading = dashboard.locator(".run-progress-header h3").first
+            if _compact(page):
+                expect(detail_heading).to_be_focused()
             pending = dashboard.get_by_role("status").filter(
                 has_text="Run history is still loading"
             )
@@ -1391,7 +1394,15 @@ def test_history_completion_preserves_live_controls_pointer_target(
             before = summary.bounding_box()
             assert before and before["width"] > 0 and before["height"] > 0, before
             before_flow = page.evaluate(
-                "() => ({scrollY, height: document.scrollingElement?.scrollHeight ?? 0})"
+                """() => ({
+                    scrollY,
+                    height: document.scrollingElement?.scrollHeight ?? 0,
+                    focus: {
+                        tag: document.activeElement?.tagName ?? null,
+                        text: document.activeElement?.textContent?.trim() ?? null,
+                        in_checkpoint_history: Boolean(document.activeElement?.closest('.checkpoint-history')),
+                    },
+                })"""
             )
             assert held_history, "initial run history response was not held"
             pointer = {
@@ -1405,15 +1416,41 @@ def test_history_completion_preserves_live_controls_pointer_target(
             held_history.clear()
             page.unroute(history_pattern, hold_initial_history)
             pending.wait_for(state="hidden")
+            checkpoint_layout = dashboard.locator(".checkpoint-history-layout")
+            checkpoint_layout.wait_for(state="visible")
+            expected_detail_heading = "Unassigned history"
+            current_checkpoint = checkpoint_layout.locator(
+                '.checkpoint-history-entry[aria-current="true"]'
+            )
+            expect(current_checkpoint).to_contain_text(expected_detail_heading)
+            expect(
+                checkpoint_layout.locator(".checkpoint-history-detail-heading h5")
+            ).to_have_text(expected_detail_heading)
 
             after = summary.bounding_box()
             assert after, "Adjust run summary detached after history completion"
             after_flow = page.evaluate(
-                "() => ({scrollY, height: document.scrollingElement?.scrollHeight ?? 0})"
+                """() => ({
+                    scrollY,
+                    height: document.scrollingElement?.scrollHeight ?? 0,
+                    focus: {
+                        tag: document.activeElement?.tagName ?? null,
+                        text: document.activeElement?.textContent?.trim() ?? null,
+                        in_checkpoint_history: Boolean(document.activeElement?.closest('.checkpoint-history')),
+                    },
+                })"""
             )
             assert after["y"] == pytest.approx(before["y"], abs=1), {
                 "before": before,
                 "after": after,
+                "before_flow": before_flow,
+                "after_flow": after_flow,
+            }
+            assert after_flow["scrollY"] == pytest.approx(before_flow["scrollY"], abs=1), {
+                "before_flow": before_flow,
+                "after_flow": after_flow,
+            }
+            assert after_flow["focus"] == before_flow["focus"], {
                 "before_flow": before_flow,
                 "after_flow": after_flow,
             }
@@ -1429,8 +1466,7 @@ def test_history_completion_preserves_live_controls_pointer_target(
             )
             assert hit["is_summary"], {"pointer": pointer, "hit": hit, "after": after}
 
-            page.mouse.down()
-            page.mouse.up()
+            page.mouse.click(pointer["x"], pointer["y"])
             expect(details).to_have_attribute("open", "")
             expect(dashboard.get_by_label("Control max turns", exact=True)).to_be_visible()
             _assert_no_horizontal_overflow(page)
