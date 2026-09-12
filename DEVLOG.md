@@ -8,6 +8,18 @@
   the recorded process-birth identity; no production lifecycle or schema
   changed.
 
+## 2026-09-12 — Gate CI UI interactions on actual readiness
+
+- Reproduced the two CI ordering boundaries with held API responses: the
+  RunDashboard follow-up section can be visible from the run list while the
+  selected-run detail is still pending, and GlobalSettings can render the
+  projected effort field while the initial load still keeps its fieldset and
+  Save action disabled.
+- Updated only the affected component tests to release those real responses,
+  re-query connected controls, preserve the corrected follow-up filename, and
+  assert the exact `effort: null` save action. This is a deterministic,
+  test-only repair; production behavior and expected payloads are unchanged.
+
 ## 2026-09-12 — Keep dirty settings headers within two rows
 
 - Use the compact settings section selector through 1399px so all seven

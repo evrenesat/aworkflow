@@ -119,6 +119,16 @@ const skillSummaries = [
 const skillContent = (name: string) => `---\nname: ${name}\ndescription: Test skill.\n---\n\n# ${name}\n`
 const skillDetail = (name: string, revision: string) => ({ ...skillSummaries.find(skill => skill.name === name)!, revision, content: skillContent(name) })
 
+function deferred<T>() {
+  let resolve!: (value: T | PromiseLike<T>) => void
+  let reject!: (reason?: unknown) => void
+  const promise = new Promise<T>((resolvePromise, rejectPromise) => {
+    resolve = resolvePromise
+    reject = rejectPromise
+  })
+  return { promise, resolve, reject }
+}
+
 function installSettingsHeaderMedia(initialMatches: boolean) {
   const originalMatchMedia = window.matchMedia
   let matches = initialMatches
@@ -162,14 +172,48 @@ describe('GlobalSettings', () => {
     vi.mocked(api.installSkills).mockResolvedValue({ mode: 'auto', succeeded: true, cancelled: false, refresh: [], operations: [] })
   })
   it.each(['save', 'blur', 'Enter'])('clears custom effort with %s and has no redundant unset button', async mode => {
-    render(<GlobalSettings onDirtyChange={() => {}} onSaved={() => {}} />)
+    const view = render(<GlobalSettings onDirtyChange={() => {}} onSaved={() => {}} />)
+    const settingsBody = view.container.querySelector('#settings-domain-panel') as HTMLFieldSetElement
     const effort = await screen.findByLabelText('Effort codex.worker')
+    await waitFor(() => expect(settingsBody.hasAttribute('disabled')).toBe(false))
     expect(screen.queryByRole('button', { name: /Unset effort/ })).toBeNull()
-    fireEvent.change(effort, { target: { value: '' } })
-    if (mode === 'blur') fireEvent.blur(effort)
-    if (mode === 'Enter') fireEvent.keyDown(effort, { key: 'Enter' })
-    fireEvent.click(screen.getByRole('button', { name: 'Save all changes' }))
+    await act(async () => {
+      fireEvent.change(effort, { target: { value: '' } })
+      if (mode === 'blur') fireEvent.blur(effort)
+      if (mode === 'Enter') fireEvent.keyDown(effort, { key: 'Enter' })
+    })
+    expect((screen.getByLabelText('Effort codex.worker') as HTMLInputElement).value).toBe('')
+    await waitFor(() => expect((screen.getByRole('button', { name: 'Save all changes' }) as HTMLButtonElement).disabled).toBe(false))
+    await act(async () => {
+      fireEvent.click(screen.getByRole('button', { name: 'Save all changes' }))
+    })
     await waitFor(() => expect(api.patchGlobalConfig).toHaveBeenCalled())
+    expect(vi.mocked(api.patchGlobalConfig).mock.calls[0][0].actions).toContainEqual({ type: 'upsert_profile', harness: 'codex', profile: 'worker', effort: null })
+  })
+  it('waits for the initial settings load before clearing effort and saving', async () => {
+    const initialServer = deferred<typeof server>()
+    vi.mocked(api.getSettings).mockImplementationOnce(() => initialServer.promise)
+    const view = render(<GlobalSettings onDirtyChange={() => {}} onSaved={() => {}} />)
+    const settingsBody = view.container.querySelector('#settings-domain-panel') as HTMLFieldSetElement
+
+    await screen.findByLabelText('Effort codex.worker')
+    expect(settingsBody.hasAttribute('disabled')).toBe(true)
+    expect((screen.getByRole('button', { name: 'Working…' }) as HTMLButtonElement).disabled).toBe(true)
+
+    await act(async () => {
+      initialServer.resolve(server)
+      await initialServer.promise
+    })
+    await waitFor(() => expect(settingsBody.hasAttribute('disabled')).toBe(false))
+
+    await act(async () => {
+      fireEvent.change(screen.getByLabelText('Effort codex.worker'), { target: { value: '' } })
+    })
+    await waitFor(() => expect((screen.getByRole('button', { name: 'Save all changes' }) as HTMLButtonElement).disabled).toBe(false))
+    await act(async () => {
+      fireEvent.click(screen.getByRole('button', { name: 'Save all changes' }))
+    })
+    await waitFor(() => expect(api.patchGlobalConfig).toHaveBeenCalledTimes(1))
     expect(vi.mocked(api.patchGlobalConfig).mock.calls[0][0].actions).toContainEqual({ type: 'upsert_profile', harness: 'codex', profile: 'worker', effort: null })
   })
   it('preserves a dirty section and draft across header presentation resize', async () => {

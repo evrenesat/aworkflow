@@ -2080,21 +2080,39 @@ describe('RunDashboard', () => {
       size_bytes: 20,
     }
     const pending = deferred<typeof created>()
+    const selectedRunDetail = deferred<typeof failed>()
     vi.mocked(api.listControlPlaneRuns).mockResolvedValue({ runs: [failed], next_cursor: null, schema_version: 1 })
-    vi.mocked(api.getControlPlaneRun).mockResolvedValue(failed)
+    vi.mocked(api.getControlPlaneRun).mockImplementationOnce(() => selectedRunDetail.promise)
     vi.mocked(api.createProjectPlanFromRun).mockReturnValue(pending.promise)
     const onOpenPlan = vi.fn()
     renderDashboard({ onOpenPlan })
 
-    const button = await screen.findByRole('button', { name: 'Create follow-up draft', exact: true })
-    const filename = screen.getByLabelText('Follow-up draft filename') as HTMLInputElement
-    expect(filename.value).toBe('followup-run-failed.md')
-    fireEvent.change(filename, { target: { value: created.name } })
-    fireEvent.click(button)
+    await screen.findByRole('button', { name: 'Create follow-up draft', exact: true })
+    expect(api.getControlPlaneRun).toHaveBeenCalledWith(
+      project.project_id,
+      failed.run_id,
+      expect.objectContaining({ signal: expect.any(AbortSignal) }),
+    )
+    expect((screen.getByLabelText('Follow-up draft filename') as HTMLInputElement).value).toBe('followup-run-failed.md')
+
+    await act(async () => {
+      selectedRunDetail.resolve(failed)
+      await selectedRunDetail.promise
+    })
+    await waitFor(() => expect((screen.getByLabelText('Follow-up draft filename') as HTMLInputElement).disabled).toBe(false))
+
+    await act(async () => {
+      fireEvent.change(screen.getByLabelText('Follow-up draft filename'), { target: { value: created.name } })
+    })
+    expect((screen.getByLabelText('Follow-up draft filename') as HTMLInputElement).value).toBe(created.name)
+    await act(async () => {
+      fireEvent.click(screen.getByRole('button', { name: 'Create follow-up draft', exact: true }))
+    })
     await waitFor(() => expect(api.createProjectPlanFromRun).toHaveBeenCalledTimes(1))
     expect(api.createProjectPlanFromRun).toHaveBeenCalledWith(project.project_id, failed.run_id, created.name)
-    expect(button).toHaveProperty('disabled', true)
-    fireEvent.click(button)
+    const busyButton = screen.getByRole('button', { name: 'Creating draft…', exact: true })
+    expect(busyButton).toHaveProperty('disabled', true)
+    fireEvent.click(busyButton)
     expect(api.createProjectPlanFromRun).toHaveBeenCalledTimes(1)
 
     await act(async () => {

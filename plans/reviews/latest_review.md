@@ -1051,4 +1051,43 @@ the approved SHA there after committing. Verify one commit and clean tracked
 state. Publication, exact-SHA CI and live activation remain controller delivery
 gates and are not claimed by this local review.
 
+---
+
+# CI UI readiness — cumulative review v01: approved
+
+Base `837fdc458ea0aa5b5124e6f58241cc20073c4f8c` → reviewed HEAD
+`1fb7708b00b5c936c1701e2de8be58711936d52f`: **1 new / 1 total commit**,
+`cp1 v01`. No prior findings or follow-up overlays for this handoff.
+Reviewed the full base-to-HEAD diff, original plan, both component owners and
+applicable UI instructions. Scope remains two component test files and DEVLOG.
+Exact corrected filename, single-flight mutation, returned plan path and all
+save/blur/Enter effort-null assertions remain intact.
+
+Settings' held server response demonstrates the disabled owning fieldset and
+Working action despite visible projected fields. Follow-up detail visibility
+alone is not an enabled-state boundary: the field is already usable before the
+held detail resolves. An independent temporary probe edited that connected,
+enabled field under awaited act before releasing detail, then verified the edit
+survived hydration and the exact submission/path/single-flight assertions passed.
+Thus no production lost-edit defect was demonstrated; this approval covers test
+synchronization, not a production bug fix or a proven detail-load reset cause.
+
+Reused final worker evidence from
+`/root/code/agent_flow/.aflow/runs/20260912t014630z-4d8f1499/turns/turn-001/transport.stdout`
+and completed `result.json` (the prompt's worktree-relative receipt is absent).
+Final post-edit bounded command:
+`npm --prefix apps/aflow_app/web test -- --run src/components/RunDashboard.test.tsx src/components/GlobalSettings.test.tsx`
+passed 187/187 at 01:54:50 UTC. Focused effort set passed 4 cases.
+Independent temporary `ReadinessReviewProbe.test.tsx` used the existing follow-up
+case with the pre-response edit checks; its exact-name filtered run passed
+1 case at 01:57:58 UTC. Probe removed. Cumulative `git diff --check` passed.
+No full suites, browser/build reruns, portable-test host paths or live writes.
+
+Approval finalization includes this already-tracked reviewer record in the one
+unpublished accumulated commit after the unchanged base. Preserve all other
+reviewed blobs; DEVLOG already has one handoff entry. No fix plan is created.
+Keep the ignored original plan for engine finalization and record approved SHA
+there after committing. Verify one final commit and clean tracked Git state.
+Publication, exact-SHA CI and live activation remain downstream delivery gates.
+
 No material findings
