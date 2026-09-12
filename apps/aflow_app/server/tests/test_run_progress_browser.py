@@ -1570,6 +1570,27 @@ def test_run_summary_wraps_without_document_overflow(
             _login(page, url)
             page.goto(f"{url}/?project={PROJECT_ID}&view=runs&run={run_id}")
             page.get_by_role("heading", name="Repair overlay", exact=True).wait_for()
+            checkpoint_navigation = page.locator(
+                '[data-sidebar-editor-list="Checkpoints"] > .sidebar-editor-navigation'
+            )
+            checkpoint_detail = page.locator(
+                '[data-sidebar-editor-list="Checkpoints"] > .sidebar-editor-detail'
+            )
+            checkpoint_navigation.wait_for(state="visible")
+            checkpoint_navigation.get_by_role(
+                "button", name=re.compile(r"^Checkpoint 4: Stage 4")
+            ).click()
+            if width <= 390:
+                checkpoint_detail.wait_for(state="visible")
+                checkpoint_detail.get_by_role(
+                    "button", name="← Back to Checkpoints", exact=True
+                ).click()
+                checkpoint_navigation.wait_for(state="visible")
+                assert not checkpoint_detail.is_visible()
+            else:
+                expect(checkpoint_detail.get_by_role(
+                    "heading", name="Checkpoint 4: Stage 4", exact=True
+                )).to_be_visible()
             summary = page.locator(
                 ".run-detail .dashboard-section > p"
             ).filter(has_text="Last finished summary").first

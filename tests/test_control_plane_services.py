@@ -326,18 +326,27 @@ def test_context_detail_reuses_status_summary_without_full_context_escalation(
     repository = RunRepository(tmp_path)
     status = repository.get_run_status("owned-run")
     context = ContextService(repository).get("owned-run")
-    detail = context.to_dict()["data"]["progress"]
+    data = context.to_dict()["data"]
+    detail = data["progress"]
+    execution = data["execution_progress"]
 
     assert status.progress is not None
     assert detail["schema_version"] == status.progress.schema_version
     assert detail["total_checkpoints"] == status.progress.total_checkpoints.to_dict()
     assert detail["approved_checkpoints"] == status.progress.approved_checkpoints.to_dict()
     assert len(detail["checkpoints"]) == 2
+    assert execution["availability"] == "available"
+    assert execution["checkpoint"] == {"index": 2, "name": "Checkpoint 2: Second"}
+    assert execution["total"] == 2
+    assert execution["complete"] is False
+    assert execution["last_finished_turn"] is None
+    assert execution["current_turn"] is None
     assert "events" not in status.progress.to_dict()
     with pytest.raises(PermissionError, match="explicit"):
         ContextService(repository).get("owned-run", level="full")
     full = ContextService(repository).get("owned-run", level="full", full_scope=True)
     assert full.to_dict()["data"]["progress"]["total_checkpoints"] == detail["total_checkpoints"]
+    assert full.to_dict()["data"]["execution_progress"] == execution
 
 
 def test_startup_questions_are_opaque_transient_service_records(monkeypatch: pytest.MonkeyPatch) -> None:

@@ -1,5 +1,18 @@
 # DEVLOG
 
+## 2026-09-11 — Preserve execution-summary compatibility beside canonical history
+
+- Added bounded `data.execution_progress` to context bundles using the existing
+  manager context, while retaining canonical `data.progress` as the sole
+  history, approval and delivery authority.
+- Updated the dashboard to prefer the explicit compatibility projection,
+  preserve current/finished and recovery-complete prose beside canonical
+  checkpoint history, and keep old-only/canonical-only payload handling
+  truthful.
+- Focused context and RunDashboard regressions cover the coexistence contract,
+  old-only unavailable evidence, canonical approval history, and recovery
+  completion. Full suites and browser-engine coverage remain CI gates.
+
 ## 2026-09-11 — Repair integrated refresh stop-control acceptance
 
 - Updated the checkpoint-history refresh assertion to retain full diagnostics,

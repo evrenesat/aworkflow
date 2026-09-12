@@ -73,6 +73,13 @@ REST context reads and MCP `get_run_context` both pass through the same
 `ContextService`, so they expose identical progress fields. The dedicated
 server fixture and real Chromium/WebKit dashboard journey verify that
 boundary against the built web assets at desktop and 390px mobile widths.
+Context data intentionally carries both projections: canonical `data.progress`
+owns checkpoint history, approval counts and delivery semantics, while bounded
+`data.execution_progress` preserves the older current/finished-turn and
+recovery-summary consumer. The dashboard reads the explicit compatibility key
+first and only accepts an old `data.progress` shape for genuinely legacy
+payloads; it never parses canonical history as the older shape or requests a
+second manager context.
 This observer path does not write run artifacts or alter manager routing,
 turn selection, or historical captured contexts.
 

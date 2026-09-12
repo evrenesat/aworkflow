@@ -470,7 +470,9 @@ class ContextBundle:
                 data["_truncated"] = "mapping item limit"
                 break
             name = str(key)
-            if name == "progress":
+            if any(part in name.lower() for part in _SECRET_FIELD_PARTS):
+                data[name] = "[redacted]"
+            elif name == "progress":
                 if isinstance(value, (RunProgressSummary, RunProgressDetail)):
                     data[name] = value.to_dict()
                 elif isinstance(value, Mapping):

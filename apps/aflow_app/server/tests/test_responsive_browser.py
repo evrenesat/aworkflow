@@ -387,6 +387,18 @@ def _visible_dashboard(page: Page):
     return dashboard
 
 
+def _run_history_navigation(surface):
+    return surface.locator(
+        '[data-sidebar-editor-list="Run history"] > .sidebar-editor-navigation'
+    )
+
+
+def _run_history_detail(surface):
+    return surface.locator(
+        '[data-sidebar-editor-list="Run history"] > .sidebar-editor-detail'
+    )
+
+
 def _open_live_controls(page: Page):
     dashboard = _visible_dashboard(page)
     details = dashboard.locator("details.dashboard-section").filter(has_text="Adjust run").first
@@ -743,7 +755,7 @@ def test_responsive_route_matrix(control_client, monkeypatch, width: int, height
             expect(run_row).to_contain_text(RESPONSIVE_FIXTURE_PLAN_PATH)
             run_row.click()
             _assert_run_detail(page, RESPONSIVE_FIXTURE_TITLE, RESPONSIVE_FIXTURE_RUN_ID)
-            detail_box = page.locator(".sidebar-editor-detail").bounding_box()
+            detail_box = _run_history_detail(page).bounding_box()
             assert detail_box and detail_box["height"] > 0
             _assert_header_and_flow(page)
             _assert_last_action_hit_test(page)
@@ -1219,7 +1231,7 @@ def test_responsive_live_controls_and_restart(
             if _compact(page):
                 page.get_by_role("button", name="← Back to Run history", exact=True).click()
                 dashboard = _visible_dashboard(page)
-                dashboard.locator(".sidebar-editor-navigation").wait_for(state="visible")
+                _run_history_navigation(dashboard).wait_for(state="visible")
                 run_row = dashboard.locator(f"[data-sidebar-editor-item='{run_id}']")
                 run_row.wait_for(state="visible")
                 run_row.click()
@@ -1235,7 +1247,7 @@ def test_responsive_live_controls_and_restart(
             page.set_viewport_size({"width": 390, "height": 844})
             if width >= 960 and height >= 600:
                 dashboard = _visible_dashboard(page)
-                dashboard.locator(".sidebar-editor-navigation").wait_for(state="visible")
+                _run_history_navigation(dashboard).wait_for(state="visible")
                 run_row = dashboard.locator(f"[data-sidebar-editor-item='{run_id}']")
                 run_row.wait_for(state="visible")
                 run_row.click()

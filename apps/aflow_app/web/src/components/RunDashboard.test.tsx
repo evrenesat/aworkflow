@@ -2,7 +2,7 @@ import { act, fireEvent, render, screen, waitFor } from '@testing-library/react'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { ApiError } from '../api'
 import * as api from '../api'
-import type { RunContext, RunProgressDetail, RunProgressSummary, WorktreePreflight } from '../types'
+import type { RunContext, RunProgress, RunProgressDetail, RunProgressSummary, WorktreePreflight } from '../types'
 import { RunDashboard, type RunSelectionChange } from './RunDashboard'
 import { App } from '../App'
 
@@ -159,6 +159,21 @@ function canonicalDetailProgress(overrides: Partial<RunProgressDetail> = {}): Ru
 }
 
 function observerProgress(overrides: Record<string, unknown> = {}): Record<string, unknown> {
+  return {
+    availability: 'available',
+    checkpoint: { index: 4, name: 'Checkpoint 4: Repair' },
+    total: 14,
+    complete: false,
+    repairing: false,
+    overlay_path: null,
+    reason: null,
+    last_finished_turn: null,
+    current_turn: null,
+    ...overrides,
+  }
+}
+
+function compatibilityProgress(overrides: Partial<RunProgress> = {}): RunProgress {
   return {
     availability: 'available',
     checkpoint: { index: 4, name: 'Checkpoint 4: Repair' },
@@ -701,6 +716,48 @@ describe('RunDashboard', () => {
     expect(screen.getByText('Last finished summary: exit 0: review approved')).toBeDefined()
     expect(screen.queryByText(/\? of 0/)).toBeNull()
     expect(screen.queryByText(/All 0 checkpoints complete/)).toBeNull()
+  })
+
+  it('keeps the bounded execution summary beside canonical history', async () => {
+    vi.mocked(api.getRunContext).mockResolvedValue({
+      run_id: 'run-owned',
+      level: 'lite',
+      schema_version: 1,
+      data: {
+        progress: canonicalDetailProgress(),
+        execution_progress: compatibilityProgress({
+          checkpoint: null,
+          total: 4,
+          complete: true,
+          current_turn: { turn_number: 4, step: 'implement', status: 'starting', summary: null },
+          last_finished_turn: { turn_number: 3, step: 'review', status: 'completed', summary: 'exit 0: recovery approved' },
+        }),
+      },
+    })
+
+    renderDashboard()
+
+    expect(await screen.findByRole('button', { name: /Checkpoint 5: Active/ })).toBeDefined()
+    expect((await screen.findAllByText('4 / 11 approved')).length).toBeGreaterThan(0)
+    expect(screen.getByText('All 4 checkpoints complete')).toBeDefined()
+    expect(screen.getByText('Current turn: turn 4 · Implement · starting')).toBeDefined()
+    expect(screen.getByText('Last finished turn: turn 3 · Review · completed')).toBeDefined()
+    expect(screen.getByText('Last finished summary: exit 0: recovery approved')).toBeDefined()
+  })
+
+  it('does not reinterpret canonical-only progress as the legacy summary', async () => {
+    vi.mocked(api.getRunContext).mockResolvedValue({
+      run_id: 'run-owned',
+      level: 'lite',
+      schema_version: 1,
+      data: { progress: canonicalDetailProgress() },
+    })
+
+    renderDashboard()
+
+    expect(await screen.findByRole('button', { name: /Checkpoint 5: Active/ })).toBeDefined()
+    expect(screen.queryByText(/Progress available — current checkpoint not reported/)).toBeNull()
+    expect(screen.queryByText(/All \d+ checkpoints complete/)).toBeNull()
   })
 
   it('renders a known partial scope without inventing a denominator', async () => {

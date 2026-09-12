@@ -530,3 +530,83 @@ Publication, exact-SHA CI and live activation remain downstream engine/coordinat
 gates and are not claimed by this review. Preserve concurrent family work.
 
 No material findings
+
+---
+
+# Visual CI contract integration — cumulative approval, 2026-09-12
+
+Original/active plan: `plans/in-progress/visual-ci-contract-integration-20260911.md`.
+Unchanged Pre-Handoff Base HEAD: `50b2e3fb0e678b8228ff9abc7a285b926e5891ca`.
+Reviewed implementation HEAD: `9622d945588f7940fc3a4b735092c2c5f4ada7b1`.
+Coverage: 3 new / 3 total commits: `cp1 v01` (`d3579fd1`), `cp2 v01`
+(`57dc8d5d`), and `cp3 v01` (`9622d945`). Reviewed all 13 changed files
+and the full original plan from base through HEAD. Branch matches tracking;
+all checkpoints are checked. No prior findings or fix overlays belong to this
+handoff. The approved visual feature and source run382 lineage remain in the base.
+
+No material findings under the material-code-review admission gate, exclusions
+and proportionate-fix discipline. Outer ContextBundle keys use the existing
+secret rule before progress dispatch; typed progress retains its independent
+bounds. Context builds the existing bounded execution projection using the
+already-built manager context and leaves canonical history/status unchanged.
+Dashboard compatibility preserves current/finished and recovery prose without
+deriving canonical approvals from it; old-only and canonical-only inputs remain
+distinct. Direct-child Run history selectors exclude nested checkpoint layouts.
+Existing recovery, exact summary token, geometry, focus, history, controls and
+menu assertions survive; checkpoint selection and compact Back gain coverage.
+No portable test embeds coordinator HOME or evidence paths.
+
+## Verification evidence
+
+Reused inspected command executions and exit codes in the completed worker
+transports at `/root/code/agent_flow/.aflow/runs/20260911t233541z-f641894b/turns/`
+(`turn-001`, `turn-002`, `turn-003`, each `transport.stdout` and `result.json`).
+The prompt's worktree-relative result is absent; these controller-root records
+retain the exact commands and successful results. Tested source matches the
+reviewed cumulative implementation. No full suites or redundant build rerun.
+
+- CP1: required `tests/test_api.py::test_public_control_plane_models_are_versioned_and_redact_secrets`
+  failed before the patch and passed afterward. It and exact new nodes
+  `test_context_bundle_redacts_nested_sensitive_keys_and_values` and
+  `test_context_bundle_preserves_large_progress_detail_history` passed together
+  (3 tests) under `uv run pytest -q ... --tb=short`.
+- CP2: `tests/test_control_plane_services.py::test_context_detail_reuses_status_summary_without_full_context_escalation`
+  and `tests/test_run_progress.py::test_finished_review_stays_last_finished_when_new_turn_is_starting`
+  passed (2 tests). CP3 repeated the required API and context-builder cases (2 passed).
+- Dashboard: `npm --prefix apps/aflow_app/web test -- --run src/components/RunDashboard.test.tsx -t 'renders verified repair progress|keeps the bounded execution summary beside canonical history|does not reinterpret canonical-only progress as the legacy summary|renders a known partial scope|renders unavailable evidence|advances from a repairing scope|renders canonical list progress|inspects selected checkpoint history'`
+  passed all 8 selected cases; 103 cases were filtered out, not browser skips.
+- All ten exact browser node IDs and viewport parameters in the original plan
+  passed under both `AFLOW_TEST_BROWSER=chromium` (72.65s) and `webkit` (88.09s),
+  using `uv run --project apps/aflow_app/server pytest -q --tb=short --basetemp=...`.
+  Separate disposable HOME/XDG directories and random server ports were used.
+  The initial Chromium attempt lacked binaries after HOME isolation; setting
+  PLAYWRIGHT_BROWSERS_PATH to the installed cache resolved startup without
+  changing tests, timeouts or assertions.
+- Browser basetemps: `/tmp/aflow-cp3-chromium-retry.GxGrgV` and
+  `/tmp/aflow-cp3-webkit.zzxzc7`. Reviewer inspected retained 390px WebKit light
+  live-control and Chromium dark unknown-successor screenshots. Exact retry,
+  control and run-navigation surfaces remain readable.
+- Retained geometry under `/root/code/evidence/aflow-dogfood-20260909/`
+  `cp3-chromium-retry-artifacts.BbjZhV` and `cp3-webkit-artifacts.0k452I`
+  confirms document/body widths of 320, 390 and 1280 in both engines;
+  paragraph scroll/client widths match at 246, 316 and 934 respectively.
+- `npm --prefix apps/aflow_app/web run build` and
+  `uv run ruff check aflow/control_plane apps/aflow_app/server/src` passed.
+  Optional wider lint reported unchanged fixture redefinitions and two baseline
+  web lint errors; these are outside the introduced changes.
+- Independent `git diff --check 50b2e3f HEAD` passed; initial tracked state was
+  clean and no remote branch contains the reviewed HEAD.
+
+## Approval finalization
+
+Squash all three unpublished handoff commits onto the unchanged base, including
+this tracked reviewer record. Preserve all 13 reviewed implementation blobs.
+Only one DEVLOG entry belongs to this handoff, so no compaction is needed.
+No fix overlay exists and no new plan is created. Keep the ignored original plan
+for engine finalization and record the final approved SHA there after committing.
+Verify one final commit after base and no remaining tracked edits.
+Publication, exact-SHA CI  repair confirmation, live activation and physical-device
+acceptance remain downstream engine/coordinator gates, unclaimed by local approval.
+No controller, owner state, shared installation or concurrent checkout is changed.
+
+No material findings

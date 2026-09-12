@@ -285,11 +285,21 @@ function canonicalProgressFromContext(context: RunContext | null, runId: string 
   // Older observer context uses the same `progress` key for a smaller
   // checkpoint summary.  Only the canonical contract owns the selected-run
   // detail view; keep the legacy projection on its compatibility path.
-  if (!Object.prototype.hasOwnProperty.call(progress, 'total_checkpoints')
-    || !Object.prototype.hasOwnProperty.call(progress, 'approved_checkpoints')
-    || !Object.prototype.hasOwnProperty.call(progress, 'recorded_complete_checkpoints')
-    || !Object.prototype.hasOwnProperty.call(progress, 'current_checkpoint_id')) return null
+  if (!hasCanonicalProgressFields(progress)) return null
   return progress as RunProgressDetail
+}
+
+function hasCanonicalProgressFields(progress: object): boolean {
+  return Object.prototype.hasOwnProperty.call(progress, 'total_checkpoints')
+    && Object.prototype.hasOwnProperty.call(progress, 'approved_checkpoints')
+    && Object.prototype.hasOwnProperty.call(progress, 'recorded_complete_checkpoints')
+    && Object.prototype.hasOwnProperty.call(progress, 'current_checkpoint_id')
+}
+
+function looksLikeCanonicalProgress(progress: Record<string, unknown>): boolean {
+  return progress.availability === 'complete'
+    || progress.availability === 'not_applicable'
+    || hasCanonicalProgressFields(progress)
 }
 
 function planPathFromContext(context: RunContext | null): string {
@@ -516,9 +526,21 @@ function legacyProgressSummary(context: RunContext): CheckpointSummary {
 
 function checkpointSummary(context: RunContext | null): CheckpointSummary | null {
   if (!context) return null
+  if (Object.prototype.hasOwnProperty.call(context.data, 'execution_progress')) {
+    const executionProgress = contextObject(context.data.execution_progress)
+    return executionProgress
+      ? checkpointSummaryFromProjection(executionProgress)
+      : emptyProgressSummary(true)
+  }
   if (Object.prototype.hasOwnProperty.call(context.data, 'progress')) {
     const progress = contextObject(context.data.progress)
-    return progress ? checkpointSummaryFromProjection(progress) : emptyProgressSummary(true, 'invalid_evidence')
+    if (!progress) return emptyProgressSummary(true, 'invalid_evidence')
+    // A genuinely old payload used data.progress for this smaller shape. Do
+    // not reinterpret canonical history as a checkpoint summary when the
+    // explicit compatibility key is absent from a retained legacy payload.
+    return looksLikeCanonicalProgress(progress)
+      ? legacyProgressSummary(context)
+      : checkpointSummaryFromProjection(progress)
   }
   return legacyProgressSummary(context)
 }
@@ -2378,11 +2400,17 @@ export function RunDashboard({ visible = true, page, onNewRun, onCancelNewRun, o
   const elapsed = selectedRun ? executionDuration(selectedRun, elapsedNow) : null
   const canonicalDetail = canonicalProgressFromContext(context, selectedRun?.run_id ?? null)
   const canonicalProgress = selectedRun?.progress ?? canonicalDetail
-  // The canonical projection owns checkpoint facts when present. Legacy
-  // context remains the compatibility path for older records and its unique
-  // manager explanation continues to render below the canonical detail.
-  const checkpoints = canonicalProgress ? null : checkpointSummary(context)
-  const outcome = managerOutcome(context, checkpoints)
+  // The canonical projection owns history and approval facts when present.
+  // The bounded execution summary still supplies older current/finished
+  // prose and recovery completion without becoming a second authority.
+  const compatibilitySummary = checkpointSummary(context)
+  const checkpoints = canonicalProgress ? null : compatibilitySummary
+  const compatibilityProgressText = canonicalProgress
+    && compatibilitySummary?.authoritative
+    && compatibilitySummary.availability !== 'unavailable'
+    ? checkpointProgressText(compatibilitySummary)
+    : null
+  const outcome = managerOutcome(context, compatibilitySummary)
   const selectedPlanPath = selectedRun
     ? selectedRun.plan_path ?? (textEvidence(selectedRun, 'plan_path') !== 'Not reported'
       ? textEvidence(selectedRun, 'plan_path')
@@ -2937,9 +2965,10 @@ export function RunDashboard({ visible = true, page, onNewRun, onCancelNewRun, o
               {!selectedRunIssue && selectedRun.reason && <div className="notice">{conciseRunText(selectedRun.reason) ?? 'A run reason was recorded.'}</div>}
 
 
-              {(checkpoints?.repairing || outcome?.decision || outcome?.currentTurn || outcome?.finishedTurn || outcome?.finishedSummary || outcome?.resultText) && <section className="dashboard-section">
+              {(compatibilitySummary?.repairing || compatibilityProgressText || outcome?.decision || outcome?.currentTurn || outcome?.finishedTurn || outcome?.finishedSummary || outcome?.resultText) && <section className="dashboard-section">
                 <h4>Latest progress</h4>
-                {checkpoints?.repairing && <p><strong>Repairing</strong>{checkpoints.overlayFileName ? <> · {checkpoints.overlayFileName}</> : null}</p>}
+                {compatibilitySummary?.repairing && <p><strong>Repairing</strong>{compatibilitySummary.overlayFileName ? <> · {compatibilitySummary.overlayFileName}</> : null}</p>}
+                {compatibilityProgressText && <p>{compatibilityProgressText}</p>}
                 {outcome?.decision && <p>{outcome.decision}</p>}
                 {outcome?.currentTurn && <p>Current turn: {outcome.currentTurn}</p>}
                 {outcome?.finishedTurn && <p>Last finished turn: {outcome.finishedTurn}</p>}

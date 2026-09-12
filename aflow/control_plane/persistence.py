@@ -632,7 +632,7 @@ def build_context_bundle(
         "events": [event.to_dict() for event in read_events(root, limit=100)],
     }
     manager_context: Mapping[str, Any] | None = None
-    from .run_progress import project_run_progress_detail
+    from .run_progress import project_run_progress, project_run_progress_detail
     from .worker_diagnostics import worker_evidence
 
     worker = worker_evidence(root.parent.parent.parent, root.name, f"aflow-run-{root.name}.service")
@@ -649,10 +649,18 @@ def build_context_bundle(
         # A pre-turn run has no finalized artifact yet; metadata/events remain
         # the authoritative bounded context until the first boundary exists.
         pass
+    # Keep the bounded execution-summary projection for older context
+    # consumers.  It reuses the manager context already built for this
+    # request; it must not trigger another context read or replace canonical
+    # progress as the history and approval authority.
+    data["execution_progress"] = project_run_progress(
+        root,
+        run_metadata=metadata,
+        manager_context=manager_context,
+    )
     # Use only the contained canonical reducer inputs here.  The manager
-    # context above is already owned by this request, but passing it back into
-    # progress would make list/status and context facts depend on context
-    # level and could trigger a second evidence authority.
+    # context above is intentionally not passed to canonical progress so list
+    # and status facts cannot depend on context level.
     data["progress"] = project_run_progress_detail(
         root,
         metadata=metadata,

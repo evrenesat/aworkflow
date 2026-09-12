@@ -142,7 +142,11 @@ Counts are evidence-qualified. A partial count is a lower bound, and missing
 or conflicting evidence is shown as unavailable rather than treated as zero.
 Approval is separate from a checked plan item, and compact markers use only
 identity-specific checkpoint evidence rather than aggregate approval counts. A
-committed lifecycle does not by itself prove a successful merge, and a pending
+selected context retains canonical `data.progress` for history and approval
+semantics alongside bounded `data.execution_progress` for older current,
+finished and recovery summaries; the compatibility projection never replaces
+canonical history. A committed lifecycle does not by itself prove a successful
+merge, and a pending
 or unknown CI/live stage is never presented as success. Historical executor names and models are
 shown exactly as recorded. Refresh and compact Back retain the selected
 checkpoint when its identity remains available; the observer view does not

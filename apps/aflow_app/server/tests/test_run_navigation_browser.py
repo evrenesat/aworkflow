@@ -14,6 +14,8 @@ from test_responsive_browser import (
     _assert_theme,
     _login,
     _register_responsive_worktree,
+    _run_history_detail,
+    _run_history_navigation,
     _select_settings_section,
     _set_theme_preference,
 )
@@ -101,12 +103,12 @@ def test_run_navigation_scroll_selection_and_history(control_client, monkeypatch
                 page.wait_for_function("new URL(location.href).searchParams.get('project') === 'test-project' && new URL(location.href).searchParams.get('view') === 'runs'")
                 selected_id = page.evaluate("() => new URL(location.href).searchParams.get('run')")
                 assert selected_id == 'history-000'
-                detail = page.locator('.sidebar-editor-detail')
+                detail = _run_history_detail(page)
                 detail.wait_for(state='visible')
-                assert not page.locator('.sidebar-editor-navigation').is_visible()
+                assert not _run_history_navigation(page).is_visible()
                 _assert_run_detail(page, 'History 000', 'history-000')
                 page.get_by_role('button', name='← Back to Run history', exact=True).click()
-                page.locator('.sidebar-editor-navigation').wait_for(state='visible')
+                _run_history_navigation(page).wait_for(state='visible')
                 assert page.evaluate("() => new URL(location.href).searchParams.get('run')") == selected_id
                 if attempt == 0:
                     open_global_destination(page, 'All runs', compact=True)
@@ -116,10 +118,10 @@ def test_run_navigation_scroll_selection_and_history(control_client, monkeypatch
             # but that passive replacement must leave compact history open.
             page.set_viewport_size({'width': 390, 'height': 844})
             page.goto(f'{url}/?project={PROJECT_ID}&view=runs')
-            nav = page.locator('.sidebar-editor-navigation')
+            nav = _run_history_navigation(page)
             nav.wait_for(state='visible')
             page.wait_for_function("new URL(location.href).searchParams.get('run') !== null")
-            detail = page.locator('.sidebar-editor-detail')
+            detail = _run_history_detail(page)
             assert not detail.is_visible()
             row = nav.locator("[data-sidebar-editor-item='history-069']")
             row.scroll_into_view_if_needed()
@@ -129,7 +131,12 @@ def test_run_navigation_scroll_selection_and_history(control_client, monkeypatch
             row.click()
             detail.wait_for(state='visible')
             assert not nav.is_visible()
-            assert page.evaluate("() => document.activeElement?.closest('.sidebar-editor-detail') !== null")
+            assert page.evaluate("""() => {
+                const detail = document.querySelector(
+                    '[data-sidebar-editor-list="Run history"] > .sidebar-editor-detail'
+                )
+                return detail?.contains(document.activeElement) === true
+            }""")
             assert page.evaluate("() => new URL(location.href).searchParams.get('run')") == item_id
             page.get_by_role('button', name='← Back to Run history', exact=True).click()
             nav.wait_for(state='visible')
@@ -142,7 +149,7 @@ def test_run_navigation_scroll_selection_and_history(control_client, monkeypatch
                 for width, height in ((1365, 900), (390, 844)):
                     page.set_viewport_size({'width': width, 'height': height})
                     page.goto(f'{url}/?project={PROJECT_ID}&view=runs&run=history-000')
-                    nav = page.locator('.sidebar-editor-navigation')
+                    nav = _run_history_navigation(page)
                     compact = width < 960 or height < 600
                     if compact:
                         page.get_by_role('button', name='← Back to Run history', exact=True).click()
@@ -171,7 +178,12 @@ def test_run_navigation_scroll_selection_and_history(control_client, monkeypatch
                         # The history list, rather than the detail surface,
                         # proves ordinary document movement on compact screens.
                         assert before_list_scroll > 0, metrics
-                        assert page.evaluate("() => document.activeElement?.closest('.sidebar-editor-detail') !== null")
+                        assert page.evaluate("""() => {
+                            const detail = document.querySelector(
+                                '[data-sidebar-editor-list="Run history"] > .sidebar-editor-detail'
+                            )
+                            return detail?.contains(document.activeElement) === true
+                        }""")
                     actions = page.get_by_role('button', name='More run actions', exact=True)
                     actions.scroll_into_view_if_needed()
                     action_box = actions.bounding_box()
@@ -336,7 +348,7 @@ def test_complete_navigation_and_launch_journeys(control_client, monkeypatch, tm
                     )
                     if _compact(page):
                         page.get_by_role('button', name='← Back to Run history', exact=True).click()
-                        page.locator('.sidebar-editor-navigation').wait_for()
+                        _run_history_navigation(page).wait_for()
                     else:
                         page.go_back()
                         page.get_by_role('heading', name='All runs', exact=True).wait_for()
@@ -656,7 +668,7 @@ def test_remaining_journeys_keep_compact_actions_and_drafts_reachable(control_cl
             _assert_run_detail(page, 'Ready cp5', 'global-cp5')
             page.get_by_role('button', name='← Back to Run history', exact=True).wait_for()
             page.get_by_role('button', name='← Back to Run history', exact=True).click()
-            page.locator('.sidebar-editor-navigation').wait_for()
+            _run_history_navigation(page).wait_for()
             assert_compact_geometry(page, 844, 390)
 
             # Logout failure stays actionable in the document and focus moves

@@ -619,6 +619,9 @@ export interface RunProgressDetail extends RunProgressSummary {
 }
 
 export interface RunContextData extends Record<string, unknown> {
+  /** Bounded compatibility projection for older execution-summary consumers. */
+  execution_progress?: RunProgress | null
+  /** Canonical history and approval projection. */
   progress?: RunProgressDetail | null
 }
 
