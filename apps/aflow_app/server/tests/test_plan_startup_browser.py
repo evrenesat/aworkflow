@@ -76,23 +76,106 @@ def _choose_workflow(page) -> None:
     expect(workflow).to_have_value("Managed")
 
 
+def _capture_startup_gate_failure(page) -> None:
+    """Print bounded browser state without changing the original failure."""
+    try:
+        evidence = page.evaluate(
+            """() => {
+                const maxTextLength = 768
+                const maxTotalTextLength = 4096
+                let remainingTextLength = maxTotalTextLength
+
+                function boundedText(value) {
+                    if (remainingTextLength <= 0 || value == null) return null
+                    const normalized = String(value).replace(/\\s+/g, ' ').trim()
+                    if (!normalized) return null
+                    const text = normalized.slice(0, Math.min(maxTextLength, remainingTextLength))
+                    remainingTextLength -= text.length
+                    return text
+                }
+
+                function isVisible(element) {
+                    if (!element || element.getAttribute('aria-hidden') === 'true') return false
+                    const style = window.getComputedStyle(element)
+                    return style.display !== 'none'
+                        && style.visibility !== 'hidden'
+                        && element.getClientRects().length > 0
+                }
+
+                function valueForLabel(label) {
+                    const control = document.querySelector(`[aria-label="${label}"]`)
+                    return control instanceof HTMLInputElement || control instanceof HTMLSelectElement
+                        ? boundedText(control.value)
+                        : null
+                }
+
+                function visibleTexts(selector) {
+                    return Array.from(document.querySelectorAll(selector))
+                        .filter(isVisible)
+                        .slice(0, 4)
+                        .map((element) => boundedText(element.textContent))
+                        .filter((text) => text !== null)
+                }
+
+                const preflight = document.querySelector('.worktree-preflight')
+                const confirmation = document.querySelector('.worktree-confirmation input[type="checkbox"]')
+                const startButtons = Array.from(document.querySelectorAll('button.btn.btn-primary'))
+                    .filter((button) => button.textContent?.trim() === 'Start run')
+                    .slice(0, 4)
+
+                return {
+                    selected: {
+                        plan: valueForLabel('Run plan'),
+                        workflow: valueForLabel('Run workflow'),
+                    },
+                    preflight: {
+                        exists: preflight !== null,
+                        status: preflight?.getAttribute('data-preflight-status') ?? null,
+                        text: boundedText(preflight?.textContent),
+                    },
+                    dirty_confirmation: {
+                        exists: confirmation !== null,
+                        checked: confirmation instanceof HTMLInputElement ? confirmation.checked : null,
+                    },
+                    start_button: {
+                        exists: startButtons.length > 0,
+                        disabled: startButtons.map((button) => button.disabled),
+                    },
+                    visible_messages: {
+                        alerts: visibleTexts('.error-message[role="alert"], .notice[role="alert"]'),
+                        launch_validation: visibleTexts('.start-run-form .notice[role="note"]'),
+                        confirmations: visibleTexts('.confirmation'),
+                    },
+                }
+            }"""
+        )
+        serialized = json.dumps(evidence, ensure_ascii=False, separators=(",", ":"), sort_keys=True)
+        print(f"STARTUP_GATE_FAILURE_EVIDENCE {serialized}")
+    except Exception as diagnostic_error:
+        print(f"STARTUP_GATE_FAILURE_EVIDENCE capture_failed={type(diagnostic_error).__name__}")
+
+
 def _acknowledge_dirty_worktree_if_needed(page) -> None:
-    page.locator(".worktree-preflight").wait_for()
-    page.wait_for_function(
-        """() => {
-            const panel = document.querySelector('.worktree-preflight')
-            if (!panel) return false
-            return panel.dataset.preflightStatus === 'ready'
-        }"""
-    )
-    confirmation = page.get_by_role(
-        "checkbox",
-        name="Continue despite uncommitted changes",
-        exact=True,
-    )
-    if confirmation.count():
-        confirmation.check()
-    expect(page.get_by_role("button", name="Start run", exact=True)).to_be_enabled()
+    try:
+        page.locator(".worktree-preflight").wait_for()
+        page.wait_for_function(
+            """() => {
+                const panel = document.querySelector('.worktree-preflight')
+                if (!panel) return false
+                return panel.dataset.preflightStatus === 'ready'
+            }"""
+        )
+        confirmation = page.get_by_role(
+            "checkbox",
+            name="Continue despite uncommitted changes",
+            exact=True,
+        )
+        if confirmation.count():
+            confirmation.check()
+        expect(page.get_by_role("button", name="Start run", exact=True)).to_be_enabled()
+    except Exception:
+        _capture_startup_gate_failure(page)
+        raise
 
 
 def test_chromium_preserves_ready_state_and_retries_a_corrected_plan(

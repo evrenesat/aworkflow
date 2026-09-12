@@ -1,5 +1,20 @@
 # DEVLOG
 
+## 2026-09-12 — Capture startup admission failure evidence
+
+- Added failure-only evidence around the existing Chromium startup boundary.
+  A single bounded DOM snapshot records the selected plan/workflow, worktree
+  preflight state, dirty confirmation, Start button state, and visible startup
+  messages; a diagnostic failure cannot replace the original assertion. The
+  existing actions, timeout behavior, and admission semantics are unchanged,
+  preserving the unexplained CI34675905355 boundary without claiming a product
+  fix.
+- Verification: the exact corrected-plan Chromium journey passed (`1 passed`);
+  an external real-Chromium forced-failure probe retained `forced enabled
+  assertion` and emitted 549-byte JSON; the production web build passed. No
+  production/runtime/UI changes, publication, release CI, or live activation
+  were performed.
+
 ## 2026-09-12 — Establish held-context capture before responsive trial
 
 - The responsive browser regression now records the intercepted context route and

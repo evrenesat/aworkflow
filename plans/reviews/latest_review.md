@@ -1448,3 +1448,47 @@ stop after existing settings delivery. This bounded review stops here and makes
 no downstream delivery claims.
 
 No material findings
+
+---
+
+# Startup gate failure evidence — cumulative review approved, 2026-09-12
+
+Base: `3838406443a479859c72404a58e3de6b2a54005d` (unchanged Pre-Handoff Base HEAD).
+Reviewed HEAD: `055ed86665d0c4648fb7c4ca56b524a03747d3a8`.
+Coverage: 1 new / 1 total commit, `cp1 v01`, all original checkpoint requirements
+and the complete two-file implementation diff. No previous findings or fix
+overlays apply to this handoff; unrelated historical records above are preserved.
+
+Applied material-code-review admission, exclusions and proportionate-fix discipline.
+No material findings. One failure-only DOM evaluation uses actual component
+selectors, bounded text and message counts, selected inputs, preflight and
+confirmation state, and Start disabled state. Diagnostic exceptions are guarded;
+the original exception is re-raised. Original helper actions match after
+normalizing embedded JavaScript indentation; timeout arguments and the full
+launch/rejection/corrected retry journey remain unchanged. No product fix or
+historical root cause is claimed.
+
+Retained evidence independently inspected in
+`/root/code/agent_flow/.aflow/runs/20260912t105431z-9c4cfc08/turns/turn-001/transport.stdout`
+and its completed `result.json` (the prompt-relative artifact is in the parent
+repository):
+- Exact corrected-plan Chromium pytest node passed: 1 passed in 6.58s, using
+  `--tb=short --basetemp /tmp/aflow-startup-gate-evidence.TMHJKp` with
+  `uv run --project apps/aflow_app/server pytest -q`.
+- External real-Chromium probe passed: forced enabled assertion preserved,
+  requested JSON fields verified, 549-byte output below 8192 bytes.
+- Production asset build passed after installing locked dependencies.
+- Reviewer cumulative `git diff --check 3838406443a479859c72404a58e3de6b2a54005d HEAD`
+  passed. Valid retained tests were reused; no full suites repeated.
+
+Approve and finalize as one unpublished handoff commit including this tracked
+record. Preserve reviewed test and DEVLOG blobs; the DEVLOG already has one
+handoff entry. No stale fix plans exist and no empty fix plan is created. Leave
+the ignored original plan in place for the engine and record the final approved
+SHA there after commit creation. Finalization checks one commit after the base,
+identical implementation blobs, and clean tracked Git state. No private artifacts
+are force-added.
+
+Publication, exact-SHA CI and live activation remain separate coordinator gates.
+
+No material findings
