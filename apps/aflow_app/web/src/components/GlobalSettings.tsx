@@ -17,11 +17,11 @@ import { ChangelogSettings } from './ChangelogSettings'
 import { TeamFamiliesSettings } from './TeamFamiliesSettings'
 
 const tabs = ['Agents & Roles', 'Teams', 'Workflows', 'Prompts', 'Skills', 'General', 'Changelog'] as const
-// Header fit is deliberately wider than the list/detail breakpoint: the seven
-// labelled tabs plus dirty-state actions do not fit reliably at 960–1024px.
+// Header fit uses a wider presentation breakpoint than list/detail: the seven
+// labelled tabs plus save/dirty-state actions need this width across engines.
 // Keep this presentation query independent so the SidebarEditorLayout
 // list/detail ownership boundary remains unchanged.
-const SETTINGS_HEADER_COMPACT_QUERY = '(max-width: 1199px), (max-height: 599px)'
+const SETTINGS_HEADER_COMPACT_QUERY = '(max-width: 1399px), (max-height: 599px)'
 const clone = <T,>(value: T): T => JSON.parse(JSON.stringify(value))
 
 function useSettingsHeaderCompact(): boolean {

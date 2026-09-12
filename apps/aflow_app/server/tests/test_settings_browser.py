@@ -209,7 +209,7 @@ def test_changelog_settings_responsive_journey(control_client, tmp_path, monkeyp
                     page.get_by_role('heading', name='Changelog', exact=True).wait_for()
                     page.get_by_text('Changes included in this version', exact=True).wait_for()
                     wait_for_changelog_read_only(page)
-                    if width < 1200 or height < 600:
+                    if width < 1400 or height < 600:
                         assert page.get_by_role('combobox', name='Settings section', exact=True).input_value() == 'Changelog'
                     else:
                         assert page.get_by_role('tab', name='Changelog', exact=True).get_attribute('aria-selected') == 'true'
@@ -293,7 +293,7 @@ def test_changelog_settings_responsive_journey(control_client, tmp_path, monkeyp
             browser.close()
 
 
-def test_settings_toolbar_stays_visible_through_long_scroll(control_client, monkeypatch):
+def test_settings_toolbar_stays_visible_through_long_scroll(control_client, monkeypatch, tmp_path):
     from aflow_app_server import main, config as config_module
     _, root, _, _ = control_client
     config_dir = root.parent / 'global'
@@ -310,7 +310,7 @@ def test_settings_toolbar_stays_visible_through_long_scroll(control_client, monk
     dist = Path(__file__).resolve().parents[2] / 'web' / 'dist'
     monkeypatch.setenv('AFLOW_APP_WEB_DIST', str(dist))
     with live_server() as url, sync_playwright() as playwright:
-        browser = playwright.chromium.launch(headless=True, args=['--no-sandbox'])
+        browser = launch_test_browser(playwright)
         try:
             page = browser.new_page(viewport={'width': 1365, 'height': 900})
             page.goto(url)
@@ -322,7 +322,7 @@ def test_settings_toolbar_stays_visible_through_long_scroll(control_client, monk
                 page.wait_for_timeout(100)
                 page.evaluate('window.scrollTo(0, 0)')
                 select_settings_section(page, 'Agents & Roles')
-                if width < 1200:
+                if width < 1400:
                     section_selector = page.get_by_role('combobox', name='Settings section', exact=True)
                     section_selector.wait_for()
                     assert page.get_by_role('tab').count() == 0
@@ -332,8 +332,11 @@ def test_settings_toolbar_stays_visible_through_long_scroll(control_client, monk
                 metrics = document_metrics(page)
                 assert metrics['headerBottom'] <= 112, metrics
                 assert metrics['contentTop'] <= 128, metrics
+                if width in (1280, 1440):
+                    page.screenshot(path=str(tmp_path / f'settings-header-{width}x{height}-dirty.png'))
                 if width == 960:
-                    page.get_by_label('Effort codex.profile_29', exact=True).fill('dirty header test')
+                    effort = page.get_by_label('Effort codex.profile_29', exact=True)
+                    effort.fill('dirty header test')
                     page.wait_for_timeout(50)
                     dirty_metrics = document_metrics(page)
                     assert dirty_metrics['headerBottom'] <= 112, dirty_metrics
@@ -347,6 +350,9 @@ def test_settings_toolbar_stays_visible_through_long_scroll(control_client, monk
                     compact = width < 960 or height < 600
                     select_settings_section(page, 'Agents & Roles')
                     page.get_by_label('Effort codex.profile_29', exact=True).wait_for()
+                    if width == 390 and height == 844:
+                        page.evaluate('window.scrollTo(0, 0)')
+                        page.screenshot(path=str(tmp_path / f'settings-header-{theme}-compact-390x844.png'))
                     metrics = document_metrics(page)
                     assert metrics['documentHeight'] > height, metrics
                     assert metrics['detailHeight'] > 0, metrics
@@ -370,11 +376,18 @@ def test_settings_toolbar_stays_visible_through_long_scroll(control_client, monk
                         page.get_by_role('button', name='Save all changes', exact=True).scroll_into_view_if_needed()
                         save = page.get_by_role('button', name='Save all changes', exact=True).bounding_box()
                     assert save and 0 <= save['y'] < height
-                    for tab, display_name in [('Teams', 'Team 39'), ('Workflows', 'Workflow 39'), ('Prompts', 'Scroll test 39')]:
-                        select_settings_section(page, tab)
-                        nav = page.get_by_role('navigation', name=tab, exact=True)
+                    for section_name, list_label, display_name in [
+                        ('Teams', 'Team families', 'Team 39'),
+                        ('Workflows', 'Workflows', 'Workflow 39'),
+                        ('Prompts', 'Prompts', 'Scroll test 39'),
+                    ]:
+                        select_settings_section(page, section_name)
+                        editor = page.locator(f'[data-sidebar-editor-list="{list_label}"]')
+                        nav = editor.get_by_role('navigation', name=list_label, exact=True)
+                        if compact and not nav.is_visible():
+                            editor.get_by_role('button', name=f'← Back to {list_label}', exact=True).click()
                         nav.wait_for(state='visible')
-                        if tab == 'Workflows':
+                        if section_name == 'Workflows':
                             nav.get_by_role('button', name='Defaults', exact=True).click()
                             default_workflow = page.get_by_role('combobox', name='Default workflow', exact=True)
                             default_workflow.focus()
@@ -386,15 +399,24 @@ def test_settings_toolbar_stays_visible_through_long_scroll(control_client, monk
                             default_workflow.press('ArrowDown')
                             default_workflow.press('Enter')
                             assert default_workflow.input_value() == 'Managed'
+                            pending_preview = page.get_by_text(
+                                'Refreshing effective team and workflow projections…', exact=True
+                            )
+                            if pending_preview.is_visible():
+                                pending_preview.wait_for(state='hidden')
                             if compact:
-                                page.get_by_role('button', name='← Back to Workflows', exact=True).click()
+                                page.get_by_role('button', name=f'← Back to {list_label}', exact=True).click()
                                 nav.wait_for(state='visible')
                         row = nav.get_by_role('button', name=display_name, exact=True)
                         row.scroll_into_view_if_needed()
                         item_id = row.get_attribute('data-sidebar-editor-item')
+                        if section_name == 'Teams':
+                            assert item_id == 'team_39'
+                        if section_name == 'Workflows' and pending_preview.is_visible():
+                            pending_preview.wait_for(state='hidden')
                         before_list_scroll = page.evaluate('() => document.scrollingElement.scrollTop')
                         row.click()
-                        page.locator(f'[data-sidebar-editor-list="{tab}"] .sidebar-editor-detail').wait_for(state='visible')
+                        editor.locator('.sidebar-editor-detail').wait_for(state='visible')
                         metrics = document_metrics(page)
                         assert metrics['detailHeight'] > 0, metrics
                         assert metrics['detailContent'] <= metrics['detailHeight'] + 1, metrics
@@ -412,20 +434,20 @@ def test_settings_toolbar_stays_visible_through_long_scroll(control_client, monk
                             save = page.get_by_role('button', name='Save all changes', exact=True).bounding_box()
                         assert save and 0 <= save['y'] < height and save['x'] + save['width'] <= width
                         if compact:
-                            page.get_by_role('button', name=f'← Back to {tab}', exact=True).click()
+                            editor.get_by_role('button', name=f'← Back to {list_label}', exact=True).click()
                             nav.wait_for(state='visible')
                             page.wait_for_timeout(50)
                             after_back_scroll = page.evaluate('() => document.scrollingElement.scrollTop')
                             assert abs(after_back_scroll - before_list_scroll) <= 2, {
-                                'before': before_list_scroll, 'after': after_back_scroll, 'tab': tab,
+                                'before': before_list_scroll, 'after': after_back_scroll, 'tab': section_name,
                             }
                             assert page.evaluate('() => document.activeElement?.dataset.sidebarEditorItem') == item_id
                             # The same selected row is a valid re-entry point.
                             row.click()
-                            page.locator(f'[data-sidebar-editor-list="{tab}"] .sidebar-editor-detail').wait_for(state='visible')
-                        nav = page.get_by_role('navigation', name=tab, exact=True)
+                            editor.locator('.sidebar-editor-detail').wait_for(state='visible')
+                        nav = editor.get_by_role('navigation', name=list_label, exact=True)
                         if compact:
-                            page.get_by_role('button', name=f'← Back to {tab}', exact=True).click()
+                            editor.get_by_role('button', name=f'← Back to {list_label}', exact=True).click()
                             nav.wait_for(state='visible')
                             page.wait_for_timeout(50)
                         nav.get_by_role('button', name=display_name.replace('39', '38'), exact=True).click()

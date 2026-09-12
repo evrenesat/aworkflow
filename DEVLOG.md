@@ -1,5 +1,15 @@
 # DEVLOG
 
+## 2026-09-12 — Keep dirty settings headers within two rows
+
+- Use the compact settings section selector through 1399px so all seven
+  destinations and dirty/save actions fit across engines; retain the existing
+  list/detail breakpoint and draft owner.
+- Align inherited browser journeys with family/stage selectors and Team families
+  list ownership, retaining exact launch identities, dirty drafts, viewport/theme,
+  scroll and focus checks. Exercise the selected Chromium or WebKit engine and
+  cover draft/section retention across header presentation changes.
+
 ## 2026-09-11 — Preserve execution-summary compatibility beside canonical history
 
 - Added bounded `data.execution_progress` to context bundles using the existing

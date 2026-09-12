@@ -1,4 +1,4 @@
-import { fireEvent, render, screen, waitFor, within } from '@testing-library/react'
+import { act, fireEvent, render, screen, waitFor, within } from '@testing-library/react'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 import * as api from '../api'
 import { GlobalSettings } from './GlobalSettings'
@@ -118,6 +118,34 @@ const skillSummaries = [
 ]
 const skillContent = (name: string) => `---\nname: ${name}\ndescription: Test skill.\n---\n\n# ${name}\n`
 const skillDetail = (name: string, revision: string) => ({ ...skillSummaries.find(skill => skill.name === name)!, revision, content: skillContent(name) })
+
+function installSettingsHeaderMedia(initialMatches: boolean) {
+  const originalMatchMedia = window.matchMedia
+  let matches = initialMatches
+  const listeners = new Set<(event: MediaQueryListEvent) => void>()
+  const media = {
+    get matches() { return matches },
+    media: '(max-width: 1399px), (max-height: 599px)',
+    onchange: null,
+    addEventListener: (_type: string, listener: (event: MediaQueryListEvent) => void) => listeners.add(listener),
+    removeEventListener: (_type: string, listener: (event: MediaQueryListEvent) => void) => listeners.delete(listener),
+    addListener: (listener: (event: MediaQueryListEvent) => void) => listeners.add(listener),
+    removeListener: (listener: (event: MediaQueryListEvent) => void) => listeners.delete(listener),
+  } as unknown as MediaQueryList
+  Object.defineProperty(window, 'matchMedia', { configurable: true, writable: true, value: () => media })
+  return {
+    setMatches(next: boolean) {
+      matches = next
+      const event = { matches: next, media: media.media } as MediaQueryListEvent
+      listeners.forEach(listener => listener(event))
+    },
+    restore() {
+      if (originalMatchMedia) Object.defineProperty(window, 'matchMedia', { configurable: true, writable: true, value: originalMatchMedia })
+      else delete (window as Window & { matchMedia?: typeof window.matchMedia }).matchMedia
+    },
+  }
+}
+
 describe('GlobalSettings', () => {
   beforeEach(() => {
     vi.resetAllMocks()
@@ -143,6 +171,35 @@ describe('GlobalSettings', () => {
     fireEvent.click(screen.getByRole('button', { name: 'Save all changes' }))
     await waitFor(() => expect(api.patchGlobalConfig).toHaveBeenCalled())
     expect(vi.mocked(api.patchGlobalConfig).mock.calls[0][0].actions).toContainEqual({ type: 'upsert_profile', harness: 'codex', profile: 'worker', effort: null })
+  })
+  it('preserves a dirty section and draft across header presentation resize', async () => {
+    const headerMedia = installSettingsHeaderMedia(true)
+    const view = render(<GlobalSettings onDirtyChange={() => {}} onSaved={() => {}} />)
+    try {
+      await screen.findByLabelText('Effort codex.worker')
+      const sectionSelector = screen.getByRole('combobox', { name: 'Settings section', exact: true }) as HTMLSelectElement
+      fireEvent.change(sectionSelector, { target: { value: 'General' } })
+      const bindHost = screen.getByLabelText('Bind host') as HTMLInputElement
+      fireEvent.change(bindHost, { target: { value: 'unsaved.example' } })
+
+      act(() => headerMedia.setMatches(false))
+      await waitFor(() => {
+        expect(screen.queryByRole('combobox', { name: 'Settings section', exact: true })).toBeNull()
+        expect(screen.getByRole('tab', { name: 'General', exact: true }).getAttribute('aria-selected')).toBe('true')
+      })
+      expect((screen.getByLabelText('Bind host') as HTMLInputElement).value).toBe('unsaved.example')
+      expect(screen.getByText('Unsaved changes')).toBeTruthy()
+
+      act(() => headerMedia.setMatches(true))
+      await waitFor(() => {
+        expect((screen.getByRole('combobox', { name: 'Settings section', exact: true }) as HTMLSelectElement).value).toBe('General')
+      })
+      expect((screen.getByLabelText('Bind host') as HTMLInputElement).value).toBe('unsaved.example')
+      expect((screen.getByRole('button', { name: 'Save all changes' }) as HTMLButtonElement).disabled).toBe(false)
+    } finally {
+      view.unmount()
+      headerMedia.restore()
+    }
   })
   it('hides all guided navigation in raw mode and retains invalid raw text', async () => {
     render(<GlobalSettings onDirtyChange={() => {}} onSaved={() => {}} />)

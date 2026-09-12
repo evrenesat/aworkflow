@@ -964,3 +964,52 @@ exact-SHA CI and live activation remain controller/coordinator delivery gates;
 this approval is local and does not claim deployment.
 
 No material findings
+
+
+---
+
+# Dirty settings header — cumulative review v01: approved
+
+Base `a4ca848966cc422690d8b382cdd6c2424e60ba3c` → reviewed HEAD
+`f9867a03bef1baa11f39412e7e3d5052b75815fa`: **3 new / 3 total commits**,
+cp1 v01 (`fde2cbb8`), v02 (`92e264d4`), v03 (`f9867a03`).
+Reviewed the full original-base diff and surrounding header ownership, media
+listener, selector/tab keyboard behavior, browser fixtures and launch assertions.
+Both source test commits were imported in order with matching test blobs.
+Read the source v01/v02 reviews: R1 (clearing dirty effort) remains resolved;
+the source WebKit layout blocker is resolved within this plan's authorized scope.
+No material findings remain. Production changes only the independent header
+width threshold to 1399px, retaining 599px height and list/detail behavior.
+
+Reused raw successful worker command receipts from
+`/root/code/agent_flow/.aflow/runs/20260912t011927z-ffcf1747/turns/turn-001/transport.stdout`
+and its completed result. The prompt's worktree-relative receipt is absent;
+the controller-root receipt is available. Focused command:
+`npm --prefix apps/aflow_app/web test -- --run src/components/GlobalSettings.test.tsx -t 'preserves a dirty section and draft across header presentation resize'`
+passed 1 selected case (71 filtered); initial missing dependencies were installed
+before this successful run. The single `npm --prefix apps/aflow_app/web run build`
+passed. Final exact browser commands used `AFLOW_TEST_BROWSER=chromium` and
+`webkit` with `uv run --project apps/aflow_app/server pytest -q`, both nodes
+`test_run_navigation_browser.py::test_complete_navigation_and_launch_journeys`
+and `test_settings_browser.py::test_settings_toolbar_stays_visible_through_long_scroll`,
+`--tb=short` and separate external `--basetemp` directories. Final results:
+Chromium 2 passed (28.55s); actual WebKit 2 passed (36.33s).
+
+Final artifacts: `/root/code/evidence/aflow-settings-header-chromium-final2-dNu8H5`
+and `/root/code/evidence/aflow-settings-header-webkit-final2-yv8V8R`.
+Reviewer inspected WebKit 1280/1440 dirty screenshots and Chromium dark 390px
+compact screenshot: selector/tabs, unsaved indicator, Save and More remain visible.
+Retained assertions enforce 112/128 geometry and existing viewport/theme,
+scroll/focus and exact-ID checks. No reset removes effort before these checks.
+Independent cumulative `git diff --check` passed. No redundant build, full suite,
+shared installation change or live owner-state mutation during review.
+
+Approval finalization combines the two handoff DEVLOG entries and includes this
+tracked reviewer record in one unpublished commit after the unchanged base.
+Preserve every reviewed implementation/test blob. No fix overlay exists or is
+created. Keep original ignored plan in place and record final approved SHA there,
+then verify exactly one commit after base and clean tracked Git state.
+Publication, exact-SHA CI and live activation remain downstream engine delivery
+gates, not claims of this local approval. Physical-device acceptance is unverified.
+
+No material findings
