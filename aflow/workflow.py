@@ -28,6 +28,7 @@ from .config import (
     WorkflowConfig,
     WorkflowStepConfig,
     WorkflowUserConfig,
+    resolve_team_config,
 )
 from .live_config import load_live_config
 from .manager import (
@@ -3221,21 +3222,26 @@ def resolve_role_selector(
         return pending_team_override.selector
     if run_local_role_selectors is not None and role in run_local_role_selectors:
         return run_local_role_selectors[role]
-    selector = config.roles.get(role)
+    if team_name is None:
+        selector = config.roles.get(role)
+    else:
+        if team_name not in config.teams:
+            raise WorkflowError(
+                f"workflow step references unknown team '{team_name}' in {step_path}"
+            )
+        try:
+            selector = resolve_team_config(config, team_name).effective_roles.get(role)
+        except ConfigError as exc:
+            raise WorkflowError(
+                f"team '{team_name}' cannot be resolved in {step_path}: {exc}"
+            ) from exc
     if selector is None:
         if "." in role:
             return role
         raise WorkflowError(
             f"workflow step references unknown role '{role}' in {step_path}"
         )
-    if team_name is None:
-        return selector
-    team_config = config.teams.get(team_name)
-    if team_config is None:
-        raise WorkflowError(
-            f"workflow step references unknown team '{team_name}' in {step_path}"
-        )
-    return team_config.roles.get(role, selector)
+    return selector
 
 
 def resolve_role_prompt(
@@ -3245,15 +3251,18 @@ def resolve_role_prompt(
     *,
     step_path: str = "<unknown>",
 ) -> str:
-    prompt = getattr(config, "role_prompts", {}).get(role, "")
     if team_name is None:
-        return prompt
-    team_config = config.teams.get(team_name)
-    if team_config is None:
+        return getattr(config, "role_prompts", {}).get(role, "")
+    if team_name not in config.teams:
         raise WorkflowError(
             f"workflow step references unknown team '{team_name}' in {step_path}"
         )
-    return getattr(team_config, "role_prompts", {}).get(role, prompt)
+    try:
+        return resolve_team_config(config, team_name).effective_prompts.get(role, "")
+    except ConfigError as exc:
+        raise WorkflowError(
+            f"team '{team_name}' cannot be resolved in {step_path}: {exc}"
+        ) from exc
 
 
 def _resolve_step_runtime(

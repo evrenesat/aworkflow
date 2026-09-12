@@ -1,4 +1,4 @@
-import { act, fireEvent, render, screen, waitFor } from '@testing-library/react'
+import { act, fireEvent, render, screen, waitFor, within } from '@testing-library/react'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { ApiError } from '../api'
 import * as api from '../api'
@@ -3439,6 +3439,184 @@ describe('RunDashboard', () => {
     expect(vi.mocked(api.startControlPlaneRun).mock.calls[1][1]).toEqual({
       plan_path: 'plans/in-progress/demo.md', workflow_name: 'other', max_turns: 12, dirty_worktree_confirmed: false,
     })
+  })
+
+  it('uses the exact child default in the family/stage preview and preserves default omission', async () => {
+    vi.mocked(api.listControlPlaneRuns).mockResolvedValue({ runs: [], next_cursor: null, schema_version: 1 })
+    vi.mocked(api.postGlobalConfigForm).mockResolvedValue({
+      ...emptyProjection,
+      form: {
+        ...emptyProjection.form,
+        default_workflow: 'managed',
+        roles: { worker: 'codex.global', reviewer: 'codex.review' },
+        teams: {
+          product: {
+            roles: { worker: 'codex.base' },
+            display_name: 'Product',
+            extends: null,
+            upgrade_to: 'product_fast',
+            effective_roles: { worker: 'codex.base', reviewer: 'codex.review' },
+            role_sources: { worker: 'product', reviewer: 'global' },
+          },
+          product_fast: {
+            roles: { worker: 'codex.fast' },
+            display_name: 'Fast',
+            extends: 'product',
+            upgrade_to: null,
+            effective_roles: { worker: 'codex.fast', reviewer: 'codex.review' },
+            role_sources: { worker: 'product_fast', reviewer: 'global' },
+          },
+        },
+        workflow_default_teams: { managed: 'product_fast' },
+      },
+    })
+    vi.mocked(api.startControlPlaneRun).mockResolvedValue({
+      result: { run_id: 'run-started', created: true, status: 'running', schema_version: 1, manifest_path: null, reason: null, restarted_from_run_id: null },
+      startup_question: null,
+    })
+
+    renderDashboard()
+    await openNewRun()
+    choose('Run plan', 'plans/in-progress/demo.md')
+
+    expect((screen.getByLabelText('Run team') as HTMLInputElement).value).toBe('Product')
+    expect((screen.getByLabelText('Run team stage') as HTMLInputElement).value).toBe('Fast')
+    const preview = screen.getByLabelText('Effective choices for this launch').textContent ?? ''
+    expect(preview).toContain('Product — workflow default (Product fast)')
+    expect(preview).toContain('baseline stage Fast (product_fast)')
+    expect(preview).toContain('codex.fast')
+
+    const familyInput = screen.getByLabelText('Run team')
+    fireEvent.focus(familyInput)
+    expect(screen.getByRole('option', { name: /Product.*Worker: codex\.base.*Upgrade route: Base → Fast/ })).toBeDefined()
+
+    // Choosing a stage keeps the exact child ID in the request, not its
+    // display name or the family root.
+    choose('Run team stage', 'product_fast')
+    await waitForPreflightReady({ team: 'product_fast' })
+    fireEvent.click(screen.getByRole('button', { name: 'Start run' }))
+    await waitFor(() => expect(api.startControlPlaneRun).toHaveBeenCalledTimes(1))
+    expect(api.startControlPlaneRun).toHaveBeenLastCalledWith(
+      'control-project',
+      expect.objectContaining({ plan_path: 'plans/in-progress/demo.md', team: 'product_fast' }),
+      expect.stringMatching(/^start-/),
+    )
+
+    // Clearing the stage returns both selectors to the resolved child while
+    // the request again omits team so the server applies that exact default.
+    await openNewRun()
+    const stageInput = screen.getByLabelText('Run team stage')
+    fireEvent.focus(stageInput)
+    fireEvent.change(stageInput, { target: { value: '' } })
+    fireEvent.click(screen.getByRole('option', { name: /Use default \(Fast\)/ }))
+    expect((screen.getByLabelText('Run team') as HTMLInputElement).value).toBe('Product')
+    expect((screen.getByLabelText('Run team stage') as HTMLInputElement).value).toBe('Fast')
+    await waitForPreflightReady()
+    fireEvent.click(screen.getByRole('button', { name: 'Start run' }))
+    await waitFor(() => expect(api.startControlPlaneRun).toHaveBeenCalledTimes(2))
+    expect(api.startControlPlaneRun).toHaveBeenLastCalledWith(
+      'control-project',
+      { plan_path: 'plans/in-progress/demo.md', dirty_worktree_confirmed: false },
+      expect.stringMatching(/^start-/),
+    )
+  })
+
+  it('does not infer worker upgrades from family membership', async () => {
+    vi.mocked(api.listControlPlaneRuns).mockResolvedValue({ runs: [], next_cursor: null, schema_version: 1 })
+    vi.mocked(api.postGlobalConfigForm).mockResolvedValue({
+      ...emptyProjection,
+      form: {
+        ...emptyProjection.form,
+        default_workflow: 'managed',
+        roles: { worker: 'codex.global', reviewer: 'codex.review' },
+        teams: {
+          product: {
+            roles: { worker: 'codex.base' },
+            display_name: 'Product',
+            extends: null,
+            upgrade_to: null,
+            effective_roles: { worker: 'codex.base', reviewer: 'codex.review' },
+            role_sources: { worker: 'product', reviewer: 'global' },
+          },
+          product_fast: {
+            roles: { worker: 'codex.fast' },
+            display_name: 'Fast',
+            extends: 'product',
+            upgrade_to: null,
+            effective_roles: { worker: 'codex.fast', reviewer: 'codex.review' },
+            role_sources: { worker: 'product_fast', reviewer: 'global' },
+          },
+        },
+        workflow_default_teams: { managed: 'product_fast' },
+      },
+    })
+
+    renderDashboard()
+    await openNewRun()
+    choose('Run plan', 'plans/in-progress/demo.md')
+
+    expect((screen.getByLabelText('Run team') as HTMLInputElement).value).toBe('Product')
+    expect((screen.getByLabelText('Run team stage') as HTMLInputElement).value).toBe('Fast')
+    const preview = screen.getByLabelText('Effective choices for this launch')
+    const chain = within(preview).getByText('Worker upgrade chain', { selector: 'dt' }).closest('div')!
+    expect(chain.textContent).toContain('codex.fast')
+    expect(chain.textContent).not.toContain('codex.base')
+
+    fireEvent.focus(screen.getByLabelText('Run team'))
+    expect(screen.getByRole('option', { name: /Product.*Members: Base, Fast/ })).toBeDefined()
+    expect(screen.queryByRole('option', { name: /Product.*Upgrade route: Base → Fast/ })).toBeNull()
+  })
+
+  it('starts a selected child upgrade chain at that child and keeps its external target', async () => {
+    vi.mocked(api.listControlPlaneRuns).mockResolvedValue({ runs: [], next_cursor: null, schema_version: 1 })
+    vi.mocked(api.postGlobalConfigForm).mockResolvedValue({
+      ...emptyProjection,
+      form: {
+        ...emptyProjection.form,
+        default_workflow: 'managed',
+        roles: { worker: 'codex.global', reviewer: 'codex.review' },
+        teams: {
+          base: {
+            roles: { worker: 'codex.base' },
+            display_name: 'Base',
+            extends: null,
+            upgrade_to: 'middle',
+            effective_roles: { worker: 'codex.base', reviewer: 'codex.review' },
+            role_sources: { worker: 'base', reviewer: 'global' },
+          },
+          middle: {
+            roles: { worker: 'codex.middle' },
+            display_name: 'Middle',
+            extends: 'base',
+            upgrade_to: 'external',
+            effective_roles: { worker: 'codex.middle', reviewer: 'codex.review' },
+            role_sources: { worker: 'middle', reviewer: 'global' },
+          },
+          external: {
+            roles: { worker: 'codex.external' },
+            display_name: 'External',
+            extends: null,
+            upgrade_to: null,
+            effective_roles: { worker: 'codex.external', reviewer: 'codex.review' },
+            role_sources: { worker: 'external', reviewer: 'global' },
+          },
+        },
+        workflow_default_teams: { managed: 'base' },
+      },
+    })
+
+    renderDashboard()
+    await openNewRun()
+    choose('Run plan', 'plans/in-progress/demo.md')
+    choose('Run team stage', 'middle')
+
+    const preview = screen.getByLabelText('Effective choices for this launch')
+    const chain = within(preview).getByText('Worker upgrade chain', { selector: 'dt' }).closest('div')!
+    expect(chain.textContent).toContain('Middle')
+    expect(chain.textContent).toContain('codex.middle')
+    expect(chain.textContent).toContain('External')
+    expect(chain.textContent).toContain('codex.external')
+    expect(chain.textContent).not.toContain('Base')
   })
 
   it('names a missing default honestly and renders membership with global fallback and the full upgrade chain', async () => {

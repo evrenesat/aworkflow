@@ -1,3 +1,53 @@
+# Team families — cumulative review v01 rejected
+
+Reviewed `010c71964317d1a2d072ce3496def47e07d3e2e2` through
+`76d90a507d4fdec0042c5741110c09bd6a98b59e`: 7 new / 7 total commits,
+`cp1 v01` through `cp7 v01`, against the original seven-checkpoint plan.
+No previous findings apply to this handoff. Implementation/history unchanged;
+no squash, approval, publication or live activation.
+
+Five admitted findings, all P2/high confidence:
+
+- R1: `GlobalSettings.tsx:711-718` sends family changes straight to setDraft;
+  effective/source projections remain stale after unsaved Base/global edits or
+  override removal. The canonical coordinator exists but is not wired to the
+  owner. Connect it with stale-response handling and declaration preservation.
+- R2: `TeamFamiliesSettings.tsx:433-434` trims the controlled display-name value
+  on every keystroke. Typing Product development yields Productdevelopment.
+  Retain editing text and normalize at a commit boundary.
+- R3: `guided_config.py:526-531` removes roles only from nested roles tables.
+  A valid legacy inline worker override survives selector=null with unchanged
+  source bytes. Remove from the actual declaration representation and preserve
+  valid legacy conversion/round-trip behavior.
+- R4: `TeamFamilyWizard.tsx:550` keys the fieldset by editable ID and position.
+  Typing an ID remounts the focused input and closes Technical details. Use an
+  immutable UI identity retained across edits/reorder, never stored in TOML.
+- R5: `TeamFamilyWizard.tsx:371-381` rejects generated-ID collisions before
+  creating any editable stage. Add two stages, remove the first, then add:
+  Strongest worker collides with the survivor and no correction input appears.
+  Allow explicit correction before acceptance without suffixing existing IDs.
+
+Concrete scenarios, commit references, implementation instructions and exact
+verification commands are in the single private fix overlay:
+`plans/in-progress/team-families-inheritance-and-creation-20260911-cp01-v01.md`.
+Original-plan tracking carries the review range and unresolved finding IDs.
+
+Retained worker transport evidence confirms 15 focused Python, 87 server,
+5 selected web cases, build, and 7 Chromium + 7 WebKit viewport journeys passed.
+The browser inheritance checks save/reload first and do not cover R1. Four
+reviewer UI probes reproduced R1/R2/R4/R5; a pure authoring probe reproduced R3.
+Probe assertions describe defective behavior. Artifacts are external under
+`/root/code/evidence/aflow-dogfood-20260909/team-families-review-20260911/review-v01/`.
+The temporary probes and probe-triggered lockfile update were removed.
+`git diff --check 010c7196 HEAD` passed. No full suite was repeated.
+
+The next review must resolve all five findings and review the full accumulated
+range from the unchanged Pre-Handoff Base HEAD before any squash approval.
+
+Material fixes required
+
+---
+
 # Issue 6 — Cumulative review approved
 
 <!-- Earlier accepted review records retained below; latest review is appended. -->
@@ -481,6 +531,47 @@ Publication, integration with current main, exact-SHA CI, live activation and ph
 
 No material findings
 
+# Team families — cumulative review v02: rejected
+
+Unchanged base: `010c71964317d1a2d072ce3496def47e07d3e2e2`.
+Reviewed HEAD: `15644e6530e021953d224130861107f49c916de0`.
+Coverage: **1 new / 8 total commits**, cp1–cp7 v01 plus follow-up cp01 v01.
+Read the active overlay and prior findings first; inspected cumulative core,
+authoring, draft/editor/wizard, launch, acceptance and documentation changes
+from the original base. R2–R5 resolved. R1 remains partially unresolved.
+
+- **R1 P2/high:** GlobalSettings.tsx:277–281 invalidates on a no-op draft change;
+  the action-key effect at 404–437 does not rerun. Change a worker, hold its
+  preview, blur an unchanged display name and release the reply: copying the
+  source is allowed with the stale worker. Match invalidation and copy eligibility
+  to current semantic/source identity; preserve matching pending/error state.
+- **R6 P2/high:** RunDashboard.tsx:2495–2499 substitutes complete family membership
+  for the selected team's upgrade chain. With inheritance but no upgrade edges,
+  the preview claims a configured Base → child escalation. Keep every member
+  selectable, but show only actual declared upgrade routes. Fix the related
+  route hints in runPresentation.ts:97–105 without changing runtime semantics.
+
+Both claims reproduced through actual owner/component tests with desired-behavior
+assertions. Probes, final logs, prior overlay and extracted worker evidence are
+external under `team-families-review-20260911/review-v02/`. Temporary test copies
+were removed. No production edits or history rewrite.
+
+Verification: affected six-file web run had 114 passes and one transient existing
+save-test failure; exact retry passed, then GlobalSettings passed 58/58. Reused
+completed final worker server 91/web 115/build and Chromium 7/7 + WebKit 7/7
+results. Retained core/runtime/MCP evidence remains applicable. Cumulative diff
+whitespace check passed. Inspected retained Chromium phone light screenshot.
+No physical keyboard, publication, CI or live activation claim.
+
+Created exactly one non-checkpoint fix overlay:
+`plans/in-progress/team-families-inheritance-and-creation-20260911-cp01-v02.md`.
+Archived and removed superseded v01; original plan/base remain in place.
+No squash, DEVLOG compaction, approval or publishing. Prior tracked reviewer
+progress is preserved. Next review must resolve R1/R6 and review the full
+original-base range before any approval/squash.
+
+Material fixes required
+
 
 ---
 
@@ -608,5 +699,268 @@ Verify one final commit after base and no remaining tracked edits.
 Publication, exact-SHA CI  repair confirmation, live activation and physical-device
 acceptance remain downstream engine/coordinator gates, unclaimed by local approval.
 No controller, owner state, shared installation or concurrent checkout is changed.
+
+# Team families — review v03: rejected
+
+Unchanged base: `010c71964317d1a2d072ce3496def47e07d3e2e2`.
+Reviewed HEAD: `aa1347ce5c700a389ad7515bc84ff9318a475ae5`.
+Coverage: **1 new / 9 total commits**, cp1–cp7 v01, cp01 v01/v02.
+Prior findings read first; original-base cumulative source was inspected across
+canonical runtime/config, server authoring, draft/editor/wizard and launch.
+R2–R5 remain resolved; R6 is resolved. R1 still fails, so this is not an
+approval-grade cumulative pass; full original-base review remains mandatory
+after the repair.
+
+**R1 P2/high — GlobalSettings.tsx:483–485:** Change Product Worker to codex.deep,
+hold its automatic preview, open Advanced and allow its separate preview to
+succeed, return to Guided, and copy Product into New family. The copy uses
+codex.worker. The transition marks the stale closure draft current instead of
+applying the canonical response, then preserves that state on return; the
+semantic effect key does not change. This can save unintended assignments.
+Merge matching canonical projection fields before marking current, preserve
+declarations, and test editor-transition recovery plus obsolete replies.
+
+Independent actual-owner probe fails its desired assertion; 179 existing tests
+in GlobalSettings/RunDashboard/runPresentation pass. Cumulative whitespace
+check passes. Evidence: external team-families-review-20260911/review-v03/
+(probe source/log, affected.log and archived v02 overlay). Completed worker
+turn-011 transport confirms retained focused settings/launch/build checks;
+its browser matrix includes successful Chromium phone-landscape retry.
+No full suites or live configuration/service operations.
+
+Created exactly one non-checkpoint fix plan at
+`plans/in-progress/team-families-inheritance-and-creation-20260911-cp01-v03.md`.
+Archived and removed superseded v02; original remains in place with unchanged
+base. Temporary probe removed. All nine implementation commits and production
+blobs preserved; tracked reviewer progress intentionally remains for eventual
+approval finalization. No squash, DEVLOG compaction, publishing, CI, live
+activation or physical-keyboard acceptance claimed.
+
+Material fixes required
+
+
+---
+
+# Team families — review v04: rejected
+
+Base `010c71964317d1a2d072ce3496def47e07d3e2e2` → HEAD
+`46a624608202415fb7840042e88c537035d2edb9`: **2 new / 11 total commits**,
+cp1–cp7 v01 and cp01 v01/v02/v03 (two v03 commits).
+Prior findings read first; original-base cumulative source inspected across
+configuration/runtime, server authoring, draft/family/editor/wizard and launch.
+R2–R6 remain resolved. R1 stale-value cases pass, but recovery remains incomplete.
+
+**R1 P2/high — GlobalSettings.tsx:457–469, 482–490:** Open Advanced from a
+valid clean draft, return to Guided, then copy Product in New family. Copying is
+blocked by “Wait for a current settings preview” with no pending request.
+Unconditional invalidation loses current readiness; zero actions return no
+response, and the unchanged semantic key never schedules recovery. Preserve a
+matching valid projection for unchanged input or preview the actual document
+pair; keep all stale/pending/error guards. This is a local transition fix.
+
+Reviewer probe fails the desired round-trip assertion; initial-state copying
+control passes. Four affected web files: 94 passed / 1 existing save-test failure;
+exact isolated retry passed. Both v03 transition regression cases passed.
+Cumulative whitespace check passed. Retained build/core/server/runtime and
+seven-viewport Chromium/WebKit evidence reused; no full suites or live edits.
+Evidence: external team-families-review-20260911/review-v04/.
+
+Created the one self-contained non-checkpoint v04 fix overlay, archived/removed
+v03, and updated original-plan tracking. Temporary probe removed. All 11 commits
+and implementation blobs preserved. No approval-grade cumulative pass, squash,
+DEVLOG compaction, publication, CI or live activation claimed. The next review
+must resolve R1 and repeat the complete original-base review before approval.
+
+Material fixes required
+
+
+---
+
+# Team families — cumulative review v05: rejected
+
+Base `010c71964317d1a2d072ce3496def47e07d3e2e2` → HEAD
+`53f0da0b45b5c10d8f80f32ffbdd694902531942`: **1 new / 12 total commits**,
+cp1–cp7 v01 plus cp01 v01/v02/v03/v04 (two v03 commits).
+Read prior overlay/findings first, verified their fixes, then inspected full
+original-base implementation across config/runtime, server authoring/contracts,
+family draft/conversion/editor/wizard, launch, acceptance and documentation.
+The prior clean Advanced round-trip defect is repaired; R2–R6 remain resolved.
+
+- **R1 P2/high — GlobalSettings.tsx:584–588:** Save only General/Bind host, then
+  Teams → New family → copy Product. Unconditional workflow-preview invalidation
+  loses readiness; no configuration acknowledgement or semantic identity change
+  restores it. Copying stays blocked with no request pending. Introduced by
+  `15644e65`; preserve matching preview state for unrelated saves or explicitly
+  recover the actual pair. This is a remaining instance of R1's readiness loss.
+- **R7 P2/high — TeamFamilyWizard.tsx:291–315:** With global defaults selected,
+  edit Worker and Reviewer prompt, then choose a copy source. Manual assignments
+  are replaced immediately because copyEdited stays false until a source was
+  already copied. Introduced by `6dbefe04`. Mark Base edits independently of
+  copySource and reuse explicit Keep/Replace confirmation, as CP5 requires.
+
+Both reproduced with desired-behavior assertions. Existing affected tests passed
+96/96; cumulative whitespace check passed. Reused final turn-015 build and
+unchanged core/server/runtime/MCP and seven-viewport Chromium/WebKit evidence.
+External `team-families-review-20260911/review-v05/` retains probes, logs, build
+records and archived v04. Initial save probe's wrong tab selector was corrected;
+the final save probe reaches the copy failure. No full suites or live operations.
+
+Created exactly one self-contained non-checkpoint v05 fix plan at the requested
+path, carrying R1 and new R7; removed superseded v04 and temporary probes. Original
+plan/base and all twelve implementation commits remain intact. No squash,
+DEVLOG compaction, publishing, CI/live activation or physical-keyboard claim.
+Tracked reviewer edits remain for eventual approval-grade finalization.
+
+Material fixes required
+
+---
+
+# Team families — cumulative review v06: rejected
+
+Base `010c71964317d1a2d072ce3496def47e07d3e2e2` → reviewed HEAD
+`f265fb8cd686c97edc166c1db5feb2d3e6856146`: **1 new / 13 total commits**,
+cp1–cp7 v01 and follow-ups cp01 v01/v02/v03/v04/v05 (two v03 commits).
+Read the prior overlay/findings first and inspected original-base cumulative
+config/runtime, server authoring/contracts, draft/conversion/editor/wizard,
+launch, responsive acceptance and documentation. No incremental-only review.
+The v05 server-only save recovery and R7 confirmation fixes pass; R2–R7 are
+resolved. R1 remains partially unresolved in rejected configuration saves.
+
+- **R1 P2/high — GlobalSettings.tsx:587–591:** Change Product Worker to codex.deep,
+  finish preview, receive a rejected configuration Save all, then try copying
+  Product into New family. Copying remains blocked by an idle preview wait.
+  Eager invalidation cancels readiness, rejection skips acknowledgement, and
+  unchanged semantic identity schedules no replacement. Preserve the matching
+  current/pending draft projection until actual source/declaration changes or
+  acknowledgement; never blindly mark stale data current. Root introduced by
+  `15644e65`, only partially repaired by `f265fb8c`.
+- **R8 P2/high — TeamFamilyWizard.tsx:586–589:** With Base A → stage B → stage B,
+  the wizard omits the required ineligibility warning on the second stage;
+  with Base A → stage B → inherited A, it falsely displays one. It compares
+  every stage to Base instead of the preceding stage, contrary to invariant 8
+  and manager selector-equality eligibility. Introduced by `6dbefe04`. Compare
+  the first stage to Base and later stages to their actual predecessor; retain
+  Base inheritance and Base-relative difference counts.
+
+Both defects independently reproduced. Existing affected four-file run:
+99 passed / 1 existing effort-blur save-test failure; exact isolated retry
+passed. Corrected owner probe reaches the copy-selection failure; two wizard
+probes reach wrong-eligibility assertions. Initial owner probe lacked setup
+mocks and is excluded from defect evidence. Reused final turn-017 100-test and
+build evidence, plus unchanged core/server/runtime/MCP and seven-viewport
+Chromium/WebKit evidence. Original-base whitespace check passed. Evidence and
+archived v05 are in external `team-families-review-20260911/review-v06/`.
+
+Created exactly one non-checkpoint overlay at
+`plans/in-progress/team-families-inheritance-and-creation-20260911-cp01-v06.md`.
+Archived/removed v05, removed temporary probes, and updated original tracking.
+All thirteen commits and implementation blobs remain intact. No squash,
+DEVLOG compaction, publication, CI/live or physical-device acceptance claim.
+Next review must resolve R1/R8 and repeat the full original-base review.
+
+Material fixes required
+
+
+---
+
+# Team families — cumulative review v07: rejected
+
+Base `010c71964317d1a2d072ce3496def47e07d3e2e2` → reviewed HEAD
+`c34078f9bcf30217672ff2809c61cd2f961c4013`: **1 new / 14 total commits**,
+cp1–cp7 v01 and cp01 v01/v02/v03/v04/v05/v06 (two v03 commits).
+Read active overlay and prior findings first, then inspected the full original-base
+configuration/runtime, authoring/contracts, draft/conversion/editor/wizard,
+launch, responsive acceptance and documentation. R2–R8 are resolved; v06 fixes
+rejected-save and candidate-preview recovery. R1 has a remaining transition path.
+
+**R1 P2/high — GlobalSettings.tsx:462–465 (catch:511–513):** Change Product Worker
+to codex.deep, finish its preview, then fail the read-only Advanced TOML preview.
+The unchanged Guided draft remains, but New family cannot copy Product: the
+coordinator was invalidated eagerly and no semantic/source change schedules
+replacement. The owner probe expects product and receives Use global defaults.
+This extends R1's preview-ownership root introduced by `15644e65`; move
+invalidation to accepted transition/source replacement, preserving matching
+current/pending state on rejection and rejecting obsolete replies on success.
+No arbitrary current-state restoration or new state framework is needed.
+
+Independent focused run: 106 passed / 1 previously recorded effort-save failure;
+exact isolated retry passed. Retained completed turn-019 evidence confirms final
+107/107 and production build. Unchanged core/server/runtime/MCP and the required
+seven-viewport Chromium/WebKit matrix remain applicable. Original-base whitespace
+check passed. External `team-families-review-20260911/review-v07/` retains the
+failing actual-owner probe, logs, results, worker receipt and archived v06 overlay.
+Temporary repository probe removed; no full suites or live operations performed.
+
+Created exactly one self-contained non-checkpoint fix plan at
+`plans/in-progress/team-families-inheritance-and-creation-20260911-cp01-v07.md`.
+Archived/removed v06 and updated original tracking. All 14 implementation commits
+and implementation blobs remain intact; no squash, DEVLOG compaction or approval.
+Tracked reviewer records remain for eventual approval finalization. Original plan
+stays in place. Next review must resolve R1 and repeat the full original-base range.
+Publication, exact-SHA CI, live activation and physical mobile keyboard acceptance
+are not claimed.
+
+Material fixes required
+
+
+---
+
+# Team families — cumulative review v08: approved
+
+Unchanged Pre-Handoff Base HEAD: `010c71964317d1a2d072ce3496def47e07d3e2e2`.
+Reviewed HEAD: `86c6a23a40bfd2fe875b32702acf45119b5a5704`.
+Previous reviewed HEAD: `c34078f9bcf30217672ff2809c61cd2f961c4013`.
+Coverage: **1 new / 15 total commits**, cp1–cp7 v01 and follow-ups
+cp01 v01/v02/v03/v04/v05/v06/v07, including both v03 commits.
+
+Read the active v07 overlay and prior findings first. R1 is resolved: current
+and matching pending projections survive a rejected Advanced transition;
+successful transitions accept canonical fields and supersede obsolete replies.
+Retained R1 no-op blur, clean/dirty editor round trips, failed previews,
+unrelated saves, rejected configuration saves and rejected family candidates
+remain covered. R2 display-name typing, R3 inline-role editing/removal,
+R4 stable component identity, R5 generated-ID correction, R6 declared-edge launch
+routes, R7 replacement confirmation and R8 adjacent-stage eligibility remain
+resolved. No unresolved earlier findings.
+
+Repeated the full cumulative original-base review of all seven checkpoints and
+all follow-ups: canonical inheritance/validation and runtime precedence;
+revisioned typed authoring, final-pair validation and sparse declarations;
+family topology, conversion parity and reference-safe removal; shared draft,
+preview, editor and wizard ownership; exact-ID/default launch presentation;
+responsive acceptance, runtime regression and documentation. No material
+finding passes the admission gate. Existing shell/scroll owners, visual-progress
+interfaces and evidence-to-plan navigation are preserved.
+
+Independent verification:
+
+```sh
+npm --prefix apps/aflow_app/web test -- --run src/components/GlobalSettings.test.tsx src/components/TeamFamilyWizard.test.tsx src/components/TeamFamiliesSettings.test.tsx src/settingsDraft.test.ts
+npm --prefix apps/aflow_app/web test -- --run src/components/ReviewV08Owner.test.tsx -t 'review v08'
+git diff --check 010c719 HEAD
+```
+
+109 affected tests passed. The additional actual-owner probe passed: guided
+worker change → Advanced raw edit → Guided → copy Product retains codex.deep
+without persistence. Temporary probe archived externally and removed. Whitespace
+check passed. Reused completed turn-021's 109-test and TypeScript/Vite build
+receipts, unchanged canonical/runtime/MCP and 91-test server evidence, plus the
+retained seven-viewport Chromium/WebKit family journeys (including recorded
+successful retries). Inspected retained light/dark screenshots; the dark image
+is a compact resized state despite its original viewport filename. No whole
+suite rerun or live owner configuration/service operation. Evidence is under
+`/root/code/evidence/aflow-dogfood-20260909/team-families-review-20260911/review-v08/`;
+earlier referenced evidence remains intact. Physical mobile keyboard acceptance
+is unverified.
+
+Approval finalization: squash all fifteen handoff commits onto the unchanged
+base, including this already-tracked reviewer record and prior reviewer progress.
+DEVLOG already contains exactly one handoff entry, so no compaction is needed.
+Preserve every other reviewed blob. Archive/remove the v07 overlay; create no
+v08 fix plan. Keep the ignored original plan in place and record the final SHA
+there after committing. Verify one accumulated commit, no stale fix plans and
+clean tracked Git state. Do not force-add private plans/evidence. Publication,
+exact-SHA CI and live activation remain controller/coordinator delivery gates;
+this approval is local and does not claim deployment.
 
 No material findings

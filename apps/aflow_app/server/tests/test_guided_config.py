@@ -9,6 +9,7 @@ function here ever touches a registered project.
 from __future__ import annotations
 
 import tempfile
+import tomllib
 from pathlib import Path
 
 import pytest
@@ -27,12 +28,15 @@ from aflow_app_server.models import (
     BuildStarterAction,
     ProjectConfigFormPayload,
     ProjectConfigFormResponse,
+    RemoveTeamAction,
     RenamePromptAction,
     SetDefaultManagerEnabledAction,
     SetDefaultWorkflowAction,
     SetGlobalRoleAction,
     SetMaxTurnsAction,
     SetPromptAction,
+    SetTeamBaseAction,
+    SetTeamDisplayNameAction,
     SetTeamRoleAction,
     SetTeamUpgradeAction,
     SetWorkflowDefaultTeamAction,
@@ -57,6 +61,82 @@ worker = "codex.fast"
 # A team that overrides the worker role.
 [teams.crew.roles]
 worker = "codex.deep"
+
+[prompts]
+p = "Work."
+"""
+
+INLINE_FAMILY_AFLOW_TEXT = """# Legacy inline roles stay editable without losing metadata.
+[harness.codex.profiles.fast]
+model = "test-model"
+
+[harness.codex.profiles.deep]
+model = "deep-model"
+
+[roles]
+worker = "codex.fast"
+reviewer = "codex.fast"
+
+[teams.base]
+display_name = "Legacy base"
+upgrade_to = "child"
+worker = "codex.deep"
+reviewer = "codex.fast"
+
+[teams.child]
+# Child metadata and comments survive role restoration.
+display_name = "Legacy child"
+extends = "base"
+backup_team = "fallback"
+worker = "codex.fast"
+reviewer = "codex.fast"
+
+[teams.fallback]
+
+[prompts]
+p = "Work."
+"""
+
+FAMILY_AFLOW_TEXT = """# Family metadata and sparse declarations remain editable.
+[harness.codex.profiles.fast]
+model = "test-model"
+
+[harness.codex.profiles.deep]
+model = "deep-model"
+
+[harness.codex.profiles.review]
+model = "review-model"
+
+[roles]
+worker = "codex.fast"
+reviewer = "codex.fast"
+
+[roles.prompts]
+worker = "Global worker guidance."
+reviewer = "Global reviewer guidance."
+
+[teams.base]
+display_name = "Product base"
+backup_team = "fallback"
+upgrade_to = "child"
+
+[teams.base.roles]
+worker = "codex.deep"
+
+[teams.base.prompts]
+reviewer = "Base reviewer guidance."
+
+[teams.child]
+display_name = "Stronger worker"
+extends = "base"
+
+[teams.child.roles]
+reviewer = "codex.review"
+
+[teams.child.prompts]
+worker = "Child worker guidance."
+
+[teams.fallback]
 
 [prompts]
 p = "Work."
@@ -336,6 +416,59 @@ class TestActions:
                 )
             )
 
+    def test_set_team_role_removes_legacy_inline_declaration_and_preserves_siblings(self) -> None:
+        response = _call(
+            aflow_text=INLINE_FAMILY_AFLOW_TEXT,
+            action=SetTeamRoleAction(
+                type="set_team_role", team="child", role="reviewer", selector=None
+            ),
+        )
+        raw = tomllib.loads(response.aflow_toml)
+        child = raw["teams"]["child"]
+        assert "reviewer" not in child
+        assert child["worker"] == "codex.fast"
+        assert child["display_name"] == "Legacy child"
+        assert child["backup_team"] == "fallback"
+        assert "# Child metadata and comments survive role restoration." in response.aflow_toml
+        assert response.form is not None
+        assert response.form.teams["child"].roles == {"worker": "codex.fast"}
+
+    def test_set_team_role_updates_legacy_inline_declaration_without_mixing_tables(self) -> None:
+        response = _call(
+            aflow_text=INLINE_FAMILY_AFLOW_TEXT,
+            action=SetTeamRoleAction(
+                type="set_team_role", team="child", role="worker", selector="codex.deep"
+            ),
+        )
+        raw = tomllib.loads(response.aflow_toml)
+        child = raw["teams"]["child"]
+        assert child["worker"] == "codex.deep"
+        assert child["reviewer"] == "codex.fast"
+        assert "roles" not in child
+        assert response.form is not None
+        assert response.form.teams["child"].roles == {
+            "worker": "codex.deep",
+            "reviewer": "codex.fast",
+        }
+
+    def test_inline_legacy_conversion_actions_round_trip_without_mixed_role_tables(self) -> None:
+        aflow_text, workflows_text = apply_action_batch(
+            INLINE_FAMILY_AFLOW_TEXT,
+            WORKFLOWS_TEXT,
+            [
+                SetTeamBaseAction(type="set_team_base", team="child", extends="base"),
+                SetTeamRoleAction(type="set_team_role", team="child", role="reviewer", selector=None),
+            ],
+        )
+        raw = tomllib.loads(aflow_text)
+        assert "roles" not in raw["teams"]["child"]
+        assert raw["teams"]["child"]["worker"] == "codex.fast"
+        response = _call(aflow_text=aflow_text, workflows_text=workflows_text)
+        assert response.validation.state == "ready"
+        assert response.form is not None
+        assert response.form.teams["child"].extends == "base"
+        assert response.form.teams["child"].roles == {"worker": "codex.fast"}
+
     def test_set_workflow_default_team_set_clear_and_rejects_unknowns(self) -> None:
         with pytest.raises(GuidedConfigError):
             _call(
@@ -362,6 +495,104 @@ class TestActions:
             ),
         )
         assert "team =" not in cleared.workflows_toml
+
+
+class TestTeamFamilies:
+    def test_projection_keeps_declarations_and_adds_canonical_effective_values(self) -> None:
+        response = _call(aflow_text=FAMILY_AFLOW_TEXT)
+        form = response.form
+        assert form is not None
+
+        child = form.teams["child"]
+        assert child.roles == {"reviewer": "codex.review"}
+        assert child.prompts == {"worker": "Child worker guidance."}
+        assert child.extends == "base"
+        assert child.display_name == "Stronger worker"
+        assert child.backup_team is None
+        assert child.upgrade_to is None
+        assert child.effective_roles == {
+            "worker": "codex.deep",
+            "reviewer": "codex.review",
+        }
+        assert child.effective_prompts == {
+            "worker": "Child worker guidance.",
+            "reviewer": "Base reviewer guidance.",
+        }
+        assert child.role_sources == {"worker": "base", "reviewer": "child"}
+        assert child.prompt_sources == {"worker": "child", "reviewer": "base"}
+
+        base = form.teams["base"]
+        assert base.backup_team == "fallback"
+        assert base.upgrade_to == "child"
+        assert base.effective_roles == {
+            "worker": "codex.deep",
+            "reviewer": "codex.fast",
+        }
+
+    def test_team_metadata_and_nullable_role_actions_preserve_sparse_source(self) -> None:
+        renamed = _call(
+            aflow_text=FAMILY_AFLOW_TEXT,
+            action=SetTeamDisplayNameAction(
+                type="set_team_display_name",
+                team="child",
+                display_name="  Stronger implementation  ",
+            ),
+        )
+        assert 'display_name = "Stronger implementation"' in renamed.aflow_toml
+        assert renamed.form is not None
+        assert renamed.form.teams["child"].display_name == "Stronger implementation"
+
+        detached = _call(
+            aflow_text=renamed.aflow_toml,
+            action=SetTeamBaseAction(type="set_team_base", team="child", extends=None),
+        )
+        assert "extends" not in detached.aflow_toml
+        assert detached.form is not None
+        assert detached.form.teams["child"].effective_roles == {
+            "worker": "codex.fast",
+            "reviewer": "codex.review",
+        }
+
+        restored = _call(
+            aflow_text=detached.aflow_toml,
+            action=SetTeamBaseAction(type="set_team_base", team="child", extends="base"),
+        )
+        removed = _call(
+            aflow_text=restored.aflow_toml,
+            action=SetTeamRoleAction(
+                type="set_team_role", team="child", role="reviewer", selector=None
+            ),
+        )
+        assert removed.form is not None
+        assert removed.form.teams["child"].roles == {}
+        assert removed.form.teams["child"].effective_roles["reviewer"] == "codex.fast"
+
+        label_removed = _call(
+            aflow_text=removed.aflow_toml,
+            action=SetTeamDisplayNameAction(
+                type="set_team_display_name", team="child", display_name=None
+            ),
+        )
+        assert label_removed.form is not None
+        assert label_removed.form.teams["child"].display_name is None
+
+        blank_removed = _call(
+            aflow_text=renamed.aflow_toml,
+            action=SetTeamDisplayNameAction(
+                type="set_team_display_name", team="child", display_name="  "
+            ),
+        )
+        assert blank_removed.form is not None
+        assert blank_removed.form.teams["child"].display_name is None
+
+    def test_remove_team_rejects_remaining_references_without_mutating_draft(self) -> None:
+        with pytest.raises(GuidedConfigError) as exc_info:
+            _call(
+                aflow_text=FAMILY_AFLOW_TEXT,
+                action=RemoveTeamAction(type="remove_team", team="base"),
+            )
+        assert exc_info.value.code == "team_in_use"
+        assert "teams.child.extends" in str(exc_info.value)
 
 
 class TestBuildStarter:

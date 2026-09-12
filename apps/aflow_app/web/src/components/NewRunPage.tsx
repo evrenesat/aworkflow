@@ -131,11 +131,20 @@ interface NewRunPageProps {
   workflowOptions: string[]
   workflowBadges: Record<string, string>
   workflowPresentation: LaunchSelectorPresentation
-  startTeam: string
-  setStartTeam: (value: string) => void
-  teamOptions: string[]
-  teamBadges: Record<string, string>
-  teamPresentation: LaunchSelectorPresentation
+  startTeamFamily: string
+  setStartTeamFamily: (value: string) => void
+  teamFamilyOptions: string[]
+  teamFamilyBadges: Record<string, string>
+  teamFamilyOptionLabel: (value: string) => string
+  teamFamilyOptionHint?: (value: string) => string | null | undefined
+  teamFamilyPresentation: LaunchSelectorPresentation
+  startTeamStage: string
+  setStartTeamStage: (value: string) => void
+  teamStageOptions: string[]
+  teamStageBadges: Record<string, string>
+  teamStageOptionLabel: (value: string) => string
+  teamStageOptionHint?: (value: string) => string | null | undefined
+  teamStagePresentation: LaunchSelectorPresentation
   startMaxTurns: string
   setStartMaxTurns: (value: string) => void
   startMaxTurnsProblem: string | null
@@ -164,7 +173,7 @@ interface NewRunPageProps {
 }
 
 /** Presentation only; the workspace retains request and answer identity across navigation. */
-export function NewRunPage({ startPlanPath, setStartPlanPath, planOptions, planBadges, restartDraftFrozen, startWorkflow, changeStartWorkflow, workflowOptions, workflowBadges, workflowPresentation, startTeam, setStartTeam, teamOptions, teamBadges, teamPresentation, startMaxTurns, setStartMaxTurns, startMaxTurnsProblem, configuredMaxTurns, preview, worktreePreflight, restartActions, onCancel, advancedOpen, setAdvancedOpen, startStep, setStartStep, effectiveWorkflow, runSteps, skippedByDraft, startExtraInstructions, setStartExtraInstructions, extraInstructionProblem, launchBlocker, onOpenSettings, handleStart, startDisabled, busyAction, hideActions = false }: NewRunPageProps) {
+export function NewRunPage({ startPlanPath, setStartPlanPath, planOptions, planBadges, restartDraftFrozen, startWorkflow, changeStartWorkflow, workflowOptions, workflowBadges, workflowPresentation, startTeamFamily, setStartTeamFamily, teamFamilyOptions, teamFamilyBadges, teamFamilyOptionLabel, teamFamilyOptionHint, teamFamilyPresentation, startTeamStage, setStartTeamStage, teamStageOptions, teamStageBadges, teamStageOptionLabel, teamStageOptionHint, teamStagePresentation, startMaxTurns, setStartMaxTurns, startMaxTurnsProblem, configuredMaxTurns, preview, worktreePreflight, restartActions, onCancel, advancedOpen, setAdvancedOpen, startStep, setStartStep, effectiveWorkflow, runSteps, skippedByDraft, startExtraInstructions, setStartExtraInstructions, extraInstructionProblem, launchBlocker, onOpenSettings, handleStart, startDisabled, busyAction, hideActions = false }: NewRunPageProps) {
   const advancedId = useId()
   return (
         <section className="card start-run-form">
@@ -203,18 +212,37 @@ export function NewRunPage({ startPlanPath, setStartPlanPath, planOptions, planB
                 <div className="dashboard-field">
                   <Combobox
                     label="Run team"
-                    visibleLabel="Team"
-                    value={startTeam}
-                    onChange={setStartTeam}
-                    options={teamOptions}
-                    optionBadges={teamBadges}
-                    optionLabel={(team) => formatMachineChoice(team, teamOptions)}
+                    visibleLabel="Team family"
+                    value={startTeamFamily}
+                    onChange={setStartTeamFamily}
+                    options={teamFamilyOptions}
+                    optionBadges={teamFamilyBadges}
+                    optionLabel={teamFamilyOptionLabel}
+                    optionHint={teamFamilyOptionHint}
                     disabled={restartDraftFrozen}
-                    placeholder="Search teams"
-                    resolvedDisplay={teamPresentation.resolvedDisplay}
-                    resolvedBadge={teamPresentation.resolvedBadge}
-                    defaultOption={{ value: '', label: teamPresentation.defaultLabel, hint: teamPresentation.defaultHint }}
+                    placeholder="Search team families"
+                    resolvedDisplay={teamFamilyPresentation.resolvedDisplay}
+                    resolvedBadge={teamFamilyPresentation.resolvedBadge}
+                    defaultOption={{ value: '', label: teamFamilyPresentation.defaultLabel, hint: teamFamilyPresentation.defaultHint }}
                   />
+                  {teamStageOptions.length > 1 && <div className="dashboard-field">
+                    <Combobox
+                      label="Run team stage"
+                      visibleLabel="Baseline stage"
+                      value={startTeamStage}
+                      onChange={setStartTeamStage}
+                      options={teamStageOptions}
+                      optionBadges={teamStageBadges}
+                      optionLabel={teamStageOptionLabel}
+                      optionHint={teamStageOptionHint}
+                      disabled={restartDraftFrozen}
+                      placeholder="Search stages"
+                      resolvedDisplay={teamStagePresentation.resolvedDisplay}
+                      resolvedBadge={teamStagePresentation.resolvedBadge}
+                      defaultOption={{ value: '', label: teamStagePresentation.defaultLabel, hint: teamStagePresentation.defaultHint }}
+                    />
+                    <span className="text-xs text-dim">The selected stage submits its exact configured team ID.</span>
+                  </div>}
                 </div>
 
               </div>

@@ -56,6 +56,21 @@
 
   Both browser invocations passed 3 cases. Evidence is retained under `/root/code/evidence/aflow-dogfood-20260909/run-summary-wrapping-review-20260911/`.
 
+## 2026-09-11 — Team-family integrated acceptance
+
+- Completed the family creation, direct inheritance, override restoration,
+  legacy conversion, reference-safe stage removal, conflict retention and
+  exact-ID launch journeys against disposable configuration.
+- Added the inherited-worker runtime regression proving one target attempt while
+  reviewer/manager routing stays on the baseline and the next checkpoint
+  returns to the baseline worker. Responsive acceptance covers the existing
+  seven viewport matrix, light/dark themes, enlarged text, keyboard/focus,
+  document scroll and compact list/detail navigation; physical mobile keyboard
+  behavior remains unverified.
+- Browser screenshots and pytest temporary artifacts are retained under the
+  external CP7 evidence directory recorded in the implementation plan. No live
+  owner configuration, team, provider or shared service was changed.
+
 ## 2026-09-11 — Gate immediate stop on selected-run control admission
 
 - The focused immediate-stop test now holds the admitted capabilities response,

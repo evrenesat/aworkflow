@@ -28,8 +28,10 @@ def _is_table(value: object) -> bool:
 
 from aflow.config import (
     ConfigError,
+    TEAM_DISPLAY_NAME_MAX_LENGTH,
     load_workflow_config,
     render_starter_documents,
+    resolve_team_config,
     validate_starter_name,
 )
 from aflow.harnesses import ADAPTERS
@@ -42,6 +44,9 @@ from .models import (
     SetDefaultWorkflowAction,
     SetGlobalRoleAction,
     SetMaxTurnsAction,
+    RemoveTeamAction,
+    SetTeamBaseAction,
+    SetTeamDisplayNameAction,
     SetTeamRoleAction,
     SetTeamUpgradeAction,
     SetWorkflowDefaultTeamAction,
@@ -66,6 +71,9 @@ _SUGGESTION_NOTE = (
 )
 STARTER_PLACEHOLDER_MODEL = "FILL_IN_MODEL"
 _STARTER_PROFILE_PATH = ("harness", "starter", "profiles", "default")
+_TEAM_RESERVED_KEYS = frozenset(
+    {"roles", "prompts", "backup_team", "upgrade_to", "extends", "display_name"}
+)
 
 # Keep this catalog in the guided projection rather than configuration data:
 # it is editor-only help and never participates in an action or TOML write.
@@ -250,12 +258,39 @@ def _role_selectors(aflow_doc: TOMLDocument) -> list[str]:
             if not _is_table(team_value):
                 continue
             team_roles = team_value.get("roles")
-            if not isinstance(team_roles, Table):
-                continue
+            if _is_table(team_roles):
+                selectors.extend(
+                    value for value in team_roles.values() if isinstance(value, str)
+                )
             selectors.extend(
-                value for value in team_roles.values() if isinstance(value, str)
+                team_value[key]
+                for key in _inline_team_role_keys(team_value)
+                if isinstance(team_value[key], str)
             )
     return selectors
+
+
+def _inline_team_role_keys(team: object) -> tuple[str, ...]:
+    """Return legacy role keys stored directly in one team table."""
+    if not _is_table(team):
+        return ()
+    return tuple(
+        str(key) for key in team if str(key) not in _TEAM_RESERVED_KEYS
+    )
+
+
+def _move_inline_team_roles_to_table(team: Table) -> Table:
+    """Normalize an explicitly edited mixed team into the supported role table."""
+    roles = team.get("roles")
+    if roles is None:
+        roles = tomlkit.table()
+        team["roles"] = roles
+    elif not _is_table(roles):
+        raise GuidedConfigError("invalid_field_type", "teams.roles must be a table")
+    for key in _inline_team_role_keys(team):
+        roles[key] = team[key]
+        del team[key]
+    return roles
 
 
 def _cleanup_starter_profile(aflow_doc: TOMLDocument) -> None:
@@ -324,6 +359,30 @@ def _require_team(aflow_doc: TOMLDocument, name: str) -> Table:
     if not isinstance(team, Table):
         raise GuidedConfigError("invalid_field_type", f"teams.{name} must be a table")
     return team
+
+
+def _team_reference_paths(
+    aflow_doc: TOMLDocument,
+    workflows_doc: TOMLDocument,
+    team_name: str,
+) -> tuple[str, ...]:
+    """Return configured fields that still point at ``team_name``."""
+    references: list[str] = []
+    teams_table = aflow_doc.get("teams")
+    if _is_table(teams_table):
+        for source_name, source_value in teams_table.items():
+            if not _is_table(source_value):
+                continue
+            for field in ("extends", "backup_team", "upgrade_to"):
+                if source_value.get(field) == team_name:
+                    references.append(f"teams.{source_name}.{field}")
+    workflow_table = workflows_doc.get("workflow")
+    if _is_table(workflow_table):
+        for workflow_name in _workflow_names(workflows_doc):
+            workflow_value = workflow_table.get(workflow_name)
+            if _is_table(workflow_value) and workflow_value.get("team") == team_name:
+                references.append(f"workflow.{workflow_name}.team")
+    return tuple(references)
 
 
 def _text_table(value: object, *, path: str) -> dict[str, str]:
@@ -494,12 +553,83 @@ def _apply_action(
         return
     if isinstance(action, SetTeamRoleAction):
         _require_role_name(aflow_doc, action.role, must_exist=True)
+        team = _require_team(aflow_doc, action.team)
+        if action.selector is None:
+            team_roles = team.get("roles")
+            if _inline_team_role_keys(team) and team_roles is not None:
+                team_roles = _move_inline_team_roles_to_table(team)
+            if _is_table(team_roles) and action.role in team_roles:
+                del team_roles[action.role]
+            if action.role in _inline_team_role_keys(team):
+                # Legacy teams store role selectors directly beside metadata.
+                # Restore inheritance must remove that real declaration too.
+                del team[action.role]
+            return
         profiles = _configured_profiles(aflow_doc)
         _require_profile_reference(action.selector, profiles)
-        team = _require_team(aflow_doc, action.team)
-        team_roles = _table(team, "roles", path=f"teams.{action.team}.roles")
-        team_roles[action.role] = action.selector
+        inline_keys = _inline_team_role_keys(team)
+        if inline_keys and team.get("roles") is None:
+            # Preserve a clean legacy representation while it is being edited;
+            # creating a nested table here would make the loader reject the
+            # untouched inline selectors as a mixed declaration.
+            team[action.role] = action.selector
+        else:
+            if inline_keys:
+                team_roles = _move_inline_team_roles_to_table(team)
+            else:
+                team_roles = _table(team, "roles", path=f"teams.{action.team}.roles")
+            team_roles[action.role] = action.selector
         _cleanup_starter_profile(aflow_doc)
+        return
+    if isinstance(action, SetTeamBaseAction):
+        team = _require_team(aflow_doc, action.team)
+        if action.extends is None:
+            team.pop("extends", None)
+            return
+        if action.extends == action.team:
+            raise GuidedConfigError(
+                "invalid_team_base",
+                f"teams.{action.team}.extends cannot reference itself",
+            )
+        _require_team(aflow_doc, action.extends)
+        team["extends"] = action.extends
+        return
+    if isinstance(action, SetTeamDisplayNameAction):
+        team = _require_team(aflow_doc, action.team)
+        if action.display_name is None:
+            team.pop("display_name", None)
+            return
+        display_name = action.display_name.strip()
+        if not display_name:
+            # Guided blank input means remove the local label, matching the
+            # draft editor contract rather than persisting an invalid value.
+            team.pop("display_name", None)
+            return
+        if len(display_name) > TEAM_DISPLAY_NAME_MAX_LENGTH:
+            raise GuidedConfigError(
+                "invalid_team_display_name",
+                f"teams.{action.team}.display_name must be at most "
+                f"{TEAM_DISPLAY_NAME_MAX_LENGTH} characters",
+            )
+        team["display_name"] = display_name
+        return
+    if isinstance(action, RemoveTeamAction):
+        _require_team(aflow_doc, action.team)
+        references = _team_reference_paths(aflow_doc, workflows_doc, action.team)
+        if references:
+            shown = ", ".join(references[:8])
+            if len(references) > 8:
+                shown += ", ..."
+            raise GuidedConfigError(
+                "team_in_use",
+                f"team '{action.team}' is still referenced by {shown}"[:300],
+            )
+        teams_table = aflow_doc.get("teams")
+        if not _is_table(teams_table):  # pragma: no cover - _require_team checked it
+            raise GuidedConfigError(
+                "invalid_field_type", "teams must be a table"
+            )
+        del teams_table[action.team]
         return
     if isinstance(action, SetTeamUpgradeAction):
         team = _require_team(aflow_doc, action.team)
@@ -714,7 +844,11 @@ def _projection(
         for key, value in roles_table.items():
             if key != "prompts" and isinstance(value, str):
                 roles[str(key)] = value
-    teams: dict[str, dict[str, dict[str, str]]] = {}
+    global_role_prompts = _text_table(
+        roles_table.get("prompts") if _is_table(roles_table) else None,
+        path="roles.prompts",
+    )
+    teams: dict[str, dict[str, Any]] = {}
     teams_table = aflow_doc.get("teams")
     if _is_table(teams_table):
         for team_name, team_value in teams_table.items():
@@ -729,17 +863,53 @@ def _projection(
                     if isinstance(value, str)
                 }
             team_upgrade = team_value.get("upgrade_to")
-            teams[str(team_name)] = {
+            team_id = str(team_name)
+            team_prompts = _text_table(
+                team_value.get("prompts"),
+                path=f"teams.{team_name}.prompts",
+            )
+            declared_roles = {**roles, **team_roles}
+            declared_role_sources = {role: "global" for role in roles}
+            declared_role_sources.update(
+                {role: team_id for role in team_roles}
+            )
+            declared_prompts = {**global_role_prompts, **team_prompts}
+            declared_prompt_sources = {
+                role: "global" for role in global_role_prompts
+            }
+            declared_prompt_sources.update(
+                {role: team_id for role in team_prompts}
+            )
+            teams[team_id] = {
                 "roles": team_roles,
-                "prompts": _text_table(
-                    team_value.get("prompts"),
-                    path=f"teams.{team_name}.prompts",
-                ),
+                "prompts": team_prompts,
                 # backup_team stays a distinct recovery field and is never
                 # surfaced as a quality-upgrade stage.
                 "upgrade_to": (
                     team_upgrade if isinstance(team_upgrade, str) else None
                 ),
+                "extends": (
+                    team_value.get("extends")
+                    if isinstance(team_value.get("extends"), str)
+                    else None
+                ),
+                "display_name": (
+                    team_value.get("display_name")
+                    if isinstance(team_value.get("display_name"), str)
+                    else None
+                ),
+                "backup_team": (
+                    team_value.get("backup_team")
+                    if isinstance(team_value.get("backup_team"), str)
+                    else None
+                ),
+                # Invalid drafts still expose a bounded best-effort effective
+                # view; valid candidates replace it below with the canonical
+                # resolver's projection and provenance.
+                "effective_roles": declared_roles,
+                "effective_prompts": declared_prompts,
+                "role_sources": declared_role_sources,
+                "prompt_sources": declared_prompt_sources,
             }
     workflow_default_teams: dict[str, str | None] = {}
     workflows: dict[str, dict[str, Any]] = {}
@@ -784,6 +954,7 @@ def _projection(
                 "manager_enabled_source": "defaults",
             }
     report = validate_candidate_pair(*texts)
+    config = None
     materialized: set[str] = set()
     if report.state != "invalid":
         with tempfile.TemporaryDirectory(prefix="aflow-guided-form-") as temporary:
@@ -795,6 +966,25 @@ def _projection(
             except ConfigError:
                 config = None
         if config is not None:
+            for team_name, team_config in config.teams.items():
+                summary = teams.get(team_name)
+                if summary is None:
+                    continue
+                resolved = resolve_team_config(config, team_name)
+                summary.update(
+                    {
+                        "roles": dict(team_config.roles),
+                        "prompts": dict(team_config.role_prompts),
+                        "upgrade_to": team_config.upgrade_to,
+                        "extends": team_config.extends,
+                        "display_name": team_config.display_name,
+                        "backup_team": team_config.backup_team,
+                        "effective_roles": resolved.effective_roles,
+                        "effective_prompts": resolved.effective_prompts,
+                        "role_sources": resolved.role_sources,
+                        "prompt_sources": resolved.prompt_sources,
+                    }
+                )
             materialized = set(config.workflows)
             for wf_name, wf_config in config.workflows.items():
                 summary = workflows.setdefault(
@@ -847,12 +1037,7 @@ def _projection(
             declared, extends, declared_manager, default_manager_enabled
         )
     named_prompts = _text_table(aflow_doc.get("prompts"), path="prompts")
-    role_prompts = (
-        _text_table(
-            roles_table.get("prompts") if _is_table(roles_table) else None,
-            path="roles.prompts",
-        )
-    )
+    role_prompts = global_role_prompts
     usages: dict[str, list[str]] = {name: [] for name in named_prompts}
     for path, values in prompt_reference_arrays(workflows_doc):
         for name in named_prompts:

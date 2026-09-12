@@ -1266,6 +1266,16 @@ lock, validates the final pair, and retains rollback-safe writes. PUT remains
 compatible with existing callers. Suggestions
 are distinct from configured choices, and ZCode model/effort stay external.
 
+The same guided projection is the canonical team-family resolver boundary:
+each team retains declared roles/prompts and direct metadata while the server
+returns effective values plus the exact global/Base/team provenance for the
+editor. The Team Families editor and wizard mutate that shared GlobalSettings
+draft; Add family to draft is a preview step and Save all changes is the only
+configuration write. Family labels are presentation values, while the raw Base
+and stage IDs remain references. Reference checks run before stage deletion or
+route rewrites, and the launch projection groups those IDs for display without
+changing the runtime request's selected team ID or baseline-routing semantics.
+
 The guided configuration projection exposes each workflow's materialized
 executable step names and `step_roles` from the production loader. The run
 preview resolves each step's role through the selected team's override and

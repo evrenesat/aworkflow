@@ -78,6 +78,22 @@ describe('PromptsSettings', () => {
     expect(screen.getByText('{MAIN_BRANCH}')).toBeTruthy()
   })
 
+  it('edits canonical inherited team prompt text and shows its exact source', () => {
+    const draft = {
+      ...baseDraft(),
+      roles: { worker: 'codex.worker' },
+      role_prompts: { worker: 'Global fallback' },
+      teams: {
+        base: { roles: {}, prompts: {}, effective_prompts: { worker: 'Canonical base prompt' }, prompt_sources: { worker: 'base' } },
+        child: { roles: {}, prompts: {}, effective_prompts: { worker: 'Canonical base prompt' }, prompt_sources: { worker: 'base' } },
+      },
+    }
+    render(<PromptsSettings draft={draft} change={() => {}} rename={() => {}} names={{}} deleted={[]} onDelete={() => {}} onUndo={() => {}} />)
+    fireEvent.click(screen.getByRole('button', { name: 'Child / Worker', exact: true }))
+    expect((screen.getByRole('textbox', { name: 'Role prompt text' }) as HTMLTextAreaElement).value).toBe('Canonical base prompt')
+    expect(screen.getByText('Inherited from Base (base)')).toBeTruthy()
+  })
+
   it('keeps prompt editing available when the help catalog is unavailable', () => {
     const draft = { ...baseDraft(), template_variables: undefined }
     render(<PromptsSettings draft={draft} change={() => {}} rename={() => {}} names={{}} deleted={[]} onDelete={() => {}} onUndo={() => {}} />)

@@ -27,7 +27,20 @@ import { MoreMenu, MenuItem } from './MoreMenu'
 import { NewRunPage, WorktreePreflightPanel, type WorktreePreflightLoadState } from './NewRunPage'
 import { Combobox } from './Combobox'
 import { useHeaderSlots } from './HeaderSlots'
-import { runPlanDisplayName, runPlanDisplayNameForRun, runPlanPath, statusLabel, executionDuration } from '../runPresentation'
+import {
+  launchTeamFamilyGroups,
+  launchTeamFamilyHint,
+  launchTeamFamilyLabel,
+  launchTeamFamilyRoute,
+  launchTeamUpgradeRoute,
+  launchTeamStageLabel,
+  launchTeamRoleSummary,
+  runPlanDisplayName,
+  runPlanDisplayNameForRun,
+  runPlanPath,
+  statusLabel,
+  executionDuration,
+} from '../runPresentation'
 import { workspaceHref } from '../urlState'
 import { formatMachineChoice, formatMachineLabel } from '../label'
 import { RunProgress } from './RunProgress'
@@ -111,10 +124,15 @@ function resolveStepRole(
   role: string,
   teamRoles: Record<string, string>,
   globalRoles: Record<string, string>,
+  teamRoleSources?: Record<string, string>,
 ): RoleResolution {
   const teamSelector = teamRoles[role]
   if (typeof teamSelector === 'string' && teamSelector.trim()) {
-    return { role, selector: teamSelector, source: 'team' as const }
+    return {
+      role,
+      selector: teamSelector,
+      source: teamRoleSources?.[role] === 'global' ? 'global' : 'team',
+    }
   }
   const globalSelector = globalRoles[role]
   if (typeof globalSelector === 'string' && globalSelector.trim()) {
@@ -2177,7 +2195,15 @@ export function RunDashboard({ visible = true, page, onNewRun, onCancelNewRun, o
     : workflowDefaultTeam
       ? `workflow default (${formatMachineLabel(workflowDefaultTeam)})`
       : 'no team — global role assignments apply'
-  const effectiveTeamRoles = effectiveTeam ? committedForm?.teams?.[effectiveTeam]?.roles ?? {} : {}
+  function teamRolesForPreview(teamId: string): Record<string, string> {
+    const summary = committedForm?.teams?.[teamId]
+    return summary?.effective_roles ?? summary?.roles ?? {}
+  }
+  function teamRoleSourcesForPreview(teamId: string): Record<string, string> | undefined {
+    return committedForm?.teams?.[teamId]?.role_sources
+  }
+  const effectiveTeamRoles = effectiveTeam ? teamRolesForPreview(effectiveTeam) : {}
+  const effectiveTeamRoleSources = effectiveTeam ? teamRoleSourcesForPreview(effectiveTeam) : undefined
   const effectiveSteps = configuredWorkflowSteps(committedForm, capabilities, effectiveWorkflow)
   // Exact per-step roles come only from the committed projection's
   // materialized mapping; a role is never inferred from the step name, the
@@ -2208,6 +2234,58 @@ export function RunDashboard({ visible = true, page, onNewRun, onCancelNewRun, o
   for (const team of teamOptions) {
     teamBadges[team] = committedForm?.teams[team] ? 'configured' : 'available on this server'
   }
+  const launchTeamGroups = launchTeamFamilyGroups(committedForm, teamOptions)
+  const teamFamilyOptions = launchTeamGroups.map((group) => group.rootId)
+  const teamFamilyLabelCounts = new Map<string, number>()
+  for (const group of launchTeamGroups) {
+    const label = launchTeamFamilyLabel(group)
+    teamFamilyLabelCounts.set(label, (teamFamilyLabelCounts.get(label) ?? 0) + 1)
+  }
+  const teamFamilyGroupFor = (teamId: string): typeof launchTeamGroups[number] | null => (
+    launchTeamGroups.find((group) => group.memberIds.includes(teamId)) ?? null
+  )
+  const effectiveTeamGroup = effectiveTeam ? teamFamilyGroupFor(effectiveTeam) : null
+  const explicitTeamGroup = startTeam.trim() ? teamFamilyGroupFor(startTeam.trim()) : null
+  const activeTeamGroup = explicitTeamGroup ?? effectiveTeamGroup
+  const teamStageOptions = activeTeamGroup && activeTeamGroup.memberIds.length > 1
+    ? launchTeamFamilyRoute(activeTeamGroup)
+    : []
+  const teamFamilyOptionLabel = (rootId: string): string => {
+    const group = launchTeamGroups.find((entry) => entry.rootId === rootId)
+    if (!group) return formatMachineChoice(rootId, teamFamilyOptions)
+    const label = launchTeamFamilyLabel(group)
+    return (teamFamilyLabelCounts.get(label) ?? 0) > 1 ? `${label} (${rootId})` : label
+  }
+  const teamFamilyOptionHint = (rootId: string): string | null => {
+    const group = launchTeamGroups.find((entry) => entry.rootId === rootId)
+    return group ? launchTeamFamilyHint(committedForm, group) : null
+  }
+  const teamStageLabelCounts = new Map<string, number>()
+  for (const teamId of teamStageOptions) {
+    const label = activeTeamGroup ? launchTeamStageLabel(committedForm, activeTeamGroup, teamId) : formatMachineLabel(teamId)
+    teamStageLabelCounts.set(label, (teamStageLabelCounts.get(label) ?? 0) + 1)
+  }
+  const teamStageOptionLabel = (teamId: string): string => {
+    const label = activeTeamGroup ? launchTeamStageLabel(committedForm, activeTeamGroup, teamId) : formatMachineLabel(teamId)
+    return (teamStageLabelCounts.get(label) ?? 0) > 1 ? `${label} (${teamId})` : label
+  }
+  const teamStageBadges: Record<string, string> = Object.fromEntries(teamStageOptions.map((teamId) => [
+    teamId,
+    committedForm?.teams[teamId] ? 'configured' : 'available on this server',
+  ]))
+  const startTeamFamily = startTeam.trim() && explicitTeamGroup ? explicitTeamGroup.rootId : ''
+  const startTeamStage = startTeam.trim() && activeTeamGroup?.memberIds.includes(startTeam.trim()) ? startTeam.trim() : ''
+  const workflowDefaultTeamGroup = workflowDefaultTeam ? teamFamilyGroupFor(workflowDefaultTeam) : null
+  const workflowDefaultFamilyLabel = workflowDefaultTeamGroup
+    ? teamFamilyOptionLabel(workflowDefaultTeamGroup.rootId)
+    : workflowDefaultTeam
+      ? formatMachineChoice(workflowDefaultTeam, teamOptions)
+      : null
+  const workflowDefaultStageLabel = workflowDefaultTeamGroup && workflowDefaultTeam
+    ? launchTeamStageLabel(committedForm, workflowDefaultTeamGroup, workflowDefaultTeam)
+    : workflowDefaultTeam
+      ? formatMachineChoice(workflowDefaultTeam, teamOptions)
+      : null
   // Visible resolved values: before focus each selector shows the effective
   // name with a Default indicator; the open list offers an explicit default row.
   const workflowResolvedDisplay = startWorkflow.trim()
@@ -2223,20 +2301,45 @@ export function RunDashboard({ visible = true, page, onNewRun, onCancelNewRun, o
       ? 'wait for committed configuration to resolve the default'
       : committedForm?.default_workflow ? 'the global default workflow applies' : 'no global default workflow is configured',
   }
-  const teamResolvedDisplay = startTeam.trim()
+  const resolvedTeamFamilyLabel = effectiveTeamGroup
+    ? teamFamilyOptionLabel(effectiveTeamGroup.rootId)
+    : effectiveTeam
+      ? formatMachineChoice(effectiveTeam, teamOptions)
+      : null
+  const resolvedTeamStageLabel = effectiveTeamGroup
+    ? launchTeamStageLabel(committedForm, effectiveTeamGroup, effectiveTeam)
+    : effectiveTeam
+      ? formatMachineChoice(effectiveTeam, teamOptions)
+      : null
+  const teamFamilyResolvedDisplay = startTeam.trim()
     ? null
     : committed === null
       ? configurationDisplay
-      : (workflowDefaultTeam ? formatMachineChoice(workflowDefaultTeam, teamOptions) : 'No team — global roles')
-  const teamResolvedBadge = !startTeam.trim() && workflowDefaultTeam ? 'Default' : undefined
-  const teamDefaultOption = {
+      : (resolvedTeamFamilyLabel ?? 'No team — global roles')
+  const teamFamilyResolvedBadge = !startTeam.trim() && workflowDefaultTeam ? 'Default' : undefined
+  const teamFamilyDefaultOption = {
     value: '',
     label: committed === null
       ? configurationDisplay
-      : workflowDefaultTeam ? `Use default (${formatMachineChoice(workflowDefaultTeam, teamOptions)})` : 'Use default (no team)',
+      : workflowDefaultFamilyLabel ? `Use default (${workflowDefaultFamilyLabel})` : 'Use default (no team)',
     hint: committed === null
       ? 'wait for committed configuration to resolve the default'
       : workflowDefaultTeam ? 'the workflow default team applies' : 'global role assignments apply',
+  }
+  const teamStageResolvedDisplay = startTeam.trim()
+    ? null
+    : committed === null
+      ? configurationDisplay
+      : (resolvedTeamStageLabel ?? 'No baseline stage — global roles')
+  const teamStageResolvedBadge = !startTeam.trim() && workflowDefaultTeam ? 'Default' : undefined
+  const teamStageDefaultOption = {
+    value: '',
+    label: committed === null
+      ? configurationDisplay
+      : workflowDefaultStageLabel ? `Use default (${workflowDefaultStageLabel})` : 'Use default (no stage)',
+    hint: committed === null
+      ? 'wait for committed configuration to resolve the default'
+      : workflowDefaultTeam ? 'the exact workflow default team applies' : 'global role assignments apply',
   }
   // Launch admission offers only saved Ready (in progress) plans: Draft and
   // Done records are never selectable, so their paths are never submitted.
@@ -2457,23 +2560,27 @@ export function RunDashboard({ visible = true, page, onNewRun, onCancelNewRun, o
   const otherConfiguredRoles = committedForm
     ? Object.keys(committedForm.roles).filter((role) => !workflowRoleList.includes(role)).sort()
     : []
-  const upgradeChain = effectiveTeam ? capabilities?.team_upgrade_chains?.[effectiveTeam] ?? null : null
+  const upgradeChain = effectiveTeam
+    ? committedForm?.teams?.[effectiveTeam]
+      ? launchTeamUpgradeRoute(committedForm, effectiveTeam)
+      : capabilities?.team_upgrade_chains?.[effectiveTeam] ?? null
+    : null
   const workerUpgradeStages = upgradeChain?.map((team) => {
-    const teamRoles = committedForm?.teams?.[team]?.roles ?? {}
-    const worker = resolveStepRole('worker', teamRoles, committedForm?.roles ?? {})
+    const teamRoles = teamRolesForPreview(team)
+    const worker = resolveStepRole('worker', teamRoles, committedForm?.roles ?? {}, teamRoleSourcesForPreview(team))
     return {
       team,
       worker,
       modelEffort: worker.selector ? selectorModelEffortText(worker.selector, committedForm) : '',
     }
   }) ?? []
-  const reviewerResolution = resolveStepRole('reviewer', effectiveTeamRoles, committedForm?.roles ?? {})
+  const reviewerResolution = resolveStepRole('reviewer', effectiveTeamRoles, committedForm?.roles ?? {}, effectiveTeamRoleSources)
   const reviewerModelEffort = reviewerResolution.selector
     ? selectorModelEffortText(reviewerResolution.selector, committedForm)
     : ''
 
-  function membershipRow(role: string, teamRoles: Record<string, string>, teamName: string | null) {
-    const resolution = resolveStepRole(role, teamRoles, committedForm?.roles ?? {})
+  function membershipRow(role: string, teamRoles: Record<string, string>, teamName: string | null, teamRoleSources?: Record<string, string>) {
+    const resolution = resolveStepRole(role, teamRoles, committedForm?.roles ?? {}, teamRoleSources)
     const modelEffort = resolution.selector ? selectorModelEffortText(resolution.selector, committedForm) : ''
     return (
       <tr key={`${teamName ?? 'workspace'}-${role}`}>
@@ -2514,7 +2621,15 @@ export function RunDashboard({ visible = true, page, onNewRun, onCancelNewRun, o
                   <div><dt>Team</dt><dd>{!startTeam.trim() && committed === null
                     ? <span className="text-dim">{configurationDisplay}</span>
                     : effectiveTeam
-                    ? <><span className="mono">{formatMachineLabel(effectiveTeam)}</span> — {effectiveTeamSource}</>
+                    ? <>
+                        <span className="mono">{resolvedTeamFamilyLabel ?? formatMachineLabel(effectiveTeam)}</span>
+                        {' — '}{effectiveTeamSource}
+                        {effectiveTeamGroup && <>
+                          {' · baseline stage '}
+                          <span className="mono">{resolvedTeamStageLabel ?? formatMachineLabel(effectiveTeam)}</span>
+                          <span className="text-xs text-dim"> ({effectiveTeam})</span>
+                        </>}
+                      </>
                     : <span className="text-dim">{effectiveTeamSource}</span>}</dd></div>
                 </dl>
                 <div className="launch-role-summary">
@@ -2597,7 +2712,7 @@ export function RunDashboard({ visible = true, page, onNewRun, onCancelNewRun, o
                       {effectiveSteps.map((step) => {
                         const role = stepRoleMap?.[step]
                         const resolution = role
-                          ? resolveStepRole(role, effectiveTeamRoles, committedForm?.roles ?? {})
+                          ? resolveStepRole(role, effectiveTeamRoles, committedForm?.roles ?? {}, effectiveTeamRoleSources)
                           : null
                         return (
                           <tr key={step}>
@@ -2636,8 +2751,8 @@ export function RunDashboard({ visible = true, page, onNewRun, onCancelNewRun, o
                       <>
                         <ol className="upgrade-chain">
                           {upgradeChain.map((team, index) => {
-                            const teamRoles = committedForm?.teams?.[team]?.roles ?? {}
-                            const worker = resolveStepRole('worker', teamRoles, committedForm?.roles ?? {})
+                            const teamRoles = teamRolesForPreview(team)
+                            const worker = resolveStepRole('worker', teamRoles, committedForm?.roles ?? {}, teamRoleSourcesForPreview(team))
                             const isLast = index === upgradeChain.length - 1
                             const modelEffort = worker.selector ? selectorModelEffortText(worker.selector, committedForm) : ''
                             const stageRoles = [...new Set([...Object.keys(teamRoles), ...Object.keys(committedForm?.roles ?? {})])].sort()
@@ -2653,7 +2768,7 @@ export function RunDashboard({ visible = true, page, onNewRun, onCancelNewRun, o
                                     <summary className="text-xs text-dim">stage team members</summary>
                                     <table className="guided-table responsive-data-table">
                                       <tbody>
-                                        {stageRoles.map((role) => membershipRow(role, teamRoles, team))}
+                                        {stageRoles.map((role) => membershipRow(role, teamRoles, team, teamRoleSourcesForPreview(team)))}
                                       </tbody>
                                     </table>
                                   </details>
@@ -3160,15 +3275,32 @@ export function RunDashboard({ visible = true, page, onNewRun, onCancelNewRun, o
           defaultLabel: workflowDefaultOption.label,
           defaultHint: workflowDefaultOption.hint,
         }}
-        startTeam={startTeam}
-        setStartTeam={setStartTeam}
-        teamOptions={teamOptions}
-        teamBadges={teamBadges}
-        teamPresentation={{
-          resolvedDisplay: teamResolvedDisplay,
-          resolvedBadge: teamResolvedBadge,
-          defaultLabel: teamDefaultOption.label,
-          defaultHint: teamDefaultOption.hint,
+        startTeamFamily={startTeamFamily}
+        setStartTeamFamily={(familyId) => setStartTeam(familyId)}
+        teamFamilyOptions={teamFamilyOptions}
+        teamFamilyBadges={Object.fromEntries(launchTeamGroups.map((group) => [
+          group.rootId,
+          committedForm?.teams[group.rootId] ? 'configured' : 'available on this server',
+        ]))}
+        teamFamilyOptionLabel={teamFamilyOptionLabel}
+        teamFamilyOptionHint={teamFamilyOptionHint}
+        teamFamilyPresentation={{
+          resolvedDisplay: teamFamilyResolvedDisplay,
+          resolvedBadge: teamFamilyResolvedBadge,
+          defaultLabel: teamFamilyDefaultOption.label,
+          defaultHint: teamFamilyDefaultOption.hint,
+        }}
+        startTeamStage={startTeamStage}
+        setStartTeamStage={setStartTeam}
+        teamStageOptions={teamStageOptions}
+        teamStageBadges={teamStageBadges}
+        teamStageOptionLabel={teamStageOptionLabel}
+        teamStageOptionHint={(teamId) => launchTeamRoleSummary(committedForm, teamId)}
+        teamStagePresentation={{
+          resolvedDisplay: teamStageResolvedDisplay,
+          resolvedBadge: teamStageResolvedBadge,
+          defaultLabel: teamStageDefaultOption.label,
+          defaultHint: teamStageDefaultOption.hint,
         }}
         startMaxTurns={startMaxTurns}
         setStartMaxTurns={setStartMaxTurns}

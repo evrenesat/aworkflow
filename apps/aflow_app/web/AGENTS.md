@@ -11,6 +11,10 @@
   clean baselines afterwards.
   New teams are created in the draft by the Add team form (`add_team` actions
   precede dependent edits); `set_team_upgrade` edits only the team's own link.
+  Team Families groups direct Base/stage inheritance, keeps display labels
+  separate from stable IDs, and uses the same shared draft and Save all action;
+  its effective role/provenance preview must not flatten declarations or turn
+  family labels into launch request values.
 - Keep destructive prompt actions secondary: referenced prompts offer no
   deletion and disclose usages; unreferenced ones delete only through the
   More menu with confirm/Undo, and the server stays authoritative.

@@ -1,11 +1,12 @@
 import json
+import tomllib
 from pathlib import Path
 
 import pytest
 from pydantic import ValidationError
 
 from aflow_app_server.global_config_service import GlobalConfigService
-from aflow_app_server.guided_config import guided_form_response
+from aflow_app_server.guided_config import GuidedConfigError, guided_form_response
 from aflow_app_server.models import GlobalConfigPatchPayload
 from aflow_app_server.project_config_service import ProjectConfigError, ProjectConfigRevisionConflict
 
@@ -30,9 +31,39 @@ prompts = ["work"]
 go = [{to="END", when="DONE"}]
 '''
 
+INLINE_FAMILY_AFLOW = '''# preserve inline family metadata
+[harness.codex.profiles.fast]
+model = "test"
+[harness.codex.profiles.deep]
+model = "deep"
+[roles]
+worker = "codex.fast"
+reviewer = "codex.fast"
+[teams.base]
+display_name = "Legacy base"
+upgrade_to = "child"
+worker = "codex.deep"
+reviewer = "codex.fast"
+[teams.child]
+# Keep this comment through conversion.
+display_name = "Legacy child"
+backup_team = "fallback"
+worker = "codex.fast"
+reviewer = "codex.fast"
+[teams.fallback]
+[prompts]
+work = "Do {task}."
+'''
+
 @pytest.fixture
 def service(tmp_path: Path):
     (tmp_path / 'aflow.toml').write_text(AFLOW)
+    (tmp_path / 'workflows.toml').write_text(WORKFLOWS)
+    return GlobalConfigService(config_dir=tmp_path, audit_path=tmp_path / 'audit.jsonl')
+
+@pytest.fixture
+def inline_service(tmp_path: Path):
+    (tmp_path / 'aflow.toml').write_text(INLINE_FAMILY_AFLOW)
     (tmp_path / 'workflows.toml').write_text(WORKFLOWS)
     return GlobalConfigService(config_dir=tmp_path, audit_path=tmp_path / 'audit.jsonl')
 
@@ -146,6 +177,15 @@ def test_closed_patch_contract(fields):
         GlobalConfigPatchPayload(expected_revision='a'*64, **fields)
 
 
+def test_oversized_family_batch_is_rejected_without_splitting():
+    actions = [
+        {'type': 'add_team', 'team': f'family-{index}'}
+        for index in range(257)
+    ]
+    with pytest.raises(ValidationError):
+        GlobalConfigPatchPayload(expected_revision='a' * 64, actions=actions)
+
+
 def test_team_chain_creation_links_and_reload_parity(service):
     """Two new teams plus their link survive one batch with byte fidelity."""
     result = patch(service, actions=[
@@ -163,6 +203,146 @@ def test_team_chain_creation_links_and_reload_parity(service):
     reread = service.read()
     reprojected = guided_form_response(reread.aflow_toml, reread.workflows_toml)['form']
     assert reprojected['teams'] == form['teams']
+
+
+def test_inline_legacy_conversion_persists_role_removal_and_reload_parity(inline_service):
+    result = inline_service.patch(GlobalConfigPatchPayload(
+        expected_revision=inline_service.read().revision,
+        actions=[
+            {'type': 'set_team_base', 'team': 'child', 'extends': 'base'},
+            {'type': 'set_team_role', 'team': 'child', 'role': 'reviewer', 'selector': None},
+        ],
+    ))
+    raw = tomllib.loads(result.aflow_toml)
+    child = raw['teams']['child']
+    assert child['extends'] == 'base'
+    assert child['worker'] == 'codex.fast'
+    assert 'reviewer' not in child
+    assert 'roles' not in child
+    assert '# Keep this comment through conversion.' in result.aflow_toml
+
+    reread = inline_service.read()
+    form = guided_form_response(reread.aflow_toml, reread.workflows_toml)['form']
+    assert form['teams']['child']['extends'] == 'base'
+    assert form['teams']['child']['roles'] == {'worker': 'codex.fast'}
+
+
+def test_family_actions_project_and_remove_after_batch_reference_rewrites(service):
+    before = service.read()
+    typed = GlobalConfigPatchPayload(
+        expected_revision=before.revision,
+        actions=[
+            {'type': 'add_team', 'team': 'family-base'},
+            {'type': 'add_team', 'team': 'family-stage'},
+            {
+                'type': 'set_team_display_name',
+                'team': 'family-base',
+                'display_name': 'Product development',
+            },
+            {
+                'type': 'set_team_display_name',
+                'team': 'family-stage',
+                'display_name': 'Stronger worker',
+            },
+            {
+                'type': 'set_team_base',
+                'team': 'family-stage',
+                'extends': 'family-base',
+            },
+            {
+                'type': 'set_team_role',
+                'team': 'family-stage',
+                'role': 'worker',
+                'selector': 'codex.worker',
+            },
+            {
+                'type': 'set_team_upgrade',
+                'team': 'family-base',
+                'upgrade_to': 'family-stage',
+            },
+            {
+                'type': 'set_workflow_default_team',
+                'workflow': 'demo',
+                'team': 'family-stage',
+            },
+        ],
+    )
+    assert typed.model_dump(mode='json')['actions'][4] == {
+        'type': 'set_team_base',
+        'team': 'family-stage',
+        'extends': 'family-base',
+    }
+
+    created = service.patch(typed)
+    form = guided_form_response(created.aflow_toml, created.workflows_toml)['form']
+    assert form is not None
+    stage = form['teams']['family-stage']
+    assert stage['roles'] == {'worker': 'codex.worker'}
+    assert stage['extends'] == 'family-base'
+    assert stage['display_name'] == 'Stronger worker'
+    assert stage['effective_roles'] == {'worker': 'codex.worker'}
+    assert stage['role_sources'] == {'worker': 'family-stage'}
+    assert form['teams']['family-base']['upgrade_to'] == 'family-stage'
+
+    before_failed_remove = service.read()
+    with pytest.raises(GuidedConfigError) as excinfo:
+        service.patch(
+            GlobalConfigPatchPayload(
+                expected_revision=before_failed_remove.revision,
+                actions=[{'type': 'remove_team', 'team': 'family-stage'}],
+            )
+        )
+    assert excinfo.value.code == 'team_in_use'
+    assert 'workflow.demo.team' in str(excinfo.value)
+    assert service.read() == before_failed_remove
+
+    removed = service.patch(
+        GlobalConfigPatchPayload(
+            expected_revision=before_failed_remove.revision,
+            actions=[
+                {
+                    'type': 'set_workflow_default_team',
+                    'workflow': 'demo',
+                    'team': None,
+                },
+                {
+                    'type': 'set_team_upgrade',
+                    'team': 'family-base',
+                    'upgrade_to': None,
+                },
+                {'type': 'remove_team', 'team': 'family-stage'},
+            ],
+        )
+    )
+    assert 'family-stage' not in removed.aflow_toml
+    assert 'team = "family-stage"' not in removed.workflows_toml
+    assert 'upgrade_to = "family-stage"' not in removed.aflow_toml
+
+
+def test_family_batch_rejects_invalid_inheritance_without_writing_either_document(service):
+    before = service.read()
+    with pytest.raises(ProjectConfigError) as excinfo:
+        service.patch(
+            GlobalConfigPatchPayload(
+                expected_revision=before.revision,
+                actions=[
+                    {'type': 'add_team', 'team': 'family-a'},
+                    {'type': 'add_team', 'team': 'family-b'},
+                    {
+                        'type': 'set_team_base',
+                        'team': 'family-a',
+                        'extends': 'family-b',
+                    },
+                    {
+                        'type': 'set_team_base',
+                        'team': 'family-b',
+                        'extends': 'family-a',
+                    },
+                ],
+            )
+        )
+    assert 'cycle' in str(excinfo.value).lower()
+    assert service.read() == before
 
 
 def test_manager_enabled_default_and_override_roundtrip(service):

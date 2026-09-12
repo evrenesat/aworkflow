@@ -17,6 +17,9 @@ class ConfigError(RuntimeError):
     pass
 
 
+TEAM_DISPLAY_NAME_MAX_LENGTH = 128
+
+
 @dataclass(frozen=True)
 class HarnessProfileConfig:
     model: str | None = None
@@ -111,6 +114,8 @@ class TeamConfig:
     role_prompts: dict[str, str] = field(default_factory=dict)
     backup_team: str | None = None
     upgrade_to: str | None = None
+    extends: str | None = None
+    display_name: str | None = None
 
 
 @dataclass(frozen=True)
@@ -191,6 +196,26 @@ class WorkflowUserConfig:
     error_handling: ErrorHandlingConfig = field(default_factory=ErrorHandlingConfig)
     workflows: dict[str, WorkflowConfig] = field(default_factory=dict)
     prompts: dict[str, str] = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
+class TeamConfigResolution:
+    """Effective role assignments for one team, with declaration provenance."""
+
+    effective_roles: dict[str, str]
+    effective_prompts: dict[str, str]
+    role_sources: dict[str, str]
+    prompt_sources: dict[str, str]
+
+    @property
+    def roles(self) -> dict[str, str]:
+        """Compatibility alias for callers that describe effective roles."""
+        return self.effective_roles
+
+    @property
+    def role_prompts(self) -> dict[str, str]:
+        """Compatibility alias for callers that describe effective prompts."""
+        return self.effective_prompts
 
 
 def _validate_condition_symbols(expression: str, *, path: str) -> None:
@@ -327,8 +352,29 @@ def _parse_workflow_harness(
     return WorkflowHarnessConfig(profiles=profiles)
 
 
+def _parse_team_display_name(
+    value: object | None, *, path: str
+) -> str | None:
+    display_name = _optional_text(value, path=path)
+    if (
+        display_name is not None
+        and len(display_name) > TEAM_DISPLAY_NAME_MAX_LENGTH
+    ):
+        raise ConfigError(
+            f"{path} must be at most {TEAM_DISPLAY_NAME_MAX_LENGTH} characters"
+        )
+    return display_name
+
+
 def _parse_team_config(raw: Mapping[str, object], *, path: str) -> TeamConfig:
-    reserved_keys = {"roles", "prompts", "backup_team", "upgrade_to"}
+    reserved_keys = {
+        "roles",
+        "prompts",
+        "backup_team",
+        "upgrade_to",
+        "extends",
+        "display_name",
+    }
     inline_role_keys = [key for key in raw if key not in reserved_keys]
     roles_value = raw.get("roles")
     if roles_value is not None and inline_role_keys:
@@ -357,6 +403,10 @@ def _parse_team_config(raw: Mapping[str, object], *, path: str) -> TeamConfig:
         role_prompts=role_prompts,
         backup_team=_optional_text(raw.get("backup_team"), path=f"{path}.backup_team"),
         upgrade_to=_optional_text(raw.get("upgrade_to"), path=f"{path}.upgrade_to"),
+        extends=_optional_text(raw.get("extends"), path=f"{path}.extends"),
+        display_name=_parse_team_display_name(
+            raw.get("display_name"), path=f"{path}.display_name"
+        ),
     )
 
 
@@ -1010,6 +1060,153 @@ def _parse_workflow_user_config(
     )
 
 
+def _team_inheritance_chain(
+    config: WorkflowUserConfig, team_name: str
+) -> tuple[str, ...]:
+    """Return a team and its inheritance path, or raise a bounded config error."""
+    chain: list[str] = []
+    current: str | None = team_name
+    while current is not None:
+        if current in chain:
+            cycle_start = chain.index(current)
+            cycle = chain[cycle_start:] + [current]
+            raise ConfigError(
+                f"teams.{team_name}.extends forms a cycle: {' -> '.join(cycle)}"
+            )
+        team_config = config.teams.get(current)
+        if team_config is None:
+            raise ConfigError(f"team '{current}' is not configured")
+        chain.append(current)
+        target = team_config.extends
+        if target is None:
+            break
+        if not isinstance(target, str) or not target.strip():
+            raise ConfigError(
+                f"teams.{current}.extends must be a non-empty string"
+            )
+        if target not in config.teams:
+            raise ConfigError(
+                f"teams.{current}.extends references unknown team '{target}'"
+            )
+        current = target
+    return tuple(chain)
+
+
+def _validate_team_inheritance(config: WorkflowUserConfig) -> list[str]:
+    """Validate team metadata and the deliberately one-level base graph."""
+    errors: list[str] = []
+    invalid_extends: set[str] = set()
+    for team_name, team_config in config.teams.items():
+        display_name = team_config.display_name
+        if display_name is not None:
+            if not isinstance(display_name, str):
+                errors.append(
+                    f"teams.{team_name}.display_name must be a string"
+                )
+            elif not display_name.strip():
+                errors.append(
+                    f"teams.{team_name}.display_name must not be empty"
+                )
+            elif len(display_name.strip()) > TEAM_DISPLAY_NAME_MAX_LENGTH:
+                errors.append(
+                    f"teams.{team_name}.display_name must be at most "
+                    f"{TEAM_DISPLAY_NAME_MAX_LENGTH} characters"
+                )
+
+        extends = team_config.extends
+        if extends is not None and (
+            not isinstance(extends, str) or not extends.strip()
+        ):
+            errors.append(
+                f"teams.{team_name}.extends must be a non-empty string"
+            )
+            invalid_extends.add(team_name)
+
+    reported: set[str] = set()
+    for team_name in config.teams:
+        if team_name in invalid_extends:
+            continue
+        try:
+            chain = _team_inheritance_chain(config, team_name)
+        except ConfigError as exc:
+            message = str(exc)
+            if message not in reported:
+                errors.append(message)
+                reported.add(message)
+            continue
+        if len(chain) > 2:
+            base_name, deeper_base_name = chain[1:3]
+            errors.append(
+                f"teams.{team_name}.extends references child team '{base_name}'; "
+                f"teams.{base_name}.extends references '{deeper_base_name}', "
+                "but team inheritance is limited to one level"
+            )
+    return errors
+
+
+def resolve_team_config(
+    config: WorkflowUserConfig,
+    team_name: str | None,
+) -> TeamConfigResolution:
+    """Resolve one team's roles and prompts without changing declarations.
+
+    Resolution starts with global declarations, overlays a direct base when
+    configured, and finally overlays the selected team's declarations.  The
+    returned source maps identify the exact declaration that supplied each
+    effective value (or ``global``).  Upgrade, backup, and display metadata are
+    intentionally not part of this resolver.
+    """
+    effective_roles = dict(config.roles)
+    role_sources = {role: "global" for role in effective_roles}
+    effective_prompts = dict(config.role_prompts)
+    prompt_sources = {role: "global" for role in effective_prompts}
+
+    if team_name is None:
+        return TeamConfigResolution(
+            effective_roles=effective_roles,
+            effective_prompts=effective_prompts,
+            role_sources=role_sources,
+            prompt_sources=prompt_sources,
+        )
+
+    team_config = config.teams.get(team_name)
+    if team_config is None:
+        raise ConfigError(f"team '{team_name}' is not configured")
+    chain = _team_inheritance_chain(config, team_name)
+    if len(chain) > 2:
+        base_name, deeper_base_name = chain[1:3]
+        raise ConfigError(
+            f"teams.{team_name}.extends references child team '{base_name}'; "
+            f"teams.{base_name}.extends references '{deeper_base_name}', "
+            "but team inheritance is limited to one level"
+        )
+
+    if len(chain) == 2:
+        base_name = chain[1]
+        base_config = config.teams[base_name]
+        effective_roles.update(base_config.roles)
+        role_sources.update(
+            {role: base_name for role in base_config.roles}
+        )
+        effective_prompts.update(base_config.role_prompts)
+        prompt_sources.update(
+            {role: base_name for role in base_config.role_prompts}
+        )
+
+    effective_roles.update(team_config.roles)
+    role_sources.update({role: team_name for role in team_config.roles})
+    effective_prompts.update(team_config.role_prompts)
+    prompt_sources.update(
+        {role: team_name for role in team_config.role_prompts}
+    )
+    return TeamConfigResolution(
+        effective_roles=effective_roles,
+        effective_prompts=effective_prompts,
+        role_sources=role_sources,
+        prompt_sources=prompt_sources,
+    )
+
+
 def load_workflow_config(
     config_path: Path | None = None,
 ) -> WorkflowUserConfig:
@@ -1265,6 +1462,10 @@ def validate_workflow_config(
                 f"aflow.default_workflow references unknown workflow "
                 f"'{config.aflow.default_workflow}'"
             )
+    # Team bases must be known and bounded before any role or route consumer
+    # attempts to resolve a team.  The route graphs below remain independent
+    # and deliberately continue to use only their declared edge fields.
+    errors.extend(_validate_team_inheritance(config))
     for role_name, selector in config.roles.items():
         if "." not in selector:
             errors.append(
@@ -1348,6 +1549,20 @@ def validate_workflow_config(
     validate_team_graph("backup_team")
     validate_team_graph("upgrade_to")
 
+    def effective_team_roles(team_name: str | None) -> Mapping[str, str]:
+        if team_name is None:
+            return config.roles
+        try:
+            return resolve_team_config(config, team_name).effective_roles
+        except ConfigError:
+            # An inheritance error is already reported above.  Keep validation
+            # of the remaining workflow fields bounded instead of masking that
+            # primary configuration error with an exception here.
+            team_config = config.teams.get(team_name)
+            if team_config is None:
+                return config.roles
+            return {**config.roles, **team_config.roles}
+
     for wf_name, wf_config in config.workflows.items():
         if wf_config.extends is not None:
             errors.append(
@@ -1365,7 +1580,7 @@ def validate_workflow_config(
                 errors.append(
                     f"manager.full_role is required for enabled workflow '{wf_name}'"
                 )
-            team_roles = config.teams.get(wf_config.team).roles if wf_config.team in config.teams else {}
+            team_roles = effective_team_roles(wf_config.team)
             for manager_role in (lite_role, full_role):
                 if manager_role is None:
                     continue
@@ -1411,7 +1626,7 @@ def validate_workflow_config(
             else:
                 effective_team = wf_config.team
                 if effective_team is not None and effective_team in config.teams:
-                    team_roles = config.teams[effective_team].roles
+                    team_roles = effective_team_roles(effective_team)
                     if team_lead_role not in team_roles and team_lead_role not in config.roles:
                         errors.append(
                             f"workflow.{wf_name} uses merge but team_lead role "

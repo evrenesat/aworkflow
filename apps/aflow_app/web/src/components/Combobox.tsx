@@ -19,6 +19,8 @@ interface ComboboxProps {
   optionBadges?: Record<string, string>
   /** Presentation label for a raw option; selection and callbacks keep the raw option. */
   optionLabel?: (option: string) => string
+  /** Optional compact metadata shown below an option's readable label. */
+  optionHint?: (option: string) => string | null | undefined
   /**
    * Resolved value shown while the control is unfocused and nothing is typed,
    * even when the stored value is empty ("follow default"). Focusing always
@@ -49,6 +51,7 @@ export function Combobox({
   emptyOption,
   optionBadges,
   optionLabel,
+  optionHint,
   resolvedDisplay = null,
   resolvedBadge,
   defaultOption,
@@ -207,6 +210,7 @@ export function Combobox({
                 {optionLabel && labelCounts.get(labelForOption(option))! > 1 && labelForOption(option) !== option && (
                   <span className="mono text-xs text-dim">{option}</span>
                 )}
+                {optionHint?.(option) && <span className="text-xs text-dim">{optionHint(option)}</span>}
                 {optionBadges?.[option] && (
                   <span className="text-xs text-dim">{optionBadges[option]}</span>
                 )}

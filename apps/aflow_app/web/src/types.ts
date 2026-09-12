@@ -133,6 +133,24 @@ export interface GuidedWorkflowStepSummaries {
   manager_enabled_source?: string
 }
 
+/**
+ * One team's declared overrides plus the server-owned canonical projection.
+ * The effective/provenance fields are optional for compatibility with older
+ * saved responses and test fixtures; clients must never derive them locally.
+ */
+export interface GuidedTeamSummary {
+  roles: Record<string, string>
+  prompts?: Record<string, string>
+  upgrade_to?: string | null
+  extends?: string | null
+  display_name?: string | null
+  backup_team?: string | null
+  effective_roles?: Record<string, string>
+  effective_prompts?: Record<string, string>
+  role_sources?: Record<string, string>
+  prompt_sources?: Record<string, string>
+}
+
 export interface GuidedTemplateVariable {
   token: string
   description: string
@@ -152,7 +170,7 @@ export interface GuidedFormProjection {
   max_turns: number | null
   harnesses: Record<string, Record<string, GuidedProfileSummary>>
   roles: Record<string, string>
-  teams: Record<string, { roles: Record<string, string>; prompts?: Record<string, string>; upgrade_to?: string | null }>
+  teams: Record<string, GuidedTeamSummary>
   workflow_default_teams: Record<string, string | null>
   workflows: Record<string, GuidedWorkflowStepSummaries>
   /** Declared `[workflow].manager_enabled` default; null when omitted (disabled). */
@@ -205,7 +223,10 @@ export type GuidedConfigAction =
   | { type: 'upsert_profile'; harness: string; profile: string; model?: string | null; effort?: string | null }
   | { type: 'set_global_role'; role: string; selector: string }
   | { type: 'add_team'; team: string }
-  | { type: 'set_team_role'; team: string; role: string; selector: string }
+  | { type: 'set_team_role'; team: string; role: string; selector: string | null }
+  | { type: 'set_team_base'; team: string; extends: string | null }
+  | { type: 'set_team_display_name'; team: string; display_name: string | null }
+  | { type: 'remove_team'; team: string }
   | { type: 'set_team_upgrade'; team: string; upgrade_to: string | null }
   | { type: 'set_workflow_default_team'; workflow: string; team: string | null }
   | { type: 'set_default_manager_enabled'; value: boolean | null }

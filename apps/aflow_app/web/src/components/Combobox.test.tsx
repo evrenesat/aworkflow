@@ -37,4 +37,21 @@ describe('Combobox readable machine labels', () => {
     fireEvent.keyDown(input, { key: 'Enter' })
     expect(onChange).toHaveBeenCalledWith('codex.reviewer')
   })
+
+  it('shows compact option hints without changing the raw selected identity', () => {
+    const onChange = vi.fn()
+    render(<Combobox
+      label="Team family"
+      value=""
+      options={['product']}
+      optionLabel={() => 'Product'}
+      optionHint={() => 'Worker: codex.fast · Reviewer: codex.review · Upgrade route: Base → Fast'}
+      onChange={onChange}
+    />)
+    const input = screen.getByRole('combobox', { name: 'Team family' })
+    fireEvent.focus(input)
+    expect(screen.getByRole('option', { name: /Product.*Worker: codex\.fast.*Base → Fast/ })).toBeTruthy()
+    fireEvent.click(screen.getByRole('option', { name: /Product.*Worker: codex\.fast/ }))
+    expect(onChange).toHaveBeenCalledWith('product')
+  })
 })

@@ -16,7 +16,7 @@ import stat
 from pathlib import Path
 from typing import Any, Literal, Mapping
 
-from .config import WorkflowUserConfig
+from .config import ConfigError, WorkflowUserConfig, resolve_team_config
 from .manager_context import (
     MANAGER_CONTEXT_SCHEMA_VERSION_V3,
     MANAGER_INLINE_CONTEXT_MAX_BYTES,
@@ -451,12 +451,12 @@ def resolve_manager_role(
 
 
 def _resolve_role(role: str, team_name: str | None, config: WorkflowUserConfig) -> str:
-    selector = config.roles.get(role)
-    if team_name is not None:
-        team = config.teams.get(team_name)
-        if team is None:
-            raise ValueError(f"unknown team '{team_name}'")
-        selector = team.roles.get(role, selector)
+    if team_name is not None and team_name not in config.teams:
+        raise ValueError(f"unknown team '{team_name}'")
+    try:
+        selector = resolve_team_config(config, team_name).effective_roles.get(role)
+    except ConfigError as exc:
+        raise ValueError(str(exc)) from exc
     if selector is None:
         raise ValueError(f"role '{role}' cannot be resolved")
     return selector

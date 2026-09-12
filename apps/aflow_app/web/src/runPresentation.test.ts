@@ -1,6 +1,18 @@
 import { describe, expect, it } from 'vitest'
-import type { RunStatus } from './types'
-import { executionDuration, runPlanDisplayName, runPlanDisplayNameForRun, runPlanPath, statusLabel } from './runPresentation'
+import type { GuidedFormProjection, RunStatus } from './types'
+import {
+  executionDuration,
+  launchTeamFamilyGroups,
+  launchTeamFamilyHint,
+  launchTeamFamilyLabel,
+  launchTeamFamilyRoute,
+  launchTeamUpgradeRoute,
+  launchTeamStageLabel,
+  runPlanDisplayName,
+  runPlanDisplayNameForRun,
+  runPlanPath,
+  statusLabel,
+} from './runPresentation'
 
 const run = { status: 'manifest_only', ownership: 'control_plane', evidence: { manifest_created_at: '2026-09-08T10:00:00Z' } } as RunStatus
 describe('honest run timing', () => {
@@ -54,5 +66,83 @@ describe('run plan presentation', () => {
     } as RunStatus
     expect(runPlanPath(run)).toBe('/srv/original/canonical-plan.md')
     expect(runPlanDisplayNameForRun(run)).toBe('Canonical plan')
+  })
+})
+
+const familyProjection: GuidedFormProjection = {
+  default_workflow: 'managed',
+  max_turns: null,
+  harnesses: {},
+  roles: { worker: 'codex.global', reviewer: 'codex.review' },
+  teams: {
+    product: {
+      roles: { worker: 'codex.base' },
+      display_name: 'Product',
+      upgrade_to: 'product_fast',
+      extends: null,
+      effective_roles: { worker: 'codex.base', reviewer: 'codex.review' },
+      role_sources: { worker: 'product', reviewer: 'global' },
+    },
+    product_fast: {
+      roles: { worker: 'codex.fast' },
+      display_name: 'Fast',
+      upgrade_to: null,
+      extends: 'product',
+      effective_roles: { worker: 'codex.fast', reviewer: 'codex.review' },
+      role_sources: { worker: 'product_fast', reviewer: 'global' },
+    },
+  },
+  workflow_default_teams: { managed: 'product_fast' },
+  workflows: {},
+}
+
+describe('launch team family presentation', () => {
+  it('keeps the server team IDs while presenting the ordered family route', () => {
+    const groups = launchTeamFamilyGroups(familyProjection, ['server_only'])
+    const product = groups.find((group) => group.rootId === 'product')!
+    const standalone = groups.find((group) => group.rootId === 'server_only')!
+
+    expect(product.memberIds).toEqual(['product', 'product_fast'])
+    expect(launchTeamFamilyRoute(product)).toEqual(['product', 'product_fast'])
+    expect(launchTeamFamilyLabel(product)).toBe('Product')
+    expect(launchTeamStageLabel(familyProjection, product, 'product')).toBe('Base')
+    expect(launchTeamStageLabel(familyProjection, product, 'product_fast')).toBe('Fast')
+    expect(launchTeamFamilyHint(familyProjection, product)).toContain('Worker: codex.base')
+    expect(launchTeamFamilyHint(familyProjection, product)).toContain('Reviewer: codex.review')
+    expect(launchTeamFamilyHint(familyProjection, product)).toContain('Upgrade route: Base → Fast')
+    expect(standalone.kind).toBe('standalone')
+    expect(standalone.memberIds).toEqual(['server_only'])
+  })
+
+  it('retains every configured team as a reachable standalone when no projection is available', () => {
+    const groups = launchTeamFamilyGroups(null, ['legacy', 'complex_child'])
+    expect(groups.map((group) => group.rootId)).toEqual(['complex_child', 'legacy'])
+    expect(groups.every((group) => group.kind === 'standalone')).toBe(true)
+  })
+
+  it('does not turn family membership into an upgrade route', () => {
+    const noEdges = structuredClone(familyProjection)
+    noEdges.teams.product.upgrade_to = null
+    noEdges.teams.product_fast.upgrade_to = null
+    const product = launchTeamFamilyGroups(noEdges).find((group) => group.rootId === 'product')!
+
+    expect(launchTeamUpgradeRoute(noEdges, 'product_fast')).toEqual(['product_fast'])
+    expect(launchTeamFamilyHint(noEdges, product)).toContain('Members: Base, Fast')
+    expect(launchTeamFamilyHint(noEdges, product)).not.toContain('Base → Fast')
+  })
+
+  it('follows declared upgrades from a selected child, including an external target', () => {
+    const withExternal = structuredClone(familyProjection)
+    withExternal.teams.product_fast.upgrade_to = 'external'
+    withExternal.teams.external = {
+      roles: { worker: 'codex.external' },
+      display_name: 'External',
+      upgrade_to: null,
+      extends: null,
+    }
+
+    expect(launchTeamUpgradeRoute(withExternal, 'product_fast')).toEqual(['product_fast', 'external'])
+    const product = launchTeamFamilyGroups(withExternal).find((group) => group.rootId === 'product')!
+    expect(launchTeamFamilyHint(withExternal, product)).toContain('Fast → External')
   })
 })

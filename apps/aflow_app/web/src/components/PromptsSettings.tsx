@@ -86,8 +86,10 @@ export function PromptsSettings({ draft, change, rename, names, deleted, onDelet
   const [targetTeam, setTargetTeam] = useState('')
   const [moveError, setMoveError] = useState<string | null>(null)
   const [restoreKeys, setRestoreKeys] = useState<Record<string, string>>({})
-  const map = team ? draft.teams[team]?.prompts ?? {} : draft.role_prompts ?? {}
-  const inherited = team ? draft.role_prompts?.[role] : undefined
+  const teamSummary = team ? draft.teams[team] : undefined
+  const map = team ? teamSummary?.prompts ?? {} : draft.role_prompts ?? {}
+  const inherited = team ? teamSummary?.effective_prompts?.[role] ?? draft.role_prompts?.[role] : undefined
+  const inheritedSource = team ? teamSummary?.prompt_sources?.[role] : undefined
   const setRoleText = (text: string | null) => change(value => {
     const prompts = team ? (value.teams[team].prompts ??= {}) : (value.role_prompts ??= {})
     if (text === null) delete prompts[role]
@@ -120,7 +122,7 @@ export function PromptsSettings({ draft, change, rename, names, deleted, onDelet
     />)}
     <div className="settings-fields">
       {role && <>
-        <span>{role in map ? 'Explicit override' : team ? 'Inherited global text' : 'Default role prompt'}</span>
+        <span>{role in map ? 'Explicit override' : team ? inheritedSource && inheritedSource !== 'global' ? `Inherited from ${formatMachineLabel(inheritedSource)} (${inheritedSource})` : 'Inherited global text' : 'Default role prompt'}</span>
         <div className="text-editor-field"><span className="text-editor-label">Role prompt text</span><TextEditor rows={7} aria-label="Role prompt text" value={map[role] ?? inherited ?? ''} onChange={e => setRoleText(e.target.value)} /></div>
         <TemplateVariablesHelp variables={draft.template_variables} context="role" />
         {role in map && <button className="btn btn-secondary" onClick={() => setRoleText(null)}>Remove override</button>}

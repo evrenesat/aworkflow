@@ -10,7 +10,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 
-from aflow.config import WorkflowUserConfig
+from aflow.config import ConfigError, WorkflowUserConfig, resolve_team_config
 
 
 _NON_OVERRIDABLE_ROLES = frozenset(
@@ -84,10 +84,17 @@ def _step_selector(
     selector = valid_role_selectors.get(role)
     if selector is not None:
         return selector
-    selector = config.roles.get(role)
     if team is not None:
-        team_config = config.teams[team]
-        selector = team_config.roles.get(role, selector)
+        try:
+            selector = resolve_team_config(config, team).effective_roles.get(role)
+        except ConfigError as exc:
+            raise ControlValidationError(
+                field="team",
+                target=team,
+                message=f"team '{team}' has invalid inheritance: {exc}",
+            ) from exc
+    else:
+        selector = config.roles.get(role)
     if selector is None and "." in role:
         return role
     return selector

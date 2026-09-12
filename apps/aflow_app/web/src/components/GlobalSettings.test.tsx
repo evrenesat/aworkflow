@@ -2,7 +2,7 @@ import { fireEvent, render, screen, waitFor, within } from '@testing-library/rea
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 import * as api from '../api'
 import { GlobalSettings } from './GlobalSettings'
-import type { GuidedFormProjection, ProjectConfigFormResponse } from '../types'
+import type { GuidedConfigAction, GuidedFormProjection, ProjectConfigFormRequest, ProjectConfigFormResponse } from '../types'
 
 vi.mock('../api', () => ({ getGlobalConfig: vi.fn(), postGlobalConfigForm: vi.fn(), getSettings: vi.fn(), patchGlobalConfig: vi.fn(), saveSettings: vi.fn(), validateGlobalConfig: vi.fn(), projectSettingsText: vi.fn(), listSkills: vi.fn(), readSkill: vi.fn(), saveSkill: vi.fn(), validateSkills: vi.fn(), installSkills: vi.fn() }))
 const validation = { state: 'ready' as const, issues: [], placeholders: [], workflows: ['demo'], teams: [], roles: ['worker'] }
@@ -10,6 +10,79 @@ const config = { project_id: 'global', revision: 'a'.repeat(64), aflow_toml: 'co
 const server = { revision: 'b'.repeat(64), bind_host: 'localhost', bind_port: 8766, managed_projects_root: '/code', password_set: true, advanced_toml: 'server', restart: { bind_host: false, bind_port: false, managed_projects_root: false } }
 const form: GuidedFormProjection = { default_workflow: 'demo', max_turns: 5, harnesses: { codex: { worker: { model: 'model', effort: 'high' } } }, roles: { worker: 'codex.worker' }, teams: {}, workflows: {}, workflow_default_teams: {}, prompts: { work: 'Original' }, role_prompts: {} }
 const response: ProjectConfigFormResponse = { ...config, changed: false, syntax_issues: [], form, choices: { harnesses: ['codex'], profiles: { codex: ['worker'] }, selectors: ['codex.worker'], roles: ['worker'], teams: [], workflows: ['demo'] }, suggestions: { label: 'suggestion', note: '', harnesses: [{ name: 'codex', supports_effort: true, custom_model_supported: true }], profiles: [{ harness: 'codex', profile: 'worker', model: 'model', effort: 'high' }] } }
+const familyForm: GuidedFormProjection = {
+  ...form,
+  harnesses: { codex: { worker: { model: 'worker-model', effort: 'high' }, deep: { model: 'deep-model', effort: 'high' }, reviewer: { model: 'reviewer-model', effort: 'low' } } },
+  roles: { worker: 'codex.worker', reviewer: 'codex.reviewer' },
+  teams: {
+    product: {
+      roles: {}, prompts: {}, display_name: 'Product', upgrade_to: 'product_stronger',
+      effective_roles: { worker: 'codex.worker', reviewer: 'codex.reviewer' },
+      effective_prompts: { worker: 'Global worker prompt', reviewer: 'Global reviewer prompt' },
+      role_sources: { worker: 'global', reviewer: 'global' },
+      prompt_sources: { worker: 'global', reviewer: 'global' },
+    },
+    product_stronger: {
+      roles: { worker: 'codex.reviewer' }, prompts: {}, display_name: 'Stronger worker', extends: 'product', upgrade_to: null,
+      effective_roles: { worker: 'codex.reviewer', reviewer: 'codex.reviewer' },
+      effective_prompts: { worker: 'Global worker prompt', reviewer: 'Global reviewer prompt' },
+      role_sources: { worker: 'product_stronger', reviewer: 'global' },
+      prompt_sources: { worker: 'global', reviewer: 'global' },
+    },
+  },
+  role_prompts: { worker: 'Global worker prompt', reviewer: 'Global reviewer prompt' },
+  workflow_default_teams: { demo: null },
+}
+const familyResponse: ProjectConfigFormResponse = {
+  ...response,
+  form: familyForm,
+  validation: { ...response.validation, teams: ['product', 'product_stronger'], roles: ['reviewer', 'worker'] },
+  choices: { ...response.choices!, profiles: { codex: ['deep', 'reviewer', 'worker'] }, selectors: ['codex.deep', 'codex.reviewer', 'codex.worker'], roles: ['reviewer', 'worker'], teams: ['product', 'product_stronger'] },
+}
+
+function familyProjectionAfterAction(action: GuidedConfigAction | undefined, seed = familyForm): GuidedFormProjection {
+  const next = structuredClone(seed)
+  if (action?.type === 'set_global_role') next.roles[action.role] = action.selector
+  if (action?.type === 'set_team_role') {
+    if (action.selector === null) delete next.teams[action.team].roles[action.role]
+    else next.teams[action.team].roles[action.role] = action.selector
+  }
+  if (action?.type === 'set_role_prompt') {
+    const prompts = action.team ? (next.teams[action.team].prompts ??= {}) : (next.role_prompts ??= {})
+    if (action.text === null) delete prompts[action.role]
+    else prompts[action.role] = action.text
+  }
+  const globalRoles = { ...next.roles }
+  const globalPrompts = { ...(next.role_prompts ?? {}) }
+  const base = next.teams.product
+  const baseRoles = { ...globalRoles, ...base.roles }
+  const basePrompts = { ...globalPrompts, ...base.prompts }
+  next.teams.product = {
+    ...base,
+    effective_roles: baseRoles,
+    effective_prompts: basePrompts,
+    role_sources: Object.fromEntries(Object.keys(baseRoles).map(role => [role, role in base.roles ? 'product' : 'global'])),
+    prompt_sources: Object.fromEntries(Object.keys(basePrompts).map(role => [role, role in base.prompts ? 'product' : 'global'])),
+  }
+  const child = next.teams.product_stronger
+  const childRoles = { ...baseRoles, ...child.roles }
+  const childPrompts = { ...basePrompts, ...child.prompts }
+  next.teams.product_stronger = {
+    ...child,
+    effective_roles: childRoles,
+    effective_prompts: childPrompts,
+    role_sources: Object.fromEntries(Object.keys(childRoles).map(role => [role, role in child.roles ? 'product_stronger' : role in base.roles ? 'product' : 'global'])),
+    prompt_sources: Object.fromEntries(Object.keys(childPrompts).map(role => [role, role in child.prompts ? 'product_stronger' : role in base.prompts ? 'product' : 'global'])),
+  }
+  return next
+}
+
+function familyPreviewResponse(request: ProjectConfigFormRequest): ProjectConfigFormResponse {
+  if (!request.action) familyPreviewState = structuredClone(familyForm)
+  else familyPreviewState = familyProjectionAfterAction(request.action, familyPreviewState ?? familyForm)
+  return { ...familyResponse, form: familyPreviewState }
+}
+let familyPreviewState: GuidedFormProjection | null = null
 const supervisedWorkflows = {
   demo: { declared_steps: ['work'], first_step: 'work', executable_steps: ['work'], first_executable_step: 'work', manager_enabled: null, effective_manager_enabled: false, manager_enabled_source: 'defaults' },
   'demo-alias': { declared_steps: ['work'], first_step: 'work', executable_steps: ['work'], first_executable_step: 'work', manager_enabled: null, effective_manager_enabled: false, manager_enabled_source: 'base:demo' },
@@ -351,6 +424,144 @@ describe('GlobalSettings', () => {
     await waitFor(() => expect(api.saveSettings).toHaveBeenCalledTimes(2))
     expect(api.patchGlobalConfig).toHaveBeenCalledTimes(1)
   })
+  it('preserves canonical family copying after a rejected workflow save', async () => {
+    familyPreviewState = null
+    vi.mocked(api.postGlobalConfigForm).mockImplementation(async request => familyPreviewResponse(request))
+    vi.mocked(api.patchGlobalConfig).mockRejectedValueOnce(new Error('revision conflict'))
+    render(<GlobalSettings onDirtyChange={() => {}} onSaved={() => {}} />)
+    await screen.findByLabelText('Effort codex.worker')
+    fireEvent.click(screen.getByRole('tab', { name: 'Teams' }))
+    fireEvent.click(screen.getByRole('button', { name: 'Product', exact: true }))
+    const worker = screen.getByLabelText('Worker')
+    fireEvent.focus(worker)
+    fireEvent.change(worker, { target: { value: 'codex.deep' } })
+    fireEvent.keyDown(worker, { key: 'Enter' })
+    await waitFor(() => {
+      expect(screen.queryByText('Refreshing effective team and workflow projections…')).toBeNull()
+      expect((screen.getByLabelText('Worker') as HTMLInputElement).value).toContain('codex.deep')
+    })
+
+    fireEvent.click(screen.getByRole('button', { name: 'Save all changes' }))
+    await screen.findByText(/revision conflict.*Your remaining edits/)
+    fireEvent.click(screen.getByRole('button', { name: 'New family', exact: true }))
+    const wizard = screen.getByLabelText('Create team family')
+    const source = within(wizard).getByLabelText('Base assignment source') as HTMLSelectElement
+    fireEvent.change(source, { target: { value: 'product' } })
+    expect(source.value).toBe('product')
+    expect(within(wizard).queryByText(/Wait for a current settings preview/)).toBeNull()
+    expect((within(wizard).getByLabelText('Worker') as HTMLInputElement).value).toContain('codex.deep')
+  })
+  it('preserves a pending family preview through a rejected workflow save', async () => {
+    familyPreviewState = null
+    let release!: (response: ProjectConfigFormResponse) => void
+    let pending = true
+    vi.mocked(api.postGlobalConfigForm).mockImplementation(async request => {
+      if (!request.action) return familyResponse
+      if (pending) {
+        pending = false
+        return new Promise<ProjectConfigFormResponse>(resolve => { release = resolve })
+      }
+      return { ...familyResponse, form: familyProjectionAfterAction(request.action, familyForm) }
+    })
+    vi.mocked(api.patchGlobalConfig).mockRejectedValueOnce(new Error('revision conflict'))
+    render(<GlobalSettings onDirtyChange={() => {}} onSaved={() => {}} />)
+    await screen.findByLabelText('Effort codex.worker')
+    fireEvent.click(screen.getByRole('tab', { name: 'Teams' }))
+    fireEvent.click(screen.getByRole('button', { name: 'Product', exact: true }))
+    const worker = screen.getByLabelText('Worker')
+    fireEvent.focus(worker)
+    fireEvent.change(worker, { target: { value: 'codex.deep' } })
+    fireEvent.keyDown(worker, { key: 'Enter' })
+    await screen.findByText('Refreshing effective team and workflow projections…')
+
+    fireEvent.click(screen.getByRole('button', { name: 'Save all changes' }))
+    await screen.findByText(/revision conflict.*Your remaining edits/)
+    release({ ...familyResponse, form: familyProjectionAfterAction({ type: 'set_team_role', team: 'product', role: 'worker', selector: 'codex.deep' }, familyForm) })
+    await waitFor(() => expect(screen.queryByText('Refreshing effective team and workflow projections…')).toBeNull())
+
+    fireEvent.click(screen.getByRole('button', { name: 'New family', exact: true }))
+    const wizard = screen.getByLabelText('Create team family')
+    const source = within(wizard).getByLabelText('Base assignment source') as HTMLSelectElement
+    fireEvent.change(source, { target: { value: 'product' } })
+    expect(source.value).toBe('product')
+    expect((within(wizard).getByLabelText('Worker') as HTMLInputElement).value).toContain('codex.deep')
+  })
+  it('preserves canonical family copying after a failed family candidate preview', async () => {
+    familyPreviewState = null
+    let failCandidate = false
+    vi.mocked(api.postGlobalConfigForm).mockImplementation(async request => {
+      if (!request.action) return familyResponse
+      if (failCandidate) throw new Error('candidate preview failed')
+      return { ...familyResponse, form: familyProjectionAfterAction(request.action, familyForm) }
+    })
+    render(<GlobalSettings onDirtyChange={() => {}} onSaved={() => {}} />)
+    await screen.findByLabelText('Effort codex.worker')
+    fireEvent.click(screen.getByRole('tab', { name: 'Teams' }))
+    fireEvent.click(screen.getByRole('button', { name: 'Product', exact: true }))
+    const worker = screen.getByLabelText('Worker')
+    fireEvent.focus(worker)
+    fireEvent.change(worker, { target: { value: 'codex.deep' } })
+    fireEvent.keyDown(worker, { key: 'Enter' })
+    await waitFor(() => expect(screen.queryByText('Refreshing effective team and workflow projections…')).toBeNull())
+
+    failCandidate = true
+    fireEvent.click(screen.getByRole('button', { name: 'New family', exact: true }))
+    fireEvent.change(screen.getByLabelText('Family display name'), { target: { value: 'Candidate family' } })
+    fireEvent.click(screen.getByRole('button', { name: 'Next: stages' }))
+    fireEvent.click(screen.getByRole('button', { name: 'Next: review' }))
+    fireEvent.click(screen.getByRole('button', { name: 'Add family to draft' }))
+    await screen.findByText('candidate preview failed', { exact: true })
+
+    fireEvent.click(screen.getByRole('button', { name: 'Back', exact: true }))
+    fireEvent.click(screen.getByRole('button', { name: 'Back', exact: true }))
+    fireEvent.click(screen.getByRole('button', { name: 'Back to family editor', exact: true }))
+    fireEvent.click(screen.getByRole('button', { name: 'New family', exact: true }))
+    const wizard = screen.getByLabelText('Create team family')
+    const source = within(wizard).getByLabelText('Base assignment source') as HTMLSelectElement
+    fireEvent.change(source, { target: { value: 'product' } })
+    expect(source.value).toBe('product')
+    expect((within(wizard).getByLabelText('Worker') as HTMLInputElement).value).toContain('codex.deep')
+  })
+  it('preserves canonical family copy readiness after a server-only save', async () => {
+    vi.mocked(api.postGlobalConfigForm).mockResolvedValue(familyResponse)
+    render(<GlobalSettings onDirtyChange={() => {}} onSaved={() => {}} />)
+    await screen.findByLabelText('Effort codex.worker')
+    fireEvent.click(screen.getByRole('tab', { name: 'General' }))
+    fireEvent.change(screen.getByLabelText('Bind host'), { target: { value: 'unsaved.example' } })
+    fireEvent.click(screen.getByRole('button', { name: 'Save all changes' }))
+    await screen.findByText('All changes saved.')
+    expect(api.saveSettings).toHaveBeenCalledWith({ expected_revision: server.revision, bind_host: 'unsaved.example' })
+    expect(api.patchGlobalConfig).not.toHaveBeenCalled()
+
+    fireEvent.click(screen.getByRole('tab', { name: 'Teams' }))
+    fireEvent.click(screen.getByRole('button', { name: 'New family', exact: true }))
+    const wizard = screen.getByLabelText('Create team family')
+    const source = within(wizard).getByLabelText('Base assignment source') as HTMLSelectElement
+    fireEvent.change(source, { target: { value: 'product' } })
+    expect(source.value).toBe('product')
+    expect(within(wizard).queryByText(/Wait for a current settings preview/)).toBeNull()
+    expect((within(wizard).getByLabelText('Worker') as HTMLInputElement).value).toContain('codex.worker')
+  })
+  it('preserves canonical family copy readiness after a failed server-only save', async () => {
+    vi.mocked(api.postGlobalConfigForm).mockResolvedValue(familyResponse)
+    vi.mocked(api.saveSettings).mockRejectedValueOnce(new Error('server save failed'))
+    render(<GlobalSettings onDirtyChange={() => {}} onSaved={() => {}} />)
+    await screen.findByLabelText('Effort codex.worker')
+    fireEvent.click(screen.getByRole('tab', { name: 'General' }))
+    fireEvent.change(screen.getByLabelText('Bind host'), { target: { value: 'unsaved.example' } })
+    fireEvent.click(screen.getByRole('button', { name: 'Save all changes' }))
+    await screen.findByText(/server save failed.*Your remaining edits/)
+    expect(api.saveSettings).toHaveBeenCalledTimes(1)
+
+    fireEvent.click(screen.getByRole('tab', { name: 'Teams' }))
+    fireEvent.click(screen.getByRole('button', { name: 'New family', exact: true }))
+    const wizard = screen.getByLabelText('Create team family')
+    const source = within(wizard).getByLabelText('Base assignment source') as HTMLSelectElement
+    fireEvent.change(source, { target: { value: 'product' } })
+    expect(source.value).toBe('product')
+    expect(within(wizard).queryByText(/Wait for a current settings preview/)).toBeNull()
+    expect(api.patchGlobalConfig).not.toHaveBeenCalled()
+  })
   it('creates a custom profile in the save action without a separate Apply', async () => {
     render(<GlobalSettings onDirtyChange={() => {}} onSaved={() => {}} />)
     fireEvent.change(await screen.findByLabelText('Harness'), { target: { value: 'codex' } })
@@ -506,6 +717,359 @@ describe('GlobalSettings', () => {
     fireEvent.change(input, { target: { value: 'ds4-stage2' } })
     fireEvent.click(screen.getByRole('button', { name: 'Add team' }))
     expect(screen.getByRole('alert').textContent).toContain('already exists')
+  })
+
+  it('adds a new family through the shared draft preview without persisting early', async () => {
+    render(<GlobalSettings onDirtyChange={() => {}} onSaved={() => {}} />)
+    await screen.findByLabelText('Effort codex.worker')
+
+    let previewForm = structuredClone(form)
+    vi.mocked(api.postGlobalConfigForm).mockImplementation(async request => {
+      const action = request.action
+      const next = structuredClone(previewForm)
+      if (action?.type === 'add_team') next.teams[action.team] = { roles: {}, prompts: {} }
+      if (action?.type === 'set_team_display_name' && next.teams[action.team]) next.teams[action.team].display_name = action.display_name
+      previewForm = next
+      return { ...response, form: next, choices: { ...response.choices!, teams: Object.keys(next.teams).sort() } }
+    })
+
+    fireEvent.click(screen.getByRole('tab', { name: 'Teams' }))
+    fireEvent.click(screen.getByRole('button', { name: 'New family' }))
+    fireEvent.change(screen.getByLabelText('Family display name'), { target: { value: 'Product development' } })
+    fireEvent.click(screen.getByRole('button', { name: 'Next: stages' }))
+    fireEvent.click(screen.getByRole('button', { name: 'Next: review' }))
+    fireEvent.click(screen.getByRole('button', { name: 'Add family to draft' }))
+
+    await waitFor(() => expect(screen.getByRole('button', { name: 'Product development', exact: true })).toBeTruthy())
+    expect(screen.getByText(/new — saved with Save all/)).toBeDefined()
+    expect(vi.mocked(api.postGlobalConfigForm).mock.calls.some(([request]) => request.action?.type === 'add_team')).toBe(true)
+    expect(api.patchGlobalConfig).not.toHaveBeenCalled()
+  })
+
+  it('refreshes unsaved family role and prompt projections from the owner preview', async () => {
+    familyPreviewState = null
+    vi.mocked(api.postGlobalConfigForm).mockImplementation(async request => familyPreviewResponse(request))
+    render(<GlobalSettings onDirtyChange={() => {}} onSaved={() => {}} />)
+    await screen.findByLabelText('Effort codex.worker')
+    fireEvent.click(screen.getByRole('tab', { name: 'Teams' }))
+    fireEvent.click(screen.getByRole('button', { name: 'Product', exact: true }))
+
+    const baseWorker = screen.getByLabelText('Worker')
+    fireEvent.focus(baseWorker)
+    fireEvent.change(baseWorker, { target: { value: 'codex.deep' } })
+    fireEvent.keyDown(baseWorker, { key: 'Enter' })
+    await waitFor(() => expect(screen.getAllByText(/codex\.deep/).length).toBeGreaterThan(0))
+
+    fireEvent.click(screen.getByRole('button', { name: 'Stronger worker', exact: true }))
+    const childOverride = screen.getByText(/Stored override · declared by Stronger worker/).closest('.team-family-role-row') as HTMLElement
+    fireEvent.click(within(childOverride).getByRole('button', { name: 'Restore inheritance' }))
+    await waitFor(() => expect(screen.getAllByText(/Inherited from global/).length).toBeGreaterThan(0))
+    expect(screen.getAllByText(/codex\.deep/).length).toBeGreaterThan(0)
+
+    fireEvent.click(screen.getByRole('button', { name: 'New family', exact: true }))
+    const wizard = screen.getByLabelText('Create team family')
+    fireEvent.change(within(wizard).getByLabelText('Base assignment source'), { target: { value: 'product' } })
+    expect((within(wizard).getByLabelText('Worker') as HTMLInputElement).value).toContain('codex.deep')
+    fireEvent.click(within(wizard).getByRole('button', { name: 'Back to family editor', exact: true }))
+
+    fireEvent.click(screen.getByRole('tab', { name: 'Prompts' }))
+    fireEvent.click(screen.getByRole('button', { name: 'Global / Worker', exact: true }))
+    fireEvent.change(screen.getByLabelText('Role prompt text'), { target: { value: 'Edited global worker prompt' } })
+    await waitFor(() => expect(vi.mocked(api.postGlobalConfigForm).mock.calls.some(([request]) => request.action?.type === 'set_role_prompt' && request.action.role === 'worker' && request.action.text === 'Edited global worker prompt')).toBe(true))
+
+    fireEvent.click(screen.getByRole('tab', { name: 'Teams' }))
+    fireEvent.click(screen.getByRole('button', { name: 'Product', exact: true }))
+    fireEvent.click(screen.getByRole('button', { name: 'Stronger worker', exact: true }))
+    expect(screen.getAllByText('Edited global worker prompt').length).toBeGreaterThan(0)
+  })
+
+  it('drops stale and reverted previews and retains declarations after a failed preview', async () => {
+    familyPreviewState = null
+    type Pending = { resolve: (value: ProjectConfigFormResponse) => void; reject: (reason: Error) => void }
+    const pending: Pending[] = []
+    vi.mocked(api.postGlobalConfigForm).mockImplementation(async request => {
+      if (!request.action) return familyResponse
+      return new Promise<ProjectConfigFormResponse>((resolve, reject) => pending.push({ resolve, reject }))
+    })
+    render(<GlobalSettings onDirtyChange={() => {}} onSaved={() => {}} />)
+    await screen.findByLabelText('Effort codex.worker')
+    fireEvent.click(screen.getByRole('tab', { name: 'Teams' }))
+    fireEvent.click(screen.getByRole('button', { name: 'Product', exact: true }))
+    const worker = screen.getByLabelText('Worker')
+
+    fireEvent.focus(worker)
+    fireEvent.change(worker, { target: { value: 'codex.deep' } })
+    fireEvent.keyDown(worker, { key: 'Enter' })
+    fireEvent.focus(screen.getByLabelText('Worker'))
+    fireEvent.change(screen.getByLabelText('Worker'), { target: { value: 'codex.reviewer' } })
+    fireEvent.keyDown(screen.getByLabelText('Worker'), { key: 'Enter' })
+    await waitFor(() => expect(pending).toHaveLength(2))
+
+    // Revert before either response arrives. Both replies are now stale and
+    // the saved projection must win without changing the current declaration.
+    fireEvent.focus(screen.getByLabelText('Worker'))
+    fireEvent.change(screen.getByLabelText('Worker'), { target: { value: 'codex.worker' } })
+    fireEvent.keyDown(screen.getByLabelText('Worker'), { key: 'Enter' })
+    expect((screen.getByLabelText('Worker') as HTMLInputElement).value).toContain('codex.worker')
+    pending[1].resolve(familyPreviewResponse({ aflow_toml: '', workflows_toml: '', action: { type: 'set_team_role', team: 'product', role: 'worker', selector: 'codex.reviewer' } }))
+    pending[0].resolve(familyPreviewResponse({ aflow_toml: '', workflows_toml: '', action: { type: 'set_team_role', team: 'product', role: 'worker', selector: 'codex.deep' } }))
+    expect((screen.getByLabelText('Worker') as HTMLInputElement).value).toContain('codex.worker')
+
+    vi.mocked(api.postGlobalConfigForm).mockRejectedValueOnce(new Error('preview unavailable'))
+    fireEvent.focus(screen.getByLabelText('Worker'))
+    fireEvent.change(screen.getByLabelText('Worker'), { target: { value: 'codex.deep' } })
+    fireEvent.keyDown(screen.getByLabelText('Worker'), { key: 'Enter' })
+    await screen.findByText(/current settings preview is unavailable: preview unavailable/)
+    expect((screen.getByLabelText('Worker') as HTMLInputElement).value).toContain('codex.deep')
+  })
+
+  it('keeps a pending canonical preview through an unchanged label blur and copies its current projection', async () => {
+    familyPreviewState = null
+    let release!: (value: ProjectConfigFormResponse) => void
+    vi.mocked(api.postGlobalConfigForm).mockImplementation(async request => {
+      if (!request.action) return familyResponse
+      return new Promise<ProjectConfigFormResponse>(resolve => { release = resolve })
+    })
+    render(<GlobalSettings onDirtyChange={() => {}} onSaved={() => {}} />)
+    await screen.findByLabelText('Effort codex.worker')
+    fireEvent.click(screen.getByRole('tab', { name: 'Teams' }))
+    fireEvent.click(screen.getByRole('button', { name: 'Product', exact: true }))
+
+    const worker = screen.getByLabelText('Worker')
+    fireEvent.focus(worker)
+    fireEvent.change(worker, { target: { value: 'codex.deep' } })
+    fireEvent.keyDown(worker, { key: 'Enter' })
+    await screen.findByText(/Refreshing effective team and workflow projections/)
+
+    const displayName = screen.getByLabelText('Display name')
+    fireEvent.focus(displayName)
+    fireEvent.blur(displayName)
+    release({
+      ...familyResponse,
+      form: familyProjectionAfterAction({ type: 'set_team_role', team: 'product', role: 'worker', selector: 'codex.deep' }, familyForm),
+    })
+    await waitFor(() => expect(screen.queryByText(/Refreshing effective team and workflow projections/)).toBeNull())
+
+    fireEvent.click(screen.getByRole('button', { name: 'New family', exact: true }))
+    const wizard = screen.getByLabelText('Create team family')
+    fireEvent.change(within(wizard).getByLabelText('Base assignment source'), { target: { value: 'product' } })
+    expect((within(wizard).getByLabelText('Worker') as HTMLInputElement).value).toContain('codex.deep')
+  })
+
+  it('keeps a failed preview unavailable after an unchanged edit and blocks stale copying', async () => {
+    familyPreviewState = null
+    vi.mocked(api.postGlobalConfigForm).mockImplementation(async request => {
+      if (!request.action) return familyResponse
+      throw new Error('preview unavailable')
+    })
+    render(<GlobalSettings onDirtyChange={() => {}} onSaved={() => {}} />)
+    await screen.findByLabelText('Effort codex.worker')
+    fireEvent.click(screen.getByRole('tab', { name: 'Teams' }))
+    fireEvent.click(screen.getByRole('button', { name: 'Product', exact: true }))
+
+    const worker = screen.getByLabelText('Worker')
+    fireEvent.focus(worker)
+    fireEvent.change(worker, { target: { value: 'codex.deep' } })
+    fireEvent.keyDown(worker, { key: 'Enter' })
+    await screen.findByText(/current settings preview is unavailable: preview unavailable/)
+
+    const displayName = screen.getByLabelText('Display name')
+    fireEvent.focus(displayName)
+    fireEvent.blur(displayName)
+    expect(screen.getByText(/current settings preview is unavailable: preview unavailable/)).toBeTruthy()
+
+    fireEvent.click(screen.getByRole('button', { name: 'New family', exact: true }))
+    const wizard = screen.getByLabelText('Create team family')
+    const source = within(wizard).getByLabelText('Base assignment source') as HTMLSelectElement
+    fireEvent.change(source, { target: { value: 'product' } })
+    expect(source.selectedIndex).toBe(0)
+    expect(within(wizard).getByRole('alert').textContent).toContain('preview is unavailable')
+  })
+
+  it('review probe clean Advanced round trip retains copying', async () => {
+    vi.mocked(api.postGlobalConfigForm).mockResolvedValue(familyResponse)
+    render(<GlobalSettings onDirtyChange={() => {}} onSaved={() => {}} />)
+    await screen.findByLabelText('Effort codex.worker')
+    fireEvent.click(screen.getByRole('tab', { name: 'Teams' }))
+    fireEvent.click(screen.getByRole('button', { name: 'Product', exact: true }))
+    fireEvent.click(screen.getByRole('button', { name: 'Advanced TOML', exact: true }))
+    await screen.findByLabelText('aflow.toml contents')
+    fireEvent.click(screen.getByRole('button', { name: 'Guided settings', exact: true }))
+    fireEvent.click(screen.getByRole('button', { name: 'New family', exact: true }))
+
+    const wizard = screen.getByLabelText('Create team family')
+    const source = within(wizard).getByLabelText('Base assignment source') as HTMLSelectElement
+    fireEvent.change(source, { target: { value: 'product' } })
+    expect(within(wizard).queryByText('Wait for a current settings preview to finish before copying a team.')).toBeNull()
+    expect(source.value).toBe('product')
+    expect((within(wizard).getByLabelText('Worker') as HTMLInputElement).value).toContain('codex.worker')
+    fireEvent.click(within(wizard).getByText('Role prompts (2)', { exact: true }))
+    expect((within(wizard).getByLabelText('Prompt text for Worker') as HTMLTextAreaElement).value).toBe('Global worker prompt')
+    expect(api.postGlobalConfigForm).toHaveBeenCalledTimes(1)
+    expect(api.patchGlobalConfig).not.toHaveBeenCalled()
+  })
+
+  it('review probe clean initial state permits copying', async () => {
+    vi.mocked(api.postGlobalConfigForm).mockResolvedValue(familyResponse)
+    render(<GlobalSettings onDirtyChange={() => {}} onSaved={() => {}} />)
+    await screen.findByLabelText('Effort codex.worker')
+    fireEvent.click(screen.getByRole('tab', { name: 'Teams' }))
+    await screen.findByRole('button', { name: 'New family', exact: true })
+    fireEvent.click(screen.getByRole('button', { name: 'New family', exact: true }))
+
+    const wizard = screen.getByLabelText('Create team family')
+    const source = within(wizard).getByLabelText('Base assignment source') as HTMLSelectElement
+    fireEvent.change(source, { target: { value: 'product' } })
+    expect(within(wizard).queryByText('Wait for a current settings preview to finish before copying a team.')).toBeNull()
+    expect(source.value).toBe('product')
+    expect((within(wizard).getByLabelText('Worker') as HTMLInputElement).value).toContain('codex.worker')
+    expect(api.patchGlobalConfig).not.toHaveBeenCalled()
+  })
+
+  it('applies the replacement Advanced preview before allowing a pending copy', async () => {
+    familyPreviewState = null
+    let release!: (value: ProjectConfigFormResponse) => void
+    vi.mocked(api.postGlobalConfigForm).mockImplementation(async request => {
+      if (!request.action) return familyResponse
+      if (!release) return new Promise<ProjectConfigFormResponse>(resolve => { release = resolve })
+      return { ...familyResponse, form: familyProjectionAfterAction(request.action, familyForm) }
+    })
+    render(<GlobalSettings onDirtyChange={() => {}} onSaved={() => {}} />)
+    await screen.findByLabelText('Effort codex.worker')
+    fireEvent.click(screen.getByRole('tab', { name: 'Teams' }))
+    fireEvent.click(screen.getByRole('button', { name: 'Product', exact: true }))
+
+    const worker = screen.getByLabelText('Worker')
+    fireEvent.focus(worker)
+    fireEvent.change(worker, { target: { value: 'codex.deep' } })
+    fireEvent.keyDown(worker, { key: 'Enter' })
+    await screen.findByText(/Refreshing effective team and workflow projections/)
+
+    fireEvent.click(screen.getByRole('button', { name: 'Advanced TOML', exact: true }))
+    await screen.findByLabelText('aflow.toml contents')
+    fireEvent.click(screen.getByRole('button', { name: 'Guided settings', exact: true }))
+    await screen.findByRole('button', { name: 'New family', exact: true })
+
+    fireEvent.click(screen.getByRole('button', { name: 'New family', exact: true }))
+    const wizard = screen.getByLabelText('Create team family')
+    const source = within(wizard).getByLabelText('Base assignment source') as HTMLSelectElement
+    fireEvent.change(source, { target: { value: 'product' } })
+    expect(source.value).toBe('product')
+    expect((within(wizard).getByLabelText('Worker') as HTMLInputElement).value).toContain('codex.deep')
+    expect(api.patchGlobalConfig).not.toHaveBeenCalled()
+
+    // The original guided request is obsolete and must not regress the copied
+    // projection after the replacement Advanced preview has been applied.
+    release({ ...familyResponse, form: familyForm })
+    await waitFor(() => expect((within(wizard).getByLabelText('Worker') as HTMLInputElement).value).toContain('codex.deep'))
+  })
+
+  it('keeps copying unavailable after a failed Advanced preview until retry succeeds', async () => {
+    let failNextAction = false
+    vi.mocked(api.postGlobalConfigForm).mockImplementation(async request => {
+      if (!request.action) return familyResponse
+      if (failNextAction) {
+        failNextAction = false
+        throw new Error('Advanced preview unavailable')
+      }
+      return { ...familyResponse, form: familyProjectionAfterAction(request.action, familyForm) }
+    })
+    render(<GlobalSettings onDirtyChange={() => {}} onSaved={() => {}} />)
+    await screen.findByLabelText('Effort codex.worker')
+    fireEvent.click(screen.getByRole('tab', { name: 'Teams' }))
+    fireEvent.click(screen.getByRole('button', { name: 'Product', exact: true }))
+
+    const worker = screen.getByLabelText('Worker')
+    fireEvent.focus(worker)
+    fireEvent.change(worker, { target: { value: 'codex.deep' } })
+    fireEvent.keyDown(worker, { key: 'Enter' })
+    await waitFor(() => expect(vi.mocked(api.postGlobalConfigForm).mock.calls.some(([request]) => request.action?.type === 'set_team_role')).toBe(true))
+
+    failNextAction = true
+    fireEvent.click(screen.getByRole('button', { name: 'Advanced TOML', exact: true }))
+    await screen.findByText('Advanced preview unavailable', { exact: true })
+    expect(screen.queryByLabelText('aflow.toml contents')).toBeNull()
+
+    fireEvent.click(screen.getByRole('button', { name: 'Advanced TOML', exact: true }))
+    await screen.findByLabelText('aflow.toml contents')
+    fireEvent.click(screen.getByRole('button', { name: 'Guided settings', exact: true }))
+    fireEvent.click(screen.getByRole('button', { name: 'New family', exact: true }))
+
+    const wizard = screen.getByLabelText('Create team family')
+    const source = within(wizard).getByLabelText('Base assignment source') as HTMLSelectElement
+    fireEvent.change(source, { target: { value: 'product' } })
+    expect(source.value).toBe('product')
+    expect((within(wizard).getByLabelText('Worker') as HTMLInputElement).value).toContain('codex.deep')
+    expect(api.patchGlobalConfig).not.toHaveBeenCalled()
+  })
+
+  it('preserves copying after a failed Advanced transition', async () => {
+    familyPreviewState = null
+    let rejectPreview = false
+    vi.mocked(api.postGlobalConfigForm).mockImplementation(async request => {
+      if (rejectPreview) throw new Error('Advanced preview unavailable')
+      return familyPreviewResponse(request)
+    })
+    render(<GlobalSettings onDirtyChange={() => {}} onSaved={() => {}} />)
+    await screen.findByLabelText('Effort codex.worker')
+    fireEvent.click(screen.getByRole('tab', { name: 'Teams' }))
+    fireEvent.click(screen.getByRole('button', { name: 'Product', exact: true }))
+    const worker = screen.getByLabelText('Worker')
+    fireEvent.focus(worker)
+    fireEvent.change(worker, { target: { value: 'codex.deep' } })
+    fireEvent.keyDown(worker, { key: 'Enter' })
+    await waitFor(() => expect(screen.queryByText('Refreshing effective team and workflow projections…')).toBeNull())
+
+    rejectPreview = true
+    fireEvent.click(screen.getByRole('button', { name: 'Advanced TOML', exact: true }))
+    await screen.findByText('Advanced preview unavailable', { exact: true })
+    fireEvent.click(screen.getByRole('button', { name: 'New family', exact: true }))
+    const wizard = screen.getByLabelText('Create team family')
+    const source = within(wizard).getByLabelText('Base assignment source') as HTMLSelectElement
+    fireEvent.change(source, { target: { value: 'product' } })
+    expect(source.value).toBe('product')
+    expect((within(wizard).getByLabelText('Worker') as HTMLInputElement).value).toContain('codex.deep')
+    expect(api.patchGlobalConfig).not.toHaveBeenCalled()
+  })
+
+  it('keeps a matching pending preview through a failed Advanced transition', async () => {
+    familyPreviewState = null
+    let releasePending!: (value: ProjectConfigFormResponse) => void
+    vi.mocked(api.postGlobalConfigForm).mockImplementation(async request => {
+      if (!request.action) return familyResponse
+      if (!releasePending) {
+        return new Promise<ProjectConfigFormResponse>(resolve => {
+          releasePending = resolve
+        })
+      }
+      throw new Error('Advanced preview unavailable')
+    })
+    render(<GlobalSettings onDirtyChange={() => {}} onSaved={() => {}} />)
+    await screen.findByLabelText('Effort codex.worker')
+    fireEvent.click(screen.getByRole('tab', { name: 'Teams' }))
+    fireEvent.click(screen.getByRole('button', { name: 'Product', exact: true }))
+    const worker = screen.getByLabelText('Worker')
+    fireEvent.focus(worker)
+    fireEvent.change(worker, { target: { value: 'codex.deep' } })
+    fireEvent.keyDown(worker, { key: 'Enter' })
+    await screen.findByText('Refreshing effective team and workflow projections…')
+    expect(releasePending).toBeTypeOf('function')
+
+    fireEvent.click(screen.getByRole('button', { name: 'Advanced TOML', exact: true }))
+    await screen.findByText('Advanced preview unavailable', { exact: true })
+    fireEvent.click(screen.getByRole('button', { name: 'New family', exact: true }))
+    const wizard = screen.getByLabelText('Create team family')
+    const source = within(wizard).getByLabelText('Base assignment source') as HTMLSelectElement
+    fireEvent.change(source, { target: { value: 'product' } })
+    expect(source.selectedIndex).toBe(0)
+    expect(within(wizard).getByRole('alert').textContent).toContain('Wait for the current settings preview')
+
+    releasePending({ ...familyResponse, form: familyProjectionAfterAction({ type: 'set_team_role', team: 'product', role: 'worker', selector: 'codex.deep' }, familyForm) })
+    await waitFor(() => expect(screen.queryByText('Refreshing effective team and workflow projections…')).toBeNull())
+    fireEvent.change(source, { target: { value: 'product' } })
+    expect(source.value).toBe('product')
+    expect((within(wizard).getByLabelText('Worker') as HTMLInputElement).value).toContain('codex.deep')
+    expect(api.patchGlobalConfig).not.toHaveBeenCalled()
   })
 
   it('creates two teams, assigns a role, links the chain, and sends add_team first in one Save', async () => {

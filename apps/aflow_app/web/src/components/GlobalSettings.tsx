@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState } from 'react'
 import * as api from '../api'
 import type { GuidedConfigAction, GuidedFormProjection, ProjectConfig, ProjectConfigFormResponse, SettingsResponse, SettingsSaveRequest } from '../types'
-import { changedDocuments, settingsActions } from '../settingsDraft'
+import { changedDocuments, createDraftPreviewCoordinator, previewLegacyConversion, previewSettingsActions, retainServerProjection, settingsActions, type DraftPreviewState } from '../settingsDraft'
 import { AppearanceSelector } from './AppearanceSelector'
 import { RecentRunsLimit } from './GlobalRunOverview'
 import { Combobox } from './Combobox'
@@ -14,6 +14,7 @@ import { MenuItem, MoreMenu } from './MoreMenu'
 import { useHeaderSlots } from './HeaderSlots'
 import { TextEditor } from './TextEditor'
 import { ChangelogSettings } from './ChangelogSettings'
+import { TeamFamiliesSettings } from './TeamFamiliesSettings'
 
 const tabs = ['Agents & Roles', 'Teams', 'Workflows', 'Prompts', 'Skills', 'General', 'Changelog'] as const
 // Header fit is deliberately wider than the list/detail breakpoint: the seven
@@ -76,7 +77,12 @@ export function GlobalSettings({ onDirtyChange, onSaved }: { onDirtyChange: (dir
   const [newTeamName, setNewTeamName] = useState('')
   const [newTeamError, setNewTeamError] = useState<string | null>(null)
   const [pendingFocusTeam, setPendingFocusTeam] = useState<string | null>(null)
+  const [teamWizardDirty, setTeamWizardDirty] = useState(false)
+  const [teamWizardResetVersion, setTeamWizardResetVersion] = useState(0)
   const [starter, setStarter] = useState({ workflow: 'cp', main_branch: 'main' })
+  const draftPreviewCoordinatorRef = useRef<ReturnType<typeof createDraftPreviewCoordinator> | null>(null)
+  const draftPreviewCoordinator = draftPreviewCoordinatorRef.current ?? (draftPreviewCoordinatorRef.current = createDraftPreviewCoordinator(api.postGlobalConfigForm))
+  const [draftPreviewState, setDraftPreviewState] = useState<DraftPreviewState>(() => draftPreviewCoordinator.state())
   // Skills domain: list, per-skill content/revision baselines, and drafts are
   // owned here so switching skill, tab, or Advanced TOML preserves them.
   // Skills never enter TOML documents and stay usable without the config projection.
@@ -95,8 +101,15 @@ export function GlobalSettings({ onDirtyChange, onSaved }: { onDirtyChange: (dir
   // Bumped by every load/discard so a response that resolves after an
   // explicit discard can never restore cleared edits.
   const epochRef = useRef(0)
+  const draftRef = useRef<GuidedFormProjection | null>(null)
+
+  useEffect(() => {
+    draftRef.current = draft
+  }, [draft])
 
   async function acceptConfig(saved: ProjectConfig, epoch: number) {
+    draftPreviewCoordinator.invalidate()
+    setDraftPreviewState(draftPreviewCoordinator.state())
     // The snapshot and raw texts are kept before the projection is attempted,
     // so a mistyped prompt table (no guided projection) still leaves the
     // documents inspectable and editable through Advanced TOML.
@@ -111,6 +124,8 @@ export function GlobalSettings({ onDirtyChange, onSaved }: { onDirtyChange: (dir
     if (epochRef.current !== epoch) return
     setProjection(form)
     setBaseline(form?.form ?? null); setDraft(form?.form ? clone(form.form) : null); setPendingNames({})
+    if (form?.form) draftPreviewCoordinator.updateDraft(form.form, true)
+    setDraftPreviewState(draftPreviewCoordinator.state())
     setRawEdited(false); setProjectionError(failure)
   }
   useEffect(() => {
@@ -185,9 +200,11 @@ export function GlobalSettings({ onDirtyChange, onSaved }: { onDirtyChange: (dir
   /** Explicit confirmed discard: every pending edit is dropped up front. */
   function discardAndReload() {
     setDeletedPrompts([])
+    draftPreviewCoordinator.invalidate()
+    setDraftPreviewState(draftPreviewCoordinator.state())
     // Bumping the epoch invalidates stale skill reads/saves as well as config loads.
     epochRef.current += 1
-    setPassword(''); setNewProfile({ harness: '', profile: '', model: '', effort: '' }); setNewProfileError(null); setNewRole({ role: '', selector: '' }); setNewRoleError(null); setNewTeamName(''); setNewTeamError(null); setPendingFocusTeam(null)
+    setPassword(''); setNewProfile({ harness: '', profile: '', model: '', effort: '' }); setNewProfileError(null); setNewRole({ role: '', selector: '' }); setNewRoleError(null); setNewTeamName(''); setNewTeamError(null); setPendingFocusTeam(null); setTeamWizardDirty(false); setTeamWizardResetVersion(value => value + 1)
     setPendingNames({}); setRawEdited(false); setError(null); setNotice(null); setProjectionError(null)
     setTexts(['', '']); setSnapshot(null); setProjection(null); setBaseline(null); setDraft(null)
     setServer(null); setServerText(''); setServerDraft({ bind_host: '', bind_port: '', managed_projects_root: '' })
@@ -199,10 +216,14 @@ export function GlobalSettings({ onDirtyChange, onSaved }: { onDirtyChange: (dir
   }
   async function retryProjection() {
     if (!snapshot) return
+    draftPreviewCoordinator.invalidate()
+    setDraftPreviewState(draftPreviewCoordinator.state())
     setBusy(true); setError(null); setProjectionError(null)
     try {
       const form = await api.postGlobalConfigForm({ aflow_toml: snapshot.aflow_toml, workflows_toml: snapshot.workflows_toml })
       setProjection(form); setBaseline(form.form); setDraft(form.form ? clone(form.form) : null)
+      if (form.form) draftPreviewCoordinator.updateDraft(form.form, true)
+      setDraftPreviewState(draftPreviewCoordinator.state())
     } catch (reason) {
       setProjectionError(reason instanceof Error ? reason.message : 'Could not build the guided view.')
     } finally { setBusy(false) }
@@ -216,7 +237,8 @@ export function GlobalSettings({ onDirtyChange, onSaved }: { onDirtyChange: (dir
   // Skill drafts live outside TOML documents and join the same dirty guard.
   const dirtySkillNames = Object.keys(skillDrafts).filter(name => skillContents[name] !== undefined && skillDrafts[name] !== skillContents[name]).sort()
   const skillsDirty = dirtySkillNames.length > 0
-  const dirty = configDirty || pendingCreation || serverDirty || skillsDirty
+  const saveableDirty = configDirty || pendingCreation || serverDirty || skillsDirty
+  const dirty = saveableDirty || teamWizardDirty
   useEffect(() => { onDirtyChange(dirty); return () => onDirtyChange(false) }, [dirty, onDirtyChange])
   useEffect(() => {
     if (!dirty) return
@@ -243,35 +265,27 @@ export function GlobalSettings({ onDirtyChange, onSaved }: { onDirtyChange: (dir
     setPendingFocusTeam(null)
   }, [pendingFocusTeam, draft])
 
-  /** Follows the draft upgrade links from a team; cycles and missing targets surface as errors. */
-  function draftUpgradeChain(start: string): { chain: string[]; error: string | null } {
-    const chain = [start]
-    const seen = new Set([start])
-    let current = draft?.teams[start]?.upgrade_to ?? null
-    while (current) {
-      if (seen.has(current)) return { chain, error: `Upgrade chain has a cycle at "${current}". Choose a different target.` }
-      if (!draft?.teams[current]) return { chain, error: `Upgrade target "${current}" does not exist. Choose a configured team.` }
-      seen.add(current)
-      chain.push(current)
-      current = draft.teams[current]?.upgrade_to ?? null
-    }
-    return { chain, error: null }
-  }
-
-  /** Worker selector plus model/effort of one team stage, from the current draft. */
-  function workerText(team: string): string {
-    const teamRoles = draft?.teams[team]?.roles ?? {}
-    const selector = (typeof teamRoles.worker === 'string' && teamRoles.worker.trim()) || draft?.roles.worker || null
-    if (!selector) return ''
-    const dot = selector.indexOf('.')
-    const profile = dot > 0 ? draft?.harnesses[selector.slice(0, dot)]?.[selector.slice(dot + 1)] : null
-    const modelEffort = profile ? [profile.model, profile.effort ? `effort ${profile.effort}` : null].filter(Boolean).join(', ') : ''
-    return [selector, modelEffort].filter(Boolean).join(' · ')
+  function updateGuidedDraft(value: GuidedFormProjection): void {
+    // Editor callbacks can be semantic no-ops (for example an unchanged label
+    // blur). Preserve a matching in-flight/result/error in that case. A real
+    // declaration change explicitly invalidates the old projection; the
+    // identity effect below then schedules the replacement request.
+    const previousActions = baseline && draft ? JSON.stringify(settingsActions(baseline, draft)) : null
+    const nextActions = baseline ? JSON.stringify(settingsActions(baseline, value)) : null
+    if (previousActions === null || previousActions !== nextActions) draftPreviewCoordinator.invalidate()
+    draftPreviewCoordinator.updateDraft(value)
+    setDraftPreviewState(draftPreviewCoordinator.state())
+    setDraft(value)
   }
 
   function change(update: (value: GuidedFormProjection) => void) {
     if (!draft) return
-    const value = clone(draft); update(value); setDraft(value)
+    const value = clone(draft); update(value)
+    updateGuidedDraft(value)
+  }
+
+  function changeDraft(value: GuidedFormProjection): void {
+    updateGuidedDraft(value)
   }
 
   function validateNewProfile(value = newProfile, current = draft): string | null {
@@ -343,52 +357,102 @@ export function GlobalSettings({ onDirtyChange, onSaved }: { onDirtyChange: (dir
     setNewRole({ role: '', selector: '' })
   }
 
-  async function previewActions(operations: GuidedConfigAction[]) {
+  async function previewActions(operations: GuidedConfigAction[], previewEmpty = false) {
     if (!snapshot) throw new Error('Workflow settings have not loaded.')
     let result: ProjectConfigFormResponse | null = null
-    let pair = { aflow_toml: rawEdited ? texts[0] : snapshot.aflow_toml, workflows_toml: rawEdited ? texts[1] : snapshot.workflows_toml }
+    let pair = rawEdited ? { aflow_toml: texts[0], workflows_toml: texts[1] } : { aflow_toml: snapshot.aflow_toml, workflows_toml: snapshot.workflows_toml }
+    if (!operations.length && previewEmpty) {
+      const preview = await previewSettingsActions(pair, operations, api.postGlobalConfigForm)
+      return { pair: preview.pair, result: preview.response }
+    }
     for (const action of operations) {
       result = await api.postGlobalConfigForm({ ...pair, action })
       pair = { aflow_toml: result.aflow_toml, workflows_toml: result.workflows_toml }
     }
     return { pair, result }
   }
-  // Manager supervision preview: declared flags resolve canonically
-  // (override → concrete base → defaults → false) on the server. While the
-  // draft carries unsaved manager declarations, refresh only the effective
-  // values/sources from the server projection and keep the pending
-  // declarations; replies superseded by newer edits are discarded.
-  const managerPreviewSeq = useRef(0)
-  const managerDeclarations = draft ? JSON.stringify([draft.default_manager_enabled ?? null, Object.keys(draft.workflows).sort().map(name => [name, draft.workflows[name].manager_enabled ?? null])]) : ''
+
+  async function previewFamilyConversion(rootId: string, value: GuidedFormProjection) {
+    if (!snapshot || !baseline) throw new Error('Workflow settings have not loaded.')
+    const pair = rawEdited
+      ? { aflow_toml: texts[0], workflows_toml: texts[1] }
+      : { aflow_toml: snapshot.aflow_toml, workflows_toml: snapshot.workflows_toml }
+    const current = await previewSettingsActions(pair, settingsActions(baseline, value), api.postGlobalConfigForm)
+    if (current.response.validation.state === 'invalid' || current.response.validation.placeholders.length || !current.response.form) {
+      throw new Error(current.response.validation.issues.map(issue => issue.message).join(' ') || 'The current draft needs a valid server preview before conversion.')
+    }
+    return previewLegacyConversion({ pair: current.pair, draft: current.response.form, rootId, preview: api.postGlobalConfigForm })
+  }
+
+  async function addFamilyToDraft(value: GuidedFormProjection, rootId: string): Promise<void> {
+    if (!snapshot || !baseline) throw new Error('Workflow settings have not loaded.')
+    const epoch = epochRef.current
+    const expectedDraft = draftRef.current
+    // This candidate preview is read-only. Keep the accepted projection for
+    // the current draft until the candidate is accepted; a rejected candidate
+    // must not strand the existing family-copy flow.
+    const preview = await previewSettingsActions(
+      rawEdited ? { aflow_toml: texts[0], workflows_toml: texts[1] } : { aflow_toml: snapshot.aflow_toml, workflows_toml: snapshot.workflows_toml },
+      settingsActions(baseline, value),
+      api.postGlobalConfigForm,
+    )
+    if (epochRef.current !== epoch) return
+    if (draftRef.current !== expectedDraft) throw new Error('The family preview became stale while another settings edit was made. Review the family and try again.')
+    if (preview.response.validation.state === 'invalid' || preview.response.validation.placeholders.length || !preview.response.form) {
+      throw new Error(preview.response.validation.issues.map(issue => issue.message).join(' ') || 'The family preview did not produce a valid configuration.')
+    }
+    setDraft(preview.response.form)
+    draftPreviewCoordinator.updateDraft(preview.response.form)
+    setDraftPreviewState(draftPreviewCoordinator.state())
+    setSelectedTeam(rootId)
+    setNavigationVersion(version => version + 1)
+    setPendingFocusTeam(rootId)
+  }
+  // Every semantic guided draft edit is previewed through the same canonical
+  // server resolver. The coordinator retains declarations while merging only
+  // effective/source projections, and its ordered action input matches the
+  // eventual save. The action key intentionally excludes projection fields so
+  // applying a response cannot create a request loop.
+  const semanticActionsKey = JSON.stringify(actions)
+  const previewIdentityKey = JSON.stringify({
+    baselineRevision: snapshot?.revision ?? null,
+    rawEdited,
+    actions,
+  })
   useEffect(() => {
-    if (!draft || !baseline || !snapshot) return
-    const operations = settingsActions(baseline, draft)
-    if (!operations.some(action => action.type === 'set_default_manager_enabled' || action.type === 'set_workflow_manager_enabled')) return
-    const seq = ++managerPreviewSeq.current
-    const requested = managerDeclarations
-    previewActions(operations).then(({ result }) => {
-      if (managerPreviewSeq.current !== seq || !result?.form) return
-      const projected = result.form
-      setDraft(next => {
-        if (!next || managerPreviewSeq.current !== seq) return next
-        // Declarations moved on while the preview was in flight: a newer
-        // preview owns the display, or none does when the edit reverted to
-        // a clean state. Never apply a resolution to other declarations.
-        const current = JSON.stringify([next.default_manager_enabled ?? null, Object.keys(next.workflows).sort().map(name => [name, next.workflows[name].manager_enabled ?? null])])
-        if (current !== requested) return next
-        const workflows = { ...next.workflows }
-        for (const [name, summary] of Object.entries(next.workflows)) {
-          const resolved = projected.workflows[name]
-          workflows[name] = {
-            ...summary,
-            effective_manager_enabled: resolved?.effective_manager_enabled ?? summary.effective_manager_enabled ?? false,
-            manager_enabled_source: resolved?.manager_enabled_source ?? summary.manager_enabled_source ?? 'defaults',
-          }
-        }
-        return { ...next, workflows }
+    if (!draft || !baseline || !snapshot) {
+      draftPreviewCoordinator.invalidate()
+      setDraftPreviewState(draftPreviewCoordinator.state())
+      return
+    }
+    if (!actions.length) {
+      draftPreviewCoordinator.invalidate()
+      // A reverted declaration must also restore the saved projection. This
+      // leaves the declaration object untouched while dropping stale display
+      // data from an earlier unsaved preview.
+      setDraft(current => {
+        if (!current || rawEdited) return current
+        return clone(baseline)
       })
-    }).catch(() => { /* keep the last known effective values */ })
-  }, [managerDeclarations]) // eslint-disable-line react-hooks/exhaustive-deps
+      if (!rawEdited) draftPreviewCoordinator.updateDraft(baseline, true)
+      setDraftPreviewState(draftPreviewCoordinator.state())
+      return
+    }
+    const pair = rawEdited
+      ? { aflow_toml: texts[0], workflows_toml: texts[1] }
+      : { aflow_toml: snapshot.aflow_toml, workflows_toml: snapshot.workflows_toml }
+    const declarations = draft
+    const request = draftPreviewCoordinator.request({ pair, actions, declarations })
+    setDraftPreviewState(draftPreviewCoordinator.state())
+    void request.then(result => {
+      setDraftPreviewState(draftPreviewCoordinator.state())
+      if (result.stale || result.error) return
+      setDraft(current => {
+        if (!current || JSON.stringify(settingsActions(baseline, current)) !== semanticActionsKey) return current
+        return result.draft
+      })
+    })
+  }, [previewIdentityKey]) // eslint-disable-line react-hooks/exhaustive-deps
   /** Human-readable source for one workflow's resolved supervision value. */
   function managerSourceLabel(source: string | null | undefined): string {
     if (source?.startsWith('base:')) return `base ${formatMachineLabel(source.slice('base:'.length))}`
@@ -396,12 +460,31 @@ export function GlobalSettings({ onDirtyChange, onSaved }: { onDirtyChange: (dir
     return 'defaults'
   }
   async function toggleAdvanced(): Promise<boolean> {
+    const previousPreview = draftPreviewCoordinator.state()
     setBusy(true); setError(null)
     try {
+      let currentPreview = false
+      let currentProjection: GuidedFormProjection | null = null
+      let acceptedDraft: GuidedFormProjection | null = null
       if (!advanced) {
         const next = candidate()
-        const { pair } = await previewActions(next.actions)
-        setTexts([pair.aflow_toml, pair.workflows_toml])
+        const canPreviewGuidedDraft = Boolean(draft && baseline)
+        const retainCurrentPreview = canPreviewGuidedDraft
+          && !rawEdited
+          && next.actions.length === 0
+          && previousPreview.current
+          && !previousPreview.pending
+          && !previousPreview.error
+        if (canPreviewGuidedDraft) {
+          if (retainCurrentPreview) {
+            currentPreview = true
+          } else {
+            const { pair, result } = await previewActions(next.actions, next.actions.length === 0)
+            setTexts([pair.aflow_toml, pair.workflows_toml])
+            currentPreview = Boolean(result?.form && result.validation.state !== 'invalid' && !result.validation.placeholders.length)
+            if (currentPreview && draft && result?.form) currentProjection = retainServerProjection(draft, result.form)
+          }
+        }
         if (rawEdited) {
           setDraft(next.form); setBaseline(next.form); setPendingNames({})
           setNewProfile({ harness: '', profile: '', model: '', effort: '' }); setNewProfileError(null); setNewRole({ role: '', selector: '' }); setNewRoleError(null); setNewTeamName(''); setNewTeamError(null); setPendingFocusTeam(null)
@@ -411,7 +494,23 @@ export function GlobalSettings({ onDirtyChange, onSaved }: { onDirtyChange: (dir
         if (!form.form) throw new Error('Correct the TOML syntax before switching to guided settings.')
         setDraft(form.form); setProjection(form)
         setBaseline(form.form); setPendingNames({})
+        currentPreview = form.validation.state !== 'invalid' && !form.validation.placeholders.length
+        acceptedDraft = form.form
+      } else if (previousPreview.current && !previousPreview.pending && !previousPreview.error) {
+        currentPreview = true
       }
+      // A transition can fail without changing the draft's source or
+      // declarations. Keep its current or matching pending preview usable in
+      // that case. Once the transition succeeds, supersede any obsolete
+      // request before accepting the replacement projection.
+      draftPreviewCoordinator.invalidate()
+      if (acceptedDraft) draftPreviewCoordinator.updateDraft(acceptedDraft, currentPreview)
+      if (!rawEdited && currentPreview && draft) {
+        const nextDraft = currentProjection ?? draft
+        setDraft(nextDraft)
+        draftPreviewCoordinator.updateDraft(nextDraft, true)
+      }
+      setDraftPreviewState(draftPreviewCoordinator.state())
       setAdvanced(!advanced)
       return true
     } catch (reason) { setError(reason instanceof Error ? reason.message : 'Could not switch editors') }
@@ -491,6 +590,10 @@ export function GlobalSettings({ onDirtyChange, onSaved }: { onDirtyChange: (dir
   async function save() {
     if (busy) return
     const epoch = epochRef.current
+    const workflowDirty = configDirty || pendingCreation
+    // Save may reject before acknowledging workflow configuration. Preserve
+    // the current or pending draft projection until a successful config
+    // acknowledgement can replace it through acceptConfig.
     setBusy(true); setError(null); setNotice(null)
     let configSaved = false
     const savedSkills: string[] = []
@@ -518,7 +621,7 @@ export function GlobalSettings({ onDirtyChange, onSaved }: { onDirtyChange: (dir
         if (password) serverUpdates.password = password
       }
       // Workflow configuration saves first so later skill failures keep acknowledged config.
-      if (configDirty || pendingCreation) {
+      if (workflowDirty) {
         if (!snapshot) throw new Error('Workflow settings have not loaded.')
         const pair = (await previewActions(operations)).pair
         const validation = await api.validateGlobalConfig(pair)
@@ -596,7 +699,7 @@ export function GlobalSettings({ onDirtyChange, onSaved }: { onDirtyChange: (dir
     context: <h2 className="header-context-title">Settings</h2>,
     local: sectionNavigation,
     primary: <>
-      {!changelogReadOnly && <button className="btn btn-primary btn-sm" disabled={!dirty || busy} onClick={() => void save()}>{busy ? 'Working…' : 'Save all changes'}</button>}
+      {!changelogReadOnly && <button className="btn btn-primary btn-sm" disabled={!saveableDirty || busy} onClick={() => void save()}>{busy ? 'Working…' : 'Save all changes'}</button>}
       {dirty && <span className="text-xs text-dim header-dirty-state">Unsaved changes</span>}
     </>,
     more: <MoreMenu label="More settings actions" triggerLabel="More">
@@ -613,14 +716,16 @@ export function GlobalSettings({ onDirtyChange, onSaved }: { onDirtyChange: (dir
       <div className="settings-fallback-controls">
         {sectionNavigation}
         {dirty && <span className="text-xs text-dim">Unsaved changes</span>}
-        {!changelogReadOnly && <button className="btn btn-primary btn-sm" disabled={!dirty || busy} onClick={() => void save()}>{busy ? 'Working…' : 'Save all changes'}</button>}
+        {!changelogReadOnly && <button className="btn btn-primary btn-sm" disabled={!saveableDirty || busy} onClick={() => void save()}>{busy ? 'Working…' : 'Save all changes'}</button>}
       </div>
     </>}
     {error && <p className="error-message" role="alert">{error}</p>}
     {notice && <p className="success-message" role="status">{notice}</p>}
     {projectionError && <div className="error-message" role="alert">The guided settings view is unavailable: {projectionError} <button className="btn btn-secondary btn-sm" onClick={() => void retryProjection()} disabled={busy || !snapshot}>Retry</button> The saved documents stay editable under Advanced TOML.</div>}
+    {draftPreviewState.pending && <p className="notice" role="status">Refreshing effective team and workflow projections…</p>}
+    {draftPreviewState.error && <p className="error-message" role="alert">The current settings preview is unavailable: {draftPreviewState.error.message} Your edits remain in the draft; edit again or save to retry.</p>}
     <fieldset disabled={busy} className="settings-body" id="settings-domain-panel" role={advanced ? 'region' : 'tabpanel'} aria-label={advanced ? 'Advanced TOML editor' : undefined} aria-labelledby={advanced ? undefined : `settings-tab-${tabs.indexOf(tab)}`}>
-    {advanced ? <div className="settings-fields">{texts.map((text, index) => <div className="text-editor-field" key={index}><span className="text-editor-label">{index ? 'workflows.toml' : 'aflow.toml'}</span><TextEditor className="mono config-textarea" aria-label={index ? 'workflows.toml contents' : 'aflow.toml contents'} value={text} onChange={e => { const next: [string, string] = [...texts]; next[index] = e.target.value; setTexts(next); if (!rawEdited) { const form = candidate().form; setBaseline(form); setDraft(form); setPendingNames({}); setNewProfile({ harness: '', profile: '', model: '', effort: '' }); setNewProfileError(null); setNewRole({ role: '', selector: '' }); setNewRoleError(null); setNewTeamName(''); setNewTeamError(null); setPendingFocusTeam(null) } setRawEdited(true) }} /></div>)}</div> : <><div className="settings-retained-skills" hidden={tab !== 'Skills'} aria-hidden={tab !== 'Skills' || undefined}><SkillsSettings
+    {advanced ? <div className="settings-fields">{texts.map((text, index) => <div className="text-editor-field" key={index}><span className="text-editor-label">{index ? 'workflows.toml' : 'aflow.toml'}</span><TextEditor className="mono config-textarea" aria-label={index ? 'workflows.toml contents' : 'aflow.toml contents'} value={text} onChange={e => { draftPreviewCoordinator.invalidate(); setDraftPreviewState(draftPreviewCoordinator.state()); const next: [string, string] = [...texts]; next[index] = e.target.value; setTexts(next); if (!rawEdited) { const form = candidate().form; setBaseline(form); setDraft(form); if (form) draftPreviewCoordinator.updateDraft(form); setPendingNames({}); setNewProfile({ harness: '', profile: '', model: '', effort: '' }); setNewProfileError(null); setNewRole({ role: '', selector: '' }); setNewRoleError(null); setNewTeamName(''); setNewTeamError(null); setPendingFocusTeam(null) } setRawEdited(true) }} /></div>)}</div> : <><div className="settings-retained-skills" hidden={tab !== 'Skills'} aria-hidden={tab !== 'Skills' || undefined}><SkillsSettings
       skills={skills}
       loadError={skillsError}
       selected={effectiveSkill}
@@ -685,31 +790,30 @@ export function GlobalSettings({ onDirtyChange, onSaved }: { onDirtyChange: (dir
           <span className="inline-action"><button type="button" className="btn btn-secondary" onClick={addRole}>Add role</button>{newRoleError && <span role="alert" className="text-sm add-team-error">{newRoleError}</span>}</span>
         </div>
       </>}
-      {tab === 'Teams' && <SidebarEditorLayout selection={selectedTeam || teamNames[0] || null} navigationVersion={navigationVersion} listLabel="Teams" navigation={<div>
-        <div className="add-team-form">
-          <label>Add team<input className="input" aria-label="New team name" placeholder="team-name" value={newTeamName} onChange={e => { setNewTeamName(e.target.value); setNewTeamError(null) }} onKeyDown={e => { if (e.key === 'Enter') { e.preventDefault(); addTeam() } }} /></label>
-          <span className="inline-action"><button type="button" className="btn btn-secondary" onClick={addTeam}>Add team</button>{newTeamError && <span role="alert" className="text-sm add-team-error">{newTeamError}</span>}</span>
-        </div>
-        {teamNames.map(team => <button data-sidebar-editor-item={team} className={`btn sidebar-entry ${(selectedTeam || teamNames[0]) === team ? 'btn-primary' : 'btn-secondary'}`} aria-pressed={(selectedTeam || teamNames[0]) === team} key={team} onClick={() => { setSelectedTeam(team); setNavigationVersion(value => value + 1) }}>{formatMachineChoice(team, teamNames)}</button>)}
-        </div>}>
-        {Object.entries(draft.teams).filter(([team]) => team === (selectedTeam in draft.teams ? selectedTeam : teamNames[0])).map(([team, value]) => {
-          const chainInfo = draftUpgradeChain(team)
-          const isNew = !baseline?.teams?.[team]
-          return <fieldset className="card settings-fields team-editor" key={team} id={`team-editor-${team}`} tabIndex={-1}>
-            <legend><span className="mono">{formatMachineChoice(team, teamNames)}</span>{isNew && <span className="status-pill status-awaiting">new — saved with Save all</span>}</legend>
-            <label>Upgrade to<select className="input" aria-label={`Upgrade to for team ${formatMachineChoice(team, teamNames)}`} value={value.upgrade_to ?? ''} onChange={e => change(next => { const edited = next.teams[team]; if (e.target.value) edited.upgrade_to = e.target.value; else delete edited.upgrade_to })}>
-              <option value="">None — no further upgrade</option>
-              {teamNames.filter(other => other !== team).map(other => <option key={other} value={other}>{formatMachineChoice(other, teamNames)}</option>)}
-            </select></label>
-            {chainInfo.error && <span role="alert" className="text-sm add-team-error">{chainInfo.error}</span>}
-            <p className="text-xs text-dim">Worker chain: {chainInfo.chain.map((stage, index) => <span key={stage}>{index > 0 && ' → '}<span className="mono">{formatMachineLabel(stage)}</span>{workerText(stage) ? <> ({workerText(stage)})</> : null}</span>)}{chainInfo.chain.length === 1 && !chainInfo.error ? ' — no further upgrade configured' : ''}</p>
-            {(() => {
-              const roleNames = [...new Set([...Object.keys(draft.roles), ...Object.keys(value.roles)])].sort()
-              return roleNames.map(role => <Combobox key={role} label={formatMachineChoice(role, roleNames)} value={value.roles[role] ?? ''} placeholder={`Inherited: ${formatMachineLabel(draft.roles[role] ?? '')}`} options={selectors} onChange={selector => change(next => { next.teams[team].roles[role] = selector })} />)
-            })()}
-          </fieldset>
-        })}
-      </SidebarEditorLayout>}
+      <div className="settings-retained-team-families" hidden={tab !== 'Teams'} aria-hidden={tab !== 'Teams' || undefined}>
+        <TeamFamiliesSettings
+          draft={draft}
+          baseline={baseline}
+          selectedTeam={selectedTeam || teamNames[0] || ''}
+          navigationVersion={navigationVersion}
+          active={tab === 'Teams'}
+          wizardResetVersion={teamWizardResetVersion}
+          onSelectTeam={setSelectedTeam}
+          onNavigate={() => setNavigationVersion(value => value + 1)}
+          onChange={changeDraft}
+          previewPending={draftPreviewState.pending}
+          previewError={draftPreviewState.error?.message ?? null}
+          previewReady={draftPreviewState.current}
+          newTeamName={newTeamName}
+          newTeamError={newTeamError}
+          onNewTeamNameChange={value => { setNewTeamName(value); setNewTeamError(null) }}
+          onAddTeam={addTeam}
+          onOpenPrompt={(team, role) => { setSelectedPrompt(JSON.stringify(['role', team, role])); setTab('Prompts') }}
+          onPreviewConversion={previewFamilyConversion}
+          onAddFamily={addFamilyToDraft}
+          onWizardDirtyChange={setTeamWizardDirty}
+        />
+      </div>
       {tab === 'Workflows' && <SidebarEditorLayout selection={selectedWorkflow} navigationVersion={navigationVersion} listLabel="Workflows" navigation={<div>{['Defaults', ...workflowNames].map(name => <button data-sidebar-editor-item={name} className={`btn sidebar-entry ${selectedWorkflow === name ? 'btn-primary' : 'btn-secondary'}`} aria-pressed={selectedWorkflow === name} key={name} onClick={() => { setSelectedWorkflow(name); setNavigationVersion(value => value + 1) }}>{name === 'Defaults' ? name : formatMachineChoice(name, workflowNames)}</button>)}</div>}><div className="settings-fields">{selectedWorkflow === 'Defaults' && <><h3>Defaults</h3><Combobox label="Default workflow" value={draft.default_workflow ?? ''} options={workflowNames} optionLabel={value => formatMachineChoice(value, workflowNames)} onChange={value => change(next => { next.default_workflow = value })} /><label>Max turns<input className="input" type="number" min="1" value={draft.max_turns ?? ''} onChange={e => change(next => { next.max_turns = e.target.value === '' ? null : Number(e.target.value) })} /></label><label>Manager supervision<select className="input" aria-label="Default manager supervision" value={draft.default_manager_enabled == null ? 'unset' : draft.default_manager_enabled ? 'enabled' : 'disabled'} onChange={e => change(next => { const raw = e.target.value; next.default_manager_enabled = raw === 'unset' ? null : raw === 'enabled' })}><option value="enabled">Enabled</option><option value="disabled">Disabled</option><option value="unset">Disabled (default)</option></select></label><p className="text-xs text-dim">Applies to new runs in every workflow without its own override. Omitted means disabled.</p></>}{Object.entries(draft.workflows).filter(([name]) => name === selectedWorkflow).map(([workflow, value]) => <div className="card" key={workflow}><h3>{formatMachineChoice(workflow, workflowNames)}</h3><p>{(value.executable_steps ?? value.declared_steps).map(formatMachineLabel).join(' → ')}</p><label>Default team<select className="input" value={draft.workflow_default_teams[workflow] ?? ''} onChange={e => change(next => { next.workflow_default_teams[workflow] = e.target.value || null })}><option value="">Unset</option>{teamNames.map(team => <option key={team} value={team}>{formatMachineChoice(team, teamNames)}</option>)}</select></label><label>Manager supervision<select className="input" aria-label={`Manager supervision for workflow ${formatMachineChoice(workflow, workflowNames)}`} value={value.manager_enabled == null ? 'inherit' : value.manager_enabled ? 'enabled' : 'disabled'} onChange={e => change(next => { const raw = e.target.value; next.workflows[workflow].manager_enabled = raw === 'inherit' ? null : raw === 'enabled' })}><option value="inherit">Inherit</option><option value="enabled">Enabled</option><option value="disabled">Disabled</option></select></label><p className="text-xs text-dim">Effective supervision: {(value.effective_manager_enabled ?? false) ? 'Enabled' : 'Disabled'} ({managerSourceLabel(value.manager_enabled_source)}). Applies to new runs; the launch-default workflow does not affect inheritance.</p></div>)}</div></SidebarEditorLayout>}
       {tab === 'Prompts' && <PromptsSettings selected={selectedPrompt} onSelect={setSelectedPrompt} draft={draft} change={change} names={pendingNames} rename={(name, target) => setPendingNames({ ...pendingNames, [name]: target })}
         deleted={deletedPrompts}
@@ -736,7 +840,9 @@ export function GlobalSettings({ onDirtyChange, onSaved }: { onDirtyChange: (dir
       </fieldset>
     </div> : <p>Loading configuration, or the saved documents contain invalid TOML or mistyped values. Use Advanced TOML to inspect and repair them.</p>}</>}
     {!advanced && tab !== 'Changelog' && snapshot?.aflow_toml === '' && snapshot.workflows_toml === '' && <div className="card settings-fields"><h3>Starter setup</h3>{(['workflow', 'main_branch'] as const).map(key => <label key={key}>{formatMachineLabel(key)}<input className="input" value={starter[key]} onChange={e => setStarter({ ...starter, [key]: e.target.value })} /></label>)}<button className="btn btn-secondary" onClick={async () => {
-      try { const form = await api.postGlobalConfigForm({ aflow_toml: '', workflows_toml: '', action: { type: 'build_starter', ...starter } }); setTexts([form.aflow_toml, form.workflows_toml]); setDraft(form.form); setProjection(form); setRawEdited(true); setAdvanced(true) } catch (reason) { setError(reason instanceof Error ? reason.message : 'Starter setup failed') }
+      draftPreviewCoordinator.invalidate()
+      setDraftPreviewState(draftPreviewCoordinator.state())
+      try { const form = await api.postGlobalConfigForm({ aflow_toml: '', workflows_toml: '', action: { type: 'build_starter', ...starter } }); setTexts([form.aflow_toml, form.workflows_toml]); setDraft(form.form); setProjection(form); if (form.form) draftPreviewCoordinator.updateDraft(form.form); setDraftPreviewState(draftPreviewCoordinator.state()); setRawEdited(true); setAdvanced(true) } catch (reason) { setError(reason instanceof Error ? reason.message : 'Starter setup failed') }
     }}>Build starter draft</button></div>}
     </fieldset>
   </div>

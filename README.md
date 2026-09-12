@@ -100,6 +100,14 @@ Configuration is split across two TOML files: `aflow.toml` contains harness
 profiles, roles, teams, prompts, and controller settings. `workflows.toml`
 contains workflow graphs and lifecycle defaults.
 
+Teams Settings groups a Base and its direct inheritance stages as one family.
+Display names are readable labels; stable team IDs remain the values used by
+workflow defaults and launches. The shared draft is persisted only by Save all
+changes, and a blank launch family or stage follows the saved workflow default;
+an explicit stage submits its exact team ID. See the
+[team-family configuration notes](docs/configuration.md#roles-teams-and-harness-profiles)
+for one-level inheritance, conversion limits, and reference-safe deletion.
+
 ## Read-only guard reports
 
 The bundled `aflow-guard-development-run` skill treats an explicit `:vr`

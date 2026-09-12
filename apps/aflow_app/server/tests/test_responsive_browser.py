@@ -85,6 +85,152 @@ def _seed_responsive_fixture(root: Path) -> None:
     workflows_path.write_text(workflows_path.read_text() + f"\n{workflows}\n")
 
 
+def _seed_team_family_fixture(root: Path) -> None:
+    """Replace the disposable global pair with a family/conversion fixture."""
+    _seed_responsive_fixture(root)
+    config_dir = root.parent / "global"
+    (config_dir / "aflow.toml").write_text(
+        """
+[aflow]
+default_workflow = "managed"
+max_turns = 5
+
+[harness.codex.profiles.global_worker]
+model = "global-worker"
+
+[harness.codex.profiles.global_reviewer]
+model = "global-reviewer"
+
+[harness.codex.profiles.review_base]
+model = "review-base"
+
+[harness.codex.profiles.review_alt]
+model = "review-alt"
+
+[harness.codex.profiles.review_child]
+model = "review-child"
+
+[harness.codex.profiles.review_final]
+model = "review-final"
+
+[harness.codex.profiles.standard]
+model = "standard-worker"
+
+[harness.codex.profiles.strong]
+model = "strong-worker"
+
+[harness.codex.profiles.strongest]
+model = "strongest-worker"
+
+[harness.codex.profiles.legacy_base]
+model = "legacy-base-worker"
+
+[harness.codex.profiles.legacy_mid]
+model = "legacy-mid-worker"
+
+[harness.codex.profiles.legacy_end]
+model = "legacy-end-worker"
+
+[harness.codex.profiles.manager_lite]
+model = "manager-lite"
+
+[harness.codex.profiles.manager_full]
+model = "manager-full"
+
+[roles]
+worker = "codex.global_worker"
+reviewer = "codex.global_reviewer"
+manager_lite = "codex.manager_lite"
+manager_full = "codex.manager_full"
+
+[roles.prompts]
+worker = "Global worker guidance."
+reviewer = "Global reviewer guidance."
+
+[prompts]
+implement = "Work from {ACTIVE_PLAN_PATH}."
+review = "Review the current plan."
+
+[teams.product]
+display_name = "Product development"
+upgrade_to = "product_stronger"
+
+[teams.product.roles]
+worker = "codex.standard"
+reviewer = "codex.review_base"
+
+[teams.product.prompts]
+worker = "Product base worker guidance."
+reviewer = "Product base reviewer guidance."
+
+[teams.product_stronger]
+display_name = "Stronger worker"
+extends = "product"
+upgrade_to = "product_strongest"
+
+[teams.product_stronger.roles]
+worker = "codex.strong"
+
+[teams.product_strongest]
+display_name = "Strongest worker"
+extends = "product"
+
+[teams.product_strongest.roles]
+worker = "codex.strongest"
+
+[teams.legacy_base]
+display_name = "Legacy base"
+upgrade_to = "legacy_mid"
+
+[teams.legacy_base.roles]
+worker = "codex.legacy_base"
+reviewer = "codex.review_base"
+
+[teams.legacy_base.prompts]
+worker = "Legacy base worker guidance."
+
+[teams.legacy_mid]
+display_name = "Legacy middle"
+upgrade_to = "legacy_end"
+
+[teams.legacy_mid.roles]
+worker = "codex.legacy_mid"
+
+[teams.legacy_mid.prompts]
+worker = "Legacy middle worker guidance."
+
+[teams.legacy_end]
+display_name = "Legacy end"
+
+[teams.legacy_end.roles]
+reviewer = "codex.review_final"
+
+[teams.legacy_end.prompts]
+reviewer = "Legacy end reviewer guidance."
+""".strip()
+        + "\n",
+        encoding="utf-8",
+    )
+    (config_dir / "workflows.toml").write_text(
+        """
+[workflow.managed]
+team = "product_stronger"
+
+[workflow.managed.steps.implement]
+role = "worker"
+prompts = ["implement"]
+go = [{ to = "END", when = "DONE" }, { to = "review" }]
+
+[workflow.managed.steps.review]
+role = "reviewer"
+prompts = ["review"]
+go = [{ to = "END", when = "DONE" }, { to = "implement" }]
+""".strip()
+        + "\n",
+        encoding="utf-8",
+    )
+
+
 def _register_responsive_worktree(root: Path) -> str:
     """Create one registered linked checkout for the presentation journey."""
     from aflow_app_server import main
@@ -1003,6 +1149,390 @@ def test_responsive_focus_resize_and_screenshots(control_client, monkeypatch, tm
                 page.screenshot(path=str(image), full_page=True)
                 print("RESPONSIVE_SCREENSHOT", image)
                 page.set_viewport_size({"width": 390, "height": 844})
+        finally:
+            browser.close()
+
+
+@pytest.mark.parametrize(("width", "height"), VIEWPORTS)
+def test_responsive_team_family_journey(
+    control_client,
+    monkeypatch,
+    tmp_path,
+    width: int,
+    height: int,
+):
+    """Exercise family authoring, conversion, retention and exact-ID launch."""
+    _, root, units, _ = control_client
+    _seed_team_family_fixture(root)
+    family_label = "Browser family " + ("x" * 100)
+    strong_stage_id = "browser_family_stronger_worker"
+    dist = Path(__file__).resolve().parents[2] / "web" / "dist"
+    monkeypatch.setenv("AFLOW_APP_WEB_DIST", str(dist))
+
+    def open_family_list(page: Page) -> None:
+        if _compact(page):
+            back = page.get_by_role("button", name="← Back to Team families", exact=True)
+            if back.is_visible():
+                back.click()
+        page.get_by_role("navigation", name="Team families", exact=True).wait_for()
+
+    def select_family(page: Page, label: str) -> None:
+        open_family_list(page)
+        page.get_by_role("navigation", name="Team families", exact=True).get_by_role(
+            "button", name=label, exact=True
+        ).click()
+        page.locator(".team-family-detail").wait_for()
+
+    def choose_profile(page: Page, label: str, selector: str) -> None:
+        field = page.get_by_role("combobox", name=label, exact=True)
+        field.click()
+        field.fill(selector)
+        page.get_by_role("option").filter(has_text=selector).first.click()
+
+    def save_settings(page: Page) -> None:
+        save = page.get_by_role("button", name="Save all changes", exact=True)
+        expect(save).to_be_enabled()
+        save.click()
+        page.get_by_text(
+            "Workflow settings saved; new runs use the saved configuration",
+            exact=False,
+        ).wait_for()
+
+    def reload_team_settings(page: Page) -> None:
+        page.reload()
+        page.get_by_role("heading", name="Settings", exact=True).wait_for()
+        _select_settings_section(page, "Teams")
+        page.locator(".team-families-settings").wait_for()
+
+    with live_server() as url, sync_playwright() as playwright:
+        browser = _browser(playwright)
+        try:
+            page = browser.new_page(viewport={"width": width, "height": height})
+            _login(page, url)
+            _assert_menu_keyboard_contract(page)
+            _open_destination(page, "Settings")
+            page.get_by_role("heading", name="Settings", exact=True).wait_for()
+            _select_settings_section(page, "Teams")
+            page.locator(".team-families-settings").wait_for()
+            _assert_header_and_flow(page)
+
+            # Base propagation and child override restoration retain raw IDs.
+            select_family(page, "Product development")
+            detail = page.locator(".team-family-detail")
+            detail.get_by_role("button", name="Base product", exact=True).click()
+            choose_profile(page, "Reviewer", "codex.review_alt")
+            detail.get_by_role("button", name="Stronger worker", exact=True).click()
+            inherited_roles = detail.locator("details").filter(has_text=re.compile(r"Inherited roles")).first
+            if inherited_roles.get_attribute("open") is None:
+                inherited_roles.locator("summary").click()
+            reviewer_row = detail.locator(".team-family-role-row").filter(has_text="Reviewer").first
+            expect(reviewer_row).to_contain_text("codex.review_alt")
+            detail.get_by_role("button", name="Base product", exact=True).click()
+            save_settings(page)
+            reload_team_settings(page)
+            select_family(page, "Product development")
+            detail = page.locator(".team-family-detail")
+            detail.get_by_role("button", name="Stronger worker", exact=True).click()
+            detail.locator("summary", has_text=re.compile(r"Inherited roles")).click()
+            reviewer_row = detail.locator(".team-family-role-row").filter(has_text="Reviewer").first
+            expect(reviewer_row).to_contain_text("codex.review_alt")
+            reviewer_row.get_by_role("button", name="Override role", exact=True).click()
+            choose_profile(page, "Reviewer", "codex.review_child")
+            detail.get_by_role("button", name="Base product", exact=True).click()
+            choose_profile(page, "Reviewer", "codex.review_final")
+            detail.get_by_role("button", name="Stronger worker", exact=True).click()
+            reviewer_row = detail.locator(".team-family-role-row").filter(has_text="Reviewer").first
+            expect(reviewer_row).to_contain_text("codex.review_child")
+            detail.get_by_role("button", name="Base product", exact=True).click()
+            save_settings(page)
+            reload_team_settings(page)
+            select_family(page, "Product development")
+            detail = page.locator(".team-family-detail")
+            detail.get_by_role("button", name="Stronger worker", exact=True).click()
+            reviewer_row = detail.locator(".team-family-role-row").filter(has_text="Reviewer").first
+            expect(reviewer_row).to_contain_text("codex.review_child")
+            reviewer_row.get_by_role("button", name="Restore inheritance", exact=True).click()
+            inherited_roles = detail.locator("details").filter(has_text=re.compile(r"Inherited roles")).first
+            if inherited_roles.get_attribute("open") is None:
+                inherited_roles.locator("summary").click()
+            reviewer_row = detail.locator(".team-family-role-row").filter(has_text="Reviewer").first
+            expect(reviewer_row).to_contain_text("codex.review_final")
+            save_settings(page)
+            reload_team_settings(page)
+            select_family(page, "Product development")
+            detail = page.locator(".team-family-detail")
+            detail.get_by_role("button", name="Stronger worker", exact=True).click()
+            detail.locator("summary", has_text=re.compile(r"Inherited roles")).click()
+            reviewer_row = detail.locator(".team-family-role-row").filter(has_text="Reviewer").first
+            expect(reviewer_row).to_contain_text("codex.review_final")
+
+            # Existing simple-family route controls reorder and remove safely.
+            detail.get_by_role("button", name="Strongest worker", exact=True).click()
+            detail.get_by_role("button", name="Move stage earlier", exact=True).click()
+            expect(page.locator(".team-family-summary-route")).to_contain_text(
+                "Base → Strongest worker → Stronger worker"
+            )
+            detail.get_by_role("button", name="Move stage later", exact=True).click()
+            detail.get_by_role("button", name="Remove stage…", exact=True).click()
+            confirmation = page.get_by_role(
+                "alertdialog", name="Confirm removal of Strongest worker", exact=True
+            )
+            confirmation.get_by_role("button", name="Confirm remove stage", exact=True).click()
+            expect(detail.get_by_role("button", name="Strongest worker", exact=True)).to_have_count(0)
+
+            # The wizard keeps the long display label separate from stable IDs.
+            open_family_list(page)
+            page.get_by_role("button", name="New family", exact=True).click()
+            wizard = page.locator(".team-family-wizard")
+            wizard.wait_for()
+            family_name = wizard.get_by_label("Family display name", exact=True)
+            family_name.fill("Browser family ")
+            family_name.type("x" * 100)
+            expect(family_name).to_have_value(family_label)
+            wizard.get_by_text("Technical details", exact=True).first.click()
+            wizard.get_by_label("Stable Base ID", exact=True).fill("browser_family")
+            wizard.get_by_label("Base assignment source", exact=True).select_option("product")
+            wizard.get_by_role("button", name="Next: stages", exact=True).click()
+            wizard.get_by_text("Stages", exact=True).wait_for()
+            wizard.get_by_role("button", name="Add upgrade stage", exact=True).click()
+            stages = wizard.locator("fieldset.team-family-wizard-stage")
+            expect(stages).to_have_count(1)
+            stage_one_id = stages.nth(0).get_by_label("Stable ID for stage 1", exact=True)
+            expect(stage_one_id).to_have_value(strong_stage_id)
+            stages.nth(0).get_by_text("Technical details", exact=True).click()
+            stage_one_id.fill("")
+            stage_one_id.type(strong_stage_id)
+            expect(stage_one_id).to_be_focused()
+            expect(stages.nth(0).locator("details")).to_have_attribute("open", "")
+            choose_profile(page, f"Worker for stage {strong_stage_id}", "codex.strong")
+            wizard.get_by_role("button", name="Add upgrade stage", exact=True).click()
+            stages = wizard.locator("fieldset.team-family-wizard-stage")
+            expect(stages).to_have_count(2)
+            second_stage_id = "browser_family_strongest_worker"
+            expect(stages.nth(1).get_by_label("Stable ID for stage 2", exact=True)).to_have_value(second_stage_id)
+            choose_profile(page, f"Worker for stage {second_stage_id}", "codex.strongest")
+            # Removing the first stage and adding again reproduces the generated
+            # ID collision. The invalid suggestion remains editable until it is
+            # corrected, without changing the surviving stage's ID.
+            stages.nth(0).get_by_role("button", name="Remove stage", exact=True).click()
+            wizard.get_by_role("alertdialog", name="Confirm removal of Stronger worker", exact=True).get_by_role(
+                "button", name="Confirm remove stage", exact=True
+            ).click()
+            expect(wizard.locator("fieldset.team-family-wizard-stage")).to_have_count(1)
+            wizard.get_by_role("button", name="Add upgrade stage", exact=True).click()
+            stages = wizard.locator("fieldset.team-family-wizard-stage")
+            expect(stages).to_have_count(2)
+            recovered = stages.nth(1)
+            expect(page.get_by_role("alert")).to_contain_text("already in use")
+            recovered.get_by_text("Technical details", exact=True).click()
+            recovered.get_by_label("Stable ID for stage 2", exact=True).fill("")
+            recovered.get_by_label("Stable ID for stage 2", exact=True).type(strong_stage_id)
+            recovered.get_by_label("Stage 2 display name", exact=True).fill("Stronger worker")
+            choose_profile(page, f"Worker for stage {strong_stage_id}", "codex.strong")
+            recovered.get_by_role("button", name="Move earlier", exact=True).click()
+            stages = wizard.locator("fieldset.team-family-wizard-stage")
+            expect(stages.nth(0).locator("legend")).to_contain_text("Stronger worker")
+            expect(stages.nth(0).get_by_label("Stable ID for stage 1", exact=True)).to_have_value(strong_stage_id)
+
+            # Keep the ordinary remove/re-add path covered as well.
+            stages.nth(1).get_by_role("button", name="Remove stage", exact=True).click()
+            wizard.get_by_role("alertdialog", name="Confirm removal of Strongest worker", exact=True).get_by_role(
+                "button", name="Confirm remove stage", exact=True
+            ).click()
+            expect(wizard.locator("fieldset.team-family-wizard-stage")).to_have_count(1)
+            wizard.get_by_role("button", name="Add upgrade stage", exact=True).click()
+            stages = wizard.locator("fieldset.team-family-wizard-stage")
+            expect(stages).to_have_count(2)
+            expect(stages.nth(1).get_by_label("Stable ID for stage 2", exact=True)).to_have_value(second_stage_id)
+            choose_profile(page, f"Worker for stage {second_stage_id}", "codex.strongest")
+            wizard.get_by_role("button", name="Next: review", exact=True).click()
+            wizard.get_by_text("Review family", exact=True).wait_for()
+            expect(wizard).to_contain_text("browser_family")
+            wizard.get_by_text("Proposed TOML (read-only)", exact=True).click()
+            expect(wizard.locator("pre")).to_contain_text('extends = "browser_family"')
+            wizard.get_by_role("button", name="Add family to draft", exact=True).click()
+            wizard.wait_for(state="hidden")
+            open_family_list(page)
+            page.get_by_role("button", name=family_label, exact=True).wait_for()
+            expect(page.get_by_role("button", name="Save all changes", exact=True)).to_be_enabled()
+            save_settings(page)
+
+            reload_team_settings(page)
+            select_family(page, family_label)
+            detail = page.locator(".team-family-detail")
+            expect(detail.get_by_role("button", name="Base browser_family", exact=True)).to_be_visible()
+            expect(detail.get_by_role("button", name="Stronger worker", exact=True)).to_be_visible()
+            expect(detail.get_by_role("button", name="Strongest worker", exact=True)).to_be_visible()
+            detail.get_by_role("button", name="Strongest worker", exact=True).click()
+            expect(detail).to_contain_text("browser_family_strongest_worker")
+
+            # A failed CAS write must keep the edited draft in the browser.
+            display_input = detail.locator("input").first
+            conflict_value = "Conflict retained family"
+            display_input.fill(conflict_value)
+            display_input.press("Tab")
+
+            def reject_config_patch(route) -> None:
+                if route.request.method == "PATCH" and urlsplit(route.request.url).path == "/api/config":
+                    route.fulfill(
+                        status=409,
+                        content_type="application/json",
+                        body=json.dumps({
+                            "detail": {
+                                "code": "revision_conflict",
+                                "message": "another operator changed the global configuration",
+                            }
+                        }),
+                    )
+                    return
+                route.continue_()
+
+            page.route("**/api/config", reject_config_patch)
+            page.get_by_role("button", name="Save all changes", exact=True).click()
+            page.get_by_role("alert").filter(has_text="Your remaining edits are retained").wait_for()
+            expect(display_input).to_have_value(conflict_value)
+            page.unroute("**/api/config", reject_config_patch)
+            display_input.fill(family_label)
+            display_input.press("Tab")
+            save_settings(page)
+
+            # Legacy conversion is preview-only until the explicit draft action.
+            select_family(page, "Legacy base")
+            detail = page.locator(".team-family-detail")
+            detail.get_by_role("button", name="Preview convert to family", exact=True).click()
+            conversion = page.get_by_role("region", name="Legacy conversion preview", exact=True)
+            conversion.wait_for()
+            expect(conversion).to_contain_text("Later edits to the family Base will propagate")
+            expect(conversion).to_contain_text("legacy_mid.roles")
+            conversion.get_by_role("button", name="Add conversion to draft", exact=True).click()
+            open_family_list(page)
+            legacy_entry = page.get_by_role("button", name="Legacy base", exact=True)
+            expect(legacy_entry.locator(".team-family-list-kind")).to_have_text("Family")
+            save_settings(page)
+            reload_team_settings(page)
+            select_family(page, "Legacy base")
+            detail = page.locator(".team-family-detail")
+            detail.get_by_role("button", name="Legacy middle", exact=True).click()
+            expect(detail).to_contain_text("Inherits declared roles and prompts")
+
+            # Family detail remains document-owned and usable across themes and zoom.
+            select_family(page, family_label)
+            _assert_document_moves(page)
+            focus_target = page.locator(".team-family-detail input").first
+            focus_target.focus()
+            focus_target.press("Tab")
+            assert page.evaluate("() => document.activeElement !== null")
+            _double_visible_text(page)
+            _assert_no_horizontal_overflow(page)
+            _clear_test_text_zoom(page)
+            _assert_header_and_flow(page)
+            browser_name = os.environ.get("AFLOW_TEST_BROWSER", "chromium").strip().lower()
+            for theme in ("light", "dark"):
+                _set_theme_preference(page, theme)
+                page.reload()
+                page.get_by_role("heading", name="Settings", exact=True).wait_for()
+                _select_settings_section(page, "Teams")
+                _assert_theme(page, theme)
+                select_family(page, family_label)
+                _assert_header_and_flow(page)
+                image = tmp_path / f"team-family-{browser_name}-{width}x{height}-{theme}.png"
+                page.screenshot(path=str(image), full_page=True)
+                print("TEAM_FAMILY_SCREENSHOT", image)
+
+                page.set_viewport_size({"width": 390, "height": 420})
+                if _compact(page):
+                    expect(page.locator(".team-families-settings .sidebar-editor-navigation")).to_be_hidden()
+                    expect(page.locator(".team-families-settings .sidebar-editor-detail")).not_to_be_hidden()
+                select_family(page, family_label)
+                _assert_header_and_flow(page)
+            short_input = page.locator(".team-family-detail input").first
+            short_input.focus()
+            assert short_input.evaluate("element => document.activeElement === element")
+            short_input.fill(f"{family_label} short")
+            short_input.press("Tab")
+            save = page.get_by_role("button", name="Save all changes", exact=True)
+            save.scroll_into_view_if_needed()
+            _assert_action_hit_test(page, save)
+            short_input.fill(family_label)
+            page.set_viewport_size({"width": width, "height": height})
+
+            # The server sees the exact child ID, while no disposable provider is called.
+            _set_theme_preference(page, "light")
+            page.goto(f"{url}/?project={PROJECT_ID}&view=new-run")
+            page.get_by_label("Run plan", exact=True).wait_for()
+            plan = page.get_by_label("Run plan", exact=True)
+            plan.click()
+            page.get_by_role("option", name=re.compile(r"ready-launch-plan\.md")).click()
+            expect(page.get_by_label("Run team", exact=True)).to_have_value("Product development")
+            expect(page.get_by_label("Run team stage", exact=True)).to_have_value("Stronger worker")
+            run_team = page.get_by_label("Run team", exact=True)
+
+            def select_launch_option(field, query: str, option_text: str) -> None:
+                field.click()
+                field.fill(query)
+                label = field.get_attribute("aria-label")
+                assert label
+                listbox = page.get_by_role("listbox", name=f"{label} suggestions", exact=True)
+                option = listbox.locator("li[role='option']:not(.combobox-default-option)").filter(
+                    has_text=option_text
+                ).first
+                option.wait_for()
+                option.click()
+
+            select_launch_option(run_team, "Browser family", family_label)
+            expect(run_team).to_have_value(family_label)
+            stage = page.get_by_label("Run team stage", exact=True)
+            select_launch_option(stage, "Stronger worker", "Stronger worker")
+            expect(stage).to_have_value("Stronger worker")
+            expect(page.locator(".run-preview-list")).to_contain_text(f"({strong_stage_id})")
+            preflight = page.locator('section[aria-label="Working tree preflight"]')
+            preflight.wait_for(state="visible")
+            clean_state = preflight.get_by_text("No uncommitted changes detected.", exact=True)
+            dirty_confirmation = preflight.get_by_role(
+                "checkbox", name="Continue despite uncommitted changes", exact=True
+            )
+            expect(clean_state.or_(dirty_confirmation)).to_be_visible()
+            if dirty_confirmation.is_visible():
+                dirty_confirmation.check()
+            expect(page.get_by_role("button", name="Start run", exact=True).last).to_be_enabled()
+
+            start_requests: list[dict[str, object]] = []
+            started = {"value": False}
+            launch_path = f"/api/control-plane/projects/{PROJECT_ID}/runs"
+
+            def intercept_launch(route) -> None:
+                request = route.request
+                path = urlsplit(request.url).path
+                if request.method == "POST" and path == launch_path:
+                    payload = request.post_data_json
+                    start_requests.append(payload)
+                    started["value"] = True
+                    route.fulfill(
+                        status=201,
+                        content_type="application/json",
+                        body=json.dumps({
+                            "result": {
+                                "run_id": "family-browser-run",
+                                "created": True,
+                                "status": "launch_requested",
+                                "schema_version": 1,
+                                "manifest_path": None,
+                                "reason": None,
+                            },
+                            "startup_question": None,
+                        }),
+                    )
+                    return
+                route.continue_()
+
+            page.route(f"**/api/control-plane/projects/{PROJECT_ID}/runs**", intercept_launch)
+            page.get_by_role("button", name="Start run", exact=True).last.click()
+            assert started["value"]
+            assert len(start_requests) == 1
+            assert start_requests[0]["team"] == strong_stage_id
+            assert "workflow_name" not in start_requests[0]
+            assert start_requests[0]["plan_path"] == "plans/in-progress/ready-launch-plan.md"
+            assert not units.start_calls
         finally:
             browser.close()
 

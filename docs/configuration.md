@@ -71,6 +71,7 @@ manager_lite = "codex.luna-max"
 manager_full = "codex.sol-high"
 
 [teams.standard]
+display_name = "Standard"
 backup_team = "fallback"
 upgrade_to = "high"
 
@@ -125,10 +126,94 @@ merge_prompt = ["simple_merge"]
 - A step `role` names a key from `[roles]`.
 - `harness.<name>.profiles.<profile>` tables set `model` and optional `effort`.
 - Global roles map to fully qualified `harness.profile` selectors.
-- Team tables override a subset of global roles. Missing roles fall back to `[roles]`.
+- Team tables override a subset of global roles. Missing roles fall back to
+  `[roles]`, or to the selected team's direct base declaration when one is
+  configured.
+- A team may declare `extends = "base_team_id"` and inherit only that base's
+  role and prompt declarations. The base must be a team without its own
+  `extends`; missing bases, self-references, cycles, and deeper inheritance
+  are rejected while loading. Role and prompt maps resolve independently:
+  child declaration, then base declaration, then global declaration.
+- `display_name` is an optional trimmed label of at most 128 characters. It is
+  never an identity or a reference; team IDs remain case-sensitive and stable.
+  When omitted, presentation uses the existing machine-name formatter.
+- In the guided family editor, labels preserve spaces while being typed and are
+  trimmed only when committed. Effective roles, prompts, and their sources are
+  refreshed from the server for unsaved edits; a failed refresh keeps the
+  declarations editable. Restoring a legacy inline role removes that actual
+  declaration, while other metadata and role entries remain intact.
 - Team tables can set `backup_team`, naming the next team to try when deterministic harness recovery switches away from the active team.
 - Team tables can also set `upgrade_to`, a separate quality/capability edge that the manager may select for exactly one next implementation attempt.
-- Backup and upgrade chains are each validated at config load: targets must exist, cannot point to themselves, and cannot form cycles.
+- `extends`, `backup_team`, and `upgrade_to` are independent links. Backup and
+  upgrade targets must exist, cannot point to themselves, and cannot form
+  cycles; neither route is inherited, and inheritance does not imply an
+  upgrade stage.
+
+For example, a child can override only the worker while reusing the base's
+reviewer and prompts:
+
+```toml
+[teams.product]
+display_name = "Product development"
+upgrade_to = "product_stronger"
+
+[teams.product.roles]
+worker = "codex.standard"
+reviewer = "codex.review"
+
+[teams.product_stronger]
+display_name = "Stronger worker"
+extends = "product"
+
+[teams.product_stronger.roles]
+worker = "codex.strong"
+```
+
+The current flat form remains valid; the family form is an explicit, opt-in
+storage change. For example, a before/after migration can keep the same IDs
+while making the shared reviewer declaration visible:
+
+```toml
+# Current flat teams: every stage is standalone.
+[teams.product]
+upgrade_to = "product_stronger"
+[teams.product.roles]
+worker = "codex.standard"
+reviewer = "codex.review"
+
+[teams.product_stronger]
+[teams.product_stronger.roles]
+worker = "codex.strong"
+reviewer = "codex.review"
+```
+
+```toml
+# Proposed family: the child stores only its worker difference.
+[teams.product]
+display_name = "Product development"
+upgrade_to = "product_stronger"
+[teams.product.roles]
+worker = "codex.standard"
+reviewer = "codex.review"
+
+[teams.product_stronger]
+display_name = "Stronger worker"
+extends = "product"
+[teams.product_stronger.roles]
+worker = "codex.strong"
+```
+
+This conversion is never inferred from names or similar values. Inheritance is
+one direct level only: a child may extend a root Base, but a child cannot extend
+another child or form a cycle. `display_name` is presentation text, not an ID;
+references, workflow defaults, backup links and `upgrade_to` continue to use the
+case-sensitive stable IDs. The family editor refuses to delete a stage while a
+workflow/default, inheritance, upgrade or backup reference still names it, and
+rewires only the reviewed predecessor edge after confirmation. `extends` shares
+role/prompt declarations; it does not inherit backup or upgrade routes. A
+selected family/stage in the UI is still submitted as the exact selected team
+ID, while an omitted launch value continues to follow the saved workflow
+default.
 
 Role prompts add static system guidance without changing the existing role
 selector interface:
@@ -142,12 +227,13 @@ reviewer = "Replacement reviewer guidance for the standard team."
 ```
 
 For an ordinary workflow step, the active team's prompt for the step role
-replaces the global role prompt; a missing team prompt falls back to
-`[roles.prompts]`, then to an empty system prompt. Team switches, upgrades, and
-overrides therefore select both the role's model mapping and prompt on the next
-workflow invocation. Inconsistent-checkpoint retries retain the prompt for the
-applicable role and team. Manager, merge, initialization, recovery, and other
-lifecycle calls do not inherit role prompts.
+replaces the global role prompt; a missing prompt falls back to the direct
+base's prompt and then `[roles.prompts]`, finally to an empty system prompt.
+Team switches, upgrades, and overrides therefore select both the role's model
+mapping and prompt on the next workflow invocation. Inconsistent-checkpoint
+retries retain the prompt for the applicable role and team. Manager, merge,
+initialization, recovery, and other lifecycle calls do not independently add
+role prompts.
 
 Prompt keys must name roles declared in `[roles]`, and values must be non-empty
 strings. Role prompts are static instructions: workflow placeholders and

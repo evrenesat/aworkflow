@@ -791,6 +791,23 @@ def test_mcp_global_config_uses_atomic_typed_patch_and_cross_transport_cas(
                         "role": "worker",
                         "selector": "codex.mcp-team",
                     },
+                    {"type": "add_team", "team": "mcp-stage"},
+                    {
+                        "type": "set_team_base",
+                        "team": "mcp-stage",
+                        "extends": "mcp-team",
+                    },
+                    {
+                        "type": "set_team_display_name",
+                        "team": "mcp-stage",
+                        "display_name": "MCP stage",
+                    },
+                    {
+                        "type": "set_team_role",
+                        "team": "mcp-stage",
+                        "role": "worker",
+                        "selector": None,
+                    },
                 ],
             }
         },
@@ -798,6 +815,8 @@ def test_mcp_global_config_uses_atomic_typed_patch_and_cross_transport_cas(
     assert typed["revision"] != before["revision"]
     assert 'model = "mcp-model"' in typed["aflow_toml"]
     assert "mcp-team" in typed["aflow_toml"]
+    assert 'extends = "mcp-team"' in typed["aflow_toml"]
+    assert 'display_name = "MCP stage"' in typed["aflow_toml"]
     assert client.get("/api/config", headers=headers).json() == typed
 
     audit_path = root.parent / "config_audit.jsonl"

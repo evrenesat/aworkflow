@@ -474,7 +474,30 @@ class SetTeamRoleAction(GuidedActionBase):
     type: Literal["set_team_role"]
     team: str = Field(min_length=1, max_length=64)
     role: str = Field(min_length=1, max_length=64)
-    selector: str = Field(min_length=1, max_length=192)
+    selector: str | None = Field(min_length=1, max_length=192)
+
+
+class SetTeamBaseAction(GuidedActionBase):
+    """Set or remove one team's direct inheritance base."""
+
+    type: Literal["set_team_base"]
+    team: str = Field(min_length=1, max_length=64)
+    extends: str | None = Field(min_length=1, max_length=64)
+
+
+class SetTeamDisplayNameAction(GuidedActionBase):
+    """Set or remove one team's optional presentation label."""
+
+    type: Literal["set_team_display_name"]
+    team: str = Field(min_length=1, max_length=64)
+    display_name: str | None = Field(max_length=128)
+
+
+class RemoveTeamAction(GuidedActionBase):
+    """Remove a team after all references have been cleared in the batch."""
+
+    type: Literal["remove_team"]
+    team: str = Field(min_length=1, max_length=64)
 
 
 class SetTeamUpgradeAction(GuidedActionBase):
@@ -550,6 +573,9 @@ GuidedConfigAction = Annotated[
     | SetGlobalRoleAction
     | AddTeamAction
     | SetTeamRoleAction
+    | SetTeamBaseAction
+    | SetTeamDisplayNameAction
+    | RemoveTeamAction
     | SetTeamUpgradeAction
     | SetWorkflowDefaultTeamAction
     | SetDefaultManagerEnabledAction
@@ -610,9 +636,18 @@ class GuidedWorkflowStepSummaries(CanonicalTransportModel):
 
 
 class GuidedTeamSummary(CanonicalTransportModel):
+    """Declared team overrides plus canonical effective assignments."""
+
     roles: Mapping[str, str]
     prompts: Mapping[str, str] = Field(default_factory=dict)
     upgrade_to: str | None = None
+    extends: str | None = None
+    display_name: str | None = None
+    backup_team: str | None = None
+    effective_roles: Mapping[str, str] = Field(default_factory=dict)
+    effective_prompts: Mapping[str, str] = Field(default_factory=dict)
+    role_sources: Mapping[str, str] = Field(default_factory=dict)
+    prompt_sources: Mapping[str, str] = Field(default_factory=dict)
 
 
 class GuidedTemplateVariable(CanonicalTransportModel):

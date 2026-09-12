@@ -13838,6 +13838,162 @@ class LifecycleBootstrapTests(unittest.TestCase):
             )
             assert second_result["action"] == "upgrade_next_implementation"
 
+    def test_inherited_upgrade_worker_is_one_attempt_then_baseline_returns(self) -> None:
+        """An inherited target changes only the selected implementation attempt."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repo_root = Path(tmpdir)
+            plan_path = repo_root / "plan.md"
+            original = (
+                "# Plan\n\n"
+                "### [ ] Checkpoint 1: First\n- [ ] step one\n\n"
+                "### [ ] Checkpoint 2: Second\n- [ ] step two\n"
+            )
+            _write_plan(plan_path, original)
+            workflow = WorkflowConfig(
+                manager_enabled=True,
+                steps={
+                    "implement": WorkflowStepConfig(
+                        role="worker",
+                        prompts=("p",),
+                        go=(
+                            GoTransition(to="END", when="DONE"),
+                            GoTransition(to="review"),
+                        ),
+                    ),
+                    "review": WorkflowStepConfig(
+                        role="reviewer",
+                        prompts=("p",),
+                        go=(
+                            GoTransition(to="END", when="DONE"),
+                            GoTransition(to="implement"),
+                        ),
+                    ),
+                },
+                first_step="implement",
+            )
+            workflow_config = WorkflowUserConfig(
+                roles={
+                    "worker": "codex.worker-default",
+                    "reviewer": "codex.reviewer-default",
+                    "manager_lite": "codex.manager-lite",
+                    "manager_full": "codex.manager-full",
+                },
+                harnesses={"codex": WorkflowHarnessConfig(profiles={
+                    "worker-default": HarnessProfileConfig(model="worker-default"),
+                    "worker-high": HarnessProfileConfig(model="worker-high"),
+                    "reviewer-default": HarnessProfileConfig(model="reviewer-default"),
+                    "manager-lite": HarnessProfileConfig(model="manager-lite"),
+                    "manager-full": HarnessProfileConfig(model="manager-full"),
+                })},
+                teams={
+                    "default": TeamConfig(
+                        roles={
+                            "worker": "codex.worker-default",
+                            "reviewer": "codex.reviewer-default",
+                            "manager_lite": "codex.manager-lite",
+                            "manager_full": "codex.manager-full",
+                        },
+                        upgrade_to="high",
+                    ),
+                    "high": TeamConfig(
+                        roles={"worker": "codex.worker-high"},
+                        extends="default",
+                    ),
+                },
+                workflows={"managed": workflow},
+                prompts={"p": "Work from {ACTIVE_PLAN_PATH}."},
+                manager=ManagerConfig(
+                    lite_role="manager_lite",
+                    full_role="manager_full",
+                    full_after_stalled_turns=99,
+                ),
+            )
+            workflow_models: list[str] = []
+            manager_models: list[str] = []
+            manager_contexts: list[dict[str, object]] = []
+            manager_calls = 0
+
+            def runner(argv, **kwargs):
+                nonlocal manager_calls
+                model = argv[argv.index("--model") + 1]
+                if model.startswith("manager-"):
+                    manager_calls += 1
+                    manager_models.append(model)
+                    context = json.loads(
+                        _runner_prompt(argv, kwargs).split("MANAGER_CONTEXT_JSON:\n", 1)[1]
+                    )
+                    manager_contexts.append(context)
+                    action = "upgrade_next_implementation" if manager_calls == 2 else "continue"
+                    return subprocess.CompletedProcess(argv, 0, json.dumps({
+                        "schema_version": 1,
+                        "action": action,
+                        "reason": "Synthetic inherited-family routing decision.",
+                        "next_step_notes": [],
+                        "stop_report": None,
+                    }), "")
+
+                workflow_models.append(model)
+                if model == "worker-high":
+                    _write_plan(
+                        plan_path,
+                        "# Plan\n\n"
+                        "### [x] Checkpoint 1: First\n- [x] step one\n\n"
+                        "### [ ] Checkpoint 2: Second\n- [ ] step two\n",
+                    )
+                elif model == "worker-default" and workflow_models.count(model) == 2:
+                    _write_plan(
+                        plan_path,
+                        "# Plan\n\n"
+                        "### [x] Checkpoint 1: First\n- [x] step one\n\n"
+                        "### [x] Checkpoint 2: Second\n- [x] step two\n",
+                    )
+                return subprocess.CompletedProcess(argv, 0, "synthetic workflow result", "")
+
+            result = run_workflow(
+                ControllerConfig(
+                    repo_root=repo_root,
+                    plan_path=plan_path,
+                    max_turns=7,
+                    team="default",
+                ),
+                workflow_config,
+                "managed",
+                config_dir=repo_root,
+                snapshot_config=False,
+                adapter=CodexAdapter(),
+                runner=runner,
+            )
+
+            assert result.final_snapshot.is_complete
+            assert workflow_models == [
+                "worker-default",
+                "reviewer-default",
+                "worker-high",
+                "reviewer-default",
+                "worker-default",
+            ]
+            assert workflow_models.count("worker-high") == 1
+            assert manager_models and all(model == "manager-lite" for model in manager_models)
+            assert manager_contexts
+            assert all(
+                context["controller_state"]["baseline_team"] == "default"
+                for context in manager_contexts
+            )
+            upgrade_contexts = [
+                context for context in manager_contexts
+                if context["controller_state"]["eligible_upgrade"]["available"]
+            ]
+            assert len(upgrade_contexts) == 1
+            assert upgrade_contexts[0]["controller_state"]["eligible_upgrade"] == {
+                "available": True,
+                "source_team": "default",
+                "target_team": "high",
+                "role": "worker",
+                "source_selector": "codex.worker-default",
+                "target_selector": "codex.worker-high",
+                "reason": None,
+            }
+
     def test_manager_chains_worker_upgrades_within_one_review_scope(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             repo_root = Path(tmpdir)

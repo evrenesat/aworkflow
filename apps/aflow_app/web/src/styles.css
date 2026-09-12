@@ -2057,6 +2057,134 @@ input::placeholder, textarea::placeholder {
 .team-editor legend { font-weight: 600; display: flex; align-items: center; gap: var(--spacing-xs); padding: 0 var(--spacing-xs); }
 .team-editor:focus-visible { outline: 2px solid var(--color-primary); }
 
+/* Family editor: ordinary content stays in document flow; only the shared
+   SidebarEditorLayout owns list/detail presentation at compact widths. */
+.team-families-settings { min-width: 0; }
+.team-family-navigation { display: flex; flex-direction: column; gap: var(--spacing-sm); min-width: 0; }
+.team-family-navigation h3 { margin: 0; }
+.team-family-list-entry { display: flex; flex-direction: column; align-items: flex-start; gap: 2px; padding: var(--spacing-sm); white-space: normal; }
+.team-family-list-title { font-weight: 600; overflow-wrap: anywhere; }
+.team-family-list-kind,
+.team-family-list-meta { font-size: 0.75rem; color: var(--color-text-dim); overflow-wrap: anywhere; }
+.team-family-list-route { font-size: 0.8125rem; overflow-wrap: anywhere; }
+.team-family-detail { display: flex; flex-direction: column; gap: var(--spacing-md); min-width: 0; }
+.team-family-detail-heading-content { display: flex; align-items: flex-start; justify-content: space-between; gap: var(--spacing-md); min-width: 0; }
+.team-family-detail-heading-content h3 { margin: 0; overflow-wrap: anywhere; }
+.team-family-detail-heading-content p { margin-block: var(--spacing-xs) 0; overflow-wrap: anywhere; }
+.team-family-detail > legend { min-width: 0; max-width: 100%; overflow-wrap: anywhere; }
+.team-family-detail > legend > * { min-width: 0; overflow-wrap: anywhere; }
+.team-family-summary-route { color: var(--color-text-dim); font-size: 0.8125rem; text-align: right; overflow-wrap: anywhere; }
+.team-family-stage-selector { display: flex; flex-wrap: wrap; gap: var(--spacing-sm); min-width: 0; }
+.team-family-stage-selector .btn { display: flex; flex-direction: column; align-items: flex-start; gap: 2px; white-space: normal; text-align: left; overflow-wrap: anywhere; }
+.team-family-stage-selector .btn > * { min-width: 0; overflow-wrap: anywhere; }
+.team-family-stage-summary,
+.team-family-section,
+.team-family-fields { display: flex; flex-direction: column; gap: var(--spacing-sm); min-width: 0; }
+.team-family-stage-summary h4,
+.team-family-section h4,
+.team-family-section h5 { margin: 0; }
+.team-family-stage-summary p { margin: 0; overflow-wrap: anywhere; }
+.team-family-fields label { display: flex; flex-direction: column; gap: var(--spacing-xs); }
+.team-family-fields > p { margin: 0; overflow-wrap: anywhere; }
+.team-family-section-heading { display: flex; justify-content: space-between; gap: var(--spacing-sm); min-width: 0; }
+.team-family-section-heading h4,
+.team-family-section-heading p { margin-block: 0; overflow-wrap: anywhere; }
+.team-family-role-list,
+.team-family-prompt-list { display: flex; flex-direction: column; gap: var(--spacing-sm); min-width: 0; }
+.team-family-role-row { display: grid; grid-template-columns: minmax(10rem, 0.8fr) minmax(0, 1.2fr) minmax(0, 1fr); align-items: center; gap: var(--spacing-sm) var(--spacing-md); padding: var(--spacing-sm) var(--spacing-md); border: 1px solid var(--color-border); border-radius: var(--radius-md); min-width: 0; }
+.team-family-inherited-row { grid-template-columns: minmax(10rem, 0.8fr) minmax(0, 1.2fr) max-content; }
+.team-family-role-heading { display: flex; flex-direction: column; gap: 2px; min-width: 0; overflow-wrap: anywhere; }
+.team-family-role-actions { display: flex; align-items: center; justify-content: flex-start; flex-wrap: wrap; gap: var(--spacing-sm); min-width: 0; }
+.team-family-role-actions > * { min-width: 0; overflow-wrap: anywhere; }
+.team-family-role-actions .btn { white-space: normal; overflow-wrap: anywhere; text-align: left; }
+.team-family-effective-value { overflow-wrap: anywhere; }
+.team-family-disclosure { border-top: 1px solid var(--color-border); min-width: 0; }
+.team-family-disclosure > summary { display: flex; align-items: center; min-height: var(--tap-target); cursor: pointer; font-weight: 600; overflow-wrap: anywhere; }
+.team-family-prompt-row { display: grid; grid-template-columns: minmax(10rem, 0.65fr) minmax(0, 1.5fr) minmax(0, 1fr); align-items: start; gap: var(--spacing-sm) var(--spacing-md); padding: var(--spacing-sm) var(--spacing-md); border: 1px solid var(--color-border); border-radius: var(--radius-md); min-width: 0; }
+.team-family-prompt-row > div:first-child { display: flex; flex-direction: column; gap: 2px; min-width: 0; overflow-wrap: anywhere; }
+.team-family-prompt-preview { margin: 0; white-space: pre-wrap; overflow-wrap: anywhere; color: var(--color-text-dim); }
+.team-family-full-route { display: flex; flex-wrap: wrap; align-items: baseline; gap: var(--spacing-xs); margin: 0; min-width: 0; overflow-wrap: anywhere; }
+.team-family-full-route > span { display: inline-flex; align-items: baseline; gap: var(--spacing-xs); min-width: 0; }
+.team-family-route-arrow { color: var(--color-text-dim); }
+.team-family-action-row { display: flex; flex-wrap: wrap; align-items: center; gap: var(--spacing-sm); min-width: 0; }
+.team-family-conversion { display: flex; align-items: flex-start; justify-content: space-between; gap: var(--spacing-md); min-width: 0; }
+.team-family-conversion h4,
+.team-family-conversion p { margin-block: 0; overflow-wrap: anywhere; }
+.team-family-conversion-preview { display: flex; flex-direction: column; gap: var(--spacing-sm); min-width: 0; }
+.team-family-conversion-preview h4 { margin: 0; }
+.team-family-change-list { margin: 0; padding-left: var(--spacing-lg); display: flex; flex-direction: column; gap: var(--spacing-xs); overflow-wrap: anywhere; }
+.team-family-declared-toml { min-width: 0; border-top: 1px solid var(--color-border); }
+.team-family-declared-toml > summary { display: flex; align-items: center; min-height: var(--tap-target); cursor: pointer; font-weight: 600; overflow-wrap: anywhere; }
+.team-family-declared-toml p { margin-block: 0 var(--spacing-sm); overflow-wrap: anywhere; }
+.team-family-declared-toml pre { margin: 0; padding: var(--spacing-md); background: var(--color-surface); border: 1px solid var(--color-border); border-radius: var(--radius-md); white-space: pre-wrap; overflow-wrap: anywhere; overflow-x: auto; }
+
+@media (max-width: 640px) {
+  .team-family-detail-heading-content,
+  .team-family-conversion { flex-direction: column; }
+  .team-family-summary-route { text-align: left; }
+  .team-family-role-row,
+  .team-family-inherited-row,
+  .team-family-prompt-row { grid-template-columns: minmax(0, 1fr); }
+}
+
+/* Family creation stays in the same detail surface and document flow as the
+   editor. Its only bounded content is the explicitly expanded TOML preview. */
+.team-family-wizard-surface,
+.team-family-editor-surface { min-width: 0; }
+.team-family-wizard { display: flex; flex-direction: column; gap: var(--spacing-md); min-width: 0; }
+.team-family-wizard-intro h3,
+.team-family-wizard-section h4,
+.team-family-wizard-section h5 { margin: 0; }
+.team-family-wizard-intro p { margin-block: var(--spacing-xs) 0; max-width: 70ch; overflow-wrap: anywhere; }
+.team-family-wizard-steps { display: flex; flex-wrap: wrap; gap: var(--spacing-md); margin: 0; padding: 0; list-style: none; color: var(--color-text-dim); }
+.team-family-wizard-steps li { display: inline-flex; align-items: center; gap: var(--spacing-xs); min-height: var(--tap-target); }
+.team-family-wizard-steps li span { display: inline-flex; align-items: center; justify-content: center; width: 1.6rem; height: 1.6rem; border: 1px solid var(--color-border); border-radius: 50%; }
+.team-family-wizard-steps li.current { color: var(--color-text); font-weight: 600; }
+.team-family-wizard-steps li.current span,
+.team-family-wizard-steps li.complete span { color: var(--color-primary-contrast); background: var(--color-primary); border-color: var(--color-primary); }
+.team-family-wizard-section { display: flex; flex-direction: column; gap: var(--spacing-sm); min-width: 0; }
+.team-family-wizard-section > label,
+.team-family-wizard-stage-fields > label { display: flex; flex-direction: column; gap: var(--spacing-xs); min-width: 0; }
+.team-family-wizard-section > details,
+.team-family-wizard-stage-fields > details,
+.team-family-wizard-toml { min-width: 0; border-top: 1px solid var(--color-border); }
+.team-family-wizard-section > details > summary,
+.team-family-wizard-stage-fields > details > summary,
+.team-family-wizard-toml > summary { display: flex; align-items: center; min-height: var(--tap-target); cursor: pointer; font-weight: 600; overflow-wrap: anywhere; }
+.team-family-wizard-role-list,
+.team-family-wizard-prompt-list,
+.team-family-wizard-actions { display: flex; flex-wrap: wrap; gap: var(--spacing-sm); min-width: 0; }
+.team-family-wizard-role-list,
+.team-family-wizard-prompt-list { flex-direction: column; }
+.team-family-wizard-disclosure { border-top: 1px solid var(--color-border); }
+.team-family-wizard-disclosure > summary { display: flex; align-items: center; min-height: var(--tap-target); cursor: pointer; font-weight: 600; overflow-wrap: anywhere; }
+.team-family-wizard-role,
+.team-family-wizard-prompt,
+.team-family-wizard-base-summary,
+.team-family-wizard-review-stage { display: flex; flex-direction: column; gap: var(--spacing-sm); min-width: 0; }
+.team-family-wizard-role { display: grid; grid-template-columns: minmax(10rem, 0.8fr) minmax(0, 1.2fr) minmax(0, 1fr); align-items: center; gap: var(--spacing-sm) var(--spacing-md); padding: var(--spacing-sm) var(--spacing-md); border: 1px solid var(--color-border); border-radius: var(--radius-md); }
+.team-family-wizard-role-heading { display: flex; flex-direction: column; gap: 2px; min-width: 0; overflow-wrap: anywhere; }
+.team-family-wizard-role-actions { display: flex; flex-wrap: wrap; align-items: center; gap: var(--spacing-sm); min-width: 0; }
+.team-family-wizard-prompt { padding: var(--spacing-sm) var(--spacing-md); border: 1px solid var(--color-border); border-radius: var(--radius-md); }
+.team-family-wizard-prompt .text-editor { min-width: 0; }
+.team-family-wizard-stage { display: flex; flex-direction: column; gap: var(--spacing-md); min-width: 0; padding: var(--spacing-md); border: 1px solid var(--color-border); border-radius: var(--radius-md); }
+.team-family-wizard-stage legend { display: flex; flex-wrap: wrap; align-items: baseline; gap: var(--spacing-sm); padding: 0 var(--spacing-xs); font-weight: 600; overflow-wrap: anywhere; }
+.team-family-wizard-stage-fields { display: flex; flex-direction: column; gap: var(--spacing-sm); min-width: 0; }
+.team-family-wizard-stage-summary { display: flex; flex-direction: column; gap: var(--spacing-xs); min-width: 0; }
+.team-family-wizard-stage-summary > * { overflow-wrap: anywhere; }
+.team-family-wizard-stage-summary .notice { margin: 0; }
+.team-family-wizard-review { display: flex; flex-direction: column; gap: var(--spacing-md); min-width: 0; }
+.team-family-wizard-review h5,
+.team-family-wizard-review p { margin: 0; overflow-wrap: anywhere; }
+.team-family-wizard-route { margin: 0; overflow-wrap: anywhere; }
+.team-family-wizard-toml pre { margin: 0; padding: var(--spacing-md); background: var(--color-surface); border: 1px solid var(--color-border); border-radius: var(--radius-md); white-space: pre-wrap; overflow-wrap: anywhere; overflow-x: auto; }
+.team-family-wizard-footer { justify-content: space-between; border-top: 1px solid var(--color-border); padding-top: var(--spacing-md); }
+
+@media (max-width: 640px) {
+  .team-family-wizard-role { grid-template-columns: minmax(0, 1fr); }
+  .team-family-wizard-footer { flex-direction: column-reverse; align-items: stretch; }
+}
+
 /* Prompt cards: compact header, secondary actions in a More menu. */
 .prompt-card-header { display: flex; align-items: center; justify-content: space-between; gap: var(--spacing-sm); min-width: 0; }
 .more-menu { position: relative; display: inline-flex; }
