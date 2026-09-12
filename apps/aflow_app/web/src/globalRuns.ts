@@ -30,6 +30,16 @@ export function useRecentRunsLimit(): [number, (value: number) => void] {
 
 export interface GlobalRun { projectId: string; run: RunStatus }
 
+export type GlobalRunProgressState = 'loading' | 'complete' | 'failed'
+
+export interface GlobalRunProgressUpdate {
+  projectId: string
+  runs: RunStatus[]
+  state: GlobalRunProgressState
+}
+
+export type GlobalRunProgressCallback = (update: GlobalRunProgressUpdate) => void
+
 /** Match every loaded, presentation-relevant field without changing records. */
 export function matchesGlobalRun(row: GlobalRun, query: string, projectLabel = ''): boolean {
   const terms = query.trim().toLocaleLowerCase().split(/\s+/).filter(Boolean)
@@ -68,27 +78,38 @@ export function selectGlobalRuns(rows: GlobalRun[], limit: number, history: 'vis
     || a.projectId.localeCompare(b.projectId) || a.run.run_id.localeCompare(b.run.run_id))
   return { ongoing: unique.filter(row => isOngoing(row.run)), attention: unique.filter(row => !isOngoing(row.run) && statusLabel(row.run) === 'Needs attention'), recent: unique.filter(row => !isOngoing(row.run) && statusLabel(row.run) !== 'Needs attention').slice(0, limit) }
 }
-export async function fetchGlobalRuns(projectIds: string[], signal: AbortSignal, history: 'visible' | 'archived' | 'all' = 'visible') {
+export async function fetchGlobalRuns(
+  projectIds: string[],
+  signal: AbortSignal,
+  history: 'visible' | 'archived' | 'all' = 'visible',
+  onProgress?: GlobalRunProgressCallback,
+) {
   const byProject: Record<string, RunStatus[]> = {}
   const errors: string[] = []
   let next = 0
   await Promise.all(Array.from({ length: Math.min(4, projectIds.length) }, async () => {
     while (next < projectIds.length && !signal.aborted) {
       const id = projectIds[next++]
+      const runs: RunStatus[] = []
       try {
-        const runs: RunStatus[] = []
-        let cursor: string | undefined
+        let cursor: string | null = null
         const seen = new Set<string>()
         do {
-          const page = await api.listControlPlaneRuns(id, { limit: 100, history, ...(cursor ? { cursor } : {}) }, { signal })
+          const page = await api.listControlPlaneRuns(id, { limit: 100, history, ...(cursor !== null ? { cursor } : {}) }, { signal })
           if (signal.aborted) return
           runs.push(...page.runs)
-          cursor = page.next_cursor ?? undefined
-          if (cursor && seen.has(cursor)) throw new Error('Repeated cursor')
-          if (cursor) seen.add(cursor)
-        } while (cursor)
+          cursor = page.next_cursor
+          onProgress?.({ projectId: id, runs: [...runs], state: cursor === null ? 'complete' : 'loading' })
+          if (cursor !== null && seen.has(cursor)) throw new Error('Repeated cursor')
+          if (cursor !== null) seen.add(cursor)
+        } while (cursor !== null)
         byProject[id] = runs
-      } catch { if (!signal.aborted) errors.push(id) }
+      } catch {
+        if (!signal.aborted) {
+          onProgress?.({ projectId: id, runs: [...runs], state: 'failed' })
+          errors.push(id)
+        }
+      }
     }
   }))
   return { byProject, errors }

@@ -26,6 +26,8 @@ from aflow.control_plane import (
     RepositoryNotFoundError,
     InMemoryUnitManager,
     LaunchManifest,
+    RunStatus,
+    UnitState,
     append_run_event,
     create_launch_manifest,
     read_events,
@@ -193,6 +195,146 @@ def _prepared(request: StartupRequest) -> PreparedRun:
         extra_instructions=(),
         start_step="implement",
     )
+
+
+@pytest.mark.parametrize(
+    "case",
+    [
+        "owner_stopped",
+        "legacy",
+        "read_error",
+        "pending_startup",
+        "prepared_step",
+        "missing_unit",
+        "active_unit",
+    ],
+)
+def test_daemon_final_progress_all_status_branches(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    case: str,
+) -> None:
+    units = InMemoryUnitManager()
+    daemon, _request = _daemon(tmp_path, monkeypatch, units)
+    repository = daemon.application.repository
+    run_ids = {
+        "owner_stopped": "owner-stopped",
+        "legacy": "20260809T172123Z-abc12345",
+        "read_error": "read-error",
+        "pending_startup": "pending-startup",
+        "prepared_step": "prepared-step",
+        "missing_unit": "missing-unit",
+        "active_unit": "active-unit",
+    }
+    run_id = run_ids[case]
+    if case == "owner_stopped":
+        base = RunStatus(
+            run_id=run_id,
+            status="owner_stopped",
+            evidence={"recorded_status": "owner_stopped"},
+        )
+    elif case == "legacy":
+        base = RunStatus(
+            run_id=run_id,
+            status="completed",
+            ownership="legacy",
+            evidence={"recorded_status": "completed"},
+        )
+    elif case == "pending_startup":
+        base = RunStatus(
+            run_id=run_id,
+            status="needs_attention",
+            evidence={
+                "startup_state": "awaiting_startup_answer",
+                "startup_question_valid": True,
+            },
+        )
+    else:
+        base = RunStatus(
+            run_id=run_id,
+            status="running",
+            evidence={
+                "has_run_metadata": True,
+                "recorded_status": "running",
+            },
+        )
+        if case == "prepared_step":
+            base = replace(base, status="needs_attention")
+
+    reads: list[tuple[str, bool]] = []
+
+    def get_status(requested_run_id: str, *, include_progress: bool = True) -> RunStatus:
+        reads.append((requested_run_id, include_progress))
+        return base
+
+    projections: list[RunStatus] = []
+
+    def counted_projection(status, _run_dir, _metadata):
+        projections.append(status)
+        return status
+
+    monkeypatch.setattr(repository, "get_run_status", get_status)
+    monkeypatch.setattr(repository, "_with_progress", counted_projection)
+    monkeypatch.setattr(daemon.service, "_can_resume", lambda _status: False)
+
+    if case == "active_unit":
+        units.units[f"aflow-run-{run_id}.service"] = UnitState(
+            name=f"aflow-run-{run_id}.service",
+            active_state="active",
+            sub_state="running",
+        )
+    if case == "read_error":
+        monkeypatch.setattr(
+            daemon.service,
+            "_read_record",
+            lambda _run_id: (_ for _ in ()).throw(DaemonError("read failed")),
+        )
+    elif case == "pending_startup":
+        monkeypatch.setattr(
+            daemon.service,
+            "_read_record",
+            lambda _run_id: {
+                "state": "awaiting_startup_answer",
+                "question": {
+                    "kind": StartupQuestionKind.PICK_STEP.value,
+                    "message": "Choose a step",
+                    "choices": ["implement"],
+                },
+            },
+        )
+    elif case == "prepared_step":
+        monkeypatch.setattr(
+            daemon.service,
+            "_read_record",
+            lambda _run_id: {
+                "prepared": {
+                    "start_step": "review",
+                    "skipped_steps": ["implement"],
+                }
+            },
+        )
+
+    status = daemon.service.run_status(run_id)
+
+    assert reads == [(run_id, False)]
+    assert len(projections) == 1
+    projected = projections[0]
+    expected = {
+        "owner_stopped": ("owner_stopped", "unknown"),
+        "legacy": ("completed", "unknown"),
+        "read_error": ("needs_attention", "unknown"),
+        "pending_startup": ("awaiting_startup_answer", "unknown"),
+        "prepared_step": ("needs_attention", "unknown"),
+        "missing_unit": ("needs_attention", "unknown"),
+        "active_unit": ("running", "active"),
+    }[case]
+    assert (projected.status, projected.activity) == expected
+    assert status == projected
+    if case == "pending_startup":
+        assert projected.evidence["startup_question"]["run_id"] == run_id
+    if case == "prepared_step":
+        assert projected.selected_start_step == "review"
+        assert projected.skipped_steps == ("implement",)
 
 
 def _neutral_recovery_receipt(

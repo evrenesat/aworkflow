@@ -72,3 +72,8 @@
 
 - Refresh the full loaded history page range, not just its first page. Keep
   the next cursor from the refreshed range and discard superseded responses.
+- `fetchGlobalRuns` owns full per-project cursor traversal and emits copied
+  cumulative page updates; `GlobalRunOverview` owns request generations and
+  coverage presentation. Only a current generation may publish callbacks;
+  successful completion replaces that project, while pending or failed
+  coverage overlays usable prior rows and stays visibly incomplete.

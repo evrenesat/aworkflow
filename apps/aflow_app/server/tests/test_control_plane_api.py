@@ -995,6 +995,58 @@ def test_run_list_uses_summary_only_without_context_requests(control_client, mon
     assert detail_progress["total_checkpoints"] == progress["total_checkpoints"]
 
 
+def test_run_list_final_projection_once(control_client, monkeypatch) -> None:
+    from aflow_app_server import main
+
+    client, root, _, _ = control_client
+    legacy_id = "20260809T172123Z-abc12345"
+    legacy_dir = root / ".aflow" / "runs" / legacy_id
+    legacy_dir.mkdir(parents=True)
+    (legacy_dir / "run.json").write_text('{"status":"running"}\n')
+
+    owned_id = "owned-projection"
+    create_launch_manifest(
+        root,
+        LaunchManifest(
+            run_id=owned_id,
+            project_root=str(root.resolve()),
+            plan_path=str((root / "plans" / "todo" / "test-plan.md").resolve()),
+            workflow_name="managed",
+            max_turns=5,
+            idempotency_key="owned-projection-key",
+            caller_scope="bearer:test-project",
+        ),
+    )
+    owned_dir = root / ".aflow" / "runs" / owned_id
+    owned_dir.mkdir(parents=True)
+    (owned_dir / "run.json").write_text('{"status":"running"}\n')
+
+    service = main._control_plane_service
+    assert service is not None
+    repository = service._project(PROJECT_ID).daemon.application.repository
+    original_projection = repository._with_progress
+    projections: list[RunStatus] = []
+
+    def counted_projection(status, run_dir, metadata):
+        projections.append(status)
+        return original_projection(status, run_dir, metadata)
+
+    monkeypatch.setattr(repository, "_with_progress", counted_projection)
+
+    response = client.get(
+        f"/api/control-plane/projects/{PROJECT_ID}/runs?history=all"
+    )
+
+    assert response.status_code == 200, response.text
+    payload = response.json()
+    assert [item["run_id"] for item in payload["runs"]] == [legacy_id, owned_id]
+    assert payload["next_cursor"] is None
+    assert [item.run_id for item in projections] == [legacy_id, owned_id]
+    assert len(projections) == len(payload["runs"]) == 2
+    assert all(item["history_state"] == "visible" for item in payload["runs"])
+    assert all(item["history_revision"] == 0 for item in payload["runs"])
+
+
 def test_deprecated_execution_routes_are_not_registered() -> None:
     assert not any(
         getattr(route, "path", "").startswith("/api/executions") for route in app.routes

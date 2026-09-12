@@ -922,9 +922,14 @@ class DaemonService:
     def run_status(self, run_id: str) -> RunStatus:
         """Project a persisted startup question into canonical run status."""
         from .control_plane.run_activity import project_activity
-        status = self._application.repository.get_run_status(run_id)
+        repository = self._application.repository
+
+        def finalize(candidate: RunStatus) -> RunStatus:
+            return repository.with_progress(project_activity(candidate))
+
+        status = repository.get_run_status(run_id, include_progress=False)
         if status.status == "owner_stopped":
-            return project_activity(
+            return finalize(
                 replace(
                     status,
                     evidence={
@@ -934,7 +939,7 @@ class DaemonService:
                 )
             )
         if status.ownership != "control_plane":
-            return project_activity(status)
+            return finalize(status)
         status = replace(status, evidence={**status.evidence, "can_resume": self._can_resume(status)})
         try:
             observed = self._application.units.get(_unit_name(run_id))
@@ -947,11 +952,11 @@ class DaemonService:
         try:
             record = self._read_record(run_id)
         except DaemonError:
-            return project_activity(status)
+            return finalize(status)
         if record.get("state") == "awaiting_startup_answer" and status.evidence.get("startup_question_valid") and status.status not in {
             "running", "completed", "failed", "interrupted",
         }:
-            return project_activity(replace(
+            return finalize(replace(
                 status,
                 status="awaiting_startup_answer",
                 reason="startup answer required before workflow unit creation",
@@ -972,12 +977,12 @@ class DaemonService:
                 and isinstance(skipped, list)
                 and all(isinstance(item, str) for item in skipped)
             ):
-                return project_activity(replace(
+                return finalize(replace(
                     status,
                     selected_start_step=selected,
                     skipped_steps=tuple(skipped),
                 ))
-        return project_activity(status)
+        return finalize(status)
 
     def _can_resume(self, status: RunStatus) -> bool:
         """Read-only admission preview; resume rechecks before any reservation."""

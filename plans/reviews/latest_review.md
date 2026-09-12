@@ -1927,4 +1927,56 @@ unchanged base and clean tracked state. Coordinator/controller owns serialized
 integration, normal publication, exact-SHA CI and live activation; those gates
 are not claimed complete. Concurrent performance work remains untouched.
 
+---
+
+# Fast usable run loading — cumulative review approved (2026-09-12)
+
+Review base: `f193dddf32e87377e77f2920804f462780c0b0be` (unchanged Pre-Handoff Base HEAD).
+Reviewed HEAD: `e76b6197f29f2b799ff549d17030a01c4f5b88f4`.
+Coverage: 2 new / 2 total commits: `cp1 v01` (`459aa1509d0ab8ac84a2c861c47c88e3e1b2c628`)
+and `cp2 v01` (`e76b6197f29f2b799ff549d17030a01c4f5b88f4`).
+Original and active plan: `plans/in-progress/fast-usable-run-loading-20260912.md`.
+No previous findings or follow-up plans apply to this handoff.
+
+Reviewed the complete cumulative diff and current implementation: history
+identity filtering/cursors/revisions and absorbing deletion; compatible direct
+repository projections; unchanged daemon ownership, startup and resume
+reconciliation followed by final progress; server response preservation;
+four-worker serial cursor traversal; copied partial-page callbacks;
+per-generation acceptance; refresh overlay and per-project replacement;
+failed/stale retention; loaded-only group/search and empty-state claims.
+No material findings passed the material-code-review admission gate.
+
+Verification reuses retained successful evidence in the primary repository's
+`.aflow/runs/20260912t203748z-686af8b9/turns/turn-001/transport.stdout` and
+`turn-002/transport.stdout`; no unchanged tests or full local suites repeated:
+
+- Repository selection: 7 passed; daemon selection: 9 passed; API selection:
+  5 passed. These include all three plan-named regression tests, optional
+  malformed progress and read-only history coverage. Ruff passed.
+- Web fetcher/overview selection: 24 passed, including the four required
+  deferred scenarios, search beyond recent ten, exact project/run identities,
+  repeated cursors, aborts and genuine complete empty results.
+- Production `tsc && vite build` and targeted ESLint passed.
+- Isolated profiler at `/tmp/tmp.qRd0HdFHaN/control-plane-profile.json` uses
+  source `459aa1509d0ab8ac84a2c861c47c88e3e1b2c628`, unchanged backend blobs
+  at reviewed HEAD. Three successful serial samples per prescribed fixture;
+  100 final projections per 100-row list. Core list medians: 334.952,
+  335.441, 597.696 and 586.847 ms for small-short, small-long, large-short
+  and large-long histories. These are isolated core timings, not live
+  navigation timings. Summary/detail reduction and resume admission remain.
+- Coordinator-owned external verifier exists at the plan's exact path and
+  its server-environment `--help` passed. It is preserved without modification.
+- Independent cumulative `git diff --check f193dddf HEAD` passed.
+
+Approve local implementation and squash all handoff commits plus intentional
+tracked reviewer records into one unpublished commit after the unchanged base.
+Compact the two handoff DEVLOG entries; preserve implementation blobs and all
+prior review records. Record final SHA in the private original plan after the
+commit, leaving that plan in place for engine finalization. No fix plan needed.
+
+Publication, exact-source CI, activation, screenshot inspection and idle p100
+<=2s first-row / <=5s full-coverage acceptance remain coordinator-owned and
+pending. This review does not certify deployed usability or waive those targets.
+
 No material findings

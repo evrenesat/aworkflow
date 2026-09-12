@@ -14,6 +14,7 @@ from aflow.control_plane import (
     append_run_event,
     create_launch_manifest,
 )
+from aflow.control_plane.run_history import RunHistory
 
 
 def _manifest(run_id: str) -> LaunchManifest:
@@ -128,6 +129,88 @@ def test_progress_projection_failure_does_not_hide_base_status(
     assert status.run_id == "owned-run"
     assert status.status == "needs_attention"
     assert status.progress is None
+
+
+def test_repository_status_projection_can_be_disabled_without_changing_default(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _owned_run(tmp_path)
+    repository = RunRepository(tmp_path)
+    projections: list[str] = []
+
+    def counted_projection(status, _run_dir, _metadata):
+        projections.append(status.run_id)
+        return status
+
+    monkeypatch.setattr(repository, "_with_progress", counted_projection)
+
+    without_progress = repository.get_run_status("owned-run", include_progress=False)
+    with_progress = repository.get_run_status("owned-run")
+
+    assert without_progress.progress is None
+    assert projections == ["owned-run"]
+    assert with_progress.run_id == without_progress.run_id
+    assert with_progress.status == without_progress.status
+
+
+def test_history_identity_page_preserves_filters_and_cursor(tmp_path: Path) -> None:
+    legacy_id = "20260809T172123Z-abc12345"
+    for run_id in ("a", "b", legacy_id):
+        directory = tmp_path / ".aflow" / "runs" / run_id
+        directory.mkdir(parents=True)
+        (directory / "run.json").write_text('{"status":"running"}\n')
+
+    repository = RunRepository(tmp_path)
+    history = RunHistory(repository)
+    history.mutate("a", state="archived", expected_revision=0, idempotency_key="archive-a")
+    history.mutate("b", state="deleted", expected_revision=0, idempotency_key="delete-b")
+    history.mutate(
+        legacy_id,
+        state="archived",
+        expected_revision=0,
+        idempotency_key="archive-legacy",
+    )
+    before = {path: path.read_bytes() for path in tmp_path.rglob("*") if path.is_file()}
+
+    expected_archived = sorted((legacy_id, "a"))
+    archived_ids: list[str] = []
+    cursor = None
+    first_page = None
+    while True:
+        page = repository.list_history_page(
+            limit=1,
+            cursor=cursor,
+            history="archived",
+        )
+        if first_page is None:
+            first_page = page
+        archived_ids.extend(item.run_id for item in page.runs)
+        cursor = page.next_cursor
+        if cursor is None:
+            break
+
+    assert archived_ids == expected_archived
+    assert first_page is not None
+    assert first_page.runs[0].history_state == "archived"
+    assert first_page.runs[0].history_revision == 1
+    assert first_page.next_cursor == expected_archived[0]
+
+    all_page = repository.list_history_page(limit=10, history="all")
+    assert [item.run_id for item in all_page.runs] == sorted(("a", legacy_id))
+    assert [(item.run_id, item.history_state, item.history_revision) for item in all_page.runs] == [
+        (run_id, "archived", 1) for run_id in sorted(("a", legacy_id))
+    ]
+    visible_page = repository.list_history_page(limit=10, history="visible")
+    assert [item.run_id for item in visible_page.runs] == []
+
+    compatible = repository.list_history(limit=10, history="archived")
+    assert [(run.run_id, run.history_state, run.history_revision) for run in compatible.runs] == [
+        (run_id, "archived", 1) for run_id in expected_archived
+    ]
+
+    with pytest.raises(RunIdentityError):
+        repository.list_history_page(cursor="../escape")
+    assert before == {path: path.read_bytes() for path in tmp_path.rglob("*") if path.is_file()}
 
 
 def test_progress_cache_is_separated_by_project_and_refreshes_new_turn_evidence(

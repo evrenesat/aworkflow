@@ -238,9 +238,8 @@ class ControlPlaneService:
 
     @staticmethod
     def _status(item, run_id: str) -> RunStatus:
-        """Return daemon status with progress using the final activity read."""
-        status = item.daemon.service.run_status(run_id)
-        return item.daemon.application.repository.with_progress(status)
+        """Return the daemon's finalized status for one run."""
+        return item.daemon.service.run_status(run_id)
 
     def list_plans(
         self, project_id: str, *, limit: int, cursor: str | None
@@ -251,15 +250,19 @@ class ControlPlaneService:
 
     def list_runs(self, project_id: str, *, limit: int, cursor: str | None, history: str = "visible") -> RunPage:
         item = self._project(project_id)
-        page = item.daemon.application.repository.list_history(limit=limit, cursor=cursor, history=history)
+        page = item.daemon.application.repository.list_history_page(
+            limit=limit,
+            cursor=cursor,
+            history=history,
+        )
         return RunPage(
             runs=tuple(
                 replace(
-                    self._status(item, run.run_id),
-                    history_state=run.history_state,
-                    history_revision=run.history_revision,
+                    self._status(item, identity.run_id),
+                    history_state=identity.history_state,
+                    history_revision=identity.history_revision,
                 )
-                for run in page.runs
+                for identity in page.runs
             ),
             next_cursor=page.next_cursor,
         )

@@ -3,11 +3,11 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
-from dataclasses import replace
+from dataclasses import dataclass, replace
 import json
 from pathlib import Path
 import re
-from typing import Any, Mapping
+from typing import Any, Literal, Mapping
 
 from aflow.run_state import load_override_request
 from aflow.recovery_runtime import RECOVERY_OPERATION_STATES, RECOVERY_RUNTIME_FIELDS
@@ -35,6 +35,23 @@ _PLAN_DIRECTORIES = (
     ("done", "done"),
 )
 _RECOVERY_SESSION_STATUSES = frozenset({"active", "handed_over", "closed"})
+
+
+@dataclass(frozen=True)
+class RunHistoryIdentity:
+    """The history metadata needed before projecting a run's current status."""
+
+    run_id: str
+    history_state: Literal["visible", "archived", "deleted"]
+    history_revision: int
+
+
+@dataclass(frozen=True)
+class RunHistoryIdentityPage:
+    """A filtered history page that carries identities without status reads."""
+
+    runs: tuple[RunHistoryIdentity, ...]
+    next_cursor: str | None = None
 
 
 class RepositoryError(PersistenceError):
@@ -225,7 +242,9 @@ class RunRepository:
             return status
         return self._with_progress(status, run_dir, metadata)
 
-    def get_run_status(self, run_id: str) -> RunStatus:
+    def get_run_status(
+        self, run_id: str, *, include_progress: bool = True
+    ) -> RunStatus:
         valid, is_legacy_identity = self._readable_run_id(run_id)
         run_dir = (
             self._contained_path(".aflow", "runs", valid)
@@ -257,7 +276,7 @@ class RunRepository:
                 started_at=_optional_text(metadata.get("run_started_at")),
                 evidence={"recorded_status": metadata.get("status")},
             ))
-            return self._with_progress(result, run_dir, metadata)
+            return self._with_progress(result, run_dir, metadata) if include_progress else result
 
         phase_data = self._launch_state(valid)
         phase = _optional_text(phase_data.get("phase"))
@@ -348,7 +367,7 @@ class RunRepository:
             if Path(manifest.project_root).resolve() == self.repo_root
             else result
         )
-        return self._with_progress(projected, run_dir, metadata)
+        return self._with_progress(projected, run_dir, metadata) if include_progress else projected
 
     def _startup_record(self, run_id: str) -> Mapping[str, Any]:
         path = self._contained_path(".aflow", "start-requests", f"{run_id}.json")
@@ -376,8 +395,12 @@ class RunRepository:
         next_cursor = selected[-1] if len(run_ids) > len(selected) and selected else None
         return RunPage(runs=tuple(self.get_run_status(run_id) for run_id in selected), next_cursor=next_cursor)
 
-    def list_history(self, *, limit=100, cursor=None, history="visible") -> RunPage:
+    def list_history_page(
+        self, *, limit=100, cursor=None, history="visible"
+    ) -> RunHistoryIdentityPage:
+        """Filter all readable history identities before applying pagination."""
         from .run_history import RunHistory
+
         _bounded_limit(limit)
         if history not in {"visible", "archived", "all"}:
             raise RepositoryError("invalid history filter")
@@ -388,9 +411,31 @@ class RunRepository:
         snapshots = {run_id: records.read(run_id) for run_id in ids}
         ids = [run_id for run_id in ids if snapshots[run_id]["state"] in ({"visible", "archived"} if history == "all" else {history})]
         selected = ids[:limit]
-        return RunPage(
-            runs=tuple(replace(self.get_run_status(run_id), history_state=snapshots[run_id]["state"], history_revision=snapshots[run_id]["revision"]) for run_id in selected),
+        return RunHistoryIdentityPage(
+            runs=tuple(
+                RunHistoryIdentity(
+                    run_id=run_id,
+                    history_state=snapshots[run_id]["state"],
+                    history_revision=snapshots[run_id]["revision"],
+                )
+                for run_id in selected
+            ),
             next_cursor=selected[-1] if len(ids) > limit else None,
+        )
+
+    def list_history(self, *, limit=100, cursor=None, history="visible") -> RunPage:
+        """Return the compatible status-bearing form of a history page."""
+        page = self.list_history_page(limit=limit, cursor=cursor, history=history)
+        return RunPage(
+            runs=tuple(
+                replace(
+                    self.get_run_status(identity.run_id),
+                    history_state=identity.history_state,
+                    history_revision=identity.history_revision,
+                )
+                for identity in page.runs
+            ),
+            next_cursor=page.next_cursor,
         )
 
     def tail_events(

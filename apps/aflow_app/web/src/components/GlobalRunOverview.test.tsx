@@ -81,7 +81,7 @@ describe('GlobalRunOverview project context', () => {
     vi.mocked(api.listControlPlaneRuns).mockReturnValue(runs.promise)
     const view = render(<GlobalRunOverview projects={[]} registryLoading onOpen={vi.fn()} />)
 
-    expect(screen.getByRole('status').textContent).toBe('Loading runs…')
+    expect(screen.getByRole('status').textContent).toBe('Loading runs… Results are incomplete.')
     expect(view.container.querySelector('.global-run-results')?.getAttribute('aria-busy')).toBe('true')
     expect(view.container.querySelector('.global-run-loading-spinner')).toBeTruthy()
     expect(screen.queryByText(/No registered projects/)).toBeNull()
@@ -90,7 +90,7 @@ describe('GlobalRunOverview project context', () => {
 
     view.rerender(<GlobalRunOverview projects={[primary]} registryLoading={false} onOpen={vi.fn()} />)
     await waitFor(() => expect(api.listControlPlaneRuns).toHaveBeenCalledWith('primary', expect.anything(), expect.anything()))
-    expect(screen.getByRole('status').textContent).toBe('Loading runs…')
+    expect(screen.getByRole('status').textContent).toBe('Loading runs… Results are incomplete.')
     expect(screen.queryByText('No runs yet.')).toBeNull()
     expect(screen.queryByText('No ongoing runs.')).toBeNull()
 
@@ -156,7 +156,7 @@ describe('GlobalRunOverview project context', () => {
     expect(screen.queryByRole('button', { name: /visible-run/ })).toBeNull()
 
     fireEvent.click(screen.getByRole('button', { name: 'Refresh' }))
-    await waitFor(() => expect(screen.getByRole('status').textContent).toBe('Refreshing runs…'))
+    await waitFor(() => expect(screen.getByRole('status').textContent).toBe('Refreshing runs… Results are incomplete.'))
     // The refresh is for the selected history, so the usable archived row stays visible.
     expect(screen.getByRole('button', { name: /archived-run/ })).toBeTruthy()
     expect(view.container.querySelector('.global-run-results')?.getAttribute('aria-busy')).toBe('true')
@@ -224,6 +224,21 @@ describe('GlobalRunOverview project context', () => {
     await waitFor(() => expect(screen.getAllByRole('button', { name: /attention-/ })).toHaveLength(10))
   })
 
+  it('searches a loaded recent run outside the recent display limit', async () => {
+    const runs = Array.from({ length: 11 }, (_, index) => makeRun(`recent-${index + 1}`, {
+      ended_at: `2026-09-${String(20 - index).padStart(2, '0')}T00:00:00Z`,
+    }))
+    vi.mocked(api.listControlPlaneRuns).mockResolvedValue(page(runs))
+
+    render(<GlobalRunOverview projects={[primary]} onOpen={vi.fn()} />)
+    expect(await screen.findByRole('heading', { name: 'Recent (10)' })).toBeTruthy()
+    expect(screen.queryByRole('button', { name: /recent-11/ })).toBeNull()
+
+    fireEvent.change(screen.getByRole('searchbox', { name: 'Search loaded runs' }), { target: { value: 'recent-11' } })
+    expect(await screen.findByRole('button', { name: /recent-11/ })).toBeTruthy()
+    expect(screen.getByRole('heading', { name: 'Recent (1)' })).toBeTruthy()
+  })
+
   it('requests and displays the selected archived history without changing run identity', async () => {
     const visible = makeRun('visible-run', { plan_path: 'plans/visible.md' })
     const archived = makeRun('archived-run', { history_state: 'archived', plan_path: 'plans/archived.md' })
@@ -282,5 +297,112 @@ describe('GlobalRunOverview project context', () => {
     fireEvent.click(screen.getByRole('button', { name: /canonical-run/ }))
     expect(onOpen).toHaveBeenCalledWith('primary', 'canonical-run')
     expect(api.listControlPlaneRuns).toHaveBeenCalledTimes(1)
+  })
+
+  it('publishes the first page before slow projects and later pages finish', async () => {
+    const laterPrimary = deferred<ReturnType<typeof page>>()
+    const slowChild = deferred<ReturnType<typeof page>>()
+    let primaryCalls = 0
+    vi.mocked(api.listControlPlaneRuns).mockImplementation((projectId) => {
+      if (projectId === 'primary') {
+        primaryCalls += 1
+        return primaryCalls === 1
+          ? Promise.resolve({ runs: [makeRun('fast-first')], next_cursor: 'older', schema_version: 1 })
+          : laterPrimary.promise
+      }
+      return slowChild.promise
+    })
+
+    render(<GlobalRunOverview projects={[primary, child]} onOpen={vi.fn()} />)
+    expect(await screen.findByRole('button', { name: /fast-first/ })).toBeTruthy()
+    expect(screen.getByRole('status').textContent).toBe('Loading runs… Results are incomplete.')
+    expect(screen.getByRole('heading', { name: 'Loaded recent (1)' })).toBeTruthy()
+    expect(screen.queryByRole('button', { name: /slow-child/ })).toBeNull()
+
+    laterPrimary.resolve(page([makeRun('older-primary')]))
+    slowChild.resolve(page([makeRun('slow-child')]))
+    expect(await screen.findByRole('button', { name: /slow-child/ })).toBeTruthy()
+    await waitFor(() => expect(screen.queryByRole('status')).toBeNull())
+    expect(screen.getByRole('heading', { name: 'Recent (3)' })).toBeTruthy()
+  })
+
+  it('retains old ongoing and attention rows until refresh coverage completes', async () => {
+    const oldOngoing = makeRun('ongoing-old', { status: 'paused', activity: 'active' })
+    const oldAttention = makeRun('attention-old', { status: 'needs_attention', status_reason_code: 'worker_attention' })
+    const refreshFirst = deferred<ReturnType<typeof page>>()
+    const refreshLater = deferred<ReturnType<typeof page>>()
+    let calls = 0
+    vi.mocked(api.listControlPlaneRuns).mockImplementation(() => {
+      calls += 1
+      if (calls === 1) return Promise.resolve(page([oldOngoing, oldAttention]))
+      if (calls === 2) return refreshFirst.promise
+      return refreshLater.promise
+    })
+
+    render(<GlobalRunOverview projects={[primary]} onOpen={vi.fn()} />)
+    expect(await screen.findByRole('button', { name: /ongoing-old/ })).toBeTruthy()
+    expect(screen.getByRole('button', { name: /attention-old/ })).toBeTruthy()
+
+    fireEvent.click(screen.getByRole('button', { name: 'Refresh' }))
+    await waitFor(() => expect(screen.getByRole('status').textContent).toBe('Refreshing runs… Results are incomplete.'))
+    expect(screen.getByRole('button', { name: /ongoing-old/ })).toBeTruthy()
+    expect(screen.getByRole('button', { name: /attention-old/ })).toBeTruthy()
+
+    refreshFirst.resolve({ runs: [makeRun('ongoing-new', { status: 'running', activity: 'active' })], next_cursor: 'older', schema_version: 1 })
+    expect(await screen.findByRole('button', { name: /ongoing-new/ })).toBeTruthy()
+    expect(screen.getByRole('button', { name: /attention-old/ })).toBeTruthy()
+
+    refreshLater.resolve(page([makeRun('attention-new', { status: 'needs_attention', status_reason_code: 'worker_attention' })]))
+    expect(await screen.findByRole('button', { name: /attention-new/ })).toBeTruthy()
+    await waitFor(() => expect(screen.queryByRole('status')).toBeNull())
+    expect(screen.queryByRole('button', { name: /ongoing-old/ })).toBeNull()
+    expect(screen.queryByRole('button', { name: /attention-old/ })).toBeNull()
+  })
+
+  it('rejects stale pages after history and project changes', async () => {
+    const visiblePage = deferred<ReturnType<typeof page>>()
+    const archivedPage = deferred<ReturnType<typeof page>>()
+    const childPage = deferred<ReturnType<typeof page>>()
+    vi.mocked(api.listControlPlaneRuns).mockImplementation((projectId, options) => {
+      if (options?.history === 'visible') return visiblePage.promise
+      if (projectId === 'primary') return archivedPage.promise
+      return childPage.promise
+    })
+    const view = render(<GlobalRunOverview projects={[primary]} onOpen={vi.fn()} />)
+    await waitFor(() => expect(api.listControlPlaneRuns).toHaveBeenCalledWith('primary', expect.objectContaining({ history: 'visible' }), expect.anything()))
+
+    fireEvent.change(screen.getByLabelText('Run history'), { target: { value: 'archived' } })
+    await waitFor(() => expect(api.listControlPlaneRuns).toHaveBeenCalledWith('primary', expect.objectContaining({ history: 'archived' }), expect.anything()))
+
+    visiblePage.resolve(page([makeRun('stale-visible')]))
+    await Promise.resolve()
+    expect(screen.queryByRole('button', { name: /stale-visible/ })).toBeNull()
+
+    view.rerender(<GlobalRunOverview projects={[child]} onOpen={vi.fn()} />)
+    await waitFor(() => expect(api.listControlPlaneRuns).toHaveBeenCalledWith('child', expect.objectContaining({ history: 'archived' }), expect.anything()))
+    archivedPage.resolve(page([makeRun('stale-archived', { history_state: 'archived' })]))
+    await Promise.resolve()
+    expect(screen.queryByRole('button', { name: /stale-archived/ })).toBeNull()
+
+    childPage.resolve(page([makeRun('current-child', { history_state: 'archived' })]))
+    expect(await screen.findByRole('button', { name: /current-child/ })).toBeTruthy()
+    await waitFor(() => expect(screen.queryByRole('status')).toBeNull())
+  })
+
+  it('retains partial pages on failure without complete empty claims', async () => {
+    let calls = 0
+    vi.mocked(api.listControlPlaneRuns).mockImplementation(async () => {
+      calls += 1
+      if (calls === 1) return { runs: [makeRun('partial-ongoing', { status: 'paused', activity: 'active' })], next_cursor: 'later', schema_version: 1 }
+      throw new Error('later page unavailable')
+    })
+
+    render(<GlobalRunOverview projects={[primary]} onOpen={vi.fn()} />)
+    expect(await screen.findByRole('button', { name: /partial-ongoing/ })).toBeTruthy()
+    expect((await screen.findByRole('alert')).textContent).toMatch(/Partial or stale results/)
+    expect(screen.queryByRole('status')).toBeNull()
+    expect(screen.getByRole('heading', { name: 'Loaded ongoing (1)' })).toBeTruthy()
+    expect(screen.queryByText('No runs yet.')).toBeNull()
+    expect(screen.queryByText('No ongoing runs.')).toBeNull()
   })
 })

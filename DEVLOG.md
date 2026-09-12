@@ -1,5 +1,22 @@
 # DEVLOG
 
+## 2026-09-12 — Reduce run loading work and publish partial coverage
+
+- Run-list reads scan filtered history identities, then let the daemon
+  reconcile each selected run and attach progress once to its final status.
+  Direct repository callers retain progress-bearing defaults and history
+  semantics. Isolated profiling records 100 projections per 100-row page.
+
+- All runs now receives cumulative project pages as they arrive. Request
+  generations reject callbacks from superseded history, project, refresh and
+  unmount lifecycles; a completed project replaces its prior rows so vanished
+  runs are removed, while pending or failed coverage retains usable rows with
+  an explicit incomplete/stale state.
+- Focused deferred-page tests cover progressive visibility, full cursor
+  traversal, refresh retention/removal, failures, aborts, identity collisions,
+  loaded-only search and genuinely empty complete coverage. Live timing and
+  deployment acceptance remain coordinator-owned.
+
 ## 2026-09-12 — Keep delivery checks on accessible run identity
 
 - Approved compact presentation no longer exposes full run IDs as row prose;

@@ -30,6 +30,14 @@ history mutations require authentication, revision and idempotency checks;
 external deleted reads return 410. No history action signals a process or removes
 workflow artifacts.
 
+Status-bearing history pages use an internal identity-only page after the full
+history scan and before pagination. The daemon reads each selected status
+without the optional progress projection, reconciles unit/startup evidence, and
+attaches progress once to the finalized activity/status result. The server
+restores the identity page's history state and revision without issuing another
+projection. Direct repository status and history callers retain their existing
+progress-bearing defaults and public response shape.
+
 The web shell composes page-owned context, local navigation, primary actions and
 secondary actions through registered header slots. Wide pages use two compact
 rows; compact pages expose the same destinations through an in-flow hamburger
