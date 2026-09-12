@@ -2309,7 +2309,7 @@ describe('RunDashboard', () => {
     fireEvent.click(screen.getByRole('button', { name: 'Recover with selected worker' }))
 
     await screen.findByText('Recovery was rejected: Durable recovery requires confirmed inactive source ownership; source activity is unknown or active.')
-    expect(screen.getByTitle('Copy full run ID').textContent).toContain(source.run_id)
+    expect(screen.getByTitle('Copy full run ID').getAttribute('aria-label')).toBe(source.run_id)
     expect((screen.getByLabelText('Recovery worker') as HTMLInputElement).value).toBe('harness/impl-b')
     expect(screen.getByRole('button', { name: 'Recover with selected worker' })).toBeDefined()
     expect(api.resumeControlPlaneRun).toHaveBeenCalledTimes(1)
@@ -3284,7 +3284,7 @@ describe('RunDashboard', () => {
     openTechnicalDetails()
     fireEvent.click(screen.getByText('Raw details'))
     await waitFor(() => expect(screen.getByText(/run run-owned/)).toBeDefined())
-    fireEvent.click(screen.getByRole('button', { name: /other\.md/ }))
+    fireEvent.click(screen.getByRole('button', { name: /^run-other / }))
     await screen.findByText(/run run-other/)
     await screen.findByText('Checkpoint 5: Fresh (5 of 14)')
     expect(screen.queryByText('Checkpoint 4: Stale (4 of 14)')).toBeNull()

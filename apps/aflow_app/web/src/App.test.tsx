@@ -1085,7 +1085,7 @@ describe('App workspace shell', () => {
     render(<App />)
     await screen.findByRole('heading', { name: 'Runs' })
     // An explicit pick pushes; the passive newest selection never did.
-    fireEvent.click(screen.getByRole('button', { name: /other\.md/ }))
+    fireEvent.click(screen.getByRole('button', { name: /^run-other / }))
     await waitFor(() => expect(push).toHaveBeenCalledWith(null, '', '/?project=alpha&view=runs&run=run-other'))
 
     // Simulate browser back to the prior entry.

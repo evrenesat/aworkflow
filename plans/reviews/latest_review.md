@@ -1855,3 +1855,37 @@ BLOCKED. Coordinator owns dispatch, serialized integration/publication and
 exact-SHA CI/live activation; none is claimed completed by this review.
 
 No material findings
+## CI readable run identity gates — cumulative review approved, 2026-09-12
+
+Base: `fd99395b6c872e0149c51917c495adddd20fd009` (unchanged).
+Reviewed HEAD: `fb19510ed5917419f15f902bf951d31635e5188f`.
+Coverage: 1 new / 1 total commit, `cp1 v01`, all original checkpoint
+requirements and all four changed files. No previous findings or fix overlays
+apply to this handoff; historical findings below belong to other plans.
+
+No material findings under the admission gate, exclusions and proportionate-fix
+discipline. Exact run-ID row boundaries, exact recovery source aria-label,
+escaped terminal full-ID browser matching, uniqueness and visibility agree with
+the production accessibility contracts. URL/back, held stale response, rejected
+recovery draft/call count, authentication/cookie/reload/logout, two-project
+history and worker lifetime assertions are preserved. No product changes.
+
+Reused successful raw command receipts from the registered parent repository:
+`/root/code/agent_flow/.aflow/runs/20260912t203140z-12f9b8fc/turns/turn-001/transport.stdout`.
+The plan's exact focused Vitest command passed 3 tests (163 unselected), with
+React act warnings; module AST and embedded-driver compilation passed.
+The completed result.json confirms checkpoint completion. Reviewer independently
+checked the full diff and `git diff --check fd99395b6c872e0149c51917c495adddd20fd009 HEAD`.
+No full suites or installed-wheel browser journey were run locally; syntax
+validation does not establish browser acceptance.
+
+Approval includes this tracked record in one unpublished handoff commit after
+the unchanged base. Preserve all four reviewed blobs and the single DEVLOG
+entry. No fix plan is needed or created. Leave the ignored original plan for
+engine finalization, recording the final SHA there after commit creation.
+Verify one final commit and clean tracked state. Coordinator/controller owns
+normal publication, exact-SHA CI and live verification; these remain pending.
+
+No material findings
+
+---

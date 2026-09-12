@@ -1,5 +1,11 @@
 # DEVLOG
 
+## 2026-09-12 — Keep delivery checks on accessible run identity
+
+- Approved compact presentation no longer exposes full run IDs as row prose;
+  focused delivery tests now select and assert the preserved exact accessible
+  identity instead. Product presentation and behavior are unchanged.
+
 ## 2026-09-12 — Make run history readable without losing evidence
 
 - Compact run rows and terminal summaries show truthful checkpoint approval,

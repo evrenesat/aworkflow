@@ -1050,8 +1050,8 @@ def full_run_flow(
 
 
 PLAYWRIGHT_DRIVER = """
-import json, sys, time
-from playwright.sync_api import sync_playwright
+import json, re, sys, time
+from playwright.sync_api import expect, sync_playwright
 
 base_url, token = sys.argv[1], sys.argv[2]
 login_only = sys.argv[3] == "login-only"
@@ -1086,7 +1086,9 @@ with sync_playwright() as p:
         page.goto(base_url + "/?view=all-runs", wait_until="domcontentloaded")
         page.get_by_role("heading", name="All runs", exact=True).wait_for(timeout=20000)
         for run_id in run_ids:
-            page.get_by_text(f"Run: {run_id}", exact=False).first.wait_for(timeout=20000)
+            run_button = page.get_by_role("button", name=re.compile(r" · " + re.escape(run_id) + r"$"))
+            expect(run_button).to_have_count(1, timeout=20000)
+            run_button.wait_for(state="visible", timeout=20000)
         result["steps"].append("two-project-history")
         page.click("text=Logout")
         time.sleep(1)
