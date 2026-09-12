@@ -11,7 +11,7 @@ from threading import Event, Thread
 from urllib.parse import urlsplit
 
 import pytest
-from playwright.sync_api import Page, expect, sync_playwright
+from playwright.sync_api import Error as PlaywrightError, Page, expect, sync_playwright
 
 from aflow.control_plane.persistence import append_run_event
 from test_control_plane_api import PROJECT_ID, TOKEN, control_client, live_server  # noqa: F401
@@ -565,25 +565,165 @@ def _choose_combobox(dashboard, label: str, query: str, option_text: str) -> Non
     option.click()
 
 
-def _assert_action_hit_test(page: Page, action) -> None:
-    """Check the actionable target and its hit identity from one DOM snapshot."""
-    action.scroll_into_view_if_needed()
-    action.click(trial=True)
-    observation = action.evaluate("""element => {
+def _assert_action_hit_test(page: Page, action, *, after_trial=None) -> None:
+    """Check one actionable element's final on-screen hit identity."""
+    action.wait_for(state="visible")
+    target = action.element_handle()
+    assert target is not None, "action target was not attached"
+    target.scroll_into_view_if_needed()
+    target.click(trial=True)
+    if after_trial is not None:
+        after_trial(target)
+    observation = target.evaluate("""element => {
+        if (!element.isConnected) {
+            throw new Error("hit-test target detached before final snapshot")
+        }
+        element.scrollIntoView({
+            behavior: "instant",
+            block: "center",
+            inline: "nearest",
+        })
         const rect = element.getBoundingClientRect()
+        const viewport = {width: window.innerWidth, height: window.innerHeight}
         const x = rect.left + rect.width / 2
         const y = rect.top + rect.height / 2
         const hit = document.elementFromPoint(x, y)
         return {
             box: {x: rect.x, y: rect.y, width: rect.width, height: rect.height},
+            viewport,
             is_target: hit === element || Boolean(hit && element.contains(hit)),
         }
     }""")
     box = observation["box"]
+    viewport = observation["viewport"]
     assert box and box["width"] > 0 and box["height"] > 0, box
-    assert 0 <= box["y"] < page.viewport_size["height"], box
-    assert box["x"] >= 0 and box["x"] + box["width"] <= page.viewport_size["width"], box
+    assert 0 <= box["y"] < viewport["height"], box
+    assert box["x"] >= 0 and box["x"] + box["width"] <= viewport["width"], box
     assert observation["is_target"], box
+
+
+def test_responsive_action_hit_test_survives_late_context_growth(
+    control_client, monkeypatch
+):
+    """Keep the exact Diagnostics target valid while run context expands."""
+    _, root, _, _ = control_client
+    _seed_responsive_fixture(root)
+    dist = Path(__file__).resolve().parents[2] / "web" / "dist"
+    monkeypatch.setenv("AFLOW_APP_WEB_DIST", str(dist))
+    context_pattern = "**/runs/responsive-run-39/context*"
+    held_context = []
+
+    def hold_context(route):
+        held_context.append((route, route.fetch()))
+
+    def release_context_after_trial(target):
+        before = target.bounding_box()
+        assert before and before["y"] < 568, before
+        assert target.evaluate("""element => {
+            const rect = element.getBoundingClientRect()
+            const hit = document.elementFromPoint(
+                rect.left + rect.width / 2,
+                rect.top + rect.height / 2,
+            )
+            return hit === element || Boolean(hit && element.contains(hit))
+        }""")
+        assert held_context, "run context request was not held"
+
+        pending = held_context[:]
+        held_context.clear()
+        for route, response in pending:
+            route.fulfill(response=response)
+        page.unroute(context_pattern, hold_context)
+        page.wait_for_function(
+            "element => element.getBoundingClientRect().y > innerHeight",
+            arg=target,
+        )
+        after = target.bounding_box()
+        assert after and after["y"] > before["y"] and after["y"] >= 568, {
+            "before": before,
+            "after": after,
+        }
+        assert not target.evaluate("""element => {
+            const rect = element.getBoundingClientRect()
+            const hit = document.elementFromPoint(
+                rect.left + rect.width / 2,
+                rect.top + rect.height / 2,
+            )
+            return hit === element || Boolean(hit && element.contains(hit))
+        }""")
+
+    with live_server() as url, sync_playwright() as playwright:
+        browser = _browser(playwright)
+        page = browser.new_page(viewport={"width": 320, "height": 568})
+        try:
+            _login(page, url)
+            _ensure_project(page)
+            page.route(context_pattern, hold_context)
+            _open_destination(page, "Runs")
+            page.get_by_role("button", name="New run", exact=True).wait_for()
+            page.locator(".run-list-item").first.wait_for()
+            run_row = page.locator(
+                f".run-list-item[data-sidebar-editor-item='{RESPONSIVE_FIXTURE_RUN_ID}']"
+            )
+            run_row.click()
+            _assert_run_detail(page, RESPONSIVE_FIXTURE_TITLE, RESPONSIVE_FIXTURE_RUN_ID)
+            action = page.locator("button:visible").last
+            _assert_action_hit_test(page, action, after_trial=release_context_after_trial)
+        finally:
+            if held_context:
+                pending = held_context[:]
+                held_context.clear()
+                for route, response in pending:
+                    try:
+                        route.fulfill(response=response)
+                    except PlaywrightError:
+                        pass
+                page.unroute(context_pattern, hold_context)
+            browser.close()
+
+
+def test_responsive_action_hit_test_rejects_detached_and_covered_targets():
+    """Keep detached targets from retargeting and retain real cover rejection."""
+    with sync_playwright() as playwright:
+        browser = _browser(playwright)
+        page = browser.new_page(viewport={"width": 320, "height": 568})
+        try:
+            page.set_content('<button id="target">Original</button>')
+
+            def replace_target(target):
+                target.evaluate("""element => {
+                    const replacement = element.cloneNode(true)
+                    replacement.textContent = "Replacement"
+                    element.replaceWith(replacement)
+                }""")
+
+            with pytest.raises(PlaywrightError, match="detached"):
+                _assert_action_hit_test(
+                    page,
+                    page.locator("#target"),
+                    after_trial=replace_target,
+                )
+            expect(page.locator("#target")).to_have_text("Replacement")
+
+            page.set_content("""
+                <style>
+                    html, body { margin: 0; min-height: 1200px; }
+                    #target { margin-top: 700px; width: 160px; height: 48px; }
+                    #cover {
+                        position: fixed;
+                        inset: 0;
+                        z-index: 1;
+                        background: rgba(0, 0, 0, 0.1);
+                    }
+                </style>
+                <button id="target">Covered</button>
+                <div id="cover" aria-hidden="true"></div>
+            """)
+            with pytest.raises(PlaywrightError):
+                _assert_action_hit_test(page, page.locator("#target"))
+            expect(page.locator("#cover")).to_be_visible()
+        finally:
+            browser.close()
 
 
 @pytest.mark.parametrize(

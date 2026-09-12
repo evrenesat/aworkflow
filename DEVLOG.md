@@ -1,5 +1,24 @@
 # DEVLOG
 
+## 2026-09-12 — Make responsive hit snapshots atomic after context growth
+
+- The browser hit helper now resolves one exact visible `ElementHandle` before
+  scrolling and trial-clicking. Its final single evaluation rejects detached
+  targets, synchronously centers that same element with instant scrolling, and
+  captures its rect, viewport dimensions and center hit identity together.
+  Positive dimensions, viewport bounds and target-or-descendant hit checks, as
+  well as normal trial-click actionability, remain strict.
+- A real 320×568 fixture regression holds the run-context response until after
+  trial-click, then observes the same Diagnostics element move below the
+  viewport before the repaired helper recovers its center. The reversible
+  original-helper probe failed at `y=744.34375` against the 568px viewport;
+  exact CI scheduling remains inferred. Detached/replaced and covered real DOM
+  targets still fail.
+- Focused helper nodes passed in Chromium and WebKit (2 each), and the exact
+  `phone-portrait` route passed in both engines (1 each). The missing local web
+  assets required one prerequisite build; no product files changed. Full CI
+  matrix and coordinator deployment/live checks remain downstream gates.
+
 ## 2026-09-12 — Reject stale clean settings previews
 
 - A delayed zero-action preview reconciliation now checks the synchronous

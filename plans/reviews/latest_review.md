@@ -1350,3 +1350,52 @@ this local approval does not claim those gates or alter integrated dashboard
 ownership and worker cleanup repairs.
 
 No material findings
+
+
+---
+
+# Phone hit snapshot delivery — cumulative review v01: approved
+
+Unchanged Pre-Handoff Base HEAD: `da593a810143b34d04693a33b5e097c315ce7c50`.
+Reviewed implementation HEAD: `0f769342d5431aa0e67d4ec0316c98d542f55eaa`.
+Coverage: 1 new / 1 total commit, cp1 v01, entire original plan and full
+actual two-file implementation. Original and active plan are
+phone-hit-snapshot-delivery-20260912.md. No prior findings or fix overlays.
+
+Reviewed the complete diff, helper callers, fixture and real DOM regressions,
+server instructions and UI guidelines. The exact handle survives trial-click
+and the final connected check, instant scroll, rect/viewport measurement and
+center hit observation occur in one synchronous browser evaluation. Positive
+size, original viewport bounds and element-or-descendant identity remain strict.
+The held real context response moves the same target offscreen after trial;
+the repaired snapshot restores reachability. Replacement fails on the detached
+original and the covered control fails normal actionability. No product changes,
+geometry stubs, relaxed assertions, added timeouts or retries in the helper.
+No material finding meets the material-code-review admission gate.
+
+Reused completed worker result and raw command receipts from
+`/root/code/agent_flow/.aflow/runs/20260912t044056z-332941d5/turns/turn-001/`;
+the prompt's worktree-relative receipt is absent. Final post-probe commands ran
+from apps/aflow_app/server with fresh mktemp directories passed as --basetemp:
+
+- `AFLOW_TEST_BROWSER=chromium uv run pytest -q 'tests/test_responsive_browser.py::test_responsive_route_matrix[phone-portrait]' --basetemp="$test_tmp_dir" --tb=short`: 1 passed, 8.92s.
+- Same exact route with `AFLOW_TEST_BROWSER=webkit`: 1 passed, 10.27s.
+- `AFLOW_TEST_BROWSER=chromium uv run pytest -q tests/test_responsive_browser.py::test_responsive_action_hit_test_survives_late_context_growth tests/test_responsive_browser.py::test_responsive_action_hit_test_rejects_detached_and_covered_targets --basetemp="$test_tmp_dir" --tb=short`: 2 passed, 35.11s.
+- Same two helper nodes with `AFLOW_TEST_BROWSER=webkit`: 2 passed, 35.81s.
+
+The reversible original-helper probe failed at y=744.34375 against height 568;
+final implementation was restored before those successful runs. Earlier setup
+failures were addressed by the allowed missing-asset build and correcting held
+route fulfillment order. Exact historical CI scheduling remains inferred.
+Reviewer cumulative `git diff --check da593a810143b34d04693a33b5e097c315ce7c50 HEAD`
+passed. Valid retained evidence reused; no full matrix or redundant local runs.
+
+Approval includes this tracked reviewer record in one unpublished handoff commit
+above the unchanged base, preserving both reviewed implementation blobs. DEVLOG
+has one relevant entry; no compaction or fix plan is required. Keep the ignored
+original plan in place for engine finalization and record the final approved SHA
+there outside its own commit. Verify one final commit and clean tracked state.
+Coordinator owns publication, exact-SHA CI, deployment/live check and final stop
+report for the existing settings delivery. This review makes no live claims.
+
+No material findings
