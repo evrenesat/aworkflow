@@ -2156,3 +2156,44 @@ state. Publication, exact-SHA CI, normal activation and live timing remain
 coordinator-owned and pending; local approval does not certify deployed usability.
 
 No material findings
+
+
+---
+
+## Projects refresh readiness CI repair — cumulative review approved, 2026-09-12
+
+Review base: `e22b0916c870be27fc06c518f1f78d475f8953c5` (unchanged).
+Reviewed HEAD: `866675a527b3ebe6bdfcf6e7b36a7e8ecf5d3a33`.
+Coverage: 1 new / 1 total commit, `cp1 v01`, all three checkpoint steps,
+both changed files and the complete original plan. No previous findings or
+follow-up plans apply to this handoff; older records concern other handoffs.
+
+No material findings passed the admission gate. Both journeys query the exact
+current More project actions menu, await connected/enabled Refresh, re-query,
+and click once outside waitFor. Deferred second discovery establishes the
+connected disabled condition with one registry read before release; the single
+ready click produces registry count two and discovery count three. Navigation,
+blocked guidance and Settings-negative assertions remain. No production changes,
+timeout inflation, retries, weakened counts or private host paths in tests.
+Backend and early selected-detail behavior remain intact.
+
+Retained worker evidence inspected from
+`/root/code/agent_flow/.aflow/runs/20260912t230324z-f31c5c9c/turns/turn-001/transport.stdout`
+and completed result.json (zero unchecked checkpoints/steps):
+
+- Exact focused selection: 2 passed, 51 skipped, 1.78s total.
+- App and ProjectPicker suites: 56 passed, 4.16s total; React act warnings
+  arose in other existing journeys, without test failures.
+- Reviewer cumulative `git diff --check e22b0916 HEAD` passed.
+- Evidence applies to the reviewed test blobs; no repeat suites, build or
+  browser matrix required or run during this review.
+
+Approve local implementation and consolidate it with this tracked reviewer
+record into one unpublished handoff commit after the unchanged base. Preserve
+both reviewed blobs and the single DEVLOG entry. No fix plan needed or created.
+Leave the ignored original plan in place for engine finalization and record the
+approved SHA there after committing. Verify one final commit and clean tracked
+state. Exact-SHA CI, normal deployment and live performance verification remain
+coordinator-owned and pending; local approval does not certify those gates.
+
+No material findings

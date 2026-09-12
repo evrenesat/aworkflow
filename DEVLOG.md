@@ -2675,3 +2675,14 @@ HISTORY: Published clipboard history `c14f1f2`/`cd78d53` remains separate and mu
   accessibility controls and explicit event-disclosure interaction. Exact URLs,
   project/worktree context, status, recovery lineage and retry evidence remain
   asserted without restoring private paths or abbreviated identities to row text.
+
+## 2026-09-12 — Projects refresh readiness test repair
+
+- A controlled return from blocked Runs to Projects held the remounted project
+  discovery request and reproduced a connected, disabled Refresh action while
+  the registry remained at one read. The acceptance journey now scopes Refresh
+  to `More project actions`, waits for the current connected action to become
+  enabled, re-queries it, and clicks once.
+- Focused App and ProjectPicker verification confirms that the single ready
+  click performs exactly one additional registry read and the normal discovery
+  refresh, without changing production loading guards.

@@ -660,11 +660,56 @@ describe('App workspace shell', () => {
     fireEvent.click(screen.getByRole('button', { name: 'Projects' }))
 
     fireEvent.click(screen.getByRole('button', { name: 'More', exact: true }))
-    const refresh = await screen.findByRole('menuitem', { name: 'Refresh', exact: true })
+    await waitFor(() => {
+      const menu = screen.getByRole('menu', { name: 'More project actions', exact: true })
+      const refresh = within(menu).getByRole('menuitem', { name: 'Refresh', exact: true }) as HTMLButtonElement
+      expect(refresh.isConnected).toBe(true)
+      expect(refresh.disabled).toBe(false)
+    })
     expect(screen.getByRole('button', { name: 'Projects' }).getAttribute('aria-current')).toBe('page')
     expect(screen.queryByLabelText('aflow.toml contents')).toBeNull()
+    const menu = screen.getByRole('menu', { name: 'More project actions', exact: true })
+    const refresh = within(menu).getByRole('menuitem', { name: 'Refresh', exact: true })
     fireEvent.click(refresh)
     await waitFor(() => expect(api.listProjects).toHaveBeenCalledTimes(2))
+  })
+
+  it('waits for project discovery before one blocked-project refresh', async () => {
+    const returningDiscovery = deferred<Awaited<ReturnType<typeof api.getProjectDiscovery>>>()
+    vi.mocked(api.listProjects).mockResolvedValue([blockedProject])
+    vi.mocked(api.getProjectDiscovery)
+      .mockResolvedValueOnce(discoveryBase)
+      .mockImplementationOnce(() => returningDiscovery.promise)
+      .mockResolvedValue(discoveryBase)
+    render(<App />)
+    await screen.findByText('/srv/code')
+    await openAddedProject(/Gamma Project/)
+    expect(await screen.findByRole('heading', { name: 'Runs' })).toBeDefined()
+    expect(screen.getByText(/not currently a usable Git project root/)).toBeDefined()
+
+    fireEvent.click(screen.getByRole('button', { name: 'Projects' }))
+    await waitFor(() => expect(api.getProjectDiscovery).toHaveBeenCalledTimes(2))
+    fireEvent.click(screen.getByRole('button', { name: 'More', exact: true }))
+    const heldMenu = screen.getByRole('menu', { name: 'More project actions', exact: true })
+    const heldRefresh = within(heldMenu).getByRole('menuitem', { name: 'Refresh', exact: true }) as HTMLButtonElement
+    expect(heldRefresh.isConnected).toBe(true)
+    expect(heldRefresh.disabled).toBe(true)
+    expect(api.listProjects).toHaveBeenCalledTimes(1)
+    expect(screen.getByRole('button', { name: 'Projects' }).getAttribute('aria-current')).toBe('page')
+    expect(screen.queryByLabelText('aflow.toml contents')).toBeNull()
+
+    returningDiscovery.resolve(discoveryBase)
+    await waitFor(() => {
+      const menu = screen.getByRole('menu', { name: 'More project actions', exact: true })
+      const refresh = within(menu).getByRole('menuitem', { name: 'Refresh', exact: true }) as HTMLButtonElement
+      expect(refresh.isConnected).toBe(true)
+      expect(refresh.disabled).toBe(false)
+    })
+    const readyMenu = screen.getByRole('menu', { name: 'More project actions', exact: true })
+    const readyRefresh = within(readyMenu).getByRole('menuitem', { name: 'Refresh', exact: true })
+    fireEvent.click(readyRefresh)
+    await waitFor(() => expect(api.listProjects).toHaveBeenCalledTimes(2))
+    await waitFor(() => expect(api.getProjectDiscovery).toHaveBeenCalledTimes(3))
   })
 
   it('renders readiness states accurately across registered projects', async () => {
