@@ -10,6 +10,22 @@
   server-composition tests preserve nonce/process identity and terminal-state
   validation without claiming the coordinator's later live performance target.
 
+## 2026-09-12 — Render accepted selected runs before history completes
+
+- Runs now keys project-access evidence and accepted direct snapshots by the
+  exact project/run identity. An accepted detail remains readable with its
+  header, copy and navigation while history or configuration loading continues;
+  stale project/run responses, deleted records and denied project access cannot
+  reveal it.
+- The history list explicitly reports pending or failed incomplete coverage and
+  its loaded count, never treating a pinned selected row as an empty or complete
+  history. Launch and configuration-dependent run controls remain gated until
+  their existing dashboard context is ready.
+- Focused deferred component cases and Chromium/WebKit desktop/phone browser
+  journeys hold the history response, prove exact direct detail visibility, then
+  release it and retain selection plus usable Refresh. Live latency measurement,
+  CI, publication and activation remain coordinator-owned.
+
 ## 2026-09-12 — Preserve status projection and composite browser identity
 
 - Recovery test doubles now forward the explicit progress-projection keyword and

@@ -2062,3 +2062,54 @@ Publication, exact-SHA CI, activation and live performance measurement remain
 controller/coordinator-owned and pending; no overall loading target is certified.
 
 No material findings
+
+---
+
+# Selected run independent readiness — cumulative review approved
+
+Review base: `4abcda76fe74c4b270e3cc7b8b3c0ba6be219da8` (unchanged Pre-Handoff Base HEAD).
+Reviewed HEAD: `346d06cf3191f3cc829b99d6a46375d76e7d2a94`.
+Coverage: 1 new / 1 total commit, `cp1 v01`, all five changed files and the
+complete original selected-run-independent-readiness plan. No previous findings
+or follow-up overlays apply to this handoff.
+
+No material findings passed the admission gate. Accepted direct details use
+project/run identity and existing request-generation/tombstone guards; project
+availability is compared against the current project. Runs and header slots
+can render independently while New run retains the loading boundary. History
+loading/failure notices remain visible in compact detail mode. Direct status
+precedence, loaded-page refresh, launch admission and existing control checks
+remain in place. Backend contracts, polling and integration ownership are unchanged.
+
+Retained worker command/output evidence inspected at
+`/root/code/agent_flow/.aflow/runs/20260912t220601z-67b0d410/turns/turn-001/transport.stdout`
+and its successful `result.json`:
+
+- Final RunDashboard component suite: 119 passed in 12.80s.
+- Production build and focused ESLint: exit 0.
+- Held-history browser journey: Chromium 2 passed in 6.88s; WebKit 2 passed
+  in 7.35s, covering desktop and phone. Earlier failed browser iterations
+  preceded the final notice placement and route-cleanup corrections.
+- The final async context-call assertion preserves the exact count/arguments
+  while waiting for the now-independent loading sequence; final suite passed.
+- Reviewer cumulative `git diff --check 4abcda76 HEAD` passed. No full suite
+  repeated; retained evidence applies to the reviewed implementation.
+
+Plan reconciliation: the original plan has checkpoint 1 and all six steps
+checked. The worker result's snapshot_after confirms complete, zero unchecked
+checkpoints and zero unchecked steps; its snapshot_before had six unchecked
+steps. The stale controller snapshot does not override these completed plan
+and implementation artifacts. Record this reconciliation in original-plan
+tracking; leave controller-owned durable state to engine synchronization.
+
+Approve local implementation and consolidate the handoff plus this intentional
+tracked review record into exactly one unpublished commit after the unchanged
+base. Preserve reviewed implementation blobs and the single DEVLOG entry.
+Leave the ignored original plan in place for engine finalization and record
+the final approved SHA there after commit creation. No fix plan is needed.
+Publication, exact-SHA CI, activation and live latency targets remain
+coordinator-owned; this review does not claim deployed usability.
+
+No material findings
+
+---

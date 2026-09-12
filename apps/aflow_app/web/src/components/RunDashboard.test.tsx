@@ -2841,6 +2841,54 @@ describe('RunDashboard', () => {
     expect(api.startControlPlaneRun).not.toHaveBeenCalled()
   })
 
+  it('renders an accepted selected snapshot before held history and configuration resolve', async () => {
+    const history = deferred<{ runs: Array<typeof ownedRun>; next_cursor: null; schema_version: number }>()
+    const configuration = deferred<typeof committedConfig>()
+    const directRun = { ...ownedRun, status: 'completed', revision: 2 }
+    vi.mocked(api.listControlPlaneRuns).mockImplementationOnce(() => history.promise)
+    vi.mocked(api.getGlobalConfig).mockImplementationOnce(() => configuration.promise)
+    vi.mocked(api.getControlPlaneRun).mockResolvedValue(directRun)
+    renderDashboard({ requestedRunId: directRun.run_id })
+
+    const detail = await screen.findByLabelText('Run details')
+    expect(within(detail).getByText('Completed')).toBeDefined()
+    expect(screen.getByText(/Run history is still loading\. 0 loaded so far; the history is incomplete\./)).toBeDefined()
+    expect(screen.queryByText('No runs yet')).toBeNull()
+    expect(screen.queryByRole('button', { name: 'Stop after current turn', exact: true })).toBeNull()
+
+    await act(async () => {
+      history.resolve({ runs: [ownedRun], next_cursor: null, schema_version: 1 })
+      await history.promise
+    })
+    await waitFor(() => expect(api.getGlobalConfig).toHaveBeenCalled())
+    expect(within(detail).getByText('Completed')).toBeDefined()
+
+    await act(async () => {
+      configuration.resolve(committedConfig)
+      await configuration.promise
+    })
+    await screen.findByRole('button', { name: 'Refresh', exact: true })
+    expect(within(detail).getByText('Completed')).toBeDefined()
+  })
+
+  it('keeps an accepted selected snapshot readable when history fails', async () => {
+    vi.mocked(api.listControlPlaneRuns).mockRejectedValueOnce(new Error('history unavailable'))
+    renderDashboard({ requestedRunId: ownedRun.run_id })
+
+    await screen.findByLabelText('Run details')
+    await screen.findByText(/history unavailable\. Existing run data remains visible/)
+    expect(screen.getByRole('button', { name: 'Refresh', exact: true }).getAttribute('disabled')).toBeNull()
+    expect(screen.getByText(/Run history could not be loaded\. 0 previously loaded; the history is incomplete/)).toBeDefined()
+  })
+
+  it('does not reveal direct detail after project access is denied', async () => {
+    vi.mocked(api.listControlPlaneProjects).mockResolvedValue([{ project_id: 'another-project', root: '/workspace/other', schema_version: 1 }])
+    renderDashboard({ requestedRunId: ownedRun.run_id })
+
+    await screen.findByRole('alert', { name: 'Project unavailable to the control plane' })
+    expect(screen.queryByLabelText('Run details')).toBeNull()
+  })
+
   it('shows control-plane guidance without other projects when the registered project is unavailable', async () => {
     vi.mocked(api.listControlPlaneProjects).mockResolvedValue([
       { project_id: 'another-project', root: '/workspace/other', schema_version: 1 },
@@ -2897,6 +2945,29 @@ describe('RunDashboard', () => {
     expect(api.getControlPlaneRun).toHaveBeenCalledWith('control-project', 'run-older', expect.objectContaining({ signal: expect.any(AbortSignal) }))
   })
 
+  it('does not reveal a late direct snapshot for a superseded selected run', async () => {
+    const oldSnapshot = deferred<typeof ownedRun>()
+    const newerRun = { ...ownedRun, run_id: 'run-newer', status: 'completed', revision: 2 }
+    vi.mocked(api.getControlPlaneRun).mockImplementation(async (_projectId, runId) => (
+      runId === 'run-older' ? oldSnapshot.promise : newerRun
+    ))
+    const rendered = renderDashboardNode(dashboardNode({ requestedRunId: 'run-older' }))
+    await waitFor(() => expect(api.getControlPlaneRun).toHaveBeenCalledWith(
+      'control-project', 'run-older', expect.objectContaining({ signal: expect.any(AbortSignal) }),
+    ))
+
+    rendered.rerender(dashboardNode({ requestedRunId: newerRun.run_id }))
+    const detail = await screen.findByLabelText('Run details')
+    expect(within(detail).getByRole('button', { name: newerRun.run_id, exact: true })).toBeDefined()
+
+    await act(async () => {
+      oldSnapshot.resolve({ ...ownedRun, run_id: 'run-older', status: 'failed' })
+      await oldSnapshot.promise
+    })
+    expect(within(detail).getByRole('button', { name: newerRun.run_id, exact: true })).toBeDefined()
+    expect(within(detail).queryByRole('button', { name: 'run-older', exact: true })).toBeNull()
+  })
+
   it('keeps the Runs view without a substitute when a linked run is missing', async () => {
     vi.mocked(api.getControlPlaneRun)
       .mockRejectedValueOnce(new ApiError(404, 'run not found', 'run_not_found'))
@@ -2916,6 +2987,15 @@ describe('RunDashboard', () => {
     fireEvent.click(screen.getByRole('button', { name: /run-owned Running/ }))
     await screen.findByRole('button', { name: 'run-owned' })
     expect(screen.queryByText(/is not recorded for this project/)).toBeNull()
+  })
+
+  it('retains the deleted-record behavior when a direct selected read returns 410', async () => {
+    vi.mocked(api.getControlPlaneRun).mockRejectedValueOnce(new ApiError(410, 'run deleted', 'run_deleted'))
+    renderDashboard({ requestedRunId: 'run-deleted' })
+
+    await screen.findByText('Deleted record')
+    expect(screen.getByText('Workflow files and recovery data are retained.')).toBeDefined()
+    expect(screen.queryByLabelText('Run details')?.textContent).toContain('Deleted record')
   })
 
   it('reports passive and user run selections so the URL can be synced', async () => {
@@ -2985,7 +3065,7 @@ describe('RunDashboard', () => {
     expect((await screen.findAllByText('4 of 11 checkpoints approved')).length).toBeGreaterThan(0)
     expect(screen.getAllByText(/CP5 of 11 · Implementing/).length).toBeGreaterThan(0)
     expect(screen.queryByText('Plan: /workspace/alpha/plans/run-owned.md · Run: run-owned')).toBeNull()
-    expect(api.getRunContext).toHaveBeenCalledTimes(1)
+    await waitFor(() => expect(api.getRunContext).toHaveBeenCalledTimes(1))
     expect(api.getRunContext).toHaveBeenCalledWith('control-project', 'run-owned', 'lite', false, expect.objectContaining({ signal: expect.any(AbortSignal) }))
   })
 

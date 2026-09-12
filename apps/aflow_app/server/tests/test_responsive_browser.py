@@ -1261,6 +1261,74 @@ def test_global_run_overview_loading_journey(control_client, monkeypatch, tmp_pa
             browser.close()
 
 
+@pytest.mark.parametrize(
+    ("width", "height"),
+    (
+        pytest.param(1280, 720, id="desktop"),
+        pytest.param(390, 844, id="phone"),
+    ),
+)
+def test_selected_run_detail_does_not_wait_for_history(
+    control_client, monkeypatch, width: int, height: int
+):
+    """Keep an exact direct run visible while its history page is held."""
+    _, root, _, _ = control_client
+    _seed_responsive_fixture(root)
+    dist = Path(__file__).resolve().parents[2] / "web" / "dist"
+    monkeypatch.setenv("AFLOW_APP_WEB_DIST", str(dist))
+    held_history = []
+
+    def hold_history(route) -> None:
+        if urlsplit(route.request.url).path.endswith("/runs"):
+            held_history.append(route)
+            return
+        route.continue_()
+
+    with live_server() as url, sync_playwright() as playwright:
+        browser = _browser(playwright)
+        page = browser.new_page(viewport={"width": width, "height": height})
+        history_pattern = f"**/api/control-plane/projects/{PROJECT_ID}/runs**"
+        page.route(history_pattern, hold_history)
+        try:
+            _login(page, url)
+            page.goto(
+                f"{url}/?project={PROJECT_ID}&view=runs&run={RESPONSIVE_FIXTURE_RUN_ID}"
+            )
+            _assert_run_detail(page, RESPONSIVE_FIXTURE_TITLE, RESPONSIVE_FIXTURE_RUN_ID)
+            pending = page.get_by_role("status").filter(
+                has_text="Run history is still loading"
+            )
+            expect(pending).to_contain_text("0 loaded so far; the history is incomplete.")
+            assert page.get_by_text("No runs yet", exact=True).count() == 0
+            assert held_history, "selected history request was not held"
+
+            for route in held_history[:]:
+                route.continue_()
+            held_history.clear()
+            page.unroute(history_pattern, hold_history)
+            if _compact(page):
+                expect(pending).to_have_count(0)
+            else:
+                page.locator(
+                    f".run-list-item[data-sidebar-editor-item='{RESPONSIVE_FIXTURE_RUN_ID}']"
+                ).wait_for()
+            _assert_run_detail(page, RESPONSIVE_FIXTURE_TITLE, RESPONSIVE_FIXTURE_RUN_ID)
+            page.get_by_role("button", name="More", exact=True).click()
+            refresh = page.get_by_role("menuitem", name="Refresh", exact=True)
+            expect(refresh).to_be_enabled()
+        finally:
+            for route in held_history:
+                try:
+                    route.continue_()
+                except PlaywrightError:
+                    pass
+            try:
+                page.unroute(history_pattern, hold_history)
+            except PlaywrightError:
+                pass
+            browser.close()
+
+
 @pytest.mark.parametrize(("width", "height"), VIEWPORTS)
 def test_responsive_route_matrix(control_client, monkeypatch, width: int, height: int):
     """Exercise every shell destination at each required CSS viewport."""

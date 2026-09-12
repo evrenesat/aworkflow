@@ -949,7 +949,14 @@ function configuredWorkflowSteps(
 }
 
 export function RunDashboard({ visible = true, page, onNewRun, onCancelNewRun, onRunStarted, projectId, requestedRunId = null, explicitRunNavigation, onRunSelectionChange, initialPlanPath, onInitialPlanHandled, restartPollIntervalMs, pendingSuccessorStart: suppliedPendingSuccessor, onPendingSuccessorStartChange, onOpenSettings, onOpenPlan }: RunDashboardProps) {
-  const [projectAvailable, setProjectAvailable] = useState<boolean | null>(null)
+  // Project access and the direct snapshot are evidence, not timing signals.
+  // Keep their identities with the values so a render for a new project/run
+  // cannot briefly reuse an accepted result before its cleanup effect runs.
+  const [projectAvailability, setProjectAvailability] = useState<{ projectId: string; available: boolean } | null>(null)
+  const projectAvailable = projectAvailability?.projectId === projectId
+    ? projectAvailability.available
+    : null
+  const [acceptedSelectedDetail, setAcceptedSelectedDetail] = useState<{ projectId: string; runId: string } | null>(null)
   const [capabilities, setCapabilities] = useState<ControlPlaneCapabilities | null>(null)
   const [readiness, setReadiness] = useState<ControlPlaneReadiness | null>(null)
   const [plans, setPlans] = useState<ControlPlanePlan[]>([])
@@ -958,6 +965,9 @@ export function RunDashboard({ visible = true, page, onNewRun, onCancelNewRun, o
   const [historyFilter, setHistoryFilter] = useState<'visible' | 'archived' | 'all'>('visible')
   const historyFilterRef = useRef(historyFilter)
   historyFilterRef.current = historyFilter
+  const currentHistoryScope = JSON.stringify([projectId, historyFilter])
+  const [historyLoad, setHistoryLoad] = useState<{ scope: string; status: 'pending' | 'ready' | 'error' }>({ scope: '', status: 'pending' })
+  const [historySnapshot, setHistorySnapshot] = useState<{ scope: string; runIds: string[] }>({ scope: '', runIds: [] })
   const loadedHistory = useRef({ scope: '', pages: 1 })
   const historyRequest = useRef(0)
   const [nextRunCursor, setNextRunCursor] = useState<string | null>(null)
@@ -1069,6 +1079,12 @@ export function RunDashboard({ visible = true, page, onNewRun, onCancelNewRun, o
   const selectedRun = useMemo(
     () => runs.find((run) => run.run_id === selectedRunId) ?? null,
     [runs, selectedRunId],
+  )
+  const selectedDetailAccepted = Boolean(
+    selectedRun
+    && selectedRunId
+    && acceptedSelectedDetail?.projectId === projectId
+    && acceptedSelectedDetail.runId === selectedRunId,
   )
 
   useEffect(() => {
@@ -1217,7 +1233,7 @@ export function RunDashboard({ visible = true, page, onNewRun, onCancelNewRun, o
     void (async () => {
       try {
         setLoading(true)
-        setProjectAvailable(null)
+        setProjectAvailability(null)
         const [available, readinessState] = await Promise.all([
           api.listControlPlaneProjects(),
           api.getControlPlaneReadiness(),
@@ -1226,7 +1242,8 @@ export function RunDashboard({ visible = true, page, onNewRun, onCancelNewRun, o
         setProjectReadError(null)
         setReadiness(readinessState)
         const availableHere = available.some((project) => project.project_id === projectId)
-        setProjectAvailable(availableHere)
+        setProjectAvailability({ projectId, available: availableHere })
+        if (!availableHere) setAcceptedSelectedDetail(null)
         if (availableHere) await loadDashboard(projectId, () => active)
       } catch (loadError) {
         if (active) setProjectReadError(errorMessage(loadError, 'Failed to load control-plane projects'))
@@ -1358,19 +1375,30 @@ export function RunDashboard({ visible = true, page, onNewRun, onCancelNewRun, o
     const request = ++historyRequest.current
     const callerActive = isActive
     isActive = () => callerActive() && requestedHistory === historyFilterRef.current && request === historyRequest.current
+    setHistoryLoad({ scope, status: 'pending' })
     async function reloadHistory() {
       const runs: RunStatus[] = []
       let cursor: string | undefined
       const seen = new Set<string>()
-      for (let index = 0; index < pageCount; index++) {
-        const page = await api.listControlPlaneRuns(nextProjectId, { limit: 100, history: requestedHistory, ...(cursor ? { cursor } : {}) })
-        runs.push(...page.runs)
-        cursor = page.next_cursor ?? undefined
-        if (!cursor || !isActive()) break
-        if (seen.has(cursor)) throw new Error('Repeated history cursor')
-        seen.add(cursor)
+      try {
+        for (let index = 0; index < pageCount; index++) {
+          const page = await api.listControlPlaneRuns(nextProjectId, { limit: 100, history: requestedHistory, ...(cursor ? { cursor } : {}) })
+          runs.push(...page.runs)
+          cursor = page.next_cursor ?? undefined
+          if (!cursor || !isActive()) break
+          if (seen.has(cursor)) throw new Error('Repeated history cursor')
+          seen.add(cursor)
+        }
+        const result = { runs, next_cursor: cursor ?? null }
+        if (isActive()) {
+          setHistoryLoad({ scope, status: 'ready' })
+          setHistorySnapshot({ scope, runIds: result.runs.map(run => run.run_id) })
+        }
+        return result
+      } catch (error) {
+        if (isActive()) setHistoryLoad({ scope, status: 'error' })
+        throw error
       }
-      return { runs, next_cursor: cursor ?? null }
     }
     try {
       setRefreshing(true)
@@ -1460,6 +1488,7 @@ export function RunDashboard({ visible = true, page, onNewRun, onCancelNewRun, o
       if (deletedRef.current.has(runId)) return
       setSelectedRunReadError(null)
       setRuns((current) => upsertRun(current, run))
+      setAcceptedSelectedDetail({ projectId: nextProjectId, runId })
       setStatusUpdatedAt(new Date().toISOString())
       setEvents((current) => mergeEvents(current, tail))
     } catch (loadError) {
@@ -1523,6 +1552,7 @@ export function RunDashboard({ visible = true, page, onNewRun, onCancelNewRun, o
   function markDeleted(runId: string) {
     deletedRef.current.add(runId)
     setDeletedIds(new Set(deletedRef.current))
+    setAcceptedSelectedDetail((current) => current?.projectId === projectId && current.runId === runId ? null : current)
     setRuns(current => current.filter(run => run.run_id !== runId))
     snapshotRequestRef.current += 1
     window.dispatchEvent(new Event('aflow-history-changed'))
@@ -1551,7 +1581,17 @@ export function RunDashboard({ visible = true, page, onNewRun, onCancelNewRun, o
   }
   useEffect(() => { if (projectAvailable) void loadDashboard(projectId) }, [historyFilter]) // eslint-disable-line react-hooks/exhaustive-deps
   const listedRuns = runs.filter(run => !deletedIds.has(run.run_id) && (run.history_state ?? 'visible') !== 'deleted' && (historyFilter === 'all' || (run.history_state ?? 'visible') === historyFilter))
-  const selectedRunOutsideLoadedHistory = Boolean(selectedRun && !listedRuns.some(run => run.run_id === selectedRun.run_id))
+  const historyLoadCurrent = historyLoad.scope === currentHistoryScope ? historyLoad : null
+  const historyPending = historyLoadCurrent?.status === 'pending' || (historyLoadCurrent === null && loading)
+  const historyIncomplete = historyPending || historyLoadCurrent?.status === 'error'
+  const historyLoadedCount = historySnapshot.scope === currentHistoryScope
+    ? listedRuns.filter(run => historySnapshot.runIds.includes(run.run_id)).length
+    : 0
+  const selectedRunOutsideLoadedHistory = Boolean(selectedRun && (
+    historyIncomplete
+    || historySnapshot.scope !== currentHistoryScope
+    || !historySnapshot.runIds.includes(selectedRun.run_id)
+  ))
   function invalidateCopyFeedback() {
     copyRequestRef.current += 1
   }
@@ -2159,7 +2199,9 @@ export function RunDashboard({ visible = true, page, onNewRun, onCancelNewRun, o
     }
   }
 
-  const canMutate = selectedRun?.ownership === 'control_plane'
+  // Direct details stay readable while dashboard/configuration work is pending,
+  // but controls that rely on that unresolved admission context do not.
+  const canMutate = selectedRun?.ownership === 'control_plane' && !loading
   const canResume = canMutate && selectedRun?.evidence.can_resume === true
   const canRestart = canMutate && (restartAdmission?.eligible === true || (selectedRunHasLiveControls && hasSafeControl('owner_stop')))
   const recoveryWorkerOptions = [...new Set(capabilities?.admitted_role_selectors?.worker ?? [])].sort()
@@ -2863,6 +2905,8 @@ export function RunDashboard({ visible = true, page, onNewRun, onCancelNewRun, o
     onCancelNewRun?.()
   }
 
+  const renderAcceptedDetail = projectAvailable === true && selectedDetailAccepted && !newRunPage
+  const dashboardRenderable = !loading || renderAcceptedDetail
   const hosted = useHeaderSlots(`run-dashboard:${projectId}`, {
     context: <h2 className="header-context-title">{newRunPage ? 'New run' : 'Runs'}</h2>,
     local: newRunPage ? <button className="btn btn-secondary btn-sm" onClick={cancelNewRun}>← Run history</button> : <label className="header-filter-select"><span>Run history</span><select aria-label="Run history" value={historyFilter} onChange={event => setHistoryFilter(event.target.value as typeof historyFilter)}><option value="visible">Visible</option><option value="archived">Archived</option><option value="all">All history</option></select></label>,
@@ -2873,9 +2917,9 @@ export function RunDashboard({ visible = true, page, onNewRun, onCancelNewRun, o
         <MenuItem disabled={refreshing || loading} onClick={() => void refreshPage()}>{refreshing ? 'Refreshing…' : 'Refresh'}</MenuItem>
       </>}
     </MoreMenu>,
-  }, visible && !loading)
+  }, visible && dashboardRenderable)
 
-  if (loading) {
+  if (!dashboardRenderable) {
     return <div className="card dashboard-loading"><div className="spinner" />Loading runs…</div>
   }
 
@@ -2903,6 +2947,11 @@ export function RunDashboard({ visible = true, page, onNewRun, onCancelNewRun, o
       {feedback && <div className="success-message">{feedback}</div>}
       {handoffError && <div className="error-message" role="alert">{handoffError}</div>}
       {restartNotice && <div className="notice" role="status">{restartNotice}</div>}
+      {projectAvailable && !newRunPage && historyIncomplete && <div className="notice text-sm" role="status">
+        {historyPending
+          ? `Run history is still loading. ${historyLoadedCount} loaded so far; the history is incomplete.`
+          : `Run history could not be loaded. ${historyLoadedCount} previously loaded; the history is incomplete. Use Refresh to retry.`}
+      </div>}
       {successorOutcomeUnknown && pendingSuccessorStart && (
         <div className="notice" role="alert">
           The successor request for {pendingSuccessorStart.sourceRunId} in {pendingSuccessorStart.projectId} is frozen while its outcome is unknown. Do not start a changed replacement.
@@ -2954,12 +3003,12 @@ export function RunDashboard({ visible = true, page, onNewRun, onCancelNewRun, o
       {projectAvailable && !newRunPage && (
         <SidebarEditorLayout selection={selectedRunId} navigationVersion={navigationVersion} listLabel="Run history" detailEntry={explicitRunNavigation ?? Boolean(requestedRunId)} navigation={
           <section className="card run-list" aria-label="Project runs">
-            <div className="section-heading"><h3>Project runs</h3><span className="text-xs text-dim">{listedRuns.length} recorded</span></div>
+            <div className="section-heading"><h3>Project runs</h3><span className="text-xs text-dim">{historyIncomplete ? `${historyLoadedCount} loaded so far` : `${listedRuns.length} recorded`}</span></div>
             {!hosted && <label>Run history<select className="input" aria-label="Run history" value={historyFilter} onChange={event => setHistoryFilter(event.target.value as typeof historyFilter)}><option value="visible">Visible</option><option value="archived">Archived</option><option value="all">All history</option></select></label>}
             {selectedRunOutsideLoadedHistory && selectedRun && <p className="notice text-sm" role="status">
               Selected run: {runPlanPresentationForRun(selectedRun).label} · {statusLabel(selectedRun)} · {shortRunId(selectedRun.run_id)}. It is outside the loaded history page; this view will not fetch more runs automatically.
             </p>}
-            {listedRuns.length === 0 ? <p className="text-sm text-dim">No runs yet</p> : listedRuns.map((run) => {
+            {listedRuns.length === 0 ? (historyIncomplete ? null : <p className="text-sm text-dim">No runs yet</p>) : listedRuns.map((run) => {
               const plan = runPlanPresentationForRun(run)
               const status = statusLabel(run)
               return <button
