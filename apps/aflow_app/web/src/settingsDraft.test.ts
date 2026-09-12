@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { settingsActions, changedDocuments } from './settingsDraft'
+import { changedDocuments, createDraftPreviewCoordinator, reconcileCleanPreview, settingsActions } from './settingsDraft'
 import type { GuidedFormProjection } from './types'
 
 export const baseline: GuidedFormProjection = {
@@ -84,5 +84,34 @@ describe('changed-only settings', () => {
     const draft = structuredClone(baseline)
     draft.default_workflow = 'demo-alias'
     expect(settingsActions(baseline, draft)).toEqual([{ type: 'set_default_workflow', value: 'demo-alias' }])
+  })
+
+  it('rejects a released clean reconciliation after the coordinator receives a custom effort', () => {
+    const coordinator = createDraftPreviewCoordinator(async () => { throw new Error('preview should not run') })
+    const cleanActionsKey = JSON.stringify(settingsActions(baseline, baseline))
+    coordinator.updateDraft(structuredClone(baseline), true)
+
+    const edited = structuredClone(baseline)
+    edited.harnesses.codex.worker.effort = 'new-effort'
+    coordinator.updateDraft(edited)
+
+    const latest = coordinator.state().draft
+    const released = reconcileCleanPreview(baseline, latest, latest, cleanActionsKey, false)
+    expect(released.stale).toBe(true)
+    expect(released.nextDraft).toBe(latest)
+    expect(latest?.harnesses.codex.worker.effort).toBe('new-effort')
+
+    // The functional updater sees the newer React declaration independently
+    // from the coordinator-entry check and must also leave it untouched.
+    const newerUpdater = reconcileCleanPreview(baseline, structuredClone(baseline), latest, cleanActionsKey, false)
+    expect(newerUpdater.stale).toBe(false)
+    expect(newerUpdater.nextDraft).toBe(latest)
+
+    // A real edit-to-baseline reversion remains eligible for the clean restore.
+    coordinator.updateDraft(structuredClone(baseline))
+    const reverted = coordinator.state().draft
+    const restored = reconcileCleanPreview(baseline, reverted, reverted, cleanActionsKey, false)
+    expect(restored.stale).toBe(false)
+    expect(restored.nextDraft).toEqual(baseline)
   })
 })

@@ -174,6 +174,40 @@ export function settingsActions(base: GuidedFormProjection, draft: GuidedFormPro
   return [...additions, ...declarations, ...deletions]
 }
 
+function matchesSemanticActions(
+  baseline: GuidedFormProjection,
+  draft: GuidedFormProjection | null,
+  expectedActionsKey: string,
+): boolean {
+  return draft !== null && JSON.stringify(settingsActions(baseline, draft)) === expectedActionsKey
+}
+
+export interface CleanPreviewReconciliation {
+  stale: boolean
+  nextDraft: GuidedFormProjection | null
+}
+
+/**
+ * Reconcile a captured clean-preview effect with the latest declarations.
+ * The returned draft is the only state transition; callers own any
+ * coordinator invalidation/update side effects after checking `stale`.
+ */
+export function reconcileCleanPreview(
+  baseline: GuidedFormProjection,
+  latestCoordinatorDraft: GuidedFormProjection | null,
+  currentDraft: GuidedFormProjection | null,
+  expectedActionsKey: string,
+  rawEdited: boolean,
+): CleanPreviewReconciliation {
+  if (!matchesSemanticActions(baseline, latestCoordinatorDraft, expectedActionsKey)) {
+    return { stale: true, nextDraft: currentDraft }
+  }
+  if (!currentDraft || rawEdited || !matchesSemanticActions(baseline, currentDraft, expectedActionsKey)) {
+    return { stale: false, nextDraft: currentDraft }
+  }
+  return { stale: false, nextDraft: JSON.parse(JSON.stringify(baseline)) as GuidedFormProjection }
+}
+
 export function changedDocuments(base: ConfigDocumentPair, texts: [string, string]): Partial<Record<'aflow.toml' | 'workflows.toml', string>> {
   return {
     ...(texts[0] !== base.aflow_toml ? { 'aflow.toml': texts[0] } : {}),

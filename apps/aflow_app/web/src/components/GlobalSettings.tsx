@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState } from 'react'
 import * as api from '../api'
 import type { GuidedConfigAction, GuidedFormProjection, ProjectConfig, ProjectConfigFormResponse, SettingsResponse, SettingsSaveRequest } from '../types'
-import { changedDocuments, createDraftPreviewCoordinator, previewLegacyConversion, previewSettingsActions, retainServerProjection, settingsActions, type DraftPreviewState } from '../settingsDraft'
+import { changedDocuments, createDraftPreviewCoordinator, previewLegacyConversion, previewSettingsActions, reconcileCleanPreview, retainServerProjection, settingsActions, type DraftPreviewState } from '../settingsDraft'
 import { AppearanceSelector } from './AppearanceSelector'
 import { RecentRunsLimit } from './GlobalRunOverview'
 import { Combobox } from './Combobox'
@@ -426,13 +426,14 @@ export function GlobalSettings({ onDirtyChange, onSaved }: { onDirtyChange: (dir
       return
     }
     if (!actions.length) {
+      const latest = draftPreviewCoordinator.state().draft
+      if (reconcileCleanPreview(baseline, latest, null, semanticActionsKey, rawEdited).stale) return
       draftPreviewCoordinator.invalidate()
       // A reverted declaration must also restore the saved projection. This
       // leaves the declaration object untouched while dropping stale display
       // data from an earlier unsaved preview.
       setDraft(current => {
-        if (!current || rawEdited) return current
-        return clone(baseline)
+        return reconcileCleanPreview(baseline, current, current, semanticActionsKey, rawEdited).nextDraft
       })
       if (!rawEdited) draftPreviewCoordinator.updateDraft(baseline, true)
       setDraftPreviewState(draftPreviewCoordinator.state())

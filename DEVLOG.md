@@ -1,5 +1,27 @@
 # DEVLOG
 
+## 2026-09-12 — Reject stale clean settings previews
+
+- A delayed zero-action preview reconciliation now checks the synchronous
+  coordinator's latest declarations before invalidating or restoring the saved
+  baseline, and the functional React updater applies the same semantic guard.
+  A newer custom effort therefore remains the owning draft, while a genuine
+  edit-to-baseline reversion still restores saved projections and clears dirty
+  state.
+- Focused coverage now uses a bounded test-local React effect scheduler to
+  release the actual clean callback after the fieldset is enabled and custom
+  effort is typed without Enter or blur. The post-fix case retains the
+  canonical declaration, preserves pending/error ownership, and asserts one
+  effort-only `upsert_profile` with the expected revision, omitting untouched
+  fields and server-settings writes. The independent pure transition coverage
+  also exercises the functional updater, genuine reversion and late-response
+  guard.
+- A reversible pre-fix run of the same component case failed at the released
+  callback: the old branch changed the indicator to `Preview settled` and
+  disabled Save while the typed input remained visible. Its private failure
+  log is retained outside the repository; exact historical CI scheduling
+  remains inferred.
+
 ## 2026-09-12 — Preserve receipts across child-exit cleanup races
 
 - The `aflow ui-worker` startup-receipt failure path now polls its direct child

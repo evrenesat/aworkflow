@@ -1,9 +1,35 @@
 import { act, fireEvent, render, screen, waitFor, within } from '@testing-library/react'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
+import type { DependencyList, EffectCallback } from 'react'
 import * as api from '../api'
 import { GlobalSettings } from './GlobalSettings'
 import { HeaderSlotsProvider } from './HeaderSlots'
 import type { GuidedConfigAction, GuidedFormProjection, ProjectConfigFormRequest, ProjectConfigFormResponse } from '../types'
+
+const reactEffectScheduler = vi.hoisted(() => ({
+  deferCleanPreview: false,
+  releaseCleanPreview: undefined as (() => void) | undefined,
+}))
+
+vi.mock('react', async () => {
+  const actual = await vi.importActual<typeof import('react')>('react')
+  return {
+    ...actual,
+    useEffect(effect: EffectCallback, deps?: DependencyList) {
+      if (!reactEffectScheduler.deferCleanPreview || deps?.length !== 1 || typeof deps[0] !== 'string') {
+        return actual.useEffect(effect, deps)
+      }
+      let dependency: { baselineRevision?: unknown; actions?: unknown }
+      try { dependency = JSON.parse(deps[0]) as typeof dependency } catch { return actual.useEffect(effect, deps) }
+      if (!dependency || typeof dependency !== 'object' || !('baselineRevision' in dependency) || !Array.isArray(dependency.actions) || dependency.actions.length !== 0) {
+        return actual.useEffect(effect, deps)
+      }
+      return actual.useEffect(() => {
+        reactEffectScheduler.releaseCleanPreview = () => { void effect() }
+      }, deps)
+    },
+  }
+})
 
 vi.mock('../api', () => ({ getGlobalConfig: vi.fn(), postGlobalConfigForm: vi.fn(), getSettings: vi.fn(), patchGlobalConfig: vi.fn(), saveSettings: vi.fn(), validateGlobalConfig: vi.fn(), projectSettingsText: vi.fn(), listSkills: vi.fn(), readSkill: vi.fn(), saveSkill: vi.fn(), validateSkills: vi.fn(), installSkills: vi.fn() }))
 const validation = { state: 'ready' as const, issues: [], placeholders: [], workflows: ['demo'], teams: [], roles: ['worker'] }
@@ -173,6 +199,8 @@ function renderHostedGlobalSettings() {
 describe('GlobalSettings', () => {
   beforeEach(() => {
     vi.resetAllMocks()
+    reactEffectScheduler.deferCleanPreview = false
+    reactEffectScheduler.releaseCleanPreview = undefined
     vi.mocked(api.getGlobalConfig).mockResolvedValue(config)
     vi.mocked(api.getSettings).mockResolvedValue(server)
     vi.mocked(api.postGlobalConfigForm).mockResolvedValue(response)
@@ -501,11 +529,65 @@ describe('GlobalSettings', () => {
     expect(api.saveSettings).not.toHaveBeenCalled()
   })
   it('saves typed custom effort without Enter, omitting every untouched field', async () => {
-    render(<GlobalSettings onDirtyChange={() => {}} onSaved={() => {}} />)
-    fireEvent.change(await screen.findByLabelText('Effort codex.worker'), { target: { value: 'new-effort' } })
-    fireEvent.click(screen.getByRole('button', { name: 'Save all changes' }))
+    const view = render(<GlobalSettings onDirtyChange={() => {}} onSaved={() => {}} />)
+    const effort = await screen.findByLabelText('Effort codex.worker')
+    const settingsBody = view.container.querySelector('#settings-domain-panel') as HTMLFieldSetElement
+    await waitFor(() => expect(settingsBody.hasAttribute('disabled')).toBe(false))
+    fireEvent.change(effort, { target: { value: 'new-effort' } })
+    const save = screen.getByRole('button', { name: 'Save all changes' }) as HTMLButtonElement
+    await waitFor(() => expect(save.disabled).toBe(false))
+    fireEvent.click(save)
+    await waitFor(() => expect(api.patchGlobalConfig).toHaveBeenCalledTimes(1))
     await waitFor(() => expect(api.patchGlobalConfig).toHaveBeenCalledWith({ expected_revision: config.revision, actions: [{ type: 'upsert_profile', harness: 'codex', profile: 'worker', effort: 'new-effort' }] }))
     expect(api.saveSettings).not.toHaveBeenCalled()
+  })
+  it('retains a typed custom effort after a stale and reverted clean preview', async () => {
+    const pendingPreview = deferred<ProjectConfigFormResponse>()
+    let actionPreview: 'pending' | 'error' | 'response' = 'pending'
+    vi.mocked(api.postGlobalConfigForm).mockImplementation(async request => {
+      if (!request.action) return response
+      if (actionPreview === 'error') throw new Error('preview unavailable')
+      if (actionPreview === 'response') return response
+      return pendingPreview.promise
+    })
+    reactEffectScheduler.deferCleanPreview = true
+    const view = render(<GlobalSettings onDirtyChange={() => {}} onSaved={() => {}} />)
+    try {
+      const effort = await screen.findByLabelText('Effort codex.worker')
+      const settingsBody = view.container.querySelector('#settings-domain-panel') as HTMLFieldSetElement
+      await waitFor(() => expect(settingsBody.hasAttribute('disabled')).toBe(false))
+      await waitFor(() => expect(reactEffectScheduler.releaseCleanPreview).toBeDefined())
+
+      fireEvent.change(effort, { target: { value: 'new-effort' } })
+      await screen.findByRole('img', { name: 'Preview refresh pending', exact: true })
+      const releaseCleanPreview = reactEffectScheduler.releaseCleanPreview!
+      reactEffectScheduler.deferCleanPreview = false
+      await act(async () => { releaseCleanPreview() })
+
+      expect(screen.getByRole('img', { name: 'Preview refresh pending', exact: true })).toBeTruthy()
+      const save = screen.getByRole('button', { name: 'Save all changes' }) as HTMLButtonElement
+      expect((screen.getByLabelText('Effort codex.worker') as HTMLInputElement).value).toBe('new-effort')
+      expect(save.disabled).toBe(false)
+
+      await act(async () => {
+        actionPreview = 'error'
+        pendingPreview.reject(new Error('preview unavailable'))
+        await pendingPreview.promise.catch(() => undefined)
+      })
+      await screen.findByText(/current settings preview is unavailable: preview unavailable/)
+      actionPreview = 'response'
+      fireEvent.click(save)
+      await waitFor(() => expect(api.patchGlobalConfig).toHaveBeenCalledTimes(1))
+      expect(api.patchGlobalConfig).toHaveBeenCalledWith({
+        expected_revision: config.revision,
+        actions: [{ type: 'upsert_profile', harness: 'codex', profile: 'worker', effort: 'new-effort' }],
+      })
+      expect(api.saveSettings).not.toHaveBeenCalled()
+    } finally {
+      view.unmount()
+      reactEffectScheduler.deferCleanPreview = false
+      reactEffectScheduler.releaseCleanPreview = undefined
+    }
   })
   it('keeps a selected raw profile identity when Combobox Enter is consumed', async () => {
     const profileResponse: ProjectConfigFormResponse = {

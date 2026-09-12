@@ -1258,3 +1258,95 @@ cleanup, publication, exact-SHA CI, and live activation/browser acceptance;
 none are claimed by this local approval.
 
 No material findings
+
+---
+
+# Settings clean-preview ownership — cumulative review v01: rejected
+
+Base `6bf1f0decb91a1dce4fbcda40a2d8a065719d307` through
+HEAD `ae80e5f5c0b7ea7c62c9670f7db7e103376c15da`: 1 new / 1 total
+commit, cp1 v01. Reviewed all five changed files against the original plan.
+No prior findings or fix overlays apply to this handoff.
+
+R1 (P2, high confidence): settingsDraft.test.ts:89-104 never executes the
+released clean reconciliation; it tests only the semantic matcher. The component
+custom-effort case at GlobalSettings.test.tsx:503-514 adds readiness and an exact
+save assertion but no deferred clean release. Removing both production guards
+would leave the helper assertions unaffected. The diagnosed canonical-draft
+loss therefore lacks the explicitly required deterministic regression. Add
+bounded ordering around the actual production reconciliation (or a minimal
+shared pure reconciliation transition plus integration), verify canonical effort,
+Save, exact patch, preview ownership and genuine reversion. No other material
+finding was admitted; production guards match the planned repair.
+
+Reviewer commands from apps/aflow_app/web:
+- ./node_modules/.bin/vitest run src/components/GlobalSettings.test.tsx -t 'custom effort|typed custom effort|initial settings load|stale and reverted previews|unchanged label blur|failed preview unavailable|drops reverted edits': 10 passed.
+- ./node_modules/.bin/vitest run src/settingsDraft.test.ts: 9 passed.
+
+Retained worker transport.stdout in the registered parent checkout at
+/root/code/agent_flow/.aflow/runs/20260912t035523z-9c1e858a/turns/turn-001
+records successful TypeScript/Vite build (exit 0); result.json confirms completed
+cp1 v01. Worktree-relative receipt is absent. Cumulative git diff --check passed.
+No full suite or live writes. Original diagnosis proves pre-fix timing mechanism,
+not deterministic post-fix acceptance.
+
+Single private fix overlay:
+plans/in-progress/settings-clean-preview-ownership-20260912-cp01-v01.md.
+Original-plan review tracking updated; no implementation edits, squash, history
+rewrite, publication or activation. R1 must be resolved before another full
+cumulative review. Coordinator owns combined delivery and live acceptance.
+
+Material fixes required
+
+
+---
+
+# Settings clean-preview ownership — cumulative review v02: approved
+
+Unchanged Pre-Handoff Base HEAD: `6bf1f0decb91a1dce4fbcda40a2d8a065719d307`.
+Reviewed implementation HEAD: `b026603c63cba8d1bc94f03040eb031ccab33f8a`.
+Coverage: 1 new / 2 total commits, cp1 v01 (`ae80e5f5`) and cp1 v02
+(`b026603c`), including the original plan and active cp01-v01 fix overlay.
+Read the prior finding first, then reviewed the full original-base range,
+all five changed files, surrounding draft/preview ownership and affected tests.
+
+R1 resolved: the test-local effect scheduler captures the actual production
+clean callback and releases it after enabled-fieldset custom typing without
+Enter/blur. Pending state survives; the subsequent rejected preview remains
+owned and visible, Save remains eligible and sends exactly one effort-only
+upsert_profile with expected_revision and no server-settings write. This
+establishes canonical retention beyond the Combobox's local visible text.
+The shared pure transition also preserves a newer functional-updater draft
+independently and permits genuine baseline restoration. Existing reversion,
+late-preview, unchanged-blur and failed-preview coverage remains in place.
+The synchronous coordinator guard returns before invalidation/state writes;
+the pure updater guard retains newer declarations without side effects.
+No additional material findings passed the admission gate.
+
+Verification reused final retained worker command receipts in
+`/root/code/agent_flow/.aflow/runs/20260912t035523z-9c1e858a/turns/turn-003/transport.stdout`
+and the completed result.json; the supplied worktree-relative receipt is absent.
+From apps/aflow_app/web, final commands at 04:16 UTC passed:
+
+- `./node_modules/.bin/vitest run src/components/GlobalSettings.test.tsx -t 'custom effort|typed custom effort|initial settings load|stale and reverted previews|unchanged label blur|failed preview unavailable|drops reverted edits'`: 11 passed.
+- `./node_modules/.bin/vitest run src/settingsDraft.test.ts`: 9 passed.
+- `npm run build`: TypeScript/Vite passed, exit 0.
+
+Retained controlled missing-guard evidence at
+`/root/code/evidence/aflow-dogfood-20260909/settings-clean-preview-ownership-20260912-cp01-v01-prefixed-regression.log`
+shows the same actual-callback regression failing immediately after release:
+pending became settled and Save disabled. Final production guards are restored.
+Exact historical CI timing remains inferred. Reviewer cumulative
+`git diff --check 6bf1f0de HEAD` passed. No full suites or live writes.
+
+Approval includes both intentional tracked reviewer records in the single
+unpublished handoff commit, preserves all five reviewed implementation blobs,
+and removes the superseded private fix overlay. DEVLOG already has one handoff
+entry. No new fix plan or forced addition of private artifacts. Record final
+approved SHA in the ignored original plan after committing; leave it in place
+for engine finalization. Verify one final commit and clean tracked state.
+Coordinator owns combined delivery, publication, exact-SHA CI and live acceptance;
+this local approval does not claim those gates or alter integrated dashboard
+ownership and worker cleanup repairs.
+
+No material findings
