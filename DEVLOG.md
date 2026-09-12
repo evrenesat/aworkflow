@@ -13,6 +13,21 @@
 - Verification: the focused worker-diagnostics module passed all 17 tests,
   including the original real-child cases; Ruff and `git diff --check` passed.
 
+## 2026-09-12 — Preserve explicit dashboard actions during reconciliation
+
+- Removed the controls-default effect's redundant restart lifecycle reset.
+  Deferred initial status now preserves successor confirmation, with existing
+  exact owner-stop, inactivity, idempotency and lineage assertions retained.
+- Consolidated checkpoint selection and its notice into one run-owned state
+  reconciled by a pure functional update. Valid explicit selections survive
+  defaults and refresh; actual run changes reset and removed entries fall back
+  with the existing notice. Current checkpoint remains an explicit action.
+- Verification: 10 restart/successor tests, 15 checkpoint-history tests, two
+  dashboard full-context tests and the TypeScript/Vite build passed. Controlled
+  CP4/stale-CP5 reconciliation proves the mechanism, not historical CI network
+  timing. Full suites, combined integration and live browser acceptance remain
+  downstream gates.
+
 ## 2026-09-12 — Wait for the exact restart action in dashboard tests
 
 - The CI failure in `ci-378278-mac-failed.log` showed the restart journey

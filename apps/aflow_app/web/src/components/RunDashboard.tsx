@@ -1193,11 +1193,7 @@ export function RunDashboard({ visible = true, page, onNewRun, onCancelNewRun, o
     setRoleSelectors({})
     setConfirmOwnerStop(false)
     setConfirmResume(false)
-    if (!pendingSuccessorStart && !restartSource) {
-      setRestartPhase(null)
-      setRestartNotice(null)
-    }
-  }, [selectedRun, pendingSuccessorStart, restartSource])
+  }, [selectedRun])
 
   // A live elapsed clock only ticks while a nonterminal owned run is selected.
   useEffect(() => {

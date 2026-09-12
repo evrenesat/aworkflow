@@ -1737,9 +1737,10 @@ describe('RunDashboard', () => {
 
   it('restarts a workflow change through owner stop, exact inactive proof, and a lineage-linked successor', async () => {
     const stopped = { ...ownedRun, status: 'owner_stopped', launch_phase: 'owner_stopped' }
+    const initialStatus = deferred<typeof ownedRun>()
     vi.mocked(api.ownerStopControlPlaneRun).mockResolvedValue(stopped)
     vi.mocked(api.getControlPlaneRun)
-      .mockResolvedValueOnce(ownedRun)
+      .mockImplementationOnce(() => initialStatus.promise)
       .mockResolvedValue(stopped)
     vi.mocked(api.startControlPlaneRun).mockResolvedValue({
       result: { run_id: 'run-successor', created: true, status: 'running', schema_version: 1, manifest_path: null, reason: null, restarted_from_run_id: 'run-owned' },
@@ -1747,6 +1748,9 @@ describe('RunDashboard', () => {
     })
     renderDashboard({ restartPollIntervalMs: 1 })
 
+    const visibleRun = await screen.findByRole('button', { name: /run-owned Running/ })
+    fireEvent.click(visibleRun)
+    await waitFor(() => expect(api.getControlPlaneRun).toHaveBeenCalledTimes(1))
     fireEvent.click(await screen.findByRole('button', { name: 'Restart with changes' }))
     await screen.findByLabelText('Run plan')
     choose('Run plan', 'plans/in-progress/demo.md')
@@ -1760,6 +1764,17 @@ describe('RunDashboard', () => {
     expect(confirmation?.textContent).toContain('and start')
     expect(confirmation?.textContent).toContain('successor workflow')
     expect(screen.getAllByText('run-owned').length).toBeGreaterThanOrEqual(2)
+
+    await act(async () => {
+      initialStatus.resolve(ownedRun)
+      await initialStatus.promise
+    })
+    await waitFor(() => {
+      const retainedConfirmation = screen.getByRole('button', { name: preflightActionLabels.successor })
+      const retainedDetails = retainedConfirmation.closest('.confirmation')
+      expect(retainedDetails?.textContent).toContain('and start')
+      expect(retainedDetails?.textContent).toContain('successor workflow')
+    })
     fireEvent.click(confirmationButton)
 
     await waitFor(() => expect(api.startControlPlaneRun).toHaveBeenCalledWith(

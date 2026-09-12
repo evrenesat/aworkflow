@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from 'react'
+import { useEffect, useMemo, useState } from 'react'
 import type {
   RunProgressChange,
   RunProgressCount,
@@ -27,6 +27,38 @@ interface HistoryEntry {
   events: RunProgressDetailEvent[]
   title: string
   synthetic: boolean
+}
+
+export interface CheckpointSelectionState {
+  runKey: string | null
+  key: string | null
+  notice: string | null
+}
+
+interface CheckpointSelectionReconciliation {
+  runKey: string
+  preferredKey: string | null
+  availableKeys: ReadonlySet<string>
+}
+
+export function reconcileCheckpointSelection(
+  current: CheckpointSelectionState,
+  next: CheckpointSelectionReconciliation,
+): CheckpointSelectionState {
+  if (current.runKey !== next.runKey) {
+    return { runKey: next.runKey, key: next.preferredKey, notice: null }
+  }
+
+  if (current.key !== null && next.availableKeys.has(current.key)) return current
+  if (current.key === null && next.preferredKey === null) return current
+
+  const notice = current.key !== null
+    ? next.preferredKey
+      ? 'The previously selected checkpoint is no longer in the refreshed bounded history; showing the nearest available evidence.'
+      : 'The previously selected checkpoint is no longer in the refreshed bounded history; no replacement evidence was returned.'
+    : null
+  if (current.key === next.preferredKey && current.notice === notice) return current
+  return { runKey: next.runKey, key: next.preferredKey, notice }
 }
 
 const ACTIVE_CHECKPOINT_STATUSES = new Set(['implementing', 'reviewing', 'repairing'])
@@ -446,29 +478,20 @@ export function CheckpointHistory({ projectId, run, progress, detail }: Checkpoi
     const approved = [...entries].reverse().find(entry => entry.checkpoint?.status === 'approved' || entry.checkpoint?.status === 'recorded_complete')
     return approved?.key ?? entries[0]?.key ?? null
   }, [currentEntryKey, entries])
-  const [selectedEntryKey, setSelectedEntryKey] = useState<string | null>(null)
   const [navigationVersion, setNavigationVersion] = useState(0)
-  const [selectionNotice, setSelectionNotice] = useState<string | null>(null)
-  const selectionRunRef = useRef<string | null>(null)
-  const entrySignature = entries.map(entry => entry.key).join('\u0000')
+  const [selection, setSelection] = useState<CheckpointSelectionState>({ runKey: null, key: null, notice: null })
+  const entryKeys = useMemo(() => new Set(entries.map(entry => entry.key)), [entries])
 
   useEffect(() => {
-    if (selectionRunRef.current !== runKey) {
-      selectionRunRef.current = runKey
-      setSelectedEntryKey(preferredEntryKey)
-      setSelectionNotice(null)
-      return
-    }
-    const stillPresent = selectedEntryKey !== null && entries.some(entry => entry.key === selectedEntryKey)
-    if (stillPresent) return
-    if (selectedEntryKey !== null) {
-      setSelectionNotice(preferredEntryKey
-        ? 'The previously selected checkpoint is no longer in the refreshed bounded history; showing the nearest available evidence.'
-        : 'The previously selected checkpoint is no longer in the refreshed bounded history; no replacement evidence was returned.')
-    }
-    setSelectedEntryKey(preferredEntryKey)
-  }, [entrySignature, entries, preferredEntryKey, runKey, selectedEntryKey])
+    setSelection(current => reconcileCheckpointSelection(current, {
+      runKey,
+      preferredKey: preferredEntryKey,
+      availableKeys: entryKeys,
+    }))
+  }, [entryKeys, preferredEntryKey, runKey])
 
+  const selectionIsCurrent = selection.runKey === runKey
+  const selectedEntryKey = selectionIsCurrent ? selection.key : null
   const selectedEntry = entries.find(entry => entry.key === selectedEntryKey) ?? null
   const runElapsed = executionDuration(run, Date.now())
   const currentExecutor = summary?.current_executor ?? null
@@ -478,8 +501,9 @@ export function CheckpointHistory({ projectId, run, progress, detail }: Checkpoi
     : null
 
   function selectEntry(key: string): void {
-    setSelectedEntryKey(key)
-    setSelectionNotice(null)
+    setSelection(current => current.runKey === runKey && current.key === key && current.notice === null
+      ? current
+      : { runKey, key, notice: null })
     setNavigationVersion(value => value + 1)
   }
 
@@ -520,7 +544,7 @@ export function CheckpointHistory({ projectId, run, progress, detail }: Checkpoi
       <ExecutorRow label="Last executor" executor={lastExecutor} />
       <div><dt>Current attempt</dt><dd>{currentAttempt ?? 'Not reported'}</dd></div>
     </dl>
-    {selectionNotice && <p className="notice" role="status">{selectionNotice}</p>}
+    {selectionIsCurrent && selection.notice && <p className="notice" role="status">{selection.notice}</p>}
     {!detailAvailable && <p className="notice" role="status">Detailed checkpoint history is loading or unavailable; summary facts remain from the selected-run record.</p>}
     {detailAvailable && <div className="checkpoint-history-layout">
       <SidebarEditorLayout

@@ -1213,3 +1213,48 @@ and records the final approved SHA outside the commit. Publication, exact-SHA
 CI and live activation remain downstream controller delivery gates.
 
 No material findings
+
+---
+
+# Dashboard selection ownership — cumulative review v01: approved
+
+Unchanged Pre-Handoff Base HEAD: `e77470fb59fc6aa990a351a0f0e126e085764d72`.
+Reviewed HEAD: `8d771794f5dc086047ba34286b5608af5ddb1c36`.
+Coverage: 2 new / 2 total commits, cp1 v01 (`d776ed7d`) and cp2 v01
+(`8d771794`). Original and active plan: dashboard-selection-ownership-20260912.md.
+No previous findings or follow-up overlays apply to this handoff.
+
+Reviewed the full original-base diff and surrounding restart lifecycle,
+checkpoint ownership/reconciliation, run-switch coverage, and diagnostics Refresh
+assertions. The restart change removes only the competing defaults owner;
+explicit cancellation, completion, rejection and frozen-successor owners remain.
+Checkpoint reconciliation reads the latest functional state and keeps selection
+and notice coherent without updater side effects. Same-run valid selection is
+preserved; exact run changes, removed entries and Current checkpoint retain their
+specified behavior. No material findings pass the admission gate.
+
+Reused completed worker results and raw command receipts in the registered
+parent checkout `/root/code/agent_flow/.aflow/runs/20260912t033545z-31c5cbd9/turns/`
+(turns 001 and 002); the prompt's worktree-relative receipt is absent.
+From apps/aflow_app/web, retained successful commands were:
+
+- `./node_modules/.bin/vitest run src/components/RunDashboard.test.tsx -t 'restart|successor'`: 10 passed after generating the missing changelog artifact.
+- `./node_modules/.bin/vitest run src/components/CheckpointHistory.test.tsx`: 15 passed in the final post-edit run.
+- `./node_modules/.bin/vitest run src/components/RunDashboard.test.tsx -t 'inspects selected checkpoint|late checkpoint'`: 2 passed in the final post-edit run.
+- `npm run build`: final TypeScript/Vite build passed, exit 0.
+
+Reviewer cumulative `git diff --check e77470fb HEAD` passed. No redundant test
+or build reruns, full suites, shared runtime changes or live writes. The CP4
+regression uses controlled pure reconciliation plus component refresh coverage;
+it does not establish historical CI network timing. No visual layout changes.
+
+Approval finalization compacts the two DEVLOG entries and includes this tracked
+review record in exactly one unpublished handoff commit after the unchanged base.
+Preserve all reviewed implementation/test blobs; no fix plan exists or is created.
+Keep the ignored original plan in place and record the final approved SHA there
+without creating another commit. Verify one accumulated commit and clean tracked
+state. Coordinator owns combined integration with independent worker-receipt
+cleanup, publication, exact-SHA CI, and live activation/browser acceptance;
+none are claimed by this local approval.
+
+No material findings

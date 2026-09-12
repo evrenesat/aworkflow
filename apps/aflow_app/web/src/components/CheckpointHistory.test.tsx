@@ -9,7 +9,7 @@ import type {
   RunProgressSummary,
   RunStatus,
 } from '../types'
-import { CheckpointHistory } from './CheckpointHistory'
+import { CheckpointHistory, reconcileCheckpointSelection, type CheckpointSelectionState } from './CheckpointHistory'
 
 function count(value: number | null, coverage: RunProgressCount['coverage'] = value === null ? 'unavailable' : 'complete'): RunProgressCount {
   return { value, coverage }
@@ -119,6 +119,29 @@ afterEach(() => {
 })
 
 describe('CheckpointHistory', () => {
+  it('preserves an explicit current-run CP4 against a stale CP5 default', () => {
+    const selected: CheckpointSelectionState = {
+      runKey: 'project-current/run-current',
+      key: 'checkpoint:cp-4',
+      notice: null,
+    }
+    const reconciled = reconcileCheckpointSelection(selected, {
+      runKey: 'project-current/run-current',
+      preferredKey: 'checkpoint:cp-5',
+      availableKeys: new Set(['checkpoint:cp-4', 'checkpoint:cp-5']),
+    })
+
+    expect(reconciled).toBe(selected)
+    expect(reconciled.key).toBe('checkpoint:cp-4')
+
+    const switchedRun = reconcileCheckpointSelection(selected, {
+      runKey: 'project-successor/run-current',
+      preferredKey: 'checkpoint:cp-4',
+      availableKeys: new Set(['checkpoint:cp-4', 'checkpoint:cp-5']),
+    })
+    expect(switchedRun).toEqual({ runKey: 'project-successor/run-current', key: 'checkpoint:cp-4', notice: null })
+  })
+
   it('shows the worker, rejection, repair and upgrade evidence without inventing delivery', () => {
     render(<CheckpointHistory projectId="project-current" run={run} progress={summary()} detail={detail()} />)
 
@@ -219,6 +242,43 @@ describe('CheckpointHistory', () => {
     view.rerender(<CheckpointHistory projectId="project-current" run={successor} progress={successorSummary} detail={detail({ ...successorSummary })} />)
     expect(document.querySelector('.checkpoint-history-detail-heading h5')?.textContent).toBe('Checkpoint 3: Pending')
     expect(document.querySelector('.checkpoint-history-detail > p:last-child')?.textContent).toContain('successor of run-current')
+  })
+
+  it('retains an explicit CP4 through a CP5 default refresh and follows Current checkpoint on request', () => {
+    const cp4 = checkpoint({ checkpoint_id: 'cp-4', ordinal: 4, title: 'Checkpoint 4: Reviewed', status: 'approved' })
+    const cp5 = checkpoint({ checkpoint_id: 'cp-5', ordinal: 5, title: 'Checkpoint 5: Active', status: 'implementing' })
+    const initialSummary = summary({ current_checkpoint_id: 'cp-5', current_checkpoint_ordinal: 5, current_checkpoint_title: 'Checkpoint 5: Active' })
+    const initial = detail({ ...initialSummary, checkpoints: [cp4, cp5], events: [] })
+    const view = render(<CheckpointHistory projectId="project-current" run={run} progress={initialSummary} detail={initial} />)
+
+    fireEvent.click(screen.getByRole('button', { name: /Checkpoint 4: Reviewed/ }))
+    expect(document.querySelector('.checkpoint-history-detail-heading h5')?.textContent).toBe('Checkpoint 4: Reviewed')
+
+    const refreshedSummary = summary({ ...initialSummary, phase: 'reviewing' })
+    const refreshed = detail({ ...refreshedSummary, checkpoints: [
+      { ...cp4, status: 'recorded_complete' },
+      { ...cp5, status: 'implementing' },
+    ], events: [] })
+    view.rerender(<CheckpointHistory projectId="project-current" run={run} progress={refreshedSummary} detail={refreshed} />)
+    expect(document.querySelector('.checkpoint-history-detail-heading h5')?.textContent).toBe('Checkpoint 4: Reviewed')
+
+    fireEvent.click(screen.getByRole('button', { name: 'Current checkpoint' }))
+    expect(document.querySelector('.checkpoint-history-detail-heading h5')?.textContent).toBe('Checkpoint 5: Active')
+  })
+
+  it('shows the existing fallback notice when the selected checkpoint is removed', () => {
+    const cp4 = checkpoint({ checkpoint_id: 'cp-4', ordinal: 4, title: 'Checkpoint 4: Reviewed', status: 'approved' })
+    const cp5 = checkpoint({ checkpoint_id: 'cp-5', ordinal: 5, title: 'Checkpoint 5: Active', status: 'implementing' })
+    const currentSummary = summary({ current_checkpoint_id: 'cp-5', current_checkpoint_ordinal: 5, current_checkpoint_title: 'Checkpoint 5: Active' })
+    const initial = detail({ ...currentSummary, checkpoints: [cp4, cp5], events: [] })
+    const view = render(<CheckpointHistory projectId="project-current" run={run} progress={currentSummary} detail={initial} />)
+
+    fireEvent.click(screen.getByRole('button', { name: /Checkpoint 4: Reviewed/ }))
+    const refreshed = detail({ ...currentSummary, checkpoints: [cp5], events: [] })
+    view.rerender(<CheckpointHistory projectId="project-current" run={run} progress={currentSummary} detail={refreshed} />)
+
+    expect(document.querySelector('.checkpoint-history-detail-heading h5')?.textContent).toBe('Checkpoint 5: Active')
+    expect(screen.getByText(/previously selected checkpoint is no longer in the refreshed bounded history/)).toBeDefined()
   })
 
   it('keeps the selected parent checkpoint through generation and current-checkpoint refresh', () => {
