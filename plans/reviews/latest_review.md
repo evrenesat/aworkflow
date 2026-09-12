@@ -1626,4 +1626,232 @@ Coordinator owns serialized integration, publication, exact-SHA CI and live
 activation, preserving concurrent ui-data-latency-discovery work. These delivery
 gates and physical-mobile acceptance are not claimed by this local review.
 
+
+---
+
+## UI data latency discovery — cumulative review v01 rejected, 2026-09-12
+
+Base: `304a39fd24b2d330d2533d041f3eb2776504086c`.
+HEAD: `4bef5c55f354cfe0224610843d8675df96ae94b1`.
+Coverage: 2 new / 2 total commits (`7b3f9000`, cp1 v01; `4bef5c55`, cp2 v01),
+full original plan and full accumulated discovery implementation. No prior
+findings or fix overlays apply. Product-source diff is empty.
+
+Applied material-code-review admission gate, exclusions and proportionate fixes.
+Four admitted findings, all high confidence:
+
+- F1 / P1: `profile_ui_data_load.py:972-975,1060-1065` accepts empty checkpoint headings and retained pre-refresh detail. A Chromium probe returned true on zero entries and Refresh success while pending (108.41 ms); the retained first warm Refresh has all new fetches unresolved at its claimed 96.013 ms completion. Require actual records and post-trigger accepted data.
+- F2 / P1: improvement plan lines 136-139,256-261 and analyzer lines 819-827 mix the only retained browser fixture (12 runs/6 events) with 100/1000-run, 8/80-event acceptance. The 27,948-byte smoke bound is applied to a 100-row list whose canonical profile payload is 232,448 bytes. Missing scale/live coverage cannot be replaced by fixture definitions or service profiles; report values are hardcoded. Correct coverage, identities and same-fixture targets.
+- F3 / P2: `profile_control_plane_reads.py:294-297` adds 300 calls each to three nested projection functions as 900 projections. Count a single canonical entry point so the future one-per-row gate is meaningful.
+- F4 / P2: `profile_control_plane_reads.py:352-361` drops each raw timing sample while retaining only medians/ranges. Preserve sanitized samples and derive report statistics from them.
+
+One self-contained non-checkpoint fix plan written to
+`plans/in-progress/ui-data-latency-discovery-20260912-cp01-v01.md`.
+No optimization implemented, no squash or history rewrite, no DEVLOG compaction.
+Original plan remains for the engine with this rejection recorded. The tracked
+reviewer record is intentional bookkeeping, not unrelated worktree noise.
+
+Verification: parsed retained baseline (46 error-free smoke samples only),
+inspected CP2 per-function counts and raw-sample absence, inspected both worker
+result receipts under the registered parent repository run
+`20260912t123823z-4f0a10bb`, and ran bounded Chromium DOM probes using
+`uv run --frozen --project apps/aflow_app/server python` with the runner's actual
+route predicate and capture_refresh function. Both negative cases reproduce.
+Cumulative `git diff --check` passes. Reused valid retained evidence; no full
+suites, live captures, shared installation changes or service restarts.
+
+Separate improvement plan (not ready for dispatch):
+`plans/in-progress/ui-data-latency-improvements-20260912.md`. Source mapping:
+run-list finding to `RunRepository.list_history/get_run_status/_with_progress`,
+`AflowDaemon.run_status`, `ControlPlaneService.list_runs/_status` and progress
+projection; proposed event finding to persistence `read_events`, repository
+`tail_events`, daemon `poll_events`, service `events`, HTTP event models/route
+and `RunDashboard.loadSelectedRun`. Revalidate the event proposal's critical-path
+support in the fix pass. Coordinator owns serialized integration/publication/CI.
+
+Material fixes required
+
+
+## UI data-latency discovery — cumulative review v02 rejected
+
+- Unchanged base: `304a39fd24b2d330d2533d041f3eb2776504086c`.
+- Reviewed HEAD: `951a3d26a4ca462ff5251ff6153abc3f65b94596`.
+- 2 new / 4 total commits: cp1 v01 `7b3f9000`, cp2 v01 `4bef5c55`,
+  cp1 v02 tooling `1d9e7321` and evidence `951a3d26`.
+- Both original checkpoints and both follow-ups were considered from the
+  unchanged base; prior-finding verification prevents cumulative approval.
+  No squash, implementation edits, publication or live activation.
+
+F1 remains unresolved (P1/high confidence), at
+`scripts/perf/profile_ui_data_load.py:1064-1071`: the selected-summary predicate
+accepts any visible status once direct-status JSON finishes, although the real
+owner waits for events before accepting that status. A real isolated Chromium
+probe returned `failed` in the synthetic direct-status response, held events,
+and observed predicate acceptance with `Completed` still rendered. One event
+request remained held. This corrupts accepted-summary and selection timings.
+Use accepted generation/data readiness and real held-response tests; retain
+empty-history rejection and verify Refresh's accepted-render boundary too.
+
+F5 is new (P2/high confidence), at
+`scripts/perf/analyze_ui_data_latency.py:221-222,280-295`: Refresh and in-app
+useful durations start at the action, while fetch completion timestamps start
+at document creation. The retained first small-short-history Refresh reports
+15510.862 ms useful versus 22981.7 ms required completion, generating a false
+-7470.838 ms gap; its first in-app cycle produces -2319.026 ms. Normalize both
+milestones and request comparisons to a recorded common browser clock origin.
+
+Previous dispositions: F2's coverage, stable selected fixture, in-app cycles,
+fixture-specific bounds and honest live/event gates are repaired; dependent
+browser timings still need F1/F5 correction. F3 canonical projection counting
+and F4 raw timing retention are resolved. No need to repeat their profiles.
+
+Verification: focused `uv run --frozen --project apps/aflow_app/server pytest
+-q scripts/perf/test_ui_data_latency.py --basetemp
+/tmp/aflow-latency-review-v02-tests` passed (8 tests); Ruff and cumulative
+`git diff --check 304a39f HEAD` passed. Inspected 184 retained samples with zero
+reported errors: per fixture, 30 warm, 6 fresh-process, 10 in-app cycles.
+Independently recomputed core medians for all 28 five-sample profile records.
+Product paths have an empty base-to-HEAD diff. Read retained worker turn-004
+receipt. Reviewer real-browser negative probe result is external at
+`/tmp/aflow-latency-review-v02-summary-probe.json`; an initial probe diagnostic
+had a strict-locator error, corrected by selecting the actual first status
+pill. No full suite, live capture, shared-tool change or service restart.
+
+One focused overlay replaces v01:
+`plans/in-progress/ui-data-latency-discovery-20260912-cp01-v02.md`.
+Keep the original plan in place. Preserve previous reviewer records and
+resolved evidence. History remains unchanged.
+
+Separate improvement handoff (not approved for dispatch):
+`plans/in-progress/ui-data-latency-improvements-20260912.md`.
+List mapping: `RunRepository.list_history/get_run_status/_with_progress`,
+`AflowDaemon.run_status`, `ControlPlaneService.list_runs/_status`, progress
+projection. Event gate mapping: persistence `read_events`, repository
+`tail_events`, daemon `poll_events`, service `events`, HTTP event route/models,
+`RunDashboard.loadSelectedRun`, web API/types. Event pagination remains blocked
+on causal measurement. Owner-facing symptom remains unmeasured. Coordinator
+owns serialized integration, publication and CI/live verification.
+
+Material fixes required
+
+
+## UI data latency discovery — cumulative review v03 rejected, 2026-09-12
+
+Base: `304a39fd24b2d330d2533d041f3eb2776504086c` (unchanged).
+Reviewed HEAD: `4c477de457edcc3aaa3960c117d689da5cb9b778`.
+Coverage: 6 new / 10 total commits; cp1 v01, cp2 v01, both cp1 v02,
+cp1 v03, all four cp1 v04 and cp1 v05. Reviewed both original checkpoints,
+the active overlay, all nine cumulative changed files and surrounding request
+owners. Prior findings were verified before the renewed cumulative review.
+
+F1 resolved: retained selected-summary held-event regression plus reviewer
+real Chromium Refresh probe. With direct Failed status returned and events
+held, acceptance stayed false, including after unrelated DOM mutation;
+after release it became true with Failed rendered. F2 coverage/fixed identities
+and honest live/event gates remain resolved. F3 canonical projection counts
+and F4 retained raw timing records remain resolved. F5 common-clock analysis
+passes document-age invariance. No previous finding remains open.
+
+One new admitted finding, F6 / P2 / high confidence:
+`scripts/perf/analyze_ui_data_latency.py:165-168` treats configuration reads
+as optional on explicit Refresh although the actual owner awaits GET config
+and POST config/form inside loadDashboard before requesting selected data.
+A real isolated held-config probe completed list JSON but started no selected
+status/events and timed out at 45 seconds with 1/3 required reads complete.
+This disproves the optional classification and hides an actual blocking
+predecessor in the required discovery dependency attribution. Correct the
+route/action-specific analysis and generated report, with a focused held-
+prerequisite regression; reuse raw samples. Do not optimize product sequencing.
+
+Evidence: external `/tmp/aflow-latency-review-v03-probe.{py,json}` (held config)
+and `/tmp/aflow-latency-review-v03-refresh.{py,json}` (successful F1 verification).
+The initial suspicion that background polling could bypass held config was
+ruled out, not admitted as a finding. Four focused reviewer tests passed via
+`uv run --frozen --project apps/aflow_app/server pytest -q
+scripts/perf/test_ui_data_latency.py -k 'action_relative or projection_breakdown
+or timing_summary or fixture_pairing' --basetemp <external-dir>/pytest`.
+Inspected 184 retained samples: zero errors, 46 per fixture, all clock fields
+present; independently recomputed 24 normal direct-operation core medians.
+Reused worker turn-006 smoke and focused-test receipts; no full suite or scale
+recollection. Cumulative whitespace check passed; product-source diff empty.
+All reviewer servers used disposable state and unique loopback ports, then
+stopped. No shared installation change, live read or service restart.
+
+Sole fix overlay: `plans/in-progress/ui-data-latency-discovery-20260912-cp01-v03.md`.
+Superseded v02 removed after preserving all prior dispositions. No history
+rewrite, squash, approval, DEVLOG compaction or publication. Original plan
+stays in place for the engine; tracked reviewer bookkeeping is intentional.
+
+Separate improvement plan remains
+`plans/in-progress/ui-data-latency-improvements-20260912.md` (dispatch pending
+review). Product source: `304a39fd`; corrected browser runner: `37f83864`.
+List mapping: repository list_history/get_run_status/_with_progress, daemon
+run_status, service list_runs/_status, progress projection. Event mapping:
+persistence read_events, repository tail_events, daemon poll_events, service
+events, HTTP event routes/models, web API/types and RunDashboard.loadSelectedRun.
+Event pagination and owner-facing baseline remain gated. Coordinator owns
+serialized integration/publication and exact-SHA CI/live verification.
+
+Material fixes required
+
+
+## UI data latency discovery — cumulative review v04 approved, 2026-09-12
+
+Base: `304a39fd24b2d330d2533d041f3eb2776504086c` (unchanged).
+Reviewed HEAD: `4e5ff5e5480ceee648185cca0d9879ccbc9d06aa`.
+Coverage: 1 new / 11 total commits: cp1 v01, cp2 v01, both cp1 v02,
+cp1 v03, four cp1 v04, cp1 v05 and cp1 v06. Read the active v03 overlay
+and prior findings first, then reviewed both original checkpoints and all nine
+cumulative changed files, actual browser/service/repository owners and the
+separate improvement handoff from the original base through HEAD.
+
+F1–F6 resolved. F1 rejects empty/stale selected data and held event generations;
+F2 retains four fixed-identity fixture shapes, full bounded browser coverage
+and explicit live/event gates; F3 counts the canonical repository projection
+separately from nested helpers; F4 retains raw timing samples; F5 uses a common
+action clock; F6 now maps configuration/capability/plan Refresh prerequisites
+as blocking without promoting initial-route configuration. No new material
+finding passes the admission gate. No optimization was implemented.
+
+Independent verification:
+
+```sh
+uv run --frozen --project apps/aflow_app/server pytest -q scripts/perf/test_ui_data_latency.py --basetemp /tmp/aflow-latency-review-v04-pytest
+uv run --frozen ruff check scripts/perf
+git diff --check 304a39fd24b2d330d2533d041f3eb2776504086c HEAD
+git diff --check
+git diff --name-only 304a39fd24b2d330d2533d041f3eb2776504086c HEAD -- aflow apps/aflow_app
+```
+
+15 tests passed in 17.93s, including real isolated Chromium held-config and
+held-event cases; lint/whitespace passed and product diff is empty. Independent
+JSON inspection verified unchanged 184 normal + 48 paired normal + 48 paired
+counterfactual samples and all 28 profile records against v03 HEAD. Recomputed
+all 28 five-sample core medians. Each fixture retains 30 warm, 6 fresh-process
+and 10 in-app samples; normal samples have no errors and retain action clocks.
+Every warm Refresh has 3 displayed-data, 4 blocking, 7 total required and 1
+optional requests. Report regeneration agrees in values/content; loading
+sorted JSON merely reorders three event/context table rows. Secret-marker
+check passed. Reused retained scale/profile evidence and completed worker
+turn-008 result from the parent repository; no full suite or live capture.
+
+Approve and squash all 11 handoff commits into one unpublished commit after
+the unchanged base, including this already-tracked review history and a single
+compact DEVLOG entry. Preserve all other reviewed blobs. Remove the resolved
+private v03 overlay; do not create v04 or force-add private artifacts. Leave
+the original plan in place and record the final SHA there after the commit.
+Finalization must verify one commit after base and clean tracked state.
+
+Separate handoff: `plans/in-progress/ui-data-latency-improvements-20260912.md`.
+Product evidence source: `304a39fd24b2d330d2533d041f3eb2776504086c`;
+corrected browser evidence runner: `37f83864be6b97ff40e420e62b181e1e07414091`.
+Run-list mapping: repository `list_history/get_run_status/_with_progress`,
+daemon `run_status`, service `list_runs/_status`, progress projection.
+Gated event mapping: persistence `read_events`, repository `tail_events`,
+daemon `poll_events`, service `events`, HTTP event models/routes, web API/types
+and `RunDashboard.loadSelectedRun`. Dispatch only the evidenced list work;
+event pagination requires its measurement gate. Owner-facing baseline remains
+BLOCKED. Coordinator owns dispatch, serialized integration/publication and
+exact-SHA CI/live activation; none is claimed completed by this review.
+
 No material findings

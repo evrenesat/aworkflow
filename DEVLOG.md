@@ -21,6 +21,26 @@
   The reviewer timing is 2m 26s with 6m 13s union coverage. Publication,
   exact-SHA CI and live acceptance remain coordinator-owned delivery gates.
 
+## 2026-09-12 — Discover UI data latency without product changes
+
+- Added bounded browser and control-plane profiling with fixed seed 20260912,
+  100/1,000-run fixtures, independent 8/80-event histories, five warm samples,
+  labelled fresh processes and ten in-app selection cycles. Useful milestones
+  require selected data and accepted request generations; analysis uses one
+  browser action clock and identifies Refresh configuration prerequisites.
+- Retained sanitized raw samples, canonical projection counts, CPU/wall/IO
+  profiles and causal counterfactuals under
+  `plans/research/ui-data-latency-20260912/`. Duplicate list progress work is
+  actionable; event pagination remains gated on a same-fixture HTTP experiment.
+- Separate unexecuted handoff:
+  `plans/in-progress/ui-data-latency-improvements-20260912.md`. The owner-facing
+  four-second symptom remains unmeasured pending URL/credentials/reference
+  identity. Discovery makes no claim of improved product latency.
+- Verification: 15 focused runner/browser regressions, Ruff, retained sample
+  and profile checks, and whitespace validation passed. Product source, live
+  services and shared installations are unchanged. Readability work remains
+  independent; coordinator owns integration, publication, full CI and live checks.
+
 ## 2026-09-12 — Retain unfinished family wizard across guided tabs
 
 - GlobalSettings now keeps the existing TeamFamiliesSettings owner mounted for
