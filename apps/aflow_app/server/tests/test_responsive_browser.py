@@ -539,10 +539,14 @@ def _assert_global_run_row(
     title: str,
     status: str = "Completed",
 ):
-    """Return the one global row ending in the exact full run identity."""
+    """Return the one global row with the exact project and full run identity."""
     row = page.locator("button.global-run-row").and_(
         page.get_by_role(
             "button", name=re.compile(rf" · {re.escape(run_id)}$")
+        )
+    ).filter(
+        has=page.locator(".global-run-row-project").filter(
+            has_text=re.compile(rf"^{re.escape(project_label)}$")
         )
     )
     expect(row).to_have_count(1)
@@ -2919,8 +2923,10 @@ def test_durable_recovery_ui_journey(control_client, monkeypatch, tmp_path):
     original_status = repository.get_run_status
     source_active = False
 
-    def source_status(run_id: str):
-        status = original_status(run_id)
+    def source_status(
+        run_id: str, *, include_progress: bool = True
+    ):
+        status = original_status(run_id, include_progress=include_progress)
         if run_id != source_id:
             return status
         return replace(
@@ -2936,6 +2942,7 @@ def test_durable_recovery_ui_journey(control_client, monkeypatch, tmp_path):
         )
 
     monkeypatch.setattr(repository, "get_run_status", source_status)
+    assert source_status(source_id, include_progress=False).progress is None
     dist = Path(__file__).resolve().parents[2] / "web" / "dist"
     monkeypatch.setenv("AFLOW_APP_WEB_DIST", str(dist))
     evidence_root = tmp_path / "issue36-recovery"
@@ -3001,6 +3008,9 @@ def test_durable_recovery_ui_journey(control_client, monkeypatch, tmp_path):
                 successor_id = successor_identity.get_attribute("aria-label")
                 assert successor_id
                 assert successor_id != source_id
+                assert source_status(
+                    successor_id, include_progress=False
+                ).progress is None
                 page.wait_for_function(
                     "expected => new URL(location.href).searchParams.get('run') === expected",
                     arg=successor_id,

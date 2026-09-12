@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import replace
 import json
 from pathlib import Path
 from types import SimpleNamespace
@@ -159,12 +160,15 @@ def _daemon_fixture(
     repository = daemon.application.repository
     original_get_status = repository.get_run_status
 
-    def get_status(run_id: str):
+    def get_status(
+        run_id: str, *, include_progress: bool = True
+    ) -> RunStatus:
         if run_id == source_id:
-            return status
-        return original_get_status(run_id)
+            return status if include_progress else replace(status, progress=None)
+        return original_get_status(run_id, include_progress=include_progress)
 
     monkeypatch.setattr(repository, "get_run_status", get_status)
+    assert get_status(source_id, include_progress=False).progress is None
     if context is None:
         context = ResumeContext(
             resumed_from_run_id=source_id,
@@ -271,6 +275,12 @@ def test_valid_recovery_persists_successor_provenance_without_source_mutation(
     )
 
     assert result.status == "running"
+    assert (
+        daemon.application.repository.get_run_status(
+            result.run_id, include_progress=False
+        ).progress
+        is None
+    )
     assert target_calls == []
     record = daemon.service._read_record(result.run_id)
     assert record["recovery"] == _recovery_request()

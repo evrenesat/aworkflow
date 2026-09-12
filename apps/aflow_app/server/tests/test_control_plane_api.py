@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from contextlib import contextmanager
+from dataclasses import replace
 import json
 from pathlib import Path
 import subprocess
@@ -303,10 +304,15 @@ def _seed_recovery_source(
     repository = daemon.application.repository
     original_get_status = repository.get_run_status
 
-    def get_status(run_id: str):
-        return source if run_id == source_id else original_get_status(run_id)
+    def get_status(
+        run_id: str, *, include_progress: bool = True
+    ) -> RunStatus:
+        if run_id == source_id:
+            return source if include_progress else replace(source, progress=None)
+        return original_get_status(run_id, include_progress=include_progress)
 
     monkeypatch.setattr(repository, "get_run_status", get_status)
+    assert get_status(source_id, include_progress=False).progress is None
     bootstrap = SimpleNamespace(
         workflow_name="managed",
         repo_root=root,
@@ -1428,6 +1434,12 @@ def test_rest_durable_recovery_preserves_lineage_and_safe_admission_errors(
     successor = resumed.json()
     successor_id = successor["run_id"]
     assert successor_id != source_id
+    assert (
+        daemon.application.repository.get_run_status(
+            successor_id, include_progress=False
+        ).progress
+        is None
+    )
     assert len(units.start_calls) == 1
     assert _source_artifact_bytes(source_dir) == before
 

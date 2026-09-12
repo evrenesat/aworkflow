@@ -332,17 +332,23 @@ def test_complete_navigation_and_launch_journeys(control_client, monkeypatch, tm
                     _assert_theme(page, theme)
                     page.get_by_role('heading', name='All runs', exact=True).wait_for()
                     page.get_by_label('Search loaded runs', exact=True).fill(run_id)
-                    exact_row = _assert_global_run_row(
+                    parent_row = _assert_global_run_row(
                         page,
                         run_id,
                         project_label=parent_name,
                         title='Journey ready',
                     )
-                    exact_row.wait_for()
+                    _assert_global_run_row(
+                        page,
+                        run_id,
+                        project_label=parent_name + ' · Worktree: ' + worktree_name,
+                        title='Journey ready',
+                    )
+                    parent_row.wait_for()
                     page.get_by_label('Search loaded runs', exact=True).fill('')
                     page.get_by_label('Run history', exact=True).select_option('all')
-                    exact_row.wait_for()
-                    exact_row.click()
+                    parent_row.wait_for()
+                    parent_row.click()
                     _assert_run_detail(page, 'Journey ready', run_id)
                     page.wait_for_function(
                         "new URL(location.href).searchParams.get('project') === 'test-project' && "

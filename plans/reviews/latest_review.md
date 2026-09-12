@@ -1980,3 +1980,47 @@ Publication, exact-source CI, activation, screenshot inspection and idle p100
 pending. This review does not certify deployed usability or waive those targets.
 
 No material findings
+# CI progress wrappers and project identity — cumulative review approved
+
+Review base: `795e16af54bd36b29418ba951a1f368177e51783` (unchanged Pre-Handoff Base HEAD).
+Reviewed HEAD: `5b4ebbeb336a0dd1cc70267493fee30723236c8f`.
+Coverage: 1 new / 1 total commit, `cp1 v01`, all six changed files and the
+complete original `ci-progress-wrapper-project-identity-20260912` plan.
+No previous findings or follow-up plans apply to this handoff.
+
+No material findings passed the admission gate. All four affected wrappers
+accept the explicit projection keyword; delegated reads forward its value,
+synthetic false-mode reads omit progress, and intentional admission/status
+overrides remain intact. The fifth audited wrapper is already compliant and
+unchanged. Global-row selection matches escaped exact project label and full
+run ID before uniqueness. Both parent/worktree duplicates are asserted, the
+parent is clicked, and exact project/run URL and later journey assertions remain.
+Production, recovery lineage, source immutability, fixtures and CI inventory
+are unchanged. No portable test embeds a private host evidence path.
+
+Verification reused inspected worker command/output evidence in
+`/root/code/agent_flow/.aflow/runs/20260912t213120z-4beabcd9/turns/turn-001/transport.stdout`
+and its successful `result.json`, against the unchanged reviewed test blobs:
+
+- Exact plan core recovery/resume nodes: 14 passed in 1.03s.
+- Exact plan REST/MCP nodes: 5 passed in 4.53s. An initial wrong-path invocation
+  ran no tests; the corrected server-environment invocation passed.
+- Exact two Chromium journeys: 2 passed in 17.20s, executed once after the
+  successful required asset build. A preceding asset-existence guard exited
+  before pytest. Existing theme/viewport loops and behavioral assertions passed.
+- Test isolation used invocation-level `--basetemp` options. No retained
+  artifacts or external verifier were changed. No full local suites repeated.
+- Independent cumulative `git diff --check 795e16af HEAD` passed; scope and
+  repository-wide wrapper audit matched the plan.
+
+Approve and consolidate the implementation plus this tracked reviewer record
+into exactly one unpublished handoff commit after the unchanged base. Preserve
+all reviewed implementation blobs and the single handoff DEVLOG entry. Leave
+the ignored original plan in place and record final approved SHA there after
+commit creation. No fix plan is needed. Finalization checks one commit and clean
+tracked Git state. Publication, exact-SHA CI and live speed acceptance remain
+controller/coordinator-owned and are not claimed complete by this review.
+
+No material findings
+
+---

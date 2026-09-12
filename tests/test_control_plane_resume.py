@@ -532,7 +532,21 @@ def test_resume_creates_one_new_continuation_and_audits_the_source(tmp_path: Pat
         repository = daemon.application.repository
         source = repository.get_run_status(source_id)
         assert not source.evidence["controller_terminal"]
-        monkeypatch.setattr(repository, "get_run_status", lambda _: replace(source, status="running"))
+        running_source = replace(source, status="running")
+
+        def unreconciled_status(
+            run_id: str, *, include_progress: bool = True
+        ):
+            assert run_id == source_id
+            return (
+                running_source
+                if include_progress
+                else replace(running_source, progress=None)
+            )
+
+        monkeypatch.setattr(repository, "get_run_status", unreconciled_status)
+        assert unreconciled_status(source_id).progress == source.progress
+        assert unreconciled_status(source_id, include_progress=False).progress is None
         with pytest.raises(DaemonError, match="must be reconciled"):
             daemon.service.resume(source_id, caller_scope="project:one", idempotency_key="resume-1")
         assert units.start_calls == []

@@ -1,5 +1,12 @@
 # DEVLOG
 
+## 2026-09-12 — Preserve status projection and composite browser identity
+
+- Recovery test doubles now forward the explicit progress-projection keyword and
+  strip synthetic progress only when requested. Global run-row checks qualify
+  duplicate full run IDs by exact project label, preserving distinct parent and
+  worktree identities without changing production behavior.
+
 ## 2026-09-12 — Reduce run loading work and publish partial coverage
 
 - Run-list reads scan filtered history identities, then let the daemon
