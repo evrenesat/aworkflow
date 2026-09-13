@@ -2758,3 +2758,16 @@ HISTORY: Published clipboard history `c14f1f2`/`cd78d53` remains separate and mu
   reconciliation before enforcing the original 1px pointer, scroll and focus
   checks and issuing one native click. Focused component tests also retain full
   canonical evidence and prove the owner-action DOM order.
+
+## 2026-09-13 — New Run controls before preflight
+
+- Controlled responsive evidence measured the preflight panel growing from
+  81px to 228.375px and moving the closed Advanced disclosure from y=950 to
+  y=1097.375 under a parked pointer; the original node was then hit by a
+  paragraph and stayed closed. Existing Advanced controls now render before
+  preview and preflight, with state ownership, ARIA wiring and admission
+  unchanged.
+- Added deferred component coverage and real Chromium/WebKit tablet/phone
+  pointer journeys. RunDashboard (123 tests), the web build, and the two
+  engine-specific three-case browser checks passed; the existing tablet route
+  journey remains included.

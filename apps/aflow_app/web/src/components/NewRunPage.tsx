@@ -246,8 +246,6 @@ export function NewRunPage({ startPlanPath, setStartPlanPath, planOptions, planB
                 </div>
 
               </div>
-              {preview}
-              {worktreePreflight}
               <section className="dashboard-section">
                 <h4>
                   <button
@@ -297,6 +295,8 @@ export function NewRunPage({ startPlanPath, setStartPlanPath, planOptions, planB
                 )}
               </section>
               {extraInstructionProblem && <div className="error-message" role="alert">{extraInstructionProblem} Open Advanced options to edit the instructions.</div>}
+              {preview}
+              {worktreePreflight}
               {launchBlocker && (
                 <div className="notice" role="note">
                   {launchBlocker}

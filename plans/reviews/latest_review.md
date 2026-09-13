@@ -2456,3 +2456,51 @@ Publication, exact-SHA CI, activation and quiet live timing remain separate
 controller/coordinator gates; overall full-coverage latency remains unproven.
 
 No material findings
+
+
+---
+
+## New Run controls before preflight — cumulative review approved, 2026-09-13
+
+Base: `801250ce94f887ed38afb2bbbf54aa85ca05176c` (unchanged Pre-Handoff Base HEAD).
+Reviewed HEAD: `77bbc579f1a23b0b73440ed2d12cd6a80c9cb579`.
+Coverage: 1 new / 1 total commit, `cp1 v01`, the complete original plan and
+all four changed files. Original and active plans coincide; no prior findings
+or follow-up plans apply.
+
+No material findings under the material-code-review admission gate, exclusions
+and proportionate-fix discipline. The production diff only relocates preview
+and preflight after Advanced and its adjacent validation message. Field order,
+props, controlled state, ARIA, frozen drafts, generation guards and launch
+admission remain intact. Deferred component coverage proves pending usability,
+DOM ordering, open-state and exact value retention with dirty confirmation.
+The browser test holds the current explicit managed-workflow request, releases
+it to the real server, checks ready checkout/result content, same button
+identity, viewport y within 1px and hit testing at the original pointer, then
+uses one native mouse down/up. The existing tablet route journey is unchanged.
+No timeout increase, forced click, new state owner or host-specific test path.
+
+Retained evidence inspected and reused from
+`/root/code/agent_flow/.aflow/runs/20260913t021000z-d391bf8e/turns/turn-001/transport.stdout`
+and completed `result.json` (one checkpoint, zero unchecked steps):
+
+- `npm --prefix apps/aflow_app/web test -- --run src/components/RunDashboard.test.tsx`: final 123 passed, 10.06s.
+- `npm --prefix apps/aflow_app/web run build`: TypeScript and Vite passed.
+- From `apps/aflow_app/server`, `uv run --frozen pytest -q tests/test_responsive_browser.py::test_new_run_advanced_pointer_survives_preflight 'tests/test_responsive_browser.py::test_responsive_route_matrix[tablet]'`: Chromium 3 passed, 16.22s.
+- Same command with `AFLOW_TEST_BROWSER=webkit`: 3 passed, 19.36s.
+- Reviewer `git diff --check 801250ce HEAD`: passed.
+
+Earlier test-only assertion/route-release errors were corrected before final
+evidence. An unchanged Stop-now assertion had one timing-sensitive failure
+before the final component pass; it is outside the relocated New Run controls.
+No full suite or additional browser matrix run during review.
+
+Approve and consolidate implementation and this tracked review record into one
+unpublished handoff commit. Preserve all four implementation blobs and the
+single DEVLOG entry. No fix plan needed or created. Keep the ignored original
+plan in place and record the final approved SHA there only; verify exactly one
+commit above base and clean tracked state. Publication remains the managed
+lifecycle's responsibility; exact CI, activation and quiet live performance
+measurement remain coordinator-owned and are not claimed by this review.
+
+No material findings

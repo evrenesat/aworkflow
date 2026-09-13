@@ -1173,6 +1173,50 @@ describe('RunDashboard', () => {
     ))
   })
 
+  it('keeps Advanced draft controls ahead of a deferred inspection result', async () => {
+    const inspection = deferred<WorktreePreflight>()
+    vi.mocked(api.preflightControlPlaneRun).mockImplementation(() => inspection.promise)
+    renderDashboard()
+
+    await openNewRun()
+    choose('Run plan', 'plans/in-progress/demo.md')
+    choose('Run workflow', 'managed')
+    await waitFor(() => expect(api.preflightControlPlaneRun).toHaveBeenCalled())
+
+    const advancedButton = screen.getByRole('button', { name: 'Advanced options' })
+    const advancedSection = advancedButton.closest('section')
+    const preview = screen.getByRole('region', { name: 'Effective choices for this launch' })
+    const preflight = screen.getByRole('region', { name: 'Working tree preflight' })
+    expect(advancedSection).not.toBeNull()
+    expect(advancedSection!.compareDocumentPosition(preview) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy()
+    expect(preview.compareDocumentPosition(preflight) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy()
+    expect(preflight.getAttribute('data-preflight-status')).toBe('loading')
+
+    openAdvanced()
+    expect(screen.getByLabelText('Run max turns')).toBeDefined()
+    expect(screen.getByLabelText('Run start step')).toBeDefined()
+    expect(screen.getByLabelText('Run extra instructions')).toBeDefined()
+    fireEvent.change(screen.getByLabelText('Run max turns'), { target: { value: '13' } })
+    fireEvent.change(screen.getByLabelText('Run start step'), { target: { value: 'implement' } })
+    fireEvent.change(screen.getByLabelText('Run extra instructions'), { target: { value: 'Keep the draft open.\nPreserve this value.' } })
+
+    inspection.resolve(preflightResult({
+      dirty: true,
+      requires_confirmation: true,
+      total_items: 1,
+      items: [{ path: 'pending.ts', index_status: ' ', worktree_status: 'M', original_path: null }],
+    }))
+    await screen.findByText('pending.ts')
+
+    expect(advancedButton.getAttribute('aria-expanded')).toBe('true')
+    expect((screen.getByLabelText('Run max turns') as HTMLInputElement).value).toBe('13')
+    expect((screen.getByLabelText('Run start step') as HTMLSelectElement).value).toBe('implement')
+    expect((screen.getByLabelText('Run extra instructions') as HTMLTextAreaElement).value).toBe('Keep the draft open.\nPreserve this value.')
+    expect(screen.getByRole('region', { name: 'Effective choices for this launch' })).toBeDefined()
+    expect(screen.getByRole('region', { name: 'Working tree preflight' })).toBeDefined()
+    expect(screen.getByRole('checkbox', { name: 'Continue despite uncommitted changes' })).toBeDefined()
+  })
+
   it('preserves acknowledgment through unrelated edits but resets it for a new launch selection', async () => {
     vi.mocked(api.preflightControlPlaneRun).mockResolvedValue(preflightResult({
       dirty: true,

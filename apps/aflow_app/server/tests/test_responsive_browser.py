@@ -1485,6 +1485,171 @@ def test_history_completion_preserves_live_controls_pointer_target(
             browser.close()
 
 
+@pytest.mark.parametrize(
+    ("width", "height"),
+    (
+        pytest.param(768, 1024, id="tablet"),
+        pytest.param(390, 844, id="phone"),
+    ),
+)
+def test_new_run_advanced_pointer_survives_preflight(
+    control_client,
+    monkeypatch,
+    width: int,
+    height: int,
+):
+    """Keep one real Advanced click valid while the current preflight completes."""
+    _, root, _, _ = control_client
+    _seed_responsive_fixture(root)
+    dist = Path(__file__).resolve().parents[2] / "web" / "dist"
+    monkeypatch.setenv("AFLOW_APP_WEB_DIST", str(dist))
+    preflight_pattern = f"**/api/control-plane/projects/{PROJECT_ID}/runs/preflight*"
+    held_current_preflight = []
+
+    def hold_current_preflight(route) -> None:
+        request = route.request
+        if request.method == "POST":
+            payload = request.post_data_json or {}
+            if payload.get("workflow_name") == "managed":
+                held_current_preflight.append(route)
+                return
+        route.continue_()
+
+    with live_server() as url, sync_playwright() as playwright:
+        browser = _browser(playwright)
+        try:
+            page = browser.new_page(viewport={"width": width, "height": height})
+            _login(page, url)
+            _ensure_project(page)
+            page.route(preflight_pattern, hold_current_preflight)
+
+            page.goto(f"{url}/?project={PROJECT_ID}&view=new-run")
+            page.get_by_label("Run plan", exact=True).wait_for()
+            plan = page.get_by_label("Run plan", exact=True)
+            plan.click()
+            page.get_by_role("option", name="ready-launch-plan.md", exact=False).click()
+
+            workflow = page.get_by_label("Run workflow", exact=True)
+            workflow.click()
+            workflow.fill("managed")
+            workflow.press("ArrowDown")
+            workflow.press("Enter")
+            expect(workflow).to_have_value("Managed")
+            preflight = page.locator('section[aria-label="Working tree preflight"]')
+            preflight.wait_for(state="visible")
+            page.wait_for_function(
+                "() => document.querySelector('section[aria-label=\"Working tree preflight\"]')?.dataset.preflightStatus === 'loading'"
+            )
+            assert held_current_preflight, "current explicit preflight response was not held"
+
+            advanced = page.get_by_role("button", name="Advanced options", exact=True)
+            advanced.wait_for(state="visible")
+            advanced.scroll_into_view_if_needed()
+            advanced.focus()
+            expect(advanced).to_be_focused()
+            before = {
+                "rect": advanced.bounding_box(),
+                "scroll": page.evaluate("() => document.scrollingElement?.scrollTop ?? 0"),
+                "active_target": page.evaluate("""() => {
+                    const element = document.activeElement;
+                    return {
+                        category: element?.getAttribute('aria-label') === 'Advanced options' ? 'advanced-button' : element?.tagName ?? 'none',
+                        tag: element?.tagName ?? null,
+                        role: element?.getAttribute('role') ?? null,
+                    };
+                }"""),
+                "preflight": preflight.get_attribute("data-preflight-status"),
+            }
+            assert before["rect"] is not None, before
+            point = {
+                "x": before["rect"]["x"] + before["rect"]["width"] / 2,
+                "y": before["rect"]["y"] + before["rect"]["height"] / 2,
+            }
+            page.mouse.move(**point)
+            before_hit = page.evaluate("""({x, y}) => {
+                const button = document.querySelector('.dashboard-host:not([hidden]) button[aria-label="Advanced options"]');
+                const hit = document.elementFromPoint(x, y);
+                const describe = element => element ? {
+                    category: element.getAttribute('aria-label') === 'Advanced options' ? 'advanced-button' : element.tagName,
+                    tag: element.tagName,
+                    role: element.getAttribute('role'),
+                } : null;
+                return { target: describe(button), hit: describe(hit), same: hit === button || Boolean(button && button.contains(hit)) };
+            }""", point)
+            assert before_hit["same"], {"before": before, "hit": before_hit}
+            original_button = advanced.element_handle()
+            assert original_button is not None, before
+
+            pending = held_current_preflight[:]
+            held_current_preflight.clear()
+            for route in pending:
+                route.continue_()
+            page.unroute(preflight_pattern, hold_current_preflight)
+
+            page.wait_for_function(
+                "() => document.querySelector('section[aria-label=\"Working tree preflight\"]')?.dataset.preflightStatus === 'ready'"
+            )
+            expect(preflight).to_contain_text("Checkout:")
+            clean = preflight.get_by_text("No uncommitted changes detected.", exact=True)
+            dirty_confirmation = preflight.get_by_role(
+                "checkbox", name="Continue despite uncommitted changes", exact=True
+            )
+            assert clean.is_visible() or dirty_confirmation.is_visible(), {
+                "preflight": preflight.get_attribute("data-preflight-status"),
+            }
+
+            after = {
+                "rect": advanced.bounding_box(),
+                "scroll": page.evaluate("() => document.scrollingElement?.scrollTop ?? 0"),
+                "active_target": page.evaluate("""() => {
+                    const element = document.activeElement;
+                    return {
+                        category: element?.getAttribute('aria-label') === 'Advanced options' ? 'advanced-button' : element?.tagName ?? 'none',
+                        tag: element?.tagName ?? null,
+                        role: element?.getAttribute('role') ?? null,
+                    };
+                }"""),
+                "preflight": preflight.get_attribute("data-preflight-status"),
+            }
+            assert page.evaluate("""button => {
+                const current = document.querySelector('.dashboard-host:not([hidden]) button[aria-label="Advanced options"]');
+                return Boolean(button && button.isConnected && current === button);
+            }""", original_button), {"before": before, "after": after}
+            assert after["rect"] is not None, {"before": before, "after": after}
+            assert after["rect"]["y"] == pytest.approx(before["rect"]["y"], abs=1), {
+                "before": before,
+                "after": after,
+            }
+            after_hit = page.evaluate("""({x, y}) => {
+                const button = document.querySelector('.dashboard-host:not([hidden]) button[aria-label="Advanced options"]');
+                const hit = document.elementFromPoint(x, y);
+                const describe = element => element ? {
+                    category: element.getAttribute('aria-label') === 'Advanced options' ? 'advanced-button' : element.tagName,
+                    tag: element.tagName,
+                    role: element.getAttribute('role'),
+                } : null;
+                return { target: describe(button), hit: describe(hit), same: hit === button || Boolean(button && button.contains(hit)) };
+            }""", point)
+            assert after_hit["same"], {"before": before, "after": after, "hit": after_hit}
+
+            page.mouse.down()
+            page.mouse.up()
+            expect(advanced).to_have_attribute("aria-expanded", "true")
+            expect(page.get_by_label("Run extra instructions", exact=True)).to_be_visible()
+        finally:
+            for route in held_current_preflight[:]:
+                try:
+                    route.continue_()
+                except PlaywrightError:
+                    pass
+            held_current_preflight.clear()
+            try:
+                page.unroute(preflight_pattern, hold_current_preflight)
+            except PlaywrightError:
+                pass
+            browser.close()
+
+
 @pytest.mark.parametrize(("width", "height"), VIEWPORTS)
 def test_responsive_route_matrix(control_client, monkeypatch, width: int, height: int):
     """Exercise every shell destination at each required CSS viewport."""
