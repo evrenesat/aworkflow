@@ -1,4 +1,5 @@
 from tests._support import *  # noqa: F401,F403
+from dataclasses import asdict, replace
 import hashlib
 import re
 from typing import Mapping
@@ -519,6 +520,245 @@ class WorkflowCliTests(unittest.TestCase):
         }
         return repo_root, run_dir, workflow_config, prev_run
 
+    def _owner_stopped_resume_fixture(
+        self,
+        tmp_path: Path,
+        *,
+        pending_boundary: bool = True,
+    ) -> tuple[Path, Path, Path, object, dict[str, object], dict[str, object] | None]:
+        repo_root, run_dir, workflow_config, prev_run = self._resume_bootstrap_fixture(
+            tmp_path
+        )
+        plan_path = Path(prev_run["original_plan_path"])
+        subprocess.run(("git", "init", "-q", str(repo_root)), check=True)
+        subprocess.run(
+            ("git", "add", "-A"),
+            cwd=repo_root,
+            check=True,
+            capture_output=True,
+        )
+        subprocess.run(
+            (
+                "git",
+                "-c",
+                "user.name=Test",
+                "-c",
+                "user.email=test@example.com",
+                "commit",
+                "-m",
+                "fixture base",
+            ),
+            cwd=repo_root,
+            check=True,
+            capture_output=True,
+        )
+        main_branch = subprocess.run(
+            ("git", "branch", "--show-current"),
+            cwd=repo_root,
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+        base_head = subprocess.run(
+            ("git", "rev-parse", "HEAD"),
+            cwd=repo_root,
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+        feature_branch = "feature/saved-run"
+        plan_path.write_text(
+            "# Plan\n\n"
+            "## Git Tracking\n\n"
+            f"- Plan Branch: `{feature_branch}`\n"
+            f"- Pre-Handoff Base HEAD: `{base_head}`\n\n"
+            "### [x] Checkpoint 1: First\n- [x] step one\n\n"
+            "### [x] Checkpoint 2: Second\n- [x] step two\n\n"
+            "### [ ] Checkpoint 3: Third\n- [ ] step three\n",
+            encoding="utf-8",
+        )
+        subprocess.run(
+            ("git", "add", "-f", "--", str(plan_path.relative_to(repo_root))),
+            cwd=repo_root,
+            check=True,
+            capture_output=True,
+        )
+        subprocess.run(
+            (
+                "git",
+                "-c",
+                "user.name=Test",
+                "-c",
+                "user.email=test@example.com",
+                "commit",
+                "-m",
+                "fixture plan",
+            ),
+            cwd=repo_root,
+            check=True,
+            capture_output=True,
+        )
+        subprocess.run(
+            ("git", "branch", feature_branch),
+            cwd=repo_root,
+            check=True,
+            capture_output=True,
+        )
+        worktree_path = repo_root / ".fixture-worktrees" / "saved-run"
+        subprocess.run(
+            (
+                "git",
+                "worktree",
+                "add",
+                "-q",
+                str(worktree_path),
+                feature_branch,
+            ),
+            cwd=repo_root,
+            check=True,
+            capture_output=True,
+        )
+        worktree_plan_path = worktree_path / plan_path.relative_to(repo_root)
+        workflow = workflow_config.workflows["saved_workflow"]
+        implement_step = replace(
+            workflow.steps["implement_plan"],
+            go=(
+                GoTransition(to="END", when="DONE"),
+                GoTransition(to="implement_plan"),
+            ),
+        )
+        workflow = replace(
+            workflow,
+            declared_steps={"implement_plan": implement_step},
+            steps={"implement_plan": implement_step},
+            setup=("worktree", "branch"),
+            teardown=("merge", "rm_worktree"),
+            main_branch=main_branch,
+        )
+        workflow_config = WorkflowUserConfig(
+            aflow=replace(workflow_config.aflow, team_lead="worker"),
+            roles={"worker": "codex.luna-max"},
+            harnesses={
+                "codex": WorkflowHarnessConfig(
+                    profiles={
+                        "luna-max": HarnessProfileConfig(model="luna-max")
+                    }
+                )
+            },
+            workflows={"saved_workflow": workflow},
+            prompts={"p": "Work from {ACTIVE_PLAN_PATH}."},
+            teams={
+                "base": TeamConfig(roles={"worker": "codex.luna-max"})
+            },
+            manager=workflow_config.manager,
+            error_handling=workflow_config.error_handling,
+        )
+        config_path = repo_root / "aflow.toml"
+        identity = _freeze_run_identity(
+            "saved_workflow",
+            workflow_config,
+            config_dir=config_path,
+        )
+        target_identity = f"{plan_path}::checkpoint-3"
+        boundary = (
+            {
+                "finalized_turn_number": 2,
+                "decision_number": 2,
+                "action": "continue",
+                "proposed_action": "transition",
+                "proposed_transition": "implement_plan",
+                "resolved_next_step": "implement_plan",
+                "target_role": "worker",
+                "target_team": None,
+                "target_selector": "codex.luna-max",
+                "checkpoint_identity": target_identity,
+                "post_transition_active_plan_path": str(plan_path),
+                "post_transition_checkpoint_identity": target_identity,
+                "notes_reference": None,
+                "applied": False,
+                "consumed": False,
+                "scope_id": None,
+                "target_plan_identity": target_identity,
+                "repartition_generation_id": None,
+                "repartition_candidate_sha256": None,
+                "repartition_partition_id": None,
+            }
+            if pending_boundary
+            else None
+        )
+        owner_stopped = dict(prev_run)
+        owner_stopped.update(
+            {
+                "status": "owner_stopped",
+                "end_reason": "owner_stopped",
+                "current_step_name": "implement_plan",
+                "active_turn": 2,
+                "turns_completed": 2,
+                "last_snapshot": {
+                    "current_checkpoint_name": "Checkpoint 3: Third",
+                    "current_checkpoint_index": 3,
+                    "unchecked_checkpoint_count": 1,
+                    "current_checkpoint_unchecked_step_count": 1,
+                    "total_checkpoint_count": 3,
+                    "is_complete": False,
+                },
+                "lifecycle_setup": ["worktree", "branch"],
+                "lifecycle_teardown": ["merge", "rm_worktree"],
+                "feature_branch": feature_branch,
+                "worktree_path": str(worktree_path),
+                "main_branch": main_branch,
+                "active_plan_path": str(plan_path),
+                "manager_decision_number": 2,
+                "active_implementation_scope": None,
+                "pending_boundary_decision": boundary,
+                "frozen_config": {
+                    "workflow_name": identity.workflow_name,
+                    "config_path": identity.config_path,
+                    "config_fingerprint": identity.config_fingerprint,
+                },
+            }
+        )
+        owner_stopped = _current_resume_payload(owner_stopped)
+        assert worktree_plan_path.read_bytes() == plan_path.read_bytes()
+        run_dir.mkdir(parents=True)
+        run_dir.joinpath("run.json").write_text(
+            json.dumps(owner_stopped, sort_keys=True),
+            encoding="utf-8",
+        )
+        return (
+            repo_root,
+            run_dir,
+            plan_path,
+            workflow_config,
+            owner_stopped,
+            boundary,
+        )
+
+    def _bootstrap_owner_stopped_fixture(
+        self,
+        repo_root: Path,
+        run_dir: Path,
+        workflow_config: object,
+    ):
+        import aflow.cli as cli_module
+
+        with patch(
+            "aflow.cli.resolve_run_id",
+            return_value=(Path(run_dir.name), "explicit_run_id"),
+        ):
+            return cli_module._bootstrap_resume_invocation(
+                repo_root=repo_root,
+                workflow_config=workflow_config,
+                requested_run_id=run_dir.name,
+                workflow_arg=None,
+                plan_file_arg=None,
+                team_arg=None,
+                start_step_arg=None,
+                max_turns_arg=None,
+                extra_instructions_arg=(),
+                extra_instructions_provided=False,
+            )
+
     def _modern_resume_fixture(
         self,
         tmp_path: Path,
@@ -739,6 +979,301 @@ class WorkflowCliTests(unittest.TestCase):
         assert result.max_turns == 15
         assert result.extra_instructions == ("keep the patch focused",)
         assert result.frozen_run_identity is not None
+
+    def test_bootstrap_resume_accepts_owner_stop_with_pending_continue(self) -> None:
+        import aflow.cli as cli_module
+
+        for pending_boundary in (True, False):
+            with self.subTest(pending_boundary=pending_boundary):
+                (
+                    repo_root,
+                    run_dir,
+                    plan_path,
+                    workflow_config,
+                    prev_run,
+                    boundary,
+                ) = self._owner_stopped_resume_fixture(
+                    self._new_temp_path(),
+                    pending_boundary=pending_boundary,
+                )
+                plan_before = plan_path.read_bytes()
+                source_before = run_dir.joinpath("run.json").read_bytes()
+                active_plan_path = Path(prev_run["active_plan_path"])
+                active_plan_before = active_plan_path.read_bytes()
+                worktree_plan_path = Path(prev_run["worktree_path"]) / (
+                    plan_path.relative_to(repo_root)
+                )
+                worktree_plan_before = worktree_plan_path.read_bytes()
+
+                bootstrap = self._bootstrap_owner_stopped_fixture(
+                    repo_root,
+                    run_dir,
+                    workflow_config,
+                )
+
+                assert bootstrap.start_step == "implement_plan"
+                assert bootstrap.plan_path == plan_path
+                assert bootstrap.team == "base"
+                assert bootstrap.extra_instructions == ("keep the patch focused",)
+                assert bootstrap.resume_context.active_plan_path == active_plan_path
+                assert load_plan(active_plan_path).snapshot.current_checkpoint_index == 3
+                pending = bootstrap.resume_context.pending_boundary_decision
+                if boundary is None:
+                    assert pending is None
+                else:
+                    assert pending is not None
+                    assert asdict(pending) == boundary
+                    assert pending.applied is False
+                    assert pending.consumed is False
+                assert plan_path.read_bytes() == plan_before
+                assert active_plan_path.read_bytes() == active_plan_before
+                assert worktree_plan_path.read_bytes() == worktree_plan_before
+                assert run_dir.joinpath("run.json").read_bytes() == source_before
+                with patch(
+                    "aflow.cli.resolve_run_id",
+                    return_value=(Path(run_dir.name), "shell_last_run_id_file"),
+                ):
+                    automatic = cli_module._detect_resume_candidate(
+                        repo_root=repo_root,
+                        workflow_config=workflow_config.workflows[
+                            bootstrap.workflow_name
+                        ],
+                        workflow_name=bootstrap.workflow_name,
+                        plan_path=bootstrap.plan_path,
+                        team=bootstrap.team,
+                        selected_start_step=bootstrap.start_step,
+                        max_turns=bootstrap.max_turns,
+                        extra_instructions=bootstrap.extra_instructions,
+                        require_resume=False,
+                    )
+                assert automatic is None
+
+    def test_resume_reconstruction_preserves_owner_stop_admission(self) -> None:
+        import aflow.cli as cli_module
+        from aflow.workflow import OwnerStopRequested
+
+        (
+            repo_root,
+            run_dir,
+            plan_path,
+            workflow_config,
+            prev_run,
+            boundary,
+        ) = self._owner_stopped_resume_fixture(self._new_temp_path())
+        assert boundary is not None
+        plan_before = plan_path.read_bytes()
+        source_before = run_dir.joinpath("run.json").read_bytes()
+        bootstrap = self._bootstrap_owner_stopped_fixture(
+            repo_root,
+            run_dir,
+            workflow_config,
+        )
+
+        reconstructed = cli_module._detect_resume_candidate(
+            repo_root=repo_root,
+            workflow_config=workflow_config.workflows[bootstrap.workflow_name],
+            workflow_name=bootstrap.workflow_name,
+            plan_path=bootstrap.plan_path,
+            team=bootstrap.team,
+            selected_start_step=bootstrap.start_step,
+            max_turns=bootstrap.max_turns,
+            extra_instructions=bootstrap.extra_instructions,
+            requested_run_id=run_dir.name,
+            require_resume=True,
+            resume_bootstrap=bootstrap,
+            team_explicit=bootstrap.team_explicit,
+            max_turns_explicit=bootstrap.max_turns_explicit,
+        )
+
+        assert reconstructed is bootstrap.resume_context
+        assert reconstructed.pending_boundary_decision is not None
+        assert asdict(reconstructed.pending_boundary_decision) == boundary
+        assert reconstructed.pending_boundary_decision.applied is False
+        assert reconstructed.pending_boundary_decision.consumed is False
+        active_plan_path = Path(prev_run["active_plan_path"])
+        active_plan_before = active_plan_path.read_bytes()
+        worktree_plan_path = Path(prev_run["worktree_path"]) / (
+            plan_path.relative_to(repo_root)
+        )
+        worktree_plan_before = worktree_plan_path.read_bytes()
+        assert reconstructed.active_plan_path == active_plan_path
+        assert load_plan(active_plan_path).snapshot.current_checkpoint_index == 3
+
+        observed: dict[str, object] = {}
+
+        def runner(argv, **_kwargs):
+            successor_dirs = [
+                candidate
+                for candidate in (repo_root / ".aflow" / "runs").iterdir()
+                if candidate.name != run_dir.name
+            ]
+            assert len(successor_dirs) == 1
+            live = json.loads(
+                successor_dirs[0].joinpath("run.json").read_text(encoding="utf-8")
+            )
+            observed["current_step_name"] = live["current_step_name"]
+            observed["pending_boundary_decision"] = live[
+                "pending_boundary_decision"
+            ]
+            observed["checkpoint_index"] = load_plan(
+                Path(live["active_plan_path"])
+            ).snapshot.current_checkpoint_index
+            raise OwnerStopRequested
+
+        result = run_workflow(
+            ControllerConfig(
+                repo_root=repo_root,
+                plan_path=plan_path,
+                max_turns=1,
+                team="base",
+            ),
+            workflow_config,
+            "saved_workflow",
+            config_dir=repo_root,
+            adapter=CodexAdapter(),
+            runner=runner,
+            resume=reconstructed,
+            snapshot_config=False,
+        )
+
+        assert result.end_reason == "owner_stopped"
+        assert observed["current_step_name"] == "implement_plan"
+        assert observed["checkpoint_index"] == 3
+        consumed = observed["pending_boundary_decision"]
+        assert isinstance(consumed, dict)
+        assert consumed == {**boundary, "applied": True, "consumed": True}
+        assert plan_path.read_bytes() == plan_before
+        assert active_plan_path.read_bytes() == active_plan_before
+        assert worktree_plan_path.read_bytes() == worktree_plan_before
+        assert run_dir.joinpath("run.json").read_bytes() == source_before
+
+    def test_owner_stop_resume_keeps_invalid_boundaries_rejected(self) -> None:
+        def mutate_missing_end_reason(
+            payload: dict[str, object], _plan_path: Path
+        ) -> None:
+            payload.pop("end_reason")
+
+        def mutate_different_end_reason(
+            payload: dict[str, object], _plan_path: Path
+        ) -> None:
+            payload["end_reason"] = "transition_end"
+
+        def mutate_missing_boundary_field(
+            payload: dict[str, object], _plan_path: Path
+        ) -> None:
+            boundary = dict(payload["pending_boundary_decision"])
+            boundary.pop("target_selector")
+            payload["pending_boundary_decision"] = boundary
+
+        def mutate_wrong_boundary_type(
+            payload: dict[str, object], _plan_path: Path
+        ) -> None:
+            boundary = dict(payload["pending_boundary_decision"])
+            boundary["resolved_next_step"] = 3
+            payload["pending_boundary_decision"] = boundary
+
+        def mutate_boolean_decision_number(
+            payload: dict[str, object], _plan_path: Path
+        ) -> None:
+            boundary = dict(payload["pending_boundary_decision"])
+            boundary["decision_number"] = True
+            payload["pending_boundary_decision"] = boundary
+
+        def mutate_awaiting_review(
+            payload: dict[str, object], plan_path: Path
+        ) -> None:
+            payload["active_implementation_scope"] = {
+                "scope_id": f"{plan_path}::checkpoint-3::third",
+                "original_plan_path": str(plan_path),
+                "checkpoint_index": 3,
+                "checkpoint_name": "Third",
+                "opened_turn_number": 2,
+                "awaiting_review": True,
+                "carried_reviewer_rejection_count": 0,
+                "envelope_artifact_path": "scopes/saved/envelope.json",
+                "envelope_artifact_sha256": "a" * 64,
+                "envelope_canonical_sha256": "b" * 64,
+                "current_partition_generation_id": None,
+                "current_partition_candidate_sha256": None,
+                "current_partition_id": None,
+            }
+
+        def mutate_complete_plan(
+            payload: dict[str, object], plan_path: Path
+        ) -> None:
+            plan_path.write_text(
+                plan_path.read_text(encoding="utf-8")
+                .replace("### [ ] Checkpoint 3", "### [x] Checkpoint 3")
+                .replace("- [ ] step three", "- [x] step three"),
+                encoding="utf-8",
+            )
+            payload["last_snapshot"] = {"is_complete": True}
+            payload["pending_boundary_decision"] = None
+
+        def mutate_wrong_repo(
+            payload: dict[str, object], plan_path: Path
+        ) -> None:
+            payload["repo_root"] = str(plan_path.parent)
+
+        def mutate_missing_worktree(
+            payload: dict[str, object], _plan_path: Path
+        ) -> None:
+            payload["lifecycle_setup"] = ["worktree", "branch"]
+            payload["lifecycle_teardown"] = ["merge", "rm_worktree"]
+            payload["feature_branch"] = "feature/missing-worktree"
+            payload["main_branch"] = "main"
+            payload["worktree_path"] = None
+
+        def mutate_terminal_status(
+            payload: dict[str, object], _plan_path: Path
+        ) -> None:
+            payload["status"] = "completed"
+
+        cases = (
+            ("missing end reason", mutate_missing_end_reason, "not resumable"),
+            ("different end reason", mutate_different_end_reason, "not resumable"),
+            (
+                "missing boundary field",
+                mutate_missing_boundary_field,
+                "missing required fields: target_selector",
+            ),
+            (
+                "wrong boundary type",
+                mutate_wrong_boundary_type,
+                "resolved_next_step must be a string",
+            ),
+            (
+                "boolean decision number",
+                mutate_boolean_decision_number,
+                "decision_number must be an integer",
+            ),
+            ("awaiting review", mutate_awaiting_review, "not resumable"),
+            ("complete plan", mutate_complete_plan, "already complete"),
+            ("wrong repository", mutate_wrong_repo, "different repo root"),
+            ("missing worktree", mutate_missing_worktree, "no recorded worktree"),
+            ("terminal status", mutate_terminal_status, "not resumable"),
+        )
+        for name, mutate, expected in cases:
+            with self.subTest(case=name):
+                (
+                    repo_root,
+                    run_dir,
+                    plan_path,
+                    workflow_config,
+                    payload,
+                    _boundary,
+                ) = self._owner_stopped_resume_fixture(self._new_temp_path())
+                mutate(payload, plan_path)
+                run_dir.joinpath("run.json").write_text(
+                    json.dumps(payload, sort_keys=True),
+                    encoding="utf-8",
+                )
+                with pytest.raises(ValueError, match=re.escape(expected)):
+                    self._bootstrap_owner_stopped_fixture(
+                        repo_root,
+                        run_dir,
+                        workflow_config,
+                    )
 
     def test_terminal_completion_resume_loads_plan_from_receipt_backed_done_path(
         self,

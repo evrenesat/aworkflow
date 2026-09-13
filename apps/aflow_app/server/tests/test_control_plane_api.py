@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from contextlib import contextmanager
-from dataclasses import replace
+from dataclasses import asdict, replace
 import json
 from pathlib import Path
 import subprocess
@@ -347,6 +347,202 @@ def _seed_recovery_source(
 
     monkeypatch.setattr(daemon.service, "_resume_bootstrap", resume_bootstrap)
     return source_id, source_dir, daemon
+
+
+def _seed_managed_owner_stopped_resume_source(
+    control_service: ControlPlaneService,
+    root: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    source_id: str,
+) -> tuple[str, Path, Path, object, dict[str, object]]:
+    """Install a real-bootstrap owner stop at an unfinished worker boundary."""
+    from aflow.config import load_workflow_config
+    from aflow.workflow import _freeze_run_identity
+
+    daemon = control_service._project(PROJECT_ID).daemon
+    config_path = daemon._config.config_path
+    config_path.write_text(
+        config_path.read_text(encoding="utf-8").replace(
+            "[aflow]\n",
+            '[aflow]\nteam_lead = "worker"\n',
+            1,
+        ),
+        encoding="utf-8",
+    )
+    with config_path.with_name("workflows.toml").open("a", encoding="utf-8") as handle:
+        handle.write(
+            "\n[workflow.managed_resume]\n"
+            'setup = ["worktree", "branch"]\n'
+            'teardown = ["merge", "rm_worktree"]\n'
+            "\n[workflow.managed_resume.steps.implement]\n"
+            'role = "worker"\n'
+            'prompts = ["p"]\n'
+            'go = [{ to = "END", when = "DONE" }]\n'
+        )
+    workflow_config = load_workflow_config(config_path)
+    daemon.service._workflow_config = workflow_config
+
+    plan_path = root / "plans" / "todo" / "test-plan.md"
+    plan_path.write_text(
+        "# Test\n\n"
+        "### [x] Checkpoint 1: First\n- [x] step one\n\n"
+        "### [x] Checkpoint 2: Second\n- [x] step two\n\n"
+        "### [ ] Checkpoint 3: Third\n- [ ] step three\n",
+        encoding="utf-8",
+    )
+    _commit_fixture_repository(root)
+    main_branch = subprocess.run(
+        ("git", "branch", "--show-current"),
+        cwd=root,
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    feature_branch = f"feature/{source_id}"
+    subprocess.run(
+        ("git", "branch", feature_branch),
+        cwd=root,
+        check=True,
+        capture_output=True,
+    )
+    worktree_path = root.parent / f"{source_id}-worktree"
+    subprocess.run(
+        ("git", "worktree", "add", "-q", str(worktree_path), feature_branch),
+        cwd=root,
+        check=True,
+        capture_output=True,
+    )
+
+    identity = _freeze_run_identity(
+        "managed_resume",
+        workflow_config,
+        config_dir=config_path,
+    )
+    target_identity = f"{plan_path}::checkpoint-3"
+    boundary = {
+        "finalized_turn_number": 2,
+        "decision_number": 2,
+        "action": "continue",
+        "proposed_action": "transition",
+        "proposed_transition": "implement",
+        "resolved_next_step": "implement",
+        "target_role": "worker",
+        "target_team": None,
+        "target_selector": "codex.test",
+        "checkpoint_identity": target_identity,
+        "post_transition_active_plan_path": str(plan_path),
+        "post_transition_checkpoint_identity": target_identity,
+        "notes_reference": None,
+        "applied": False,
+        "consumed": False,
+        "scope_id": None,
+        "target_plan_identity": target_identity,
+        "repartition_generation_id": None,
+        "repartition_candidate_sha256": None,
+        "repartition_partition_id": None,
+    }
+    source_payload = {
+        "schema_version": 2,
+        "repo_root": str(root.resolve()),
+        "workflow_name": "managed_resume",
+        "plan_path": str(plan_path.resolve()),
+        "original_plan_path": str(plan_path.resolve()),
+        "team": None,
+        "selected_start_step": "implement",
+        "max_turns": 3,
+        "effective_max_turns": 3,
+        "extra_instructions": [],
+        "lifecycle_setup": ["worktree", "branch"],
+        "lifecycle_teardown": ["merge", "rm_worktree"],
+        "feature_branch": feature_branch,
+        "worktree_path": str(worktree_path.resolve()),
+        "main_branch": main_branch,
+        "status": "owner_stopped",
+        "end_reason": "owner_stopped",
+        "current_step_name": "implement",
+        "active_turn": 2,
+        "turns_completed": 2,
+        "active_plan_path": str(plan_path.resolve()),
+        "last_snapshot": {
+            "current_checkpoint_name": "Checkpoint 3: Third",
+            "current_checkpoint_index": 3,
+            "unchecked_checkpoint_count": 1,
+            "current_checkpoint_unchecked_step_count": 1,
+            "total_checkpoint_count": 3,
+            "is_complete": False,
+        },
+        "frozen_config": {
+            "workflow_name": identity.workflow_name,
+            "config_path": identity.config_path,
+            "config_fingerprint": identity.config_fingerprint,
+        },
+        "manager_decision_number": 2,
+        "manager_history": [],
+        "semantic_stall_count": 0,
+        "reviewer_rejection_count": 0,
+        "implementation_attempts": {},
+        "active_implementation_scope": None,
+        "review_rejection_history": [],
+        "pending_manager_notes": None,
+        "pending_step_team_override": None,
+        "pending_boundary_decision": boundary,
+        "pending_repartition": None,
+        "repartition_history": [],
+        "scope_pressure_reason": None,
+        "last_manager_report_path": None,
+        "hotplug_schema_version": 1,
+        "role_selectors": {"worker": "codex.test"},
+        "current_hotplug_transaction": None,
+        "pending_hotplug_transaction": None,
+        "active_role_sessions": [],
+        "hotplug_transaction_number": 0,
+        "hotplug_history": [],
+    }
+    create_launch_manifest(
+        root,
+        LaunchManifest(
+            run_id=source_id,
+            project_root=str(root.resolve()),
+            plan_path=str(plan_path.resolve()),
+            workflow_name="managed_resume",
+            max_turns=3,
+            start_step="implement",
+            idempotency_key=f"{source_id}-start",
+            caller_scope=f"bearer:{PROJECT_ID}",
+            frozen_config_fingerprint=identity.config_fingerprint,
+        ),
+    )
+    source_dir = root / ".aflow" / "runs" / source_id
+    source_dir.mkdir(parents=True)
+    source_dir.joinpath("run.json").write_text(
+        json.dumps(source_payload, sort_keys=True),
+        encoding="utf-8",
+    )
+    write_launch_phase(root, source_id, "owner_stopped")
+    append_run_event(source_dir, "owner_stopped", {"source": "test"})
+    source = RunStatus(
+        run_id=source_id,
+        status="owner_stopped",
+        launch_phase="owner_stopped",
+        ownership="control_plane",
+        plan_path=str(plan_path.resolve()),
+        workflow_name="managed_resume",
+        max_turns=3,
+        selected_start_step="implement",
+        unit_name=f"aflow-run-{source_id}.service",
+        evidence={"controller_terminal": False, "worker": {"active": False, "exit_code": 0}},
+    )
+    repository = daemon.application.repository
+    original_get_status = repository.get_run_status
+
+    def get_status(run_id: str, *, include_progress: bool = True) -> RunStatus:
+        if run_id == source_id:
+            return source if include_progress else replace(source, progress=None)
+        return original_get_status(run_id, include_progress=include_progress)
+
+    monkeypatch.setattr(repository, "get_run_status", get_status)
+    return source_id, source_dir, plan_path, daemon, boundary
 
 
 def _source_artifact_bytes(source_dir: Path) -> dict[str, bytes]:
@@ -1628,6 +1824,115 @@ def test_rest_resume_persists_reviewer_start_step_and_replays_once(control_clien
     )
     assert manifest["start_step"] == "review_implementation"
     assert source_path.read_bytes() == before
+
+
+@pytest.mark.parametrize(
+    "resume_mode",
+    ("ordinary", "durable_evidence"),
+)
+def test_rest_managed_owner_stop_resume_uses_real_bootstrap(
+    control_client,
+    resume_mode: str,
+) -> None:
+    from aflow.config import load_workflow_config
+    from aflow.daemon import _worker_prepared
+    from aflow.plan import load_plan
+    from aflow_app_server import main
+
+    client, root, units, monkeypatch = control_client
+    service = main._control_plane_service
+    assert service is not None
+    request_key = f"rest-owner-stop-{resume_mode}"
+    source_id, source_dir, plan_path, daemon, boundary = (
+        _seed_managed_owner_stopped_resume_source(
+            service,
+            root,
+            monkeypatch,
+            source_id=f"rest-owner-stopped-{resume_mode.replace('_', '-')}",
+        )
+    )
+    source_before = source_dir.joinpath("run.json").read_bytes()
+    plan_before = plan_path.read_bytes()
+    payload = (
+        {"recovery": _recovery_payload()}
+        if resume_mode == "durable_evidence"
+        else {}
+    )
+    endpoint = f"/api/control-plane/projects/{PROJECT_ID}/runs/{source_id}/resume"
+
+    wrong_project = client.post(
+        endpoint.replace(PROJECT_ID, "not-allowed"),
+        headers={"Idempotency-Key": f"{request_key}-wrong-project"},
+        json=payload,
+    )
+    assert wrong_project.status_code == 404
+    assert units.start_calls == []
+    if resume_mode == "durable_evidence":
+        invalid_target = client.post(
+            endpoint,
+            headers={"Idempotency-Key": f"{request_key}-invalid-target"},
+            json={"recovery": _recovery_payload("codex.missing")},
+        )
+        assert invalid_target.status_code == 422
+        assert invalid_target.json()["detail"]["code"] == "recovery_target_invalid"
+        assert units.start_calls == []
+
+    first = client.post(
+        endpoint,
+        headers={"Idempotency-Key": request_key},
+        json=payload,
+    )
+    replay = client.post(
+        endpoint,
+        headers={"Idempotency-Key": request_key},
+        json=payload,
+    )
+
+    assert first.status_code == 201, first.text
+    assert replay.status_code == 200, replay.text
+    successor_id = first.json()["run_id"]
+    assert successor_id != source_id
+    assert replay.json()["run_id"] == successor_id
+    assert replay.json()["created"] is False
+    assert len(units.start_calls) == 1
+    record = daemon.service._read_record(successor_id)
+    assert record["resumed_from_run_id"] == source_id
+    assert record["effective_idempotency_key"] == request_key
+    manifest = daemon.application.repository.get_launch_manifest(successor_id)
+    assert manifest is not None
+    assert manifest.idempotency_key == request_key
+
+    prepared, resume = _worker_prepared(
+        record,
+        manifest,
+        root,
+        daemon._config.config_path,
+        load_workflow_config(daemon._config.config_path),
+    )
+
+    assert prepared.reserved_run_id == successor_id
+    assert prepared.repo_root == root
+    assert prepared.plan_path == plan_path
+    assert prepared.workflow_name == "managed_resume"
+    assert prepared.start_step == "implement"
+    assert isinstance(resume, ResumeContext)
+    assert resume.resumed_from_run_id == source_id
+    assert resume.worktree_path is not None
+    assert resume.worktree_path.is_dir()
+    assert resume.active_plan_path == plan_path
+    assert load_plan(plan_path).snapshot.current_checkpoint_index == 3
+    assert resume.pending_boundary_decision is not None
+    assert asdict(resume.pending_boundary_decision) == boundary
+    assert resume.pending_boundary_decision.applied is False
+    assert resume.pending_boundary_decision.consumed is False
+    if resume_mode == "durable_evidence":
+        assert resume.recovery_context is not None
+        assert resume.recovery_context.intent.target_selector == "codex.test"
+    else:
+        assert resume.recovery_context is None
+    assert source_dir.joinpath("run.json").read_bytes() == source_before
+    assert plan_path.read_bytes() == plan_before
+    assert len(units.start_calls) == 1
 
 
 @pytest.mark.parametrize(

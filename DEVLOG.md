@@ -2846,3 +2846,20 @@ HISTORY: Published clipboard history `c14f1f2`/`cd78d53` remains separate and mu
   screenshots per engine (14 Changelog and four toolbar); representative light,
   dark, compact and desktop captures were inspected with the expected controls,
   selected section, dirty state and readable content.
+
+## 2026-09-13 — Resume ordinary safe owner stops
+
+- Separated ordinary owner-stopped resume admission from the artifact-backed
+  pending-review exception at both CLI validation passes. Ordinary admission
+  requires matching `owner_stopped` status/reason, no awaiting-review scope, and
+  the existing strict current metadata decoder; saved continue boundaries remain
+  subject to canonical target matching and are not added to automatic scanning.
+- Added fixture-owned three-checkpoint coverage for exact pending-boundary
+  reconstruction and consumption, malformed/completed/lifecycle rejection, and
+  real daemon-backed REST/MCP ordinary and durable resume through a registered
+  managed worktree. Exact-key replay allocates and launches one successor while
+  predecessor run metadata and plan bytes remain unchanged.
+- Verification: CLI `11 passed, 150 deselected, 26 subtests passed`; daemon `5
+  passed, 34 deselected`; REST `7 passed, 54 deselected`; MCP `6 passed, 29
+  deselected`. Production Ruff and `git diff --check` passed. The server tests
+  emitted only the existing Starlette/httpx deprecation warning.

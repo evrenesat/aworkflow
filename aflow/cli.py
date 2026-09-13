@@ -289,6 +289,32 @@ def _completion_resume_phase(prev_run: Mapping[str, object]) -> str | None:
     return None
 
 
+def _is_ordinary_owner_stopped_resume(
+    prev_run: Mapping[str, object],
+    run_id: Path,
+    *,
+    reset_scope: bool = False,
+) -> bool:
+    """Recognize a structurally valid owner stop outside pending review."""
+    if (
+        prev_run.get("status") != "owner_stopped"
+        or prev_run.get("end_reason") != "owner_stopped"
+    ):
+        return False
+    active_scope = prev_run.get("active_implementation_scope")
+    if isinstance(active_scope, Mapping) and active_scope.get("awaiting_review") is True:
+        return False
+    try:
+        _validate_current_resume_metadata(
+            prev_run,
+            run_id,
+            reset_scope=reset_scope,
+        )
+    except ValueError:
+        return False
+    return True
+
+
 def _is_terminal_completion_resume(prev_run: Mapping[str, object]) -> bool:
     return _completion_resume_phase(prev_run) is not None
 
@@ -1498,6 +1524,11 @@ def _bootstrap_resume_invocation(
 
     effective_extra = extra_instructions_arg if extra_instructions_provided else saved_extra
 
+    ordinary_owner_stop = _is_ordinary_owner_stopped_resume(
+        prev_run,
+        resolved_run_id,
+        reset_scope=reset_scope,
+    )
     has_owner_stopped_pending_review = (
         _owner_stopped_review_step(
             run_dir,
@@ -1520,7 +1551,9 @@ def _bootstrap_resume_invocation(
         allow_start_step_override=start_step_override,
         allow_max_turns_override=max_turns_override,
         allow_extra_instructions_override=extra_instructions_provided,
-        allow_owner_stopped=has_owner_stopped_pending_review,
+        allow_owner_stopped=(
+            ordinary_owner_stop or has_owner_stopped_pending_review
+        ),
         allow_owner_stopped_pending_review=has_owner_stopped_pending_review,
         team_explicit=saved_team_explicit,
         max_turns_explicit=saved_max_turns_explicit,
@@ -1610,7 +1643,7 @@ def _resume_candidate_mismatch_reason(
     A valid candidate must:
     - Have lifecycle metadata compatible with the current workflow
     - Have branch/worktree identity required by that lifecycle mode
-    - Have status of "failed" or "running" (not "completed")
+    - Have an admitted status (ordinary scanning remains failed/running/waiting only)
     - Have last_snapshot.is_complete == false, unless terminal merge failed
     - Not have merge_status, unless it records a failed terminal merge
     - Have lifecycle_setup that matches the current workflow's effective setup tuple
@@ -4055,6 +4088,14 @@ def _detect_resume_candidate(
                 raise
             return None
 
+    ordinary_owner_stop = (
+        resume_bootstrap is not None
+        and _is_ordinary_owner_stopped_resume(
+            prev_run,
+            resolved_run_id,
+            reset_scope=reset_scope,
+        )
+    )
     has_owner_stopped_pending_review = (
         _owner_stopped_review_step(
             run_dir,
@@ -4080,7 +4121,9 @@ def _detect_resume_candidate(
         allow_extra_instructions_override=resume_bootstrap is not None,
         allow_start_step_override=allow_start_step_override,
         allow_max_turns_override=allow_max_turns_override,
-        allow_owner_stopped=has_owner_stopped_pending_review,
+        allow_owner_stopped=(
+            ordinary_owner_stop or has_owner_stopped_pending_review
+        ),
         allow_owner_stopped_pending_review=has_owner_stopped_pending_review,
         team_explicit=team_explicit,
         max_turns_explicit=max_turns_explicit,

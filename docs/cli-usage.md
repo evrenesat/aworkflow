@@ -122,6 +122,14 @@ creating a new run. Extra instructions use three-way resume semantics: omit
 them to inherit, pass text after `--` to replace them, or pass a bare `--` to
 clear them. Fresh `aflow run` invocations still require a plan.
 
+An explicitly selected owner-stopped run can resume from an ordinary safe
+worker boundary when both its status and end reason are `owner_stopped`, its
+plan remains incomplete, and its complete current manager metadata validates.
+A saved, unconsumed `continue` decision remains authoritative through bootstrap
+and is consumed only when its exact next step, role, selector, plan, and scope
+target starts. This does not add owner-stopped runs to automatic candidate
+scanning or relax the separate artifact-backed pending-review exception.
+
 A remote successor restart is separate from resume. It creates a fresh run
 with normal startup validation and records restarted_from_run_id; the source
 must be daemon-owned, explicitly owner-stopped, and have no active exact unit.

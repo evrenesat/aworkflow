@@ -30,6 +30,7 @@ from test_control_plane_api import (
     _register_peer_project,
     _unresolved_recovery_runtime,
     _seed_recovery_source,
+    _seed_managed_owner_stopped_resume_source,
     _seed_issue35_progress_fixture,
     _source_artifact_bytes,
     _start_pending as _rest_start_pending,
@@ -457,6 +458,126 @@ def test_mcp_durable_recovery_matches_rest_and_discovery(mcp_client) -> None:
     assert unauthenticated.json() == {"detail": {"code": "unauthorized"}}
     assert len(units.start_calls) == 1
     assert _source_artifact_bytes(source_dir) == before
+
+
+@pytest.mark.parametrize(
+    "resume_mode",
+    ("ordinary", "durable_evidence"),
+)
+def test_mcp_managed_owner_stop_resume_uses_real_bootstrap(
+    mcp_client,
+    resume_mode: str,
+) -> None:
+    from dataclasses import asdict
+
+    from aflow.config import load_workflow_config
+    from aflow.daemon import _worker_prepared
+    from aflow.plan import load_plan
+    from aflow.run_state import ResumeContext
+    from aflow_app_server import main
+
+    client, root, units, monkeypatch = mcp_client
+    service = main._control_plane_service
+    assert service is not None
+    request_key = f"mcp-owner-stop-{resume_mode}"
+    source_id, source_dir, plan_path, daemon, boundary = (
+        _seed_managed_owner_stopped_resume_source(
+            service,
+            root,
+            monkeypatch,
+            source_id=f"mcp-owner-stopped-{resume_mode.replace('_', '-')}",
+        )
+    )
+    source_before = source_dir.joinpath("run.json").read_bytes()
+    plan_before = plan_path.read_bytes()
+    arguments = {
+        "project_id": PROJECT_ID,
+        "run_id": source_id,
+        "idempotency_key": request_key,
+    }
+    if resume_mode == "durable_evidence":
+        arguments["recovery"] = _recovery_payload()
+
+    wrong_project = _mcp_request(
+        client,
+        "tools/call",
+        {
+            "name": "resume_run",
+            "arguments": {
+                **arguments,
+                "project_id": "not-allowed",
+                "idempotency_key": f"{request_key}-wrong-project",
+            },
+        },
+    )
+    assert wrong_project["result"]["isError"] is True
+    assert wrong_project["result"]["content"][0]["text"] == "project_not_found"
+    assert units.start_calls == []
+    if resume_mode == "durable_evidence":
+        invalid_target = _mcp_request(
+            client,
+            "tools/call",
+            {
+                "name": "resume_run",
+                "arguments": {
+                    **arguments,
+                    "idempotency_key": f"{request_key}-invalid-target",
+                    "recovery": _recovery_payload("codex.missing"),
+                },
+            },
+        )
+        assert invalid_target["result"]["isError"] is True
+        assert json.loads(invalid_target["result"]["content"][0]["text"])[
+            "code"
+        ] == "recovery_target_invalid"
+        assert units.start_calls == []
+
+    first = _mcp_tool(client, "resume_run", arguments)
+    replay = _mcp_tool(client, "resume_run", arguments)
+
+    successor_id = first["run_id"]
+    assert successor_id != source_id
+    assert replay["run_id"] == successor_id
+    assert replay["created"] is False
+    assert len(units.start_calls) == 1
+    record = daemon.service._read_record(successor_id)
+    assert record["resumed_from_run_id"] == source_id
+    assert record["effective_idempotency_key"] == request_key
+    manifest = daemon.application.repository.get_launch_manifest(successor_id)
+    assert manifest is not None
+    assert manifest.idempotency_key == request_key
+
+    prepared, resume = _worker_prepared(
+        record,
+        manifest,
+        root,
+        daemon._config.config_path,
+        load_workflow_config(daemon._config.config_path),
+    )
+
+    assert prepared.reserved_run_id == successor_id
+    assert prepared.repo_root == root
+    assert prepared.plan_path == plan_path
+    assert prepared.workflow_name == "managed_resume"
+    assert prepared.start_step == "implement"
+    assert isinstance(resume, ResumeContext)
+    assert resume.resumed_from_run_id == source_id
+    assert resume.worktree_path is not None
+    assert resume.worktree_path.is_dir()
+    assert resume.active_plan_path == plan_path
+    assert load_plan(plan_path).snapshot.current_checkpoint_index == 3
+    assert resume.pending_boundary_decision is not None
+    assert asdict(resume.pending_boundary_decision) == boundary
+    assert resume.pending_boundary_decision.applied is False
+    assert resume.pending_boundary_decision.consumed is False
+    if resume_mode == "durable_evidence":
+        assert resume.recovery_context is not None
+        assert resume.recovery_context.intent.target_selector == "codex.test"
+    else:
+        assert resume.recovery_context is None
+    assert source_dir.joinpath("run.json").read_bytes() == source_before
+    assert plan_path.read_bytes() == plan_before
+    assert len(units.start_calls) == 1
 
 
 @pytest.mark.parametrize(

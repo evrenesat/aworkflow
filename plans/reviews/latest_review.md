@@ -2751,4 +2751,45 @@ Keep the ignored original plan in place and record the final SHA there.
 Publication, exact-SHA CI and live activation remain controller/coordinator
 delivery steps and are not claimed by this review.
 
+
+---
+
+## Ordinary owner-stop bootstrap — cumulative review approved, 2026-09-13
+
+- Unchanged Pre-Handoff Base HEAD: `c2ade231cc40613acc6a251a95ff631fc762f492`.
+- Reviewed HEAD: `786150a3dfc50b2609ed36df607ee44bd0db0566`.
+- Coverage: 1 new / 1 total commit, `cp1 v01`; full original plan and all six
+  accumulated implementation files. No prior findings or follow-up overlays.
+- Applied material finding admission gate, exclusions and proportionate-fix
+  discipline. No material findings. Ordinary status admission is separate from
+  the stronger pending-review flag at both validation sites; strict decoding,
+  completion, lifecycle, identity, review, daemon ownership and inactivity gates
+  remain in place. Automatic scanning is unchanged.
+- Exact pending-continue fields survive decoding and checkpoint-3 continuation;
+  the runner observes consumption only at canonical matching target startup.
+  REST/MCP fixtures exercise real bootstrap and worker preparation for ordinary
+  and durable recovery, exact-key replay, predecessor immutability and rejection
+  of wrong projects/invalid targets. No providers or actual stopped runs invoked.
+
+Retained completed command receipts and result.json inspected at
+`/root/code/agent_flow/.aflow/runs/20260913t162439z-4507b612/turns/turn-001/`:
+
+- Final plan CLI selection: 11 passed, 150 deselected, 26 subtests passed (1.33s).
+- Plan daemon selection: 5 passed, 34 deselected (0.74s).
+- Plan REST selection: 7 passed, 54 deselected (3.04s).
+- Plan MCP selection: 6 passed, 29 deselected (2.34s).
+- Production Ruff and syntax-focused test Ruff: passed.
+- Reviewer full-range `git diff --check c2ade231 HEAD`: passed.
+- Earlier fixture failures were corrected before final passing receipts. Retained
+  focused evidence reused; full regression remains CI-owned. Existing server
+  dependency warning only. Fixture paths are portable and locally isolated.
+
+Approval folds this tracked reviewer record into exactly one unpublished handoff
+commit, preserving all six reviewed implementation blobs and the single DEVLOG
+entry. No fix plan created and no stale overlay exists. Original ignored plan
+remains in place for engine finalization; final approved SHA is recorded there
+only. Verify one commit above base and clean tracked state after finalization.
+Publication, exact-SHA CI, activation and coordinator retry of source 4180bb8c
+remain separate pending delivery gates; none is claimed complete by this review.
+
 No material findings
