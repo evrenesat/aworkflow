@@ -241,9 +241,9 @@ class ControlPlaneService:
         return self._project(project_id).daemon.application.capabilities.get()
 
     @staticmethod
-    def _status(item, run_id: str) -> RunStatus:
+    def _status(item, run_id: str, *, include_progress: bool = True) -> RunStatus:
         """Return the daemon's finalized status for one run."""
-        return item.daemon.service.run_status(run_id)
+        return item.daemon.service.run_status(run_id, include_progress=include_progress)
 
     def list_plans(
         self, project_id: str, *, limit: int, cursor: str | None
@@ -252,22 +252,38 @@ class ControlPlaneService:
             limit=limit, cursor=cursor
         )
 
-    def list_runs(self, project_id: str, *, limit: int, cursor: str | None, history: str = "visible") -> RunPage:
+    def list_runs(
+        self,
+        project_id: str,
+        *,
+        limit: int,
+        cursor: str | None,
+        history: str = "visible",
+        include_progress: bool = True,
+    ) -> RunPage:
         item = self._project(project_id)
         page = item.daemon.application.repository.list_history_page(
             limit=limit,
             cursor=cursor,
             history=history,
         )
+
+        def status_for(identity) -> RunStatus:
+            status = self._status(
+                item,
+                identity.run_id,
+                include_progress=include_progress,
+            )
+            if not include_progress:
+                status = item.daemon.application.repository.with_original_plan_identity(status)
+            return replace(
+                status,
+                history_state=identity.history_state,
+                history_revision=identity.history_revision,
+            )
+
         return RunPage(
-            runs=tuple(
-                replace(
-                    self._status(item, identity.run_id),
-                    history_state=identity.history_state,
-                    history_revision=identity.history_revision,
-                )
-                for identity in page.runs
-            ),
+            runs=tuple(status_for(identity) for identity in page.runs),
             next_cursor=page.next_cursor,
         )
 

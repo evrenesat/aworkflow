@@ -2549,3 +2549,68 @@ Publication, exact-SHA CI, deployment and live speed verification remain the
 controller/coordinator's normal delivery steps and are not claimed complete.
 
 No material findings
+
+
+---
+
+# Global visible progress loading — cumulative review v01 rejected, 2026-09-13
+
+Base: `6e40b91058fb00b7a7bba337f0bb63f7ca892a6d` (unchanged).
+HEAD: `cb194b34b1905a71ec3b011fb24ae4c4efe04195`.
+2 new / 2 total commits: `cp1 v01` (`f05733c3`) and `cp2 v01` (`cb194b34`).
+Reviewed the full original plan and accumulated producer, transport, presentation,
+scheduler, tests and documentation. No previous findings apply to this handoff.
+
+R1 — P2, high confidence — GlobalRunOverview.tsx:337-354 and 394-400.
+Document hiding aborts only currently known enrichment. A late raw page updates
+renderedSnapshot and starts new detail GETs because pump does not check visibility.
+This runs expensive checkpoint projections while hidden, violating CP2's explicit
+suspension contract. A temporary deferred test began a raw request while visible,
+hid the document, then resolved a page inside act: the expected zero detail calls
+failed with one primary/late-hidden-page GET and signal.aborted=false. Probe removed.
+Keep hidden state as an admission/completion guard and recover cancelled work via
+the existing visibility refresh, including when raw cursor traversal remains busy.
+Use the smallest local scheduler correction and deterministic lifecycle coverage.
+
+Independent verification passed: 53 focused Vitest tests, 21 repository/identity
+checks, 4 selected canonical safety checks, 6 selected API tests, both scoped Ruff
+commands and cumulative git diff --check. Exact commands are in the original plan.
+Retained turn-002 result.json and command records in transport.stdout under the
+primary repository's `.aflow/runs/20260913t033036z-48d6edc5/turns/` confirm final
+build success, Chromium loading/visible-progress journeys 2 passed in 5.00s,
+and WebKit visible-progress journey 1 passed in 3.66s. These unchanged journeys
+were reused; they do not test the admitted hidden-document race. No full suites.
+
+One self-contained non-checkpoint fix overlay was written to
+`plans/in-progress/global-visible-progress-loading-20260913-cp01-v01.md`.
+Original plan tracking updated; implementation commits and DEVLOG unchanged.
+No squash or approval. Next review must resolve R1 and repeat the complete
+cumulative review from the original base before any squash. Publication, CI,
+live activation and quiet displayed-progress acceptance remain coordinator-owned.
+
+Material fixes required
+
+
+### 2026-09-13 — Cumulative review v02 rejected
+
+- Base unchanged: `6e40b91058fb00b7a7bba337f0bb63f7ca892a6d`.
+- Last Reviewed HEAD: `6beecafb8ecd5146a9c6ee6ea4f1662d881dfa00`.
+- 1 new / 3 total commits: `cp1 v01` (`f05733c3`), `cp2 v01` (`cb194b34`), `cp1 v02` (`6beecafb`). Reviewed the complete cumulative original-plan implementation, including producer, transport, presentation, scheduler, tests and documentation.
+- R1 resolved by `6beecafb`: hidden admission/cancelled completion/busy-cursor recovery pass the three new deferred regressions.
+- R2 open (P2/high), `GlobalRunOverview.tsx:300-304`, introduced by `6beecafb`: same-target recovery requeues completed stale mismatches when later raw pages change the rendered set. Reviewer deferred probe observed 2 exact GETs rather than 1 for the unchanged stale row in the same generation; probe removed. Distinguish terminal settlement from unfinished/cancelled work without changing stale presentation or R1 recovery.
+- Reviewer verification: 56 focused web tests passed; cumulative diff check passed. Reused unchanged CP1 v01 retained evidence: 21 repository/identity, 4 canonical safety, 6 API tests and scoped Ruff. Read turn-004 result.json and completed command records in the primary repository transport.stdout: build passed, browser Ruff passed, Chromium 2 passed (4.99s), WebKit 1 passed (3.70s). No full suites or external evidence edits.
+- Material fixes required. No squash, approval or history rewrite. New single non-checkpoint overlay: `plans/in-progress/global-visible-progress-loading-20260913-cp01-v02.md`; superseded v01 deleted. Preserve resolved R1; next review covers the full unchanged-base range again. Publication, exact-SHA CI, live activation and displayed-progress performance acceptance remain coordinator-owned.
+
+
+### 2026-09-13 — Cumulative review v03 approved
+
+- Unchanged review/squash base: `6e40b91058fb00b7a7bba337f0bb63f7ca892a6d`.
+- Reviewed HEAD: `963a04829b111b0886e3052cf77ee7843901f353`.
+- 1 new / 4 total commits: `cp1 v01` (`f05733c3`), `cp2 v01` (`cb194b34`), `cp1 v02` (`6beecafb`), `cp1 v03` (`963a0482`). Reviewed the entire original-plan range, including producer/transport defaults, canonical identity safety, raw coverage/search, bounded visible enrichment, snapshot ownership, tests and documentation.
+- R1 resolved and preserved: hidden late pages cannot admit reads; cancelled responses cannot publish or pump; returning visible during busy raw traversal recovers pending work.
+- R2 resolved by `963a0482`: explicit settlement distinguishes terminal mismatches from cancelled pending work. Later-page and attention-expansion regressions preserve one GET per admitted stale target; normal Refresh retries.
+- Reviewer verification: exact focused web command passed 59 tests; cumulative `git diff --check` passed. Reused unchanged CP1 evidence recorded in v01/v02: 21 repository/identity, 4 canonical safety and 6 API tests plus scoped Ruff. Turn-006 result and completed transport command records confirm build success, browser Ruff success, Chromium 2 passed (5.13s), WebKit 1 passed (3.95s). No full suites or external evidence/script edits.
+- Approval finalization: squash all four handoff commits into one after the unchanged base, preserve implementation blobs, include intentional tracked reviewer records, compact DEVLOG to one handoff entry, and delete the superseded v02 overlay. Original private plan remains in place for engine finalization; record the final approved SHA there after committing.
+- No new fix plan. Publication, exact-SHA CI, normal live activation and quiet full-coverage-plus-displayed-progress performance acceptance remain coordinator-owned and pending.
+
+No material findings

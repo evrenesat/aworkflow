@@ -16,6 +16,11 @@ export interface RunPlanPresentation {
   machineDerived: boolean
 }
 
+export interface RunCanonicalIdentity {
+  displayName: string | null
+  path: string | null
+}
+
 function validCount(count: RunProgressCount | null | undefined): number | null {
   return count?.coverage !== 'unavailable'
     && typeof count?.value === 'number'
@@ -126,6 +131,23 @@ function planBasename(planPath: string | null | undefined): string | null {
   return planPath.split(/[\\/]+/).pop()?.trim() || null
 }
 
+function canonicalIdentityValue(value: string | null | undefined): string | null {
+  return typeof value === 'string' && value.trim() ? value : null
+}
+
+/** Prefer the full progress identity, then the compatible raw-list identity. */
+export function runCanonicalIdentity(run: RunStatus): RunCanonicalIdentity {
+  const progressName = canonicalIdentityValue(run.progress?.original_plan_display_name)
+  const progressPath = canonicalIdentityValue(run.progress?.original_plan_path)
+  if (progressName || progressPath) {
+    return { displayName: progressName, path: progressPath }
+  }
+  return {
+    displayName: canonicalIdentityValue(run.original_plan_display_name),
+    path: canonicalIdentityValue(run.original_plan_path),
+  }
+}
+
 /**
  * Return the short, user-facing name for a run's plan without changing the
  * exact path kept in the run identity or technical details.
@@ -144,8 +166,7 @@ export function runPlanPath(run: RunStatus): string | null {
   if (typeof run.plan_path === 'string' && run.plan_path.trim()) return run.plan_path
   const evidencePath = run.evidence.plan_path
   if (typeof evidencePath === 'string' && evidencePath.trim()) return evidencePath
-  const canonicalPath = run.progress?.original_plan_path
-  return typeof canonicalPath === 'string' && canonicalPath.trim() ? canonicalPath : null
+  return runCanonicalIdentity(run).path
 }
 
 /** Use the canonical original identity when the legacy list fields are absent. */
@@ -159,8 +180,9 @@ export function runPlanDisplayNameForRun(run: RunStatus): string {
  * unchanged at this presentation boundary.
  */
 export function runPlanPresentationForRun(run: RunStatus): RunPlanPresentation {
-  const canonicalName = run.progress?.original_plan_display_name?.trim() || ''
-  const canonicalPath = run.progress?.original_plan_path
+  const canonical = runCanonicalIdentity(run)
+  const canonicalName = canonical.displayName || ''
+  const canonicalPath = canonical.path
   if (canonicalName) {
     const canonicalBasename = planBasename(canonicalPath)
     const isPathDerived = canonicalBasename !== null

@@ -919,13 +919,14 @@ class DaemonService:
                 recovery_intent=recovery_intent,
             )
 
-    def run_status(self, run_id: str) -> RunStatus:
+    def run_status(self, run_id: str, *, include_progress: bool = True) -> RunStatus:
         """Project a persisted startup question into canonical run status."""
         from .control_plane.run_activity import project_activity
         repository = self._application.repository
 
         def finalize(candidate: RunStatus) -> RunStatus:
-            return repository.with_progress(project_activity(candidate))
+            projected = project_activity(candidate)
+            return repository.with_progress(projected) if include_progress else projected
 
         status = repository.get_run_status(run_id, include_progress=False)
         if status.status == "owner_stopped":

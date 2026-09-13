@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from 'react'
-import { fetchGlobalRuns, matchesGlobalRun, selectGlobalRuns, useRecentRunsLimit, type GlobalRunProgressUpdate } from '../globalRuns'
-import type { ProjectInfo, RunStatus } from '../types'
+import * as api from '../api'
+import { fetchGlobalRuns, matchesGlobalRun, matchesGlobalRunProgressIdentity, matchesGlobalRunSnapshot, selectGlobalRuns, useRecentRunsLimit, type GlobalRunProgressUpdate } from '../globalRuns'
+import type { ProjectInfo, RunProgressSummary, RunStatus } from '../types'
 import {
   checkpointApprovalText,
   runActivityText,
@@ -10,7 +11,7 @@ import {
 } from '../runPresentation'
 import { projectContextLabel } from '../projectPresentation'
 import { useHeaderSlots } from './HeaderSlots'
-import { RunProgress } from './RunProgress'
+import { RunProgress, type RunProgressLoadState } from './RunProgress'
 
 export function RecentRunsLimit() {
   const [limit, setLimit] = useRecentRunsLimit()
@@ -36,6 +37,7 @@ interface ProjectRunLoadState {
 
 interface GlobalRunLoadState {
   identity: string | null
+  generation: number
   mode: 'initial' | 'refresh'
   settled: boolean
   projects: Record<string, ProjectRunLoadState>
@@ -43,6 +45,7 @@ interface GlobalRunLoadState {
 
 const emptyGlobalRunLoadState: GlobalRunLoadState = {
   identity: null,
+  generation: 0,
   mode: 'initial',
   settled: false,
   projects: {},
@@ -59,11 +62,45 @@ function overlayRuns(projectId: string, previousRows: RunStatus[], freshRows: Ru
   return [...rows.values()]
 }
 
+interface EnrichmentTarget {
+  key: string
+  projectId: string
+  runId: string
+  generation: number
+  resultsIdentity: string
+  run: RunStatus
+}
+
+interface EnrichmentRecord extends EnrichmentTarget {
+  state: RunProgressLoadState
+  progress: RunProgressSummary | null
+  message: string | null
+  settled: boolean
+}
+
+interface EnrichmentRequest extends EnrichmentTarget {
+  controller: AbortController
+}
+
+const MAX_VISIBLE_ENRICHMENTS = 4
+const STALE_PROGRESS_MESSAGE = 'Run changed; refresh to update checkpoint progress.'
+const FAILED_PROGRESS_MESSAGE = 'Checkpoint progress unavailable — Refresh to retry.'
+
 export function GlobalRunOverview({ projects, onOpen, registryLoading = false, registryError = null }: { projects: ProjectInfo[]; onOpen: (project: string, run: string) => void; registryLoading?: boolean; registryError?: string | null }) {
   const [history, setHistory] = useState<'visible' | 'archived' | 'all'>('visible')
   const [loadState, setLoadState] = useState<GlobalRunLoadState>(emptyGlobalRunLoadState)
   const loadStateRef = useRef(loadState)
   const requestGenerationRef = useRef(0)
+  const enrichmentRef = useRef(new Map<string, EnrichmentRecord>())
+  const enrichmentQueueRef = useRef<EnrichmentTarget[]>([])
+  const activeEnrichmentRef = useRef(new Map<string, EnrichmentRequest>())
+  const visibleEnrichmentRef = useRef(new Map<string, EnrichmentTarget>())
+  const enrichmentEpochRef = useRef(0)
+  const rowTokenRef = useRef(new WeakMap<RunStatus, number>())
+  const nextRowTokenRef = useRef(0)
+  const pumpEnrichmentRef = useRef<(() => void) | null>(null)
+  const [, setEnrichmentVersion] = useState(0)
+  const [visibilityRevision, setVisibilityRevision] = useState(0)
   const [nonce, setNonce] = useState(0)
   const [limit] = useRecentRunsLimit()
   const [search, setSearch] = useState('')
@@ -91,7 +128,7 @@ export function GlobalRunOverview({ projects, onOpen, registryLoading = false, r
     const identity = resultsIdentity
     const requestedProjectIds = ids ? ids.split('\n') : []
 
-    const beginRequest = (): void => {
+    const beginRequest = (generation: number): void => {
       const previous = loadStateRef.current
       const sameIdentity = previous.identity === identity
       const previousProjects = sameIdentity ? previous.projects : {}
@@ -106,6 +143,7 @@ export function GlobalRunOverview({ projects, onOpen, registryLoading = false, r
       }))
       updateLoadState(() => ({
         identity,
+        generation,
         mode: sameIdentity && previous.settled ? 'refresh' : 'initial',
         settled: requestedProjectIds.length === 0,
         projects: projectsState,
@@ -116,7 +154,7 @@ export function GlobalRunOverview({ projects, onOpen, registryLoading = false, r
       if (busy || document.visibilityState === 'hidden' || !registryReady) return
       busy = true
       const generation = ++requestGenerationRef.current
-      beginRequest()
+      beginRequest(generation)
       if (!ids) {
         busy = false
         return
@@ -204,6 +242,189 @@ export function GlobalRunOverview({ projects, onOpen, registryLoading = false, r
   ] as const)
   useEffect(() => setAttentionVisible(10), [history, ids, search])
 
+  const renderedRows = [...selected.ongoing, ...selected.recent, ...attentionRows]
+  const currentGeneration = currentLoad?.generation ?? 0
+  const renderedSnapshot = renderedRows.map(({ projectId, run }) => {
+    let token = rowTokenRef.current.get(run)
+    if (token === undefined) {
+      token = ++nextRowTokenRef.current
+      rowTokenRef.current.set(run, token)
+    }
+    return `${runIdentity(projectId, run.run_id)}:${token}`
+  }).join('\u0000')
+
+  useEffect(() => {
+    const targets = new Map<string, EnrichmentTarget>()
+    for (const { projectId, run } of renderedRows) {
+      const key = runIdentity(projectId, run.run_id)
+      targets.set(key, { key, projectId, runId: run.run_id, generation: currentGeneration, resultsIdentity, run })
+    }
+    visibleEnrichmentRef.current = targets
+
+    const sameTarget = (left: EnrichmentTarget, right: EnrichmentTarget): boolean => (
+      left.key === right.key
+      && left.generation === right.generation
+      && left.resultsIdentity === right.resultsIdentity
+      && left.run === right.run
+    )
+    const isCurrentTarget = (target: EnrichmentTarget): boolean => {
+      const current = targets.get(target.key)
+      return current !== undefined && sameTarget(current, target)
+    }
+    const hasQueuedTarget = (target: EnrichmentTarget): boolean => enrichmentQueueRef.current.some(candidate => sameTarget(candidate, target))
+    const hasActiveTarget = (target: EnrichmentTarget): boolean => {
+      const active = activeEnrichmentRef.current.get(target.key)
+      return active !== undefined && sameTarget(active, target)
+    }
+    let changed = false
+    const enqueueTarget = (target: EnrichmentTarget): void => {
+      if (hasQueuedTarget(target) || hasActiveTarget(target)) return
+      enrichmentQueueRef.current.push(target)
+      changed = true
+    }
+
+    for (const [key, request] of activeEnrichmentRef.current) {
+      if (!isCurrentTarget(request)) {
+        request.controller.abort()
+        activeEnrichmentRef.current.delete(key)
+      }
+    }
+    enrichmentQueueRef.current = enrichmentQueueRef.current.filter(isCurrentTarget)
+
+    for (const key of [...enrichmentRef.current.keys()]) {
+      if (!targets.has(key)) {
+        enrichmentRef.current.delete(key)
+        changed = true
+      }
+    }
+
+    for (const target of targets.values()) {
+      const existing = enrichmentRef.current.get(target.key)
+      if (existing && sameTarget(existing, target)) {
+        if (!existing.settled && !hasActiveTarget(target)) enqueueTarget(target)
+        continue
+      }
+
+      if (target.run.progress) {
+        enrichmentRef.current.set(target.key, {
+          ...target,
+          state: 'ready',
+          progress: target.run.progress,
+          message: null,
+          settled: true,
+        })
+        changed = true
+        continue
+      }
+
+      const rawChanged = existing !== undefined && existing.run !== target.run
+      enrichmentRef.current.set(target.key, {
+        ...target,
+        state: rawChanged && existing?.progress ? 'stale' : 'loading',
+        progress: existing?.progress ?? null,
+        message: rawChanged && existing?.progress ? STALE_PROGRESS_MESSAGE : null,
+        settled: false,
+      })
+      enqueueTarget(target)
+    }
+
+    const settle = (
+      target: EnrichmentTarget,
+      state: RunProgressLoadState,
+      progress: RunProgressSummary | null,
+      message: string | null,
+    ): void => {
+      const current = enrichmentRef.current.get(target.key)
+      const visible = visibleEnrichmentRef.current.get(target.key)
+      if (
+        !current
+        || !visible
+        || current.generation !== target.generation
+        || current.resultsIdentity !== target.resultsIdentity
+        || current.run !== target.run
+        || visible.generation !== target.generation
+        || visible.resultsIdentity !== target.resultsIdentity
+        || visible.run !== target.run
+      ) return
+      enrichmentRef.current.set(target.key, { ...current, state, progress, message, settled: true })
+      setEnrichmentVersion(version => version + 1)
+    }
+
+    const pump = (): void => {
+      if (pumpEnrichmentRef.current !== pump) return
+      if (document.visibilityState === 'hidden') return
+      while (activeEnrichmentRef.current.size < MAX_VISIBLE_ENRICHMENTS) {
+        const target = enrichmentQueueRef.current.shift()
+        if (!target) break
+        if (!isCurrentTarget(target)) continue
+        const current = enrichmentRef.current.get(target.key)
+        if (
+          !current
+          || current.generation !== target.generation
+          || current.resultsIdentity !== target.resultsIdentity
+          || current.run !== target.run
+          || (current.state !== 'loading' && current.state !== 'stale')
+        ) continue
+        const controller = new AbortController()
+        const request: EnrichmentRequest = { ...target, controller }
+        const requestEpoch = enrichmentEpochRef.current
+        activeEnrichmentRef.current.set(target.key, request)
+        void api.getControlPlaneRun(target.projectId, target.runId, { signal: controller.signal })
+          .then(detail => {
+            if (controller.signal.aborted || enrichmentEpochRef.current !== requestEpoch) return
+            if (
+              detail.run_id !== target.runId
+              || !matchesGlobalRunSnapshot(target.run, detail)
+              || !matchesGlobalRunProgressIdentity(target.run, detail)
+            ) {
+              settle(target, 'stale', current.progress, STALE_PROGRESS_MESSAGE)
+              return
+            }
+            settle(target, 'ready', detail.progress ?? null, null)
+          })
+          .catch(() => {
+            if (!controller.signal.aborted && enrichmentEpochRef.current === requestEpoch) {
+              const latest = enrichmentRef.current.get(target.key)
+              settle(target, 'failed', latest?.progress ?? null, FAILED_PROGRESS_MESSAGE)
+            }
+          })
+          .finally(() => {
+            if (activeEnrichmentRef.current.get(target.key) === request) {
+              activeEnrichmentRef.current.delete(target.key)
+            }
+            if (!controller.signal.aborted && enrichmentEpochRef.current === requestEpoch) pumpEnrichmentRef.current?.()
+          })
+      }
+    }
+    pumpEnrichmentRef.current = pump
+    if (changed) setEnrichmentVersion(version => version + 1)
+    pump()
+  }, [renderedSnapshot, currentGeneration, resultsIdentity, visibilityRevision])
+
+  useEffect(() => () => {
+    enrichmentEpochRef.current += 1
+    for (const request of activeEnrichmentRef.current.values()) request.controller.abort()
+    activeEnrichmentRef.current.clear()
+    enrichmentQueueRef.current = []
+    enrichmentRef.current.clear()
+    visibleEnrichmentRef.current.clear()
+    pumpEnrichmentRef.current = null
+  }, [])
+
+  useEffect(() => {
+    const pauseEnrichment = (): void => {
+      if (document.visibilityState === 'hidden') {
+        enrichmentEpochRef.current += 1
+        for (const request of activeEnrichmentRef.current.values()) request.controller.abort()
+        activeEnrichmentRef.current.clear()
+        enrichmentQueueRef.current = []
+      }
+      setVisibilityRevision(revision => revision + 1)
+    }
+    document.addEventListener('visibilitychange', pauseEnrichment)
+    return () => document.removeEventListener('visibilitychange', pauseEnrichment)
+  }, [])
+
   function changeHistory(next: 'visible' | 'archived' | 'all') {
     updateLoadState(() => emptyGlobalRunLoadState)
     setAttentionVisible(10)
@@ -216,10 +437,25 @@ export function GlobalRunOverview({ projects, onOpen, registryLoading = false, r
     const status = statusLabel(run)
     const title = runPlanPresentationForRun(run)
     const displayName = title.label
+    const key = runIdentity(projectId, run.run_id)
+    const enrichment = enrichmentRef.current.get(key)
+    const currentEnrichment = enrichment
+      && enrichment.generation === currentGeneration
+      && enrichment.resultsIdentity === resultsIdentity
+      && enrichment.run === run
+      ? enrichment
+      : null
+    const progressRun = currentEnrichment ? { ...run, progress: currentEnrichment.progress } : run
+    const progressState: RunProgressLoadState = currentEnrichment?.state ?? (run.progress ? 'ready' : 'loading')
+    const progressLabel = progressState === 'ready'
+      ? progressRun.progress ? checkpointApprovalText(progressRun.progress) : 'Checkpoint progress unavailable'
+      : currentEnrichment?.message
+        || (progressState === 'loading' ? 'Loading checkpoint progress…' : 'Checkpoint progress unavailable')
     return <li key={JSON.stringify([projectId, run.run_id])}>
       <button
         className="card global-run-row"
-        aria-label={`${projectLabel} · ${status} · ${displayName} · ${run.progress ? checkpointApprovalText(run.progress) : 'Checkpoint progress unavailable'} · ${runDurationText(run)} · ${runActivityText(run)} · ${run.run_id}`}
+        data-enrichment-state={progressState === 'ready' ? 'settled' : progressState}
+        aria-label={`${projectLabel} · ${status} · ${displayName} · ${progressLabel} · ${runDurationText(run)} · ${runActivityText(run)} · ${run.run_id}`}
         onClick={() => onOpen(projectId, run.run_id)}
       >
         <span className="global-run-row-heading">
@@ -233,7 +469,7 @@ export function GlobalRunOverview({ projects, onOpen, registryLoading = false, r
           <span>{runDurationText(run)}</span>
           <span>{runActivityText(run)}</span>
         </span>
-        <RunProgress run={run} />
+        <RunProgress run={progressRun} loadState={progressState} loadMessage={currentEnrichment?.message} />
       </button>
     </li>
   }

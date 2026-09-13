@@ -221,6 +221,8 @@ class RunStatusResponse(CanonicalTransportModel):
     revision: int
     reason: str | None = None
     plan_path: str | None = None
+    original_plan_display_name: str | None = None
+    original_plan_path: str | None = None
     started_at: str | None = None
     ended_at: str | None = None
     unit_name: str | None = None

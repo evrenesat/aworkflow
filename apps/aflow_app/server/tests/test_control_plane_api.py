@@ -1054,6 +1054,100 @@ def test_run_list_final_projection_once(control_client, monkeypatch) -> None:
     assert all(item["history_revision"] == 0 for item in payload["runs"])
 
 
+def test_raw_run_list_skips_rich_projection_and_preserves_history_identity(
+    control_client,
+) -> None:
+    from aflow_app_server import main
+
+    client, root, _, monkeypatch = control_client
+    plan = root / "plans" / "todo" / "test-plan.md"
+    owned_id = "raw-list-owned"
+    create_launch_manifest(
+        root,
+        LaunchManifest(
+            run_id=owned_id,
+            project_root=str(root.resolve()),
+            plan_path=str(plan.resolve()),
+            workflow_name="managed",
+            max_turns=5,
+            idempotency_key="raw-list-owned-key",
+            caller_scope=f"bearer:{PROJECT_ID}",
+        ),
+    )
+    overlay = root / "execution" / "raw-overlay.md"
+    overlay.parent.mkdir(parents=True)
+    overlay.write_text("# Active overlay\n", encoding="utf-8")
+    owned_dir = root / ".aflow" / "runs" / owned_id
+    owned_dir.mkdir(parents=True)
+    (owned_dir / "run.json").write_text(
+        json.dumps(
+            {
+                "status": "running",
+                "repo_root": str(root.resolve()),
+                "original_plan_path": str(plan.resolve()),
+                "active_plan_path": str(overlay.resolve()),
+                "workflow_name": "managed",
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    archived = client.post(
+        f"/api/control-plane/projects/{PROJECT_ID}/runs/{owned_id}/archive",
+        headers={"Idempotency-Key": "raw-list-archive"},
+        json={"expected_revision": 0},
+    )
+    assert archived.status_code == 200, archived.text
+
+    legacy_id = "20260809T172123Z-abc12345"
+    legacy_dir = root / ".aflow" / "runs" / legacy_id
+    legacy_dir.mkdir(parents=True)
+    (legacy_dir / "run.json").write_text('{"status":"running"}\n', encoding="utf-8")
+
+    service = main._control_plane_service
+    assert service is not None
+    repository = service._project(PROJECT_ID).daemon.application.repository
+    original_projection = repository._with_progress
+    projections: list[str] = []
+
+    def counted_projection(status, run_dir, metadata):
+        projections.append(status.run_id)
+        return original_projection(status, run_dir, metadata)
+
+    monkeypatch.setattr(repository, "_with_progress", counted_projection)
+
+    raw_response = client.get(
+        f"/api/control-plane/projects/{PROJECT_ID}/runs?history=all&include_progress=false"
+    )
+    assert raw_response.status_code == 200, raw_response.text
+    raw_payload = raw_response.json()
+    assert [item["run_id"] for item in raw_payload["runs"]] == [legacy_id, owned_id]
+    assert projections == []
+
+    raw_owned = next(item for item in raw_payload["runs"] if item["run_id"] == owned_id)
+    assert raw_owned["history_state"] == "archived"
+    assert raw_owned["history_revision"] == 1
+    assert raw_owned["progress"] is None
+    assert raw_owned["plan_path"] == str(overlay.resolve())
+    assert raw_owned["original_plan_display_name"] == "test-plan.md"
+    assert raw_owned["original_plan_path"] == "plans/todo/test-plan.md"
+
+    rich_response = client.get(
+        f"/api/control-plane/projects/{PROJECT_ID}/runs?history=all&include_progress=true"
+    )
+    assert rich_response.status_code == 200, rich_response.text
+    assert projections == [legacy_id, owned_id]
+    rich_payload = rich_response.json()
+    for raw_item in raw_payload["runs"]:
+        rich_item = next(
+            item for item in rich_payload["runs"] if item["run_id"] == raw_item["run_id"]
+        )
+        assert rich_item["progress"] is not None
+        for key, value in raw_item.items():
+            if key != "progress":
+                assert rich_item[key] == value
+
+
 def test_deprecated_execution_routes_are_not_registered() -> None:
     assert not any(
         getattr(route, "path", "").startswith("/api/executions") for route in app.routes

@@ -1,5 +1,22 @@
 # DEVLOG
 
+## 2026-09-13 — Complete raw run coverage with bounded visible progress
+
+- Added compatible `include_progress=false` lists with full daemon authority,
+  history pagination and validated canonical original-plan identity. Default
+  lists and exact-run GETs remain rich; the raw identity resolver avoids rich
+  checkpoint/history reduction and preserves active overlay paths.
+- All runs searches complete raw coverage and enriches only rendered exact
+  project/run rows with at most four concurrent GETs. Generation, raw-row and
+  snapshot guards reject contradictory or obsolete progress visibly as stale.
+- Hidden documents suspend admission and cancel work, including late raw-page
+  arrivals. Visibility recovery resumes unfinished work; settled mismatches
+  remain terminal until a new refresh generation or raw row.
+- Observable loading/stale/failed/settled progress states distinguish visible
+  enrichment from raw cursor completion. Focused identity/API and deferred web
+  tests, build, Ruff and Chromium/WebKit journeys passed; live timing and
+  displayed-progress acceptance remain coordinator-owned.
+
 ## 2026-09-13 — Reconcile raw inclusive statuses once
 
 - Reconciliation now requests progress-free statuses from inclusive repository

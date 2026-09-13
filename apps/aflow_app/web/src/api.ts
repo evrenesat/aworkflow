@@ -412,7 +412,7 @@ export async function preflightControlPlaneRun(
 
 export async function listControlPlaneRuns(
   projectId: string,
-  request: { cursor?: string; limit?: number; history?: 'visible' | 'archived' | 'all' } = {},
+  request: { cursor?: string; limit?: number; history?: 'visible' | 'archived' | 'all'; include_progress?: boolean } = {},
   options: { signal?: AbortSignal } = {},
 ): Promise<RunPage> {
   return fetchJson<RunPage>(`${controlProjectPath(projectId)}/runs${buildQuery(request)}`, options)

@@ -15,6 +15,7 @@ from urllib.parse import urlsplit
 import pytest
 from playwright.sync_api import Error as PlaywrightError, Page, expect, sync_playwright
 
+from aflow.control_plane import LaunchManifest, create_launch_manifest
 from aflow.control_plane.persistence import append_run_event
 from test_control_plane_api import PROJECT_ID, TOKEN, control_client, live_server  # noqa: F401
 from test_control_plane_api import (
@@ -41,6 +42,8 @@ RESPONSIVE_GLOBAL_RUN_ID = "responsive-run-00"
 RESPONSIVE_GLOBAL_TITLE = "Long plan 00"
 LONG_LABEL = "route-" + "x" * 120
 LONG_TEXT = "# Responsive fixture\n\n" + ("A long document line for ordinary document flow. " * 420) + "\n"
+VISIBLE_PROGRESS_RUN_ID = "visible-progress-hidden"
+VISIBLE_PROGRESS_TITLE = "Hidden original title"
 
 
 def _seed_responsive_fixture(root: Path) -> None:
@@ -84,6 +87,59 @@ def _seed_responsive_fixture(root: Path) -> None:
         for index in range(40)
     )
     workflows_path.write_text(workflows_path.read_text() + f"\n{workflows}\n")
+
+
+def _seed_visible_progress_fixture(root: Path) -> None:
+    """Add one canonical original plan behind a different active overlay."""
+    original = root / "plans" / "in-progress" / "hidden-original-title.md"
+    overlay = root / "execution" / "visible-overlay.md"
+    original.parent.mkdir(parents=True, exist_ok=True)
+    overlay.parent.mkdir(parents=True, exist_ok=True)
+    original.write_text(
+        "# Hidden original title\n\n"
+        "### [x] Checkpoint 1: Visible progress\n"
+        "- [x] Record the visible checkpoint\n\n"
+        "### [ ] Checkpoint 2: Remaining work\n"
+        "- [ ] Keep the remaining work pending\n",
+        encoding="utf-8",
+    )
+    overlay.write_text(
+        "# Active overlay\n\nThis is not the canonical original plan.\n",
+        encoding="utf-8",
+    )
+    create_launch_manifest(
+        root,
+        LaunchManifest(
+            run_id=VISIBLE_PROGRESS_RUN_ID,
+            project_root=str(root),
+            plan_path=str(original.resolve()),
+            workflow_name="managed",
+            team="team_00",
+            max_turns=5,
+            idempotency_key="responsive-visible-progress",
+            caller_scope=f"bearer:{PROJECT_ID}",
+            created_at="1970-01-01T00:00:00+00:00",
+        ),
+    )
+    run_dir = root / ".aflow" / "runs" / VISIBLE_PROGRESS_RUN_ID
+    run_dir.mkdir(parents=True, exist_ok=True)
+    (run_dir / "run.json").write_text(
+        json.dumps({
+            "status": "completed",
+            "repo_root": str(root),
+            "original_plan_path": str(original.resolve()),
+            "active_plan_path": str(overlay.resolve()),
+            "plan_path": str(overlay.resolve()),
+            "workflow_name": "managed",
+            "team": "team_00",
+            "turns_completed": 2,
+            "max_turns": 5,
+            "run_started_at": "2026-09-10T00:00:00Z",
+            "progress_history_complete": True,
+            "approved_checkpoint_indices": [1],
+        }),
+        encoding="utf-8",
+    )
 
 
 def _seed_team_family_fixture(root: Path) -> None:
@@ -1260,6 +1316,87 @@ def test_global_run_overview_loading_journey(control_client, monkeypatch, tmp_pa
             assert page.locator(".global-run-results h3").count() == 0
             expect(page.get_by_role("status")).to_have_count(0)
         finally:
+            browser.close()
+
+
+def test_global_run_overview_visible_progress_journey(control_client, monkeypatch):
+    """Search raw canonical identity, then release one bounded real detail read."""
+    _, root, _, _ = control_client
+    _seed_responsive_fixture(root)
+    _seed_visible_progress_fixture(root)
+    dist = Path(__file__).resolve().parents[2] / "web" / "dist"
+    monkeypatch.setenv("AFLOW_APP_WEB_DIST", str(dist))
+    base_path = f"/api/control-plane/projects/{PROJECT_ID}/runs"
+    detail_path = f"{base_path}/{VISIBLE_PROGRESS_RUN_ID}"
+    held_details = []
+    released = {"value": False}
+
+    def hold_visible_detail(route):
+        request_path = urlsplit(route.request.url).path
+        if (
+            route.request.method == "GET"
+            and request_path == detail_path
+            and not released["value"]
+        ):
+            held_details.append(route)
+            return
+        route.continue_()
+
+    with live_server() as url, sync_playwright() as playwright:
+        browser = _browser(playwright)
+        page = browser.new_page(viewport={"width": 1280, "height": 720})
+        pattern = f"**/api/control-plane/projects/{PROJECT_ID}/runs**"
+        page.route(pattern, hold_visible_detail)
+        try:
+            _login(page, url)
+            page.goto(f"{url}/?view=all-runs")
+            page.get_by_role("heading", name="All runs", exact=True).wait_for()
+            expect(page.locator(".global-run-results")).to_have_attribute("aria-busy", "false")
+            assert page.get_by_role("button", name=re.compile(rf"{re.escape(VISIBLE_PROGRESS_RUN_ID)}$")).count() == 0
+            assert held_details == []
+
+            search = page.get_by_role("searchbox", name="Search loaded runs")
+            search.fill(VISIBLE_PROGRESS_TITLE)
+            row = _assert_global_run_row(
+                page,
+                VISIBLE_PROGRESS_RUN_ID,
+                project_label="Test project",
+                title=VISIBLE_PROGRESS_TITLE,
+            )
+            expect(row.locator(".compact-run-progress")).to_have_attribute(
+                "data-progress-state", "loading"
+            )
+            expect(row).to_contain_text("Loading checkpoint progress…")
+            assert len(held_details) == 1
+
+            released["value"] = True
+            for route in held_details:
+                route.continue_()
+            held_details.clear()
+            expect(row.locator(".compact-run-progress")).to_have_attribute(
+                "data-progress-state", "settled"
+            )
+            expect(row.locator(".compact-run-progress")).to_have_attribute(
+                "data-progress-availability", "complete"
+            )
+            expect(row.locator(".compact-run-progress")).to_contain_text(
+                "1 of 2 checkpoints approved"
+            )
+            page.unroute(pattern, hold_visible_detail)
+
+            row.click()
+            _assert_run_detail(page, VISIBLE_PROGRESS_TITLE, VISIBLE_PROGRESS_RUN_ID)
+        finally:
+            released["value"] = True
+            for route in held_details:
+                try:
+                    route.continue_()
+                except PlaywrightError:
+                    pass
+            try:
+                page.unroute(pattern, hold_visible_detail)
+            except PlaywrightError:
+                pass
             browser.close()
 
 

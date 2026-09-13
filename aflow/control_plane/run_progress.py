@@ -1032,6 +1032,16 @@ class _ProgressBudget:
         )
 
 
+@dataclass(frozen=True)
+class _CanonicalProjectionInput:
+    """Validated run root and metadata shared by observer projections."""
+
+    root: Path | None
+    metadata: Mapping[str, Any] | None
+    budget: _ProgressBudget
+    reason: str | None = None
+
+
 @dataclass
 class _CanonicalDiscovery:
     """Bounded direct-entry discovery shared by one projection attempt."""
@@ -1070,6 +1080,64 @@ class _Invocation:
     inherited: bool = False
     repair: bool = False
     runtime_retry: bool = False
+
+
+def _canonical_projection_input(
+    run_dir: Path,
+    *,
+    metadata: Mapping[str, Any] | None,
+    run_metadata: Mapping[str, Any] | None,
+) -> _CanonicalProjectionInput:
+    """Apply the rich projection's root and supplied-metadata read boundary."""
+    if metadata is not None and run_metadata is not None and metadata != run_metadata:
+        raise ValueError("metadata and run_metadata disagree")
+    supplied_metadata = metadata if metadata is not None else run_metadata
+    candidate = Path(run_dir)
+    if candidate.is_symlink() or not candidate.is_dir():
+        return _CanonicalProjectionInput(
+            root=None,
+            metadata=None,
+            budget=_ProgressBudget(),
+            reason="missing_run",
+        )
+    try:
+        root = candidate.resolve(strict=True)
+    except (OSError, RuntimeError):
+        return _CanonicalProjectionInput(
+            root=None,
+            metadata=None,
+            budget=_ProgressBudget(),
+            reason="unavailable_run",
+        )
+
+    budget = _ProgressBudget()
+    if supplied_metadata is None:
+        loaded, load_reason = _canonical_read_json(
+            root / "run.json", budget, label="run.json", root=root
+        )
+        if loaded is None:
+            if load_reason == "invalid_evidence":
+                return _CanonicalProjectionInput(
+                    root=None,
+                    metadata=None,
+                    budget=budget,
+                    reason="invalid_evidence",
+                )
+            supplied_metadata = {}
+        else:
+            supplied_metadata = loaded
+    elif not isinstance(supplied_metadata, Mapping):
+        return _CanonicalProjectionInput(
+            root=None,
+            metadata=None,
+            budget=budget,
+            reason="invalid_evidence",
+        )
+    return _CanonicalProjectionInput(
+        root=root,
+        metadata=dict(supplied_metadata),
+        budget=budget,
+    )
 
 
 def _canonical_text(value: object, *, limit: int = 500) -> str | None:
@@ -5285,52 +5353,22 @@ def project_run_progress_detail(
     use_cache: bool = True,
 ) -> RunProgressDetail:
     """Return one bounded, read-only canonical run-progress detail projection."""
-    if metadata is not None and run_metadata is not None and metadata != run_metadata:
-        raise ValueError("metadata and run_metadata disagree")
-    supplied_metadata = metadata if metadata is not None else run_metadata
-    candidate = Path(run_dir)
-    if candidate.is_symlink() or not candidate.is_dir():
+    prepared = _canonical_projection_input(
+        run_dir,
+        metadata=metadata,
+        run_metadata=run_metadata,
+    )
+    if prepared.root is None:
         return _canonical_empty_detail(
-            reason="missing_run",
+            reason=prepared.reason or "unavailable_run",
             activity=activity,
             phase=phase,
             run_status=run_status,
+            budget=prepared.budget,
         )
-    try:
-        root = candidate.resolve(strict=True)
-    except (OSError, RuntimeError):
-        return _canonical_empty_detail(
-            reason="unavailable_run",
-            activity=activity,
-            phase=phase,
-            run_status=run_status,
-        )
-    initial_budget = _ProgressBudget()
-    if supplied_metadata is None:
-        loaded, load_reason = _canonical_read_json(
-            root / "run.json", initial_budget, label="run.json", root=root
-        )
-        if loaded is None:
-            if load_reason == "invalid_evidence":
-                return _canonical_empty_detail(
-                    reason="invalid_evidence",
-                    activity=activity,
-                    phase=phase,
-                    run_status=run_status,
-                    budget=initial_budget,
-                )
-            supplied_metadata = {}
-        else:
-            supplied_metadata = loaded
-    elif not isinstance(supplied_metadata, Mapping):
-        return _canonical_empty_detail(
-            reason="invalid_evidence",
-            activity=activity,
-            phase=phase,
-            run_status=run_status,
-            budget=initial_budget,
-        )
-    metadata_mapping = dict(supplied_metadata)
+    root = prepared.root
+    metadata_mapping = dict(prepared.metadata or {})
+    initial_budget = prepared.budget
     discovery = _CanonicalDiscovery()
     key = _canonical_cache_key(
         root,
@@ -5366,6 +5404,37 @@ def project_run_progress_detail(
         while len(_PROGRESS_CACHE) > _PROGRESS_CACHE_MAX_RUNS:
             _PROGRESS_CACHE.popitem(last=False)
     return detail
+
+
+def project_run_original_plan_identity(
+    run_dir: Path,
+    *,
+    metadata: Mapping[str, Any] | None = None,
+    run_metadata: Mapping[str, Any] | None = None,
+    manager_context: Mapping[str, Any] | None = None,
+) -> tuple[str | None, str | None]:
+    """Return only the validated original-plan display name and path.
+
+    This deliberately stops after the canonical plan resolver. It shares the
+    rich projection's guarded run-root and metadata boundary, but does not
+    discover turns, read manager/event history, build a cache key, or reduce
+    any presentation progress.
+    """
+    prepared = _canonical_projection_input(
+        run_dir,
+        metadata=metadata,
+        run_metadata=run_metadata,
+    )
+    if prepared.root is None:
+        return None, None
+    metadata_mapping = dict(prepared.metadata or {})
+    plan = _canonical_resolve_plan(
+        prepared.root,
+        metadata_mapping,
+        manager_context,
+        prepared.budget,
+    )
+    return plan.display_name, _canonical_plan_path(plan, metadata_mapping)
 
 
 def project_run_progress_summary(
@@ -5423,6 +5492,7 @@ __all__ = [
     "invalidate_run_progress_cache",
     "project_run_progress",
     "project_run_progress_canonical",
+    "project_run_original_plan_identity",
     "project_run_progress_detail",
     "project_run_progress_summary",
 ]

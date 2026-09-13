@@ -1,5 +1,14 @@
 import { describe, expect, it, vi } from 'vitest'
-import { fetchGlobalRuns, isOngoing, matchesGlobalRun, selectGlobalRuns, validRecentLimit } from './globalRuns'
+import {
+  fetchGlobalRuns,
+  globalRunSnapshot,
+  isOngoing,
+  matchesGlobalRun,
+  matchesGlobalRunProgressIdentity,
+  matchesGlobalRunSnapshot,
+  selectGlobalRuns,
+  validRecentLimit,
+} from './globalRuns'
 import * as api from './api'
 import type { RunStatus } from './types'
 vi.mock('./api', () => ({ listControlPlaneRuns: vi.fn() }))
@@ -32,6 +41,11 @@ describe('global runs', () => {
         : { runs: [...Array.from({ length: 99 }, (_, i) => run(String(i))), run('attention', 'needs_attention')], next_cursor: 'next', schema_version: 1 }
     })
     const result = await fetchGlobalRuns(['a', 'bad'], new AbortController().signal)
+    expect(api.listControlPlaneRuns).toHaveBeenCalledWith(
+      'a',
+      expect.objectContaining({ include_progress: false }),
+      expect.anything(),
+    )
     expect(result.byProject.a).toHaveLength(101)
     const selected = selectGlobalRuns(result.byProject.a.map(run => ({ projectId: 'a', run })), 10)
     expect(selected.ongoing.map(row => row.run.run_id)).toEqual(['old'])
@@ -103,4 +117,48 @@ it('searches loaded run identities and readable labels without changing the sour
   expect(matchesGlobalRun(row, 'run-exact', 'AFlow project')).toBe(true)
   expect(matchesGlobalRun(row, 'other', 'AFlow project')).toBe(false)
   expect(row.run.plan_path).toBe('plans/clear-run-ui.md')
+})
+
+it('searches the raw canonical title before visible grouping and enrichment', () => {
+  const row = {
+    projectId: 'project-a',
+    run: {
+      ...run('hidden-canonical'),
+      plan_path: 'plans/active-overlay.md',
+      original_plan_display_name: 'Hidden original title',
+      original_plan_path: 'plans/in-progress/original.md',
+    },
+  }
+  expect(matchesGlobalRun(row, 'Hidden original title', 'AFlow project')).toBe(true)
+  expect(matchesGlobalRun(row, 'original.md', 'AFlow project')).toBe(true)
+  expect(row.run.plan_path).toBe('plans/active-overlay.md')
+})
+
+it('compares the explicit raw snapshot and progress identity without fabricating values', () => {
+  const raw = {
+    ...run('snapshot-run', 'running'),
+    activity: undefined,
+    status_reason_code: undefined,
+    original_plan_display_name: 'Canonical title',
+    original_plan_path: 'plans/original.md',
+    history_state: undefined,
+    history_revision: undefined,
+    evidence: {},
+  } as RunStatus
+  const matchingDetail = {
+    ...raw,
+    activity: 'unknown' as const,
+    progress: {
+      original_plan_display_name: 'Canonical title',
+      original_plan_path: 'plans/original.md',
+    },
+  } as RunStatus
+  expect(globalRunSnapshot(raw)).toMatchObject({ activity: 'unknown', history_state: 'visible', history_revision: 0, unit_active: null })
+  expect(matchesGlobalRunSnapshot(raw, matchingDetail)).toBe(true)
+  expect(matchesGlobalRunSnapshot(raw, { ...matchingDetail, current_step: 'review' } as RunStatus)).toBe(false)
+  expect(matchesGlobalRunProgressIdentity(raw, matchingDetail)).toBe(true)
+  expect(matchesGlobalRunProgressIdentity(raw, {
+    ...matchingDetail,
+    progress: { original_plan_display_name: 'Contradictory title', original_plan_path: 'plans/other.md' },
+  } as RunStatus)).toBe(false)
 })

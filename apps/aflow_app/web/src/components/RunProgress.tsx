@@ -9,6 +9,8 @@ import {
 
 const MAX_SEGMENTS = 30
 
+export type RunProgressLoadState = 'ready' | 'loading' | 'stale' | 'failed'
+
 function trimmed(value: string | null | undefined): string | null {
   const text = value?.trim()
   return text ? text : null
@@ -93,18 +95,37 @@ export function RunProgressStrip({ progress }: { progress: RunProgressSummary })
   </span>
 }
 
-export function RunProgress({ run, now: _now = Date.now() }: { run: RunStatus; now?: number }): JSX.Element {
+export function RunProgress({
+  run,
+  now: _now = Date.now(),
+  loadState = 'ready',
+  loadMessage = null,
+}: {
+  run: RunStatus
+  now?: number
+  loadState?: RunProgressLoadState
+  loadMessage?: string | null
+}): JSX.Element {
   const progress = run.progress
+  const loadNotice = loadMessage
+    || (loadState === 'loading'
+      ? 'Loading checkpoint progress…'
+      : loadState === 'stale'
+        ? 'Checkpoint progress stale — Refresh to update.'
+        : loadState === 'failed'
+          ? 'Checkpoint progress unavailable — Refresh to retry.'
+          : 'Checkpoint progress unavailable')
+  const observableState = loadState === 'ready' ? 'settled' : loadState
   if (!progress) {
-    return <span className="compact-run-progress unavailable" data-progress-availability="unavailable">
-      <span className="compact-run-progress-line"><strong>Checkpoint progress unavailable</strong></span>
+    return <span className={`compact-run-progress unavailable ${loadState}`} data-progress-availability="unavailable" data-progress-state={observableState}>
+      <span className="compact-run-progress-line"><strong>{loadNotice}</strong></span>
     </span>
   }
 
   const checkpointPosition = checkpointPositionText(progress, run)
   const notice = progressHistoryNotice(progress)
 
-  return <span className={`compact-run-progress ${progress.availability}`} data-progress-availability={progress.availability}>
+  return <span className={`compact-run-progress ${progress.availability} ${loadState}`} data-progress-availability={progress.availability} data-progress-state={observableState}>
     <span className="compact-run-progress-line">
       <strong>{checkpointApprovalText(progress)}</strong>
       {checkpointPosition && <span>{checkpointPosition}</span>}
@@ -113,6 +134,7 @@ export function RunProgress({ run, now: _now = Date.now() }: { run: RunStatus; n
     <span className="compact-run-progress-meta">
       <span>{runTurnBudgetText(run)}</span>
       {notice && <span>{notice}</span>}
+      {loadState !== 'ready' && <span>{loadNotice}</span>}
     </span>
   </span>
 }

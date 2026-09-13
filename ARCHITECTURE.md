@@ -35,8 +35,13 @@ history scan and before pagination. The daemon reads each selected status
 without the optional progress projection, reconciles unit/startup evidence, and
 attaches progress once to the finalized activity/status result. The server
 restores the identity page's history state and revision without issuing another
-projection. Direct repository status and history callers retain their existing
-progress-bearing defaults and public response shape.
+projection. Public run lists default to that rich response; callers may pass
+`include_progress=false` to retain the same finalized status, activity,
+authority, history filter, and cursor behavior while attaching only the
+validated original-plan display name and path. The single-run GET remains rich
+by default. Direct repository status and history callers retain their existing
+progress-bearing defaults, while internal raw reconciliation stays free of
+identity and progress reduction.
 
 `ReconciliationService` consumes the inclusive repository union as a bounded raw
 status snapshot: each batch page is classified once under the reconciliation
@@ -118,6 +123,25 @@ retains the exact awaiting-review original scope—never the post-worker
 snapshot. Conflicting or incomplete retained evidence stays unassigned;
 verified repartition records remain applied generation entries under the stable
 original checkpoint.
+
+All-runs requests the compatible raw list form (`include_progress=false`) so
+cursor coverage, authoritative status/history, and canonical original-plan
+identity settle independently from checkpoint enrichment. Search and grouping
+operate on the complete loaded raw set before the recent/attention display
+limits. Only rows currently rendered in ongoing, recent, or expanded attention
+groups own exact project/run detail reads, with four requests in flight at most;
+hidden rows never hydrate. Each enrichment captures the list generation,
+results identity, and exact raw row object, and attaches progress only after an
+explicit snapshot and canonical-identity comparison. Replaced, archived,
+deleted, or mismatched rows discard late results; mismatches settle with the
+visible stale message rather than retrying. The row exposes `loading`,
+`stale`, `failed`, and `settled` `data-progress-state` values, while the raw
+results container can become non-busy before visible progress settles. Normal
+Refresh or visibility recovery is the retry boundary; visibility suspension also
+gates enrichment admitted by late raw cursor pages, and abort epochs discard late
+detail resolutions. Returning visible requeues current pending rendered rows
+through the same lifecycle even while raw traversal remains busy; there is no
+per-row polling or request loop.
 
 Unreadable turn results and malformed event records make dependent history
 counts partial without discarding readable events, plan structure, or

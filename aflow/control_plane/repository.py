@@ -226,7 +226,12 @@ class RunRepository:
             # concurrently changing optional evidence must not hide the
             # authoritative status or remove another project's row.
             return status
-        return replace(status, progress=progress)
+        return replace(
+            status,
+            original_plan_display_name=progress.original_plan_display_name,
+            original_plan_path=progress.original_plan_path,
+            progress=progress,
+        )
 
     def with_progress(self, status: RunStatus) -> RunStatus:
         """Refresh the additive projection after another read adds evidence."""
@@ -241,6 +246,33 @@ class RunRepository:
         except (OSError, RuntimeError, TypeError, ValueError):
             return status
         return self._with_progress(status, run_dir, metadata)
+
+    def with_original_plan_identity(self, status: RunStatus) -> RunStatus:
+        """Attach canonical original-plan identity without rich progress."""
+        from .run_progress import project_run_original_plan_identity
+
+        valid, is_legacy_identity = self._readable_run_id(status.run_id)
+        run_dir = (
+            self._contained_path(".aflow", "runs", valid)
+            if is_legacy_identity
+            else self.run_directory(valid)
+        )
+        try:
+            metadata = self._read_run_metadata(run_dir) if run_dir.is_dir() else {}
+        except (OSError, RuntimeError, TypeError, ValueError):
+            return status
+        try:
+            display_name, plan_path = project_run_original_plan_identity(
+                run_dir,
+                metadata=metadata,
+            )
+        except (OSError, RuntimeError, TypeError, ValueError):
+            return status
+        return replace(
+            status,
+            original_plan_display_name=display_name,
+            original_plan_path=plan_path,
+        )
 
     def get_run_status(
         self, run_id: str, *, include_progress: bool = True

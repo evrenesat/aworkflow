@@ -77,6 +77,23 @@ describe('run plan presentation', () => {
     expect(runPlanDisplayNameForRun(run)).toBe('Canonical plan')
   })
 
+  it('uses the raw canonical identity before legacy plan fallback', () => {
+    const run = {
+      run_id: 'run-raw-canonical',
+      status: 'completed',
+      ownership: 'control_plane',
+      evidence: { plan_path: 'plans/evidence-overlay.md' },
+      plan_path: 'plans/active-overlay.md',
+      original_plan_display_name: 'Hidden original title',
+      original_plan_path: 'plans/in-progress/original.md',
+    } as RunStatus
+    expect(runPlanPath(run)).toBe('plans/active-overlay.md')
+    expect(runPlanPresentationForRun(run)).toMatchObject({ label: 'Hidden original title', date: null, machineDerived: false })
+
+    const fallback = { ...run, plan_path: null } as RunStatus
+    expect(runPlanPath(fallback)).toBe('plans/evidence-overlay.md')
+  })
+
   it('separates a valid machine date suffix from a readable title', () => {
     const presentation = runPlanPresentation('/srv/plans/run-history-readable-evidence-20260912.md', 'run-1')
     expect(presentation.label).toBe('Run history readable evidence')

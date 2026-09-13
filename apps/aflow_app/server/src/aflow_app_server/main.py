@@ -1025,10 +1025,17 @@ def control_plane_runs(
     history: Literal["visible", "archived", "all"] = Query(default="visible"),
     limit: int = Query(default=100, ge=1, le=1_000),
     cursor: str | None = Query(default=None, max_length=64),
+    include_progress: bool = Query(default=True),
     _: str = Depends(verify_token),
     service: ControlPlaneService = Depends(get_control_plane_service),
 ) -> RunListResponse:
-    page = service.list_runs(project_id, limit=limit, cursor=cursor, history=history)
+    page = service.list_runs(
+        project_id,
+        limit=limit,
+        cursor=cursor,
+        history=history,
+        include_progress=include_progress,
+    )
     return RunListResponse(
         runs=tuple(RunStatusResponse.from_canonical(run) for run in page.runs),
         next_cursor=page.next_cursor,
