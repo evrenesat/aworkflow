@@ -429,6 +429,12 @@ input::placeholder, textarea::placeholder {
   gap: var(--spacing-sm);
 }
 
+.run-progress-header .run-title-date {
+  display: block;
+  margin-block-start: var(--spacing-xs);
+  font-weight: 400;
+}
+
 .run-scan-summary {
   display: grid;
   grid-template-columns: repeat(auto-fit, minmax(11rem, 1fr));

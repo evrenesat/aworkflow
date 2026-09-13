@@ -12,6 +12,14 @@
   addresses the retained profile's 80 identity calls/0.377s; no live profile or
   end-to-end latency claim is made here.
 
+## 2026-09-13 — Separate selected run title and date
+
+- Selected run detail headings now keep the readable plan title and its
+  machine-derived date on separate lines at desktop and phone widths. Existing
+  run IDs, list rows, and title/date values remain unchanged.
+- Focused dashboard/build and disposable responsive browser checks cover the
+  scoped visual correction; CI and live screenshots remain coordinator-owned.
+
 ## 2026-09-12 — Retain compact run navigation during readiness
 
 - An authorized Runs shell now remains mounted through same-project selection

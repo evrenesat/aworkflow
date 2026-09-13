@@ -3044,7 +3044,7 @@ export function RunDashboard({ visible = true, page, onNewRun, onCancelNewRun, o
               <div className="run-progress-header">
                 <div className="section-heading">
                   <div>
-                    <h3>{selectedPlanFileName === 'Not reported' ? `Run ${selectedRun.run_id}` : selectedPlanFileName}{selectedPlanPresentation?.date && <span className="run-title-date">{selectedPlanPresentation.date}</span>}</h3>
+                    <h3>{selectedPlanFileName === 'Not reported' ? `Run ${selectedRun.run_id}` : selectedPlanFileName}{selectedPlanPresentation?.date && <>{' '}<span className="run-title-date">{selectedPlanPresentation.date}</span></>}</h3>
                     <button className="text-xs text-dim mono run-id-copy" title="Copy full run ID" aria-label={selectedRun.run_id} aria-describedby={`${technicalId}-copy-run-id`} onClick={() => void handleCopyRunId()}>{shortRunId(selectedRun.run_id)}<span className="copy-full-id-label">Copy full ID</span></button>
                     <span id={`${technicalId}-copy-run-id`} className="sr-only">Copy full run ID</span>
                   </div>

@@ -2324,4 +2324,47 @@ there after committing. Verify one commit above the unchanged base and clean
 tracked state. Publication, exact-SHA CI, normal activation and actual UI/profile
 timing remain coordinator-owned. Overall full-list speed remains unproven.
 
+---
+
+## Selected heading date separation — cumulative review approved, 2026-09-13
+
+Review base: `577a230e1a1dd639e2d694529334764b213f12e0` (unchanged).
+Reviewed HEAD: `57fb8002c2a5d198ddc249ec04b8b220c636e90b`.
+Coverage: 1 new / 1 total commit, `cp1 v01`, the complete original plan and
+all three changed files. Original and active plans coincide; no previous
+findings or superseded fix overlays apply to this handoff.
+
+No material findings. The conditional literal whitespace preserves a textual
+title/date boundary; the selected-header selector adds block layout, existing
+small spacing and normal weight. Shared date size/color/nowrap and list layout
+remain intact. Full title/date values, h3 semantics, exact run ID/copy behavior,
+header rows, document flow and controls are preserved. One DEVLOG entry exists,
+so no compaction is needed. No backend changes are included.
+
+Retained command receipts inspected and reused from
+`/root/code/agent_flow/.aflow/runs/20260913t002344z-4b50f274/turns/turn-001/transport.stdout`
+and completed result.json (zero unchecked checkpoints/steps):
+
+- Production build passed after normal npm ci supplied missing dependencies;
+  the existing hook generated 182 changelog entries.
+- Focused lineage component test: 1 passed, 121 skipped.
+- Existing early selected-detail browser test: 2 passed, desktop and phone.
+- Disposable dated long-title capture: 1 passed, both required viewports;
+  private evidence directory supplied through pytest --basetemp.
+- Reviewer visually inspected full-page Chromium screenshots captured at
+  1280x720 and 390x844 under
+  `/root/code/evidence/aflow-dogfood-20260909/run-heading-date-separation-cp1/test_capture_selected_heading0/`
+  (`selected-heading-1280x720.png`, `selected-heading-390x844.png`). Date is
+  separate and within the viewport; phone title wraps and exact copy identity
+  remains responsive-run-39.
+- Reviewer cumulative `git diff --check 577a230e HEAD` passed. No full suites
+  repeated, no portable tests changed, no shared runtime/controller altered.
+
+Approve and consolidate with this tracked reviewer record into one unpublished
+handoff commit. Preserve all three implementation blobs. No fix plan needed.
+Keep the ignored original plan for engine finalization and record the final
+approved SHA there only. Finalization checks one commit above the unchanged
+base and clean tracked state. Serialized publication, exact-SHA CI, normal
+activation and live verification remain coordinator-owned and pending.
+
 No material findings
