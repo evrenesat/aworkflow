@@ -1,0 +1,30 @@
+# Disabled example: this file intentionally lives outside .github/workflows.
+# Copy it to each authorized repository's default branch only after owner
+# approval, private transport setup, and exact registry/configuration checks.
+name: AFlow issue intake (inactive example)
+
+on:
+  issues:
+    types: [opened, edited]
+
+permissions:
+  contents: read
+
+jobs:
+  intake:
+    # This condition runs before the executable concurrency is entered.
+    if: >-
+      github.event.issue.user.id == 591691 && github.event.sender.id == 591691 &&
+      (github.event.action == 'opened' || github.event.action == 'edited')
+    runs-on: REPLACE_WITH_APPROVED_SELF_HOSTED_RUNNER
+    concurrency:
+      group: aflow-issue-intake-${{ github.event.repository.id }}-${{ github.event.issue.number }}
+      cancel-in-progress: false
+    steps:
+      - name: Relay metadata to the approved private host command
+        run: >-
+          python3 /opt/aflow/current/deploy/issue-intake/relay.py
+          --host-command /opt/aflow/current/bin/aflow-issue-intake
+          --config /etc/aflow/issue-intake/intake.toml
+          # For an approved hosted runner, add the reviewed --ssh-host,
+          # --ssh-user, and --ssh-identity-file arguments instead.

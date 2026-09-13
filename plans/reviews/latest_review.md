@@ -2793,3 +2793,104 @@ Publication, exact-SHA CI, activation and coordinator retry of source 4180bb8c
 remain separate pending delivery gates; none is claimed complete by this review.
 
 No material findings
+
+---
+
+## Reactive GitHub issue intake — cumulative review v01 rejected, 2026-09-13
+
+- Unchanged base: `c2ade231cc40613acc6a251a95ff631fc762f492`.
+- Reviewed HEAD: `91626e6227d241b21278dd077506630c6f10498e`.
+- 3 new / 3 total commits: CP1 v01 `c133f048`, CP2 v01 `34a64ba2`, CP3 v01 `91626e62`. Reviewed the full original-plan range, command/store/planner, inactive relay/configuration, tests and docs. No previous formal rejection findings. The owner CP1 production corrections are present, but required runner-through-transport/import-budget evidence remains incomplete.
+
+R1 — P2, high confidence — `aflow/issue_intake_planner.py:454–463`, introduced by CP2 `34a64ba2`. Synchronous prompt writes occur before the timeout starts. A non-reading fake child with 131072 input bytes and a 0.1-second timeout left the supervisor alive after 0.4 seconds. A stalled Codex can hold the issue lock indefinitely. Feed stdin concurrently/nonblockingly under the existing deadline and bounded shutdown.
+
+R2 — P2, high confidence — `aflow/issue_intake_planner.py:476–484` (detached session at line 417), introduced by CP2 `34a64ba2`. SIGTERM bypasses exception cleanup and leaves the separately sessioned planner running. The local probe terminated its supervisor and confirmed the owned child remained alive, then explicitly killed the probe-owned group. Handle catchable termination during the owned planner lifetime, clean up only that group, restore handlers and preserve no-replay uncertainty.
+
+R3 — P2, high confidence — `aflow/issue_intake_planner.py:523–528`, introduced by CP2 `34a64ba2`. Authored output accepts a checked first checkpoint/implementation step followed by unfinished work. A direct parsed-output probe returned `status=plan`; the normal executor can skip the falsely completed work. Require pristine generated checkpoint/step progress for fresh and recovered output, without changing partially progressed attached-plan acceptance.
+
+Verification: `uv run pytest -q tests/test_issue_intake.py tests/test_issue_intake_store.py tests/test_issue_intake_planner.py tests/test_issue_intake_relay.py --basetemp /tmp/aflow-intake-review-20260913` passed 72 tests in 1.30s. Ruff for all three new production modules and the relay passed. `git diff --check c2ade231 HEAD` passed. Read retained completed CP3 result and command receipts in `/root/code/agent_flow/.aflow/runs/20260913t174057z-919108e5/turns/turn-001/`: original six-module pytest passed 198 tests plus 17 subtests; lint passed. No live provider calls or active triggers. Probes used temporary resources and cleaned owned subprocesses.
+
+Excluded the tentative lifecycle finding: real capability responses omit lifecycle fields, but the existing config validator admits worktree setup only with merge/removal teardown, and daemon preflight validates that live configuration. It therefore did not meet the material finding gate.
+
+Exactly one self-contained non-checkpoint fix overlay was created at `plans/in-progress/reactive-github-issue-intake-20260913-cp01-v01.md`. It covers R1–R3 plus the explicitly required missing import/start retry and process-level CP3 evidence. Original-plan tracking updated, base unchanged; no implementation edits, DEVLOG compaction, commit or squash. Next review must recheck findings and the complete cumulative range. Publication, exact-SHA CI and owner-selected private activation remain pending and distinct.
+
+Material fixes required
+
+
+---
+
+## Reactive GitHub issue intake — cumulative review v02 rejected, 2026-09-13
+
+- Unchanged base: `c2ade231cc40613acc6a251a95ff631fc762f492`.
+- Reviewed HEAD: `fa7aab1b4031c5ccf83361b1896a4cfab40d0bd3`.
+- 1 new / 4 total commits: CP1 v01 `c133f048`, CP2 v01 `34a64ba2`, CP3 v01 `91626e62`, follow-up CP01 v01 `fa7aab1b`. Inspected the complete cumulative command/store/planner, inactive relay/configuration, tests/docs and existing plan/start/preflight API contracts.
+- R1 resolved: concurrent stdin feeding is supervised by the launch deadline. R3 resolved: fresh/recovered generated progress is pristine, with durable attention/no replay. Preserve both fixes.
+
+R2 remains open — P2, high confidence — `aflow/issue_intake_planner.py:388–390`, with consequences at `510–525`. The CP2 helper returns when the group leader exits, skipping escalation against surviving descendants. A TERM-resistant inspection/tool child inheriting pipes can survive timeout/SIGTERM and keep writer/drainer threads blocked; supervisor buffered-stream closure can then block indefinitely. Direct SIGTERM handling added in `fa7aab1b` fixes the original single-process reproduction but not the owned-group contract. Reviewer local process probe: 0.3-second timeout, 131072-byte prompt, default-TERM leader plus same-group SIGTERM-ignoring child; after 12 seconds child remained sleeping, supervisor was alive, and no result was written. Explicit probe-owned group SIGKILL released the supervisor; live probe processes cleaned. Smallest fix: bounded group escalation independent of leader exit, followed by safe owned-pipe finalization; add timeout/SIGTERM descendant regressions with an unrelated sentinel and outer test timeout.
+
+Required evidence disposition: runner-through-real-transport start budget and process-level attached/absent relay/host/fake-Codex/API redelivery now pass. Create/promote four-attempt transport evidence is still missing: `test_import_recovery_does_not_restart_post_retry_budget` directly injects an exhausted fake call, without using `FixedOriginHTTPClient`. Carry its explicitly required real-transport exact/absent/conflicting read-back matrix forward; no production retry redesign is requested.
+
+Verification: reviewer four-module focused pytest passed 88 tests in 4.06s using `--basetemp /tmp/aflow-intake-review-v02-20260913`; scoped Ruff, CLI help and cumulative diff check passed. Read retained completed turn-003 result and command receipts in the primary repository; worker focused checks passed. Reuse unchanged turn-001 parser/session evidence (198 tests plus 17 subtests), without full local suites. No live provider exercise or active trigger.
+
+Created exactly one non-checkpoint overlay at `plans/in-progress/reactive-github-issue-intake-20260913-cp01-v02.md`, carrying R2 and missing import-budget evidence; superseded v01 deleted. Updated original-plan tracking, unchanged base. No code edits, commit, squash, DEVLOG compaction or publication. Next review must verify carried findings and repeat the full original-base cumulative range. Publication, exact-SHA CI and owner-selected private activation remain separate pending gates.
+
+Material fixes required
+
+
+---
+
+## Reactive GitHub issue intake — cumulative review v03 approved, 2026-09-13
+
+- Unchanged Pre-Handoff Base HEAD: `c2ade231cc40613acc6a251a95ff631fc762f492`.
+- Reviewed HEAD: `b0ef82681f2b5c4507739ed9363b633e401675a9`.
+- Coverage: 1 new / 5 total commits, CP1 v01 `c133f048`, CP2 v01
+  `34a64ba2`, CP3 v01 `91626e62`, follow-up CP01 v01 `fa7aab1b`,
+  and CP01 v02 `b0ef8268`. Reviewed the complete original-base range and
+  current production modules, tests, inactive relay/configuration and docs,
+  with the existing plan, preflight and start API contracts.
+- R1 remains resolved: concurrent stdin feeding runs under the launch deadline.
+- R2 resolved by `b0ef8268`: owned-group escalation continues after leader exit,
+  including unconditional finalization before inherited pipe closure. Real
+  timeout/SIGTERM regressions use a TERM-resistant descendant holding all pipes,
+  bounded supervisor completion, and an unrelated surviving sentinel.
+- R3 remains resolved: fresh and recovered generated plans reject checked
+  checkpoint/step progress; invalid results persist attention without replay.
+- Required evidence gap closed: the real FixedOriginHTTPClient create/promote
+  matrix proves exactly four identical mutation attempts, 1/5/15 backoffs,
+  expected revision, exact source/destination read-back, and no fifth attempt
+  or conflicting overwrite. Start-budget and process-level attached/absent
+  relay/host/fake-Codex/API redelivery evidence remains valid.
+- Owner numeric identity, accepted event/source hash, digest/provenance binding,
+  durable receipt and exact artifact/start identity checks remain intact.
+  Canonical config and the single transport-owned retry budget are preserved.
+
+Retained completed worker command receipts were read from
+`/root/code/agent_flow/.aflow/runs/20260913t174057z-919108e5/turns/turn-005/`:
+
+- Final four-module focused pytest: 89 passed in 4.72s with isolated
+  `--basetemp /tmp/aflow-intake-review-v02-final-ZvDbjA`; subsequent literal
+  invocation also passed 89 tests in 4.59s.
+- Scoped Ruff across production and affected tests: passed. CLI help: passed.
+- Earlier overlapping basetemp invocations collided; subsequent isolated
+  focused runs and the final matrix passed. No portable tests contain private
+  host evidence paths.
+- Reused unchanged parser/session coverage from completed turn-001 receipts:
+  198 tests plus 17 subtests passed. No full suite repeated locally.
+- Reviewer cumulative `git diff --check c2ade231 HEAD`: passed.
+
+No material findings under the requested admission gate, exclusions and
+proportionate-fix discipline. Approval finalization includes this intentional
+tracked reviewer record and every handoff commit in one unpublished final
+commit after the unchanged base. Preserve all 15 reviewed implementation
+blobs and the existing single DEVLOG handoff entry. Delete the superseded v02
+fix overlay; create no empty fix plan. Keep the ignored original plan in place
+for engine finalization and record the approved SHA there after committing.
+Verify exactly one commit above base and clean tracked state.
+
+Publication and exact-SHA CI remain separate managed controller/coordinator
+delivery gates. Private transport, registrations, credentials, trigger
+installation and live acceptance remain owner-pending. No live provider call,
+active trigger, runner/service installation or other-repository mutation was
+performed by this review.
+
+No material findings

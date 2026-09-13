@@ -7,6 +7,27 @@
   narrower windows keep the selector and existing drafts and navigation state.
 - Reduced tab padding preserves full-height targets and the two-row header.
 
+## 2026-09-13 — Inactive owner-only GitHub issue intake
+
+- Added the metadata-only relay, disabled Actions/TOML examples, and activation
+  handoff documentation. No workflow, runner, service, credential, or live
+  issue was installed or exercised.
+- Simplified intake configuration to one schema and retained a single
+  transport-owned POST retry budget. Saved start idempotency keys are always
+  sent as headers; exhausted mutations use exact read-back or durable attention.
+- Cumulative review fixes now start the planner deadline at process launch,
+  feed stdin concurrently, and clean only its detached process group on timeout,
+  overflow, or SIGTERM. Generated plans and recovered artifacts must have
+  pristine checkpoint/step progress; attached plans retain their existing
+  partial-progress behavior.
+- Focused fixtures cover runner-through-transport retry identity, exact import
+  recovery, and real relay-to-host/API/Codex attached and absent routes with
+  redelivery. No live provider or activation was used.
+- v02 closes the leader-exit descendant gap with bounded group escalation and
+  verifies timeout and SIGTERM cleanup without touching an unrelated process.
+- Import recovery now drives the real four-attempt transport budget for both
+  create and promote, with exact, absent, and conflicting read-back fixtures.
+
 ## 2026-09-13 — Expose safe extra-instruction validation errors
 
 - Overlength or otherwise semantically invalid daemon extra instructions now

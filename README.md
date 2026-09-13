@@ -39,6 +39,17 @@ execution gate.
 4. AFlow re-reads the plan, records the turn, and follows the next matching
    transition.
 
+## Inactive GitHub issue intake
+
+The optional one-shot intake command is an operator-hosted adapter, not a
+server endpoint, daemon, or enabled workflow. Its inactive relay and example
+configuration live in [`deploy/issue-intake/`](deploy/issue-intake/README.md).
+Actions may schedule owner-authorized issue events, but the host retains
+credentials and durable receipts, rechecks canonical GitHub identity/content,
+and submits ordinary AFlow plan/run API calls. Activation, private transport,
+per-repository workflow installation, and live exercises require separate owner
+authorization.
+
 ## Plan backup history
 
 Workflow snapshots retain their existing backup names, bytes, and

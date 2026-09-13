@@ -4,6 +4,22 @@ AFlow is a plan-driven workflow orchestrator that runs coding tasks through exis
 
 `RunMetadataWriter` is the workflow controller's bound schema-v2 persistence boundary, holding stable run identity while each write supplies mutable lifecycle state explicitly.
 
+## Optional issue-intake boundary
+
+`aflow/issue_intake.py` is a short-lived host command. It loads one strict
+operator TOML schema, receives metadata-only owner issue envelopes, re-fetches
+the canonical issue, persists a per-issue receipt, then imports/promotes a plan
+and starts an ordinary run through the existing private API. Its transport owns
+one initial-plus-three-attempt retry budget for each logical HTTP operation;
+mutation uncertainty is recovered only through exact read-back.
+
+`deploy/issue-intake/relay.py` and its Actions YAML are inactive examples kept
+outside `.github/workflows`. The relay forwards numeric identity metadata and a
+canonical title/body hash over an approved fixed local or private SSH command;
+it does not expose issue text, credentials, an endpoint, or a background
+service. Actions concurrency is per repository/issue, while durable receipts
+remain the authority for redelivery and reconciliation.
+
 Standard terminal failures after execution-context resolution use the private
 `_WorkflowFailureFinalizer` in `workflow.py` to preserve the failed-metadata,
 banner-stop, and `WorkflowError` ordering in one boundary. Startup, preflight,
