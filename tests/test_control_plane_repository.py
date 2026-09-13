@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import replace
 import json
 from pathlib import Path
 
@@ -151,6 +152,77 @@ def test_repository_status_projection_can_be_disabled_without_changing_default(
     assert projections == ["owned-run"]
     assert with_progress.run_id == without_progress.run_id
     assert with_progress.status == without_progress.status
+
+
+def test_list_runs_progress_opt_out_preserves_inclusive_pages_and_default(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _owned_run(tmp_path, "owned-run")
+    _owned_run(tmp_path, "deleted-run")
+    legacy_id = "20260809T172123Z-abc12345"
+    legacy = tmp_path / ".aflow" / "runs" / legacy_id
+    legacy.mkdir(parents=True)
+    (legacy / "run.json").write_text('{"status":"running"}\n', encoding="utf-8")
+
+    repository = RunRepository(tmp_path)
+    RunHistory(repository).mutate(
+        "deleted-run",
+        state="deleted",
+        expected_revision=0,
+        idempotency_key="delete-deleted-run",
+    )
+
+    read_modes: list[tuple[str, bool]] = []
+    original_get_status = repository.get_run_status
+
+    def counted_status(run_id: str, *, include_progress: bool = True):
+        read_modes.append((run_id, include_progress))
+        return original_get_status(run_id, include_progress=include_progress)
+
+    projections: list[str] = []
+    original_projection = repository._with_progress
+
+    def counted_projection(status, run_dir, metadata):
+        projections.append(status.run_id)
+        return original_projection(status, run_dir, metadata)
+
+    monkeypatch.setattr(repository, "get_run_status", counted_status)
+    monkeypatch.setattr(repository, "_with_progress", counted_projection)
+
+    def collect_pages(*, include_progress: bool):
+        pages = []
+        cursor = None
+        while True:
+            page = repository.list_runs(
+                limit=2,
+                cursor=cursor,
+                include_progress=include_progress,
+            )
+            pages.append(page)
+            if page.next_cursor is None:
+                return pages
+            cursor = page.next_cursor
+
+    raw_pages = collect_pages(include_progress=False)
+    assert projections == []
+    raw_ids = [status.run_id for page in raw_pages for status in page.runs]
+    assert raw_ids == sorted(("deleted-run", "owned-run", legacy_id))
+
+    default_pages = collect_pages(include_progress=True)
+    assert projections == raw_ids
+    assert read_modes == [(run_id, False) for run_id in raw_ids] + [
+        (run_id, True) for run_id in raw_ids
+    ]
+    assert [page.next_cursor for page in raw_pages] == [
+        page.next_cursor for page in default_pages
+    ]
+    for raw_page, default_page in zip(raw_pages, default_pages):
+        assert tuple(replace(status, progress=None) for status in default_page.runs) == raw_page.runs
+
+    with pytest.raises(RepositoryError):
+        repository.list_runs(limit=0, include_progress=False)
+    with pytest.raises(RunIdentityError):
+        repository.list_runs(limit=2, cursor="../escape", include_progress=False)
 
 
 def test_history_identity_page_preserves_filters_and_cursor(tmp_path: Path) -> None:

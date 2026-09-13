@@ -1,5 +1,17 @@
 # DEVLOG
 
+## 2026-09-13 — Reconcile raw inclusive statuses once
+
+- Reconciliation now requests progress-free statuses from inclusive repository
+  pages and classifies each returned identity once through a shared private
+  boundary. Single-run reconciliation uses the same fresh raw read; unit,
+  manifest, controller-terminal and startup evidence remain authoritative.
+- `RunRepository.list_runs` accepts a keyword-only progress opt-out while its
+  default projected behavior, inclusive legacy/deleted coverage, cursor order,
+  and persistence/deduplication semantics remain unchanged. Focused tests cover
+  raw/default parity, exact paginated read counts, persistence bytes and fresh
+  evidence; the retained cold profile remains coordinator-owned.
+
 ## 2026-09-13 — Require dirty acknowledgement in startup browser coverage
 
 - The corrected-plan browser fixture now carries a force-tracked modified

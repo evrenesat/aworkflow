@@ -2412,3 +2412,47 @@ and clean tracked state. Publication, exact-SHA CI and live verification remain
 pending at the normal controller/coordinator delivery boundary.
 
 No material findings
+
+
+---
+
+## Raw inclusive reconciliation — cumulative review approved, 2026-09-13
+
+Base: `a400925012c36ef6044a205aa25ae0b22c72fb1e` (unchanged Pre-Handoff Base HEAD).
+Reviewed HEAD: `90cea08302e570e66c460a25d3b848f814b0c04e`.
+Coverage: 1 new / 1 total commit, `cp1 v01`, all six changed files and the
+complete original single-checkpoint plan, including all six implementation steps.
+Original and active plans coincide. No previous findings or fix overlays apply.
+
+No material findings under the material-code-review admission gate, exclusions
+and proportionate-fix discipline. Inclusive legacy/deleted pagination retains
+ordering and cursor validation. list_runs forwards its default-true progress
+option; reconciliation requests raw status once per identity. The shared helper
+retains locked classification and deduplicated persistence. Classifier precedence,
+exact unit/manifest checks, fresh observations, worker/activity/startup evidence
+and public projected defaults remain intact. No cache or lifecycle action added.
+
+Retained final worker command/output receipts inspected and reused from
+`/root/code/agent_flow/.aflow/runs/20260913t013520z-e281cf51/turns/turn-001/transport.stdout`
+and completed result.json (zero unchecked checkpoints/steps):
+
+- `uv run --frozen pytest -q tests/test_control_plane_repository.py tests/test_control_plane_reconciliation.py`: 27 passed, 0.78s.
+- `uv run --frozen pytest -q tests/test_aflowd.py::test_daemon_replays_active_idempotent_start_and_restarts_by_reconciling_only`: 1 passed, 0.29s.
+- Scoped Ruff on the two source and two test files: all checks passed.
+- Reviewer cumulative `git diff --check a4009250 HEAD`: passed.
+
+Initial fixture failures preceded corrected expectations for existing activity
+precedence and event-lock creation; final tests preserve the existing behavior.
+Evidence covers paginated raw read/projector counts, complete results, byte/file
+persistence and deduplication, unit/terminal freshness and startup compatibility.
+No full suite, browser build or live profiling repeated; portable tests use tmp_path.
+
+Approve and consolidate implementation plus this intentional tracked review
+record into exactly one unpublished handoff commit. Preserve all six reviewed
+implementation blobs and the single DEVLOG entry. No fix plan needed or created.
+Keep the ignored original plan in place for engine finalization and record the
+final SHA there only. Verify one commit above base and clean tracked state.
+Publication, exact-SHA CI, activation and quiet live timing remain separate
+controller/coordinator gates; overall full-coverage latency remains unproven.
+
+No material findings

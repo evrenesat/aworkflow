@@ -32,26 +32,41 @@ class ReconciliationService:
             results: list[ReconciliationResult] = []
             cursor: str | None = None
             while True:
-                page = self._repository.list_runs(limit=1_000, cursor=cursor)
-                results.extend(self.reconcile_run(status.run_id, persist=persist) for status in page.runs)
+                # Each bounded inclusive page is the current status snapshot for
+                # this pass; classify those raw statuses without rereading them.
+                page = self._repository.list_runs(
+                    limit=1_000,
+                    cursor=cursor,
+                    include_progress=False,
+                )
+                for status in page.runs:
+                    results.append(self._reconcile_status(status, persist=persist))
                 if page.next_cursor is None:
                     return tuple(results)
                 cursor = page.next_cursor
 
     def reconcile_run(self, run_id: str, *, persist: bool = True) -> ReconciliationResult:
         with self._lock:
-            status = self._repository.get_run_status(run_id)
-            if status.ownership == "legacy":
-                return ReconciliationResult(
-                    run_id=run_id,
-                    status=status.status,
-                    reason="legacy run has no control-plane ownership evidence",
-                    ownership="legacy",
-                )
-            result = self._classify_owned(status)
-            if persist:
-                self._append_deduplicated_observation(status, result)
-            return result
+            status = self._repository.get_run_status(run_id, include_progress=False)
+            return self._reconcile_status(status, persist=persist)
+
+    def _reconcile_status(
+        self,
+        status: RunStatus,
+        *,
+        persist: bool,
+    ) -> ReconciliationResult:
+        if status.ownership == "legacy":
+            return ReconciliationResult(
+                run_id=status.run_id,
+                status=status.status,
+                reason="legacy run has no control-plane ownership evidence",
+                ownership="legacy",
+            )
+        result = self._classify_owned(status)
+        if persist:
+            self._append_deduplicated_observation(status, result)
+        return result
 
     def _classify_owned(self, status: RunStatus) -> ReconciliationResult:
         if status.status == "owner_stopped" or status.evidence.get("controller_terminal"):

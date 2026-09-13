@@ -383,7 +383,13 @@ class RunRepository:
             raise RepositorySchemaError("startup record has an unsupported schema")
         return payload
 
-    def list_runs(self, *, limit: int = 100, cursor: str | None = None) -> RunPage:
+    def list_runs(
+        self,
+        *,
+        limit: int = 100,
+        cursor: str | None = None,
+        include_progress: bool = True,
+    ) -> RunPage:
         """Return a stable, cursorable union of legacy and owned run identities."""
         _bounded_limit(limit)
         if cursor is not None:
@@ -393,7 +399,13 @@ class RunRepository:
             run_ids = [run_id for run_id in run_ids if run_id > cursor]
         selected = run_ids[:limit]
         next_cursor = selected[-1] if len(run_ids) > len(selected) and selected else None
-        return RunPage(runs=tuple(self.get_run_status(run_id) for run_id in selected), next_cursor=next_cursor)
+        return RunPage(
+            runs=tuple(
+                self.get_run_status(run_id, include_progress=include_progress)
+                for run_id in selected
+            ),
+            next_cursor=next_cursor,
+        )
 
     def list_history_page(
         self, *, limit=100, cursor=None, history="visible"

@@ -38,6 +38,14 @@ restores the identity page's history state and revision without issuing another
 projection. Direct repository status and history callers retain their existing
 progress-bearing defaults and public response shape.
 
+`ReconciliationService` consumes the inclusive repository union as a bounded raw
+status snapshot: each batch page is classified once under the reconciliation
+lock, and each single-run read requests the same progress-free status form. The
+shared classifier still performs fresh unit and manifest observations and the
+existing deduplicated event append; presentation progress is not part of this
+boundary. `RunRepository.list_runs(include_progress=False)` is the internal
+opt-out, while its default continues to project progress for ordinary callers.
+
 The web shell composes page-owned context, local navigation, primary actions and
 secondary actions through registered header slots. Wide pages use two compact
 rows; compact pages expose the same destinations through an in-flow hamburger
