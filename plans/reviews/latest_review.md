@@ -2504,3 +2504,48 @@ lifecycle's responsibility; exact CI, activation and quiet live performance
 measurement remain coordinator-owned and are not claimed by this review.
 
 No material findings
+
+
+---
+
+# Compact configuration hold — cumulative review approved, 2026-09-13
+
+Base: `9f56cf69821f0ace152615e51a403fa15b23cb5f` (unchanged Pre-Handoff Base HEAD).
+Reviewed HEAD: `ed62ebbbc07e7236e0f7b1bccb8484724bdf83f0`.
+Coverage: 1 new / 1 total commit, `cp1 v01`, entire original checkpoint and
+full cumulative two-file implementation. No previous findings or fix overlays
+apply to this handoff. Material admission gate, exclusions and proportionate
+fix discipline applied: no material findings.
+
+Verified explicit authenticated context, setup-page closure before fresh-page
+routing, single pending POST, unchanged first/second selection and Back/focus
+assertions, exact request-identity response predicate, HTTP 200/body completion,
+and enabled current More → Refresh after preserved focus. Normal release remains
+strict; cancellation handling is cleanup-only. No production loader changes,
+timeout inflation, release/reload retries, or waived assertions. DEVLOG separates
+observed navigation cancellation from inferred CI request ownership. The local
+F811 suppression preserves intentional imported pytest fixture registration.
+
+Retained evidence inspected at
+`/root/code/agent_flow/.aflow/runs/20260913t024548z-e66130ec/turns/turn-001/`
+(`result.json` and completed command records in `transport.stdout`):
+
+- Final Chromium: 2 passed in 6.56s. Final WebKit: 2 passed in 7.74s.
+- Both used `uv run --frozen pytest -q --basetemp=/tmp/aflow-compact-config-cp1-<engine>-<pid> tests/test_responsive_browser.py::test_compact_selection_survives_pending_configuration`
+  from `apps/aflow_app/server`, with `AFLOW_TEST_BROWSER=webkit` for WebKit.
+- Scoped `uv run --frozen ruff check apps/aflow_app/server/tests/test_responsive_browser.py`: passed.
+- One `npm --prefix apps/aflow_app/web run build`: passed after discovering absent managed-worktree assets.
+- Earlier fixture-registration, missing-assets and More-trigger selector failures
+  were corrected before final passing runs; no unchanged browser cases repeated
+  by reviewer. Existing dependency deprecation warnings only.
+- Independent `git diff --check 9f56cf69821f0ace152615e51a403fa15b23cb5f HEAD`: passed.
+
+Approval finalization includes this tracked record in exactly one unpublished
+handoff commit after the unchanged base, preserving reviewed test and DEVLOG
+blobs. No stale fix plans exist; no empty fix plan is created. Final approved SHA
+is recorded only in original-plan tracking; the ignored original stays in place
+for engine finalization. Verify one commit and clean tracked state.
+Publication, exact-SHA CI, deployment and live speed verification remain the
+controller/coordinator's normal delivery steps and are not claimed complete.
+
+No material findings

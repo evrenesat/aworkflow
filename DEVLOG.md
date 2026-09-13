@@ -2771,3 +2771,16 @@ HISTORY: Published clipboard history `c14f1f2`/`cd78d53` remains separate and mu
   pointer journeys. RunDashboard (123 tests), the web build, and the two
   engine-specific three-case browser checks passed; the existing tablet route
   journey remains included.
+
+## 2026-09-13 — Compact configuration request ownership
+
+- The compact pending-configuration journey now finishes setup in a separate
+  page, closes that page, and installs its hold on a fresh page in the same
+  authenticated context. The held POST therefore belongs to the document whose
+  selection, Back and focus behavior the test exercises.
+- A trace directly observed the setup document's held request being cancelled
+  by the later navigation. The CI diagnosis that its first-POST hold captured
+  that older request remains an inference from the request ordering and timeout.
+- Release acceptance is bound to the exact stored request and requires its 200
+  response to finish. The preserved row focus is followed by an enabled current
+  Refresh menu assertion without triggering another configuration request.

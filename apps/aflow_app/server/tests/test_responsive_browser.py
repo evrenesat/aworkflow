@@ -1,5 +1,7 @@
 """Behavioral responsive journeys for the authenticated dashboard."""
 
+# ruff: noqa: F811 -- imported pytest fixtures are intentionally named as test parameters.
+
 from __future__ import annotations
 
 import json
@@ -2001,32 +2003,66 @@ def test_compact_selection_survives_pending_configuration(
 
     with live_server() as url, sync_playwright() as playwright:
         browser = _browser(playwright)
+        context = browser.new_context(viewport={"width": width, "height": height})
         try:
-            page = browser.new_page(viewport={"width": width, "height": height})
-            _login(page, url)
-            _ensure_project(page)
+            setup_page = context.new_page()
+            _login(setup_page, url)
+            _ensure_project(setup_page)
+            setup_page.close()
 
-            held_form = []
+            page = context.new_page()
+
+            held_form_route = None
+            held_form_request = None
+            held_form_requests = []
             hold_enabled = {"value": True}
 
             def hold_initial_form(route):
-                if hold_enabled["value"] and route.request.method == "POST" and not held_form:
-                    held_form.append(route)
-                else:
-                    route.continue_()
+                nonlocal held_form_request, held_form_route
+                request = route.request
+                if hold_enabled["value"] and request.method == "POST":
+                    held_form_requests.append(request)
+                    if held_form_route is None:
+                        held_form_route = route
+                        held_form_request = request
+                        return
+                route.continue_()
 
-            def release_form():
-                while held_form:
-                    held_form.pop(0).continue_()
+            def release_form(*, cleanup: bool = False):
+                nonlocal held_form_route
+                if held_form_route is None:
+                    return
+                try:
+                    held_form_route.continue_()
+                except PlaywrightError as error:
+                    message = str(error).lower()
+                    disposed = page.is_closed() or any(
+                        fragment in message
+                        for fragment in (
+                            "target page, context or browser has been closed",
+                            "request is already handled",
+                            "route is already handled",
+                            "invalid interception id",
+                            "request cancelled",
+                        )
+                    )
+                    if not cleanup or not disposed:
+                        raise
+                held_form_route = None
 
             page.route("**/api/config/form", hold_initial_form)
             try:
                 first_run = RESPONSIVE_FIXTURE_RUN_ID
                 second_run = "responsive-run-38"
-                with page.expect_request("**/api/config/form", timeout=10_000):
+                with page.expect_request(
+                    lambda request: request.method == "POST"
+                    and urlsplit(request.url).path == "/api/config/form",
+                    timeout=10_000,
+                ):
                     page.goto(f"{url}/?project={PROJECT_ID}&view=runs&run={first_run}")
                 _assert_run_detail(page, RESPONSIVE_FIXTURE_TITLE, first_run)
-                assert len(held_form) == 1, "initial configuration projection was not held"
+                assert len(held_form_requests) == 1, "initial configuration projection was not held"
+                assert held_form_request is held_form_requests[0]
 
                 page.get_by_role("button", name="← Back to Run history", exact=True).click()
                 row = page.locator(
@@ -2039,15 +2075,41 @@ def test_compact_selection_survives_pending_configuration(
                 page.get_by_role("button", name="← Back to Run history", exact=True).click()
                 expect(row).to_be_focused()
 
+                assert len(held_form_requests) == 1, "more than one configuration projection was held"
                 hold_enabled["value"] = False
-                with page.expect_response("**/api/config/form", timeout=10_000):
+                with page.expect_response(
+                    lambda response: response.request is held_form_request
+                    and response.request.method == "POST"
+                    and urlsplit(response.url).path == "/api/config/form",
+                    timeout=10_000,
+                ) as held_response_info:
                     release_form()
+                held_response = held_response_info.value
+                assert held_response.request is held_form_request
+                assert held_response.status == 200
+                held_response.body()
                 expect(row).to_be_focused()
+
+                page.get_by_role("button", name="More", exact=True).click()
+                run_page_menu = page.get_by_role(
+                    "menu", name="More run page actions", exact=True
+                )
+                expect(
+                    run_page_menu.get_by_role("menuitem", name="Refresh", exact=True)
+                ).to_be_enabled()
             finally:
                 hold_enabled["value"] = False
-                release_form()
-                page.unroute("**/api/config/form", hold_initial_form)
+                release_form(cleanup=True)
+                try:
+                    page.unroute("**/api/config/form", hold_initial_form)
+                except PlaywrightError as error:
+                    if not page.is_closed() and (
+                        "target page, context or browser has been closed"
+                        not in str(error).lower()
+                    ):
+                        raise
         finally:
+            context.close()
             browser.close()
 
 
