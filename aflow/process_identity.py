@@ -2,8 +2,22 @@
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
 import subprocess
+import sys
+
+
+def _linux_procfs_is_usable() -> bool:
+    """Return whether the current procfs exposes a parseable stat shape."""
+    try:
+        stat = Path("/proc/self/stat").read_text(encoding="utf-8")
+    except (OSError, IndexError, UnicodeError):
+        return False
+    closing = stat.rfind(")")
+    if closing < 0 or stat[closing + 1 : closing + 2] != " ":
+        return False
+    return len(stat[closing + 2 :].split()) > 19
 
 
 def process_birth_identity(pid: int) -> str | None:
@@ -16,6 +30,14 @@ def process_birth_identity(pid: int) -> str | None:
         if suffix[0] == "Z":
             return None
         return f"linux-start-ticks:{suffix[19]}"
+    except FileNotFoundError:
+        if sys.platform == "linux" and _linux_procfs_is_usable():
+            try:
+                os.kill(pid, 0)
+            except ProcessLookupError:
+                return None
+            except OSError:
+                pass
     except (OSError, IndexError):
         pass
     completed = subprocess.run(

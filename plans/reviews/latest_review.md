@@ -2285,3 +2285,43 @@ state. Publication, exact-SHA CI, deployment and live timings remain separate
 coordinator gates; this review does not claim them complete.
 
 No material findings
+
+
+---
+
+## Confirm absent Linux processes — cumulative review approved, 2026-09-13
+
+Review base: `577a230e1a1dd639e2d694529334764b213f12e0` (unchanged).
+Reviewed HEAD: `a7f78295aea5df99339ba12d40755e0129f8943d`.
+Coverage: 1 new / 1 total commit, `cp1 v01`, the complete original plan,
+all five steps and all three changed files. No previous findings or fix
+overlays apply to this handoff.
+
+No material findings under the material-code-review admission gate. Only Linux
+target FileNotFoundError plus fresh parseable self stat plus signal-0
+ProcessLookupError skips ps. Uncertain observations retain fallback; valid
+identities, zombies, nonpositive PIDs, exact ps arguments and ownership
+comparisons remain intact. No cache, nonzero signal, consumer change or
+external profiler edit was introduced.
+
+Inspected and reused final worker command/output receipts in
+`/root/code/agent_flow/.aflow/runs/20260913t002207z-8ab25ad0/turns/turn-001/transport.stdout`
+and completed result.json (zero unchecked checkpoints/steps). These controller
+artifacts reside outside the execution worktree. Final verification:
+
+- `uv run --frozen pytest -q tests/test_process_identity.py`: 19 passed, 0.27s.
+- Plan-specified four persistent-unit ownership/lifecycle cases: 4 passed,
+  16 deselected, 1.31s.
+- Scoped Ruff: all checks passed.
+- Reviewer full-range `git diff --check`: passed.
+
+Evidence applies to the final reviewed blobs; no repeat or full local suites
+needed. Approve and consolidate the handoff with this tracked review record
+into one unpublished final commit. Preserve all three implementation blobs
+and the single DEVLOG entry. No fix plan needed or created. Leave the ignored
+original plan in place for engine finalization; record the final approved SHA
+there after committing. Verify one commit above the unchanged base and clean
+tracked state. Publication, exact-SHA CI, normal activation and actual UI/profile
+timing remain coordinator-owned. Overall full-list speed remains unproven.
+
+No material findings

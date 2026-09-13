@@ -1,5 +1,17 @@
 # DEVLOG
 
+## 2026-09-13 — Confirm absent Linux processes before the ps fallback
+
+- A missing Linux `/proc/<pid>/stat` entry now gets a fresh parseability check
+  of `/proc/self/stat` and one read-only `os.kill(pid, 0)` query. Only
+  `ProcessLookupError` confirms absence and skips `ps`; permission, malformed,
+  non-Linux and otherwise uncertain observations retain the existing fallback,
+  identity tokens and ownership semantics.
+- Focused deterministic tests cover the error matrix, valid-path no-probe
+  behavior and a process appearing after a prior miss. This narrow optimization
+  addresses the retained profile's 80 identity calls/0.377s; no live profile or
+  end-to-end latency claim is made here.
+
 ## 2026-09-12 — Retain compact run navigation during readiness
 
 - An authorized Runs shell now remains mounted through same-project selection
