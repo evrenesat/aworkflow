@@ -2368,3 +2368,47 @@ base and clean tracked state. Serialized publication, exact-SHA CI, normal
 activation and live verification remain coordinator-owned and pending.
 
 No material findings
+
+
+---
+
+# Startup required dirty acknowledgement — cumulative review approved
+
+Base: `268237046548a1e03b076285b7ce5f57416aad57` (unchanged Pre-Handoff Base HEAD).
+Reviewed HEAD: `29e0efca65b6f0a91d9b9a1b1d527193550605ca`.
+Coverage: 1 new / 1 total commit, `cp1 v01`, the entire original checkpoint.
+No previous findings or fix overlays apply to this handoff.
+
+No material findings under the material-code-review admission gate, exclusions,
+and proportionate-fix discipline. The force-staged sentinel is committed before
+capturing plan tracking, then remains verifiably modified before all three
+launch attempts. Both parameter cases retain every original validation,
+allocation, selection, revision and content assertion. The required helper
+waits for current visible/enabled confirmation, checks once, asserts checked
+and Start enabled, and preserves bounded failure capture and original errors.
+Repository-local excludes preserve existing bytes; no production, timeout,
+retry, global Git configuration or portable evidence-path changes were made.
+The single DEVLOG entry distinguishes demonstrated coverage from inferred timing.
+
+Retained evidence: `/root/code/agent_flow/.aflow/runs/20260913t005954z-3b150b44/turns/turn-001/transport.stdout`
+and its completed `result.json`. The initial test invocation failed at login
+because this worktree lacked built assets. Existing exact-baseline assets were
+copied without rebuilding; the subsequent scoped invocation passed both cases:
+
+```sh
+(cd apps/aflow_app/server && uv run --frozen pytest -q tests/test_plan_startup_browser.py::test_chromium_preserves_ready_state_and_retries_a_corrected_plan)
+uv run --frozen ruff check apps/aflow_app/server/tests/test_plan_startup_browser.py
+```
+
+Results: 2 passed in 8.79s; Ruff passed. Reviewer reused valid unchanged evidence
+and independently passed `git diff --check 268237046548a1e03b076285b7ce5f57416aad57 HEAD`.
+No full suite, browser repetition, or UI rebuild during review.
+
+Approve and consolidate implementation plus this tracked review record into one
+unpublished handoff commit, preserving both implementation blobs. No fix plan
+is needed. Leave the ignored original plan in place for engine finalization;
+record the final approved SHA there only. Verify exactly one commit above base
+and clean tracked state. Publication, exact-SHA CI and live verification remain
+pending at the normal controller/coordinator delivery boundary.
+
+No material findings

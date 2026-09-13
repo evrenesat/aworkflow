@@ -7,6 +7,7 @@ from pathlib import Path
 import subprocess
 
 from playwright.sync_api import expect, sync_playwright
+import pytest
 
 from test_control_plane_api import (
     PROJECT_ID,
@@ -155,7 +156,7 @@ def _capture_startup_gate_failure(page) -> None:
         print(f"STARTUP_GATE_FAILURE_EVIDENCE capture_failed={type(diagnostic_error).__name__}")
 
 
-def _acknowledge_dirty_worktree_if_needed(page) -> None:
+def _acknowledge_required_dirty_worktree(page) -> None:
     try:
         page.locator(".worktree-preflight").wait_for()
         page.wait_for_function(
@@ -170,17 +171,27 @@ def _acknowledge_dirty_worktree_if_needed(page) -> None:
             name="Continue despite uncommitted changes",
             exact=True,
         )
-        if confirmation.count():
-            confirmation.check()
+        confirmation.wait_for(state="visible")
+        expect(confirmation).to_be_enabled()
+        confirmation.check()
+        expect(confirmation).to_be_checked()
         expect(page.get_by_role("button", name="Start run", exact=True)).to_be_enabled()
     except Exception:
         _capture_startup_gate_failure(page)
         raise
 
 
+def _assert_tracked_modification(root: Path, path: Path) -> None:
+    relative_path = path.relative_to(root).as_posix()
+    assert _git(root, "ls-files", "--error-unmatch", "--", relative_path) == relative_path
+    assert _git(root, "diff", "--name-only", "HEAD", "--", relative_path) == relative_path
+
+
+@pytest.mark.parametrize("ignore_plan_files", [False, True], ids=("normal", "ignored-plans"))
 def test_chromium_preserves_ready_state_and_retries_a_corrected_plan(
     _control_client_fixture,  # noqa: F811
     monkeypatch,
+    ignore_plan_files: bool,
 ) -> None:
     _, root, units, _ = _control_client_fixture
     workflow_config = root.parent / "global" / "aflow.toml"
@@ -191,9 +202,20 @@ def test_chromium_preserves_ready_state_and_retries_a_corrected_plan(
         encoding="utf-8",
     )
     (root / ".gitignore").write_text(".aflow/\n", encoding="utf-8")
+    sentinel_path = root / "startup-dirty-sentinel.txt"
+    sentinel_path.write_text("fixture baseline\n", encoding="utf-8")
+    _git(root, "add", "-f", "--", sentinel_path.name)
     _commit_fixture_repository(root)
     branch = _git(root, "symbolic-ref", "--short", "HEAD")
     base_head = _git(root, "rev-parse", "HEAD")
+    sentinel_path.write_text("fixture baseline\nfixture dirty\n", encoding="utf-8")
+    _assert_tracked_modification(root, sentinel_path)
+
+    if ignore_plan_files:
+        exclude_path = root / ".git" / "info" / "exclude"
+        existing_exclude = exclude_path.read_bytes()
+        separator = b"" if not existing_exclude or existing_exclude.endswith(b"\n") else b"\n"
+        exclude_path.write_bytes(existing_exclude + separator + b"/plans/\n")
 
     numbered = (
         "# Numbered ready plan\n\n"
@@ -250,7 +272,8 @@ def test_chromium_preserves_ready_state_and_retries_a_corrected_plan(
                 "plans/in-progress/numbered-ready.md"
             )
             _choose_workflow(page)
-            _acknowledge_dirty_worktree_if_needed(page)
+            _assert_tracked_modification(root, sentinel_path)
+            _acknowledge_required_dirty_worktree(page)
             page.get_by_role("button", name="Start run", exact=True).click()
             assert page.locator(".run-detail h3").inner_text() == "Numbered ready"
             assert len(units.start_calls) == 1
@@ -265,7 +288,8 @@ def test_chromium_preserves_ready_state_and_retries_a_corrected_plan(
                 "plans/in-progress/duplicate-ready.md"
             )
             _choose_workflow(page)
-            _acknowledge_dirty_worktree_if_needed(page)
+            _assert_tracked_modification(root, sentinel_path)
+            _acknowledge_required_dirty_worktree(page)
             before_rejection = _run_ids(root)
             page.get_by_role("button", name="Start run", exact=True).click()
             expect(page.get_by_role("alert").filter(has_text="Plan validation failed")).to_contain_text(
@@ -299,7 +323,8 @@ def test_chromium_preserves_ready_state_and_retries_a_corrected_plan(
 
             _open_run_for_selected_plan(page)
             _choose_workflow(page)
-            _acknowledge_dirty_worktree_if_needed(page)
+            _assert_tracked_modification(root, sentinel_path)
+            _acknowledge_required_dirty_worktree(page)
             page.get_by_role("button", name="Start run", exact=True).click()
             assert page.locator(".run-detail h3").inner_text() == "Duplicate ready"
             assert len(units.start_calls) == 2

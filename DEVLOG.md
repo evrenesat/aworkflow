@@ -1,5 +1,16 @@
 # DEVLOG
 
+## 2026-09-13 — Require dirty acknowledgement in startup browser coverage
+
+- The corrected-plan browser fixture now carries a force-tracked modified
+  sentinel and runs with both visible and repository-locally ignored plan
+  files. Each variant proves all three startup attempts require one current,
+  visible acknowledgement while preserving the full rejection and correction
+  journey.
+- This demonstrates the prior environment-dependent coverage gap. The exact CI
+  skipped-ack timing remains inferred, and no product acknowledgement-reset
+  defect has been demonstrated.
+
 ## 2026-09-13 — Confirm absent Linux processes before the ps fallback
 
 - A missing Linux `/proc/<pid>/stat` entry now gets a fresh parseability check
