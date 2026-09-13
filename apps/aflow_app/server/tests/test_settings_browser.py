@@ -59,6 +59,19 @@ def select_settings_section(page, name):
         tab.click()
 
 
+def assert_settings_section_navigation(page, name, width):
+    selector = page.get_by_role('combobox', name='Settings section', exact=True)
+    tab = page.get_by_role('tab', name=name, exact=True)
+    if width < 1200:
+        selector.wait_for(state='visible')
+        assert selector.input_value() == name
+        assert page.get_by_role('tab').count() == 0
+    else:
+        tab.wait_for(state='visible')
+        assert tab.get_attribute('aria-selected') == 'true'
+        assert selector.count() == 0
+
+
 def open_settings_more(page):
     page.get_by_role('button', name='More', exact=True).click()
 
@@ -209,10 +222,7 @@ def test_changelog_settings_responsive_journey(control_client, tmp_path, monkeyp
                     page.get_by_role('heading', name='Changelog', exact=True).wait_for()
                     page.get_by_text('Changes included in this version', exact=True).wait_for()
                     wait_for_changelog_read_only(page)
-                    if width < 1400 or height < 600:
-                        assert page.get_by_role('combobox', name='Settings section', exact=True).input_value() == 'Changelog'
-                    else:
-                        assert page.get_by_role('tab', name='Changelog', exact=True).get_attribute('aria-selected') == 'true'
+                    assert_settings_section_navigation(page, 'Changelog', width)
                     assert page.get_by_role('button', name='Save all changes', exact=True).count() == 0
                     assert page.get_by_role('button', name='Reload server settings', exact=True).count() == 0
                     open_settings_more(page)
@@ -317,21 +327,28 @@ def test_settings_toolbar_stays_visible_through_long_scroll(control_client, monk
             page.get_by_placeholder('Auth token').fill(TOKEN)
             page.get_by_role('button', name='Login', exact=True).click()
             page.get_by_role('button', name='Settings', exact=True).click()
-            for width, height in ((960, 720), (1024, 720), (1280, 720), (1440, 900)):
+            for width, height in (
+                (960, 720),
+                (1024, 720),
+                (1199, 720),
+                (1200, 720),
+                (1200, 500),
+                (1280, 720),
+                (1440, 900),
+            ):
                 page.set_viewport_size({'width': width, 'height': height})
                 page.wait_for_timeout(100)
                 page.evaluate('window.scrollTo(0, 0)')
                 select_settings_section(page, 'Agents & Roles')
-                if width < 1400:
-                    section_selector = page.get_by_role('combobox', name='Settings section', exact=True)
-                    section_selector.wait_for()
-                    assert page.get_by_role('tab').count() == 0
-                else:
-                    page.get_by_role('tab', name='Agents & Roles', exact=True).wait_for()
-                    assert page.get_by_role('combobox', name='Settings section', exact=True).count() == 0
+                assert_settings_section_navigation(page, 'Agents & Roles', width)
                 metrics = document_metrics(page)
-                assert metrics['headerBottom'] <= 112, metrics
-                assert metrics['contentTop'] <= 128, metrics
+                if (width, height) in ((960, 720), (1024, 720), (1280, 720), (1440, 900)):
+                    assert metrics['headerBottom'] <= 112, metrics
+                    assert metrics['contentTop'] <= 128, metrics
+                elif height < 600:
+                    assert page.locator('.app-header-row-two').evaluate(
+                        '(element) => getComputedStyle(element).position'
+                    ) == 'static'
                 if width in (1280, 1440):
                     page.screenshot(path=str(tmp_path / f'settings-header-{width}x{height}-dirty.png'))
                 if width == 960:
@@ -341,6 +358,8 @@ def test_settings_toolbar_stays_visible_through_long_scroll(control_client, monk
                     dirty_metrics = document_metrics(page)
                     assert dirty_metrics['headerBottom'] <= 112, dirty_metrics
                     assert dirty_metrics['contentTop'] <= 128, dirty_metrics
+                if (width, height) in ((1199, 720), (1200, 720), (1200, 500)):
+                    assert page.get_by_label('Effort codex.profile_29', exact=True).input_value() == 'dirty header test'
             for theme in ('light', 'dark'):
                 select_settings_section(page, 'General')
                 page.get_by_label('Color theme').select_option(theme)
@@ -456,6 +475,7 @@ def test_settings_toolbar_stays_visible_through_long_scroll(control_client, monk
             page.get_by_role('menuitem', name='Advanced TOML', exact=True).click()
             page.get_by_label('aflow.toml contents', exact=True).wait_for()
             assert page.get_by_role('tab').count() == 0
+            assert page.get_by_role('combobox', name='Settings section', exact=True).count() == 0
             assert page.locator('.sidebar-editor-layout').count() == 0
             aflow_editor = page.get_by_label('aflow.toml contents', exact=True)
             long_toml = aflow_editor.input_value() + '\n# CP4 long TOML comment ' + ('t' * 20000) + '\n'
@@ -474,9 +494,9 @@ def test_settings_toolbar_stays_visible_through_long_scroll(control_client, monk
             assert ('# CP4 long TOML comment ' + ('t' * 20000)) in config.read_text()
             open_settings_more(page)
             page.get_by_role('menuitem', name='Guided settings', exact=True).click()
-            if compact:
+            assert_settings_section_navigation(page, 'Prompts', width)
+            if width < 1200:
                 section_selector = page.get_by_role('combobox', name='Settings section', exact=True)
-                section_selector.wait_for()
                 section_labels = section_selector.locator('option').all_text_contents()
                 assert {'General', 'Agents & Roles', 'Skills'}.issubset(
                     {label.strip() for label in section_labels}

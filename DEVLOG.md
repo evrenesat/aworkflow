@@ -2829,3 +2829,20 @@ HISTORY: Published clipboard history `c14f1f2`/`cd78d53` remains separate and mu
 - Release acceptance is bound to the exact stored request and requires its 200
   response to finish. The preserved row focus is followed by an enabled current
   Refresh menu assertion without triggering another configuration request.
+
+## 2026-09-13 — Settings header breakpoint browser fixtures
+
+- Settings browser assertions now use the shipped width-only navigation rule:
+  the labelled selector below 1200px and exact selected tabs at 1200px and
+  above. Boundary coverage at 1199×720, 1200×720 and 1200×500 preserves the
+  dirty profile draft while the short-height case independently confirms the
+  static action row. Existing list/detail, sticky, geometry, scroll, save,
+  Changelog and Advanced TOML checks remain in their original domains.
+- The production build passed. Chromium passed both named journeys (`2 passed`).
+  The initial WebKit pair passed Changelog but exposed that the newly added
+  boundary points temporarily inherited the original viewport geometry check;
+  after limiting that check to its unchanged 960/1024/1280/1440 cases, the
+  affected toolbar journey passed. The retained final evidence contains 18
+  screenshots per engine (14 Changelog and four toolbar); representative light,
+  dark, compact and desktop captures were inspected with the expected controls,
+  selected section, dirty state and readable content.

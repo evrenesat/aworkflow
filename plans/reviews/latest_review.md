@@ -2708,3 +2708,47 @@ Publication, exact-SHA CI and live activation remain separate managed
 controller/coordinator delivery gates and are not claimed complete here.
 
 No material findings
+
+---
+
+# Settings tab browser fixtures — cumulative review approved, 2026-09-13
+
+Base: `e04e9a58b5acde73aba183efe511fa879fa80f76` (unchanged Pre-Handoff Base HEAD).
+Reviewed HEAD: `b8444e8a5a2a22355d8595faa47b222e1c628549`.
+Coverage: 1 new / 1 total commit, `cp1 v01`, original checkpoint 1 in full.
+No earlier findings or follow-up overlays apply to this handoff.
+
+No material findings. The width-only 1200px navigation helper verifies visible
+controls, exact selected identity and absent alternate navigation. Boundary
+draft checks cover 1199×720, 1200×720 and 1200×500. Existing geometry assertions
+retain their original viewport set; list/detail and sticky/static predicates,
+read-only Changelog, pagination, focus, scroll, save and Advanced checks remain.
+Only the browser test and one DEVLOG entry changed; production and uv.lock did not.
+
+Retained worker evidence:
+`/root/code/agent_flow/.aflow/runs/20260913t165332z-b1b357cf/turns/turn-001/transport.stdout`
+and its completed result.json. Build passed after locked dependency installation.
+Chromium pair: 2 passed in 29.39s. WebKit initial pair: Changelog passed,
+toolbar failed; the first toolbar correction also failed. Both failures applied
+new geometry checks outside the original viewport set. Final scoped correction:
+WebKit toolbar 1 passed in 24.44s. These were code-dependent reruns, not unchanged
+retries. Retained Changelog evidence remains valid.
+
+Reviewer ran the final Chromium toolbar to cover the subsequently added static
+assertion: 1 passed in 20.80s, existing deprecation warnings only:
+`AFLOW_TEST_BROWSER=chromium uv run --frozen --project apps/aflow_app/server python -m pytest -q --basetemp=/root/code/evidence/aflow-settings-tab-browser-fixtures-20260913/review-chromium-toolbar apps/aflow_app/server/tests/test_settings_browser.py::test_settings_toolbar_stays_visible_through_long_scroll`.
+Evidence root: `/root/code/evidence/aflow-settings-tab-browser-fixtures-20260913/`.
+Inspected representative retained WebKit desktop dirty header/light Changelog
+and Chromium dark compact Changelog screenshots; expected tabs/selector,
+dirty state and readable content are present. Worker retained 18 screenshots
+per engine. Cumulative `git diff --check e04e9a58 HEAD` passed.
+Full suites remain CI-owned.
+
+Approve and squash the implementation plus this tracked reviewer record into
+one unpublished handoff commit, preserving all reviewed implementation blobs.
+One DEVLOG entry needs no compaction. No fix plan is created or remains.
+Keep the ignored original plan in place and record the final SHA there.
+Publication, exact-SHA CI and live activation remain controller/coordinator
+delivery steps and are not claimed by this review.
+
+No material findings
