@@ -76,4 +76,8 @@
   cumulative page updates; `GlobalRunOverview` owns request generations and
   coverage presentation. Only a current generation may publish callbacks;
   successful completion replaces that project, while pending or failed
-  coverage overlays usable prior rows and stays visibly incomplete.
+  coverage overlays usable prior rows and stays visibly incomplete. Raw rows
+  remain searchable and navigable while traversal is pending, but exact-run
+  progress admission waits until every current project traversal has completed
+  or failed. Partial project failure releases usable current rows without
+  claiming complete coverage.

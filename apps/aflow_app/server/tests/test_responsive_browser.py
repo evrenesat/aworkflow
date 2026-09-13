@@ -10,7 +10,7 @@ from pathlib import Path
 import re
 import subprocess
 from threading import Event, Thread
-from urllib.parse import urlsplit
+from urllib.parse import parse_qs, urlsplit
 
 import pytest
 from playwright.sync_api import Error as PlaywrightError, Page, expect, sync_playwright
@@ -1320,42 +1320,131 @@ def test_global_run_overview_loading_journey(control_client, monkeypatch, tmp_pa
 
 
 def test_global_run_overview_visible_progress_journey(control_client, monkeypatch):
-    """Search raw canonical identity, then release one bounded real detail read."""
+    """Keep raw rows usable, then admit exact progress after real cursor traversal."""
     _, root, _, _ = control_client
     _seed_responsive_fixture(root)
     _seed_visible_progress_fixture(root)
+    from aflow_app_server import main
+
+    service = main._control_plane_service
+    assert service is not None
+    original_list_runs = service.list_runs
+
+    def paged_list_runs(
+        project_id,
+        *,
+        limit,
+        cursor,
+        history="visible",
+        include_progress=True,
+    ):
+        return original_list_runs(
+            project_id,
+            limit=min(limit, 10),
+            cursor=cursor,
+            history=history,
+            include_progress=include_progress,
+        )
+
+    monkeypatch.setattr(service, "list_runs", paged_list_runs)
     dist = Path(__file__).resolve().parents[2] / "web" / "dist"
     monkeypatch.setenv("AFLOW_APP_WEB_DIST", str(dist))
     base_path = f"/api/control-plane/projects/{PROJECT_ID}/runs"
     detail_path = f"{base_path}/{VISIBLE_PROGRESS_RUN_ID}"
+    held_lists = []
     held_details = []
-    released = {"value": False}
+    hold_cursor = {"value": True}
+    hold_details = {"value": True}
+    overview_detail_paths = []
+    overview_response_statuses = []
 
-    def hold_visible_detail(route):
-        request_path = urlsplit(route.request.url).path
+    def route_global_runs(route):
+        parsed = urlsplit(route.request.url)
+        request_path = parsed.path
+        if request_path == base_path:
+            cursor = parse_qs(parsed.query).get("cursor")
+            if route.request.method == "GET" and cursor and hold_cursor["value"]:
+                hold_cursor["value"] = False
+                held_lists.append(route)
+                return
+            route.continue_()
+            return
         if (
             route.request.method == "GET"
-            and request_path == detail_path
-            and not released["value"]
+            and request_path.startswith(f"{base_path}/")
+            and "view=all-runs" in route.request.frame.page.url
         ):
-            held_details.append(route)
-            return
+            overview_detail_paths.append(request_path)
+            if hold_details["value"]:
+                held_details.append(route)
+                return
         route.continue_()
+
+    def record_overview_response(response):
+        request_path = urlsplit(response.url).path
+        if (
+            response.request.method == "GET"
+            and request_path.startswith(f"{base_path}/")
+            and "view=all-runs" in response.request.frame.page.url
+        ):
+            overview_response_statuses.append((request_path, response.status))
 
     with live_server() as url, sync_playwright() as playwright:
         browser = _browser(playwright)
-        page = browser.new_page(viewport={"width": 1280, "height": 720})
+        context = browser.new_context(viewport={"width": 1280, "height": 720})
+        setup_page = context.new_page()
+        _login(setup_page, url)
+        setup_page.close()
+        page = context.new_page()
         pattern = f"**/api/control-plane/projects/{PROJECT_ID}/runs**"
-        page.route(pattern, hold_visible_detail)
+        page.route(pattern, route_global_runs)
+        page.on("response", record_overview_response)
         try:
-            _login(page, url)
             page.goto(f"{url}/?view=all-runs")
             page.get_by_role("heading", name="All runs", exact=True).wait_for()
-            expect(page.locator(".global-run-results")).to_have_attribute("aria-busy", "false")
-            assert page.get_by_role("button", name=re.compile(rf"{re.escape(VISIBLE_PROGRESS_RUN_ID)}$")).count() == 0
-            assert held_details == []
+            early_row = _assert_global_run_row(
+                page,
+                RESPONSIVE_GLOBAL_RUN_ID,
+                project_label="Test project",
+                title=RESPONSIVE_GLOBAL_TITLE,
+            )
+            early_row.wait_for()
+            expect(page.locator(".global-run-results")).to_have_attribute("aria-busy", "true")
+            assert len(held_lists) == 1
+            assert overview_detail_paths == []
 
             search = page.get_by_role("searchbox", name="Search loaded runs")
+            search.fill(RESPONSIVE_GLOBAL_TITLE)
+            assert overview_detail_paths == []
+            early_row.click()
+            _assert_run_detail(page, RESPONSIVE_GLOBAL_TITLE, RESPONSIVE_GLOBAL_RUN_ID)
+
+            for route in held_lists:
+                try:
+                    route.abort()
+                except PlaywrightError:
+                    pass
+            held_lists.clear()
+            hold_cursor["value"] = True
+            overview_detail_paths.clear()
+            overview_response_statuses.clear()
+
+            page.goto(f"{url}/?view=all-runs")
+            page.get_by_role("heading", name="All runs", exact=True).wait_for()
+            search = page.get_by_role("searchbox", name="Search loaded runs")
+            search.fill(RESPONSIVE_GLOBAL_TITLE)
+            _assert_global_run_row(
+                page,
+                RESPONSIVE_GLOBAL_RUN_ID,
+                project_label="Test project",
+                title=RESPONSIVE_GLOBAL_TITLE,
+            ).wait_for()
+            expect(page.locator(".global-run-results")).to_have_attribute("aria-busy", "true")
+            assert len(held_lists) == 1
+            assert overview_detail_paths == []
+
+            held_lists.pop(0).continue_()
+            expect(page.locator(".global-run-results")).to_have_attribute("aria-busy", "false")
             search.fill(VISIBLE_PROGRESS_TITLE)
             row = _assert_global_run_row(
                 page,
@@ -1367,9 +1456,10 @@ def test_global_run_overview_visible_progress_journey(control_client, monkeypatc
                 "data-progress-state", "loading"
             )
             expect(row).to_contain_text("Loading checkpoint progress…")
-            assert len(held_details) == 1
+            assert any(path == detail_path for path in overview_detail_paths)
+            assert any(urlsplit(route.request.url).path == detail_path for route in held_details)
 
-            released["value"] = True
+            hold_details["value"] = False
             for route in held_details:
                 route.continue_()
             held_details.clear()
@@ -1382,21 +1472,33 @@ def test_global_run_overview_visible_progress_journey(control_client, monkeypatc
             expect(row.locator(".compact-run-progress")).to_contain_text(
                 "1 of 2 checkpoints approved"
             )
-            page.unroute(pattern, hold_visible_detail)
+            page.wait_for_function(
+                "() => [...document.querySelectorAll('.global-run-row')].every(row => "
+                "row.getAttribute('data-enrichment-state') === 'settled')"
+            )
+            assert (detail_path, 200) in overview_response_statuses
+            page.unroute(pattern, route_global_runs)
 
             row.click()
             _assert_run_detail(page, VISIBLE_PROGRESS_TITLE, VISIBLE_PROGRESS_RUN_ID)
         finally:
-            released["value"] = True
+            hold_cursor["value"] = False
+            hold_details["value"] = False
+            for route in held_lists:
+                try:
+                    route.continue_()
+                except PlaywrightError:
+                    pass
             for route in held_details:
                 try:
                     route.continue_()
                 except PlaywrightError:
                     pass
             try:
-                page.unroute(pattern, hold_visible_detail)
+                page.unroute(pattern, route_global_runs)
             except PlaywrightError:
                 pass
+            context.close()
             browser.close()
 
 

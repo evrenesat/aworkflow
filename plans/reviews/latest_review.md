@@ -2614,3 +2614,55 @@ Material fixes required
 - No new fix plan. Publication, exact-SHA CI, normal live activation and quiet full-coverage-plus-displayed-progress performance acceptance remain coordinator-owned and pending.
 
 No material findings
+
+
+---
+
+## Raw traversal progress admission — cumulative review approved, 2026-09-13
+
+- Unchanged base: `a3b274166f1222da062de411b8a1903957c8da52`.
+- Reviewed HEAD: `14ae74843c0cc8e2db36f1e110195869a40c8ddb`.
+- Coverage: 1 new / 1 total commit, `cp1 v01`, complete original plan and all
+  six changed files. Original and active plans coincide; no prior findings or
+  fix overlays exist for this handoff.
+- No material findings under the admission gate, exclusions and proportionate
+  fix discipline. Current identity, registry readiness and all-project settlement
+  gate only pump admission. Queue reconciliation, stale cancellation and target
+  bookkeeping continue while raw traversal is pending. Partial project failure
+  releases usable rows without claiming complete coverage. Refresh, hidden and
+  obsolete-generation guards, bounded concurrency and exact identity checks remain.
+- Prior baseline findings R1 (hidden work) and R2 (terminal mismatch retries)
+  remain resolved: late hidden pages cannot admit reads, admitted requests abort,
+  recovery waits for current settlement, and attention expansion does not retry
+  a terminal stale target. Deferred tests prove pre-release search/click, final
+  candidate selection, failure release, refresh retention and obsolete identity
+  rejection. Browser coverage uses real capped cursors and current exact GETs.
+
+Retained completed command receipts inspected and reused from
+`/root/code/agent_flow/.aflow/runs/20260913t052730z-fc1510ae/turns/turn-001/transport.stdout`
+and completed `result.json` (zero unchecked checkpoints/steps):
+
+- Plan's focused GlobalRunOverview/globalRuns Vitest command: 46 passed, 2.17s.
+- Production TypeScript/Vite build: passed.
+- Scoped browser Ruff with `--no-respect-gitignore`: passed.
+- Chromium loading journey: passed in initial two-case invocation; final modified
+  visible-progress journey: 1 passed, 3.94s.
+- WebKit visible-progress journey: 1 passed, 4.58s.
+- Browser invocations used private temporary directories via `--basetemp`;
+  no host-specific evidence paths entered portable tests.
+- Initial missing dependencies and old request-count expectations were corrected
+  before the final web pass. Initial browser assertion preceded first-row arrival;
+  the final test waits for the usable row before asserting the held cursor.
+- Reviewer cumulative `git diff --check a3b27416 HEAD`: passed. Valid retained
+  tests reused without broad suites or repeated unchanged verification.
+
+Approval finalization consolidates the implementation and this tracked reviewer
+record into exactly one unpublished handoff commit after the unchanged base,
+preserving all six implementation blobs and the single DEVLOG entry. No fix plan
+is needed or created; no stale overlay exists. Keep the ignored original plan in
+place for engine finalization and record the final approved SHA there only.
+Verify one commit above base and clean tracked state. Publication, exact-SHA CI,
+activation and strict shipped UI measurement remain controller/coordinator-owned
+and pending; this review makes no live performance acceptance claim.
+
+No material findings

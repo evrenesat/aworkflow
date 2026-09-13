@@ -1,5 +1,19 @@
 # DEVLOG
 
+## 2026-09-13 — Admit visible progress after raw traversal settlement
+
+- Deferred the bounded All runs exact-detail pump until every current project
+  cursor chain has completed or failed. Raw rows remain immediately searchable
+  and navigable; queue reconciliation, stale cancellation and retained progress
+  bookkeeping continue while admission is closed.
+- Partial project failure releases enrichment for usable current rows while the
+  page keeps its incomplete/error presentation. Refresh generations close the
+  gate again, and exact generation/row guards prevent obsolete work from
+  releasing or populating the new view.
+- The change addresses measured enrichment contention during raw traversal; the
+  external held-dispatch diagnostic is directional evidence, not a claim that
+  the shipped live timing target has been reached.
+
 ## 2026-09-13 — Complete raw run coverage with bounded visible progress
 
 - Added compatible `include_progress=false` lists with full daemon authority,

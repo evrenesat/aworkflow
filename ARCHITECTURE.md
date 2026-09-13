@@ -130,18 +130,23 @@ identity settle independently from checkpoint enrichment. Search and grouping
 operate on the complete loaded raw set before the recent/attention display
 limits. Only rows currently rendered in ongoing, recent, or expanded attention
 groups own exact project/run detail reads, with four requests in flight at most;
-hidden rows never hydrate. Each enrichment captures the list generation,
+hidden rows never hydrate. Target reconciliation, stale-request cancellation,
+and queue pruning continue as raw pages arrive, but the pump admits no exact-run
+GET until every requested project in the current list generation has settled as
+complete or failed. Partial project failure therefore releases usable rows while
+coverage stays explicitly incomplete. Each enrichment captures the list generation,
 results identity, and exact raw row object, and attaches progress only after an
 explicit snapshot and canonical-identity comparison. Replaced, archived,
 deleted, or mismatched rows discard late results; mismatches settle with the
 visible stale message rather than retrying. The row exposes `loading`,
 `stale`, `failed`, and `settled` `data-progress-state` values, while the raw
 results container can become non-busy before visible progress settles. Normal
-Refresh or visibility recovery is the retry boundary; visibility suspension also
-gates enrichment admitted by late raw cursor pages, and abort epochs discard late
-detail resolutions. Returning visible requeues current pending rendered rows
-through the same lifecycle even while raw traversal remains busy; there is no
-per-row polling or request loop.
+Refresh or visibility recovery is the retry boundary; each refresh closes pump
+admission for its new raw generation while retaining honest stale progress.
+Visibility suspension aborts admitted work, and abort epochs discard late detail
+resolutions. Returning visible requeues current pending rendered rows through the
+same lifecycle once the current raw traversal is settled; there is no per-row
+polling or request loop.
 
 Unreadable turn results and malformed event records make dependent history
 counts partial without discarding readable events, plan structure, or

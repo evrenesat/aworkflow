@@ -113,6 +113,8 @@ export function GlobalRunOverview({ projects, onOpen, registryLoading = false, r
   const projectStates = currentLoad?.projects ?? {}
   const resultsPending = !registryError && (!registryReady || !currentLoad || projectIds.some(id => projectStates[id]?.coverage === 'loading' || !projectStates[id]))
   const coverageComplete = registryReady && currentLoad !== null && projectIds.every(id => projectStates[id]?.coverage === 'complete')
+  const progressAdmissionReady = registryReady && currentLoad !== null && currentLoad.settled
+    && projectIds.every(id => projectStates[id] !== undefined && projectStates[id].coverage !== 'loading')
   const incompleteCoverage = resultsPending || !coverageComplete
   const failedProjectIds = projectIds.filter(id => projectStates[id]?.coverage === 'failed')
 
@@ -353,6 +355,7 @@ export function GlobalRunOverview({ projects, onOpen, registryLoading = false, r
     const pump = (): void => {
       if (pumpEnrichmentRef.current !== pump) return
       if (document.visibilityState === 'hidden') return
+      if (!progressAdmissionReady) return
       while (activeEnrichmentRef.current.size < MAX_VISIBLE_ENRICHMENTS) {
         const target = enrichmentQueueRef.current.shift()
         if (!target) break
@@ -399,7 +402,7 @@ export function GlobalRunOverview({ projects, onOpen, registryLoading = false, r
     pumpEnrichmentRef.current = pump
     if (changed) setEnrichmentVersion(version => version + 1)
     pump()
-  }, [renderedSnapshot, currentGeneration, resultsIdentity, visibilityRevision])
+  }, [renderedSnapshot, currentGeneration, resultsIdentity, progressAdmissionReady, visibilityRevision])
 
   useEffect(() => () => {
     enrichmentEpochRef.current += 1

@@ -49,8 +49,9 @@ function makeRun(run_id: string, overrides: Record<string, unknown> = {}): RunSt
 
 function deferred<T>() {
   let resolve!: (value: T) => void
-  const promise = new Promise<T>(value => { resolve = value })
-  return { promise, resolve }
+  let reject!: (reason?: unknown) => void
+  const promise = new Promise<T>((value, failure) => { resolve = value; reject = failure })
+  return { promise, resolve, reject }
 }
 
 function page(runs: RunStatus[]) {
@@ -312,7 +313,11 @@ describe('GlobalRunOverview project context', () => {
     expect(api.listControlPlaneRuns).toHaveBeenCalledTimes(1)
   })
 
-  it('publishes the first page before slow projects and later pages finish', async () => {
+  it('keeps first-page rows usable but admits only final rendered targets after traversal', async () => {
+    const early = makeRun('fast-first', { ended_at: '2026-01-01T00:00:00Z', original_plan_display_name: 'Early searchable' })
+    const finalRuns = Array.from({ length: 10 }, (_, index) => makeRun(`final-${index + 1}`, {
+      ended_at: `2026-09-${String(20 - index).padStart(2, '0')}T00:00:00Z`,
+    }))
     const laterPrimary = deferred<ReturnType<typeof page>>()
     const slowChild = deferred<ReturnType<typeof page>>()
     let primaryCalls = 0
@@ -320,23 +325,61 @@ describe('GlobalRunOverview project context', () => {
       if (projectId === 'primary') {
         primaryCalls += 1
         return primaryCalls === 1
-          ? Promise.resolve({ runs: [makeRun('fast-first')], next_cursor: 'older', schema_version: 1 })
+          ? Promise.resolve({ runs: [early], next_cursor: 'older', schema_version: 1 })
           : laterPrimary.promise
       }
       return slowChild.promise
     })
+    vi.mocked(api.getControlPlaneRun).mockImplementation(async (projectId, runId) => {
+      const run = finalRuns.find(candidate => candidate.run_id === runId) ?? makeRun('slow-child')
+      return canonicalDetail(run, { original_plan_path: run.original_plan_path ?? null })
+    })
 
-    render(<GlobalRunOverview projects={[primary, child]} onOpen={vi.fn()} />)
-    expect(await screen.findByRole('button', { name: /fast-first/ })).toBeTruthy()
+    const onOpen = vi.fn()
+    render(<GlobalRunOverview projects={[primary, child]} onOpen={onOpen} />)
+    const earlyRow = await screen.findByRole('button', { name: /Early searchable.*fast-first/ })
     expect(screen.getByRole('status').textContent).toBe('Loading runs… Results are incomplete.')
     expect(screen.getByRole('heading', { name: 'Loaded recent (1)' })).toBeTruthy()
     expect(screen.queryByRole('button', { name: /slow-child/ })).toBeNull()
+    expect(api.getControlPlaneRun).not.toHaveBeenCalled()
 
-    laterPrimary.resolve(page([makeRun('older-primary')]))
+    const search = screen.getByRole('searchbox', { name: 'Search loaded runs' })
+    fireEvent.change(search, { target: { value: 'Early searchable' } })
+    fireEvent.click(earlyRow)
+    expect(onOpen).toHaveBeenCalledWith('primary', early.run_id)
+    expect(api.getControlPlaneRun).not.toHaveBeenCalled()
+    fireEvent.change(search, { target: { value: '' } })
+
+    laterPrimary.resolve(page(finalRuns))
+    await waitFor(() => expect(screen.queryByRole('button', { name: /fast-first/ })).toBeNull())
+    expect(api.getControlPlaneRun).not.toHaveBeenCalled()
     slowChild.resolve(page([makeRun('slow-child')]))
-    expect(await screen.findByRole('button', { name: /slow-child/ })).toBeTruthy()
     await waitFor(() => expect(screen.queryByRole('status')).toBeNull())
-    expect(screen.getByRole('heading', { name: 'Recent (3)' })).toBeTruthy()
+    await waitFor(() => expect(api.getControlPlaneRun).toHaveBeenCalled())
+    expect(api.getControlPlaneRun).not.toHaveBeenCalledWith('primary', early.run_id, expect.anything())
+    expect(vi.mocked(api.getControlPlaneRun).mock.calls.every(([, runId]) => runId !== early.run_id)).toBe(true)
+  })
+
+  it('releases usable current rows after another project traversal fails', async () => {
+    const usable = makeRun('usable-after-failure')
+    const failedProject = deferred<ReturnType<typeof page>>()
+    vi.mocked(api.listControlPlaneRuns).mockImplementation(projectId => (
+      projectId === 'primary' ? Promise.resolve(page([usable])) : failedProject.promise
+    ))
+    vi.mocked(api.getControlPlaneRun).mockResolvedValue(canonicalDetail(usable, {
+      total_checkpoints: { value: 1, coverage: 'complete' },
+      approved_checkpoints: { value: 1, coverage: 'complete' },
+    }))
+
+    render(<GlobalRunOverview projects={[primary, child]} onOpen={vi.fn()} />)
+    const row = await screen.findByRole('button', { name: /usable-after-failure/ })
+    expect(api.getControlPlaneRun).not.toHaveBeenCalled()
+
+    failedProject.reject(new Error('child unavailable'))
+    expect((await screen.findByRole('alert')).textContent).toMatch(/Partial or stale results/)
+    await waitFor(() => expect(api.getControlPlaneRun).toHaveBeenCalledWith('primary', usable.run_id, { signal: expect.anything() }))
+    await waitFor(() => expect(row.getAttribute('data-enrichment-state')).toBe('settled'))
+    expect(row.textContent).toContain('1 of 1 checkpoint approved')
   })
 
   it('retains old ongoing and attention rows until refresh coverage completes', async () => {
@@ -390,16 +433,19 @@ describe('GlobalRunOverview project context', () => {
     visiblePage.resolve(page([makeRun('stale-visible')]))
     await Promise.resolve()
     expect(screen.queryByRole('button', { name: /stale-visible/ })).toBeNull()
+    expect(api.getControlPlaneRun).not.toHaveBeenCalled()
 
     view.rerender(<GlobalRunOverview projects={[child]} onOpen={vi.fn()} />)
     await waitFor(() => expect(api.listControlPlaneRuns).toHaveBeenCalledWith('child', expect.objectContaining({ history: 'archived' }), expect.anything()))
     archivedPage.resolve(page([makeRun('stale-archived', { history_state: 'archived' })]))
     await Promise.resolve()
     expect(screen.queryByRole('button', { name: /stale-archived/ })).toBeNull()
+    expect(api.getControlPlaneRun).not.toHaveBeenCalled()
 
     childPage.resolve(page([makeRun('current-child', { history_state: 'archived' })]))
     expect(await screen.findByRole('button', { name: /current-child/ })).toBeTruthy()
     await waitFor(() => expect(screen.queryByRole('status')).toBeNull())
+    await waitFor(() => expect(api.getControlPlaneRun).toHaveBeenCalledWith('child', 'current-child', { signal: expect.anything() }))
   })
 
   it('retains partial pages on failure without complete empty claims', async () => {
@@ -515,7 +561,7 @@ describe('GlobalRunOverview project context', () => {
     expect(api.getControlPlaneRun).toHaveBeenCalledTimes(1)
   })
 
-  it('keeps a terminal stale mismatch from retrying when a later raw page arrives', async () => {
+  it('keeps a terminal stale mismatch from retrying after raw traversal settles', async () => {
     const staleRun = makeRun('review-stale', {
       original_plan_display_name: 'Review stale', original_plan_path: 'plans/review-stale.md',
     })
@@ -536,15 +582,16 @@ describe('GlobalRunOverview project context', () => {
     try {
       view = render(<GlobalRunOverview projects={[primary]} onOpen={vi.fn()} />)
       const row = await screen.findByRole('button', { name: /Review stale.*review-stale/ })
-      await waitFor(() => expect(api.getControlPlaneRun).toHaveBeenCalledTimes(1))
-      mismatchResponse.resolve({ ...staleRun, status: 'running' } as RunStatus)
-      await waitFor(() => expect(row.getAttribute('data-enrichment-state')).toBe('stale'))
+      expect(api.getControlPlaneRun).not.toHaveBeenCalled()
 
       await act(async () => {
         laterPage.resolve(page([laterRun]))
         await laterPage.promise
       })
       await waitFor(() => expect(api.getControlPlaneRun).toHaveBeenCalledWith('primary', laterRun.run_id, { signal: expect.anything() }))
+      await waitFor(() => expect(api.getControlPlaneRun).toHaveBeenCalledWith('primary', staleRun.run_id, { signal: expect.anything() }))
+      mismatchResponse.resolve({ ...staleRun, status: 'running' } as RunStatus)
+      await waitFor(() => expect(row.getAttribute('data-enrichment-state')).toBe('stale'))
       expect(vi.mocked(api.getControlPlaneRun).mock.calls.filter(([, runId]) => runId === staleRun.run_id)).toHaveLength(1)
       expect(row.getAttribute('data-enrichment-state')).toBe('stale')
     } finally {
@@ -614,6 +661,46 @@ describe('GlobalRunOverview project context', () => {
     expect(detailCalls).toBe(2)
   })
 
+  it('closes admission during Refresh while retaining stale progress, then reopens once', async () => {
+    const run = makeRun('refresh-gated', {
+      original_plan_display_name: 'Refresh gated', original_plan_path: 'plans/refresh-gated.md',
+    })
+    const refreshPage = deferred<ReturnType<typeof page>>()
+    const initialDetail = canonicalDetail(run, {
+      total_checkpoints: { value: 2, coverage: 'complete' },
+      approved_checkpoints: { value: 1, coverage: 'complete' },
+    })
+    const refreshedDetail = deferred<RunStatus>()
+    let listCalls = 0
+    let detailCalls = 0
+    vi.mocked(api.listControlPlaneRuns).mockImplementation(() => {
+      listCalls += 1
+      return listCalls === 1 ? Promise.resolve(page([run])) : refreshPage.promise
+    })
+    vi.mocked(api.getControlPlaneRun).mockImplementation(async () => {
+      detailCalls += 1
+      return detailCalls === 1 ? initialDetail : refreshedDetail.promise
+    })
+
+    render(<GlobalRunOverview projects={[primary]} onOpen={vi.fn()} />)
+    const row = await screen.findByRole('button', { name: /Refresh gated.*refresh-gated/ })
+    await waitFor(() => expect(row.textContent).toContain('1 of 2 checkpoints approved'))
+
+    fireEvent.click(screen.getByRole('button', { name: 'Refresh', exact: true }))
+    await waitFor(() => expect(screen.getByRole('status').textContent).toBe('Refreshing runs… Results are incomplete.'))
+    expect(row.textContent).toContain('1 of 2 checkpoints approved')
+    expect(detailCalls).toBe(1)
+
+    refreshPage.resolve(page([run]))
+    await waitFor(() => expect(detailCalls).toBe(2))
+    refreshedDetail.resolve(canonicalDetail(run, {
+      total_checkpoints: { value: 2, coverage: 'complete' },
+      approved_checkpoints: { value: 2, coverage: 'complete' },
+    }))
+    await waitFor(() => expect(row.textContent).toContain('2 of 2 checkpoints approved'))
+    expect(detailCalls).toBe(2)
+  })
+
   it('settles failures explicitly and retries only after an ordinary Refresh', async () => {
     const run = makeRun('retry-run', {
       original_plan_display_name: 'Retry title', original_plan_path: 'plans/retry.md',
@@ -663,14 +750,14 @@ describe('GlobalRunOverview project context', () => {
     vi.mocked(api.getControlPlaneRun).mockImplementation(async projectId => {
       if (projectId === 'child') return canonicalDetail(sibling, { total_checkpoints: { value: 3, coverage: 'complete' }, approved_checkpoints: { value: 3, coverage: 'complete' } })
       primaryDetailCalls += 1
-      return primaryDetailCalls <= 2 ? oldResponse.promise : newResponse.promise
+      return primaryDetailCalls === 1 ? oldResponse.promise : newResponse.promise
     })
 
     const view = render(<GlobalRunOverview projects={[primary, child]} onOpen={vi.fn()} />)
     await waitFor(() => expect(api.getControlPlaneRun).toHaveBeenCalledTimes(2))
     fireEvent.click(screen.getByRole('button', { name: 'Refresh', exact: true }))
     await waitFor(() => expect(listCalls).toBe(2))
-    await waitFor(() => expect(primaryDetailCalls).toBe(3))
+    await waitFor(() => expect(primaryDetailCalls).toBe(2))
 
     oldResponse.resolve(canonicalDetail(first, { total_checkpoints: { value: 1, coverage: 'complete' }, approved_checkpoints: { value: 1, coverage: 'complete' } }))
     newResponse.resolve(canonicalDetail(replacement, { total_checkpoints: { value: 2, coverage: 'complete' }, approved_checkpoints: { value: 2, coverage: 'complete' } }))
@@ -761,25 +848,14 @@ describe('GlobalRunOverview project context', () => {
     }
   })
 
-  it('does not publish a cancelled detail response or restart hidden queued work', async () => {
+  it('does not publish a cancelled detail response or restart work while hidden', async () => {
     const first = makeRun('cancelled-hidden')
-    const second = makeRun('queued-hidden')
     const cancelledResponse = deferred<RunStatus>()
-    const unexpectedResponse = deferred<RunStatus>()
-    const laterPage = deferred<ReturnType<typeof page>>()
     const originalVisibility = Object.getOwnPropertyDescriptor(document, 'visibilityState')
     let view: ReturnType<typeof render> | null = null
-    let listCalls = 0
     Object.defineProperty(document, 'visibilityState', { configurable: true, value: 'visible' })
-    vi.mocked(api.listControlPlaneRuns).mockImplementation(async () => {
-      listCalls += 1
-      return listCalls === 1
-        ? { runs: [first], next_cursor: 'later', schema_version: 1 }
-        : laterPage.promise
-    })
-    vi.mocked(api.getControlPlaneRun).mockImplementation(async (_projectId, runId) => (
-      runId === first.run_id ? cancelledResponse.promise : unexpectedResponse.promise
-    ))
+    vi.mocked(api.listControlPlaneRuns).mockResolvedValue(page([first]))
+    vi.mocked(api.getControlPlaneRun).mockReturnValue(cancelledResponse.promise)
 
     try {
       view = render(<GlobalRunOverview projects={[primary]} onOpen={vi.fn()} />)
@@ -792,12 +868,6 @@ describe('GlobalRunOverview project context', () => {
         await Promise.resolve()
       })
       expect(firstSignal?.aborted).toBe(true)
-
-      await act(async () => {
-        laterPage.resolve(page([second]))
-        await laterPage.promise
-      })
-      expect(api.getControlPlaneRun).toHaveBeenCalledTimes(1)
 
       await act(async () => {
         cancelledResponse.resolve(canonicalDetail(first, {
@@ -813,16 +883,14 @@ describe('GlobalRunOverview project context', () => {
     } finally {
       view?.unmount()
       cancelledResponse.resolve(matchingDetail(first))
-      unexpectedResponse.resolve(matchingDetail(second))
       if (originalVisibility) Object.defineProperty(document, 'visibilityState', originalVisibility)
       else delete (document as unknown as { visibilityState?: string }).visibilityState
     }
   })
 
-  it('re-enriches once on visibility recovery while raw cursors remain pending', async () => {
+  it('keeps visibility recovery gated while raw cursors remain pending', async () => {
     const run = makeRun('recovery-run')
     const laterPage = deferred<ReturnType<typeof page>>()
-    const cancelledResponse = deferred<RunStatus>()
     const currentResponse = deferred<RunStatus>()
     const originalVisibility = Object.getOwnPropertyDescriptor(document, 'visibilityState')
     let view: ReturnType<typeof render> | null = null
@@ -832,54 +900,52 @@ describe('GlobalRunOverview project context', () => {
     vi.mocked(api.listControlPlaneRuns).mockImplementationOnce(async () => ({
       runs: [run], next_cursor: 'later', schema_version: 1,
     })).mockImplementationOnce(async () => laterPage.promise)
-    vi.mocked(api.getControlPlaneRun).mockImplementation(async () => {
+    vi.mocked(api.getControlPlaneRun).mockImplementation(async (_projectId, runId) => {
       detailCalls += 1
-      if (detailCalls === 1) return cancelledResponse.promise
-      if (detailCalls === 2) return currentResponse.promise
+      if (detailCalls === 1 && runId === run.run_id) return currentResponse.promise
       throw new Error('duplicate recovery detail request')
     })
 
     try {
-      view = render(<GlobalRunOverview projects={[primary]} onOpen={vi.fn()} />)
+      const onOpen = vi.fn()
+      view = render(<GlobalRunOverview projects={[primary]} onOpen={onOpen} />)
       const row = await screen.findByRole('button', { name: /recovery-run/ })
-      await waitFor(() => expect(detailCalls).toBe(1))
+      fireEvent.click(row)
+      expect(onOpen).toHaveBeenCalledWith('primary', run.run_id)
+      expect(detailCalls).toBe(0)
 
       await act(async () => {
         Object.defineProperty(document, 'visibilityState', { configurable: true, value: 'hidden' })
         document.dispatchEvent(new Event('visibilitychange'))
         await Promise.resolve()
       })
-      expect(vi.mocked(api.getControlPlaneRun).mock.calls[0][2]?.signal?.aborted).toBe(true)
+      expect(detailCalls).toBe(0)
 
       await act(async () => {
         Object.defineProperty(document, 'visibilityState', { configurable: true, value: 'visible' })
         document.dispatchEvent(new Event('visibilitychange'))
         await Promise.resolve()
       })
-      await waitFor(() => expect(detailCalls).toBe(2))
+      expect(detailCalls).toBe(0)
       expect(row.getAttribute('data-enrichment-state')).toBe('loading')
       expect(view.container.querySelector('.global-run-results')?.getAttribute('aria-busy')).toBe('true')
-
-      await act(async () => {
-        currentResponse.resolve(canonicalDetail(run, {
-          total_checkpoints: { value: 1, coverage: 'complete' },
-          approved_checkpoints: { value: 1, coverage: 'complete' },
-        }))
-        await currentResponse.promise
-      })
-      await waitFor(() => expect(row.getAttribute('data-enrichment-state')).toBe('settled'))
-      expect(row.textContent).toContain('1 of 1 checkpoint approved')
-      expect(detailCalls).toBe(2)
 
       await act(async () => {
         laterPage.resolve(page([]))
         await laterPage.promise
       })
-      await waitFor(() => expect(view?.container.querySelector('.global-run-results')?.getAttribute('aria-busy')).toBe('false'))
-      expect(detailCalls).toBe(2)
+      await waitFor(() => expect(detailCalls).toBe(1))
+      expect(view.container.querySelector('.global-run-results')?.getAttribute('aria-busy')).toBe('false')
+
+      currentResponse.resolve(canonicalDetail(run, {
+        total_checkpoints: { value: 1, coverage: 'complete' },
+        approved_checkpoints: { value: 1, coverage: 'complete' },
+      }))
+      await waitFor(() => expect(row.getAttribute('data-enrichment-state')).toBe('settled'))
+      expect(row.textContent).toContain('1 of 1 checkpoint approved')
+      expect(detailCalls).toBe(1)
     } finally {
       view?.unmount()
-      cancelledResponse.resolve(matchingDetail(run))
       currentResponse.resolve(matchingDetail(run))
       laterPage.resolve(page([]))
       if (originalVisibility) Object.defineProperty(document, 'visibilityState', originalVisibility)
@@ -887,16 +953,23 @@ describe('GlobalRunOverview project context', () => {
     }
   })
 
-  it('aborts active enrichment when the document becomes hidden', async () => {
+  it('aborts admitted enrichment when hidden and admits one current replacement on recovery', async () => {
     const run = makeRun('hidden-abort-run')
-    const response = deferred<RunStatus>()
+    const cancelledResponse = deferred<RunStatus>()
+    const replacementResponse = deferred<RunStatus>()
     const originalVisibility = Object.getOwnPropertyDescriptor(document, 'visibilityState')
     Object.defineProperty(document, 'visibilityState', { configurable: true, value: 'visible' })
     vi.mocked(api.listControlPlaneRuns).mockResolvedValue(page([run]))
-    vi.mocked(api.getControlPlaneRun).mockReturnValue(response.promise)
+    let detailCalls = 0
+    vi.mocked(api.getControlPlaneRun).mockImplementation(async () => {
+      detailCalls += 1
+      if (detailCalls === 1) return cancelledResponse.promise
+      if (detailCalls === 2) return replacementResponse.promise
+      throw new Error('duplicate recovery detail request')
+    })
 
     const view = render(<GlobalRunOverview projects={[primary]} onOpen={vi.fn()} />)
-    await screen.findByRole('button', { name: /hidden-abort-run/ })
+    const row = await screen.findByRole('button', { name: /hidden-abort-run/ })
     await waitFor(() => expect(api.getControlPlaneRun).toHaveBeenCalledTimes(1))
     const signal = vi.mocked(api.getControlPlaneRun).mock.calls[0][2]?.signal
     await act(async () => {
@@ -905,9 +978,24 @@ describe('GlobalRunOverview project context', () => {
       await Promise.resolve()
     })
     expect(signal?.aborted).toBe(true)
+
+    await act(async () => {
+      Object.defineProperty(document, 'visibilityState', { configurable: true, value: 'visible' })
+      document.dispatchEvent(new Event('visibilitychange'))
+      await Promise.resolve()
+    })
+    await waitFor(() => expect(detailCalls).toBe(2))
+    replacementResponse.resolve(canonicalDetail(run, {
+      total_checkpoints: { value: 1, coverage: 'complete' },
+      approved_checkpoints: { value: 1, coverage: 'complete' },
+    }))
+    await waitFor(() => expect(row.getAttribute('data-enrichment-state')).toBe('settled'))
+    expect(detailCalls).toBe(2)
+
     view.unmount()
     if (originalVisibility) Object.defineProperty(document, 'visibilityState', originalVisibility)
     else delete (document as unknown as { visibilityState?: string }).visibilityState
-    response.resolve(matchingDetail(run))
+    cancelledResponse.resolve(matchingDetail(run))
+    replacementResponse.resolve(matchingDetail(run))
   })
 })
