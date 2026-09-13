@@ -1,5 +1,12 @@
 # DEVLOG
 
+## 2026-09-13 — Keep Settings tabs visible on desktop
+
+- Settings now shows its section tabs from 1200 CSS pixels instead of collapsing
+  ordinary desktop windows into a selector. Short desktop windows retain tabs;
+  narrower windows keep the selector and existing drafts and navigation state.
+- Reduced tab padding preserves full-height targets and the two-row header.
+
 ## 2026-09-13 — Expose safe extra-instruction validation errors
 
 - Overlength or otherwise semantically invalid daemon extra instructions now

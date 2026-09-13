@@ -1323,6 +1323,11 @@ input::placeholder, textarea::placeholder {
   flex-wrap: nowrap;
 }
 
+.header-settings-tabs .btn {
+  padding-inline: var(--spacing-md);
+  white-space: nowrap;
+}
+
 .header-search input {
   width: clamp(9rem, 24vw, 18rem);
   padding-inline: var(--spacing-sm);

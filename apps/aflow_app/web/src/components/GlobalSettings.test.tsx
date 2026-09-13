@@ -162,7 +162,7 @@ function installSettingsHeaderMedia(initialMatches: boolean) {
   const listeners = new Set<(event: MediaQueryListEvent) => void>()
   const media = {
     get matches() { return matches },
-    media: '(max-width: 1399px), (max-height: 599px)',
+    media: '(max-width: 1199px)',
     onchange: null,
     addEventListener: (_type: string, listener: (event: MediaQueryListEvent) => void) => listeners.add(listener),
     removeEventListener: (_type: string, listener: (event: MediaQueryListEvent) => void) => listeners.delete(listener),

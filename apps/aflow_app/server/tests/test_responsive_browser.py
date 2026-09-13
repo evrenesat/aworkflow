@@ -1892,7 +1892,7 @@ def test_new_run_advanced_pointer_survives_preflight(
 
 
 @pytest.mark.parametrize(("width", "height"), VIEWPORTS)
-def test_responsive_route_matrix(control_client, monkeypatch, width: int, height: int):
+def test_responsive_route_matrix(control_client, monkeypatch, tmp_path, width: int, height: int):
     """Exercise every shell destination at each required CSS viewport."""
     _, root, _, _ = control_client
     _seed_responsive_fixture(root)
@@ -1912,6 +1912,25 @@ def test_responsive_route_matrix(control_client, monkeypatch, width: int, height
             for section in ("General", "Teams", "Workflows", "Prompts", "Agents & Roles"):
                 _select_settings_section(page, section)
                 page.locator("#settings-domain-panel").wait_for()
+            if width >= 1200:
+                assert page.get_by_role("tab", name="Changelog", exact=True).is_visible()
+                assert page.get_by_role("combobox", name="Settings section", exact=True).count() == 0
+                page.set_viewport_size({"width": width, "height": 500})
+                assert page.get_by_role("tab", name="Changelog", exact=True).is_visible()
+                _assert_header_and_flow(page)
+                page.set_viewport_size({"width": width, "height": height})
+                _select_settings_section(page, "Changelog")
+                for theme in ("light", "dark"):
+                    _set_theme_preference(page, theme)
+                    page.reload()
+                    page.get_by_role("heading", name="Settings", exact=True).wait_for()
+                    _assert_theme(page, theme)
+                    _select_settings_section(page, "Changelog")
+                    page.get_by_role("heading", name="Changelog", exact=True).wait_for()
+                    _assert_header_and_flow(page)
+                    page.screenshot(path=str(tmp_path / f"desktop-settings-{theme}.png"))
+            else:
+                assert page.get_by_role("combobox", name="Settings section", exact=True).is_visible()
             _select_settings_section(page, "Agents & Roles")
             page.get_by_label("Effort codex.profile_39", exact=True).wait_for()
             _assert_header_and_flow(page)

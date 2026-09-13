@@ -78,6 +78,8 @@ export default defineConfig({
   test: {
     globals: true,
     environment: 'happy-dom',
+    // Component journeys default to desktop; responsive tests override media.
+    environmentOptions: { happyDOM: { width: 1440, height: 900 } },
     setupFiles: './src/test-setup.ts',
     include: ['src/**/*.{test,spec}.{js,mjs,cjs,ts,mts,cts,jsx,tsx}'],
   },
