@@ -36,7 +36,11 @@ from aflow.control_plane import (
 from aflow.control_plane.persistence import append_run_event
 from aflow.control_plane.persistent_units import PersistentUnitManager
 from aflow.control_plane.units import InMemoryUnitManager, UnitState
-from aflow.daemon import AflowDaemon
+from aflow.daemon import (
+    AflowDaemon,
+    ExtraInstructionsValidationError,
+    _validate_extra_instructions,
+)
 from aflow_app_server.config import ServerConfig
 from aflow_app_server.control_plane_service import ControlPlaneService
 from aflow_app_server.main import app
@@ -448,6 +452,241 @@ def _commit_fixture_repository(root: Path) -> None:
         cwd=root,
         check=True,
         capture_output=True,
+    )
+
+
+def _lifecycle_record_bytes(root: Path) -> dict[str, bytes]:
+    records: dict[str, bytes] = {}
+    for directory_name in ("runs", "launches"):
+        directory = root / ".aflow" / directory_name
+        if directory.exists():
+            records.update(
+                {
+                    path.relative_to(root).as_posix(): path.read_bytes()
+                    for path in directory.rglob("*")
+                    if path.is_file()
+                }
+            )
+    start_requests = root / ".aflow" / "start-requests"
+    if start_requests.exists():
+        records.update(
+            {
+                path.relative_to(root).as_posix(): path.read_bytes()
+                for path in start_requests.glob("*.json")
+                if path.is_file()
+            }
+        )
+    return records
+
+
+def test_extra_instructions_validation_boundaries() -> None:
+    valid_values: tuple[tuple[str, ...], ...] = (
+        (),
+        ("x" * 512,),
+        ("x" * 512,) * 8,
+        ("  surrounding whitespace  ",),
+    )
+    for value in valid_values:
+        _validate_extra_instructions(value)
+
+    preserved = ("  surrounding whitespace  ",)
+    _validate_extra_instructions(preserved)
+    assert preserved == ("  surrounding whitespace  ",)
+
+    invalid_values: tuple[object, ...] = (
+        ("x" * 513,),
+        ("x",) * 9,
+        ("",),
+        ("   ",),
+        ("contains\x00nul",),
+        (1,),
+        ["valid list is not the canonical tuple"],
+    )
+    for value in invalid_values:
+        with pytest.raises(ExtraInstructionsValidationError) as caught:
+            _validate_extra_instructions(value)  # type: ignore[arg-type]
+        assert caught.value.code == "invalid_extra_instructions"
+        assert caught.value.field == "extra_instructions"
+        assert str(caught.value) == ExtraInstructionsValidationError.message
+
+
+@pytest.mark.parametrize("operation", ("start", "preflight"))
+def test_rest_extra_instructions_start_and_preflight_reject_without_allocation(
+    control_client,
+    operation: str,
+) -> None:
+    client, root, units, _ = control_client
+    prefix = "private-extra-instruction-"
+    sentinel = prefix + "x" * (513 - len(prefix))
+    before = _lifecycle_record_bytes(root)
+    payload = {
+        "plan_path": "plans/todo/test-plan.md",
+        "workflow_name": "managed",
+        "extra_instructions": [sentinel],
+    }
+    if operation == "start":
+        response = client.post(
+            f"/api/control-plane/projects/{PROJECT_ID}/runs",
+            headers={"Idempotency-Key": "overlength-rest-start"},
+            json=payload,
+        )
+    else:
+        response = client.post(
+            f"/api/control-plane/projects/{PROJECT_ID}/runs/preflight",
+            json=payload,
+        )
+
+    expected = {
+        "detail": {
+            "code": ExtraInstructionsValidationError.code,
+            "field": ExtraInstructionsValidationError.field,
+            "message": ExtraInstructionsValidationError.message,
+        }
+    }
+    assert response.status_code == 422, response.text
+    assert response.json() == expected
+    assert sentinel not in response.text
+    assert _lifecycle_record_bytes(root) == before
+    assert units.start_calls == []
+
+
+@pytest.mark.parametrize(
+    "extra_instructions",
+    (
+        ("x" * 512,),
+        ("x" * 256, "x" * 256),
+        ("  surrounding whitespace  ",),
+    ),
+    ids=("single-boundary-item", "split-guidance", "surrounding-whitespace"),
+)
+def test_extra_instructions_valid_boundary_preserves_bytes(
+    control_client,
+    extra_instructions: tuple[str, ...],
+) -> None:
+    client, _, units, monkeypatch = control_client
+    captured: list[tuple[str, ...]] = []
+
+    def prepare(request):
+        captured.append(request.extra_instructions)
+        return _prepared(request)
+
+    monkeypatch.setattr("aflow.daemon.prepare_startup", prepare)
+    payload = {
+        "plan_path": "plans/todo/test-plan.md",
+        "workflow_name": "managed",
+        "extra_instructions": list(extra_instructions),
+    }
+    headers = {"Idempotency-Key": "valid-extra-boundary"}
+    first = client.post(
+        f"/api/control-plane/projects/{PROJECT_ID}/runs",
+        headers=headers,
+        json=payload,
+    )
+    replay = client.post(
+        f"/api/control-plane/projects/{PROJECT_ID}/runs",
+        headers=headers,
+        json=payload,
+    )
+
+    assert first.status_code == 201, first.text
+    assert replay.status_code == 200, replay.text
+    assert replay.json()["result"]["run_id"] == first.json()["result"]["run_id"]
+    assert captured == [extra_instructions]
+    assert len(units.start_calls) == 1
+    assert [
+        argument.removeprefix("--extra-instruction=")
+        for argument in units.start_calls[0][1]
+        if argument.startswith("--extra-instruction=")
+    ] == list(extra_instructions)
+
+
+def test_rest_extra_instructions_safe_error_does_not_unmask_other_failures(
+    control_client,
+) -> None:
+    from aflow_app_server import main
+
+    client, _, _, monkeypatch = control_client
+    service = main._control_plane_service
+    assert service is not None
+    sentinel = "private-rest-extra-instruction-failure"
+
+    def reject(*_args, **_kwargs):
+        from aflow.daemon import DaemonError
+
+        raise DaemonError(sentinel)
+
+    monkeypatch.setattr(service, "start_run", reject)
+    response = client.post(
+        f"/api/control-plane/projects/{PROJECT_ID}/runs",
+        headers={"Idempotency-Key": "unrelated-extra-error"},
+        json={
+            "plan_path": "plans/todo/test-plan.md",
+            "workflow_name": "managed",
+        },
+    )
+    assert response.status_code == 422
+    assert response.json() == {"detail": {"code": "operation_rejected"}}
+    assert sentinel not in response.text
+
+    malformed = client.post(
+        f"/api/control-plane/projects/{PROJECT_ID}/runs",
+        headers={"Idempotency-Key": "malformed-extra-error"},
+        json={
+            "plan_path": "plans/todo/test-plan.md",
+            "extra_instructions": {"not": "a list"},
+        },
+    )
+    assert malformed.status_code == 422
+    assert malformed.json() == {"detail": {"code": "operation_rejected"}}
+
+    schema = client.get("/openapi.json").json()
+    components = schema["components"]["schemas"]
+    assert set(components["StartRunPayload"]["properties"]) == {
+        "plan_path",
+        "workflow_name",
+        "team",
+        "start_step",
+        "max_turns",
+        "extra_instructions",
+        "restarted_from_run_id",
+        "dirty_worktree_confirmed",
+    }
+    assert set(components["ResumeRunPayload"]["properties"]) == {
+        "extra_instructions",
+        "recovery",
+    }
+    assert (
+        components["StartRunPayload"]["properties"]["extra_instructions"][
+            "description"
+        ]
+        == ExtraInstructionsValidationError.message
+    )
+    assert (
+        components["ResumeRunPayload"]["properties"]["extra_instructions"][
+            "description"
+        ]
+        == ExtraInstructionsValidationError.message
+    )
+    assert (
+        components["StartRunPayload"]["properties"]["extra_instructions"]["default"]
+        == []
+    )
+    assert (
+        ResumeRunPayload.model_fields["extra_instructions"].default is None
+    )
+    assert (
+        components["StartRunPayload"]["properties"]["extra_instructions"]["maxItems"]
+        == 8
+    )
+    assert (
+        next(
+            item
+            for item in components["ResumeRunPayload"]["properties"][
+                "extra_instructions"
+            ]["anyOf"]
+            if item.get("type") == "array"
+        )["maxItems"]
+        == 8
     )
 
 
@@ -1499,7 +1738,13 @@ def test_resume_rejects_invalid_extra_instructions_without_reserving(
         json={"extra_instructions": [""]},
     )
     assert response.status_code == 422
-    assert response.json() == {"detail": {"code": "operation_rejected"}}
+    assert response.json() == {
+        "detail": {
+            "code": ExtraInstructionsValidationError.code,
+            "field": ExtraInstructionsValidationError.field,
+            "message": ExtraInstructionsValidationError.message,
+        }
+    }
     assert len(units.start_calls) == 1
     assert source_path.read_bytes() == before
     assert len(client.get(f"/api/control-plane/projects/{PROJECT_ID}/runs").json()["runs"]) == 1

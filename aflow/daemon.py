@@ -106,6 +106,23 @@ class DaemonError(RuntimeError):
     """The daemon cannot safely carry out a lifecycle operation."""
 
 
+class ExtraInstructionsValidationError(DaemonError):
+    """A safe, actionable rejection of invalid extra-instruction input."""
+
+    code = "invalid_extra_instructions"
+    field = "extra_instructions"
+    message = (
+        "extra_instructions accepts at most "
+        f"{_MAX_EXTRA_INSTRUCTION_ITEMS} non-empty strings, each at most "
+        f"{_MAX_EXTRA_INSTRUCTION_LENGTH} characters, with at most "
+        f"{_MAX_EXTRA_INSTRUCTIONS_LENGTH} characters total; NUL characters "
+        "are not allowed."
+    )
+
+    def __init__(self) -> None:
+        super().__init__(self.message)
+
+
 _RECOVERY_REJECTION_MESSAGES = {
     "recovery_source_state": (
         "Durable recovery requires a failed, interrupted, or owner-stopped "
@@ -3884,9 +3901,9 @@ def _source_worker_selector(
 
 def _validate_extra_instructions(extra_instructions: tuple[str, ...]) -> None:
     if not isinstance(extra_instructions, tuple):
-        raise DaemonError("extra instructions must be a tuple of strings")
+        raise ExtraInstructionsValidationError
     if len(extra_instructions) > _MAX_EXTRA_INSTRUCTION_ITEMS:
-        raise DaemonError("too many extra instructions")
+        raise ExtraInstructionsValidationError
     if any(
         not isinstance(item, str)
         or not item.strip()
@@ -3894,9 +3911,9 @@ def _validate_extra_instructions(extra_instructions: tuple[str, ...]) -> None:
         or "\x00" in item
         for item in extra_instructions
     ):
-        raise DaemonError("extra instructions must be non-empty bounded strings")
+        raise ExtraInstructionsValidationError
     if sum(len(item) for item in extra_instructions) > _MAX_EXTRA_INSTRUCTIONS_LENGTH:
-        raise DaemonError("extra instructions exceed the total length limit")
+        raise ExtraInstructionsValidationError
 
 
 def _startup_request_digest(request: StartupRequest) -> str:

@@ -17,6 +17,7 @@ from aflow.control_plane import (
     StartupQuestionRecord,
     WorktreePreflightResult,
 )
+from aflow.daemon import ExtraInstructionsValidationError
 from aflow.skill_catalog import BUNDLED_SKILL_NAMES
 
 
@@ -366,7 +367,11 @@ class StartRunPayload(CanonicalTransportModel):
     team: str | None = Field(default=None, max_length=128)
     start_step: str | None = Field(default=None, max_length=128)
     max_turns: int | None = Field(default=None, ge=1)
-    extra_instructions: tuple[str, ...] = Field(default=(), max_length=8)
+    extra_instructions: tuple[str, ...] = Field(
+        default=(),
+        max_length=8,
+        description=ExtraInstructionsValidationError.message,
+    )
     restarted_from_run_id: str | None = Field(default=None, max_length=64)
     dirty_worktree_confirmed: StrictBool = False
 
@@ -374,7 +379,11 @@ class StartRunPayload(CanonicalTransportModel):
 class ResumeRunPayload(CanonicalTransportModel):
     """Optional instruction replacement or explicit durable recovery request."""
 
-    extra_instructions: tuple[str, ...] | None = Field(default=None, max_length=8)
+    extra_instructions: tuple[str, ...] | None = Field(
+        default=None,
+        max_length=8,
+        description=ExtraInstructionsValidationError.message,
+    )
     recovery: Mapping[str, object] | None = Field(
         default=None,
         description=(

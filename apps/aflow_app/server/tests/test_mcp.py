@@ -16,6 +16,7 @@ from fastapi.testclient import TestClient
 
 from aflow.api.models import StartupQuestion, StartupQuestionKind
 from aflow.control_plane import ContextBundle, RunStatus
+from aflow.daemon import DaemonError, ExtraInstructionsValidationError
 from aflow_app_server.main import app
 from test_control_plane_api import (
     PROJECT_ID,
@@ -23,6 +24,7 @@ from test_control_plane_api import (
     _add_live_control_targets,
     _answer_pending as _rest_answer_pending,
     _commit_fixture_repository,
+    _lifecycle_record_bytes,
     _prepared,
     _recovery_payload,
     _register_peer_project,
@@ -1901,6 +1903,106 @@ def test_mcp_resume_extra_instructions_inherit_replace_and_clear(
     assert source_path.read_bytes() == before
 
 
+@pytest.mark.parametrize("operation", ("start", "preflight"))
+def test_mcp_extra_instructions_start_and_preflight_reject_without_allocation(
+    mcp_client,
+    operation: str,
+) -> None:
+    client, root, units, _ = mcp_client
+    prefix = "private-extra-instruction-"
+    sentinel = prefix + "x" * (513 - len(prefix))
+    tools = _mcp_request(client, "tools/list")["result"]["tools"]
+    tool_by_name = {tool["name"]: tool for tool in tools}
+    for name in ("preflight_run", "start_run", "resume_run"):
+        description = tool_by_name[name]["description"]
+        assert "extra_instructions" in description
+        assert "8" in description
+        assert "512" in description
+        assert "4096" in description
+        assert "NUL" in description
+
+    before = _lifecycle_record_bytes(root)
+    arguments: dict[str, Any] = {
+        "project_id": PROJECT_ID,
+        "plan_path": "plans/todo/test-plan.md",
+        "workflow_name": "managed",
+        "extra_instructions": [sentinel],
+    }
+    if operation == "start":
+        arguments["idempotency_key"] = "overlength-mcp-start"
+    response = _mcp_request(
+        client,
+        "tools/call",
+        {"name": f"{operation}_run", "arguments": arguments},
+    )
+    result = response["result"]
+    assert result["isError"] is True
+    detail = json.loads(result["content"][0]["text"])
+    assert detail == {
+        "code": ExtraInstructionsValidationError.code,
+        "field": ExtraInstructionsValidationError.field,
+        "message": ExtraInstructionsValidationError.message,
+    }
+    assert sentinel not in json.dumps(response)
+    assert _lifecycle_record_bytes(root) == before
+    assert units.start_calls == []
+
+
+def test_mcp_extra_instructions_safe_error_does_not_unmask_other_failures(
+    mcp_client,
+) -> None:
+    from aflow_app_server import main
+
+    client, _, _, monkeypatch = mcp_client
+    service = main._control_plane_service
+    assert service is not None
+    sentinel = "private-mcp-extra-instruction-failure"
+
+    def reject(*_args, **_kwargs):
+        raise DaemonError(sentinel)
+
+    monkeypatch.setattr(service, "start_run", reject)
+    response = _mcp_request(
+        client,
+        "tools/call",
+        {
+            "name": "start_run",
+            "arguments": {
+                "project_id": PROJECT_ID,
+                "plan_path": "plans/todo/test-plan.md",
+                "workflow_name": "managed",
+                "idempotency_key": "unrelated-mcp-extra-error",
+            },
+        },
+    )
+    result = response["result"]
+    assert result["isError"] is True
+    assert result["content"][0]["text"] == "operation_rejected"
+    assert sentinel not in json.dumps(response)
+
+    tools = _mcp_request(client, "tools/list")["result"]["tools"]
+    tool_by_name = {tool["name"]: tool for tool in tools}
+    assert set(tool_by_name["start_run"]["inputSchema"]["properties"]) == {
+        "project_id",
+        "plan_path",
+        "idempotency_key",
+        "workflow_name",
+        "team",
+        "start_step",
+        "max_turns",
+        "extra_instructions",
+        "restarted_from_run_id",
+        "dirty_worktree_confirmed",
+    }
+    assert set(tool_by_name["resume_run"]["inputSchema"]["properties"]) == {
+        "project_id",
+        "run_id",
+        "idempotency_key",
+        "extra_instructions",
+        "recovery",
+    }
+
+
 def test_mcp_resume_rejects_invalid_extra_instructions_without_reserving(
     mcp_client,
 ) -> None:
@@ -1930,7 +2032,11 @@ def test_mcp_resume_rejects_invalid_extra_instructions_without_reserving(
         },
     )
     assert rejected["result"]["isError"] is True
-    assert rejected["result"]["content"][0]["text"] == "operation_rejected"
+    assert json.loads(rejected["result"]["content"][0]["text"]) == {
+        "code": ExtraInstructionsValidationError.code,
+        "field": ExtraInstructionsValidationError.field,
+        "message": ExtraInstructionsValidationError.message,
+    }
     assert len(units.start_calls) == 1
     assert source_path.read_bytes() == before
 

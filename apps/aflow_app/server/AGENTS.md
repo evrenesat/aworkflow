@@ -23,6 +23,8 @@
 
 - Reserved startup rejections use `DaemonStartupError` to return a bounded,
   sanitized message and run ID. Other exception responses remain opaque.
+  The dedicated `ExtraInstructionsValidationError` is also safe to expose
+  before run allocation, with its fixed code, field, and constraint message.
   Resume visibility uses the daemon's read-only admission preview; mutation
   endpoints still recheck all admission conditions.
 

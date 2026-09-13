@@ -1,5 +1,12 @@
 # DEVLOG
 
+## 2026-09-13 — Expose safe extra-instruction validation errors
+
+- Overlength or otherwise semantically invalid daemon extra instructions now
+  return the fixed `invalid_extra_instructions` code, field, and constraint
+  message through REST and MCP before run allocation; generic failures remain
+  opaque and submitted text is never exposed.
+
 ## 2026-09-13 — Admit visible progress after raw traversal settlement
 
 - Deferred the bounded All runs exact-detail pump until every current project

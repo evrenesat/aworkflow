@@ -2666,3 +2666,45 @@ activation and strict shipped UI measurement remain controller/coordinator-owned
 and pending; this review makes no live performance acceptance claim.
 
 No material findings
+
+
+---
+
+## Safe extra-instruction validation — cumulative review approved, 2026-09-13
+
+- Unchanged base: `0ae4eda8503b06c08c30a9fa19ae93bcb75556bd`.
+- Reviewed HEAD: `81ffbf4c51c2c40845edb740f367aa1c0d11665b`.
+- Coverage: 1 new / 1 total commit, `cp1 v01`, all nine changed files and
+  the complete original single-checkpoint plan. Original and active plans
+  coincide; no previous findings or fix overlays apply to this handoff.
+- No material findings under the finding admission gate, exclusions and
+  proportionate-fix discipline. Canonical predicates, constants, validation
+  ordering and preallocation admission remain unchanged. REST and MCP expose
+  only fixed class-level code/field/message for the dedicated subtype; generic
+  errors, malformed transport input and credential handling retain masking.
+  Boundary, content/order preservation, resume inheritance/clear, source
+  immutability, no-reservation, idempotency and schema contracts are covered.
+
+Retained completed worker receipts inspected and reused from
+`/root/code/agent_flow/.aflow/runs/20260913t141506z-4e01c41d/turns/turn-001/`
+(`transport.stdout` and completed `result.json`, zero unchecked steps):
+
+- Plan's exact focused server pytest selection: final 22 passed, 70 deselected
+  in 4.54s.
+- Exact retained auth/parity, startup/resume idempotency and read-only preflight
+  selection: final 3 passed in 3.07s.
+- Scoped Ruff for all four production files and both test files: passed.
+- Reviewer `git diff --check 0ae4eda8 HEAD`: passed.
+- Earlier test assertion errors were corrected before final passing evidence;
+  existing Starlette deprecation warning only. No full suite repeated. Tests
+  use isolated fixtures and no committed host-specific evidence/home paths.
+
+Approval consolidates implementation and this intentional tracked review record
+into exactly one unpublished handoff commit after the unchanged base. Preserve
+all nine implementation blobs and the single DEVLOG entry. No fix plan needed
+or created. Original private plan stays in place for engine finalization; record
+the final SHA there only and verify one commit above base and clean tracked state.
+Publication, exact-SHA CI and live activation remain separate managed
+controller/coordinator delivery gates and are not claimed complete here.
+
+No material findings

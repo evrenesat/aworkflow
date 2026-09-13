@@ -34,6 +34,7 @@ from aflow.daemon import (
     DaemonIdempotencyConflict,
     DaemonStartupError,
     DurableRecoveryRejection,
+    ExtraInstructionsValidationError,
 )
 
 
@@ -75,6 +76,8 @@ def _public_error_code(
         return exc.code
     if isinstance(exc, DurableRecoveryRejection):
         return exc.code
+    if isinstance(exc, ExtraInstructionsValidationError):
+        return ExtraInstructionsValidationError.code
     if isinstance(exc, ControlValidationError):
         return exc.code
     if isinstance(exc, RepositoryNotFoundError):
@@ -105,6 +108,16 @@ def _public_error_detail(
     if isinstance(exc, DurableRecoveryRejection):
         return json.dumps(
             {"code": code, "message": str(exc)},
+            separators=(",", ":"),
+            sort_keys=True,
+        )
+    if isinstance(exc, ExtraInstructionsValidationError):
+        return json.dumps(
+            {
+                "code": ExtraInstructionsValidationError.code,
+                "field": ExtraInstructionsValidationError.field,
+                "message": ExtraInstructionsValidationError.message,
+            },
             separators=(",", ":"),
             sort_keys=True,
         )
@@ -410,7 +423,12 @@ def create_control_plane_mcp(
         restarted_from_run_id: str | None = None,
         dirty_worktree_confirmed: bool = False,
     ) -> dict[str, Any]:
-        """Inspect current launch dirtiness without allocating a run."""
+        """Inspect launch dirtiness without allocating a run.
+
+        ``extra_instructions`` accepts at most 8 non-empty strings, each at
+        most 512 characters and 4096 characters total; NUL characters are not
+        allowed.
+        """
         return tool_result(
             lambda: get_service()
             .preflight(
@@ -460,7 +478,12 @@ def create_control_plane_mcp(
         restarted_from_run_id: str | None = None,
         dirty_worktree_confirmed: bool = False,
     ) -> dict[str, Any]:
-        """Reserve and start one daemon-owned workflow, or return its startup question."""
+        """Reserve and start a daemon-owned workflow, or return its question.
+
+        ``extra_instructions`` accepts at most 8 non-empty strings, each at
+        most 512 characters and 4096 characters total; NUL characters are not
+        allowed.
+        """
         return tool_result(
             lambda: _start_response(
                 get_service().start_run(
@@ -624,6 +647,9 @@ def create_control_plane_mcp(
     ) -> dict[str, Any]:
         """Create a continuation or explicit durable-evidence replacement.
 
+        ``extra_instructions`` accepts at most 8 non-empty strings, each at
+        most 512 characters and 4096 characters total; NUL characters are not
+        allowed. Omit it or pass ``null`` to inherit; pass ``[]`` to clear.
         Omit ``recovery`` for an ordinary resume. To recover with another
         worker, pass exactly ``{"mode": "durable_evidence", "worker_selector":
         "<configured selector>"}``. The source must be confirmed inactive;

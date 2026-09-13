@@ -43,6 +43,7 @@ from aflow.daemon import (
     DaemonIdempotencyConflict,
     DaemonStartupError,
     DurableRecoveryRejection,
+    ExtraInstructionsValidationError,
 )
 
 from .browser_session import (
@@ -892,6 +893,18 @@ async def durable_recovery_rejection_handler(
         status.HTTP_422_UNPROCESSABLE_CONTENT,
         exception.code,
         message=str(exception),
+    )
+
+
+@app.exception_handler(ExtraInstructionsValidationError)
+async def extra_instructions_validation_error_handler(
+    _: Request, __: ExtraInstructionsValidationError
+) -> JSONResponse:
+    return _error_response(
+        status.HTTP_422_UNPROCESSABLE_CONTENT,
+        ExtraInstructionsValidationError.code,
+        field=ExtraInstructionsValidationError.field,
+        message=ExtraInstructionsValidationError.message,
     )
 
 
