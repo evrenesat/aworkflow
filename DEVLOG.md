@@ -1,5 +1,12 @@
 # DEVLOG
 
+## 2026-09-14 — Repair assistant documentation CI coverage
+
+- Updated the installed-use documentation check to the assistant's current
+  optional-source guidance; the prior wording and heading were removed by
+  the interactive operating guide rewrite.
+- Check that all four linked reference guides exist in the bundled skill.
+
 ## 2026-09-14 — Teach interactive agents current AFlow operation
 
 - Expanded the optional `aflow-assistant` skill from run triage into an

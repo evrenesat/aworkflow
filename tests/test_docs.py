@@ -41,7 +41,9 @@ class SkillDocsTests(unittest.TestCase):
         repo_root = Path(__file__).resolve().parents[1]
         skill_root = repo_root / 'aflow' / 'bundled_skills' / 'aflow-assistant'
         assert (skill_root / 'SKILL.md').exists()
-        assert (skill_root / 'references' / 'engine-map.md').exists()
+        for reference in ('engine-map.md', 'engine-features.md',
+                          'mcp-operations.md', 'run-troubleshooting.md'):
+            assert (skill_root / 'references' / reference).is_file()
         assert (skill_root / 'scripts' / 'analyze_runs.py').exists()
 
     def test_aflow_assistant_skill_prefers_bundled_resources_for_installed_use(self) -> None:
@@ -50,8 +52,13 @@ class SkillDocsTests(unittest.TestCase):
         assert 'references/engine-map.md' in text
         assert 'aflow analyze' in text
         assert '--all' in text
-        assert 'Do not assume the original `aflow` repo checkout exists' in text
-        assert '## Bundled Engine Map First' in text
+        for reference in ('engine-features.md', 'mcp-operations.md',
+                          'run-troubleshooting.md'):
+            assert f'references/{reference}' in text
+        normalized = ' '.join(text.split())
+        assert 'All references travel with this skill.' in normalized
+        assert 'Source-code access is optional' in normalized
+        assert 'do not direct users to nonexistent local repository files' in normalized
 
     def test_guard_skill_is_self_contained_and_same_task_only(self) -> None:
         repo_root = Path(__file__).resolve().parents[1]
