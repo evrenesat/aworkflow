@@ -685,7 +685,7 @@ aflow show [WORKFLOW_NAME]
 `install-skills` details: destination omitted → auto-detect supported harness
 CLIs on PATH and install into each harness's global skill directory
 (`codex`/`copilot`/`gemini`/`pi` → `~/.agents/skills`, `kiro` →
-`~/.kiro/skills`, `opencode` → `~/.config/opencode/skills`, `claude` →
+`~/.kiro/skills`, `opencode` → `~/.agents/skills`, `claude` →
 `~/.claude/skills`). `--yes` skips the confirmation prompt (required for
 non-interactive stdin). `--include-optional` adds optional skills;
 `--only SKILL` installs exactly the named skill(s) and cannot be combined
@@ -716,8 +716,18 @@ Note: `--dry-run` and `aflow config` subcommands do not exist in this engine.
 
 ## 13. Skill System
 
-`aflow install-skills` copies bundled skills from `aflow/bundled_skills/`
-into harness skill directories.
+The account-local canonical store is `~/.config/aflow/skills/`.
+`aflow install-skills` explicitly refreshes selected bundled trees there and
+creates absolute directory symlinks in harness destinations. Reads do not
+initialize or refresh the store. Unedited baseline-matching trees update;
+locally edited or unknown-baseline trees are preserved. Inspect the refresh
+result before claiming an installed skill matches a newer package. Skill
+saves use revision checks and become visible through existing links.
+
+Install this optional guide alone with:
+`aflow install-skills ~/.agents/skills --only aflow-assistant --yes`.
+This requires an installed package containing the intended guide version;
+it does not configure an MCP connection.
 
 Default skills (13):
 
@@ -737,8 +747,8 @@ Default skills (13):
 
 Optional skill (1):
 
-- `aflow-assistant` — setup help, AFlow concepts, evidence-first run
-  debugging (this skill).
+- `aflow-assistant` — interactive MCP operation, setup, planning, launch,
+  monitoring, control/recovery, AFlow concepts, and evidence-first debugging.
 
 Skill names and manager/repartition settings are resolved from the current
 configuration at their invocation boundary. Manager and repartition prompts
@@ -783,119 +793,31 @@ setup; the engine tracks `plans/in-progress/` as the durable plan location and
 `plans/backups/` for original-plan backups (reused when content matches,
 `_vNN` versions otherwise).
 
-## 15. MCP Control Plane (aflowd)
+## 15. UI-hosted MCP Control Plane
 
-The optional daemon control plane (`aflowd`, `aflow/daemon.py`) exposes the
-same durable AFlow run state over authenticated REST, web UI, and an MCP
-server. It is an additive transport over the engine; direct `aflow run`
-workflows remain unchanged and are never guessed into daemon-owned state.
+The supported server is `aflow ui`, serving the dashboard and bearer-header
+authenticated MCP together at `/mcp` or `/mcp/`. There is no standalone MCP
+listener or separate public daemon process to launch. Internal daemon modules
+remain implementation services, not an alternative operating interface.
 
-### Daemon and app config
+Read [MCP operations](mcp-operations.md) for connection/discovery, all current
+lifecycle and authoring tools, resource templates, launch/startup, revision and
+idempotency handling, stop/resume, and delivery evidence. The full UI registry
+has 14 lifecycle tools and eight authoring tools; discover the connected
+deployment before relying on an optional field or tool.
 
-`aflowd` CLI: `--repo-root` (default cwd), `--config` (required app TOML),
-`--aflow-executable`, `--environment-file` (required bearer-token
-EnvironmentFile; deployments should enforce restrictive ownership and
-permissions), `--release-identity`, `--once`.
+The UI server owns persistent unit management; detached workflow wrappers
+write bounded stdout/stderr tails and exit receipts. UI shutdown does not stop
+workers. Canonical status reconciles ownership and receipts; a raw run summary
+alone can be stale. Do not infer an active worker from its launcher count or
+start a duplicate controller after a client disconnect.
 
-The app TOML carries `[control_plane]` with a `[[control_plane.projects]]`
-allowlist (project id, repo root, config path, aflow executable, environment
-file, release identity, environment). Every served
-project must be allowlisted; requests cannot supply arbitrary roots,
-executables, environment files, or plan locations. Writes are journaled under
-durable idempotency scopes in `.aflow/launches/` and run as independent
-`systemd-run` workflow units.
-
-### MCP server
-
-The stateless FastMCP server ("AFlow Control Plane", version 1,
-`mask_error_details=True`) is mounted at `/mcp` (and `/mcp/`) on the FastAPI
-app (`apps/aflow_app/server/src/aflow_app_server/mcp_adapter.py`,
-`main.py`). Bearer authentication; credentials belong only in the client's
-bearer-token environment variable — literal bearer tokens, `token=`/
-`authorization=` patterns, query parameters, fragments, and userinfo in URLs
-or tool arguments are rejected.
-
-**Read tools** (read-only, idempotent annotations; bounded pages — `limit`
-must be 1–1000, default 100 — plus bounded cursors):
-
-- `get_capabilities` — versioned capabilities for every allowlisted project.
-- `list_projects` — the configured project allowlist.
-- `get_project_capabilities(project_id)` — one project's versioned capabilities.
-- `list_plans(project_id, limit=100, cursor=None)` — bounded plan metadata.
-- `list_runs(project_id, limit=100, cursor=None)` — bounded, versioned run status page.
-- `get_run(project_id, run_id)` — one run's state.
-- `get_run_events(project_id, run_id, ...)` — bounded ordered event tail.
-- `get_run_context(project_id, run_id, ...)` — context snapshot.
-
-**Write tools** (require client approval; all take an `idempotency_key`; a
-replayed key returns the recorded effect, a reused key with different input is
-rejected):
-
-- `start_run(project_id, plan_path, idempotency_key, workflow_name=None,
-  team=None, start_step=None, max_turns=None)` — reserve and start one
-  daemon-owned workflow; when startup needs an answer the response carries
-  the startup question and the run state becomes `awaiting_startup_answer`.
-- `answer_startup(project_id, question_id, answer, idempotency_key)` — submit
-  one authenticated answer for a pending startup question.
-- `control_run(project_id, run_id, expected_revision, idempotency_key,
-  max_turns=None, team=None, role_selectors=None, unsafe_changes=None,
-  owner_stop=None)` — compare-and-swap control; `expected_revision` is
-  required. Set `owner_stop=true` to request stopping after the current
-  worker/reviewer call reaches the existing safe boundary; it does not
-  interrupt the active unit or imply checkpoint approval.
-- `owner_stop(project_id, run_id, expected_revision, idempotency_key)` —
-  explicit immediate terminal owner stop (destructive; it interrupts the
-  exact active unit and is separate from the `control_run` boundary intent).
-- `resume_run(project_id, run_id, idempotency_key, extra_instructions=None)` —
-  explicit lineage-linked continuation with a new run id for a stopped run.
-  Omitted or `null` instructions inherit; a bounded list replaces them and
-  `[]` clears them for the successor. The predecessor is unchanged.
-
-**Resources:**
-
-- `AFlow project capabilities` (project_id)
-- `AFlow run state` (project_id, run_id)
-- `AFlow lite run context` (project_id, run_id)
-
-**Stable public error codes** (ToolError/ResourceError messages):
-`project_not_found`, `control_plane_unavailable`, `run_not_found`,
-`idempotency_conflict`, `revision_conflict`, `restart_required`,
-`operation_forbidden`, `operation_rejected`, `internal_error`.
-
-### Client configuration
-
-```toml
-[mcp_servers.aflow_control_plane]
-url = "http://<host>:8765/mcp"
-required = false
-bearer_token_env_var = "AFLOW_CONTROL_PLANE_TOKEN"
-default_tools_approval_mode = "writes"
-
-[mcp_servers.aflow_control_plane.tools.start_run]
-approval_mode = "approve"
-# ... same for answer_startup, control_run, owner_stop, resume_run
-```
-
-Validate the final client configuration with the client's own parser before
-connecting. Keep the URL private and free of query strings, fragments,
-userinfo, or literal bearer values; keep every write tool approval-gated.
-
-### Semantics
-
-- Failed or ambiguous daemon-owned units are reported `needs_attention` and
-  are never auto-restarted; explicit `resume_run` creates one linked
-  continuation.
-- Resume instruction replacements are run-wide continuation guidance, not
-  checkpoint notes. REST and MCP callers may inherit, replace, or clear them;
-  the UI intentionally keeps the editor omitted. Reusing an idempotency key
-  with different replacement text is rejected.
-- Legacy runs without the control-plane manifest are read-only and reported
-  as legacy/interrupted.
-- Loss of the client, MCP connection, or SSH transport has no lifecycle
-  effect; daemon restarts do not stop workflow units.
-- `aflow-guard-development-run` remains opt-in supervision for exact
-  explicitly-guarded runs (typically direct-CLI workflows), not a second
-  daemon controller or an automatic recovery loop for daemon-owned units.
+Current configuration is reloaded at reservation, startup preparation, worker
+boot, and resume. Saved launch snapshots and fingerprints are diagnostic, not
+required admission artifacts or a substitute for the selected source.
+Recoveries preserve exact project, plan, run, unit, and continuation identity.
+Ambiguous managed runs need evidence-backed explicit recovery; legacy
+unmanaged runs are not silently adopted.
 
 ## 16. Fast-Facts Summary
 
@@ -914,6 +836,5 @@ userinfo, or literal bearer values; keep every write tool approval-gated.
 - Resume: new successor run dir; current configuration source is reloaded and
   hotplug and repartition transactions reconcile before any harness. Lifecycle,
   ownership, plan, and controller-inactivity identity still must match.
-- MCP: stateless FastMCP server at `/mcp` on the aflowd control plane — 8 read
-  tools, 5 write tools (idempotency-keyed, client approval), 3 resources;
-  bearer token only via `AFLOW_CONTROL_PLANE_TOKEN` env var (Section 15).
+- MCP: authenticated HTTP at the UI server's `/mcp`; discover the live tools
+  and use [MCP operations](mcp-operations.md) for current operating contracts.

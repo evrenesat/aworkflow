@@ -107,6 +107,20 @@ aflow install-skills
 aflow show
 ```
 
+Interactive agents can use the optional
+[aflow-assistant skill](aflow/bundled_skills/aflow-assistant/SKILL.md) for MCP
+discovery, plan authoring, launch/startup, monitoring, control/resume, and run
+troubleshooting. Install it from the intended AFlow package version:
+
+```bash
+aflow install-skills ~/.agents/skills --only aflow-assistant --yes
+```
+
+The installer links the account's canonical skill store into the shared agent
+directory. Locally edited canonical skills are preserved; check the refresh
+result before assuming the content updated. Installing the skill does not
+configure or authenticate an MCP connection.
+
 Configuration is split across two TOML files: `aflow.toml` contains harness
 profiles, roles, teams, prompts, and controller settings. `workflows.toml`
 contains workflow graphs and lifecycle defaults.

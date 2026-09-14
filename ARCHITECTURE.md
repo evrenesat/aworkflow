@@ -1002,7 +1002,7 @@ Thirteen default skill definitions plus one optional shipped skill installed int
 | `aflow-repartition-checkpoint` | Scope-preserving checkpoint split proposal and validation  |
 | `aflow-guard-development-run` | Same-task heartbeat guard for one exact AFlow run           |
 | `material-code-review`      | Material-defect admission gate and proportionate review fixes |
-| `aflow-assistant`           | Optional evidence-first debugging and setup helper              |
+| `aflow-assistant`           | Optional interactive MCP operations, setup, and run debugging   |
 
 ### `api/`
 Public library API for startup preparation, workflow execution, analysis, and

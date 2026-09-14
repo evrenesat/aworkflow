@@ -1,5 +1,17 @@
 # DEVLOG
 
+## 2026-09-14 — Teach interactive agents current AFlow operation
+
+- Expanded the optional `aflow-assistant` skill from run triage into an
+  interactive operating guide, with focused MCP and troubleshooting references.
+- Documented UI-hosted discovery, plan/config authoring, startup questions,
+  revision/idempotency handling, stop modes, successor recovery, and delivery
+  evidence. Live schemas remain authoritative for the connected deployment.
+- Removed obsolete standalone-daemon guidance and corrected canonical-store
+  installation semantics; customized skill trees remain protected on refresh.
+- Validation: skill validator, 93 skill store/install/refresh tests, 35 MCP
+  contract tests, reference-link checks, and an isolated full-tree install.
+
 ## 2026-09-13 — Keep Settings tabs visible on desktop
 
 - Settings now shows its section tabs from 1200 CSS pixels instead of collapsing

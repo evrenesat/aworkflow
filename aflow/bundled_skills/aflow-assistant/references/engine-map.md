@@ -8,13 +8,42 @@ Use this reference when the `aflow-assistant` skill is installed into a harness 
 
 At a high level:
 
-1. The CLI resolves the workflow, plan path, and startup questions.
+1. The UI/MCP control plane or direct CLI resolves the workflow, plan, and
+   startup questions. Managed starts reserve an identity and may await answers
+   before a worker starts.
 2. The workflow runner creates a run log directory under `.aflow/runs/`.
 3. The runner invokes a harness subprocess for each turn.
 4. The engine reloads the plan after each turn and decides the next transition.
 5. Optional lifecycle steps handle repo bootstrap, branch/worktree setup, merge, and teardown.
 
 The plan file on disk is the durable state for checkpoint progress and restart behavior. The run log is the durable evidence trail for what happened during execution.
+
+## Interactive entry points and managed ownership
+
+Use [MCP operations](mcp-operations.md) for the connected-agent operating
+procedure. `aflow ui` serves both the dashboard and authenticated HTTP MCP;
+there is no separate public daemon/MCP listener to start. Registered projects
+define the allowed roots. Global workflow settings are shared, while plans,
+run identities, and execution artifacts belong to the selected project.
+
+For managed runs, start with canonical `get_run` and lite `get_run_context`.
+They incorporate worker ownership and exit receipts that a raw `run.json` may
+not yet reflect. A detached worker can outlive the UI server or MCP client;
+reconnect and inspect ownership before starting or resuming anything.
+An active controller and its launcher/child processes are one logical run,
+not several independent runs.
+
+Resume creates a lineage-linked successor with a new run ID and preserves the
+predecessor. It reloads current configuration while checking lifecycle and
+ownership identities. Frozen launch config copies are diagnostics. Managed
+worktrees can hold execution code while the primary checkout owns durable
+run artifacts and synchronized plans: follow returned paths, not the current
+shell directory by assumption.
+
+Worktree setup, merge, publication, and teardown depend on the resolved
+workflow and repository settings. A terminal turn or checked plan does not
+prove remote publication, CI success, or live activation. Inspect the
+controller's delivery evidence and verify those stages when in scope.
 
 ## Runtime Call Flow
 
@@ -78,7 +107,8 @@ The run-log subsystem persists:
 - stdout and stderr
 - structured turn result metadata
 
-This is the first place to inspect when a workflow misbehaves.
+For direct CLI runs, start here. For managed runs, inspect canonical MCP state
+first, then use these local artifacts when the bounded context is insufficient.
 
 ### Banner and status UI
 
@@ -134,7 +164,7 @@ invitation to scan every stream.
 - `status == "retry-scheduled"` on a turn
   - the harness exited cleanly, but the resulting plan was in an inconsistent checkpoint state and the engine scheduled another attempt
 - turn `status == "starting"` with no completed result
-  - the run was interrupted or crashed after turn-start artifacts were written
+  - the turn is unfinished; inspect worker ownership before inferring a crash
 
 ## Common Failure Shapes
 
@@ -198,7 +228,7 @@ Symptoms:
 
 Interpretation:
 
-- the run likely terminated mid-turn
+- confirm the worker is inactive before concluding the run terminated mid-turn
 - inspect the last completed turn and the surrounding environment
 
 ## How To Use This Reference
@@ -206,7 +236,9 @@ Interpretation:
 1. Start with the `aflow analyze` command for one run:
    - `aflow analyze <run-id>`
    - or `aflow analyze --repo-root <repo> <run-id>`
-2. If the user only gives a repo and no run ID, the analyzer defaults to the latest substantive run:
+2. Without an explicit ID, the analyzer checks shell/environment/last-run
+   records before falling back to the latest substantive run. Verify which
+   run was selected:
    - `aflow analyze`
    - or `aflow analyze --repo-root <repo>`
 3. Use `--all` only when you actually want repeated patterns across several runs:
