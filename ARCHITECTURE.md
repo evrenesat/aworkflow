@@ -648,6 +648,9 @@ Analyzes `.aflow/runs/` artifacts and powers `aflow analyze`.
 ### `config.py`
 Loads `~/.config/aflow/aflow.toml` plus sibling `workflows.toml` (bootstrapped from the bundled defaults on first run). Parses and validates:
 - **`[aflow]`** section: `default_workflow`, `keep_runs`, `max_turns`, `retry_inconsistent_checkpoint_state`, `banner_files_limit`, `max_same_step_turns`, `team_lead`, `branch_prefix`, `worktree_prefix`, `worktree_root`.
+- The multi-step same-node guard counts only consecutive turns without forward
+  plan-snapshot movement. Productive cumulative checkpoint work resets the
+  streak; unchanged or regressed state continues toward the configured cap.
 - **`[harness.<name>.profiles.<profile>]`** tables: `model`, optional `effort` per harness profile.
 - **`[roles]`** and **`[teams.<name>]`** tables: role-to-selector mappings, with team tables allowed to override a subset of the global map and optionally name a `backup_team` for harness recovery chaining. Nested `prompts` tables provide static per-role system guidance; active-team values replace global values for ordinary workflow turns only.
 - **`[manager]`**: Lite and Full role names, a semantic-stall threshold, `skill`, and the read-only `repartition_skill`. Roles are required only for workflows with supervision enabled. `upgrade_to` on a team is a separate one-edge implementation-quality route; both it and `backup_team` are acyclic validated team graphs.

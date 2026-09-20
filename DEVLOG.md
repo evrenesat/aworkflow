@@ -1,5 +1,13 @@
 # DEVLOG
 
+## 2026-09-20 — Reset the same-step cap on plan progress
+
+- Fixed cumulative workflows consuming the same-step safety budget while they
+  were advancing checkpoint state. The guard now resets on verified forward
+  plan-snapshot movement and still terminates genuinely stalled same-node loops;
+  regression coverage exercises both productive traversal and post-progress
+  stalling. Refs evrenesat/aworkflow#44.
+
 ## 2026-09-14 — Repair assistant documentation CI coverage
 
 - Updated the installed-use documentation check to the assistant's current
