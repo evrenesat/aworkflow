@@ -2,16 +2,10 @@ import { useEffect, useRef, useState } from 'react'
 import * as api from '../api'
 import { fetchGlobalRuns, matchesGlobalRun, matchesGlobalRunProgressIdentity, matchesGlobalRunSnapshot, selectGlobalRuns, useRecentRunsLimit, type GlobalRunProgressUpdate } from '../globalRuns'
 import type { ProjectInfo, RunProgressSummary, RunStatus } from '../types'
-import {
-  checkpointApprovalText,
-  runActivityText,
-  runDurationText,
-  runPlanPresentationForRun,
-  statusLabel,
-} from '../runPresentation'
 import { projectContextLabel } from '../projectPresentation'
 import { useHeaderSlots } from './HeaderSlots'
-import { RunProgress, type RunProgressLoadState } from './RunProgress'
+import { RunListItem } from './RunListItem'
+import { type RunProgressLoadState } from './RunProgress'
 
 export function RecentRunsLimit() {
   const [limit, setLimit] = useRecentRunsLimit()
@@ -437,9 +431,6 @@ export function GlobalRunOverview({ projects, onOpen, registryLoading = false, r
   function renderRunRow({ projectId, run }: { projectId: string; run: RunStatus }) {
     const project = projects.find(candidate => candidate.id === projectId)
     const projectLabel = project ? projectContextLabel(project, projects) : projectId
-    const status = statusLabel(run)
-    const title = runPlanPresentationForRun(run)
-    const displayName = title.label
     const key = runIdentity(projectId, run.run_id)
     const enrichment = enrichmentRef.current.get(key)
     const currentEnrichment = enrichment
@@ -450,30 +441,17 @@ export function GlobalRunOverview({ projects, onOpen, registryLoading = false, r
       : null
     const progressRun = currentEnrichment ? { ...run, progress: currentEnrichment.progress } : run
     const progressState: RunProgressLoadState = currentEnrichment?.state ?? (run.progress ? 'ready' : 'loading')
-    const progressLabel = progressState === 'ready'
-      ? progressRun.progress ? checkpointApprovalText(progressRun.progress) : 'Checkpoint progress unavailable'
-      : currentEnrichment?.message
-        || (progressState === 'loading' ? 'Loading checkpoint progress…' : 'Checkpoint progress unavailable')
     return <li key={JSON.stringify([projectId, run.run_id])}>
-      <button
-        className="card global-run-row"
-        data-enrichment-state={progressState === 'ready' ? 'settled' : progressState}
-        aria-label={`${projectLabel} · ${status} · ${displayName} · ${progressLabel} · ${runDurationText(run)} · ${runActivityText(run)} · ${run.run_id}`}
-        onClick={() => onOpen(projectId, run.run_id)}
-      >
-        <span className="global-run-row-heading">
-          <strong className="global-run-row-title" title={displayName}>{displayName}</strong>
-          {title.date && <span className="run-title-date">{title.date}</span>}
-          <span className="global-run-row-project">{projectLabel}</span>
-          <span className="status-pill">{status}</span>
-          {run.history_state === 'archived' && <span className="status-pill">Archived</span>}
-        </span>
-        <span className="global-run-row-meta text-sm text-dim">
-          <span>{runDurationText(run)}</span>
-          <span>{runActivityText(run)}</span>
-        </span>
-        <RunProgress run={progressRun} loadState={progressState} loadMessage={currentEnrichment?.message} />
-      </button>
+      <RunListItem
+        run={progressRun}
+        stableKey={key}
+        projectLabel={projectLabel}
+        rowClassName="global-run-row"
+        dataEnrichmentState={progressState === 'ready' ? 'settled' : progressState}
+        loadState={progressState}
+        loadMessage={currentEnrichment?.message}
+        onSelect={() => onOpen(projectId, run.run_id)}
+      />
     </li>
   }
 

@@ -1,5 +1,19 @@
 # DEVLOG
 
+## 2026-09-22 — Add compact run navigation and anchored previews
+
+- Mapped the approved calm-workspace shell tokens into light/dark themes while
+  retaining the two-row desktop header, mobile list/detail navigation and 44px
+  touch targets.
+- Added the shared `RunListItem` for project and All runs lists. Stable exact
+  run identities, concise status/checkpoint facts and richer anchored previews
+  now share one selection/Back-preserving implementation; row progress stays
+  compact while detailed evidence remains available in the preview and run
+  detail.
+- Extended the disposable fidelity smoke with row height, sibling geometry,
+  hover/focus/touch-toggle/Escape checks and six light/dark captures. The final
+  Chromium run passed with no page errors or legacy-manifest warnings.
+
 ## 2026-09-22 — Repair calm-workspace fidelity capture evidence
 
 - Bound every disposable running, paused and completed fixture to its canonical

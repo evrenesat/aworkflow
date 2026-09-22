@@ -285,6 +285,12 @@ function dashboardNode(options: { requestedRunId?: string | null; visible?: bool
   )
 }
 
+function findRunSelection(runId: string): HTMLButtonElement | null {
+  const row = [...document.querySelectorAll<HTMLElement>('[data-run-row="true"]')]
+    .find(candidate => candidate.dataset.runKey === runId)
+  return row?.querySelector<HTMLButtonElement>('.run-list-select') ?? null
+}
+
 /** Commits an option in a searchable combobox control. */
 function choose(label: string, value: string) {
   const input = screen.getByLabelText(label)
@@ -547,13 +553,13 @@ describe('RunDashboard', () => {
     }))
     renderDashboard()
 
-    await screen.findByRole('button', { name: newest.run_id })
-    fireEvent.click(screen.getByRole('button', { name: new RegExp(oldest.run_id) }))
-    await screen.findByRole('button', { name: oldest.run_id })
+    await waitFor(() => expect(findRunSelection(newest.run_id)).not.toBeNull())
+    fireEvent.click(findRunSelection(oldest.run_id)!)
+    await waitFor(() => expect(findRunSelection(oldest.run_id)).not.toBeNull())
     fireEvent.click(screen.getByRole('button', { name: 'Refresh', exact: true }))
     await waitFor(() => expect(api.listControlPlaneRuns).toHaveBeenCalledTimes(2))
-    await screen.findByRole('button', { name: new RegExp(later.run_id) })
-    expect(screen.getByRole('button', { name: oldest.run_id })).toBeDefined()
+    await waitFor(() => expect(findRunSelection(later.run_id)).not.toBeNull())
+    expect(findRunSelection(oldest.run_id)).not.toBeNull()
   })
 
   it('keeps the server snapshot visible through a failed daemon refresh', async () => {

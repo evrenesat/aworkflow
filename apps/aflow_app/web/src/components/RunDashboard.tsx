@@ -28,7 +28,6 @@ import { NewRunPage, WorktreePreflightPanel, type WorktreePreflightLoadState } f
 import { Combobox } from './Combobox'
 import { useHeaderSlots } from './HeaderSlots'
 import {
-  checkpointApprovalText,
   launchTeamFamilyGroups,
   launchTeamFamilyHint,
   launchTeamFamilyLabel,
@@ -39,8 +38,6 @@ import {
   formatLocalTimestamp,
   runPlanPresentation,
   runPlanPresentationForRun,
-  runActivityText,
-  runDurationText,
   runFinishText,
   shortRunId,
   statusLabel,
@@ -48,7 +45,7 @@ import {
 } from '../runPresentation'
 import { workspaceHref } from '../urlState'
 import { formatMachineChoice, formatMachineLabel } from '../label'
-import { RunProgress } from './RunProgress'
+import { RunListItem } from './RunListItem'
 import { CheckpointHistory } from './CheckpointHistory'
 
 const MAX_TIMELINE_EVENTS = 100
@@ -3013,26 +3010,16 @@ export function RunDashboard({ visible = true, page, onNewRun, onCancelNewRun, o
             {selectedRunOutsideLoadedHistory && selectedRun && <p className="notice text-sm" role="status">
               Selected run: {runPlanPresentationForRun(selectedRun).label} · {statusLabel(selectedRun)} · {shortRunId(selectedRun.run_id)}. It is outside the loaded history page; this view will not fetch more runs automatically.
             </p>}
-            {listedRuns.length === 0 ? (historyIncomplete ? null : <p className="text-sm text-dim">No runs yet</p>) : listedRuns.map((run) => {
-              const plan = runPlanPresentationForRun(run)
-              const status = statusLabel(run)
-              return <button
-                data-sidebar-editor-item={run.run_id}
-                className={`content-button run-list-item ${selectedRunId === run.run_id ? 'selected' : ''}`}
-                aria-current={selectedRunId === run.run_id ? 'true' : undefined}
-                aria-label={`${run.run_id} ${status} · ${plan.label} · ${run.progress ? checkpointApprovalText(run.progress) : 'Checkpoint progress unavailable'} · ${runDurationText(run)} · ${runActivityText(run)}`}
+            {listedRuns.length === 0 ? (historyIncomplete ? null : <p className="text-sm text-dim">No runs yet</p>) : listedRuns.map((run) => (
+              <RunListItem
                 key={run.run_id}
-                onClick={() => selectRun(run.run_id)}
-              >
-                <span className="run-list-context">
-                  <strong className="run-list-title" title={plan.label}>{plan.label}</strong>
-                  {plan.date && <span className="run-title-date">{plan.date}</span>}
-                  <span className="status-pill">{status}</span>
-                </span>
-                <span className="run-row-meta text-xs text-dim"><span>{runDurationText(run)}</span><span>{runActivityText(run)}</span></span>
-                <RunProgress run={run} />
-              </button>
-            })}
+                run={run}
+                stableKey={run.run_id}
+                dataSidebarEditorItem={run.run_id}
+                selected={selectedRunId === run.run_id}
+                onSelect={() => selectRun(run.run_id)}
+              />
+            ))}
             {nextRunCursor && <button className="btn btn-secondary" disabled={refreshing} onClick={() => void loadMoreRuns()}>Load more runs</button>}
           </section>}>
 
@@ -3284,7 +3271,7 @@ export function RunDashboard({ visible = true, page, onNewRun, onCancelNewRun, o
                 {technicalOpen && (
                   <div id={technicalId} className="run-technical-details">
               <section className="dashboard-section" data-ui-fidelity-anchor="recent-activity">
-                <div className="section-heading"><div><h4>Activity timeline</h4><span className="text-xs text-dim">{events.length} recent events</span></div></div>
+                <div className="section-heading" data-ui-fidelity-anchor="mobile-recent-activity"><div><h4>Activity timeline</h4><span className="text-xs text-dim">{events.length} recent events</span></div></div>
                 {streamNotice && <div className="notice">{streamNotice}</div>}
                 {events.length === 0 ? <p className="text-sm text-dim">No activity has been reported yet.</p> : <div className="run-timeline">{events.map((event) => <article className="timeline-event" key={event.sequence}><div><strong>{formatMachineLabel(event.event_type)}</strong><span className="text-xs text-dim">#{event.sequence} · {timestamp(event.timestamp)}</span></div></article>)}</div>}
               </section>

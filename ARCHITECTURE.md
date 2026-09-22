@@ -73,6 +73,10 @@ rows; compact pages expose the same destinations through an in-flow hamburger
 menu with Escape-to-close and focus return. Settings uses the shared row for its
 section selector/tabs, save coordinator and More actions, while the consumer
 continues to own drafts and handlers. The web `SidebarEditorLayout` keeps detail and editor content in document flow.
+Project and All runs lists share `RunListItem`: exact run identity remains the
+selection key, while compact progress and an anchored preview expose available
+facts without growing rows or changing sibling geometry. The preview control is
+separate from selection and preserves the layout's mobile Back/focus ownership.
 In wide/tall mode its navigation may be sticky with a bounded local scroll
 surface; in compact/short mode its local presentation state exposes one
 already-mounted list or detail surface at a time. Selection remains owned by

@@ -147,6 +147,39 @@ describe('RunProgress', () => {
     expect(screen.getByText('Approval progress unknown')).toBeTruthy()
   })
 
+  it.each([
+    ['stale', 'Run changed; refresh to update checkpoint progress.'],
+    ['failed', 'Checkpoint progress unavailable — Refresh to retry.'],
+  ] as const)('shows the retained projection and actionable %s notice in compact rows', (loadState, loadMessage) => {
+    const { container } = render(<RunProgress
+      run={run()}
+      mode="row"
+      loadState={loadState}
+      loadMessage={loadMessage}
+    />)
+
+    const row = container.querySelector('.compact-run-progress-row')!
+    const notice = row.querySelector('.compact-run-progress-row-notice')
+    expect(row.textContent).toContain('4 of 11 checkpoints approved')
+    expect(notice?.textContent).toBe(loadMessage)
+    expect(notice?.className).toContain(loadState)
+    expect(row.getAttribute('aria-label')).toContain(loadMessage)
+    expect(row.querySelector('.sr-only')).toBeNull()
+  })
+
+  it('keeps ordinary compact-row loading announcements out of the visible projection line', () => {
+    const { container } = render(<RunProgress
+      run={run()}
+      mode="row"
+      loadState="loading"
+    />)
+
+    const row = container.querySelector('.compact-run-progress-row')!
+    expect(row.querySelector('.compact-run-progress-row-notice')).toBeNull()
+    expect(row.querySelector('.sr-only')?.textContent).toBe('Loading checkpoint progress…')
+    expect(row.textContent).toContain('4 of 11 checkpoints approved')
+  })
+
   it('keeps an active waiting run position visible', () => {
     render(<RunProgress run={run({ status: 'waiting_for_input', activity: 'inactive', progress: progress({ phase: null, activity: null }) })} />)
     expect(screen.getByText(/CP5 of 11/)).toBeTruthy()

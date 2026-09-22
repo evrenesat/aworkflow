@@ -76,6 +76,96 @@ def _assert_production_capture(page, capture: dict[str, object]) -> None:
     ) is True
 
 
+def _visible_run_row_boxes(page) -> list[dict[str, float]]:
+    return page.evaluate(
+        """() => [...document.querySelectorAll('.run-list-item[data-run-row="true"]')]
+          .filter(element => {
+            const style = getComputedStyle(element);
+            const box = element.getBoundingClientRect();
+            return style.display !== 'none' && style.visibility !== 'hidden' && box.width > 0 && box.height > 0;
+          })
+          .map(element => {
+            const box = element.getBoundingClientRect();
+            return {x: box.x, y: box.y, width: box.width, height: box.height};
+          })"""
+    )
+
+
+def _assert_compact_run_rows(page, *, width: int, height: int, fixture_count: int) -> dict[str, object]:
+    if width < 960 or height < 600:
+        return {"skipped": True}
+    rows = page.locator(".run-list-item[data-run-row='true']:visible")
+    expect(rows).to_have_count(fixture_count)
+    before = _visible_run_row_boxes(page)
+    assert len(before) == fixture_count
+    assert all(56 <= row["height"] <= 72 for row in before), before
+    assert all(
+        before[index]["y"] + before[index]["height"] <= before[index + 1]["y"] + 1
+        for index in range(len(before) - 1)
+    ), before
+    assert page.locator(".run-list-item[data-run-row='true'] button button").count() == 0
+
+    rows.first.hover()
+    page.wait_for_timeout(350)
+    preview = page.locator(".run-row-preview:visible").first
+    expect(preview).to_be_visible()
+    preview_box = preview.bounding_box()
+    assert preview_box is not None
+    assert 0 <= preview_box["x"]
+    assert preview_box["x"] + preview_box["width"] <= width
+    assert 0 <= preview_box["y"]
+    assert preview_box["y"] + preview_box["height"] <= height
+    after = _visible_run_row_boxes(page)
+    assert after == before, {"before": before, "after": after}
+
+    rows.first.locator(".run-list-select").focus()
+    expect(page.locator(".run-row-preview:visible").first).to_be_visible()
+    page.keyboard.press("Escape")
+    expect(page.locator(".run-row-preview:visible")).to_have_count(0)
+    return {
+        "skipped": False,
+        "row_boxes": before,
+        "hover_preview_box": preview_box,
+        "sibling_boxes_stable": after == before,
+        "focus_preview_opened": True,
+        "escape_closed_preview": True,
+    }
+
+
+def _assert_mobile_run_preview(page, *, width: int, height: int, fixture_count: int) -> dict[str, object]:
+    if width >= 960:
+        return {"skipped": True}
+    back = page.locator(".sidebar-editor-back:visible").first
+    expect(back).to_be_visible()
+    back.click()
+    rows = page.locator(".run-list-item[data-run-row='true']:visible")
+    expect(rows).to_have_count(fixture_count)
+    before = _visible_run_row_boxes(page)
+    toggle = rows.first.locator(".run-row-preview-toggle")
+    toggle.click()
+    expect(toggle).to_have_attribute("aria-expanded", "true")
+    preview = page.locator(".run-row-preview:visible").first
+    expect(preview).to_be_visible()
+    preview_box = preview.bounding_box()
+    assert preview_box is not None
+    assert 0 <= preview_box["x"]
+    assert preview_box["x"] + preview_box["width"] <= width
+    assert 0 <= preview_box["y"]
+    assert preview_box["y"] + preview_box["height"] <= height
+    after_preview = _visible_run_row_boxes(page)
+    assert after_preview == before, {"before": before, "after": after_preview}
+    page.keyboard.press("Escape")
+    expect(page.locator(".run-row-preview:visible")).to_have_count(0)
+    return {
+        "skipped": False,
+        "row_boxes": before,
+        "touch_preview_box": preview_box,
+        "sibling_boxes_stable": _visible_run_row_boxes(page) == before,
+        "explicit_toggle_opened": True,
+        "escape_closed_preview": True,
+    }
+
+
 def _write_artifact_manifest(path: Path, payload: dict[str, object]) -> None:
     path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
     print("AFLOW_UI_DEMO_FIDELITY_ARTIFACT", path)
@@ -172,7 +262,7 @@ def test_ui_demo_fixture_captures_authenticated_built_app(
                     if width >= 960 and height >= 600:
                         for variant in fixtures.values():
                             row = page.locator(
-                                f"button.run-list-item[data-sidebar-editor-item='{variant['run_id']}']:visible"
+                                f".run-list-item[data-run-key='{variant['run_id']}']:visible"
                             )
                             expect(row).to_be_visible()
                     diagnostics = detail.locator("button[aria-label='Diagnostics']")
@@ -207,6 +297,22 @@ def test_ui_demo_fixture_captures_authenticated_built_app(
                         "screenshot": capture_path.name,
                     }
                     _assert_production_capture(page, capture)
+                    desktop_rows = _assert_compact_run_rows(
+                        page,
+                        width=width,
+                        height=height,
+                        fixture_count=len(fixtures),
+                    )
+                    mobile_rows = _assert_mobile_run_preview(
+                        page,
+                        width=width,
+                        height=height,
+                        fixture_count=len(fixtures),
+                    )
+                    capture["row_comparison"] = {
+                        "desktop": desktop_rows,
+                        "mobile": mobile_rows,
+                    }
                     captures.append(capture)
             assert page_errors == []
         finally:

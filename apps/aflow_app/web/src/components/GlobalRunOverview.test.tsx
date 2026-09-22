@@ -561,6 +561,48 @@ describe('GlobalRunOverview project context', () => {
     expect(api.getControlPlaneRun).toHaveBeenCalledTimes(1)
   })
 
+  it.each([
+    ['stale', 'Run changed; refresh to update checkpoint progress.'],
+    ['failed', 'Checkpoint progress unavailable — Refresh to retry.'],
+  ] as const)('keeps the last known projection visible with a sighted %s enrichment notice', async (state, message) => {
+    const initial = makeRun('retained-enrichment', {
+      status: 'running', activity: 'active', revision: 1,
+      original_plan_display_name: 'Retained progress', original_plan_path: 'plans/retained.md',
+    })
+    const replacement = { ...initial, revision: 2 }
+    const initialResponse = deferred<RunStatus>()
+    const replacementResponse = deferred<RunStatus>()
+    let listCalls = 0
+    let detailCalls = 0
+    vi.mocked(api.listControlPlaneRuns).mockImplementation(async () => {
+      listCalls += 1
+      return page([listCalls === 1 ? initial : replacement])
+    })
+    vi.mocked(api.getControlPlaneRun).mockImplementation(async () => {
+      detailCalls += 1
+      return detailCalls === 1 ? initialResponse.promise : replacementResponse.promise
+    })
+
+    render(<GlobalRunOverview projects={[primary]} onOpen={vi.fn()} />)
+    const row = await screen.findByRole('button', { name: /Retained progress.*retained-enrichment/ })
+    await waitFor(() => expect(detailCalls).toBe(1))
+    initialResponse.resolve(canonicalDetail(initial, {
+      total_checkpoints: { value: 2, coverage: 'complete' },
+      approved_checkpoints: { value: 1, coverage: 'complete' },
+    }))
+    await waitFor(() => expect(row.textContent).toContain('1 of 2 checkpoints approved'))
+
+    fireEvent.click(screen.getByRole('button', { name: 'Refresh', exact: true }))
+    await waitFor(() => expect(listCalls).toBe(2))
+    await waitFor(() => expect(detailCalls).toBe(2))
+    if (state === 'stale') replacementResponse.resolve({ ...replacement, revision: 1 } as RunStatus)
+    else replacementResponse.reject(new Error('temporary detail failure'))
+
+    await waitFor(() => expect(row.getAttribute('data-enrichment-state')).toBe(state))
+    expect(row.textContent).toContain('1 of 2 checkpoints approved')
+    expect(row.querySelector('.compact-run-progress-row-notice')?.textContent).toBe(message)
+  })
+
   it('keeps a terminal stale mismatch from retrying after raw traversal settles', async () => {
     const staleRun = makeRun('review-stale', {
       original_plan_display_name: 'Review stale', original_plan_path: 'plans/review-stale.md',

@@ -32,6 +32,7 @@ PRODUCTION_ANCHORS = {
     "current_work": ".checkpoint-history-at-a-glance",
     "latest_result": "[data-ui-fidelity-anchor='latest-result']",
     "recent_activity": "[data-ui-fidelity-anchor='recent-activity']",
+    "mobile_recent_activity": "[data-ui-fidelity-anchor='mobile-recent-activity']",
     "first_disclosure": "details[data-ui-fidelity-anchor='first-disclosure']",
 }
 PRODUCTION_PROGRESS_SURFACE = ".run-progress-evidence"
