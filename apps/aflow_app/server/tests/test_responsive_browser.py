@@ -1298,8 +1298,11 @@ def test_global_run_overview_loading_journey(control_client, monkeypatch, tmp_pa
                 re.compile(rf".*/api/control-plane/projects/{re.escape(PROJECT_ID)}/runs(?:\?.*)?$")
             ):
                 page.get_by_role("button", name="Refresh", exact=True).click()
-            expect(page.get_by_role("status")).to_contain_text("Refreshing runs…")
+            # A retained populated refresh is intentionally invisible: the
+            # existing rows remain usable and the surface is not marked busy.
+            expect(page.get_by_role("status")).to_have_count(0)
             expect(populated_row).to_be_visible()
+            assert page.locator(".global-run-results").get_attribute("aria-busy") == "false"
             phone_image = tmp_path / f"issue40-{browser_name}-phone-refresh.png"
             page.screenshot(path=str(phone_image), full_page=True)
             print("ISSUE40_SCREENSHOT", phone_image)

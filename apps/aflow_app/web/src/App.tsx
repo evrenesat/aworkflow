@@ -20,6 +20,30 @@ import {
 
 type View = WorkspaceQuery['view']
 
+function sameProjectInfo(left: ProjectInfo, right: ProjectInfo): boolean {
+  return left.id === right.id
+    && left.display_name === right.display_name
+    && left.current_path === right.current_path
+    && left.is_git_root === right.is_git_root
+    && left.registered_at === right.registered_at
+    && left.readiness === right.readiness
+    && (left.parent_project_id ?? null) === (right.parent_project_id ?? null)
+}
+
+/** Reuse equal registry records so a refresh cannot remount project rows. */
+function reconcileProjects(previous: ProjectInfo[], next: ProjectInfo[]): ProjectInfo[] {
+  const byId = new Map(previous.map(project => [project.id, project]))
+  let changed = previous.length !== next.length
+  const reconciled = next.map(project => {
+    const prior = byId.get(project.id)
+    if (prior && sameProjectInfo(prior, project)) return prior
+    changed = true
+    return project
+  })
+  if (!changed && reconciled.every((project, index) => project === previous[index])) return previous
+  return reconciled
+}
+
 interface RunNavigationIntent {
   projectId: string
   runId: string
@@ -176,7 +200,10 @@ export function App() {
   const [logoutError, setLogoutError] = useState<string | null>(null)
   const [projects, setProjects] = useState<ProjectInfo[]>([])
   const [projectsLoading, setProjectsLoading] = useState(true)
+  const [projectsRefreshing, setProjectsRefreshing] = useState(false)
   const [projectsError, setProjectsError] = useState<string | null>(null)
+  const projectsLoadedRef = useRef(false)
+  const projectsRequestRef = useRef(0)
   const [query, setQuery] = useState<WorkspaceQuery>(initialWorkspaceQuery)
   const [runNavigationIntent, setRunNavigationIntent] = useState<RunNavigationIntent | null>(() => (
     runNavigationIntentFor(initialWorkspaceQuery())
@@ -286,17 +313,23 @@ export function App() {
 
   const loadProjects = useCallback(async () => {
     const epoch = authEpoch.current
+    const request = ++projectsRequestRef.current
+    const initial = !projectsLoadedRef.current
     try {
-      setProjectsLoading(true)
-      setProjectsError(null)
+      if (initial) setProjectsLoading(true)
+      else setProjectsRefreshing(true)
       const loaded = await api.listProjects()
-      if (authEpoch.current !== epoch) return
-      setProjects(loaded)
+      if (authEpoch.current !== epoch || projectsRequestRef.current !== request) return
+      setProjects(current => reconcileProjects(current, loaded))
+      projectsLoadedRef.current = true
+      setProjectsError(null)
     } catch (err) {
-      if (authEpoch.current !== epoch) return
+      if (authEpoch.current !== epoch || projectsRequestRef.current !== request) return
       setProjectsError(err instanceof Error ? err.message : 'Failed to load registered projects')
     } finally {
-      if (authEpoch.current === epoch) setProjectsLoading(false)
+      if (authEpoch.current !== epoch || projectsRequestRef.current !== request) return
+      if (initial) setProjectsLoading(false)
+      else setProjectsRefreshing(false)
     }
   }, [])
 
@@ -394,7 +427,11 @@ export function App() {
   }
 
   function resetWorkspace() {
+    projectsRequestRef.current += 1
+    projectsLoadedRef.current = false
     setProjects([])
+    setProjectsLoading(false)
+    setProjectsRefreshing(false)
     setVisitedProjects([])
     setProjectsError(null)
     setStaleLinkTarget(null)
@@ -493,7 +530,8 @@ export function App() {
       const refreshed = await api.listProjects()
       if (authEpoch.current !== epoch) return created
       const canonical = refreshed.find((project) => project.id === created.id)
-      setProjects([...refreshed.filter((project) => project.id !== created.id), canonical ?? createdProject])
+      projectsLoadedRef.current = true
+      setProjects(current => reconcileProjects(current, [...refreshed.filter((project) => project.id !== created.id), canonical ?? createdProject]))
     } catch (err) {
       if (authEpoch.current !== epoch) return created
       setProjectsError(
@@ -523,9 +561,14 @@ export function App() {
     if (readiness === 'invalid') return
     // The saved configuration is global: every registered project's
     // readiness follows the same shared pair.
-    setProjects((current) => current.map((project) => (
-      project.readiness === 'blocked' ? project : { ...project, readiness }
-    )))
+    setProjects((current) => {
+      const next = current.map((project) => (
+        project.readiness === 'blocked' || project.readiness === readiness
+          ? project
+          : { ...project, readiness }
+      ))
+      return next.every((project, index) => project === current[index]) ? current : next
+    })
   }, [])
 
   function handleOpenRunDashboard(planPath: string) {
@@ -673,6 +716,8 @@ export function App() {
             projects={projects}
             selectedProjectId={query.project}
             loading={projectsLoading}
+            refreshing={projectsRefreshing}
+            hasLoaded={projectsLoadedRef.current}
             error={projectsError}
             onSelectProject={openProject}
             onRefresh={loadProjects}

@@ -35,6 +35,20 @@ function planIdentity(projectId: string, plan: PlanDocument): string {
   return JSON.stringify([projectId, plan.status, plan.name, plan.path])
 }
 
+function samePlan(left: PlanDocument, right: PlanDocument): boolean {
+  return JSON.stringify(left) === JSON.stringify(right)
+}
+
+function reconcilePlans(previous: PlanDocument[], next: PlanDocument[]): PlanDocument[] {
+  const byPath = new Map(previous.map(plan => [plan.path, plan]))
+  const reconciled = next.map(plan => {
+    const prior = byPath.get(plan.path)
+    return prior && samePlan(prior, plan) ? prior : plan
+  })
+  if (reconciled.length === previous.length && reconciled.every((plan, index) => plan === previous[index])) return previous
+  return reconciled
+}
+
 function backupOriginLabel(summary: PlanBackupSummary): string {
   if (summary.kind === 'follow_up') return 'Follow-up'
   if (summary.kind === 'snapshot' && summary.baseline_status === 'known') return 'Baseline'
@@ -94,6 +108,10 @@ export function PlanPanel({ project, onDirtyChange, onOpenRunDashboard, initialP
   const [historyOpen, setHistoryOpen] = useState(false)
   const [history, setHistory] = useState<BackupHistoryState>({ page: null, loading: false, error: null })
   const planLoadRequest = useRef(0)
+  const planListRequest = useRef(0)
+  const plansLoadedRef = useRef(false)
+  const [plansLoading, setPlansLoading] = useState(true)
+  const [plansRefreshing, setPlansRefreshing] = useState(false)
   const historyRequest = useRef(0)
   const projectIdRef = useRef(project.id)
   const selectedRef = useRef<PlanDocument | null>(selected)
@@ -158,6 +176,11 @@ export function PlanPanel({ project, onDirtyChange, onOpenRunDashboard, initialP
 
   useEffect(() => {
     planLoadRequest.current += 1
+    planListRequest.current += 1
+    plansLoadedRef.current = false
+    setPlans([])
+    setPlansLoading(true)
+    setPlansRefreshing(false)
     setSelected(null)
     setContent('')
     setSavedContent('')
@@ -172,11 +195,23 @@ export function PlanPanel({ project, onDirtyChange, onOpenRunDashboard, initialP
   }, [project.id])
 
   async function refresh() {
+    const request = ++planListRequest.current
+    const initial = !plansLoadedRef.current
     try {
+      if (initial) setPlansLoading(true)
+      else setPlansRefreshing(true)
+      const listed = await api.listProjectPlans(project.id)
+      if (request !== planListRequest.current || projectIdRef.current !== project.id) return
+      plansLoadedRef.current = true
+      setPlans(current => reconcilePlans(current, listed))
       setError(null)
-      setPlans(await api.listProjectPlans(project.id))
     } catch (err) {
+      if (request !== planListRequest.current || projectIdRef.current !== project.id) return
       setError(err instanceof Error ? err.message : 'Failed to load plans')
+    } finally {
+      if (request !== planListRequest.current || projectIdRef.current !== project.id) return
+      if (initial) setPlansLoading(false)
+      else setPlansRefreshing(false)
     }
   }
 
@@ -374,7 +409,7 @@ export function PlanPanel({ project, onDirtyChange, onOpenRunDashboard, initialP
       {conflict && !confirmReload && <MenuItem onClick={() => setConfirmReload(true)}>Reload from server…</MenuItem>}
       {selected.status !== 'done' && <MenuItem disabled={busy || dirty} onClick={() => void promotePlan()}>Move to {selected.status === 'todo' ? 'Ready' : 'Done'}</MenuItem>}
       {selected.status === 'in_progress' && <MenuItem disabled={!runnable} onClick={() => onOpenRunDashboard(selected.path)}>Run this plan</MenuItem>}
-    </MoreMenu> : <MoreMenu label="More plan actions" triggerLabel="More"><MenuItem onClick={() => void refresh()}>Refresh plans</MenuItem></MoreMenu>,
+    </MoreMenu> : <MoreMenu label="More plan actions" triggerLabel="More"><MenuItem disabled={plansLoading || plansRefreshing} onClick={() => void refresh()}>Refresh plans</MenuItem></MoreMenu>,
   })
 
   if (selected) {
@@ -541,6 +576,7 @@ export function PlanPanel({ project, onDirtyChange, onOpenRunDashboard, initialP
   return (
     <div className="plan-list">
       {error && <div className="error-message" role="alert">{error}</div>}
+      {plansLoading && <div className="card dashboard-loading" role="status"><div className="spinner" />Loading plans…</div>}
       {!hosted && <div className="card" style={{ display: 'flex', gap: 'var(--spacing-sm)', flexWrap: 'wrap' }}>
         <input
           className="input mono"
@@ -553,7 +589,7 @@ export function PlanPanel({ project, onDirtyChange, onOpenRunDashboard, initialP
           Create plan
         </button>
       </div>}
-      {LIFECYCLE_SECTIONS.map(({ status, title, hint }) => {
+      {!plansLoading && LIFECYCLE_SECTIONS.map(({ status, title, hint }) => {
         const matching = plans.filter((plan) => plan.status === status)
         return (
           <section key={status}>

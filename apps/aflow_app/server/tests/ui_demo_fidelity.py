@@ -386,11 +386,18 @@ def capture_dom_identity(page: Page, selector: str) -> dict[str, Any]:
         """selector => {
           const element = document.querySelector(selector);
           if (!element) return {present: false};
+          window.__aflowFidelityNodeTokens ||= new WeakMap();
+          window.__aflowFidelityNextNodeToken ||= 0;
+          let nodeToken = window.__aflowFidelityNodeTokens.get(element);
+          if (!nodeToken) {
+            nodeToken = `node-${++window.__aflowFidelityNextNodeToken}`;
+            window.__aflowFidelityNodeTokens.set(element, nodeToken);
+          }
           const rect = element.getBoundingClientRect();
           return {
             present: true,
             nodeName: element.nodeName,
-            identity: element.id || element.getAttribute('data-testid') || null,
+            identity: element.id || element.getAttribute('data-testid') || nodeToken,
             text: element.textContent || '',
             x: rect.x,
             y: rect.y,

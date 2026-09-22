@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+from urllib.parse import urlsplit
 
 import pytest
 from playwright.sync_api import expect, sync_playwright
@@ -357,3 +358,199 @@ def test_ui_demo_fixture_captures_authenticated_built_app(
             "disposable": True,
         },
     )
+
+
+@pytest.mark.parametrize(
+    ("width", "height", "theme"),
+    (
+        pytest.param(1280, 720, "light", id="desktop-light"),
+        pytest.param(390, 844, "dark", id="mobile-dark"),
+    ),
+)
+def test_ui_demo_equal_refresh_retains_detail_and_changed_rows_update(
+    control_client,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    width: int,
+    height: int,
+    theme: str,
+) -> None:
+    """Hold equal data in the real app, then prove a changed row updates locally."""
+    _, root, _, _ = control_client
+    fixtures = seed_demo_fidelity_fixture(root)
+    selected = fixtures["paused"]
+    changed_fixture = fixtures["completed"]
+    assert isinstance(selected, dict)
+    assert isinstance(changed_fixture, dict)
+    dist = Path(__file__).resolve().parents[2] / "web" / "dist"
+    if not (dist / "index.html").exists():
+        pytest.fail("The CP6 refresh capture requires the real built web app; run the web build first.")
+    monkeypatch.setenv("AFLOW_APP_WEB_DIST", str(dist))
+
+    base_path = f"/api/control-plane/projects/{PROJECT_ID}/runs"
+    held_routes = []
+    request_count = {"value": 0}
+    initial_body: bytes | None = None
+    changed_body: bytes | None = None
+
+    def intercept_runs(route) -> None:
+        nonlocal initial_body, changed_body
+        request = route.request
+        if request.method != "GET" or urlsplit(request.url).path != base_path:
+            route.continue_()
+            return
+        request_count["value"] += 1
+        if request_count["value"] == 1:
+            response = route.fetch()
+            initial_body = response.body()
+            payload = json.loads(initial_body)
+            changed = json.loads(initial_body)
+            changed_run = next(run for run in changed["runs"] if run["run_id"] == changed_fixture["run_id"])
+            changed_run["status"] = "failed"
+            changed_run["activity"] = "inactive"
+            changed_run["status_reason_code"] = "worker_failure"
+            changed_run["revision"] = int(changed_run.get("revision", 0)) + 1
+            changed_body = json.dumps(changed).encode()
+            assert payload["runs"]
+            route.fulfill(status=response.status, headers=response.headers, body=initial_body)
+        elif request_count["value"] == 2:
+            held_routes.append(route)
+        elif request_count["value"] == 3:
+            assert changed_body is not None
+            route.fulfill(status=200, content_type="application/json", body=changed_body)
+        else:
+            # Keep any follow-up stream/poll refreshes on the changed
+            # snapshot; an uncontrolled server response would otherwise
+            # race the assertion with the original completed fixture.
+            assert changed_body is not None
+            route.fulfill(status=200, content_type="application/json", body=changed_body)
+
+    captures: dict[str, object] = {
+        "viewport": {"width": width, "height": height},
+        "theme": theme,
+        "run_id": selected["run_id"],
+        "changed_row_id": changed_fixture["run_id"],
+    }
+    with live_server() as url, sync_playwright() as playwright:
+        browser = _browser(playwright)
+        page = browser.new_page(viewport={"width": width, "height": height})
+        page.route(f"**{base_path}**", intercept_runs)
+        try:
+            _login(page, url)
+            page.emulate_media(color_scheme=theme)  # type: ignore[arg-type]
+            _set_theme_preference(page, theme)
+            page.goto(
+                f"{url}/?project={PROJECT_ID}&view=runs&run={selected['run_id']}",
+                wait_until="load",
+            )
+            detail = page.locator(".run-detail:visible").first
+            detail.wait_for()
+            first_disclosure = detail.locator("details[data-ui-fidelity-anchor='first-disclosure']").first
+            first_disclosure.locator("summary").click()
+            expect(first_disclosure).to_have_attribute("open", "")
+            page.evaluate("window.scrollTo(0, Math.min(document.body.scrollHeight - window.innerHeight, 180))")
+
+            actions = detail.get_by_role("button", name="Actions", exact=True)
+            actions.click()
+            expect(page.get_by_role("menu").last).to_be_visible()
+            actions.focus()
+            page.evaluate("window.scrollTo(0, Math.min(document.body.scrollHeight - window.innerHeight, 180))")
+            # Let the selected paused fixture finish its initial progress and
+            # diagnostics reads before observing the equal refresh. WebKit
+            # resolves those independent reads later than Chromium.
+            page.wait_for_timeout(2_500)
+            expect(page.get_by_role("menu").last).to_be_visible()
+            actions.focus()
+            page.evaluate("window.scrollTo(0, Math.min(document.body.scrollHeight - window.innerHeight, 180))")
+            page.wait_for_timeout(50)
+            before_detail = capture_dom_identity(page, ".run-detail")
+            before_disclosure = capture_dom_identity(page, "details[data-ui-fidelity-anchor='first-disclosure']")
+            before_box = first_disclosure.bounding_box()
+            assert before_box is not None
+            page.locator(".app-shell").screenshot(path=str(tmp_path / f"refresh-before-{theme}-{width}x{height}.png"))
+            refresh_baseline_disclosure = capture_dom_identity(page, "details[data-ui-fidelity-anchor='first-disclosure']")
+            refresh_baseline_box = first_disclosure.bounding_box()
+            assert refresh_baseline_box is not None
+            # Observe the opened, stable disclosure subtree. The surrounding
+            # detail also contains asynchronous event/progress evidence that
+            # may settle independently of this held history response; the
+            # detail/disclosure identity, text, geometry, focus and scroll
+            # assertions below still cover the outer surface.
+            install_mutation_observer(page, "details[data-ui-fidelity-anchor='first-disclosure']")
+            page.evaluate("window.dispatchEvent(new Event('aflow-history-changed'))")
+            read_mutation_records(page)
+            for _ in range(100):
+                if held_routes:
+                    break
+                page.wait_for_timeout(25)
+            assert held_routes, "the equal refresh request was not held"
+            page.wait_for_timeout(250)
+            held_detail = capture_dom_identity(page, ".run-detail")
+            held_disclosure = capture_dom_identity(page, "details[data-ui-fidelity-anchor='first-disclosure']")
+            held_box = first_disclosure.bounding_box()
+            assert held_box is not None
+            assert held_detail["identity"] == before_detail["identity"]
+            assert held_disclosure["identity"] == before_disclosure["identity"]
+            assert held_disclosure["text"] == before_disclosure["text"]
+            assert held_box == refresh_baseline_box
+            assert held_disclosure["scrollY"] == refresh_baseline_disclosure["scrollY"]
+            assert page.get_by_role("status").filter(has_text="Refreshing runs").count() == 0
+            assert page.evaluate("document.activeElement?.textContent?.trim() === 'Actions'") is True
+            captures["held_mutations"] = read_mutation_records(page)
+            assert captures["held_mutations"] == []
+
+            page.keyboard.press("Escape")
+            read_mutation_records(page)
+            page.wait_for_timeout(50)
+            closed_detail = capture_dom_identity(page, ".run-detail")
+            closed_disclosure = capture_dom_identity(page, "details[data-ui-fidelity-anchor='first-disclosure']")
+            closed_box = first_disclosure.bounding_box()
+            assert closed_box is not None
+            assert initial_body is not None
+            held_routes.pop(0).fulfill(status=200, content_type="application/json", body=initial_body)
+            page.wait_for_timeout(250)
+            after_equal = capture_dom_identity(page, ".run-detail")
+            after_disclosure = capture_dom_identity(page, "details[data-ui-fidelity-anchor='first-disclosure']")
+            after_box = first_disclosure.bounding_box()
+            assert after_box is not None
+            assert after_equal["identity"] == closed_detail["identity"]
+            assert after_disclosure["identity"] == closed_disclosure["identity"]
+            assert after_disclosure["text"] == closed_disclosure["text"]
+            assert after_box == closed_box
+            page.locator(".app-shell").screenshot(path=str(tmp_path / f"refresh-after-equal-{theme}-{width}x{height}.png"))
+
+            for _ in range(5):
+                page.evaluate("window.dispatchEvent(new Event('aflow-history-changed'))")
+                for _ in range(40):
+                    if request_count["value"] >= 3:
+                        break
+                    page.wait_for_timeout(50)
+                if request_count["value"] >= 3:
+                    break
+            assert request_count["value"] >= 3, "the changed refresh request was not issued"
+            if width < 960:
+                page.get_by_role("button", name="← Back to Run history", exact=True).click()
+            changed_row = page.locator(
+                f".run-list-item[data-run-key='{changed_fixture['run_id']}']:visible"
+            )
+            expect(changed_row).to_be_visible()
+            expect(changed_row).to_contain_text("Failed")
+            captures["changed_row_text"] = changed_row.inner_text()
+            captures["after_equal"] = {
+                "detail": after_equal,
+                "disclosure": after_disclosure,
+                "box": after_box,
+            }
+            captures["screenshots"] = [
+                f"refresh-before-{theme}-{width}x{height}.png",
+                f"refresh-after-equal-{theme}-{width}x{height}.png",
+            ]
+        finally:
+            for route in held_routes:
+                try:
+                    if initial_body is not None:
+                        route.fulfill(status=200, content_type="application/json", body=initial_body)
+                except Exception:
+                    pass
+            browser.close()
+    _write_artifact_manifest(tmp_path / f"refresh-comparison-{theme}-{width}x{height}.json", captures)

@@ -17,6 +17,8 @@ interface ProjectPickerProps {
   projects: ProjectInfo[]
   selectedProjectId: string | null
   loading: boolean
+  refreshing?: boolean
+  hasLoaded?: boolean
   error: string | null
   onSelectProject: (project: ProjectInfo) => void
   onRefresh: () => void | Promise<void>
@@ -114,6 +116,8 @@ export function ProjectPicker({
   projects,
   selectedProjectId,
   loading,
+  refreshing = false,
+  hasLoaded = true,
   error,
   onSelectProject,
   onRefresh,
@@ -195,6 +199,7 @@ export function ProjectPicker({
   }
 
   const query = search.trim().toLowerCase()
+  const showLoadedContent = !loading && (hasLoaded || !error)
   const projectGroups = groupProjectRegistrations(projects, query, selectedProjectId)
   const allCandidates = (discovery?.candidates ?? []).filter(candidate => candidate.registered_project_id === null)
   const filteredCandidates = allCandidates.filter((candidate) =>
@@ -218,7 +223,7 @@ export function ProjectPicker({
       aria-expanded={showCreateForm}
     >{showCreateForm ? 'Close form' : 'Add project'}</button>,
     more: <MoreMenu label="More project actions" triggerLabel="More">
-      <MenuItem disabled={loading || discoveryLoading} onClick={() => void handleRefresh()}>Refresh</MenuItem>
+      <MenuItem disabled={loading || refreshing || discoveryLoading} onClick={() => void handleRefresh()}>Refresh</MenuItem>
     </MoreMenu>,
   })
 
@@ -233,7 +238,7 @@ export function ProjectPicker({
           </div>
         </div>
         <div className="dashboard-actions">
-          <button className="btn btn-secondary btn-sm" onClick={handleRefresh} disabled={loading || discoveryLoading}>
+          <button className="btn btn-secondary btn-sm" onClick={handleRefresh} disabled={loading || refreshing || discoveryLoading}>
             Refresh
           </button>
           <button
@@ -257,7 +262,7 @@ export function ProjectPicker({
 
       {loading && <div className="dashboard-loading card"><div className="spinner" />Loading registered projects…</div>}
 
-      {!loading && !error && (
+      {showLoadedContent && (
         <>
           {hosted && discovery && <div className="project-server-context text-xs text-dim">
             Registered beneath the server's managed root — <span className="mono">{discovery.managed_root}</span>.

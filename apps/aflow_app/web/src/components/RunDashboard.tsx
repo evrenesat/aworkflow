@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useId, useMemo, useRef, useState } from 'react'
+import { memo, useCallback, useEffect, useId, useMemo, useRef, useState } from 'react'
 import type {
   ConfigValidationIssue,
   ControlPlaneCapabilities,
@@ -249,18 +249,37 @@ function usePendingWriteKeys() {
 function mergeEvents(current: RunEvent[], next: RunEvent[]): RunEvent[] {
   const bySequence = new Map<number, RunEvent>()
   for (const event of [...current, ...next]) bySequence.set(event.sequence, event)
-  return [...bySequence.values()]
+  const merged = [...bySequence.values()]
     .sort((left, right) => left.sequence - right.sequence)
     .slice(-MAX_TIMELINE_EVENTS)
+  if (merged.length === current.length && merged.every((event, index) => (
+    event === current[index] || JSON.stringify(event) === JSON.stringify(current[index])
+  ))) return current
+  return merged
 }
 
 function upsertRun(current: RunStatus[], next: RunStatus): RunStatus[] {
   const existing = current.findIndex((run) => run.run_id === next.run_id)
   if (existing < 0) return [...current, next]
-  return current.map((run) => {
+  let changed = false
+  const updated = current.map((run) => {
     if (run.run_id !== next.run_id || run.revision > next.revision) return run
-    return { ...next, ...((run.history_revision ?? 0) > (next.history_revision ?? 0) ? { history_state: run.history_state, history_revision: run.history_revision } : {}) }
+    const candidate = { ...next, ...((run.history_revision ?? 0) > (next.history_revision ?? 0) ? { history_state: run.history_state, history_revision: run.history_revision } : {}) }
+    if (candidate === run || JSON.stringify(candidate) === JSON.stringify(run)) return run
+    changed = true
+    return candidate
   })
+  return changed ? updated : current
+}
+
+function reconcilePlans(current: ControlPlanePlan[], next: ControlPlanePlan[]): ControlPlanePlan[] {
+  const previousByPath = new Map(current.map(plan => [plan.path, plan]))
+  const reconciled = next.map(plan => {
+    const previous = previousByPath.get(plan.path)
+    return previous && JSON.stringify(previous) === JSON.stringify(plan) ? previous : plan
+  })
+  if (reconciled.length === current.length && reconciled.every((plan, index) => plan === current[index])) return current
+  return reconciled
 }
 
 function timestamp(value: unknown): string {
@@ -705,6 +724,31 @@ function runTimingSummary(run: RunStatus, elapsed: string | null): string {
   return 'Not reported'
 }
 
+const LiveRunTiming = memo(function LiveRunTiming({ run }: { run: RunStatus }) {
+  const [now, setNow] = useState(() => Date.now())
+  const ticking = run.status === 'running' || run.activity === 'active'
+  useEffect(() => {
+    if (!ticking) return
+    setNow(Date.now())
+    const timer = setInterval(() => setNow(Date.now()), 1_000)
+    return () => clearInterval(timer)
+  }, [ticking, run.started_at, run.ended_at])
+  return runTimingSummary(run, executionDuration(run, now))
+})
+
+const LiveRunElapsed = memo(function LiveRunElapsed({ run, label }: { run: RunStatus; label: string }) {
+  const [now, setNow] = useState(() => Date.now())
+  const ticking = run.status === 'running' || run.activity === 'active'
+  useEffect(() => {
+    if (!ticking) return
+    setNow(Date.now())
+    const timer = setInterval(() => setNow(Date.now()), 1_000)
+    return () => clearInterval(timer)
+  }, [ticking, run.started_at, run.ended_at])
+  const elapsed = executionDuration(run, now)
+  return elapsed ? ` · ${label} ${elapsed}` : null
+})
+
 function lastExecutedEvidence(
   events: RunEvent[],
   context: RunContext | null,
@@ -985,6 +1029,10 @@ export function RunDashboard({ visible = true, page, onNewRun, onCancelNewRun, o
   const [missingRunId, setMissingRunId] = useState<string | null>(null)
   const [events, setEvents] = useState<RunEvent[]>([])
   const [context, setContext] = useState<RunContext | null>(null)
+  const runsRef = useRef(runs)
+  const contextRef = useRef(context)
+  runsRef.current = runs
+  contextRef.current = context
   const [rawOpen, setRawOpen] = useState(false)
   const [reportOpen, setReportOpen] = useState(false)
   const [contextBusy, setContextBusy] = useState(false)
@@ -1038,7 +1086,6 @@ export function RunDashboard({ visible = true, page, onNewRun, onCancelNewRun, o
     setLocalPendingSuccessor(pending)
     onPendingSuccessorStartChange?.(pending)
   }, [onPendingSuccessorStartChange])
-  const [elapsedNow, setElapsedNow] = useState(() => Date.now())
   // New run is a compact disclosure: it opens for an exact plan handoff, when
   // no runs exist, or when a frozen successor draft needs attention.
   const [localPage, setLocalPage] = useState<'runs' | 'new-run'>(initialPlanPath ? 'new-run' : 'runs')
@@ -1243,14 +1290,6 @@ export function RunDashboard({ visible = true, page, onNewRun, onCancelNewRun, o
     setConfirmResume(false)
   }, [selectedRun])
 
-  // A live elapsed clock only ticks while a nonterminal owned run is selected.
-  useEffect(() => {
-    if (!visible || !selectedRunIsActive || !selectedRun?.started_at) return
-    setElapsedNow(Date.now())
-    const ticker = setInterval(() => setElapsedNow(Date.now()), 1_000)
-    return () => clearInterval(ticker)
-  }, [visible, selectedRunIsActive, selectedRun?.started_at])
-
   // The registered project id is the sole authority: no root matching, no
   // internal switcher, and never a fallback to another control-plane project.
   useEffect(() => {
@@ -1277,7 +1316,12 @@ export function RunDashboard({ visible = true, page, onNewRun, onCancelNewRun, o
       } catch (loadError) {
         if (active) setProjectReadError(errorMessage(loadError, 'Failed to load control-plane projects'))
       } finally {
-        if (active) setLoading(false)
+        if (active) {
+          setLoading(false)
+          // A stream-triggered background read may supersede the initial
+          // dashboard request; it must not strand the initial refresh label.
+          setRefreshing(false)
+        }
       }
     })()
     return () => {
@@ -1324,6 +1368,7 @@ export function RunDashboard({ visible = true, page, onNewRun, onCancelNewRun, o
     if (!visible || !projectId || !selectedRunId || deletedIds.has(selectedRunId)) return
     let active = true
     setEvents([])
+    contextRef.current = null
     setContext(null)
     setStatusUpdatedAt(null)
     setContextUpdatedAt(null)
@@ -1343,7 +1388,7 @@ export function RunDashboard({ visible = true, page, onNewRun, onCancelNewRun, o
         refreshTimer = null
         refreshRequested = false
         refreshingSnapshot = true
-        void refreshPageRef.current().finally(() => {
+        void refreshPageRef.current({ background: true }).finally(() => {
           refreshingSnapshot = false
           if (refreshRequested) scheduleSnapshotRefresh()
         })
@@ -1392,19 +1437,18 @@ export function RunDashboard({ visible = true, page, onNewRun, onCancelNewRun, o
     // eslint-disable-next-line react-hooks/exhaustive-deps -- resubscribes only per project/run, not per render
   }, [visible, projectId, selectedRunId, deletedIds])
 
-  async function loadDashboard(nextProjectId: string, isActive = () => true) {
+  async function loadDashboard(nextProjectId: string, isActive = () => true, { background = false }: { background?: boolean } = {}) {
     const requestedHistory = historyFilter
     const scope = JSON.stringify([nextProjectId, requestedHistory])
     if (loadedHistory.current.scope !== scope) loadedHistory.current = { scope, pages: 1 }
-    // Do not present an old projection as a newly resolved default while the
-    // refresh is reading the committed pair again.
-    setCommitted(null)
-    setCommittedError(null)
     const pageCount = loadedHistory.current.pages
     const request = ++historyRequest.current
     const callerActive = isActive
     isActive = () => callerActive() && requestedHistory === historyFilterRef.current && request === historyRequest.current
-    setHistoryLoad({ scope, status: 'pending' })
+    // A retained, ready history snapshot remains authoritative while a
+    // background read is in flight. Only a new scope enters the initial
+    // pending state; failures later become an explicit stale notice.
+    if (historyLoad.scope !== scope) setHistoryLoad({ scope, status: 'pending' })
     async function reloadHistory() {
       const runs: RunStatus[] = []
       let cursor: string | undefined
@@ -1420,8 +1464,15 @@ export function RunDashboard({ visible = true, page, onNewRun, onCancelNewRun, o
         }
         const result = { runs, next_cursor: cursor ?? null }
         if (isActive()) {
-          setHistoryLoad({ scope, status: 'ready' })
-          setHistorySnapshot({ scope, runIds: result.runs.map(run => run.run_id) })
+          setHistoryLoad(current => current.scope === scope && current.status === 'ready'
+            ? current
+            : { scope, status: 'ready' })
+          const runIds = result.runs.map(run => run.run_id)
+          setHistorySnapshot(current => current.scope === scope
+            && current.runIds.length === runIds.length
+            && current.runIds.every((runId, index) => runId === runIds[index])
+            ? current
+            : { scope, runIds })
         }
         return result
       } catch (error) {
@@ -1430,7 +1481,7 @@ export function RunDashboard({ visible = true, page, onNewRun, onCancelNewRun, o
       }
     }
     try {
-      setRefreshing(true)
+      if (!background) setRefreshing(true)
       const [nextReadiness, nextCapabilities, nextPlans, page] = await Promise.all([
         api.getControlPlaneReadiness(),
         api.getControlPlaneCapabilities(nextProjectId),
@@ -1439,9 +1490,9 @@ export function RunDashboard({ visible = true, page, onNewRun, onCancelNewRun, o
       ])
       if (!isActive()) return
       setDashboardReadError(null)
-      setReadiness(nextReadiness)
-      setCapabilities(nextCapabilities)
-      setPlans(nextPlans)
+      setReadiness(current => JSON.stringify(current) === JSON.stringify(nextReadiness) ? current : nextReadiness)
+      setCapabilities(current => JSON.stringify(current) === JSON.stringify(nextCapabilities) ? current : nextCapabilities)
+      setPlans(current => reconcilePlans(current, nextPlans))
       setNextRunCursor(page.next_cursor)
       setExposedShellProjectId(nextProjectId)
       const orderedRuns = newestRunsFirst(page.runs.filter(run => !deletedRef.current.has(run.run_id)))
@@ -1452,12 +1503,14 @@ export function RunDashboard({ visible = true, page, onNewRun, onCancelNewRun, o
         const pageIds = new Set(page.runs.map((run) => run.run_id))
         const pinned = current.filter((run) => !pageIds.has(run.run_id)
           && (run.run_id === requestedRunRef.current || run.run_id === selectedRunRef.current))
-        return [...orderedRuns.map(run => {
+        const refreshed = [...orderedRuns.map(run => {
           const previous = current.find(item => item.run_id === run.run_id)
           const next = run.run_id === selectedRunRef.current && previous ? previous : run
           const history = previous && (previous.history_revision ?? 0) > (run.history_revision ?? 0) ? previous : run
-          return { ...next, history_state: history.history_state, history_revision: history.history_revision }
+          const candidate = { ...next, history_state: history.history_state, history_revision: history.history_revision }
+          return previous && JSON.stringify(previous) === JSON.stringify(candidate) ? previous : candidate
         }), ...pinned]
+        return refreshed.length === current.length && refreshed.every((run, index) => run === current[index]) ? current : refreshed
       })
       // Default to the newest returned run only when there is no requested
       // or current selection: a linked run is validated separately through
@@ -1480,15 +1533,15 @@ export function RunDashboard({ visible = true, page, onNewRun, onCancelNewRun, o
           workflows_toml: committedPair.workflows_toml,
         })
         if (!isActive()) return
-        setCommitted({
+        const nextCommitted = {
           validationState: projected.validation.state,
           form: projected.form,
           syntaxIssues: projected.syntax_issues,
-        })
+        }
+        setCommitted(current => JSON.stringify(current) === JSON.stringify(nextCommitted) ? current : nextCommitted)
         setCommittedError(null)
       } catch (projectionError) {
         if (!isActive()) return
-        setCommitted(null)
         setCommittedError(errorMessage(projectionError, 'Failed to read the committed configuration'))
       }
     } catch (loadError) {
@@ -1496,7 +1549,7 @@ export function RunDashboard({ visible = true, page, onNewRun, onCancelNewRun, o
       // Preserve the last daemon snapshot: a connection failure is not a run transition.
       setDashboardReadError(`${errorMessage(loadError, 'Failed to refresh runs')}. Existing run data remains visible.`)
     } finally {
-      if (isActive()) setRefreshing(false)
+      if (isActive() && !background) setRefreshing(false)
     }
   }
 
@@ -1517,9 +1570,12 @@ export function RunDashboard({ visible = true, page, onNewRun, onCancelNewRun, o
       if (!isActive() || selectedRunRef.current !== runId || requestNumber !== snapshotRequestRef.current) return
       if (deletedRef.current.has(runId)) return
       setSelectedRunReadError(null)
+      const refreshedRuns = upsertRun(runsRef.current, run)
       setRuns((current) => upsertRun(current, run))
-      setAcceptedSelectedDetail({ projectId: nextProjectId, runId })
-      setStatusUpdatedAt(new Date().toISOString())
+      setAcceptedSelectedDetail(current => current?.projectId === nextProjectId && current.runId === runId
+        ? current
+        : { projectId: nextProjectId, runId })
+      if (refreshedRuns !== runsRef.current) setStatusUpdatedAt(new Date().toISOString())
       setEvents((current) => mergeEvents(current, tail))
     } catch (loadError) {
       if (!isActive() || selectedRunRef.current !== runId || requestNumber !== snapshotRequestRef.current) return
@@ -1548,29 +1604,40 @@ export function RunDashboard({ visible = true, page, onNewRun, onCancelNewRun, o
     pageRefreshRef.current = null
     return () => { requestAbortRef.current.abort(); contextAbortRef.current.abort(); refreshEpochRef.current += 1; snapshotRequestRef.current += 1; contextRequestRef.current += 1 }
   }, [projectId, selectedRunId, visible])
-  async function refreshPage() {
+  async function refreshPage({ background = false }: { background?: boolean } = {}) {
     if (!visible || !projectId) return
     if (projectAvailable !== true) { setRefreshNonce(nonce => nonce + 1); return }
     if (pageRefreshRef.current) return pageRefreshRef.current
     const epoch = refreshEpochRef.current
     const active = () => epoch === refreshEpochRef.current
     const task = (async () => {
-      setRefreshing(true)
+      if (!background) setRefreshing(true)
       if (handoffError) setRefreshNonce(nonce => nonce + 1)
-      await loadDashboard(projectId, active)
+      await loadDashboard(projectId, active, { background })
       if (!active()) return
-      setRefreshing(true)
+      if (!background) setRefreshing(true)
       await Promise.all([
         selectedRunId ? loadSelectedRun(projectId, selectedRunId, active) : Promise.resolve(),
-        loadContext(desiredContextLevelRef.current),
+        loadContext(desiredContextLevelRef.current, selectedRunId, { background }),
         newRunPage ? refreshPreflight() : Promise.resolve(),
       ])
-    })().finally(() => { if (active()) { pageRefreshRef.current = null; setRefreshing(false) } })
+    })().finally(() => { if (active()) { pageRefreshRef.current = null; if (!background) setRefreshing(false) } })
     pageRefreshRef.current = task
     return task
   }
   const refreshPageRef = useRef(refreshPage)
   refreshPageRef.current = refreshPage
+  useEffect(() => {
+    const refreshInBackground = (): void => {
+      // markDeleted already owns the selected deleted-record projection;
+      // do not let the broadcast used by the global history view replace it
+      // before the user can review the retained recovery message.
+      if (selectedRunRef.current && deletedRef.current.has(selectedRunRef.current)) return
+      void refreshPageRef.current({ background: true })
+    }
+    window.addEventListener('aflow-history-changed', refreshInBackground)
+    return () => window.removeEventListener('aflow-history-changed', refreshInBackground)
+  }, [projectId, visible])
   async function refreshSelectedRun() { await refreshPage() }
 
   /** An explicit run pick: cleared stale-link guidance and a history push report. */
@@ -1730,38 +1797,46 @@ export function RunDashboard({ visible = true, page, onNewRun, onCancelNewRun, o
    * compatibility flag) needs no further acknowledgement. A stale response
    * (run changed, diagnostics closed, dashboard hidden) is discarded.
    */
-  async function loadContext(level: 'lite' | 'full', runId: string | null = selectedRunId) {
+  async function loadContext(level: 'lite' | 'full', runId: string | null = selectedRunId, { background = false }: { background?: boolean } = {}) {
     if (!projectId || !runId) return
     const request = ++contextRequestRef.current
     contextAbortRef.current.abort()
     contextAbortRef.current = new AbortController()
-    setContextBusy(true)
+    if (!background) setContextBusy(true)
     setContextError(null)
     try {
       const result = await api.getRunContext(projectId, runId, level, level === 'full', { signal: contextAbortRef.current.signal })
       if (request !== contextRequestRef.current || selectedRunRef.current !== runId) return
-      setContext((previous) => {
-        if (previous?.run_id !== runId || level !== 'lite') return result
+      const previous = contextRef.current
+      let nextContext: RunContext = result
+      if (previous?.run_id === runId && level === 'lite') {
         // A progress refresh is intentionally allowed to use Lite context,
         // but it must not discard a richer Full diagnostics payload. Preserve
         // the full response and replace only the additive canonical progress
         // projection when the Lite response actually returned one.
         if (previous.level === 'full') {
-          return Object.prototype.hasOwnProperty.call(result.data, 'progress')
+          nextContext = Object.prototype.hasOwnProperty.call(result.data, 'progress')
             ? { ...previous, data: { ...previous.data, progress: result.data.progress } }
             : previous
-        }
-        if (Object.prototype.hasOwnProperty.call(result.data, 'progress')) return result
-        return previous.data.progress === undefined
+        } else if (Object.prototype.hasOwnProperty.call(result.data, 'progress')) {
+          nextContext = result
+        } else {
+          nextContext = previous.data.progress === undefined
           ? result
           : { ...result, data: { ...result.data, progress: previous.data.progress } }
-      })
-      setContextUpdatedAt(new Date().toISOString())
-      setContextBusy(false)
+        }
+      }
+      if (previous && nextContext !== previous && JSON.stringify(nextContext) === JSON.stringify(previous)) nextContext = previous
+      if (nextContext !== previous) {
+        contextRef.current = nextContext
+        setContext(nextContext)
+        setContextUpdatedAt(new Date().toISOString())
+      }
+      if (!background) setContextBusy(false)
     } catch (contextLoadError) {
       if (request !== contextRequestRef.current || selectedRunRef.current !== runId) return
       setContextError(errorMessage(contextLoadError, 'Failed to load run debugging info'))
-      setContextBusy(false)
+      if (!background) setContextBusy(false)
     }
   }
 
@@ -2603,7 +2678,6 @@ export function RunDashboard({ visible = true, page, onNewRun, onCancelNewRun, o
       ? 'stream reconnecting — last snapshot shown'
       : 'stream stopped — refresh for updates'
   const startTime = selectedRun?.started_at ?? null
-  const elapsed = selectedRun ? executionDuration(selectedRun, elapsedNow) : null
   const canonicalDetail = canonicalProgressFromContext(context, selectedRun?.run_id ?? null)
   const canonicalProgress = selectedRun?.progress ?? canonicalDetail
   // The canonical projection owns history and approval facts when present.
@@ -2664,7 +2738,7 @@ export function RunDashboard({ visible = true, page, onNewRun, onCancelNewRun, o
   const recoveryReplacementStarted = Boolean(
     recoveryWorkerEvidenceMatches && recoveryWorkerEvidence?.operation_started,
   )
-  const selectedRunTiming = selectedRun ? runTimingSummary(selectedRun, elapsed) : 'Not reported'
+  const selectedRunTiming = selectedRun ? runTimingSummary(selectedRun, null) : 'Not reported'
   const latestResultEvent = latestRunResultEvent(events)
   const latestResultPresentation = latestResultEvent ? presentRunEvent(latestResultEvent) : null
   const observedInvocation = selectedRun?.current_step
@@ -3316,7 +3390,7 @@ export function RunDashboard({ visible = true, page, onNewRun, onCancelNewRun, o
                 {isTerminalInactiveRun(selectedRun) && checkpoints && <p><span>{checkpointProgressText(checkpoints)}</span></p>}
                 {outcome?.currentTurn && <p>Current turn: {outcome.currentTurn}</p>}
                 {observedInvocation && <p>Last observed invocation: <span>{observedInvocation}</span></p>}
-                {selectedRunTiming !== 'Not reported' && <p>{selectedRunTiming}</p>}
+                {selectedRunTiming !== 'Not reported' && <p><LiveRunTiming run={selectedRun} /></p>}
                 {outcome?.decision && <p>{outcome.decision}</p>}
                 {outcome?.finishedTurn && <p>Last finished turn: {outcome.finishedTurn}</p>}
                 {outcome?.finishedSummary && <p>Last finished summary: {outcome.finishedSummary}</p>}
@@ -3338,14 +3412,14 @@ export function RunDashboard({ visible = true, page, onNewRun, onCancelNewRun, o
                     <dl className="run-scan-summary">
                       <div><dt>Project</dt><dd className="mono">{projectId}</dd></div>
                       <div><dt>Worker / reviewer</dt><dd>{runActorSummary(lastExecuted)}</dd></div>
-                      <div><dt>Elapsed / completion</dt><dd>{selectedRunTiming}</dd></div>
+                      <div><dt>Elapsed / completion</dt><dd><LiveRunTiming run={selectedRun} /></dd></div>
                     </dl>
                     <dl className="run-progress-strip">
                       {selectedRun.workflow_name && <div><dt>Workflow</dt><dd>{formatMachineLabel(selectedRun.workflow_name)}</dd></div>}
                       <div><dt>Team</dt><dd>{selectedRun.team ? formatMachineLabel(selectedRun.team) : 'Not recorded'}</dd></div>
                       <div><dt>Max turns</dt><dd>{selectedRun.max_turns ?? 'Not reported'}</dd></div>
                       {lastExecuted && <div><dt>Last executed</dt><dd>{lastExecuted.turnNumber !== null ? `turn ${lastExecuted.turnNumber}` : 'Not reported'}</dd></div>}
-                      {startTime ? <div><dt>Started</dt><dd>{timestamp(startTime)}{elapsed ? ` · ${selectedRunIsActive ? 'running for' : 'duration'} ${elapsed}` : ''}</dd></div>
+                      {startTime ? <div><dt>Started</dt><dd>{timestamp(startTime)}<LiveRunElapsed run={selectedRun} label={selectedRunIsActive ? 'running for' : 'duration'} /></dd></div>
                         : selectedRun.evidence.manifest_created_at ? <div><dt>Submitted</dt><dd>{timestamp(selectedRun.evidence.manifest_created_at)}</dd></div> : null}
                       {selectedRun.ended_at && <div><dt>Ended</dt><dd>{timestamp(selectedRun.ended_at)}</dd></div>}
                     </dl>

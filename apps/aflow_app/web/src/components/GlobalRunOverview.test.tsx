@@ -170,10 +170,10 @@ describe('GlobalRunOverview project context', () => {
     expect(screen.queryByRole('button', { name: /visible-run/ })).toBeNull()
 
     fireEvent.click(screen.getByRole('button', { name: 'Refresh' }))
-    await waitFor(() => expect(screen.getByRole('status').textContent).toBe('Refreshing runs… Results are incomplete.'))
+    await waitFor(() => expect(screen.queryByRole('status')).toBeNull())
     // The refresh is for the selected history, so the usable archived row stays visible.
     expect(screen.getByRole('button', { name: /archived-run/ })).toBeTruthy()
-    expect(view.container.querySelector('.global-run-results')?.getAttribute('aria-busy')).toBe('true')
+    expect(view.container.querySelector('.global-run-results')?.getAttribute('aria-busy')).toBe('false')
 
     refreshed.resolve(page([makeRun('refreshed-run', { history_state: 'archived', plan_path: 'plans/refreshed.md' })]))
     expect(await screen.findByRole('button', { name: /refreshed-run/ })).toBeTruthy()
@@ -400,7 +400,7 @@ describe('GlobalRunOverview project context', () => {
     expect(screen.getByRole('button', { name: /attention-old/ })).toBeTruthy()
 
     fireEvent.click(screen.getByRole('button', { name: 'Refresh' }))
-    await waitFor(() => expect(screen.getByRole('status').textContent).toBe('Refreshing runs… Results are incomplete.'))
+    await waitFor(() => expect(screen.queryByRole('status')).toBeNull())
     expect(screen.getByRole('button', { name: /ongoing-old/ })).toBeTruthy()
     expect(screen.getByRole('button', { name: /attention-old/ })).toBeTruthy()
 
@@ -729,7 +729,7 @@ describe('GlobalRunOverview project context', () => {
     await waitFor(() => expect(row.textContent).toContain('1 of 2 checkpoints approved'))
 
     fireEvent.click(screen.getByRole('button', { name: 'Refresh', exact: true }))
-    await waitFor(() => expect(screen.getByRole('status').textContent).toBe('Refreshing runs… Results are incomplete.'))
+    await waitFor(() => expect(screen.queryByRole('status')).toBeNull())
     expect(row.textContent).toContain('1 of 2 checkpoints approved')
     expect(detailCalls).toBe(1)
 

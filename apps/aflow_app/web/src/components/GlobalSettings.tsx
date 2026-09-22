@@ -22,6 +22,10 @@ const tabs = ['Agents & Roles', 'Teams', 'Workflows', 'Prompts', 'Skills', 'Gene
 const SETTINGS_HEADER_COMPACT_QUERY = '(max-width: 1199px)'
 const clone = <T,>(value: T): T => JSON.parse(JSON.stringify(value))
 
+function sameValue(left: unknown, right: unknown): boolean {
+  return left === right || JSON.stringify(left) === JSON.stringify(right)
+}
+
 function useSettingsHeaderCompact(): boolean {
   const [compact, setCompact] = useState(() => (
     typeof window !== 'undefined'
@@ -133,12 +137,12 @@ export function GlobalSettings({ onDirtyChange, onSaved }: { onDirtyChange: (dir
   }, [draft, selectedTeam, selectedWorkflow])
   function acceptServer(saved: SettingsResponse, epoch: number) {
     if (epochRef.current !== epoch) return
-    setServer(saved); setServerText(saved.advanced_toml)
+    setServer(current => sameValue(current, saved) ? current : saved); setServerText(saved.advanced_toml)
     setServerDraft({ bind_host: saved.bind_host, bind_port: String(saved.bind_port), managed_projects_root: saved.managed_projects_root })
   }
   function acceptSkills(list: SkillSummary[], epoch: number) {
     if (epochRef.current !== epoch) return
-    setSkills(list); setSkillsError(null)
+    setSkills(current => sameValue(current, list) ? current : list); setSkillsError(null)
     setSelectedSkill(current => (current && list.some(skill => skill.name === current) ? current : list[0]?.name ?? ''))
   }
   /** Loads one skill's content/revision baseline on selection; drafts win over reloads. */
