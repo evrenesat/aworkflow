@@ -884,6 +884,18 @@ input::placeholder, textarea::placeholder {
   gap: var(--spacing-sm);
 }
 
+.checkpoint-history-disclosure-controls {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: var(--spacing-xs) var(--spacing-sm);
+  padding-top: var(--spacing-xs);
+}
+
+.checkpoint-history-disclosure-controls > span {
+  margin-right: auto;
+}
+
 .checkpoint-history-delivery-summary {
   display: flex;
   align-items: baseline;
@@ -920,8 +932,39 @@ input::placeholder, textarea::placeholder {
   min-height: var(--tap-target);
   display: flex;
   align-items: center;
+  justify-content: flex-start;
+  gap: var(--spacing-sm);
   cursor: pointer;
   font-weight: 600;
+}
+
+.checkpoint-history-disclosure > summary > * {
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+.checkpoint-history-disclosure > summary::before {
+  content: '▸';
+  color: var(--color-text-dim);
+  margin-right: var(--spacing-xs);
+}
+
+.checkpoint-history-disclosure[open] > summary::before {
+  content: '▾';
+}
+
+.checkpoint-history-checkpoints > summary {
+  justify-content: flex-start;
+}
+
+.checkpoint-history-checkpoints > summary > span:last-child {
+  margin-left: auto;
+}
+
+.checkpoint-history-navigation-tools {
+  display: flex;
+  justify-content: flex-end;
+  min-height: var(--tap-target);
 }
 
 .checkpoint-history-change-list {

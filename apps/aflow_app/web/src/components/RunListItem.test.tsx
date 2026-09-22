@@ -63,6 +63,7 @@ describe('RunListItem', () => {
   })
 
   it('supports focus, explicit touch toggle, Escape, and full-title preview content', () => {
+    vi.useFakeTimers()
     const longRun = {
       ...run,
       original_plan_display_name: 'Automatic plan consumption and repair upgrades with a very long title',
@@ -78,6 +79,7 @@ describe('RunListItem', () => {
     fireEvent.keyDown(document, { key: 'Escape' })
     expect(previewToggle.getAttribute('aria-expanded')).toBe('false')
     fireEvent.focus(selection)
+    act(() => vi.advanceTimersByTime(300))
     expect(screen.getByRole('dialog')).toBeTruthy()
   })
 

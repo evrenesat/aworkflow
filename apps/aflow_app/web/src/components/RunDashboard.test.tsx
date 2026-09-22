@@ -3253,7 +3253,88 @@ describe('RunDashboard', () => {
     expect(ownerActions!.compareDocumentPosition(evidence) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy()
     expect(currentCheckpoint.getAttribute('aria-current')).toBe('true')
     expect(within(detail).getByRole('button', { name: /Checkpoint 4: Reviewed/ })).toBeDefined()
-    expect(within(detail).getByText('Team & change history', { selector: 'summary' })).toBeDefined()
+    expect(within(detail).getByText('Run settings & changes', { selector: 'summary' })).toBeDefined()
+  })
+
+  it('bulk informational controls include parent technical details without reads or mutations', async () => {
+    const listed = { ...ownedRun, evidence: {}, plan_path: null, progress: canonicalListProgress() }
+    const canonicalDetail = canonicalDetailProgress()
+    vi.mocked(api.listControlPlaneRuns).mockResolvedValue({ runs: [listed], next_cursor: null, schema_version: 1 })
+    vi.mocked(api.getControlPlaneRun).mockResolvedValue(listed)
+    vi.mocked(api.getRunContext).mockResolvedValue({
+      run_id: listed.run_id,
+      level: 'lite',
+      schema_version: 1,
+      data: { progress: canonicalDetail },
+    })
+
+    renderDashboard()
+    await screen.findByRole('button', { name: /Checkpoint 5: Active/ })
+    const contextCallsBeforeBulk = vi.mocked(api.getRunContext).mock.calls.length
+    const details = screen.getByText('Details', { selector: 'summary' }).closest('details') as HTMLDetailsElement
+    const diagnostics = screen.getByRole('button', { name: 'Diagnostics' })
+    expect(details.hasAttribute('open')).toBe(false)
+    expect(diagnostics.getAttribute('aria-expanded')).toBe('false')
+
+    fireEvent.click(screen.getByRole('button', { name: 'Expand all' }))
+    await waitFor(() => {
+      expect(details.hasAttribute('open')).toBe(true)
+      expect(diagnostics.getAttribute('aria-expanded')).toBe('true')
+    })
+    expect(vi.mocked(api.getRunContext).mock.calls.length).toBe(contextCallsBeforeBulk)
+    expect(api.controlControlPlaneRun).not.toHaveBeenCalled()
+    expect(api.ownerStopControlPlaneRun).not.toHaveBeenCalled()
+    expect(api.startControlPlaneRun).not.toHaveBeenCalled()
+
+    fireEvent.click(screen.getByRole('button', { name: 'Collapse all' }))
+    await waitFor(() => {
+      expect(details.hasAttribute('open')).toBe(false)
+      expect(diagnostics.getAttribute('aria-expanded')).toBe('false')
+    })
+  })
+
+  it('bulk informational controls include saved run settings when present', async () => {
+    const listed = {
+      ...ownedRun,
+      progress: canonicalListProgress(),
+      evidence: {
+        ...ownedRun.evidence,
+        overrides: { state: 'applied', revision: 2, max_turns: 12, team: 'full', role_selectors: { worker: 'harness/impl-a' } },
+      },
+    }
+    const canonicalDetail = canonicalDetailProgress()
+    vi.mocked(api.listControlPlaneRuns).mockResolvedValue({ runs: [listed], next_cursor: null, schema_version: 1 })
+    vi.mocked(api.getControlPlaneRun).mockResolvedValue(listed)
+    vi.mocked(api.getRunContext).mockResolvedValue({
+      run_id: listed.run_id,
+      level: 'lite',
+      schema_version: 1,
+      data: { progress: canonicalDetail },
+    })
+
+    renderDashboard()
+    await screen.findByRole('button', { name: /Checkpoint 5: Active/ })
+    const savedSettings = document.querySelector('details.run-settings-changes-disclosure') as HTMLDetailsElement
+    const diagnostics = screen.getByRole('button', { name: 'Diagnostics' })
+    const contextCallsBeforeBulk = vi.mocked(api.getRunContext).mock.calls.length
+    expect(savedSettings).not.toBeNull()
+    expect(savedSettings.hasAttribute('open')).toBe(false)
+
+    fireEvent.click(screen.getByRole('button', { name: 'Expand all' }))
+    await waitFor(() => {
+      expect(savedSettings.hasAttribute('open')).toBe(true)
+      expect(diagnostics.getAttribute('aria-expanded')).toBe('true')
+    })
+    expect(vi.mocked(api.getRunContext).mock.calls.length).toBe(contextCallsBeforeBulk)
+    expect(api.controlControlPlaneRun).not.toHaveBeenCalled()
+    expect(api.ownerStopControlPlaneRun).not.toHaveBeenCalled()
+    expect(api.startControlPlaneRun).not.toHaveBeenCalled()
+
+    fireEvent.click(screen.getByRole('button', { name: 'Collapse all' }))
+    await waitFor(() => {
+      expect(savedSettings.hasAttribute('open')).toBe(false)
+      expect(diagnostics.getAttribute('aria-expanded')).toBe('false')
+    })
   })
 
   it('inspects selected checkpoint history while preserving full diagnostics on refresh', async () => {
@@ -3552,6 +3633,7 @@ describe('RunDashboard', () => {
     fireEvent.click(screen.getByText('Raw details'))
     await waitFor(() => expect(screen.getByText(/run run-owned/)).toBeDefined())
     fireEvent.click(screen.getByRole('button', { name: /^run-other / }))
+    openTechnicalDetails()
     await screen.findByText(/run run-other/)
     await screen.findByText('Checkpoint 5: Fresh (5 of 14)')
     expect(screen.queryByText('Checkpoint 4: Stale (4 of 14)')).toBeNull()

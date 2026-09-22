@@ -1044,7 +1044,8 @@ export function RunDashboard({ visible = true, page, onNewRun, onCancelNewRun, o
   function openNewRunPage() { setLocalPage('new-run'); onNewRun?.() }
   const [failedRequestId, setFailedRequestId] = useState<string | null>(null)
   const [advancedOpen, setAdvancedOpen] = useState(false)
-  const [technicalOpen, setTechnicalOpen] = useState(false)
+  const [technicalOpenByRun, setTechnicalOpenByRun] = useState<Record<string, boolean>>({})
+  const [runChangesOpenByRun, setRunChangesOpenByRun] = useState<Record<string, boolean>>({})
   const technicalId = useId()
   const [copyState, setCopyState] = useState<'idle' | 'copied' | 'failed'>('idle')
   const [copyKind, setCopyKind] = useState<'link' | 'run-id' | null>(null)
@@ -1062,6 +1063,9 @@ export function RunDashboard({ visible = true, page, onNewRun, onCancelNewRun, o
   const preflightRequestRef = useRef(0)
   const preflightAbortRef = useRef(new AbortController())
   const desiredContextLevelRef = useRef<'lite' | 'full'>('lite')
+  const disclosureRunKey = selectedRunId ? `${projectId}/${selectedRunId}` : null
+  const technicalOpen = disclosureRunKey !== null && technicalOpenByRun[disclosureRunKey] === true
+  const runChangesOpen = disclosureRunKey !== null && runChangesOpenByRun[disclosureRunKey] === true
   desiredContextLevelRef.current = technicalOpen && rawOpen && capabilities?.context_levels.includes('full') ? 'full' : 'lite'
   useEffect(() => {
     requestAbortRef.current = new AbortController()
@@ -1686,6 +1690,20 @@ export function RunDashboard({ visible = true, page, onNewRun, onCancelNewRun, o
       capabilities?.controls.includes(control)
       && capabilities.control_safety[control] === 'safe',
     )
+  }
+
+  function setTechnicalDisclosure(open: boolean): void {
+    if (disclosureRunKey === null) return
+    setTechnicalOpenByRun(current => current[disclosureRunKey] === open
+      ? current
+      : { ...current, [disclosureRunKey]: open })
+  }
+
+  function setRunChangesDisclosure(open: boolean): void {
+    if (disclosureRunKey === null) return
+    setRunChangesOpenByRun(current => current[disclosureRunKey] === open
+      ? current
+      : { ...current, [disclosureRunKey]: open })
   }
 
   /**
@@ -3216,7 +3234,16 @@ export function RunDashboard({ visible = true, page, onNewRun, onCancelNewRun, o
 
               <div className="run-progress-evidence">
                 {canonicalProgress
-                  ? <CheckpointHistory projectId={projectId} run={selectedRun} progress={canonicalProgress} detail={canonicalDetail} />
+                  ? <CheckpointHistory
+                    projectId={projectId}
+                    run={selectedRun}
+                    progress={canonicalProgress}
+                    detail={canonicalDetail}
+                    onBulkInformationalDisclosureChange={open => {
+                      setTechnicalDisclosure(open)
+                      if (savedOverrides) setRunChangesDisclosure(open)
+                    }}
+                  />
                   : <>
                     <dl className="run-scan-summary">
                       <div><dt>Project</dt><dd className="mono">{projectId}</dd></div>
@@ -3314,14 +3341,18 @@ export function RunDashboard({ visible = true, page, onNewRun, onCancelNewRun, o
                   <div><dt>Replacement worker</dt><dd className="mono">{recoveryProvenance.targetSelector}</dd></div>
                 </dl>
                 <p>
-                  Recovery evidence: <a href={`#${technicalId}`} onClick={() => setTechnicalOpen(true)}>open the recorded event and artifact details in Diagnostics</a>
+                  Recovery evidence: <a href={`#${technicalId}`} onClick={() => setTechnicalDisclosure(true)}>open the recorded event and artifact details in Technical details</a>
                   {recoveryProvenance.artifactPath && <> · <span className="mono">{recoveryProvenance.artifactPath}</span></>}
                 </p>
                 {recoveryProvenance.evidenceReferences.length > 0 && <p className="text-xs text-dim">Saved evidence references: {recoveryProvenance.evidenceReferences.join(' · ')}</p>}
                 {recoveryProvenance.sourceSessionContextTransferred === false && <p className="notice">Private context from the old provider session was unavailable and was not transferred.</p>}
               </section>}
 
-              {savedOverrides && <details className="dashboard-section" open><summary>Run changes</summary>
+              {savedOverrides && <details
+                className="dashboard-section run-settings-changes-disclosure"
+                open={runChangesOpen}
+                onToggle={event => setRunChangesDisclosure(event.currentTarget.open)}
+              ><summary>Run settings &amp; changes</summary>
                 {savedOverrides && <div>
                   <p>{savedOverrides.state === 'applied' ? 'Applied' : savedOverrides.state === 'rejected' ? 'Rejected' : 'Pending'} changes · revision {savedOverrides.revision}{savedOverrides.state === 'pending' ? ' · applies at the next turn or on resume' : ''}</p>
                   {savedOverrides.max_turns && <p>Max turns: {savedOverrides.max_turns}</p>}
@@ -3334,7 +3365,7 @@ export function RunDashboard({ visible = true, page, onNewRun, onCancelNewRun, o
                 </div>}
               </details>}
 
-              <section className="dashboard-section">
+              <section className="dashboard-section run-technical-section">
                 <h4>
                   <button
                     type="button"
@@ -3342,9 +3373,9 @@ export function RunDashboard({ visible = true, page, onNewRun, onCancelNewRun, o
                     aria-label="Diagnostics"
                     aria-expanded={technicalOpen}
                     aria-controls={technicalId}
-                    onClick={() => setTechnicalOpen((open) => !open)}
+                    onClick={() => setTechnicalDisclosure(!technicalOpen)}
                   >
-                    Diagnostics
+                    Technical details
                   </button>
                 </h4>
                 {technicalOpen && (

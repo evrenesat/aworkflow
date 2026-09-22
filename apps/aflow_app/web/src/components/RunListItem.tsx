@@ -170,7 +170,7 @@ export function RunListItem({
   function handleFocus(event: FocusEvent<HTMLDivElement>): void {
     const target = event.target
     if (target instanceof HTMLElement && target.closest('.run-list-select')) {
-      openPreview('focus')
+      scheduleOpen()
     }
   }
 
