@@ -119,8 +119,10 @@ describe('GlobalRunOverview project context', () => {
     render(<GlobalRunOverview projects={[primary]} onOpen={vi.fn()} />)
 
     expect(await screen.findByText('No runs yet.')).toBeTruthy()
-    expect(screen.getByRole('heading', { name: 'Ongoing (0)' })).toBeTruthy()
-    expect(screen.getByText('No ongoing runs.')).toBeTruthy()
+    expect(screen.queryByRole('heading', { name: 'Ongoing (0)' })).toBeNull()
+    expect(screen.queryByText('No ongoing runs.')).toBeNull()
+    expect(screen.queryByRole('heading', { name: 'Recent (0)' })).toBeNull()
+    expect(screen.queryByRole('heading', { name: 'Needs attention (0)' })).toBeNull()
     expect(screen.queryByRole('status')).toBeNull()
   })
 

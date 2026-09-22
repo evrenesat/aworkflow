@@ -759,9 +759,9 @@ def test_responsive_action_hit_test_survives_late_context_growth(
             page.get_by_role("button", name="New run", exact=True).wait_for()
             page.locator(".run-list-item").first.wait_for()
             run_row = page.locator(
-                f".run-list-item[data-sidebar-editor-item='{RESPONSIVE_FIXTURE_RUN_ID}']"
+                f".run-list-item[data-run-key='{RESPONSIVE_FIXTURE_RUN_ID}']"
             )
-            run_row.click()
+            run_row.locator(".run-list-select").click()
             _assert_run_detail(page, RESPONSIVE_FIXTURE_TITLE, RESPONSIVE_FIXTURE_RUN_ID)
             page.wait_for_function(
                 "() => window.__aflowResponsiveContextCaptured === true"
@@ -1155,17 +1155,17 @@ def test_project_worktree_presentation(control_client, monkeypatch, width: int, 
                 )
                 page.get_by_role("button", name="New run", exact=True).wait_for()
                 history_row = page.locator(
-                    f".run-list-item[data-sidebar-editor-item='{RESPONSIVE_FIXTURE_RUN_ID}']"
+                    f".run-list-item[data-run-key='{RESPONSIVE_FIXTURE_RUN_ID}']"
                 )
                 history_row.wait_for()
                 expect(history_row).to_have_attribute(
-                    "data-sidebar-editor-item", RESPONSIVE_FIXTURE_RUN_ID
+                    "data-run-key", RESPONSIVE_FIXTURE_RUN_ID
                 )
                 expect(history_row.locator(".run-list-title")).to_have_text(
                     RESPONSIVE_FIXTURE_TITLE
                 )
                 _assert_document_moves(page)
-                history_row.click()
+                history_row.locator(".run-list-select").click()
                 _assert_run_detail(page, RESPONSIVE_FIXTURE_TITLE, RESPONSIVE_FIXTURE_RUN_ID)
                 _assert_header_and_flow(page)
 
@@ -1313,7 +1313,8 @@ def test_global_run_overview_loading_journey(control_client, monkeypatch, tmp_pa
             run_mode["value"] = "empty"
             page.goto(f"{url}/?view=all-runs")
             expect(page.get_by_text("No runs yet.", exact=True)).to_be_visible()
-            expect(page.get_by_role("heading", name="Ongoing (0)", exact=True)).to_be_visible()
+            expect(page.locator(".global-run-results h3")).to_have_count(0)
+            expect(page.get_by_text("No ongoing runs.", exact=True)).to_have_count(0)
             expect(page.get_by_role("status")).to_have_count(0)
 
             run_mode["value"] = "error"
@@ -1558,7 +1559,7 @@ def test_selected_run_detail_does_not_wait_for_history(
                 expect(pending).to_have_count(0)
             else:
                 page.locator(
-                    f".run-list-item[data-sidebar-editor-item='{RESPONSIVE_FIXTURE_RUN_ID}']"
+                    f".run-list-item[data-run-key='{RESPONSIVE_FIXTURE_RUN_ID}']"
                 ).wait_for()
             _assert_run_detail(page, RESPONSIVE_FIXTURE_TITLE, RESPONSIVE_FIXTURE_RUN_ID)
             page.get_by_role("button", name="More", exact=True).click()
@@ -1979,16 +1980,16 @@ def test_responsive_route_matrix(control_client, monkeypatch, tmp_path, width: i
             _assert_header_and_flow(page)
             _assert_document_moves(page)
             run_row = page.locator(
-                f".run-list-item[data-sidebar-editor-item='{RESPONSIVE_FIXTURE_RUN_ID}']"
+                f".run-list-item[data-run-key='{RESPONSIVE_FIXTURE_RUN_ID}']"
             )
             run_row.scroll_into_view_if_needed()
             expect(run_row).to_have_attribute(
-                "data-sidebar-editor-item", RESPONSIVE_FIXTURE_RUN_ID
+                "data-run-key", RESPONSIVE_FIXTURE_RUN_ID
             )
             expect(run_row.locator(".run-list-title")).to_have_text(
                 RESPONSIVE_FIXTURE_TITLE
             )
-            run_row.click()
+            run_row.locator(".run-list-select").click()
             _assert_run_detail(page, RESPONSIVE_FIXTURE_TITLE, RESPONSIVE_FIXTURE_RUN_ID)
             detail_box = _run_history_detail(page).bounding_box()
             assert detail_box and detail_box["height"] > 0
@@ -2196,11 +2197,11 @@ def test_responsive_focus_resize_and_screenshots(control_client, monkeypatch, tm
                     else:
                         page.get_by_role("button", name="New run", exact=True).wait_for()
                         row = page.locator(
-                            f".run-list-item[data-sidebar-editor-item='{RESPONSIVE_FIXTURE_RUN_ID}']"
+                            f".run-list-item[data-run-key='{RESPONSIVE_FIXTURE_RUN_ID}']"
                         )
                         row.wait_for()
                         if detail:
-                            row.click()
+                            row.locator(".run-list-select").click()
                             _assert_run_detail(page, RESPONSIVE_FIXTURE_TITLE, RESPONSIVE_FIXTURE_RUN_ID)
                     image = tmp_path / f"responsive-{theme}-{name}.png"
                     page.screenshot(path=str(image), full_page=True)
@@ -2331,14 +2332,15 @@ def test_compact_selection_survives_pending_configuration(
 
                 page.get_by_role("button", name="← Back to Run history", exact=True).click()
                 row = page.locator(
-                    f".run-list-item[data-sidebar-editor-item='{second_run}']"
+                    f".run-list-item[data-run-key='{second_run}']"
                 )
                 row.wait_for()
-                row.click()
+                selectable = row.locator(".run-list-select")
+                selectable.click()
                 _assert_run_detail(page, "Long plan 38", second_run)
 
                 page.get_by_role("button", name="← Back to Run history", exact=True).click()
-                expect(row).to_be_focused()
+                expect(selectable).to_be_focused()
 
                 assert len(held_form_requests) == 1, "more than one configuration projection was held"
                 hold_enabled["value"] = False
@@ -2353,7 +2355,7 @@ def test_compact_selection_survives_pending_configuration(
                 assert held_response.request is held_form_request
                 assert held_response.status == 200
                 held_response.body()
-                expect(row).to_be_focused()
+                expect(selectable).to_be_focused()
 
                 page.get_by_role("button", name="More", exact=True).click()
                 run_page_menu = page.get_by_role(

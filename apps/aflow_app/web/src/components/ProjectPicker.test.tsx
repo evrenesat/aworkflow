@@ -96,4 +96,24 @@ describe('ProjectPicker worktree disclosure', () => {
     const addedList = screen.getByRole('list', { name: 'Added projects' })
     expect(Array.from(addedList.children).filter(item => item.tagName === 'LI')).toHaveLength(1)
   })
+
+  it('keeps server discovery behind a named collapsed disclosure', async () => {
+    vi.mocked(api.getProjectDiscovery).mockResolvedValue({
+      ...discovery,
+      candidates: [{
+        relative_path: 'available/project',
+        display_name: 'Available project',
+        registered_project_id: null,
+        addable: true,
+        add_blocker: null,
+      }],
+    })
+
+    renderPicker()
+    const summary = await screen.findByText('Find projects on this server')
+    const details = summary.closest('details')
+    expect(details).not.toBeNull()
+    expect(details?.hasAttribute('open')).toBe(false)
+    expect(screen.getByText('1 available')).toBeDefined()
+  })
 })

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+import re
 from urllib.parse import urlsplit
 
 import pytest
@@ -11,7 +12,7 @@ from playwright.sync_api import expect, sync_playwright
 
 from aflow.control_plane.units import InMemoryUnitManager, UnitState
 from test_control_plane_api import PROJECT_ID, control_client, live_server  # noqa: F401
-from test_responsive_browser import _browser, _login, _set_theme_preference
+from test_responsive_browser import _assert_header_and_flow, _assert_theme, _browser, _login, _set_theme_preference
 from ui_demo_fidelity import (
     CAPTURE_THEMES,
     CAPTURE_VIEWPORTS,
@@ -358,6 +359,97 @@ def test_ui_demo_fixture_captures_authenticated_built_app(
             "disposable": True,
         },
     )
+
+
+@pytest.mark.parametrize(
+    ("width", "height", "theme"),
+    (
+        pytest.param(1280, 720, "light", id="desktop-light"),
+        pytest.param(390, 844, "dark", id="mobile-dark"),
+    ),
+)
+def test_ui_demo_project_and_global_overview_captures(
+    control_client,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    width: int,
+    height: int,
+    theme: str,
+) -> None:
+    """Capture populated project and All runs surfaces at reference breakpoints."""
+    _, root, _, _ = control_client
+    fixtures = seed_demo_fidelity_fixture(root)
+    dist = Path(__file__).resolve().parents[2] / "web" / "dist"
+    if not (dist / "index.html").exists():
+        pytest.fail("The CP7 capture requires the real built web app; run the web build first.")
+    monkeypatch.setenv("AFLOW_APP_WEB_DIST", str(dist))
+
+    captures: dict[str, object] = {
+        "reference_sha256": load_reference_manifest()["demo_sha256"],
+        "width": width,
+        "height": height,
+        "theme": theme,
+        "screenshots": {},
+    }
+    with live_server() as url, sync_playwright() as playwright:
+        browser = _browser(playwright)
+        page = browser.new_page(viewport={"width": width, "height": height})
+        try:
+            _login(page, url)
+            page.emulate_media(color_scheme=theme)  # type: ignore[arg-type]
+            _set_theme_preference(page, theme)
+
+            page.goto(f"{url}/?view=projects", wait_until="load")
+            _assert_theme(page, theme)
+            project_row = page.locator("ul[aria-label='Added projects'] > li").first
+            project_row.wait_for()
+            expect(project_row.locator(".project-row-facts")).to_contain_text("Git root")
+            discovery = page.locator("details.project-discovery-disclosure")
+            discovery.wait_for()
+            assert discovery.get_attribute("open") is None
+            expect(discovery.locator("summary")).to_contain_text("Find projects on this server")
+            _assert_header_and_flow(page)
+            project_image = tmp_path / f"cp7-projects-{theme}-{width}x{height}.png"
+            page.screenshot(path=str(project_image), full_page=True)
+            captures["projects"] = {
+                "row": page.evaluate(
+                    """element => {
+                      const box = element.getBoundingClientRect();
+                      return {x: box.x, y: box.y, width: box.width, height: box.height};
+                    }""",
+                    project_row.element_handle(),
+                ),
+                "worktrees_open": page.locator("details.worktree-disclosure[open]").count(),
+                "discovery_open": page.locator("details.project-discovery-disclosure[open]").count(),
+                "screenshot": project_image.name,
+            }
+
+            page.goto(f"{url}/?view=all-runs", wait_until="load")
+            page.get_by_role("heading", name="All runs", exact=True).wait_for()
+            page.get_by_role("heading", name=re.compile(r"Ongoing \(\d+\)")).wait_for()
+            expect(page.locator(".global-run-results h3")).to_have_count(3)
+            expect(page.get_by_role("heading", name=re.compile(r"Recent \(\d+\)"))).to_be_visible()
+            expect(page.get_by_text(re.compile(r"No (?:ongoing|recent|runs need attention)"))).to_have_count(0)
+            expect(page.locator(".global-run-row")).to_have_count(3)
+            expect(page.locator(".global-run-row[data-enrichment-state='settled']")).to_have_count(3)
+            expect(page.get_by_text("Loading checkpoint progress…", exact=True)).to_have_count(0)
+            _assert_header_and_flow(page)
+            runs_image = tmp_path / f"cp7-all-runs-{theme}-{width}x{height}.png"
+            page.screenshot(path=str(runs_image), full_page=True)
+            captures["all_runs"] = {
+                "groups": page.locator(".global-run-results h3").all_text_contents(),
+                "rows": page.locator(".global-run-row:visible").count(),
+                "enrichment_states": page.locator(".global-run-row").evaluate_all(
+                    "rows => rows.map(row => row.getAttribute('data-enrichment-state'))"
+                ),
+                "row_text": page.locator(".global-run-row").all_text_contents(),
+                "screenshot": runs_image.name,
+            }
+        finally:
+            page.close()
+            browser.close()
+
+    _write_artifact_manifest(tmp_path / f"cp7-overview-{theme}-{width}x{height}.json", captures)
 
 
 @pytest.mark.parametrize(

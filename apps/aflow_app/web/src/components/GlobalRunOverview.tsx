@@ -277,6 +277,10 @@ export function GlobalRunOverview({ projects, onOpen, registryLoading = false, r
     { key: 'recent', label: `${incompleteCoverage ? 'Loaded recent' : 'Recent'} (${selected.recent.length})`, rows: selected.recent },
     { key: 'attention', label: `${incompleteCoverage ? 'Loaded needs attention' : 'Needs attention'} (${selected.attention.length})`, rows: attentionRows },
   ] as const)
+  // A populated overview should spend space on meaningful groups only. Empty
+  // states remain explicit at the page level (no projects, no runs, or no
+  // search match) instead of becoming repeated decorative group cards.
+  const visibleGroups = groups.filter(group => group.rows.length > 0)
   useEffect(() => setAttentionVisible(10), [history, ids, search])
 
   const renderedRows = [...selected.ongoing, ...selected.recent, ...attentionRows]
@@ -518,12 +522,9 @@ export function GlobalRunOverview({ projects, onOpen, registryLoading = false, r
       {coverageComplete && !registryError && !projects.length && <p>No registered projects. Add a project in Projects to start.</p>}
       {coverageComplete && !registryError && !rows.length && projects.length > 0 && <p>No runs yet.</p>}
       {rows.length > 0 && filteredRows.length === 0 && search.trim() && <p className="text-sm text-dim">No loaded runs match “{search.trim()}”.</p>}
-      {showGroups && groups.map(group => <section key={group.key}>
+      {showGroups && visibleGroups.map(group => <section key={group.key}>
         <h3>{group.label}</h3>
-        {group.rows.length === 0 && <p className="text-sm text-dim">{incompleteCoverage
-          ? group.key === 'ongoing' ? 'No loaded ongoing runs yet.' : group.key === 'attention' ? 'No loaded runs need attention yet.' : 'No loaded recent runs yet.'
-          : group.key === 'ongoing' ? 'No ongoing runs.' : group.key === 'attention' ? 'No runs need attention.' : 'No recent runs.'}</p>}
-        {group.rows.length > 0 && <ul className="compact-list">{group.rows.map(renderRunRow)}</ul>}
+        <ul className="compact-list">{group.rows.map(renderRunRow)}</ul>
         {group.key === 'attention' && remainingAttention > 0 && <button type="button" className="btn btn-secondary" onClick={() => setAttentionVisible(count => count + 10)}>Show more ({remainingAttention} remaining)</button>}
       </section>)}
     </div>
