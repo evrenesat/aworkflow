@@ -71,6 +71,9 @@ DEFAULT_MAX_TURNS = 15
 DEFAULT_MAX_SAME_STEP_TURNS = 5
 
 
+DEFAULT_UPGRADE_AFTER_REPAIRS = 1
+
+
 @dataclass(frozen=True)
 class AflowSection:
     default_workflow: str | None = None
@@ -85,7 +88,14 @@ class AflowSection:
     worktree_root: str | None = None
 
 
-WORKFLOW_LIFECYCLE_KEYS = frozenset({"setup", "teardown", "main_branch", "merge_prompt", "manager_enabled"})
+WORKFLOW_LIFECYCLE_KEYS = frozenset({
+    "setup",
+    "teardown",
+    "main_branch",
+    "merge_prompt",
+    "manager_enabled",
+    "upgrade_after_repairs",
+})
 
 VALID_LIFECYCLE_COMBOS: frozenset[tuple[tuple[str, ...], tuple[str, ...]]] = frozenset({
     ((), ()),
@@ -101,6 +111,8 @@ class WorkflowLifecycleDefaults:
     main_branch: str | None = None
     merge_prompt: tuple[str, ...] = ()
     manager_enabled: bool = False
+    upgrade_after_repairs: int = DEFAULT_UPGRADE_AFTER_REPAIRS
+    declared_upgrade_after_repairs: int | None = None
 
 
 @dataclass(frozen=True)
@@ -183,6 +195,17 @@ class WorkflowConfig:
     # _materialize_workflows this is always a resolved bool; resolve by
     # presence, never truthiness, so explicit false overrides inherited true.
     manager_enabled: bool | None = None
+    # Effective repair threshold.  The declared value is retained separately so
+    # callers can distinguish an omitted/inherited setting from an explicit
+    # workflow override without re-reading the live TOML pair.
+    upgrade_after_repairs: int = DEFAULT_UPGRADE_AFTER_REPAIRS
+    declared_upgrade_after_repairs: int | None = None
+    upgrade_after_repairs_source: str = "defaults"
+
+    @property
+    def effective_upgrade_after_repairs(self) -> int:
+        """Return the resolved threshold used by future execution policy."""
+        return self.upgrade_after_repairs
 
 
 @dataclass(frozen=True)
@@ -704,6 +727,7 @@ def _parse_workflow_definition(
         "main_branch",
         "merge_prompt",
         "manager_enabled",
+        "upgrade_after_repairs",
     }
     unknown = sorted(set(raw) - allowed)
     if unknown:
@@ -742,6 +766,18 @@ def _parse_workflow_definition(
         if not isinstance(manager_value, bool):
             raise ConfigError(f"{path}.manager_enabled must be a boolean")
         wf_manager_enabled = manager_value
+    wf_upgrade_after_repairs: int | None = None
+    if "upgrade_after_repairs" in raw:
+        upgrade_value = raw["upgrade_after_repairs"]
+        if (
+            not isinstance(upgrade_value, int)
+            or isinstance(upgrade_value, bool)
+            or upgrade_value < 1
+        ):
+            raise ConfigError(
+                f"{path}.upgrade_after_repairs must be a positive integer"
+            )
+        wf_upgrade_after_repairs = upgrade_value
     steps: dict[str, WorkflowStepConfig] = {}
     first_step: str | None = None
     if wf_extends is None:
@@ -771,6 +807,12 @@ def _parse_workflow_definition(
         main_branch=wf_main_branch,
         merge_prompt=wf_merge_prompt,
         manager_enabled=wf_manager_enabled,
+        upgrade_after_repairs=(
+            wf_upgrade_after_repairs
+            if wf_upgrade_after_repairs is not None
+            else DEFAULT_UPGRADE_AFTER_REPAIRS
+        ),
+        declared_upgrade_after_repairs=wf_upgrade_after_repairs,
     )
 
 
@@ -782,6 +824,8 @@ def _parse_workflow_lifecycle_defaults(
     main_branch: str | None = None
     merge_prompt: tuple[str, ...] = ()
     manager_enabled: bool = False
+    upgrade_after_repairs = DEFAULT_UPGRADE_AFTER_REPAIRS
+    declared_upgrade_after_repairs: int | None = None
     if "setup" in raw:
         setup = _parse_lifecycle_array(raw["setup"], path=f"{path}.setup")
     if "teardown" in raw:
@@ -797,12 +841,26 @@ def _parse_workflow_lifecycle_defaults(
         if not isinstance(default_value, bool):
             raise ConfigError(f"{path}.manager_enabled must be a boolean")
         manager_enabled = default_value
+    if "upgrade_after_repairs" in raw:
+        upgrade_value = raw["upgrade_after_repairs"]
+        if (
+            not isinstance(upgrade_value, int)
+            or isinstance(upgrade_value, bool)
+            or upgrade_value < 1
+        ):
+            raise ConfigError(
+                f"{path}.upgrade_after_repairs must be a positive integer"
+            )
+        upgrade_after_repairs = upgrade_value
+        declared_upgrade_after_repairs = upgrade_value
     return WorkflowLifecycleDefaults(
         setup=setup,
         teardown=teardown,
         main_branch=main_branch,
         merge_prompt=merge_prompt,
         manager_enabled=manager_enabled,
+        upgrade_after_repairs=upgrade_after_repairs,
+        declared_upgrade_after_repairs=declared_upgrade_after_repairs,
     )
 
 
@@ -908,6 +966,17 @@ def _materialize_workflows(
                 main_branch=raw_wf.main_branch if raw_wf.main_branch is not None else lifecycle_defaults.main_branch,
                 merge_prompt=raw_wf.merge_prompt if raw_wf.merge_prompt is not None else lifecycle_defaults.merge_prompt,
                 manager_enabled=raw_wf.manager_enabled if raw_wf.manager_enabled is not None else lifecycle_defaults.manager_enabled,
+                upgrade_after_repairs=(
+                    raw_wf.declared_upgrade_after_repairs
+                    if raw_wf.declared_upgrade_after_repairs is not None
+                    else lifecycle_defaults.upgrade_after_repairs
+                ),
+                declared_upgrade_after_repairs=raw_wf.declared_upgrade_after_repairs,
+                upgrade_after_repairs_source=(
+                    "workflow"
+                    if raw_wf.declared_upgrade_after_repairs is not None
+                    else "defaults"
+                ),
             )
             _validate_workflow_transitions(concrete.steps, path=f"{path}.{name}")
         else:
@@ -942,6 +1011,17 @@ def _materialize_workflows(
                 main_branch=raw_wf.main_branch if raw_wf.main_branch is not None else base.main_branch,
                 merge_prompt=raw_wf.merge_prompt if raw_wf.merge_prompt is not None else base.merge_prompt,
                 manager_enabled=raw_wf.manager_enabled if raw_wf.manager_enabled is not None else base.manager_enabled,
+                upgrade_after_repairs=(
+                    raw_wf.declared_upgrade_after_repairs
+                    if raw_wf.declared_upgrade_after_repairs is not None
+                    else base.upgrade_after_repairs
+                ),
+                declared_upgrade_after_repairs=raw_wf.declared_upgrade_after_repairs,
+                upgrade_after_repairs_source=(
+                    "workflow"
+                    if raw_wf.declared_upgrade_after_repairs is not None
+                    else f"base:{base_name}"
+                ),
             )
             _validate_workflow_transitions(concrete.steps, path=f"{path}.{name}")
         resolving.remove(name)
@@ -1564,6 +1644,25 @@ def validate_workflow_config(
             return {**config.roles, **team_config.roles}
 
     for wf_name, wf_config in config.workflows.items():
+        if (
+            not isinstance(wf_config.upgrade_after_repairs, int)
+            or isinstance(wf_config.upgrade_after_repairs, bool)
+            or wf_config.upgrade_after_repairs < 1
+        ):
+            errors.append(
+                f"workflow.{wf_name}.upgrade_after_repairs must be a positive integer"
+            )
+        if (
+            wf_config.declared_upgrade_after_repairs is not None
+            and (
+                not isinstance(wf_config.declared_upgrade_after_repairs, int)
+                or isinstance(wf_config.declared_upgrade_after_repairs, bool)
+                or wf_config.declared_upgrade_after_repairs < 1
+            )
+        ):
+            errors.append(
+                f"workflow.{wf_name}.declared_upgrade_after_repairs must be a positive integer"
+            )
         if wf_config.extends is not None:
             errors.append(
                 f"workflow.{wf_name}.extends should not be present after materialization"
