@@ -1023,6 +1023,8 @@ export function RunDashboard({ visible = true, page, onNewRun, onCancelNewRun, o
   const [roleSelectors, setRoleSelectors] = useState<Record<string, string>>({})
   const [confirmOwnerStop, setConfirmOwnerStop] = useState(false)
   const [confirmResume, setConfirmResume] = useState(false)
+  const [stopReviewOpen, setStopReviewOpen] = useState(false)
+  const [adjustRunOpen, setAdjustRunOpen] = useState(false)
   const [recoveryOpen, setRecoveryOpen] = useState(false)
   const [recoverySelector, setRecoverySelector] = useState('')
   const [restartPhase, setRestartPhase] = useState<RestartPhase | null>(null)
@@ -1054,6 +1056,7 @@ export function RunDashboard({ visible = true, page, onNewRun, onCancelNewRun, o
   const selectedRunRef = useRef<string | null>(selectedRunId)
   const requestedRunRef = useRef<string | null>(requestedRunId)
   const missingRunRef = useRef<string | null>(null)
+  const restartFocusPendingRef = useRef(false)
   const snapshotRequestRef = useRef(0)
   const contextRequestRef = useRef(0)
   const followupRequestRef = useRef(0)
@@ -1116,6 +1119,10 @@ export function RunDashboard({ visible = true, page, onNewRun, onCancelNewRun, o
 
   function openRestart() {
     if (!selectedRun) return
+    restartFocusPendingRef.current = true
+    setStopReviewOpen(false)
+    setAdjustRunOpen(false)
+    setConfirmOwnerStop(false)
     const options = restartAdmission?.options
     setRestartSource(selectedRun)
     setStartPlanPath(options?.plan_path ?? selectedRun.plan_path ?? String(selectedRun.evidence.plan_path ?? ''))
@@ -1128,6 +1135,14 @@ export function RunDashboard({ visible = true, page, onNewRun, onCancelNewRun, o
     setRestartPhase('confirming')
     openNewRunPage()
   }
+
+  useEffect(() => {
+    if (!restartFocusPendingRef.current || !newRunPage || !restartSource || restartPhase !== 'confirming') return
+    const planInput = document.querySelector<HTMLElement>('.start-run-form [aria-label="Run plan"]')
+    if (!planInput) return
+    planInput.focus()
+    restartFocusPendingRef.current = false
+  }, [newRunPage, restartPhase, restartSource])
 
   useEffect(() => {
     const question = selectedRun?.evidence.startup_question
@@ -1619,6 +1634,9 @@ export function RunDashboard({ visible = true, page, onNewRun, onCancelNewRun, o
   function selectRun(runId: string) {
     setNavigationVersion(value => value + 1)
     setHistoryConfirm(null)
+    setStopReviewOpen(false)
+    setAdjustRunOpen(false)
+    setConfirmOwnerStop(false)
     setMissingRunId(null)
     invalidateCopyFeedback()
     clearActionFeedback()
@@ -2960,17 +2978,63 @@ export function RunDashboard({ visible = true, page, onNewRun, onCancelNewRun, o
       dirtyQuestionMessage={dirtyStartupQuestion ? startupQuestion?.message ?? 'The working tree changed while starting. Review it before continuing.' : null}
     />
   )
+  const restartSourcePlan = restartSource?.plan_path ?? String(restartSource?.evidence.plan_path ?? '')
+  const restartSourceWorkflow = restartSource?.workflow_name ?? ''
+  const restartSourceTeam = restartSource?.team ?? ''
+  const restartSourceMaxTurns = restartSource?.max_turns?.toString() ?? ''
+  const restartChangedValues = restartSource ? [
+    {
+      label: 'Plan',
+      value: startPlanPath.trim() || 'Not selected',
+      changed: startPlanPath.trim() !== restartSourcePlan,
+    },
+    {
+      label: 'Workflow',
+      value: restartDraftWorkflow ? formatMachineLabel(restartDraftWorkflow) : 'Not selected',
+      changed: restartDraftWorkflow !== restartSourceWorkflow,
+    },
+    {
+      label: 'Team',
+      value: startTeam.trim() ? formatMachineLabel(startTeam.trim()) : 'Saved/default selection',
+      changed: startTeam.trim() !== restartSourceTeam,
+    },
+    {
+      label: 'Max turns',
+      value: startMaxTurns.trim() || 'Saved/default selection',
+      changed: startMaxTurns.trim() !== restartSourceMaxTurns,
+    },
+    {
+      label: 'Start step',
+      value: startStep.trim() ? formatMachineLabel(startStep.trim()) : 'Workflow beginning',
+      changed: startStep.trim() !== (restartSource?.selected_start_step ?? ''),
+    },
+    {
+      label: 'Extra instructions',
+      value: extraInstructions.length > 0 ? `${extraInstructions.length} line${extraInstructions.length === 1 ? '' : 's'}` : 'None',
+      changed: extraInstructions.length > 0 || missingRestartInstructions,
+    },
+  ] : []
   const restartActions = restartSource && restartPhase ? (
                 <section className="dashboard-section">
-                  <div className="section-heading"><h4>Restart with changes</h4><span className="text-xs text-dim">stop → confirm inactive → successor start</span></div>
+                  <div className="section-heading"><h4>Restart review</h4><span className="text-xs text-dim">review → stop safely → create successor</span></div>
                   <div className="notice">
-                    Create a new attempt from <span className="mono">{restartSource.run_id}</span> with these choices.
-                    Plan progress is retained. Active sources are stopped first. This attempt and Resume use the current saved configuration.
+                    No stop or start has been requested. Review the exact source and successor choices below before the final confirmation.
                   </div>
+                  <dl className="run-metadata restart-review-details">
+                    <div><dt>Source run</dt><dd className="mono">{restartSource.run_id}</dd></div>
+                    <div><dt>Source revision</dt><dd>{restartSource.revision}</dd></div>
+                    <div><dt>Changed values</dt><dd><ul>{restartChangedValues.map(item => <li key={item.label}><strong>{item.label}:</strong> {item.value}{item.changed ? ' · changed' : ' · unchanged'}</li>)}</ul></dd></div>
+                  </dl>
+                  <p className="text-sm text-dim">
+                    If the source is active, the existing owner-stop protection runs first, then the dashboard waits for exact terminal inactivity. No successor starts when that proof is uncertain; an inactive source is not stopped again.
+                  </p>
+                  <p className="text-sm text-dim">
+                    Confirming creates one distinct successor linked to this source. The source history, progress, and evidence remain readable, while the successor receives a fresh turn/token budget; prior usage stays attributed to the source.
+                  </p>
                   {restartDraftHint
                     ? <div className="text-xs text-dim">{restartDraftHint}</div>
                     : !restartPendingConfirmation && !restartInProgress && (
-                      <div className="dashboard-actions"><button className="btn btn-danger" onClick={() => setRestartPhase('confirming')}>Change workflow: stop and restart…</button></div>
+                      <div className="dashboard-actions"><button className="btn btn-danger" onClick={() => setRestartPhase('confirming')}>Review successor choices…</button></div>
                     )}
                   {restartPendingConfirmation && !restartDraftReady && (
                     <div className="text-xs text-dim">Select a successor workflow and plan in the New run form before confirming.</div>
@@ -2983,7 +3047,7 @@ export function RunDashboard({ visible = true, page, onNewRun, onCancelNewRun, o
                         {startStep.trim() ? <> at step <strong>{formatMachineLabel(startStep.trim())}</strong></> : null}
                         {startPlanPath ? <> with plan <span className="mono">{startPlanPath.trim()}</span></> : null}? The successor records this run as its restart source.
                       </span>
-                      <button className="btn btn-danger" disabled={busyAction !== null || restartInProgress} onClick={() => void handleConfirmedRestart()}>Confirm stop and start successor</button>
+                      <button className="btn btn-danger" disabled={busyAction !== null || restartInProgress} onClick={() => void handleConfirmedRestart()}>Confirm restart</button>
                       <button className="btn btn-secondary" onClick={() => { setRestartPhase(null); setRestartSource(null); setLocalPage('runs'); onCancelNewRun?.() }}>Cancel restart</button>
                     </div>
                   )}
@@ -2998,6 +3062,7 @@ export function RunDashboard({ visible = true, page, onNewRun, onCancelNewRun, o
               ) : null
 
   function cancelNewRun() {
+    restartFocusPendingRef.current = false
     if (!restartInProgress && !pendingSuccessorStart) { setRestartPhase(null); setRestartSource(null) }
     setLocalPage('runs')
     onCancelNewRun?.()
@@ -3131,6 +3196,11 @@ export function RunDashboard({ visible = true, page, onNewRun, onCancelNewRun, o
                     <span className="status-pill">{statusLabel(selectedRun)}</span>
                     {selectedRun.history_state === 'archived' && <span className="status-pill">Archived</span>}
                     {selectedRun.history_state === 'archived' && <button className="btn btn-secondary" disabled={busyAction === 'history' || historyConfirm !== null} onClick={() => void mutateHistory('restore')}>Restore</button>}
+                    {(canRestart || selectedRunHasLiveControls) && <MoreMenu label="Run actions" triggerLabel="Actions" triggerContent="Actions" className="run-actions-menu">
+                      {canRestart && <MenuItem disabled={!canMutate || busyAction !== null} onClick={openRestart}>Configure restart…</MenuItem>}
+                      {selectedRunHasLiveControls && <MenuItem disabled={!canMutate || busyAction !== null} onClick={() => { setStopReviewOpen(false); setConfirmOwnerStop(false); setAdjustRunOpen(true) }}>Adjust run settings…</MenuItem>}
+                      {hasSafeControl('owner_stop') && selectedRunHasLiveControls && <MenuItem disabled={!canMutate || busyAction !== null} onClick={() => { setAdjustRunOpen(false); setStopReviewOpen(true); setConfirmOwnerStop(false) }}>Review stop options…</MenuItem>}
+                    </MoreMenu>}
                     <MoreMenu label="More run actions">
                       {selectedRun.history_state !== 'archived' && <MenuItem disabled={busyAction === 'history' || historyConfirm !== null} onClick={() => { if (selectedRun.activity === 'active') { setHistoryConfirm('archive'); setAcknowledgeActive(false) } else void mutateHistory('archive') }}>Archive</MenuItem>}
                       <MenuItem danger disabled={busyAction === 'history' || historyConfirm !== null} onClick={() => { setHistoryConfirm('delete'); setAcknowledgeActive(false) }}>Delete record…</MenuItem>
@@ -3157,7 +3227,7 @@ export function RunDashboard({ visible = true, page, onNewRun, onCancelNewRun, o
                       {canResume && (!confirmResume
                         ? <button className="btn btn-primary" disabled={restartInProgress} onClick={() => setConfirmResume(true)}>Resume as new run…</button>
                         : <div className="confirmation"><span>Confirm explicit resume. Source {selectedRun.run_id} remains visible; the server creates a distinct continuation run with the same workflow and current configuration source.</span><button className="btn btn-primary" disabled={busyAction === 'resume'} onClick={() => void handleResume()}>Confirm resume</button><button className="btn btn-secondary" onClick={() => setConfirmResume(false)}>Cancel</button></div>)}
-                      {canRestart && <button className="btn btn-secondary" onClick={openRestart}>Restart with changes</button>}
+                      {canRestart && <span className="text-sm text-dim">Configure a restart from Actions after reviewing the recorded issue.</span>}
                       {!canResume && !canRestart && <span className="text-sm text-dim">Open Diagnostics for the recorded details.</span>}
                     </div>
                   </section>}
@@ -3169,7 +3239,7 @@ export function RunDashboard({ visible = true, page, onNewRun, onCancelNewRun, o
                 streamNotice={streamNotice}
               />
 
-              {selectedRunHasLiveControls && <details className="dashboard-section"><summary>Adjust run</summary>
+              {selectedRunHasLiveControls && <details className="dashboard-section" open={adjustRunOpen}><summary onClick={event => { event.preventDefault(); setAdjustRunOpen(open => !open) }}>Adjust run</summary>
                 {!canMutate && loading && <div className="notice">Initial run controls are pending admission. Actions stay disabled until loading finishes.</div>}
                 <div className="notice">
                   Changes are saved now and apply at the next safe turn or when the run resumes. Refresh after saving Settings to use newly saved teams and profiles; restarting is not required.
@@ -3199,18 +3269,38 @@ export function RunDashboard({ visible = true, page, onNewRun, onCancelNewRun, o
                 <div className="dashboard-actions"><button className="btn btn-secondary" onClick={() => void handleControl()} disabled={!canMutate || busyAction === 'control'}>{busyAction === 'control' ? 'Applying…' : 'Save run settings'}</button></div>
               </details>}
 
-              <section className="dashboard-section dashboard-actions">
-                {hasSafeControl('owner_stop') && selectedRunHasLiveControls && <>
-                  {!pendingBoundaryStop && <button className="btn btn-primary" disabled={!canMutate || busyAction !== null || restartInProgress} onClick={() => void handleBoundaryStop()}>Stop after current turn</button>}
-                  <p className="text-sm text-dim">The current worker or reviewer call can finish at the next safe boundary. Stopping does not approve the checkpoint.</p>
-                  {!confirmOwnerStop ? <button className="btn btn-secondary" disabled={!canMutate || busyAction !== null || restartInProgress} onClick={() => setConfirmOwnerStop(true)}>Stop now…</button> : <div className="confirmation"><span>Stop {selectedRun.run_id} immediately? This interrupts the active worker/reviewer call; it does not approve the checkpoint.</span><button className="btn btn-danger" disabled={!canMutate || busyAction === 'owner-stop' || restartInProgress} onClick={() => void handleOwnerStop()}>Stop now</button><button className="btn btn-secondary" onClick={() => setConfirmOwnerStop(false)}>Cancel</button></div>}
-                </>}
-                {!selectedRunIssue && canResume && <>
-                  {!confirmResume ? <button className="btn btn-primary" disabled={restartInProgress} onClick={() => setConfirmResume(true)}>Resume as new run…</button> : <div className="confirmation"><span>Confirm explicit resume. Source {selectedRun.run_id} remains visible; the server creates a distinct continuation run with the same workflow and current configuration source.</span><button className="btn btn-primary" disabled={busyAction === 'resume'} onClick={() => void handleResume()}>Confirm resume</button><button className="btn btn-secondary" onClick={() => setConfirmResume(false)}>Cancel</button></div>}
-                </>}
-              </section>
+              {stopReviewOpen && hasSafeControl('owner_stop') && selectedRunHasLiveControls && <section className="dashboard-section run-stop-review" aria-label="Review stop options">
+                <div className="section-heading">
+                  <div>
+                    <h4>Review stop options</h4>
+                    <span className="text-xs text-dim">No stop request is submitted until you choose a final action.</span>
+                  </div>
+                  <button className="btn btn-secondary btn-sm" onClick={() => { setStopReviewOpen(false); setConfirmOwnerStop(false) }}>Cancel review</button>
+                </div>
+                <div className="run-stop-options">
+                  <div className="run-stop-option">
+                    <h5>Request a graceful stop</h5>
+                    <p className="text-sm text-dim">The current worker or reviewer call may finish at its existing safe boundary. This does not approve the checkpoint.</p>
+                    {pendingBoundaryStop
+                      ? <p className="notice" role="status">Stop after the current turn is already requested. The pending request remains visible in the overview above.</p>
+                      : <button className="btn btn-primary" disabled={!canMutate || busyAction !== null || restartInProgress} onClick={() => void handleBoundaryStop()}>Request stop after current turn</button>}
+                  </div>
+                  <div className="run-stop-option">
+                    <h5>Interrupt immediately</h5>
+                    <p className="text-sm text-dim">This interrupts the active worker/reviewer call and does not approve the checkpoint.</p>
+                    {!confirmOwnerStop
+                      ? <button className="btn btn-secondary" disabled={!canMutate || busyAction !== null || restartInProgress} onClick={() => setConfirmOwnerStop(true)}>Stop now…</button>
+                      : <div className="confirmation"><span>Stop {selectedRun.run_id} immediately? This interrupts the active worker/reviewer call; it does not approve the checkpoint.</span><button className="btn btn-danger" disabled={!canMutate || busyAction === 'owner-stop' || restartInProgress} onClick={() => void handleOwnerStop()}>Stop now</button><button className="btn btn-secondary" onClick={() => setConfirmOwnerStop(false)}>Cancel</button></div>}
+                  </div>
+                </div>
+              </section>}
 
-              {canRestart && !selectedRunIssue && <button className="btn btn-secondary" onClick={openRestart}>Restart with changes</button>}
+              {!selectedRunIssue && canResume && <section className="dashboard-section dashboard-actions">
+                <>
+                  {!confirmResume ? <button className="btn btn-primary" disabled={restartInProgress} onClick={() => setConfirmResume(true)}>Resume as new run…</button> : <div className="confirmation"><span>Confirm explicit resume. Source {selectedRun.run_id} remains visible; the server creates a distinct continuation run with the same workflow and current configuration source.</span><button className="btn btn-primary" disabled={busyAction === 'resume'} onClick={() => void handleResume()}>Confirm resume</button><button className="btn btn-secondary" onClick={() => setConfirmResume(false)}>Cancel</button></div>}
+                </>
+              </section>}
+
               {!canResume && selectedRun.evidence.no_agent_started === true && <p className="text-sm">No execution state is available to Resume.</p>}
               {!canRestart && restartAdmission?.reason && <p className="text-sm">Restart unavailable: {restartAdmission.reason}</p>}
 

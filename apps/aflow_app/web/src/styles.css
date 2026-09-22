@@ -2736,6 +2736,7 @@ input::placeholder, textarea::placeholder {
 .team-family-wizard-footer { justify-content: space-between; border-top: 1px solid var(--color-border); padding-top: var(--spacing-md); }
 
 @media (max-width: 640px) {
+  .run-stop-options { grid-template-columns: minmax(0, 1fr); }
   .team-family-wizard-role { grid-template-columns: minmax(0, 1fr); }
   .team-family-wizard-footer { flex-direction: column-reverse; align-items: stretch; }
 }
@@ -2744,6 +2745,17 @@ input::placeholder, textarea::placeholder {
 .prompt-card-header { display: flex; align-items: center; justify-content: space-between; gap: var(--spacing-sm); min-width: 0; }
 .more-menu { position: relative; display: inline-flex; }
 .more-menu [role='menu'] { position: absolute; right: 0; top: calc(100% + 2px); z-index: 20; display: flex; flex-direction: column; min-width: 190px; padding: var(--spacing-xs); background: var(--color-surface); border: 1px solid var(--color-border); border-radius: var(--radius-md); box-shadow: 0 4px 14px color-mix(in srgb, var(--color-text) 18%, transparent); }
+.run-actions-menu .more-menu-trigger { min-width: 7.5rem; }
+.run-actions-menu [role='menu'] { min-width: min(15rem, calc(100vw - var(--spacing-md))); max-width: calc(100vw - var(--spacing-md)); }
+@media (max-width: 640px) {
+  .run-actions-menu [role='menu'] { left: 0; right: auto; width: min(15rem, calc(100vw - var(--spacing-md))); }
+  .run-actions-menu [role='menu'] .btn { white-space: normal; overflow-wrap: anywhere; text-align: left; }
+}
+.run-stop-options { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: var(--spacing-md); }
+.run-stop-option { display: flex; flex-direction: column; align-items: flex-start; gap: var(--spacing-sm); min-width: 0; padding: var(--spacing-md); border: 1px solid var(--color-border); border-radius: var(--radius-md); }
+.run-stop-option h5,
+.run-stop-option p { margin-block: 0; overflow-wrap: anywhere; }
+.restart-review-details ul { margin: 0; padding-left: var(--spacing-lg); display: flex; flex-direction: column; gap: 2px; overflow-wrap: anywhere; }
 .prompt-usage-list { margin: 0; padding-left: var(--spacing-lg); display: flex; flex-direction: column; gap: 2px; overflow-wrap: anywhere; }
 
 /* Settings' hosted header owns navigation and Save. The direct-render fallback

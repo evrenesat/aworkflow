@@ -598,8 +598,8 @@ def _assert_global_run_row(
     status: str = "Completed",
 ):
     """Return the one global row with the exact project and full run identity."""
-    row = page.locator("button.global-run-row").and_(
-        page.get_by_role(
+    row_container = page.locator("div.global-run-row").filter(
+        has=page.get_by_role(
             "button", name=re.compile(rf" · {re.escape(run_id)}$")
         )
     ).filter(
@@ -607,10 +607,14 @@ def _assert_global_run_row(
             has_text=re.compile(rf"^{re.escape(project_label)}$")
         )
     )
+    expect(row_container).to_have_count(1)
+    row = row_container.get_by_role(
+        "button", name=re.compile(rf" · {re.escape(run_id)}$")
+    )
     expect(row).to_have_count(1)
     expect(row.locator(".global-run-row-project")).to_have_text(project_label)
-    expect(row.locator(".global-run-row-title")).to_have_text(title)
-    exact_status = row.locator(".global-run-row-heading > .status-pill").filter(
+    expect(row.locator(".run-list-title")).to_have_text(title)
+    exact_status = row.locator(".status-pill").filter(
         has_text=re.compile(rf"^{re.escape(status)}$")
     )
     expect(exact_status).to_have_count(1)
@@ -3043,9 +3047,39 @@ def test_responsive_live_controls_and_restart(
             page.goto(f"{url}/?project={PROJECT_ID}&view=runs&run={run_id}")
             dashboard = _visible_dashboard(page)
             dashboard.locator(".run-detail h3").wait_for()
-            page.get_by_role("button", name="Restart with changes", exact=True).click()
+            actions = dashboard.get_by_role("button", name="Actions", exact=True)
+            actions.click()
+            actions_menu = dashboard.get_by_role("menu", name="Run actions", exact=True)
+            menu_box = actions_menu.bounding_box()
+            assert menu_box is not None
+            assert menu_box["x"] >= 0, menu_box
+            assert menu_box["x"] + menu_box["width"] <= page.viewport_size["width"], menu_box
+            for label in ("Configure restart…", "Adjust run settings…", "Review stop options…"):
+                item = actions_menu.get_by_role("menuitem", name=label, exact=True)
+                expect(item).to_be_visible()
+                item_box = item.bounding_box()
+                assert item_box is not None
+                assert item_box["x"] >= 0, {"label": label, "box": item_box}
+                assert item_box["x"] + item_box["width"] <= page.viewport_size["width"], {"label": label, "box": item_box}
+            page.keyboard.press("Escape")
+            assert actions.evaluate("element => document.activeElement === element")
+            actions.click()
+            actions_menu = dashboard.get_by_role("menu", name="Run actions", exact=True)
+            configure_restart = actions_menu.get_by_role(
+                "menuitem", name="Configure restart…", exact=True
+            )
+            configure_restart.wait_for(state="visible")
+            assert len(owner_stop_requests) == 0
+            assert len(successor_requests) == 0
+            configure_restart.focus()
+            configure_restart.press("Enter")
             dashboard = _visible_dashboard(page)
-            dashboard.get_by_label("Run plan", exact=True).wait_for()
+            run_plan = dashboard.get_by_label("Run plan", exact=True)
+            run_plan.wait_for()
+            assert run_plan.evaluate("element => document.activeElement === element")
+            assert page.evaluate("() => document.activeElement?.tagName !== 'BODY'")
+            assert len(owner_stop_requests) == 0
+            assert len(successor_requests) == 0
             _choose_combobox(dashboard, "Run team", "fast__team", "Fast team (fast__team)")
             if not dashboard.get_by_label("Run max turns", exact=True).is_visible():
                 dashboard.get_by_role("button", name="Advanced options", exact=True).click()
@@ -3059,7 +3093,7 @@ def test_responsive_live_controls_and_restart(
             assert not dirty_ack.is_checked()
             dirty_ack.check()
             assert dirty_ack.is_checked()
-            confirm = dashboard.get_by_role("button", name="Confirm stop and start successor", exact=True)
+            confirm = dashboard.get_by_role("button", name="Confirm restart", exact=True)
             confirm.wait_for(state="visible")
             expect(confirm).to_be_enabled()
             assert not confirm.is_disabled()
