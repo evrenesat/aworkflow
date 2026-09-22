@@ -2248,6 +2248,7 @@ def build_manager_context(
                 "team": boundary.get("backup_team"), "selector": boundary.get("backup_selector"),
             },
             "eligible_upgrade": boundary.get("implementation_upgrade"),
+            "repair_upgrade_policy": boundary.get("repair_upgrade_policy"),
             "active_implementation_scope": boundary.get("active_implementation_scope"),
             "eligible_actions": list(boundary.get("eligible_actions", [])),
             "lite_evidence": boundary.get("evidence"),
@@ -2372,6 +2373,7 @@ def build_manager_context(
                     "checkpoint_index": item.get("checkpoint_index"),
                     "checkpoint_name": item.get("checkpoint_name"),
                     "reviewed_implementation_turn_number": item.get("reviewed_implementation_turn_number"),
+                    "reviewed_attempt_ordinal": item.get("reviewed_attempt_ordinal"),
                     "reviewed_worker_team": item.get("reviewed_worker_team"),
                     "reviewed_worker_selector": item.get("reviewed_worker_selector"),
                     "review_summary": item.get("review_summary"),
@@ -2412,6 +2414,7 @@ def build_manager_context(
                 "scope_id": active_scope_id,
                 "attempts": [
                     {
+                        "attempt_ordinal": a.get("attempt_ordinal"),
                         "turn_number": a.get("turn_number"),
                         "step_name": a.get("step_name"),
                         "role": a.get("role"),
@@ -2419,6 +2422,8 @@ def build_manager_context(
                         "selector": a.get("selector"),
                         "outcome": a.get("outcome"),
                         "manager_decision_number": a.get("manager_decision_number"),
+                        "repair_ordinal": a.get("repair_ordinal"),
+                        "team_repairs_completed": a.get("team_repairs_completed"),
                     }
                     for a in raw_attempts if isinstance(a, dict)
                 ],

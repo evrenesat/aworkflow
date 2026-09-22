@@ -68,8 +68,12 @@ choosing an action:
   worker.
 - For broad misunderstanding or capability gaps, `upgrade_next_implementation`.
 - For structural ambiguity or scope pressure, `escalate_to_full`.
-- `continue` and upgrade are both legal first-rejection actions; neither is
-  forced.
+- `continue` and upgrade are both legal before the controller's repair
+  threshold is due; neither is forced at that point. When
+  `controller_state.repair_upgrade_policy.forced` is
+  true, a `continue` decision is still accepted, but the controller routes
+  the next worker through the exposed one-edge upgrade. Do not treat that
+  forced route as permission to choose a different team or selector.
 
 ## Terminal transitions
 
@@ -190,16 +194,18 @@ when exposed), and `stop`.
 - Never invent a workflow step, role, team, selector, transition, or upgrade
   route. The controller validates all routing and decides the concrete target.
 - An eligible implementation upgrade advances exactly one configured edge from
-  the worker attempt the reviewer just assessed. After another rejection, use
-  the newly exposed edge only when the scope history and eligible action support
-  it. Reviewers and managers remain on baseline routing.
-- On the first reviewer rejection in an active implementation scope, decide by
-  cause. Keep the same worker with `continue` for a bounded repair, select the
-  exposed one-edge upgrade for a capability or convergence failure, or escalate
-  structural ambiguity to Full. An available edge never mandates an upgrade.
-- The second rejection in that same open scope invokes Full directly. Full
-  decides retrospectively from the complete scope evidence whether to continue
-  the worker, choose an eligible one-edge upgrade, repartition, or stop.
+  the worker attempt the reviewer just assessed. The controller's repair
+  policy counts only linked attempt/rejection evidence in the active original
+  scope. Reviewers and managers remain on baseline routing.
+- Before the threshold is due, decide by cause: keep the same worker with
+  `continue` for a bounded repair, select the exposed one-edge upgrade for a
+  capability or convergence failure, or escalate structural ambiguity to Full.
+  An available edge may be selected early.
+- When the threshold is due, `continue` cannot keep the old worker: the
+  controller applies the exposed one-edge upgrade, if it is distinct and
+  configured. If no usable edge remains, the controller retains the strongest
+  team and preserves the documented exhausted-chain state. Stop and
+  repartition decisions retain their normal authority.
 - `repartition_current_checkpoint` is legal only at Full when the controller
   exposes it and the agreed checkpoint has structural execution pressure that a
   scope-preserving split can address. `AFLOW_SCOPE_PRESSURE` and file/line/change

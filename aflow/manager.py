@@ -14,7 +14,7 @@ import os
 import re
 import stat
 from pathlib import Path
-from typing import Any, Literal, Mapping
+from typing import Any, Literal, Mapping, Sequence
 
 from .config import ConfigError, WorkflowUserConfig, resolve_team_config
 from .manager_context import (
@@ -171,6 +171,263 @@ class EligibleImplementationUpgrade:
     source_selector: str | None
     target_selector: str | None
     reason: str | None = None
+
+
+@dataclass(frozen=True)
+class RepairUpgradePolicy:
+    """Controller-owned repair progress for one active implementation scope."""
+
+    active: bool
+    threshold: int
+    scope_id: str | None
+    current_team: str | None
+    repair_ordinal: int | None
+    team_repairs_completed: int
+    due: bool
+    forced: bool
+    eligible_upgrade: EligibleImplementationUpgrade
+    reason: str
+    latest_rejection_number: int | None = None
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+
+def _repair_record_value(record: object, name: str, default: object = None) -> object:
+    if isinstance(record, Mapping):
+        return record.get(name, default)
+    return getattr(record, name, default)
+
+
+def determine_repair_upgrade_policy(
+    config: WorkflowUserConfig,
+    *,
+    threshold: int,
+    role: str,
+    baseline_team: str | None,
+    scope_id: str | None,
+    attempts: Sequence[object],
+    rejections: Sequence[object],
+) -> RepairUpgradePolicy:
+    """Calculate the next worker route from authoritative scope evidence.
+
+    A rejection earns repair credit only when it identifies exactly one worker
+    attempt in this scope and that attempt follows an earlier authoritative
+    rejection.  Durable attempt ordinals take precedence over diagnostic local
+    turn numbers, which can restart after resume.  Legacy turn-only evidence is
+    accepted only when it is unambiguous within the retained scope history.
+    """
+    if not isinstance(threshold, int) or isinstance(threshold, bool) or threshold < 1:
+        raise ValueError("repair upgrade threshold must be a positive integer")
+
+    unavailable = EligibleImplementationUpgrade(
+        available=False,
+        source_team=baseline_team,
+        target_team=None,
+        role=role,
+        source_selector=None,
+        target_selector=None,
+        reason="no authoritative rejected worker boundary in active scope",
+    )
+    inactive = RepairUpgradePolicy(
+        active=False,
+        threshold=threshold,
+        scope_id=scope_id,
+        current_team=None,
+        repair_ordinal=None,
+        team_repairs_completed=0,
+        due=False,
+        forced=False,
+        eligible_upgrade=unavailable,
+        reason=unavailable.reason or "no repair boundary",
+    )
+    if role != "worker" or scope_id is None:
+        return inactive
+
+    worker_attempts = [
+        (history_index, attempt)
+        for history_index, attempt in enumerate(attempts, start=1)
+        if _repair_record_value(attempt, "role") == "worker"
+        and isinstance(_repair_record_value(attempt, "turn_number"), int)
+        and not isinstance(_repair_record_value(attempt, "turn_number"), bool)
+        and isinstance(_repair_record_value(attempt, "team"), str)
+        and bool(_repair_record_value(attempt, "team").strip())
+        and isinstance(_repair_record_value(attempt, "selector"), str)
+        and bool(_repair_record_value(attempt, "selector").strip())
+    ]
+    if not worker_attempts:
+        return inactive
+
+    def attempt_chronology(item: tuple[int, object]) -> tuple[int, int]:
+        history_index, attempt = item
+        ordinal = _repair_record_value(attempt, "attempt_ordinal")
+        return (
+            ordinal
+            if isinstance(ordinal, int)
+            and not isinstance(ordinal, bool)
+            and ordinal > 0
+            else history_index,
+            history_index,
+        )
+
+    worker_attempts.sort(key=attempt_chronology)
+    attempts_by_turn: dict[int, list[tuple[int, object]]] = {}
+    attempts_by_ordinal: dict[int, list[tuple[int, object]]] = {}
+    for attempt_entry in worker_attempts:
+        _, attempt = attempt_entry
+        attempts_by_turn.setdefault(
+            int(_repair_record_value(attempt, "turn_number")), []
+        ).append(attempt_entry)
+        attempt_ordinal = _repair_record_value(attempt, "attempt_ordinal")
+        if (
+            isinstance(attempt_ordinal, int)
+            and not isinstance(attempt_ordinal, bool)
+            and attempt_ordinal > 0
+        ):
+            attempts_by_ordinal.setdefault(attempt_ordinal, []).append(attempt_entry)
+
+    # A reviewer may be retried against the same worker attempt.  Keep only
+    # the latest authoritative rejection for that reviewed attempt: the
+    # reviewer invocation itself is not a repair and must not advance the
+    # threshold.
+    valid_rejections_by_attempt: dict[int, tuple[object, tuple[int, object]]] = {}
+    for rejection in rejections:
+        if _repair_record_value(rejection, "scope_id") != scope_id:
+            continue
+        rejection_number = _repair_record_value(rejection, "rejection_number")
+        review_turn = _repair_record_value(rejection, "review_turn_number")
+        reviewed_turn = _repair_record_value(
+            rejection, "reviewed_implementation_turn_number"
+        )
+        reviewed_attempt_ordinal = _repair_record_value(
+            rejection, "reviewed_attempt_ordinal"
+        )
+        if not all(
+            isinstance(value, int) and not isinstance(value, bool)
+            for value in (rejection_number, review_turn, reviewed_turn)
+        ):
+            continue
+        if reviewed_attempt_ordinal is not None:
+            if (
+                not isinstance(reviewed_attempt_ordinal, int)
+                or isinstance(reviewed_attempt_ordinal, bool)
+                or reviewed_attempt_ordinal < 1
+            ):
+                continue
+            candidates = attempts_by_ordinal.get(reviewed_attempt_ordinal, [])
+        else:
+            candidates = attempts_by_turn.get(reviewed_turn, [])
+            if review_turn <= reviewed_turn:
+                continue
+        if len(candidates) != 1:
+            continue
+        attempt_entry = candidates[0]
+        attempt_identity, attempt = attempt_entry
+        if (
+            _repair_record_value(attempt, "turn_number") != reviewed_turn
+            or _repair_record_value(rejection, "reviewed_worker_team")
+            != _repair_record_value(attempt, "team")
+            or _repair_record_value(rejection, "reviewed_worker_selector")
+            != _repair_record_value(attempt, "selector")
+        ):
+            continue
+        prior = valid_rejections_by_attempt.get(attempt_identity)
+        if prior is None:
+            valid_rejections_by_attempt[attempt_identity] = (
+                rejection,
+                attempt_entry,
+            )
+            continue
+        prior_rejection = prior[0]
+        prior_identity = (
+            int(_repair_record_value(prior_rejection, "rejection_number")),
+            int(_repair_record_value(prior_rejection, "review_turn_number")),
+        )
+        current_identity = (rejection_number, review_turn)
+        if current_identity > prior_identity:
+            valid_rejections_by_attempt[attempt_identity] = (
+                rejection,
+                attempt_entry,
+            )
+
+    valid_rejections = list(valid_rejections_by_attempt.values())
+
+    if not valid_rejections:
+        return inactive
+    valid_rejections.sort(
+        key=lambda item: (
+            int(_repair_record_value(item[0], "rejection_number")),
+            int(_repair_record_value(item[0], "review_turn_number")),
+        )
+    )
+    latest_attempt_entry = worker_attempts[-1]
+    latest_rejection, latest_reviewed_attempt_entry = valid_rejections[-1]
+    if latest_reviewed_attempt_entry[0] != latest_attempt_entry[0]:
+        return inactive
+
+    _, latest_attempt = latest_attempt_entry
+    current_team = _repair_record_value(latest_attempt, "team")
+    # The first valid rejection is the initial implementation rejection, even
+    # when retries or an early discretionary upgrade produced several worker
+    # attempts before it.  A later rejection is repair evidence only when the
+    # reviewed worker actually ran after an earlier authoritative rejection.
+    # This keeps missing/invalid old records from manufacturing repair credit.
+    repair_attempt_identities: set[int] = set()
+    prior_attempt_chronologies: list[tuple[int, int]] = []
+    for _rejection, reviewed_attempt_entry in valid_rejections:
+        chronology = attempt_chronology(reviewed_attempt_entry)
+        if any(chronology > prior for prior in prior_attempt_chronologies):
+            repair_attempt_identities.add(reviewed_attempt_entry[0])
+        prior_attempt_chronologies.append(chronology)
+    team_repairs_completed = sum(
+        1
+        for _rejection, (attempt_identity, reviewed_attempt) in valid_rejections
+        if attempt_identity in repair_attempt_identities
+        and _repair_record_value(reviewed_attempt, "team") == current_team
+    )
+    repair_ordinal = len(valid_rejections)
+    due = team_repairs_completed >= threshold
+    eligible = eligible_implementation_upgrade(
+        config,
+        role=role,
+        baseline_team=baseline_team,
+        most_recent_implementation_team=(
+            current_team if isinstance(current_team, str) else None
+        ),
+        is_implementation_attempt=True,
+    )
+    if not due:
+        reason = (
+            f"repair threshold not due: {team_repairs_completed}/{threshold} "
+            f"failed repairs on team {current_team or '<unassigned>'}"
+        )
+    elif eligible.available:
+        reason = (
+            f"repair threshold reached after {team_repairs_completed} failed "
+            f"repairs on team {current_team or '<unassigned>'}; the next worker "
+            f"must use the one-hop upgrade"
+        )
+    else:
+        reason = (
+            f"repair threshold reached after {team_repairs_completed} failed "
+            f"repairs on team {current_team or '<unassigned>'}, but no distinct "
+            f"upgrade is available: {eligible.reason or 'unavailable'}"
+        )
+    return RepairUpgradePolicy(
+        active=True,
+        threshold=threshold,
+        scope_id=scope_id,
+        current_team=(current_team if isinstance(current_team, str) else None),
+        repair_ordinal=repair_ordinal,
+        team_repairs_completed=team_repairs_completed,
+        due=due,
+        forced=due and eligible.available,
+        eligible_upgrade=eligible,
+        reason=reason,
+        latest_rejection_number=int(
+            _repair_record_value(latest_rejection, "rejection_number")
+        ),
+    )
 
 
 def _nonempty_text(value: object, *, field: str) -> str:

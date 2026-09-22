@@ -15,7 +15,7 @@ from datetime import datetime, timezone
 from dataclasses import asdict, dataclass, replace
 from enum import Enum
 from pathlib import Path
-from typing import TYPE_CHECKING, Callable, Literal, Mapping, NoReturn
+from typing import TYPE_CHECKING, Callable, Literal, Mapping, NoReturn, Sequence
 
 if TYPE_CHECKING:
     from aflow.api.events import ExecutionEvent, ExecutionObserver
@@ -40,6 +40,7 @@ from .manager import (
     build_manager_note_correction_result,
     build_manager_prompts,
     build_repartition_prompts,
+    determine_repair_upgrade_policy,
     eligible_implementation_upgrade,
     manager_prompt_metrics,
     parse_manager_decision,
@@ -1857,14 +1858,6 @@ class _ManagerGateCoordinator:
                 f"scope-pressure rerouting requires an enabled manager",
                 run_dir=run_paths.run_dir,
             )
-        if not self.workflow.manager_enabled:
-            return proposed_transition
-        if scope_pressure_reason is not None:
-            self.state.scope_pressure_reason = scope_pressure_reason
-            _require_valid_pressure_scope(
-                run_paths.run_dir,
-                self.state.active_implementation_scope,
-            )
         next_step = None if proposed_transition == "END" else proposed_transition
         candidate_step = self.workflow.steps.get(next_step) if next_step is not None else None
         proposed_target_plan = (
@@ -1879,6 +1872,71 @@ class _ManagerGateCoordinator:
             if scope is not None else []
         )
         recent_team = attempts[-1].team if attempts else None
+        repair_policy = determine_repair_upgrade_policy(
+            self.workflow_config,
+            threshold=self.workflow.upgrade_after_repairs,
+            role=(candidate_step.role if candidate_step is not None else current_role),
+            baseline_team=baseline_team_name,
+            scope_id=scope.scope_id if scope is not None else None,
+            attempts=attempts,
+            rejections=self.state.review_rejection_history,
+        )
+        if scope_pressure_reason is not None:
+            self.state.scope_pressure_reason = scope_pressure_reason
+            _require_valid_pressure_scope(
+                run_paths.run_dir,
+                self.state.active_implementation_scope,
+            )
+        if not self.workflow.manager_enabled:
+            # Manager-independent routing is still durable: the selected team
+            # is recorded before the next worker invocation, exactly like a
+            # manager decision route. A due edge is mandatory when available;
+            # an exhausted edge retains the strongest reviewed team.
+            if (
+                repair_policy.active
+                and candidate_step is not None
+                and candidate_step.role == "worker"
+                and repair_policy.current_team is not None
+            ):
+                target_team = (
+                    repair_policy.eligible_upgrade.target_team
+                    if repair_policy.forced
+                    else repair_policy.current_team
+                )
+                target_selector = (
+                    repair_policy.eligible_upgrade.target_selector
+                    if repair_policy.forced
+                    else None
+                )
+                if target_selector is None:
+                    target_selector, _ = _resolve_step_runtime(
+                        candidate_step,
+                        self.workflow_config,
+                        team_name=target_team,
+                        step_path=f"workflow.{self.workflow_name}.steps.{next_step}",
+                    )
+                self.state.pending_step_team_override = PendingTeamOverride(
+                    target_step=str(next_step),
+                    role=candidate_step.role,
+                    source_team=repair_policy.current_team,
+                    target_team=str(target_team),
+                    selector=target_selector,
+                    checkpoint_identity=target_plan_identity,
+                    decision_number=self.state.manager_decision_number,
+                    scope_id=scope.scope_id if scope is not None else None,
+                    target_plan_identity=target_plan_identity,
+                    repair_ordinal=repair_policy.repair_ordinal,
+                    team_repairs_completed=repair_policy.team_repairs_completed,
+                )
+                self.run_metadata.write(
+                    status="running",
+                    last_snapshot=self.state.last_snapshot,
+                    original_plan_path=original_plan_path,
+                    current_step_name=runtime_current_step_name,
+                    active_plan_path=active_plan_path,
+                    new_plan_path=new_plan_path,
+                )
+            return proposed_transition
         scope_context = None
         if scope is not None:
             upgrade_depth = _implementation_upgrade_depth(
@@ -1900,6 +1958,9 @@ class _ManagerGateCoordinator:
                 "attempt_selectors": [attempt.selector for attempt in attempts],
                 "most_recent_team": recent_team,
                 "upgrade_depth": upgrade_depth,
+                "repair_ordinal": repair_policy.repair_ordinal,
+                "team_repairs_completed": repair_policy.team_repairs_completed,
+                "repair_threshold": repair_policy.threshold,
             }
         retrying_scoped_implementation = (
             scope is not None
@@ -2011,6 +2072,7 @@ class _ManagerGateCoordinator:
             operational_failure=operational_failure, backup_team=backup_team,
             backup_selector=backup_selector, implementation_upgrade=upgrade.__dict__,
             active_implementation_scope=scope_context,
+            repair_upgrade_policy=repair_policy.to_dict(),
             eligible_actions=sorted(lite_eligible),
             scope_pressure_reason=scope_pressure_reason,
             # Immutable controller-owned copies for deterministic v2 reconstruction.
@@ -2176,14 +2238,29 @@ class _ManagerGateCoordinator:
             and retrying_scoped_implementation
             and recent_team is not None
         )
+        forced_worker_upgrade = (
+            decision.action == "continue"
+            and repair_policy.forced
+            and target_config is not None
+            and target_config.role == "worker"
+        )
+        selected_upgrade = (
+            repair_policy.eligible_upgrade
+            if forced_worker_upgrade
+            else upgrade
+        )
         target_team = (
-            upgrade.target_team
-            if decision.action == "upgrade_next_implementation"
+            selected_upgrade.target_team
+            if decision.action == "upgrade_next_implementation" or forced_worker_upgrade
             else recent_team
             if retain_scoped_team
             else None
         )
-        target_selector = upgrade.target_selector if decision.action == "upgrade_next_implementation" else None
+        target_selector = (
+            selected_upgrade.target_selector
+            if decision.action == "upgrade_next_implementation" or forced_worker_upgrade
+            else None
+        )
         if target_config is not None and target_selector is None:
             resolution_team = (
                 backup_team
@@ -2245,18 +2322,30 @@ class _ManagerGateCoordinator:
                 raise WorkflowError("manager selected unavailable backup-team retry", run_dir=run_paths.run_dir)
             self.state.current_team_override = backup_team
             return current_step
-        if decision.action == "upgrade_next_implementation":
+        if decision.action == "upgrade_next_implementation" or forced_worker_upgrade:
             assert next_step is not None
-            if not upgrade.available or upgrade.target_team is None or upgrade.target_selector is None:
+            if (
+                not selected_upgrade.available
+                or selected_upgrade.target_team is None
+                or selected_upgrade.target_selector is None
+            ):
                 raise WorkflowError("manager selected unavailable implementation upgrade", run_dir=run_paths.run_dir)
             self.state.pending_step_team_override = PendingTeamOverride(
-                target_step=next_step, role=self.workflow.steps[next_step].role, source_team=upgrade.source_team,
-                target_team=upgrade.target_team, selector=upgrade.target_selector,
+                target_step=next_step, role=self.workflow.steps[next_step].role,
+                source_team=selected_upgrade.source_team,
+                target_team=selected_upgrade.target_team, selector=selected_upgrade.target_selector,
                 checkpoint_identity=target_identity, decision_number=self.state.manager_decision_number,
                 scope_id=scope_id, target_plan_identity=target_identity,
                 repartition_generation_id=active_partition_identity[0],
                 repartition_candidate_sha256=active_partition_identity[1],
                 repartition_partition_id=active_partition_identity[2],
+                repair_ordinal=(
+                    repair_policy.repair_ordinal if repair_policy.active else None
+                ),
+                team_repairs_completed=(
+                    repair_policy.team_repairs_completed
+                    if repair_policy.active else None
+                ),
             )
         elif (
             retain_scoped_team
@@ -2281,6 +2370,13 @@ class _ManagerGateCoordinator:
                 repartition_generation_id=active_partition_identity[0],
                 repartition_candidate_sha256=active_partition_identity[1],
                 repartition_partition_id=active_partition_identity[2],
+                repair_ordinal=(
+                    repair_policy.repair_ordinal if repair_policy.active else None
+                ),
+                team_repairs_completed=(
+                    repair_policy.team_repairs_completed
+                    if repair_policy.active else None
+                ),
             )
         return proposed_transition
 
@@ -2917,6 +3013,25 @@ def _close_implementation_scope(state: ControllerState) -> None:
     state.reviewer_rejection_count = 0
 
 
+def _append_replayed_review_rejection(
+    state: ControllerState,
+    rejection: ReviewRejectionRecord,
+) -> bool:
+    """Append one finalized rejection exactly once during resume replay."""
+    if any(
+        item.scope_id == rejection.scope_id
+        and item.rejection_number == rejection.rejection_number
+        and item.reviewed_attempt_ordinal == rejection.reviewed_attempt_ordinal
+        and item.review_turn_number == rejection.review_turn_number
+        and item.reviewed_implementation_turn_number
+        == rejection.reviewed_implementation_turn_number
+        for item in state.review_rejection_history
+    ):
+        return False
+    state.review_rejection_history.append(rejection)
+    return True
+
+
 def _pending_matches_scope_and_plan(
     pending: object,
     state: ControllerState,
@@ -2965,6 +3080,20 @@ def _mutable_implementation_attempts(
 ) -> dict[str, list[ImplementationAttempt]]:
     """Normalize durable resume histories before any live append."""
     return {key: list(history) for key, history in attempts.items()}
+
+
+def _next_implementation_attempt_ordinal(
+    attempts: Sequence[ImplementationAttempt],
+) -> int:
+    """Allocate a scope-local identity after all durable retained attempts."""
+    durable_ordinals = [
+        attempt.attempt_ordinal
+        for attempt in attempts
+        if isinstance(attempt.attempt_ordinal, int)
+        and not isinstance(attempt.attempt_ordinal, bool)
+        and attempt.attempt_ordinal > 0
+    ]
+    return max([len(attempts), *durable_ordinals], default=0) + 1
 
 
 def _implementation_upgrade_depth(
@@ -10622,6 +10751,27 @@ def run_workflow(
                     source_scope.carried_reviewer_rejection_count
                 ),
             )
+        replayed_rejection = replayed_boundary.review_rejection
+        replay_scope = state.active_implementation_scope
+        if (
+            replayed_rejection is not None
+            and replay_scope is not None
+            and replayed_rejection.scope_id == replay_scope.scope_id
+            and not any(
+                item.scope_id == replayed_rejection.scope_id
+                and item.rejection_number == replayed_rejection.rejection_number
+                and item.reviewed_attempt_ordinal
+                == replayed_rejection.reviewed_attempt_ordinal
+                and item.review_turn_number == replayed_rejection.review_turn_number
+                and item.reviewed_implementation_turn_number
+                == replayed_rejection.reviewed_implementation_turn_number
+                for item in state.review_rejection_history
+            )
+        ):
+            # The result artifact is the only accepted source for a rejection
+            # that was finalized before the controller ledger write. Matching
+            # its scope makes replay idempotent and prevents cross-scope credit.
+            _append_replayed_review_rejection(state, replayed_rejection)
         post_transition_active_path = _select_next_active_plan_path(
             original_plan_path=original_plan_path,
             active_plan_path=active_plan_path,
@@ -11857,6 +12007,9 @@ def run_workflow(
         followup_candidates_before: set[Path] = set()
         consume_manager_notes = False
         consume_team_override = False
+        attempt_repair_ordinal: int | None = None
+        attempt_team_repairs_completed: int | None = None
+        attempt_ordinal: int | None = None
         turn_session_request: SessionRequest | None = None
         owned_session_result = None
         cross_handover_prompt = ""
@@ -11940,6 +12093,31 @@ def run_workflow(
             ):
                 active_team_name = pending_override.target_team
                 consume_team_override = True
+                attempt_repair_ordinal = pending_override.repair_ordinal
+                attempt_team_repairs_completed = pending_override.team_repairs_completed
+            if step.role == "worker" and state.active_implementation_scope is not None:
+                if attempt_repair_ordinal is None:
+                    prelaunch_policy = determine_repair_upgrade_policy(
+                        workflow_config,
+                        threshold=wf.upgrade_after_repairs,
+                        role="worker",
+                        baseline_team=baseline_team_name,
+                        scope_id=state.active_implementation_scope.scope_id,
+                        attempts=state.implementation_attempts.get(
+                            state.active_implementation_scope.scope_id, []
+                        ),
+                        rejections=state.review_rejection_history,
+                    )
+                    attempt_repair_ordinal = (
+                        prelaunch_policy.repair_ordinal
+                        if prelaunch_policy.active
+                        else 0
+                    )
+                    attempt_team_repairs_completed = (
+                        prelaunch_policy.team_repairs_completed
+                        if prelaunch_policy.active
+                        else 0
+                    )
             selector, resolved = _resolve_step_runtime(
                 step,
                 workflow_config,
@@ -12281,6 +12459,31 @@ def run_workflow(
             ):
                 active_team_name = pending_override.target_team
                 consume_team_override = True
+                attempt_repair_ordinal = pending_override.repair_ordinal
+                attempt_team_repairs_completed = pending_override.team_repairs_completed
+            if step.role == "worker" and state.active_implementation_scope is not None:
+                if attempt_repair_ordinal is None:
+                    prelaunch_policy = determine_repair_upgrade_policy(
+                        workflow_config,
+                        threshold=wf.upgrade_after_repairs,
+                        role="worker",
+                        baseline_team=baseline_team_name,
+                        scope_id=state.active_implementation_scope.scope_id,
+                        attempts=state.implementation_attempts.get(
+                            state.active_implementation_scope.scope_id, []
+                        ),
+                        rejections=state.review_rejection_history,
+                    )
+                    attempt_repair_ordinal = (
+                        prelaunch_policy.repair_ordinal
+                        if prelaunch_policy.active
+                        else 0
+                    )
+                    attempt_team_repairs_completed = (
+                        prelaunch_policy.team_repairs_completed
+                        if prelaunch_policy.active
+                        else 0
+                    )
             selector, resolved = _resolve_step_runtime(
                 step,
                 workflow_config,
@@ -12530,6 +12733,14 @@ def run_workflow(
                     new_path=new_plan_path,
                 )
 
+        if step.role == "worker" and state.active_implementation_scope is not None:
+            attempt_ordinal = _next_implementation_attempt_ordinal(
+                state.implementation_attempts.get(
+                    state.active_implementation_scope.scope_id,
+                    [],
+                )
+            )
+
         turn_dir, turn_started_at = _start_turn(
             turn_number=turn_number,
             step_name=current_step_name,
@@ -12567,8 +12778,12 @@ def run_workflow(
                 )
             if consume_manager_notes:
                 state.pending_manager_notes = None
-            if consume_team_override:
-                state.pending_step_team_override = None
+            # Keep the selected worker route durable through the provider
+            # launch boundary.  Clearing it here leaves a prelaunch resume
+            # with only the baseline team, even though the override was
+            # already selected and persisted in the turn metadata.  The
+            # finalized-turn path below clears it after the provider result
+            # has been recorded.
             boundary_target_started = (
                 state.pending_boundary_decision is not None
                 and not state.pending_boundary_decision.consumed
@@ -13181,6 +13396,7 @@ def run_workflow(
                     reviewed_implementation_turn_number=reviewed_attempt.turn_number,
                     reviewed_worker_team=reviewed_attempt.team,
                     reviewed_worker_selector=reviewed_attempt.selector,
+                    reviewed_attempt_ordinal=reviewed_attempt.attempt_ordinal,
                     review_summary=summarize_review_rejection(completed.stdout),
                     repair_plan_summary=summarize_repair_plan(repair_path),
                     review_stdout_artifact_path=_turn_artifact_display_path(
@@ -13267,6 +13483,9 @@ def run_workflow(
                 outcome="accepted" if done else "progress",
                 manager_decision_number=(state.pending_boundary_decision.decision_number
                     if state.pending_boundary_decision is not None else None),
+                repair_ordinal=attempt_repair_ordinal,
+                team_repairs_completed=attempt_team_repairs_completed,
+                attempt_ordinal=attempt_ordinal,
             ))
             next_config = (
                 wf.steps.get(transition_target)
@@ -13278,6 +13497,8 @@ def run_workflow(
                     next_config is not None and next_config.role != "worker"
                 ),
             )
+            if consume_team_override:
+                state.pending_step_team_override = None
 
         post_transition_active_path = _select_next_active_plan_path(
             original_plan_path=original_plan_path,

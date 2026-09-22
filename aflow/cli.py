@@ -47,6 +47,7 @@ from .run_state import (
     PendingRepartitionV1,
     RUN_STATE_SCHEMA_VERSION,
     ResumeContext,
+    ReviewRejectionRecord,
     WorkflowEndReason,
     describe_end_reason,
     hotplug_resume_fields,
@@ -1989,6 +1990,83 @@ def _resume_plan_snapshot(value: object) -> PlanSnapshot | None:
     )
 
 
+def _resume_review_rejection(value: object) -> ReviewRejectionRecord | None:
+    """Decode only complete controller-owned rejection evidence."""
+    if not isinstance(value, Mapping):
+        return None
+    required_text = (
+        "scope_id",
+        "source_run_id",
+        "review_step_name",
+        "review_summary",
+        "review_stdout_artifact_path",
+    )
+    if any(
+        not isinstance(value.get(field), str) or not value[field].strip()
+        for field in required_text
+    ):
+        return None
+    integer_fields = (
+        "rejection_number",
+        "review_turn_number",
+        "reviewed_implementation_turn_number",
+    )
+    if any(
+        not isinstance(value.get(field), int)
+        or isinstance(value[field], bool)
+        or value[field] < 0
+        for field in integer_fields
+    ):
+        return None
+    optional_text = (
+        "reviewer_selector",
+        "checkpoint_name",
+        "reviewed_worker_team",
+        "reviewed_worker_selector",
+        "repair_plan_summary",
+        "repair_plan_path",
+    )
+    if any(
+        item is not None and not isinstance(item, str)
+        for item in (value.get(field) for field in optional_text)
+    ):
+        return None
+    checkpoint_index = value.get("checkpoint_index")
+    if checkpoint_index is not None and (
+        not isinstance(checkpoint_index, int)
+        or isinstance(checkpoint_index, bool)
+        or checkpoint_index < 0
+    ):
+        return None
+    reviewed_attempt_ordinal = value.get("reviewed_attempt_ordinal")
+    if reviewed_attempt_ordinal is not None and (
+        not isinstance(reviewed_attempt_ordinal, int)
+        or isinstance(reviewed_attempt_ordinal, bool)
+        or reviewed_attempt_ordinal < 1
+    ):
+        return None
+    return ReviewRejectionRecord(
+        scope_id=value["scope_id"],
+        rejection_number=value["rejection_number"],
+        source_run_id=value["source_run_id"],
+        review_turn_number=value["review_turn_number"],
+        review_step_name=value["review_step_name"],
+        reviewer_selector=value.get("reviewer_selector"),
+        checkpoint_index=checkpoint_index,
+        checkpoint_name=value.get("checkpoint_name"),
+        reviewed_implementation_turn_number=value[
+            "reviewed_implementation_turn_number"
+        ],
+        reviewed_worker_team=value.get("reviewed_worker_team"),
+        reviewed_worker_selector=value.get("reviewed_worker_selector"),
+        review_summary=value["review_summary"],
+        repair_plan_summary=value.get("repair_plan_summary"),
+        review_stdout_artifact_path=value["review_stdout_artifact_path"],
+        repair_plan_path=value.get("repair_plan_path"),
+        reviewed_attempt_ordinal=reviewed_attempt_ordinal,
+    )
+
+
 def _completed_manager_budget_boundary_pending(prev_run: Mapping[str, object], repo_root: Path) -> bool:
     run_dir_value = prev_run.get("run_dir")
     if not isinstance(run_dir_value, str):
@@ -2104,6 +2182,7 @@ def _pending_finalized_resume_turn(
         conditions={key: bool(value) for key, value in condition_values.items()},
         chosen_transition=chosen_transition,
         chosen_transition_condition=chosen_condition,
+        review_rejection=_resume_review_rejection(result.get("review_rejection")),
     )
 
 

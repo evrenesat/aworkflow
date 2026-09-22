@@ -14909,7 +14909,8 @@ class LifecycleBootstrapTests(unittest.TestCase):
                     live = json.loads((run_dir / "run.json").read_text())
                     assert live["team"] == "base"
                     assert live["pending_repartition"] is None
-                    assert live["pending_step_team_override"] is None
+                    assert live["pending_step_team_override"]["target_team"] == "high"
+                    assert live["pending_step_team_override"]["selector"] == "codex.worker-high"
                     assert live["pending_boundary_decision"]["consumed"] is True
                     boundary_observations.append("consumed-after-starting")
                     _write_plan(plan_path, _COMPLETE_PLAN)
