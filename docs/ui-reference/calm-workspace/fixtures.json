@@ -1,0 +1,107 @@
+{
+  "schema_version": 1,
+  "project_id": "test-project",
+  "variants": {
+    "running": {
+      "run_id": "demo-fidelity-running-checkpoint-2",
+      "title": "Automatic plan consumption and repair upgrades",
+      "plan_status": "in-progress",
+      "plan_slug": "automatic-plan-consumption",
+      "status": "running",
+      "phase": "reviewing",
+      "current_step_name": "review",
+      "current_checkpoint": 2,
+      "checkpoint_names": [
+        "Workflow repair-policy configuration",
+        "Durable manager-independent worker upgrades",
+        "Shared project scheduling settings",
+        "Cross-process launch admission and capacity",
+        "Failure lifecycle and identity-preserving requeue",
+        "Filename dependency admission",
+        "Background plan consumer",
+        "Scheduling and repair-policy API contracts",
+        "UI settings and plan states",
+        "End-to-end evidence and documentation"
+      ],
+      "approved_checkpoints": [1],
+      "turns_completed": 4,
+      "max_turns": 100,
+      "team": "base-team",
+      "active_role": "reviewer",
+      "active_selector": "codex.astra-medium",
+      "activity": "active",
+      "run_started_at": "2026-09-22T10:28:00Z",
+      "publication": {
+        "Final review": { "status": "pending", "reason": "Checkpoint review is in progress." },
+        "Merge": { "status": "not_applicable", "reason": "Run is not terminal." },
+        "Publish": { "status": "pending", "reason": "Run is not terminal." },
+        "CI": { "status": "unknown", "reason": "No terminal receipt exists." },
+        "Live verification": { "status": "unknown", "reason": "No terminal receipt exists." }
+      }
+    },
+    "paused": {
+      "run_id": "demo-fidelity-paused-provider-limit",
+      "title": "Provider recovery",
+      "plan_status": "in-progress",
+      "plan_slug": "provider-recovery",
+      "status": "paused",
+      "phase": "waiting",
+      "current_step_name": "implement",
+      "current_checkpoint": 1,
+      "checkpoint_names": [
+        "Inspect recovery state",
+        "Resume safely",
+        "Verify results"
+      ],
+      "approved_checkpoints": [],
+      "turns_completed": 1,
+      "max_turns": 12,
+      "team": "base-team",
+      "active_role": "worker",
+      "active_selector": "codex.worker",
+      "activity": "inactive",
+      "status_reason_code": "provider_rate_limit",
+      "reason": "Provider rate limit reached. Completed work is preserved; no new worker is running.",
+      "run_started_at": "2026-09-22T10:00:00Z",
+      "publication": {
+        "Final review": { "status": "pending", "reason": "The run paused before review." },
+        "Merge": { "status": "not_applicable", "reason": "The run is not terminal." },
+        "Publish": { "status": "pending", "reason": "The run is not terminal." },
+        "CI": { "status": "unknown", "reason": "No terminal receipt exists." },
+        "Live verification": { "status": "unknown", "reason": "No terminal receipt exists." }
+      }
+    },
+    "completed": {
+      "run_id": "demo-fidelity-completed-published",
+      "title": "Readable run history",
+      "plan_status": "done",
+      "plan_slug": "readable-run-history",
+      "status": "completed",
+      "phase": "completed",
+      "current_step_name": "done",
+      "current_checkpoint": null,
+      "checkpoint_names": [
+        "Readable labels",
+        "Compact history",
+        "Preserve selection",
+        "Browser checks",
+        "Delivery verification"
+      ],
+      "approved_checkpoints": [1, 2, 3, 4, 5],
+      "turns_completed": 10,
+      "max_turns": 12,
+      "team": "base-team",
+      "active_role": "reviewer",
+      "active_selector": "codex.astra-medium",
+      "activity": "inactive",
+      "run_started_at": "2026-09-21T16:00:00Z",
+      "publication": {
+        "Final review": { "status": "succeeded", "recorded_at": "2026-09-21T16:45:00Z" },
+        "Merge": { "status": "succeeded", "recorded_at": "2026-09-21T16:46:00Z" },
+        "Publish": { "status": "succeeded", "recorded_at": "2026-09-21T16:49:00Z" },
+        "CI": { "status": "succeeded", "recorded_at": "2026-09-21T16:50:00Z" },
+        "Live verification": { "status": "succeeded", "recorded_at": "2026-09-21T16:52:00Z" }
+      }
+    }
+  }
+}

@@ -7,6 +7,57 @@ These are acceptance rules for future changes, not a claim that the current UI
 already satisfies them. The responsive document-scrolling plan implements the
 migration. Preserve existing domain behavior while replacing the old layout.
 
+## UI/UX expectations summary
+
+Owner-approved additions, 2026-09-22, apply across the application and future UI
+work. They describe the intended experience, not verified implementation status.
+
+- Reduce anxiety about mistakes that cost time, energy, money, or tokens. Make
+  the current situation, next step, and consequences understandable within the
+  app, without requiring an AI chat to interpret a run URL.
+- Put current work, the latest meaningful result, and required user action
+  first. Follow with recent activity; checkpoint history, receipts, technical
+  details, and long explanations belong behind named disclosures. Offer
+  Expand all / Collapse all for information, never for executing actions.
+- Spend space on useful content. Avoid large gaps, repeated headings, redundant
+  status cards, and tall lists that push current progress below the fold.
+  Plans lead with the document, Settings with effective values and assignments,
+  Projects with project selection, and Runs with current progress and results.
+- Distinguish navigation/preparation from execution in button labels: for
+  example, "Configure restart…" opens a review screen; "Confirm restart" acts.
+  Explain effect, timing, and relevant resource use before final confirmation.
+  Keep stop/restart controls in a labelled Actions menu, outside the happy path;
+  both graceful and immediate stop require a review step. Promote recovery
+  actions only when the current situation warrants them.
+- Do not report events that have not happened. Omit expected missing optional
+  data instead of repeating Unknown, Unassigned, or Unavailable. Use `-` when a
+  value slot is necessary. Keep meaningful zeroes and partial-count qualifiers;
+  never turn absent evidence into success. Important missing evidence or a
+  blocking failure gets a concise actionable warning; reserve red for real
+  problems. Preserve recorded but unmatched events in expandable history.
+- Keep run rows compact: title plus useful status/progress, targeting 56–72px
+  at default desktop text size. Reveal additional useful facts in anchored
+  hover/focus previews without shifting neighboring rows. Provide equivalent
+  touch access; essential information must never depend on hover.
+- Treat mobile as a first-class experience. Use list → detail → Back, readable
+  inputs, touch-sized controls, and document scrolling. Preserve position,
+  selections, drafts, and focus across navigation and viewport changes.
+- Background refresh must be visually unnoticeable when nothing changed. Keep
+  populated content mounted; update only changed values/content without flash,
+  loading-screen replacement, scroll jumps, focus loss, or disclosure resets.
+  Initial loading and actual failures remain visible and truthful.
+- Preserve execution, save, conflict, identity, and recovery semantics during
+  presentation changes. Verify whole user journeys, not just isolated layouts.
+- Treat an owner-approved demo as the visual and interaction acceptance
+  reference. Compare populated desktop/mobile and light/dark output, including
+  the deployed app, against it. Record material gaps and follow-up work rather
+  than claiming fidelity from passing tests alone.
+
+When asked to "learn" a preference, store it in project or personal guidance
+or an appropriate skill. Internal assistant memory is not the primary record.
+Keep this existing document as the project source of truth; discover it from
+`AGENTS.md` and `ARCHITECTURE.md` rather than adding root-level summary files.
+
 ## Spend space on the task
 
 - On desktop, fit persistent app navigation, page context, section navigation,
@@ -60,6 +111,14 @@ migration. Preserve existing domain behavior while replacing the old layout.
   scroll/focus stability. Presentation changes do not justify domain changes.
 
 ## Required evidence
+
+- Review populated screenshots for information hierarchy as well as geometry.
+  Show one identity per heading or selector; expose stable IDs in identity
+  details or tooltips. Do not repeat a selected profile beside its own control.
+  Keep creation forms, migration explanations and identity maintenance behind
+  labelled disclosures so assignments remain the focus of the Teams editor.
+  Verify sidebar metadata occupies separate lines and stays readable when
+  selected; generic shared CSS must not override the component layout.
 
 - Test loaded task states at 320×568, 390×844, 768×1024, 844×390, 1280×720,
   1440×900, and a reduced 390×420 viewport. Include text enlargement, long labels,

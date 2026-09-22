@@ -1,5 +1,28 @@
 # DEVLOG
 
+## 2026-09-22 — Repair calm-workspace fidelity capture evidence
+
+- Bound every disposable running, paused and completed fixture to its canonical
+  launch manifest and launch phase, and added real bounded turn activity so the
+  authenticated capture exercises control-plane identity and recent activity.
+- Replaced the broad progress wrapper with distinct latest-result, recent-
+  activity and disclosure anchors; desktop/mobile light/dark captures now
+  require visible ordered anchors and reject legacy ownership warnings.
+- Chromium and WebKit focused captures passed with six production manifests;
+  the remaining dense pre-redesign shell is intentionally left for the original
+  full-app fidelity checkpoints.
+
+## 2026-09-22 — Freeze calm-workspace fidelity reference
+
+- Added the byte-checked owner demo, local ownership rules, capture matrix,
+  anchor contract, intentional-difference manifest, and deterministic running,
+  paused, and completed disposable run fixtures.
+- Added a real-browser harness that renders the literal reference fragment and
+  captures the authenticated built app at the approved desktop/mobile widths
+  and light/dark themes. Screenshots and capture manifests remain disposable
+  pytest artifacts; later checkpoints will add production fidelity assertions.
+- Preserved the approved September 22 UI expectations in `UI_GUIDELINES.md`.
+
 ## 2026-09-14 — Repair assistant documentation CI coverage
 
 - Updated the installed-use documentation check to the assistant's current

@@ -3210,7 +3210,7 @@ export function RunDashboard({ visible = true, page, onNewRun, onCancelNewRun, o
               {!selectedRunIssue && selectedRun.reason && <div className="notice">{conciseRunText(selectedRun.reason) ?? 'A run reason was recorded.'}</div>}
 
 
-              {(compatibilitySummary?.repairing || compatibilityProgressText || outcome?.decision || outcome?.currentTurn || outcome?.finishedTurn || outcome?.finishedSummary || outcome?.resultText) && <section className="dashboard-section">
+              {(compatibilitySummary?.repairing || compatibilityProgressText || outcome?.decision || outcome?.currentTurn || outcome?.finishedTurn || outcome?.finishedSummary || outcome?.resultText) && <section className="dashboard-section" data-ui-fidelity-anchor="latest-result">
                 <h4>Latest progress</h4>
                 {compatibilitySummary?.repairing && <p><strong>Repairing</strong>{compatibilitySummary.overlayFileName ? <> · {compatibilitySummary.overlayFileName}</> : null}</p>}
                 {compatibilityProgressText && <p>{compatibilityProgressText}</p>}
@@ -3283,7 +3283,7 @@ export function RunDashboard({ visible = true, page, onNewRun, onCancelNewRun, o
                 </h4>
                 {technicalOpen && (
                   <div id={technicalId} className="run-technical-details">
-              <section className="dashboard-section">
+              <section className="dashboard-section" data-ui-fidelity-anchor="recent-activity">
                 <div className="section-heading"><div><h4>Activity timeline</h4><span className="text-xs text-dim">{events.length} recent events</span></div></div>
                 {streamNotice && <div className="notice">{streamNotice}</div>}
                 {events.length === 0 ? <p className="text-sm text-dim">No activity has been reported yet.</p> : <div className="run-timeline">{events.map((event) => <article className="timeline-event" key={event.sequence}><div><strong>{formatMachineLabel(event.event_type)}</strong><span className="text-xs text-dim">#{event.sequence} · {timestamp(event.timestamp)}</span></div></article>)}</div>}
@@ -3326,7 +3326,7 @@ export function RunDashboard({ visible = true, page, onNewRun, onCancelNewRun, o
                       <p>{[selectedRun.plan_path, selectedRun.workflow_name ? formatMachineLabel(selectedRun.workflow_name) : null, selectedRun.team ? formatMachineLabel(selectedRun.team) : null, selectedRun.current_step ? formatMachineLabel(selectedRun.current_step) : null].filter(Boolean).join(' · ')}</p>
                       {events.length > 0 && <p>Last event: {formatMachineLabel(events[events.length - 1].event_type)} · {timestamp(events[events.length - 1].timestamp)}</p>}
                       <p>{selectedRun.evidence.can_resume === true ? 'Saved continuation is available.' : 'Resume is unavailable: no admitted saved continuation.'} {selectedRun.status === 'failed' ? 'Restart with options checks eligibility before creating a fresh run.' : ''}</p>
-                      <details open={rawOpen}>
+                      <details open={rawOpen} data-ui-fidelity-anchor="first-disclosure">
                         <summary onClick={event => { event.preventDefault(); setRawOpen(open => !open) }}>Raw details</summary>
                         {contextUpdatedAt && <p className="text-xs text-dim">Details observed: {timestamp(contextUpdatedAt)}</p>}
                         {contextBusy && <p role="status">Loading raw details…</p>}
