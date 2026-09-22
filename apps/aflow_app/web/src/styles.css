@@ -429,6 +429,128 @@ input::placeholder, textarea::placeholder {
   gap: var(--spacing-sm);
 }
 
+.run-overview {
+  display: flex;
+  flex-direction: column;
+  gap: var(--spacing-sm);
+  min-width: 0;
+}
+
+.dashboard-section.run-overview-section {
+  gap: var(--spacing-sm);
+  padding-block: var(--spacing-sm);
+  border-top: 1px solid var(--color-border);
+}
+
+.dashboard-section.run-overview-section:first-of-type {
+  border-top: 0;
+  padding-top: 0;
+}
+
+.run-overview-content {
+  display: flex;
+  flex-direction: column;
+  gap: var(--spacing-xs);
+  min-width: 0;
+}
+
+.run-overview-content > p {
+  margin: 0;
+  overflow-wrap: anywhere;
+}
+
+.run-overview-content > .run-report > summary {
+  min-height: 1.5rem;
+}
+
+.run-overview-inline-facts {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--spacing-xs) var(--spacing-sm);
+  min-width: 0;
+}
+
+.run-overview-inline-facts > * {
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+.run-overview-lead {
+  font-size: 1rem;
+  font-weight: 600;
+}
+
+.run-overview-activity {
+  gap: var(--spacing-sm);
+}
+
+.run-overview-event-list {
+  display: flex;
+  flex-direction: column;
+  gap: 0;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.run-overview-event {
+  min-width: 0;
+  border-bottom: 1px solid var(--color-border);
+}
+
+.run-overview-event:last-child {
+  border-bottom: 0;
+}
+
+.run-overview-event > details > summary {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: var(--spacing-sm);
+  min-height: 1.25rem;
+  min-width: 0;
+  color: var(--color-primary);
+  cursor: pointer;
+  font-size: 0.8rem;
+}
+
+.run-overview-event-summary {
+  display: flex;
+  align-items: baseline;
+  flex-wrap: wrap;
+  gap: 0 var(--spacing-sm);
+  min-width: 0;
+}
+
+.run-overview-event-summary > * {
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+.run-overview-event-summary span {
+  color: var(--color-text-dim);
+}
+
+.run-overview-event-action {
+  flex: 0 0 auto;
+  white-space: nowrap;
+}
+
+.run-overview-event .dashboard-payload {
+  min-width: min(24rem, 78vw);
+  margin-top: var(--spacing-xs);
+}
+
+@media (max-width: 640px) {
+  .run-overview-content > .run-report > summary {
+    min-height: var(--tap-target);
+  }
+
+  .run-overview-event > details > summary {
+    align-items: baseline;
+  }
+}
+
 .run-progress-header .run-title-date {
   display: block;
   margin-block-start: var(--spacing-xs);

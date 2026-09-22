@@ -896,7 +896,7 @@ function RunProgressDetails({
       <div><dt>Elapsed</dt><dd>{runElapsed ?? 'Not reported'}</dd></div>
       {terminalInactive
         ? <div><dt>Finished</dt><dd>{finish ?? 'Finish time not reported'}</dd></div>
-        : <div><dt>Current work</dt><dd>{positionText(progress)}</dd></div>}
+        : <div><dt>Evidence state</dt><dd>{activity ? formatMachineLabel(activity) : 'Active progress'}</dd></div>}
     </dl>
     <DeliverySummary stages={delivery} onDetails={onDeliveryDetails} />
     {notice && <p className="notice" role="status">{notice}</p>}

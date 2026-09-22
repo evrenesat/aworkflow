@@ -3,6 +3,7 @@ import type {
   GuidedTeamSummary,
   RunProgressCount,
   RunProgressSummary,
+  RunEvent,
   RunStatus,
 } from './types'
 import { formatMachineLabel } from './label'
@@ -57,6 +58,110 @@ export function checkpointApprovalText(progress: RunProgressSummary): string {
   if (totalLabel !== null) return `${totalLabel} ${pluralizeCheckpoint(total ?? 0)} · approval unknown`
   if (approvedLabel !== null) return `${approvedLabel} approved · total unknown`
   return 'Approval progress unknown'
+}
+
+/** Keep the active checkpoint position concise enough for the run overview. */
+export function runCurrentWorkText(progress: RunProgressSummary, phaseOverride: string | null = null): string {
+  const phase = [phaseOverride, progress.phase, progress.activity, progress.run_status]
+    .find((value): value is string => typeof value === 'string' && value.trim().length > 0)
+  if (progress.availability === 'not_applicable') {
+    return phase ? formatMachineLabel(phase) : 'Non-checkpoint workflow'
+  }
+  const ordinal = progress.current_checkpoint_ordinal
+  const total = validCount(progress.total_checkpoints)
+  const rawTitle = typeof progress.current_checkpoint_title === 'string' && progress.current_checkpoint_title.trim()
+    ? progress.current_checkpoint_title.trim()
+    : null
+  if (typeof ordinal === 'number' && Number.isSafeInteger(ordinal) && ordinal > 0) {
+    const position = `CP${ordinal}${total !== null ? ` of ${total}` : ''}`
+    const title = rawTitle?.replace(new RegExp(`^checkpoint\\s+${ordinal}\\s*:\\s*`, 'i'), '') || rawTitle
+    return `${position}${phase ? ` · ${formatMachineLabel(phase)}` : ''}${title ? ` — ${title}` : ''}`
+  }
+  return phase ? `${formatMachineLabel(phase)} · current checkpoint not reported` : 'Current checkpoint not reported'
+}
+
+export interface RunEventPresentation {
+  event: RunEvent
+  label: string
+  summary: string | null
+  detail: string
+}
+
+const RUN_EVENT_TEXT_FIELDS = [
+  'failure_reason',
+  'end_reason',
+  'summary',
+  'outcome',
+  'reason',
+  'error',
+  'message',
+  'semantic_summary',
+  'result',
+] as const
+
+function eventText(value: unknown, limit = 240): string | null {
+  if (typeof value !== 'string' || !value.trim()) return null
+  const text = value.trim().replace(/\s+/g, ' ')
+  return text.length <= limit ? text : `${text.slice(0, limit - 1)}…`
+}
+
+/** Return the newest bounded set without inventing a narrative between events. */
+export function meaningfulRunEvents(events: RunEvent[], limit = 5): RunEvent[] {
+  if (limit <= 0) return []
+  return events
+    .filter(event => typeof event.event_type === 'string' && event.event_type.trim().length > 0)
+    .slice(-limit)
+    .reverse()
+}
+
+type RunEventOutcome = 'failed' | 'stopped' | 'successful' | null
+
+function runEventOutcome(event: RunEvent): RunEventOutcome {
+  const eventType = event.event_type.toLowerCase()
+  const status = typeof event.data?.status === 'string' ? event.data.status.toLowerCase() : ''
+  if (/(?:fail|error|reject)/.test(eventType) || ['failed', 'error', 'rejected'].includes(status)) return 'failed'
+  if (/(?:stop|interrupt|cancel)/.test(eventType) || ['stopped', 'interrupted', 'cancelled', 'canceled'].includes(status)) return 'stopped'
+  if (/(?:finish|complet|approv|success|done)/.test(eventType) || ['completed', 'approved', 'succeeded', 'done', 'accepted'].includes(status)) return 'successful'
+  return null
+}
+
+function terminalResultUnavailable(outcome: RunEventOutcome): string | null {
+  if (outcome === 'failed') return 'Failure reason unavailable.'
+  if (outcome === 'stopped') return 'Stop reason unavailable.'
+  if (outcome === 'successful') return 'Recorded result unavailable.'
+  return null
+}
+
+/** Present one recorded event using only text already stored in its payload. */
+export function presentRunEvent(event: RunEvent): RunEventPresentation {
+  const label = formatMachineLabel(event.event_type) || 'Recorded update'
+  const storedSummary = RUN_EVENT_TEXT_FIELDS
+    .map(field => {
+      const value = eventText(event.data?.[field])
+      return value && (field === 'failure_reason' || field === 'end_reason') ? formatMachineLabel(value) : value
+    })
+    .find((value): value is string => value !== null) ?? null
+  const summary = storedSummary ?? terminalResultUnavailable(runEventOutcome(event))
+  return {
+    event,
+    label,
+    summary,
+    detail: JSON.stringify({ event_type: event.event_type, sequence: event.sequence, timestamp: event.timestamp, data: event.data }, null, 2),
+  }
+}
+
+/** Find the latest event that records a finished or otherwise terminal result. */
+export function latestRunResultEvent(events: RunEvent[]): RunEvent | null {
+  for (let index = events.length - 1; index >= 0; index -= 1) {
+    const event = events[index]
+    const eventType = event.event_type.toLowerCase()
+    const status = typeof event.data?.status === 'string' ? event.data.status.toLowerCase() : ''
+    if (
+      /(?:finished|completed|failed|rejected|approved|error|stopped|interrupted)/.test(eventType)
+      || ['completed', 'failed', 'rejected', 'approved', 'stopped', 'interrupted', 'done'].includes(status)
+    ) return event
+  }
+  return null
 }
 
 /** Keep a nullable turn limit explicit without turning missing usage into zero. */

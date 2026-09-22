@@ -29,7 +29,7 @@ REFERENCE_ANCHORS = {
 }
 PRODUCTION_ANCHORS = {
     "title": ".run-detail h3",
-    "current_work": ".checkpoint-history-at-a-glance",
+    "current_work": "[data-ui-fidelity-anchor='current-work']",
     "latest_result": "[data-ui-fidelity-anchor='latest-result']",
     "recent_activity": "[data-ui-fidelity-anchor='recent-activity']",
     "mobile_recent_activity": "[data-ui-fidelity-anchor='mobile-recent-activity']",
