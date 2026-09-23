@@ -740,10 +740,19 @@ def _run_history_detail(surface):
 def _open_live_controls(page: Page):
     dashboard = _visible_dashboard(page)
     details = dashboard.locator("details.dashboard-section").filter(has_text="Adjust run").first
+    if details.count() == 0:
+        actions = dashboard.get_by_role("button", name="Actions", exact=True)
+        actions.click()
+        actions_menu = dashboard.get_by_role("menu", name="Run actions", exact=True)
+        adjust = actions_menu.get_by_role(
+            "menuitem", name="Adjust run settings…", exact=True
+        )
+        expect(adjust).to_be_enabled()
+        adjust.click()
     details.wait_for()
     max_turns = dashboard.get_by_label("Control max turns", exact=True)
     if details.get_attribute("open") is None:
-        details.locator("summary").click()
+        details.locator(":scope > summary").click()
     max_turns.wait_for(state="visible")
     return dashboard
 
@@ -1696,7 +1705,7 @@ def test_history_completion_preserves_live_controls_pointer_target(
     base_path = f"/api/control-plane/projects/{PROJECT_ID}/runs"
     run_path = f"{base_path}/{run_id}"
 
-    def hold_initial_history(route) -> None:
+    def hold_refresh_history(route) -> None:
         if (
             route.request.method == "GET"
             and urlsplit(route.request.url).path == base_path
@@ -1709,7 +1718,6 @@ def test_history_completion_preserves_live_controls_pointer_target(
         browser = _browser(playwright)
         page = browser.new_page(viewport={"width": width, "height": height})
         history_pattern = f"**/api/control-plane/projects/{PROJECT_ID}/runs**"
-        page.route(history_pattern, hold_initial_history)
         try:
             _login(page, url)
             with page.expect_response(
@@ -1726,10 +1734,15 @@ def test_history_completion_preserves_live_controls_pointer_target(
             detail_heading = dashboard.locator(".run-progress-header h3").first
             if _compact(page):
                 expect(detail_heading).to_be_focused()
+            dashboard = _open_live_controls(page)
+            page.route(history_pattern, hold_refresh_history)
+            page.locator('select[aria-label="Run history"]').first.select_option("all")
             pending = dashboard.get_by_role("status").filter(
                 has_text="Run history is still loading"
             )
-            expect(pending).to_contain_text("0 loaded so far; the history is incomplete.")
+            expect(pending).to_contain_text(
+                "0 loaded so far; the history is incomplete."
+            )
             details = dashboard.locator("details.dashboard-section").filter(
                 has_text="Adjust run"
             ).first
@@ -1751,7 +1764,7 @@ def test_history_completion_preserves_live_controls_pointer_target(
                     },
                 })"""
             )
-            assert held_history, "initial run history response was not held"
+            assert held_history, "refresh run history response was not held"
             pointer = {
                 "x": before["x"] + before["width"] / 2,
                 "y": before["y"] + before["height"] / 2,
@@ -1761,23 +1774,8 @@ def test_history_completion_preserves_live_controls_pointer_target(
             for held_route in held_history[:]:
                 held_route.fallback()
             held_history.clear()
-            page.unroute(history_pattern, hold_initial_history)
+            page.unroute(history_pattern, hold_refresh_history)
             pending.wait_for(state="hidden")
-            checkpoint_disclosure = dashboard.locator(
-                "details.checkpoint-history-checkpoints"
-            ).first
-            checkpoint_disclosure.evaluate("element => { element.open = true }")
-            checkpoint_layout = dashboard.locator(".checkpoint-history-layout")
-            checkpoint_layout.wait_for(state="visible")
-            expected_detail_heading = "Unassigned history"
-            current_checkpoint = checkpoint_layout.locator(
-                '.checkpoint-history-entry[aria-current="true"]'
-            )
-            expect(current_checkpoint).to_contain_text(expected_detail_heading)
-            expect(
-                checkpoint_layout.locator(".checkpoint-history-detail-heading h5")
-            ).to_have_text(expected_detail_heading)
-
             after = summary.bounding_box()
             assert after, "Adjust run summary detached after history completion"
             after_flow = page.evaluate(
@@ -1818,8 +1816,25 @@ def test_history_completion_preserves_live_controls_pointer_target(
             assert hit["is_summary"], {"pointer": pointer, "hit": hit, "after": after}
 
             page.mouse.click(pointer["x"], pointer["y"])
-            expect(details).to_have_attribute("open", "")
-            expect(dashboard.get_by_label("Control max turns", exact=True)).to_be_visible()
+            expect(details).to_have_count(0)
+            expect(dashboard.get_by_label("Control max turns", exact=True)).to_have_count(0)
+
+            checkpoint_disclosure = dashboard.locator(
+                "details.checkpoint-history-checkpoints"
+            ).first
+            if checkpoint_disclosure.get_attribute("open") is None:
+                checkpoint_disclosure.locator(":scope > summary").click()
+            expect(checkpoint_disclosure).to_have_attribute("open", "")
+            checkpoint_layout = dashboard.locator(".checkpoint-history-layout")
+            checkpoint_layout.wait_for(state="visible")
+            expected_detail_heading = "Unassigned history"
+            current_checkpoint = checkpoint_layout.locator(
+                '.checkpoint-history-entry[aria-current="true"]'
+            )
+            expect(current_checkpoint).to_contain_text(expected_detail_heading)
+            expect(
+                checkpoint_layout.locator(".checkpoint-history-detail-heading h5")
+            ).to_have_text(expected_detail_heading)
             _assert_no_horizontal_overflow(page)
             _assert_no_unauthorized_scrollers(page)
             _assert_document_moves(page)
@@ -1830,7 +1845,7 @@ def test_history_completion_preserves_live_controls_pointer_target(
                 except PlaywrightError:
                     pass
             try:
-                page.unroute(history_pattern, hold_initial_history)
+                page.unroute(history_pattern, hold_refresh_history)
             except PlaywrightError:
                 pass
             browser.close()
@@ -4038,6 +4053,12 @@ def test_durable_recovery_ui_journey(control_client, monkeypatch, tmp_path):
                 dashboard.get_by_role(
                     "heading", name="Replacement worker started", exact=True
                 ).wait_for()
+                evidence = dashboard.locator(
+                    "details.checkpoint-history-disclosure"
+                ).filter(has_text="Count definitions & evidence").first
+                expect(evidence).not_to_have_attribute("open", "")
+                evidence.locator(":scope > summary").click()
+                expect(evidence).to_have_attribute("open", "")
                 dashboard.get_by_text("All 4 checkpoints complete", exact=True).wait_for()
                 _assert_header_and_flow(page)
                 screenshot = evidence_root / f"issue36-recovery-{browser_name}-390x844.png"
@@ -4053,7 +4074,19 @@ def test_durable_recovery_ui_journey(control_client, monkeypatch, tmp_path):
                 page.goto(f"{url}/?project={PROJECT_ID}&view=runs&run={source_id}")
                 active_dashboard = _visible_dashboard(page)
                 active_dashboard.locator(".run-detail h3").wait_for()
-                page.get_by_text(re.compile(r"Restart unavailable:"), exact=False).wait_for()
+                actions = active_dashboard.get_by_role(
+                    "button", name="Actions", exact=True
+                )
+                actions.wait_for(state="visible")
+                actions.click()
+                actions_menu = active_dashboard.get_by_role(
+                    "menu", name="Run actions", exact=True
+                )
+                expect(
+                    actions_menu.get_by_role(
+                        "menuitem", name=re.compile(r"Restart unavailable:"), exact=False
+                    )
+                ).to_be_visible()
                 assert page.get_by_role(
                     "button", name="Recover with another worker…", exact=True
                 ).count() == 0
