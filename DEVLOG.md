@@ -1,5 +1,49 @@
 # DEVLOG
 
+## 2026-09-23 — Retain Teams geometry failure artifacts in CI
+
+- Teams geometry failures now select `AFLOW_BROWSER_ARTIFACT_DIR` when CI
+  provides it, create that directory before writing, and retain the existing
+  browser/viewport-specific JSON and PNG names. Ordinary local runs still use
+  pytest `tmp_path`; the bounded snapshot contains geometry and selected
+  computed/viewport/scroll/focus data only, with no tokens, cookies, or request
+  bodies.
+- The dashboard CI job creates
+  `${{ github.workspace }}/artifacts/responsive-browser` before Chromium server
+  tests. The job-scoped path reaches both Chromium and WebKit; every OS/Python
+  matrix job uploads it under a unique artifact name with `always()`, including
+  a Chromium failure that skips the later WebKit step.
+- Validation: a disposable forced Chromium short-viewport failure returned a
+  non-zero test result and wrote both artifacts inside
+  `/tmp/aflow-cp02-probe.9Q8p2x`; its JSON contained the expected rectangles,
+  computed styles, viewport, scroll, and focus fields without secret-like
+  fields. The focused landscape/short pair passed 2/2, and the full
+  team-family journey passed 7/7 in Chromium and 7/7 in WebKit. YAML syntax,
+  workflow ordering/inheritance, Python compilation, and `git diff --check`
+  passed. No production Teams markup/CSS or acceptance assertion changed.
+
+## 2026-09-23 — Stabilize Teams family short-viewport geometry evidence
+
+- The published Teams journey added three separate `Locator.bounding_box()`
+  reads for the long family title, kind, and metadata. The source layout
+  already declares a column flex row with wrapping, and the baseline passed
+  five unchanged Chromium repetitions plus the focused WebKit pair locally;
+  no production overlap was reproduced.
+- A direct 390×420 Chromium/WebKit probe kept document scroll unchanged across
+  sequential offscreen `bounding_box()` calls, so scrolling by that API alone
+  is not claimed as the root cause. The responsive helper now waits for the
+  visible descendants and font/frame readiness, reads all rectangles in one
+  settled DOM evaluation with computed styles, viewport, scroll, and focus,
+  and writes a bounded JSON snapshot plus full-page screenshot on an ordering
+  failure. The original vertical ordering assertions and journey behavior are
+  unchanged; no Teams component or CSS change was demonstrated or needed.
+- Validation: the exact short/landscape command passed five post-change
+  repetitions (2 tests each); the full team-family journey passed 7/7
+  viewports in Chromium and 7/7 in WebKit; the focused TeamFamiliesSettings
+  suite passed 11/11 tests; the production web build passed. Chromium and
+  WebKit light/dark captures at 844×390 and 390×420 were inspected and showed
+  readable stacked rows. The frozen demo checksum remains unchanged.
+
 ## 2026-09-23 — Verify populated calm-workspace fidelity
 
 - Tightened the desktop workspace content boundary while retaining the mobile
