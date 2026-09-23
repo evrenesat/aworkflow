@@ -55,6 +55,16 @@ function sortedUnique(values: Iterable<string>): string[] {
   return [...new Set(values)].sort()
 }
 
+const PRIMARY_ROLE_NAMES = ['worker', 'reviewer'] as const
+
+function primaryRolesFirst(roleNames: string[]): { primary: string[]; other: string[] } {
+  const primary = PRIMARY_ROLE_NAMES.filter(role => roleNames.includes(role))
+  return {
+    primary,
+    other: roleNames.filter(role => !primary.includes(role as typeof PRIMARY_ROLE_NAMES[number])),
+  }
+}
+
 function stageLabel(draft: GuidedFormProjection, rootId: string, teamId: string, kind: TeamFamilyGroup['kind'] = 'family'): string {
   if (teamId === rootId && kind === 'family') return 'Base'
   return normalized(draft.teams[teamId]?.display_name) ?? formatMachineLabel(teamId)
@@ -327,8 +337,9 @@ export function TeamFamiliesSettings({
     ...Object.keys(activeSummary.effective_prompts ?? {}),
     ...Object.keys(activeSummary.prompt_sources ?? {}),
   ]) : []
-  const preferredRoles = ['worker', 'reviewer'].filter(role => roleNames.includes(role))
-  const otherRoles = roleNames.filter(role => !preferredRoles.includes(role))
+  const { primary: primaryRoles, other: otherRoles } = primaryRolesFirst(roleNames)
+  const explicitOtherRoles = explicitRoles.filter(role => otherRoles.includes(role))
+  const inheritedOtherRoles = inheritedRoles.filter(role => otherRoles.includes(role))
   const isSimpleFamily = selectedGroup?.kind === 'family' && selectedGroup.simpleRoute
   const activeRouteIndex = activeRoute.indexOf(activeTeamId)
   const precedingTeamId = activeRouteIndex > 0 ? activeRoute[activeRouteIndex - 1] : null
@@ -350,16 +361,16 @@ export function TeamFamiliesSettings({
     apply(() => setDeclaredPromptOverride(draft, activeTeamId, role, text))
   }
 
-  function renderOverrideRole(role: string): ReactNode {
+  function renderOverrideRole(role: string, primary = false): ReactNode {
     const declared = activeSummary?.roles[role] ?? ''
-    return <div className="team-family-role-row" key={`override-${role}`}>
+    return <div className={`team-family-role-row${primary ? ' team-family-primary-role' : ''}`} key={`override-${role}`}>
       <div className="team-family-role-heading">
         <strong>{roleLabel(role)}</strong>
         <span className="text-xs text-dim" title={`Declared by ${activeTeamId}`}>Local override</span>
       </div>
       <Combobox
         label={roleLabel(role)}
-        visibleLabel="Configured profile"
+        visibleLabel={primary ? undefined : 'Configured profile'}
         value={declared}
         options={selectors}
         optionLabel={selector => selectorSummary(draft, selector)}
@@ -372,10 +383,10 @@ export function TeamFamiliesSettings({
     </div>
   }
 
-  function renderInheritedRole(role: string): ReactNode {
+  function renderInheritedRole(role: string, primary = false): ReactNode {
     const effective = activeSummary?.effective_roles?.[role]
     const source = sourceLabel(draft, activeRootId, activeSummary?.role_sources?.[role])
-    return <div className="team-family-role-row team-family-inherited-row" key={`inherited-${role}`}>
+    return <div className={`team-family-role-row team-family-inherited-row${primary ? ' team-family-primary-role' : ''}`} key={`inherited-${role}`}>
       <div className="team-family-role-heading">
         <strong>{roleLabel(role)}</strong>
         <span className="text-xs text-dim">Inherited from {source}</span>
@@ -391,18 +402,18 @@ export function TeamFamiliesSettings({
     </div>
   }
 
-  function renderBaseRole(role: string): ReactNode {
-    if (own(activeSummary?.roles ?? {}, role)) return renderOverrideRole(role)
+  function renderBaseRole(role: string, primary = false): ReactNode {
+    if (own(activeSummary?.roles ?? {}, role)) return renderOverrideRole(role, primary)
     const effective = activeSummary?.effective_roles?.[role]
     const source = sourceLabel(draft, activeRootId, activeSummary?.role_sources?.[role])
-    return <div className="team-family-role-row team-family-inherited-row" key={`base-${role}`}>
+    return <div className={`team-family-role-row team-family-inherited-row${primary ? ' team-family-primary-role' : ''}`} key={`base-${role}`}>
       <div className="team-family-role-heading">
         <strong>{roleLabel(role)}</strong>
         <span className="text-xs text-dim">Inherited from {source} · choose a local override to diverge</span>
       </div>
       <Combobox
         label={roleLabel(role)}
-        visibleLabel="Configured profile"
+        visibleLabel={primary ? undefined : 'Configured profile'}
         value=""
         options={selectors}
         optionLabel={selector => selectorSummary(draft, selector)}
@@ -556,24 +567,6 @@ export function TeamFamiliesSettings({
           </button>)}
         </div>
 
-        {selectedGroup.kind === 'legacy_chain' && <details className="team-family-disclosure"><summary>Convert to family…</summary><div className="team-family-conversion">
-          <div>
-            <p className="text-sm">These teams upgrade in sequence but do not inherit from each other. Preview sharing a Base configuration while preserving every effective role and prompt.</p>
-          </div>
-          <button type="button" className="btn btn-secondary" disabled={conversionBusy} onClick={previewConversion}>{conversionBusy ? 'Previewing conversion…' : 'Preview convert to family'}</button>
-        </div></details>}
-
-        {conversionPreview && conversionPreview.conversion.rootId === selectedGroup.rootId && <div className="team-family-conversion-preview card" role="region" aria-label="Legacy conversion preview">
-          <h4>Conversion preview</h4>
-          <p className="text-sm">{conversionPreview.validation.warning}</p>
-          {conversionPreview.conversion.changes.length > 0 && <ul className="team-family-change-list">
-            {conversionPreview.conversion.changes.filter(change => change.removed.length || change.retained.length).map(change => <li key={`${change.teamId}-${change.field}`}><span className="mono">{change.teamId}.{change.field}</span>: {change.removed.length ? `remove ${change.removed.join(', ')}` : 'no removals'}{change.retained.length ? `; retain ${change.retained.join(', ')}` : ''}</li>)}
-          </ul>}
-          {conversionPreview.error && <p className="error-message" role="alert">{conversionPreview.error.message}</p>}
-          {conversionPreview.valid && <button type="button" className="btn btn-primary" onClick={applyConversion}>Add conversion to draft</button>}
-          {!conversionPreview.valid && <p className="text-xs text-dim">The candidate remains preview-only; no draft values were changed.</p>}
-        </div>}
-
         <div className="team-family-stage-summary">
           {activeTeamId !== selectedGroup.rootId && activeSummary.extends && <p className="text-sm">Inherits declared roles and prompts from <strong>{stageLabel(draft, selectedGroup.rootId, activeSummary.extends)}</strong> (<span className="mono">{activeSummary.extends}</span>).</p>}
           {activeTeamId === selectedGroup.rootId && selectedGroup.kind === 'family' && <p className="text-sm">Base assignments are the family source; stages inherit them unless they store an explicit override.</p>}
@@ -581,54 +574,82 @@ export function TeamFamiliesSettings({
           {workerUnchanged && <p className="notice" role="status">This stage does not change the implementation worker. Worker-quality escalation from the preceding stage is not eligible.</p>}
         </div>
 
-        <details className="team-family-disclosure"><summary>Name and identity</summary><div className="team-family-fields">
-          <label>Display name<input className="input" value={displayNameDrafts[activeTeamId]?.value ?? activeSummary.display_name ?? ''} placeholder={activeTeamId === selectedGroup.rootId ? 'Family label (optional)' : 'Stage label (optional)'} onChange={event => updateDisplayName(event.target.value)} onBlur={commitDisplayName} /></label>
-          <p className="text-xs text-dim">Blank removes the label. The raw ID remains <span className="mono">{activeTeamId}</span>.</p>
-          {activeSummary.extends && <p className="text-sm">Base relationship: <span className="mono">{activeSummary.extends}</span> (direct declaration)</p>}
-          {!activeSummary.extends && activeTeamId !== selectedGroup.rootId && <p className="text-sm">No inheritance declaration. This team remains a standalone route until conversion or an explicit base assignment.</p>}
-        </div></details>
-
         <section className="team-family-section" aria-labelledby="team-family-roles-heading">
           <h4 id="team-family-roles-heading">Role assignments</h4>
-          {activeTeamId !== selectedGroup.rootId && explicitRoles.length > 0 && <div className="team-family-role-list"><h5>Stored overrides</h5>{explicitRoles.map(renderOverrideRole)}</div>}
-          {activeTeamId !== selectedGroup.rootId && explicitRoles.length === 0 && <p className="text-sm text-dim">No stored overrides. This stage is a valid inherited variant.</p>}
-          {activeTeamId === selectedGroup.rootId && selectedGroup.kind !== 'family' && roleNames.length > 0 && <div className="team-family-role-list">{roleNames.map(renderBaseRole)}</div>}
-          {activeTeamId === selectedGroup.rootId && selectedGroup.kind === 'family' && preferredRoles.length > 0 && <div className="team-family-role-list"><h5>Base roles</h5>{preferredRoles.map(renderBaseRole)}</div>}
-          {activeTeamId === selectedGroup.rootId && selectedGroup.kind === 'family' && preferredRoles.length === 0 && <p className="text-sm text-dim">Worker and reviewer roles are not configured in this draft.</p>}
-          {activeTeamId === selectedGroup.rootId && selectedGroup.kind === 'family' && otherRoles.length > 0 && <details className="team-family-disclosure" open={preferredRoles.length === 0}><summary>Other roles ({otherRoles.length}) — Show all roles</summary><div className="team-family-role-list">{otherRoles.map(renderBaseRole)}</div></details>}
-          {activeTeamId !== selectedGroup.rootId && inheritedRoles.length > 0 && <details className="team-family-disclosure"><summary>Inherited roles ({inheritedRoles.length}) — Show all roles</summary><div className="team-family-role-list">{inheritedRoles.map(renderInheritedRole)}</div></details>}
+          {primaryRoles.length > 0 && <div className="team-family-role-list team-family-primary-role-list">
+            {primaryRoles.map(role => activeTeamId === selectedGroup.rootId
+              ? renderBaseRole(role, true)
+              : own(activeSummary?.roles ?? {}, role)
+                ? renderOverrideRole(role, true)
+                : renderInheritedRole(role, true))}
+          </div>}
+          {!primaryRoles.length && roleNames.length > 0 && <p className="text-sm text-dim">Worker and Reviewer are not configured. Other configured roles remain available in Advanced details.</p>}
           {!roleNames.length && <p className="text-sm text-dim">No configured roles are available.</p>}
         </section>
 
-        <section className="team-family-section" aria-labelledby="team-family-prompts-heading">
-          <div className="team-family-section-heading"><div><h4 id="team-family-prompts-heading">Role prompts</h4><p className="text-xs text-dim">Prompt text stays with the existing Prompts editor; this view shows its declared/effective source.</p></div></div>
-          {promptNames.length ? <div className="team-family-prompt-list">{promptNames.map(renderPrompt)}</div> : <p className="text-sm text-dim">No role prompt declarations or canonical values are available.</p>}
-        </section>
+        {activeUpgradeChain.error && <p className="notice" role="alert">{activeUpgradeChain.error}</p>}
+        {selectedGroup.kind === 'family' && !selectedGroup.simpleRoute && <p className="notice" role="status">This family has an explicit complex route. Reorder and stage removal are disabled; use Advanced details for the next-upgrade controls and full route.</p>}
+        <details className="team-family-advanced-details"><summary>Advanced details</summary><div className="team-family-advanced-content">
+          {otherRoles.length > 0 && <details className="team-family-disclosure"><summary>Other roles ({otherRoles.length})</summary><div className="team-family-role-list">
+            {activeTeamId !== selectedGroup.rootId && explicitOtherRoles.length > 0 && <h5>Stored overrides</h5>}
+            {activeTeamId !== selectedGroup.rootId && explicitOtherRoles.map(role => renderOverrideRole(role))}
+            {activeTeamId !== selectedGroup.rootId && inheritedOtherRoles.length > 0 && <h5>Inherited roles</h5>}
+            {activeTeamId !== selectedGroup.rootId && inheritedOtherRoles.map(role => renderInheritedRole(role))}
+            {activeTeamId === selectedGroup.rootId && otherRoles.map(role => renderBaseRole(role))}
+          </div></details>}
 
-        <section className="team-family-section" aria-labelledby="team-family-route-heading">
-          <h4 id="team-family-route-heading">Upgrade route</h4>
-          <p className="text-xs text-dim">Worker chain: {workerRoute.map((teamId, index) => <span key={teamId}>{index > 0 && ' → '}<span className="mono">{formatMachineLabel(teamId)}</span>{workerText(draft, teamId) ? <> ({workerText(draft, teamId)})</> : null}</span>)}{workerRoute.length === 1 && !activeUpgradeChain.error ? ' — no further upgrade configured' : ''}</p>
-          {activeUpgradeChain.error && <p className="text-sm add-team-error" role="alert">{activeUpgradeChain.error}</p>}
-          <p className="team-family-full-route team-family-summary-route">{fullRoute.map(teamId => <span key={teamId} title={teamId}><span>{stageLabel(draft, selectedGroup.rootId, teamId, selectedGroup.kind)}</span>{teamId !== fullRoute[fullRoute.length - 1] && <span className="team-family-route-arrow">{' → '}</span>}</span>)}</p>
-          <label>Next upgrade<select className="input" aria-label={`Upgrade to for team ${formatMachineChoice(activeTeamId, teamNames)}`} value={activeSummary.upgrade_to ?? ''} onChange={event => updateUpgrade(event.target.value)}><option value="">None — no further upgrade</option>{teamNames.filter(teamId => teamId !== activeTeamId).map(teamId => <option key={teamId} value={teamId}>{formatMachineChoice(teamId, teamNames)}</option>)}</select></label>
-          {selectedGroup.kind === 'family' && !selectedGroup.simpleRoute && <p className="notice" role="status">This family has an explicit complex route. Reorder and stage removal are disabled; use the next-upgrade controls and the full route above.</p>}
-          {selectedGroup.kind === 'legacy_chain' && <p className="text-xs text-dim">Upgrade links remain standalone until an accepted conversion is added to the draft.</p>}
-          {isSimpleFamily && activeTeamId !== selectedGroup.rootId && <div className="team-family-action-row">
-            <button type="button" className="btn btn-secondary" disabled={activeRouteIndex <= 1} onClick={() => reorder(-1)}>Move stage earlier</button>
-            <button type="button" className="btn btn-secondary" disabled={activeRouteIndex < 0 || activeRouteIndex >= activeRoute.length - 1} onClick={() => reorder(1)}>Move stage later</button>
-            <button type="button" className="btn btn-danger" onClick={removeStage}>Remove stage…</button>
-          </div>}
-          {confirmRemove === activeTeamId && <div className="confirmation" role="alertdialog" aria-label={`Confirm removal of ${stageDisplay(activeTeamId)}`}>
-            <p>Remove <strong>{stageDisplay(activeTeamId)}</strong> from the draft? The preceding upgrade link will be rewired to its successor; Save all is still required.</p>
-            <div className="team-family-action-row"><button type="button" className="btn btn-danger" onClick={removeStage}>Confirm remove stage</button><button type="button" className="btn btn-secondary" onClick={() => setConfirmRemove(null)}>Cancel</button></div>
-          </div>}
-        </section>
+          <details className="team-family-disclosure"><summary>Role prompts</summary><div className="team-family-section">
+            <div className="team-family-section-heading"><div><p className="text-xs text-dim">Prompt text stays with the existing Prompts editor; this view shows its declared/effective source.</p></div></div>
+            {promptNames.length ? <div className="team-family-prompt-list">{promptNames.map(renderPrompt)}</div> : <p className="text-sm text-dim">No role prompt declarations or canonical values are available.</p>}
+          </div></details>
 
-        <details className="team-family-declared-toml">
-          <summary>Declared TOML for this team (read-only)</summary>
-          <p className="text-xs text-dim">Effective assignments and provenance are server projections and are not written here. Use Advanced TOML for the complete source documents.</p>
-          <pre className="mono">{declaredToml(activeTeamId, activeSummary)}</pre>
-        </details>
+          <details className="team-family-disclosure"><summary>Upgrade routing</summary><div className="team-family-section">
+            <p className="text-xs text-dim">Worker chain: {workerRoute.map((teamId, index) => <span key={teamId}>{index > 0 && ' → '}<span className="mono">{formatMachineLabel(teamId)}</span>{workerText(draft, teamId) ? <> ({workerText(draft, teamId)})</> : null}</span>)}{workerRoute.length === 1 && !activeUpgradeChain.error ? ' — no further upgrade configured' : ''}</p>
+            <p className="team-family-full-route team-family-summary-route">{fullRoute.map(teamId => <span key={teamId} title={teamId}><span>{stageLabel(draft, selectedGroup.rootId, teamId, selectedGroup.kind)}</span>{teamId !== fullRoute[fullRoute.length - 1] && <span className="team-family-route-arrow">{' → '}</span>}</span>)}</p>
+            <label>Next upgrade<select className="input" aria-label={`Upgrade to for team ${formatMachineChoice(activeTeamId, teamNames)}`} value={activeSummary.upgrade_to ?? ''} onChange={event => updateUpgrade(event.target.value)}><option value="">None — no further upgrade</option>{teamNames.filter(teamId => teamId !== activeTeamId).map(teamId => <option key={teamId} value={teamId}>{formatMachineChoice(teamId, teamNames)}</option>)}</select></label>
+            {selectedGroup.kind === 'legacy_chain' && <p className="text-xs text-dim">Upgrade links remain standalone until an accepted conversion is added to the draft.</p>}
+            {isSimpleFamily && activeTeamId !== selectedGroup.rootId && <div className="team-family-action-row">
+              <button type="button" className="btn btn-secondary" disabled={activeRouteIndex <= 1} onClick={() => reorder(-1)}>Move stage earlier</button>
+              <button type="button" className="btn btn-secondary" disabled={activeRouteIndex < 0 || activeRouteIndex >= activeRoute.length - 1} onClick={() => reorder(1)}>Move stage later</button>
+              <button type="button" className="btn btn-danger" onClick={removeStage}>Remove stage…</button>
+            </div>}
+            {confirmRemove === activeTeamId && <div className="confirmation" role="alertdialog" aria-label={`Confirm removal of ${stageDisplay(activeTeamId)}`}>
+              <p>Remove <strong>{stageDisplay(activeTeamId)}</strong> from the draft? The preceding upgrade link will be rewired to its successor; Save all is still required.</p>
+              <div className="team-family-action-row"><button type="button" className="btn btn-danger" onClick={removeStage}>Confirm remove stage</button><button type="button" className="btn btn-secondary" onClick={() => setConfirmRemove(null)}>Cancel</button></div>
+            </div>}
+          </div></details>
+
+          <details className="team-family-disclosure"><summary>Name and identity</summary><div className="team-family-fields">
+            <label>Display name<input className="input" value={displayNameDrafts[activeTeamId]?.value ?? activeSummary.display_name ?? ''} placeholder={activeTeamId === selectedGroup.rootId ? 'Family label (optional)' : 'Stage label (optional)'} onChange={event => updateDisplayName(event.target.value)} onBlur={commitDisplayName} /></label>
+            <p className="text-xs text-dim">Blank removes the label. The raw ID remains <span className="mono">{activeTeamId}</span>.</p>
+            {activeSummary.extends && <p className="text-sm">Base relationship: <span className="mono">{activeSummary.extends}</span> (direct declaration)</p>}
+            {!activeSummary.extends && activeTeamId !== selectedGroup.rootId && <p className="text-sm">No inheritance declaration. This team remains a standalone route until conversion or an explicit base assignment.</p>}
+          </div></details>
+
+          {selectedGroup.kind === 'legacy_chain' && <details className="team-family-disclosure"><summary>Convert to family…</summary><div className="team-family-conversion">
+            <div>
+              <p className="text-sm">These teams upgrade in sequence but do not inherit from each other. Preview sharing a Base configuration while preserving every effective role and prompt.</p>
+            </div>
+            <button type="button" className="btn btn-secondary" disabled={conversionBusy} onClick={previewConversion}>{conversionBusy ? 'Previewing conversion…' : 'Preview convert to family'}</button>
+          </div>
+          {conversionPreview && conversionPreview.conversion.rootId === selectedGroup.rootId && <div className="team-family-conversion-preview card" role="region" aria-label="Legacy conversion preview">
+            <h4>Conversion preview</h4>
+            <p className="text-sm">{conversionPreview.validation.warning}</p>
+            {conversionPreview.conversion.changes.length > 0 && <ul className="team-family-change-list">
+              {conversionPreview.conversion.changes.filter(change => change.removed.length || change.retained.length).map(change => <li key={`${change.teamId}-${change.field}`}><span className="mono">{change.teamId}.{change.field}</span>: {change.removed.length ? `remove ${change.removed.join(', ')}` : 'no removals'}{change.retained.length ? `; retain ${change.retained.join(', ')}` : ''}</li>)}
+            </ul>}
+            {conversionPreview.error && <p className="error-message" role="alert">{conversionPreview.error.message}</p>}
+            {conversionPreview.valid && <button type="button" className="btn btn-primary" onClick={applyConversion}>Add conversion to draft</button>}
+            {!conversionPreview.valid && <p className="text-xs text-dim">The candidate remains preview-only; no draft values were changed.</p>}
+          </div>}
+          </details>}
+
+          <details className="team-family-declared-toml">
+            <summary>Declared TOML for this team (read-only)</summary>
+            <p className="text-xs text-dim">Effective assignments and provenance are server projections and are not written here. Use Advanced TOML for the complete source documents.</p>
+            <pre className="mono">{declaredToml(activeTeamId, activeSummary)}</pre>
+          </details>
+        </div></details>
         {operationError && <p className="error-message" role="alert">{operationError.message}</p>}
       </fieldset> : <p className="text-sm text-dim">Select a team family to inspect its declarations.</p>}
       </div>

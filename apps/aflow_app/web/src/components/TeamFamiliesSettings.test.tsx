@@ -149,6 +149,40 @@ function complexDraft(): GuidedFormProjection {
   })
 }
 
+function legacySixRoleDraft(): GuidedFormProjection {
+  const draft = legacyDraft()
+  draft.roles = {
+    worker: 'codex.worker',
+    reviewer: 'codex.reviewer',
+    architect: 'codex.architect',
+    manager_full: 'codex.architect',
+    manager_lite: 'codex.deep',
+    senior_architect: 'codex.architect',
+  }
+  for (const team of Object.values(draft.teams)) {
+    team.effective_roles = {
+      ...(team.effective_roles ?? {}),
+      manager_full: 'codex.architect',
+      manager_lite: 'codex.deep',
+      senior_architect: 'codex.architect',
+    }
+  }
+  return draft
+}
+
+function customRolesOnlyDraft(): GuidedFormProjection {
+  const draft = projection({
+    custom_team: summary({
+      roles: { manager_full: 'codex.architect', manager_lite: 'codex.deep' },
+      effective_roles: { manager_full: 'codex.architect', manager_lite: 'codex.deep' },
+      role_sources: { manager_full: 'custom_team', manager_lite: 'custom_team' },
+    }),
+  })
+  draft.roles = { manager_full: 'codex.architect', manager_lite: 'codex.deep' }
+  draft.role_prompts = {}
+  return draft
+}
+
 const rejectedPreview = async (): Promise<LegacyConversionPreviewResult> => {
   throw new Error('preview callback not configured')
 }
@@ -213,6 +247,18 @@ function renderEditor(initial: GuidedFormProjection, options: {
   return { ...view, onChange, onOpenPrompt }
 }
 
+function openAdvancedDetails(): HTMLElement {
+  const summary = screen.getByText('Advanced details', { exact: true })
+  fireEvent.click(summary)
+  return summary.closest('details') as HTMLElement
+}
+
+function openAdvancedSection(advanced: HTMLElement, label: string | RegExp): HTMLElement {
+  const summary = within(advanced).getByText(label, { exact: typeof label === 'string' })
+  fireEvent.click(summary)
+  return summary.closest('details') as HTMLElement
+}
+
 describe('TeamFamiliesSettings', () => {
   it('opens the new-family wizard lazily and retains its draft across Back', () => {
     const onWizardDirtyChange = vi.fn()
@@ -244,11 +290,13 @@ describe('TeamFamiliesSettings', () => {
     expect(within(navigation).getAllByText(/ · 1 changed role$/)).toHaveLength(2)
 
     fireEvent.click(screen.getByRole('button', { name: 'Fast variant', exact: true }))
-    expect(screen.getByText('Stored overrides')).toBeTruthy()
-    expect(screen.getByText(/Inherited roles \(2\)/)).toBeTruthy()
-    const inheritedRoles = screen.getByText(/Inherited roles \(2\)/).closest('details') as HTMLElement
-    expect(within(inheritedRoles).getAllByText(/Inherited from declared by Base \(base\)/)).toHaveLength(2)
-    expect(screen.getByText('Base reviewer prompt')).toBeTruthy()
+    const primary = screen.getByRole('heading', { name: 'Role assignments' }).nextElementSibling as HTMLElement
+    expect([...primary.querySelectorAll('.team-family-role-heading strong')].map(node => node.textContent)).toEqual(['Worker', 'Reviewer'])
+    const advanced = openAdvancedDetails()
+    const otherRoles = openAdvancedSection(advanced, /Other roles \(1\)/)
+    expect(within(otherRoles).getByText('Architect')).toBeTruthy()
+    const prompts = openAdvancedSection(advanced, 'Role prompts')
+    expect(within(prompts).getByText('Base reviewer prompt')).toBeTruthy()
   })
 
   it('edits declared role and display metadata, hands prompts to Prompts, and shows declared TOML only', () => {
@@ -262,15 +310,18 @@ describe('TeamFamiliesSettings', () => {
     fireEvent.keyDown(worker, { key: 'Enter' })
     expect(onChange).toHaveBeenLastCalledWith(expect.objectContaining({ teams: expect.objectContaining({ base: expect.objectContaining({ roles: expect.objectContaining({ worker: 'codex.deep' }) }) }) }))
 
+    const advanced = openAdvancedDetails()
+    openAdvancedSection(advanced, 'Name and identity')
     fireEvent.change(screen.getByLabelText('Display name'), { target: { value: 'Product renamed' } })
     fireEvent.blur(screen.getByLabelText('Display name'))
     expect(onChange).toHaveBeenLastCalledWith(expect.objectContaining({ teams: expect.objectContaining({ base: expect.objectContaining({ display_name: 'Product renamed' }) }) }))
 
-    const promptRow = screen.getByText('Base reviewer prompt').closest('.team-family-prompt-row') as HTMLElement
+    const prompts = openAdvancedSection(advanced, 'Role prompts')
+    const promptRow = within(prompts).getByText('Base reviewer prompt').closest('.team-family-prompt-row') as HTMLElement
     fireEvent.click(within(promptRow).getByRole('button', { name: 'Edit in Prompts' }))
     expect(onOpenPrompt).toHaveBeenCalledWith('base', 'reviewer')
 
-    fireEvent.click(screen.getByText('Declared TOML for this team (read-only)'))
+    fireEvent.click(within(advanced).getByText('Declared TOML for this team (read-only)'))
     const declared = screen.getByText(/\[teams\."base"\]/).closest('pre') as HTMLElement
     expect(declared.textContent).toContain('worker = "codex.deep"')
     expect(declared.textContent).not.toContain('effective_roles')
@@ -306,6 +357,8 @@ describe('TeamFamiliesSettings', () => {
   it('keeps spaces while family and stage labels are being typed, then normalizes on blur', () => {
     const onChange = vi.fn()
     renderEditor(familyDraft(), { selectedTeam: 'base', onChange })
+    const advanced = openAdvancedDetails()
+    openAdvancedSection(advanced, 'Name and identity')
     const familyName = screen.getByLabelText('Display name') as HTMLInputElement
     fireEvent.change(familyName, { target: { value: 'Product ' } })
     expect(familyName.value).toBe('Product ')
@@ -333,6 +386,8 @@ describe('TeamFamiliesSettings', () => {
   it('keeps complex routes read-only for ordering and removal while retaining explicit route controls', () => {
     renderEditor(complexDraft(), { selectedTeam: 'complex_base' })
     expect(screen.getByText(/explicit complex route/)).toBeTruthy()
+    const advanced = openAdvancedDetails()
+    openAdvancedSection(advanced, 'Upgrade routing')
     expect(screen.queryByRole('button', { name: 'Move stage earlier' })).toBeNull()
     expect(screen.queryByRole('button', { name: 'Move stage later' })).toBeNull()
     expect(screen.queryByRole('button', { name: 'Remove stage…' })).toBeNull()
@@ -343,6 +398,8 @@ describe('TeamFamiliesSettings', () => {
   it('reorders simple stages and requires confirmation before removing one', () => {
     const onChange = vi.fn()
     renderEditor(routeDraft(), { selectedTeam: 'second', onChange })
+    const advanced = openAdvancedDetails()
+    openAdvancedSection(advanced, 'Upgrade routing')
     fireEvent.click(screen.getByRole('button', { name: 'Move stage earlier' }))
     let next = onChange.mock.lastCall?.[0] as GuidedFormProjection
     expect(next.teams.base.upgrade_to).toBe('second')
@@ -361,6 +418,8 @@ describe('TeamFamiliesSettings', () => {
   it('reports removal dependencies without dropping the draft', () => {
     const onChange = vi.fn()
     renderEditor(routeDraft(true), { selectedTeam: 'second', onChange })
+    const advanced = openAdvancedDetails()
+    openAdvancedSection(advanced, 'Upgrade routing')
     fireEvent.click(screen.getByRole('button', { name: 'Remove stage…' }))
     fireEvent.click(screen.getByRole('button', { name: 'Confirm remove stage' }))
     expect(onChange).not.toHaveBeenCalled()
@@ -383,6 +442,8 @@ describe('TeamFamiliesSettings', () => {
     const onPreviewConversion = vi.fn(async () => preview)
     renderEditor(draft, { selectedTeam: 'legacy_base', onChange, onPreviewConversion })
 
+    const advanced = openAdvancedDetails()
+    openAdvancedSection(advanced, 'Convert to family…')
     fireEvent.click(screen.getByRole('button', { name: 'Preview convert to family' }))
     await waitFor(() => expect(screen.getByRole('region', { name: 'Legacy conversion preview' })).toBeTruthy())
     expect(onPreviewConversion).toHaveBeenCalledWith('legacy_base', draft)
@@ -409,8 +470,51 @@ describe('TeamFamiliesSettings', () => {
       error: new Error('Preview failed'),
     }))
     renderEditor(draft, { selectedTeam: 'legacy_base', onChange, onPreviewConversion })
+    const advanced = openAdvancedDetails()
+    openAdvancedSection(advanced, 'Convert to family…')
     fireEvent.click(screen.getByRole('button', { name: 'Preview convert to family' }))
     await waitFor(() => expect(screen.getByText('The candidate remains preview-only; no draft values were changed.')).toBeTruthy())
+    expect(onChange).not.toHaveBeenCalled()
+  })
+
+  it('shows Worker and Reviewer first for a legacy six-role root and keeps other roles closed', () => {
+    renderEditor(legacySixRoleDraft(), { selectedTeam: 'legacy_base' })
+    const assignments = screen.getByRole('heading', { name: 'Role assignments' }).nextElementSibling as HTMLElement
+    expect([...assignments.querySelectorAll('.team-family-role-heading strong')].map(node => node.textContent)).toEqual(['Worker', 'Reviewer'])
+    const advanced = screen.getByText('Advanced details', { exact: true }).closest('details') as HTMLDetailsElement
+    expect(advanced.hasAttribute('open')).toBe(false)
+    expect(screen.getByText('Other roles (4)', { exact: true })).toBeTruthy()
+  })
+
+  it('keeps an inherited child primary effective and nonmutating until Override role is chosen', () => {
+    const onChange = vi.fn()
+    renderEditor(familyDraft(), { selectedTeam: 'fast', onChange })
+    const assignments = screen.getByRole('heading', { name: 'Role assignments' }).nextElementSibling as HTMLElement
+    expect([...assignments.querySelectorAll('.team-family-role-heading strong')].map(node => node.textContent)).toEqual(['Worker', 'Reviewer'])
+    const reviewer = assignments.querySelector('.team-family-role-row:nth-child(2)') as HTMLElement
+    expect(within(reviewer).getByText(/Inherited from/)).toBeTruthy()
+    expect(within(reviewer).getByRole('button', { name: 'Override role', exact: true })).toBeTruthy()
+    expect(onChange).not.toHaveBeenCalled()
+    fireEvent.click(within(reviewer).getByRole('button', { name: 'Override role', exact: true }))
+    expect(onChange).toHaveBeenCalledTimes(1)
+    expect(onChange.mock.lastCall?.[0].teams.fast.roles.reviewer).toBe('codex.reviewer')
+  })
+
+  it('keeps configured custom-only roles discoverable without inventing primary assignments', () => {
+    renderEditor(customRolesOnlyDraft(), { selectedTeam: 'custom_team' })
+    expect(screen.queryByRole('combobox', { name: 'Worker', exact: true })).toBeNull()
+    expect(screen.queryByRole('combobox', { name: 'Reviewer', exact: true })).toBeNull()
+    expect(screen.getByText(/Other configured roles remain available in Advanced details/)).toBeTruthy()
+    const advanced = openAdvancedDetails()
+    const otherRoles = openAdvancedSection(advanced, 'Other roles (2)')
+    expect(within(otherRoles).getByText('Manager full')).toBeTruthy()
+    expect(within(otherRoles).getByText('Manager lite')).toBeTruthy()
+  })
+
+  it('does not emit a draft change when only opening Advanced details', () => {
+    const onChange = vi.fn()
+    renderEditor(familyDraft(), { selectedTeam: 'base', onChange })
+    openAdvancedDetails()
     expect(onChange).not.toHaveBeenCalled()
   })
 })

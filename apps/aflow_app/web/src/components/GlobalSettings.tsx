@@ -823,7 +823,7 @@ export function GlobalSettings({ onDirtyChange, onSaved }: { onDirtyChange: (dir
     {draftPreviewState.pending && <span className="settings-preview-announcement" role="status" aria-atomic="true">Refreshing effective team and workflow projections…</span>}
   </span>
   const sectionNavigation = advanced ? <span className="header-local-label">Advanced TOML</span> : headerCompact ? <label className="header-section-select">
-    <span>Section</span>
+    <span className="header-section-label" aria-hidden="true">Section</span>
     <select aria-label="Settings section" value={tab} onChange={event => setTab(event.target.value as typeof tabs[number])}>
       {tabs.map(name => <option key={name} value={name}>{name}</option>)}
     </select>
@@ -831,11 +831,18 @@ export function GlobalSettings({ onDirtyChange, onSaved }: { onDirtyChange: (dir
     const next = event.key === 'ArrowRight' ? (index + 1) % tabs.length : event.key === 'ArrowLeft' ? (index + tabs.length - 1) % tabs.length : event.key === 'Home' ? 0 : event.key === 'End' ? tabs.length - 1 : -1
     if (next >= 0) { event.preventDefault(); setTab(tabs[next]); (event.currentTarget.parentElement?.children[next] as HTMLElement).focus() }
   }}>{name}</button>)}</div>
+  const settingsSaveButton = <button
+    data-ui-fidelity-anchor="settings-save"
+    className="btn btn-primary btn-sm"
+    aria-label={busy ? 'Working…' : 'Save all changes'}
+    disabled={!saveableDirty || busy}
+    onClick={() => void save()}
+  >{busy ? 'Working…' : <><span className="settings-save-label-full">Save all changes</span><span className="settings-save-label-compact">Save</span></>}</button>
   const settingsSlots = {
     context: <h2 className="header-context-title">Settings</h2>,
     local: sectionNavigation,
     primary: <>
-      {!changelogReadOnly && <button data-ui-fidelity-anchor="settings-save" className="btn btn-primary btn-sm" disabled={!saveableDirty || busy} onClick={() => void save()}>{busy ? 'Working…' : 'Save all changes'}</button>}
+      {!changelogReadOnly && settingsSaveButton}
       {previewStatus}
     </>,
     more: <MoreMenu label="More settings actions" triggerLabel="More">
@@ -852,7 +859,7 @@ export function GlobalSettings({ onDirtyChange, onSaved }: { onDirtyChange: (dir
       <div className="settings-fallback-controls">
         {sectionNavigation}
         {previewStatus}
-        {!changelogReadOnly && <button className="btn btn-primary btn-sm" disabled={!saveableDirty || busy} onClick={() => void save()}>{busy ? 'Working…' : 'Save all changes'}</button>}
+        {!changelogReadOnly && settingsSaveButton}
       </div>
     </>}
     {error && <p className="error-message" role="alert">{error}</p>}
