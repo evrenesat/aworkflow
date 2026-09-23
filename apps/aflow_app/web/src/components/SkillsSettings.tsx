@@ -46,7 +46,7 @@ export function SkillsSettings({ skills, loadError, selected, onSelect, content,
   const [wrapLines, setWrapLines] = useState(true)
   function select(name: string) { onSelect(name); setNavigationVersion(value => value + 1) }
   const active = skills?.find(skill => skill.name === selected) ?? null
-  const dirty = draft !== null && content !== null && draft !== content
+  const dirty = unsavedNames.includes(selected) || (draft !== null && content !== null && draft !== content)
   // GlobalSettings owns the disclosure lifecycle. Results and errors remain
   // props so hiding only changes presentation; reopening shows the retained
   // outcome without making a dismissed disclosure sticky.

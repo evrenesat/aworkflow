@@ -3215,3 +3215,26 @@ HISTORY: Published clipboard history `c14f1f2`/`cd78d53` remains separate and mu
 - No deployment, publication, live activation, physical-device or full visual
   redesign acceptance is claimed. The concurrent diagnostic helper file was
   not changed.
+
+## 2026-09-23 — Preserve skill draft revisions during reload (Checkpoint 1)
+
+- Replaced text-only Settings skill drafts with `{ content, expectedRevision }`
+  pairs. The first meaningful edit captures the loaded revision; accepted
+  background reads remove only no-op artifacts and cannot silently rebase a
+  genuine draft. Save freezes each pair for both validation and PUT, while
+  conflicts retain the draft and its original revision.
+- Added deferred component coverage for the R1/R2 pending-read conflict,
+  equal-refresh editing, refreshed no-op editing, cached non-selected refresh,
+  superseded reads, and existing acknowledgement/error behavior. Added a
+  disposable Chromium/WebKit journey that holds the skill detail read, edits
+  the visible editor, intercepts validation and PUT, and verifies the R1
+  revision plus retained conflict draft. No real skill files are written.
+- Preserved prerequisite `6f7a72cc85d067653743f639eb8e8f495c3e88b6` and
+  published `af8ae222c906449b1243e93d11d8e869e8ec60fa` in the branch history.
+- Verification from the repository root/server:
+  - `npm --prefix apps/aflow_app/web test -- --run src/components/GlobalSettings.test.tsx` — 88 passed.
+  - `npm --prefix apps/aflow_app/web test -- --run` — 601 passed across 28 files.
+  - `npm --prefix apps/aflow_app/web run build` — passed; Vite emitted only the existing chunk-size warning.
+  - `uv run pytest -q tests/test_settings_reload_browser.py` — 2 passed in Chromium.
+  - `AFLOW_TEST_BROWSER=webkit uv run pytest -q tests/test_settings_reload_browser.py` — 2 passed in WebKit.
+  - `git diff --check` — passed.

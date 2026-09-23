@@ -21,6 +21,7 @@ const tabs = ['Agents & Roles', 'Teams', 'Workflows', 'Prompts', 'Skills', 'Gene
 // Height does not affect horizontal fit; list/detail keeps its own breakpoint.
 const SETTINGS_HEADER_COMPACT_QUERY = '(max-width: 1199px)'
 const clone = <T,>(value: T): T => JSON.parse(JSON.stringify(value))
+type SkillDraft = { content: string; expectedRevision: string }
 
 function sameValue(left: unknown, right: unknown): boolean {
   return left === right || JSON.stringify(left) === JSON.stringify(right)
@@ -94,7 +95,7 @@ export function GlobalSettings({ onDirtyChange, onSaved }: { onDirtyChange: (dir
   const [selectedSkill, setSelectedSkill] = useState('')
   const [skillContents, setSkillContents] = useState<Record<string, string>>({})
   const [skillRevisions, setSkillRevisions] = useState<Record<string, string>>({})
-  const [skillDrafts, setSkillDrafts] = useState<Record<string, string>>({})
+  const [skillDrafts, setSkillDrafts] = useState<Record<string, SkillDraft>>({})
   const [skillContentLoading, setSkillContentLoading] = useState(false)
   const [skillContentError, setSkillContentError] = useState<string | null>(null)
   const [installing, setInstalling] = useState(false)
@@ -217,7 +218,8 @@ export function GlobalSettings({ onDirtyChange, onSaved }: { onDirtyChange: (dir
       // no-op editor artifact. Remove it after the response is accepted so
       // changed server bytes become visible and cannot be saved as stale data.
       setSkillDrafts(drafts => {
-        if (previousContent === undefined || drafts[name] !== previousContent) return drafts
+        const draft = drafts[name]
+        if (previousContent === undefined || !draft || draft.content !== previousContent) return drafts
         const next = { ...drafts }
         delete next[name]
         return next
@@ -334,7 +336,7 @@ export function GlobalSettings({ onDirtyChange, onSaved }: { onDirtyChange: (dir
   const pendingCreation = Object.values(newProfile).some(Boolean) || Object.values(newRole).some(Boolean)
   const serverDirty = Boolean(server && (password || serverText !== server.advanced_toml || serverDraft.bind_host !== server.bind_host || serverDraft.bind_port !== String(server.bind_port) || serverDraft.managed_projects_root !== server.managed_projects_root))
   // Skill drafts live outside TOML documents and join the same dirty guard.
-  const dirtySkillNames = Object.keys(skillDrafts).filter(name => skillContents[name] !== undefined && skillDrafts[name] !== skillContents[name]).sort()
+  const dirtySkillNames = Object.keys(skillDrafts).sort()
   const skillsDirty = dirtySkillNames.length > 0
   const saveableDirty = configDirty || pendingCreation || serverDirty || skillsDirty
   const dirty = saveableDirty || teamWizardDirty
@@ -708,7 +710,14 @@ export function GlobalSettings({ onDirtyChange, onSaved }: { onDirtyChange: (dir
     try {
       // Validate all dirty domains before the first write; password is in the final write.
       // Skills prevalidate read-only; every PUT repeats its checks under the store lock.
-      const skillCandidates = dirtySkillNames.map(name => ({ name, content: skillDrafts[name], expected_revision: skillRevisions[name] ?? '' }))
+      // Freeze each text/revision pair before validation. The read-only check
+      // and each PUT must describe the same draft even if a background read
+      // settles while this save is in flight.
+      const skillSaveSnapshot = dirtySkillNames.flatMap(name => {
+        const draft = skillDrafts[name]
+        return draft ? [{ name, ...draft }] : []
+      })
+      const skillCandidates = skillSaveSnapshot.map(({ name, content, expectedRevision }) => ({ name, content, expected_revision: expectedRevision }))
       if (skillCandidates.length) {
         const verdicts = await api.validateSkills(skillCandidates)
         if (epochRef.current !== epoch) return
@@ -746,9 +755,9 @@ export function GlobalSettings({ onDirtyChange, onSaved }: { onDirtyChange: (dir
       }
       // Dirty skills save in sorted name order; each clears only on its own
       // acknowledgement, so a 409/network/write failure preserves the rest.
-      for (const name of dirtySkillNames) {
+      for (const { name, content, expectedRevision } of skillSaveSnapshot) {
         try {
-          const acked = await api.saveSkill(name, { content: skillDrafts[name], expected_revision: skillRevisions[name] ?? '' })
+          const acked = await api.saveSkill(name, { content, expected_revision: expectedRevision })
           if (epochRef.current !== epoch) return
           savedSkills.push(name)
           applySkillAck(acked)
@@ -859,9 +868,21 @@ export function GlobalSettings({ onDirtyChange, onSaved }: { onDirtyChange: (dir
       content={effectiveSkill && skillContents[effectiveSkill] !== undefined ? skillContents[effectiveSkill] : null}
       contentLoading={skillContentLoading}
       contentError={skillContentError}
-      draft={effectiveSkill && skillDrafts[effectiveSkill] !== undefined ? skillDrafts[effectiveSkill] : null}
+      draft={effectiveSkill && skillDrafts[effectiveSkill] !== undefined ? skillDrafts[effectiveSkill].content : null}
       unsavedNames={dirtySkillNames}
-      onEdit={(name, text) => setSkillDrafts(drafts => ({ ...drafts, [name]: text }))}
+      onEdit={(name, text) => setSkillDrafts(drafts => {
+        const baseline = skillContents[name]
+        if (baseline === undefined) return drafts
+        if (text === baseline) {
+          if (!(name in drafts)) return drafts
+          const next = { ...drafts }
+          delete next[name]
+          return next
+        }
+        const current = drafts[name]
+        const expectedRevision = current?.expectedRevision ?? skillRevisions[name] ?? ''
+        return { ...drafts, [name]: { content: text, expectedRevision } }
+      })}
       hasUnsavedEdits={skillsDirty}
       onInstall={() => void installSkillsAction()}
       installing={installing}

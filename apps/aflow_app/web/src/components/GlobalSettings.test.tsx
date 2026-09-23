@@ -1663,6 +1663,74 @@ describe('GlobalSettings', () => {
     fireEvent.click(screen.getByRole('button', { name: 'aflow-manager', exact: true }))
     await waitFor(() => expect((screen.getByLabelText('SKILL.md for aflow-manager') as HTMLTextAreaElement).value).toContain('Refreshed non-selected.'))
   })
+  it('keeps a skill draft paired with its original revision through a pending refresh and conflict', async () => {
+    const refreshedManager = deferred<ReturnType<typeof skillDetail>>()
+    const firstRevision = 'c'.repeat(64)
+    const refreshedRevision = 'f'.repeat(64)
+    let listCalls = 0
+    let managerReads = 0
+    const firstContent = skillContent('aflow-manager')
+    const edited = `${firstContent}\nEdit made while the refresh is pending.\n`
+    vi.mocked(api.listSkills).mockImplementation(async () => {
+      listCalls += 1
+      return listCalls === 1
+        ? skillSummaries
+        : skillSummaries.map(skill => skill.name === 'aflow-manager' ? { ...skill, revision: refreshedRevision } : skill)
+    })
+    vi.mocked(api.readSkill).mockImplementation((name: string) => {
+      managerReads += 1
+      return managerReads === 1 ? Promise.resolve(skillDetail(name, firstRevision)) : refreshedManager.promise
+    })
+    vi.mocked(api.saveSkill).mockRejectedValueOnce(Object.assign(new Error('revision conflict'), { status: 409, detail: { code: 'revision_conflict', current_revision: refreshedRevision } }))
+
+    render(<GlobalSettings onDirtyChange={() => {}} onSaved={() => {}} />)
+    await screen.findByLabelText('Effort codex.worker')
+    fireEvent.click(screen.getByRole('tab', { name: 'Skills' }))
+    const area = await screen.findByLabelText('SKILL.md for aflow-manager') as HTMLTextAreaElement
+    expect(area.value).toBe(firstContent)
+
+    fireEvent.click(screen.getByRole('button', { name: 'Reload server settings', exact: true }))
+    await waitFor(() => expect(managerReads).toBe(2))
+    expect(area.value).toBe(firstContent)
+    expect(area.disabled).toBe(false)
+    fireEvent.change(area, { target: { value: edited } })
+
+    await act(async () => {
+      refreshedManager.resolve({ ...skillDetail('aflow-manager', refreshedRevision), content: `${firstContent}\nConcurrent server change.\n` })
+      await refreshedManager.promise
+    })
+    expect(area.value).toBe(edited)
+
+    fireEvent.click(screen.getByRole('button', { name: 'Save all changes' }))
+    await screen.findByText(/Skill aflow-manager was not saved/)
+    expect(api.validateSkills).toHaveBeenCalledWith([{ name: 'aflow-manager', content: edited, expected_revision: firstRevision }])
+    expect(api.saveSkill).toHaveBeenCalledWith('aflow-manager', { content: edited, expected_revision: firstRevision })
+    expect(area.value).toBe(edited)
+    expect((screen.getByRole('button', { name: 'Save all changes' }) as HTMLButtonElement).disabled).toBe(false)
+  })
+  it('uses the equal refreshed revision for a later skill edit', async () => {
+    const equalRefresh = deferred<ReturnType<typeof skillDetail>>()
+    const revision = 'c'.repeat(64)
+    let readCalls = 0
+    vi.mocked(api.readSkill).mockImplementation((name: string) => {
+      readCalls += 1
+      return readCalls === 1 ? Promise.resolve(skillDetail(name, revision)) : equalRefresh.promise
+    })
+    render(<GlobalSettings onDirtyChange={() => {}} onSaved={() => {}} />)
+    await screen.findByLabelText('Effort codex.worker')
+    fireEvent.click(screen.getByRole('tab', { name: 'Skills' }))
+    const area = await screen.findByLabelText('SKILL.md for aflow-manager') as HTMLTextAreaElement
+    fireEvent.click(screen.getByRole('button', { name: 'Reload server settings', exact: true }))
+    await waitFor(() => expect(readCalls).toBe(2))
+    await act(async () => {
+      equalRefresh.resolve(skillDetail('aflow-manager', revision))
+      await equalRefresh.promise
+    })
+    const edited = `${area.value}\nEdit after equal refresh.\n`
+    fireEvent.change(area, { target: { value: edited } })
+    fireEvent.click(screen.getByRole('button', { name: 'Save all changes' }))
+    await waitFor(() => expect(api.saveSkill).toHaveBeenCalledWith('aflow-manager', { content: edited, expected_revision: revision }))
+  })
   it('retries a failed stale skill refresh when it is selected again', async () => {
     const failedRefresh = deferred<ReturnType<typeof skillDetail>>()
     const retryRefresh = deferred<ReturnType<typeof skillDetail>>()

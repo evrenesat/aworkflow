@@ -219,3 +219,103 @@ def test_settings_reload_preserves_visible_editors(control_client, monkeypatch, 
             assert not config_writes
         finally:
             browser.close()
+
+
+def test_skill_reload_preserves_draft_revision_and_conflict(control_client, monkeypatch):
+    """A pending skill read never rebases an edit onto the replacement revision."""
+    summary = {
+        "name": "aflow-manager",
+        "default": True,
+        "revision": "c" * 64,
+        "source": "bundled",
+        "edited": False,
+        "installed": True,
+        "links": [],
+        "detected_harnesses": [],
+    }
+    first_content = "---\nname: aflow-manager\ndescription: Test skill.\n---\n\nOriginal content.\n"
+    revised_content = first_content + "Concurrent server change.\n"
+    first_revision = summary["revision"]
+    revised_revision = "f" * 64
+    edited_content = first_content + "My edit.\n"
+    state = {"list_calls": 0, "detail_calls": 0, "held": [], "validation": [], "writes": []}
+
+    def intercept_skills(route):
+        request = route.request
+        path = request.url.split("/api/skills", 1)[-1].split("?", 1)[0]
+        if request.method == "GET" and path == "":
+            state["list_calls"] += 1
+            listed = {**summary, "revision": revised_revision} if state["list_calls"] > 1 else summary
+            route.fulfill(json=[listed])
+            return
+        if request.method == "GET" and path == "/aflow-manager":
+            state["detail_calls"] += 1
+            if state["detail_calls"] <= 2:
+                route.fulfill(json={**summary, "content": first_content})
+            else:
+                state["held"].append(route)
+            return
+        if request.method == "POST" and path == "/validate":
+            payload = request.post_data_json
+            state["validation"].append(payload)
+            route.fulfill(json={"entries": [{
+                "name": "aflow-manager",
+                "ok": True,
+                "current_revision": revised_revision,
+                "error_code": None,
+                "error": None,
+            }]})
+            return
+        if request.method == "PUT" and path == "/aflow-manager":
+            payload = request.post_data_json
+            state["writes"].append(payload)
+            route.fulfill(
+                status=409,
+                content_type="application/json",
+                body=json.dumps({"detail": {"code": "revision_conflict", "current_revision": revised_revision}}),
+            )
+            return
+        route.continue_()
+
+    dist = Path(__file__).resolve().parents[2] / "web" / "dist"
+    monkeypatch.setenv("AFLOW_APP_WEB_DIST", str(dist))
+    with live_server() as url, sync_playwright() as playwright:
+        browser = _browser(playwright)
+        try:
+            page = browser.new_page(viewport={"width": 1280, "height": 720})
+            page.route("**/api/skills**", intercept_skills)
+            _login(page, url)
+            page.get_by_role("button", name="Settings", exact=True).click()
+            _select_settings_section(page, "Skills")
+            area = page.get_by_label("SKILL.md for aflow-manager", exact=True)
+            area.wait_for(state="visible")
+            assert area.is_enabled()
+            assert area.input_value() == first_content
+
+            _reload_from_more(page)
+            deadline = time.monotonic() + 5
+            while not state["held"] and time.monotonic() < deadline:
+                page.wait_for_timeout(25)
+            assert state["held"], "the skill detail refresh was not held"
+            assert area.is_visible() and area.is_enabled()
+            area.fill(edited_content)
+            for route in state["held"]:
+                route.fulfill(json={**summary, "revision": revised_revision, "content": revised_content})
+            state["held"].clear()
+            assert area.input_value() == edited_content
+
+            page.get_by_role("button", name="Save all changes", exact=True).click()
+            page.get_by_text("Skill aflow-manager was not saved", exact=False).wait_for()
+            assert state["validation"] == [{"entries": [{
+                "name": "aflow-manager", "content": edited_content, "expected_revision": first_revision,
+            }]}]
+            assert state["writes"] == [{"content": edited_content, "expected_revision": first_revision}]
+            assert area.input_value() == edited_content
+            assert page.get_by_role("button", name="Save all changes", exact=True).is_enabled()
+        finally:
+            for route in state["held"]:
+                try:
+                    route.abort()
+                except Exception:
+                    pass
+            browser.close()
