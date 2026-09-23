@@ -67,22 +67,26 @@ function backupEventLabel(event: string | null): string {
   return typeof event === 'string' && event.trim() ? formatMachineLabel(event) : 'Unavailable'
 }
 
+function lifecycleLabel(status: PlanDocument['status']): string {
+  return status === 'todo' ? 'Draft' : status === 'in_progress' ? 'Ready' : 'Done'
+}
+
 /** Lifecycle sections always render in canonical order with runnable guidance. */
 const LIFECYCLE_SECTIONS: Array<{ status: PlanDocument['status']; title: string; hint: string }> = [
   {
     status: 'todo',
-    title: 'Draft (todo)',
-    hint: 'Editable working notes. A draft is not runnable yet — save it, then move it to Ready.',
+    title: 'Draft',
+    hint: 'Working notes. Save and move to Ready before configuring a run.',
   },
   {
     status: 'in_progress',
-    title: 'Ready (in progress)',
-    hint: 'Runnable plans. Startup checks run when you start one. Open one and use “Run this plan” to start a run from it.',
+    title: 'Ready',
+    hint: 'Saved plans available for reviewed launch configuration.',
   },
   {
     status: 'done',
     title: 'Done',
-    hint: 'Finished plans, kept for the record. A done plan is no longer runnable.',
+    hint: 'Finished plans kept for the record.',
   },
 ]
 
@@ -400,15 +404,34 @@ export function PlanPanel({ project, onDirtyChange, onOpenRunDashboard, initialP
   }
 
   const runnable = selected !== null && selected.status === 'in_progress' && !dirty
+  const saveState = busy
+    ? 'Saving…'
+    : conflict
+      ? 'Conflict — not saved'
+      : dirty
+        ? 'Unsaved changes'
+        : 'Saved'
   const hosted = useHeaderSlots('plan-panel', {
-    context: selected ? <h2 className="header-context-title">{selected.name} <span className="text-xs text-dim">{selected.status === 'todo' ? 'Draft' : selected.status === 'in_progress' ? 'Ready' : 'Done'}</span></h2> : <h2 className="header-context-title">Plans</h2>,
-    compactContext: selected ? <span className="header-context-title">{selected.name}</span> : undefined,
+    context: selected ? (
+      <div className="header-context-stack plan-header-context">
+        <h2 className="header-context-title">{selected.name}</h2>
+        <span className={`status-pill ${selected.status === 'in_progress' ? 'status-awaiting' : ''}`}>{lifecycleLabel(selected.status)}</span>
+        <span className="plan-save-state text-xs text-dim" role="status" aria-live="polite">{saveState}</span>
+      </div>
+    ) : <h2 className="header-context-title">Plans</h2>,
+    compactContext: selected ? (
+      <div className="plan-mobile-context">
+        <span className="plan-mobile-name">{selected.name}</span>
+        <span className={`status-pill ${selected.status === 'in_progress' ? 'status-awaiting' : ''}`}>{lifecycleLabel(selected.status)}</span>
+        <span className="plan-save-state text-xs text-dim" role="status" aria-live="polite">{saveState}</span>
+      </div>
+    ) : undefined,
     local: selected ? <button className="btn btn-secondary btn-sm" onClick={() => (dirty ? setConfirmClose(true) : closePlan())}>← Back to Plans</button> : <label className="header-plan-name"><span>New plan</span><input className="input mono" aria-label="New plan filename" placeholder="new-plan.md" value={newName} onChange={(event) => setNewName(event.target.value)} /></label>,
     primary: selected ? <button className="btn btn-primary btn-sm" onClick={() => void savePlan()} disabled={busy}>{busy ? 'Working…' : 'Save'}</button> : <button className="btn btn-primary btn-sm" onClick={() => void createPlan()} disabled={busy || !newName.trim()}>Create plan</button>,
     more: selected ? <MoreMenu label="More plan actions" triggerLabel="More">
       {conflict && !confirmReload && <MenuItem onClick={() => setConfirmReload(true)}>Reload from server…</MenuItem>}
       {selected.status !== 'done' && <MenuItem disabled={busy || dirty} onClick={() => void promotePlan()}>Move to {selected.status === 'todo' ? 'Ready' : 'Done'}</MenuItem>}
-      {selected.status === 'in_progress' && <MenuItem disabled={!runnable} onClick={() => onOpenRunDashboard(selected.path)}>Run this plan</MenuItem>}
+      {selected.status === 'in_progress' && <MenuItem disabled={!runnable} onClick={() => onOpenRunDashboard(selected.path)}>Configure run…</MenuItem>}
     </MoreMenu> : <MoreMenu label="More plan actions" triggerLabel="More"><MenuItem disabled={plansLoading || plansRefreshing} onClick={() => void refresh()}>Refresh plans</MenuItem></MoreMenu>,
   })
 
@@ -416,7 +439,7 @@ export function PlanPanel({ project, onDirtyChange, onOpenRunDashboard, initialP
     // Only a saved Ready plan can run: a dirty draft or another lifecycle
     // state explains its next step instead of exposing a button that no-ops.
     const lifecycleExplanation = selected.status === 'todo'
-      ? 'This draft is not runnable yet. Save it and move it to Ready (in progress) to enable “Run this plan”.'
+      ? 'This draft is not runnable yet. Save it and move it to Ready before configuring a run.'
       : selected.status === 'done'
         ? 'Done plans are kept for the record and cannot run. Create a new plan and move it through Draft → Ready to run this work again.'
         : dirty
@@ -428,12 +451,8 @@ export function PlanPanel({ project, onDirtyChange, onOpenRunDashboard, initialP
         {!hosted && <div className="plan-editor-header">
           <button className="btn btn-secondary btn-sm" onClick={() => (dirty ? setConfirmClose(true) : closePlan())}>← Back to Plans</button>
           <strong className="mono text-sm">{selected.path}</strong>
-          <span className={`status-pill ${selected.status === 'in_progress' ? 'status-awaiting' : ''}`}>
-            {selected.status === 'todo' ? 'Draft — not runnable yet' : selected.status === 'in_progress' ? 'Ready' : 'Done — not runnable'}
-          </span>
-          <span className="text-xs text-dim mono" title={selected.revision}>
-            Revision {shortRevision(selected.revision)}
-          </span>
+          <span className={`status-pill ${selected.status === 'in_progress' ? 'status-awaiting' : ''}`}>{lifecycleLabel(selected.status)}</span>
+          <span className="plan-save-state text-xs text-dim" role="status" aria-live="polite">{saveState}</span>
         </div>}
         {error && <div className="error-message" role="alert">{error}</div>}
         {conflict && (
@@ -475,6 +494,15 @@ export function PlanPanel({ project, onDirtyChange, onOpenRunDashboard, initialP
           value={content}
           onChange={(event) => setContent(event.target.value)}
         />
+        <details className="plan-metadata">
+          <summary>Plan details</summary>
+          <dl className="plan-metadata-list">
+            <div><dt>Path</dt><dd className="mono">{selected.path}</dd></div>
+            <div><dt>Lifecycle</dt><dd>{lifecycleLabel(selected.status)}</dd></div>
+            <div><dt>Revision</dt><dd className="mono" title={selected.revision}>{shortRevision(selected.revision)}</dd></div>
+            <div><dt>Content size</dt><dd>{selected.size_bytes} bytes</dd></div>
+          </dl>
+        </details>
         <details
           className="plan-backup-history"
           open={historyOpen}
@@ -561,7 +589,7 @@ export function PlanPanel({ project, onDirtyChange, onOpenRunDashboard, initialP
               onClick={() => onOpenRunDashboard(selected.path)}
               disabled={!runnable}
             >
-              Run this plan
+              Configure run…
             </button>
           )}
         </div>}
@@ -601,7 +629,10 @@ export function PlanPanel({ project, onDirtyChange, onOpenRunDashboard, initialP
               <button key={plan.path} className="card card-interactive content-button" onClick={() => void openPlan(plan)}>
                 <div className="content-button-row">
                   <span className="mono text-sm">{plan.name}</span>
-                  <span className="text-xs text-dim">{plan.size_bytes} bytes</span>
+                  <span className="plan-list-row-facts">
+                    <span className={`status-pill ${plan.status === 'in_progress' ? 'status-awaiting' : ''}`}>{lifecycleLabel(plan.status)}</span>
+                    <span className="text-xs text-dim">{plan.size_bytes} bytes</span>
+                  </span>
                 </div>
               </button>
             ))}

@@ -397,6 +397,15 @@ def _ensure_project(page: Page) -> None:
     page.get_by_role("button", name="New run", exact=True).wait_for()
 
 
+def _open_start_review(page: Page):
+    """Open the read-only launch review and return its final action."""
+    review = page.get_by_role("button", name="Review start…", exact=True)
+    expect(review).to_be_enabled()
+    review.click()
+    page.get_by_role("region", name="Review start", exact=True).wait_for()
+    return page.get_by_role("button", name="Start run", exact=True)
+
+
 def _assert_no_horizontal_overflow(page: Page) -> None:
     metrics = page.evaluate("""() => ({
         width: innerWidth,
@@ -1665,6 +1674,10 @@ def test_history_completion_preserves_live_controls_pointer_target(
             held_history.clear()
             page.unroute(history_pattern, hold_initial_history)
             pending.wait_for(state="hidden")
+            checkpoint_disclosure = dashboard.locator(
+                "details.checkpoint-history-checkpoints"
+            ).first
+            checkpoint_disclosure.evaluate("element => { element.open = true }")
             checkpoint_layout = dashboard.locator(".checkpoint-history-layout")
             checkpoint_layout.wait_for(state="visible")
             expected_detail_heading = "Unassigned history"
@@ -2056,7 +2069,7 @@ def test_responsive_route_matrix(control_client, monkeypatch, tmp_path, width: i
             extra = page.get_by_label("Run extra instructions", exact=True)
             expect(extra).to_be_visible()
             extra.fill("Long launch instruction. " * 100)
-            assert page.get_by_role("button", name="Start run", exact=True).is_visible()
+            assert page.get_by_role("button", name="Review start…", exact=True).is_visible()
             _assert_header_and_flow(page)
             _assert_last_action_hit_test(page)
         finally:
@@ -2744,7 +2757,7 @@ def test_responsive_team_family_journey(
             expect(clean_state.or_(dirty_confirmation)).to_be_visible()
             if dirty_confirmation.is_visible():
                 dirty_confirmation.check()
-            expect(page.get_by_role("button", name="Start run", exact=True).last).to_be_enabled()
+            expect(page.get_by_role("button", name="Review start…", exact=True)).to_be_enabled()
 
             start_requests: list[dict[str, object]] = []
             started = {"value": False}
@@ -2776,7 +2789,12 @@ def test_responsive_team_family_journey(
                 route.continue_()
 
             page.route(f"**/api/control-plane/projects/{PROJECT_ID}/runs**", intercept_launch)
-            page.get_by_role("button", name="Start run", exact=True).last.click()
+            with page.expect_response(
+                lambda response: response.request.method == "POST"
+                and urlsplit(response.url).path == launch_path
+            ) as launch_response:
+                _open_start_review(page).click()
+            assert launch_response.value.status == 201
             assert started["value"]
             assert len(start_requests) == 1
             assert start_requests[0]["team"] == strong_stage_id
@@ -3105,7 +3123,7 @@ def test_responsive_live_controls_and_restart(
             confirm.click()
             page.get_by_role("button", name="Retry exact successor request", exact=True).wait_for()
             assert dashboard.get_by_label("Run workflow", exact=True).is_disabled()
-            assert page.get_by_role("button", name="Start run", exact=True).is_disabled()
+            assert page.get_by_role("button", name="Review start…", exact=True).is_disabled()
             image = tmp_path / f"responsive-{width}x{height}-light-restart-unknown.png"
             page.screenshot(path=str(image), full_page=True)
             print("RESPONSIVE_RESTART_SCREENSHOT", image)
@@ -3298,8 +3316,10 @@ go = [{ to = "END" }]
                 run_url = f"{url}/?project={PROJECT_ID}&view=runs&run={run_id}"
                 page.goto(run_url)
                 dashboard = _visible_dashboard(page)
+                dashboard.get_by_role("button", name="Actions", exact=True).click()
+                dashboard.get_by_role("menuitem", name="Review stop options…", exact=True).click()
                 boundary = dashboard.get_by_role(
-                    "button", name="Stop after current turn", exact=True
+                    "button", name="Request stop after current turn", exact=True
                 )
                 boundary.wait_for()
                 boundary.click()
@@ -3361,11 +3381,11 @@ go = [{ to = "END" }]
                             "Stop requested — finishing current turn", exact=False
                         )).to_be_visible()
                         assert fresh_page.get_by_text("Running", exact=True).count() > 0
-                        immediate_stop = fresh_dashboard.get_by_role(
-                            "button", name="Stop now…", exact=True
+                        fresh_dashboard.get_by_role("button", name="Actions", exact=True).click()
+                        immediate_review = fresh_dashboard.get_by_role(
+                            "menuitem", name="Review stop options…", exact=True
                         )
-                        if immediate_stop.count():
-                            expect(immediate_stop).to_be_disabled()
+                        expect(immediate_review).to_be_disabled()
                         assert len(held_capabilities) == 1, "admitted capabilities response was not held"
                         held_state = client.get(run_path)
                         assert held_state.status_code == 200, held_state.text
@@ -3378,6 +3398,8 @@ go = [{ to = "END" }]
                             "Stop requested — finishing current turn", exact=False
                         ).wait_for()
                         assert fresh_page.get_by_text("Running", exact=True).count() > 0
+                        expect(immediate_review).to_be_enabled()
+                        immediate_review.click()
                         expect(fresh_dashboard.get_by_role(
                             "button", name="Stop now…", exact=True
                         )).to_have_count(1)
@@ -3423,7 +3445,7 @@ go = [{ to = "END" }]
                     "Stopped", exact=True
                 ).wait_for()
                 assert page.get_by_role(
-                    "button", name="Stop after current turn", exact=True
+                    "button", name="Request stop after current turn", exact=True
                 ).count() == 0
                 assert page.get_by_role(
                     "button", name="Stop now…", exact=True

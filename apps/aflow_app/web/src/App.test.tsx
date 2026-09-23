@@ -797,7 +797,7 @@ describe('App workspace shell', () => {
     await openAddedProject(/Alpha Project/)
     fireEvent.click(screen.getByRole('button', { name: 'Plans' }))
     fireEvent.click(await screen.findByRole('button', { name: /demo\.md/ }))
-    await clickHeaderMenuItem('Run this plan')
+    await clickHeaderMenuItem('Configure run…')
 
     await screen.findByRole('heading', { name: 'New run' })
     expect(push).toHaveBeenCalledWith(null, '', '/?project=alpha&view=new-run')
@@ -1204,7 +1204,7 @@ describe('App workspace shell', () => {
     // Ready-plan launch and an exact link reload.
     fireEvent.click(screen.getByRole('button', { name: 'Plans' }))
     fireEvent.click(await screen.findByRole('button', { name: /demo\.md/ }))
-    await clickHeaderMenuItem('Run this plan')
+    await clickHeaderMenuItem('Configure run…')
     await screen.findByRole('heading', { name: 'New run' })
     await waitFor(() => expect((screen.getByLabelText('Run plan') as HTMLInputElement).value).toBe('plans/in-progress/demo.md'))
   })

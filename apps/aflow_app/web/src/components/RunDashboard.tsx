@@ -6,6 +6,8 @@ import type {
   ControlPlaneReadiness,
   GuidedFormProjection,
   GuidedProfileSummary,
+  ProjectConfig,
+  ProjectConfigFormResponse,
   RecoveryRequest,
   RecoveryWorkerEvidence,
   RunProgressDetail,
@@ -108,9 +110,24 @@ interface RunDashboardProps {
  * canonical daemon capabilities — never from unsaved settings drafts.
  */
 interface CommittedProjection {
+  revision: string
   validationState: 'ready' | 'configuration_required' | 'invalid'
   form: GuidedFormProjection | null
   syntaxIssues: ConfigValidationIssue[]
+  serverDefaultMaxTurns: number | null
+}
+
+function committedProjectionFrom(
+  pair: ProjectConfig,
+  projected: ProjectConfigFormResponse,
+): CommittedProjection {
+  return {
+    revision: pair.revision,
+    validationState: projected.validation.state,
+    form: projected.form,
+    syntaxIssues: projected.syntax_issues,
+    serverDefaultMaxTurns: projected.server_default_max_turns ?? null,
+  }
 }
 
 interface WorktreePreflightState {
@@ -1093,11 +1110,16 @@ export function RunDashboard({ visible = true, page, onNewRun, onCancelNewRun, o
   function openNewRunPage() { setLocalPage('new-run'); onNewRun?.() }
   const [failedRequestId, setFailedRequestId] = useState<string | null>(null)
   const [advancedOpen, setAdvancedOpen] = useState(false)
+  const [startReviewIdentity, setStartReviewIdentity] = useState<string | null>(null)
   const [technicalOpenByRun, setTechnicalOpenByRun] = useState<Record<string, boolean>>({})
   const [runChangesOpenByRun, setRunChangesOpenByRun] = useState<Record<string, boolean>>({})
   const technicalId = useId()
   const [copyState, setCopyState] = useState<'idle' | 'copied' | 'failed'>('idle')
   const [copyKind, setCopyKind] = useState<'link' | 'run-id' | null>(null)
+
+  useEffect(() => {
+    if (!newRunPage) setStartReviewIdentity(null)
+  }, [newRunPage])
   const copyRequestRef = useRef(0)
   const [refreshNonce, setRefreshNonce] = useState(0)
   const selectedRunRef = useRef<string | null>(selectedRunId)
@@ -1533,11 +1555,7 @@ export function RunDashboard({ visible = true, page, onNewRun, onCancelNewRun, o
           workflows_toml: committedPair.workflows_toml,
         })
         if (!isActive()) return
-        const nextCommitted = {
-          validationState: projected.validation.state,
-          form: projected.form,
-          syntaxIssues: projected.syntax_issues,
-        }
+        const nextCommitted = committedProjectionFrom(committedPair, projected)
         setCommitted(current => JSON.stringify(current) === JSON.stringify(nextCommitted) ? current : nextCommitted)
         setCommittedError(null)
       } catch (projectionError) {
@@ -2356,12 +2374,17 @@ export function RunDashboard({ visible = true, page, onNewRun, onCancelNewRun, o
       ? 'global default'
       : 'no default workflow configured'
   const configuredMaxTurns = committedForm?.max_turns ?? null
-  const effectiveMaxTurns = startMaxTurns.trim() !== '' ? Number(startMaxTurns.trim()) : configuredMaxTurns
+  const serverDefaultMaxTurns = committed?.serverDefaultMaxTurns ?? null
+  const effectiveMaxTurns = startMaxTurns.trim() !== ''
+    ? Number(startMaxTurns.trim())
+    : configuredMaxTurns ?? serverDefaultMaxTurns
   const effectiveMaxTurnsSource = startMaxTurns.trim() !== ''
     ? 'your override'
     : configuredMaxTurns !== null
       ? 'global default'
-      : 'no limit configured'
+      : serverDefaultMaxTurns !== null
+        ? 'server default'
+        : 'no limit configured'
   const workflowDefaultTeam = effectiveWorkflow
     ? committedForm?.workflow_default_teams?.[effectiveWorkflow]
       ?? capabilities?.workflow_details?.[effectiveWorkflow]?.default_team
@@ -2589,6 +2612,73 @@ export function RunDashboard({ visible = true, page, onNewRun, onCancelNewRun, o
     || launchBlocker !== null
     || worktreeLaunchBlocked
     || (startupQuestion !== null && !dirtyStartupQuestion)
+  const selectedStartPlan = runnablePlans.find((plan) => plan.path === startPlanPath.trim()) ?? null
+  const currentLaunchIdentity = JSON.stringify([
+    projectId,
+    selectedStartPlan ? [selectedStartPlan.path, selectedStartPlan.status, selectedStartPlan.modified_at, selectedStartPlan.schema_version] : null,
+    committed ? [committed.revision, committed.serverDefaultMaxTurns] : null,
+    [effectiveWorkflow, effectiveTeam, effectiveMaxTurns],
+    startRequestFromDraft(restartSource?.run_id, dirtyWorktreeConfirmed),
+    preflightRequestIdentity,
+  ])
+  const startReviewReady = startReviewIdentity !== null && startReviewIdentity === currentLaunchIdentity
+  const currentLaunchIdentityRef = useRef<string | null>(null)
+  currentLaunchIdentityRef.current = currentLaunchIdentity
+
+  function openStartReview() {
+    // A dirty-worktree startup question is an answer to an already allocated
+    // request, not a new launch. Keep that explicit continuation path intact.
+    if (startupQuestion?.kind === 'confirm_worktree_dirty') {
+      void handleStart()
+      return
+    }
+    if (startDisabled || (restartSource !== null && restartPhase !== null)) return
+    setStartReviewIdentity(currentLaunchIdentity)
+  }
+
+  function cancelStartReview() {
+    setStartReviewIdentity(null)
+  }
+
+  async function confirmStart() {
+    if (!startReviewIdentity) return
+    if (!startReviewReady) {
+      setStartReviewIdentity(null)
+      setActionError('Launch choices changed while the review was open. Review the current choices before starting.')
+      return
+    }
+    if (!committed) {
+      setStartReviewIdentity(null)
+      setActionError('The committed launch configuration is unavailable. Review the current choices before starting.')
+      return
+    }
+    try {
+      const latestPair = await api.getGlobalConfig()
+      if (latestPair.revision !== committed.revision) {
+        const latestProjection = await api.postGlobalConfigForm({
+          aflow_toml: latestPair.aflow_toml,
+          workflows_toml: latestPair.workflows_toml,
+        })
+        setCommitted(committedProjectionFrom(latestPair, latestProjection))
+        setCommittedError(null)
+        setStartReviewIdentity(null)
+        setActionError('Committed launch defaults changed while the review was open. Review the current choices before starting.')
+        return
+      }
+    } catch (revalidationError) {
+      setStartReviewIdentity(null)
+      setActionError(`Could not revalidate the committed launch configuration: ${errorMessage(revalidationError, 'configuration read failed')}. Review again before starting.`)
+      return
+    }
+    if (startReviewIdentity !== currentLaunchIdentityRef.current) {
+      setStartReviewIdentity(null)
+      setActionError('Launch choices changed while the review was open. Review the current choices before starting.')
+      return
+    }
+    setStartReviewIdentity(null)
+    await handleStart()
+  }
+
   const restartDraftChoicesReady = Boolean(restartDraftWorkflow && startPlanPath && planOptions.includes(startPlanPath))
     && (!missingRestartInstructions || Boolean(startExtraInstructions.trim()))
     && launchBlocker === null && startMaxTurnsProblem === null && !extraInstructionProblem
@@ -3052,6 +3142,43 @@ export function RunDashboard({ visible = true, page, onNewRun, onCancelNewRun, o
       dirtyQuestionMessage={dirtyStartupQuestion ? startupQuestion?.message ?? 'The working tree changed while starting. Review it before continuing.' : null}
     />
   )
+  const launchReview = (
+    <div className="launch-review-summary">
+      <dl className="run-preview-list">
+        <div><dt>Plan</dt><dd className="mono">{startPlanPath.trim() || 'Not chosen'}</dd></div>
+        <div><dt>Workflow</dt><dd>{effectiveWorkflow ? formatMachineLabel(effectiveWorkflow) : 'Not resolved'}</dd></div>
+        <div><dt>Team</dt><dd>{effectiveTeam ? `${resolvedTeamFamilyLabel ?? formatMachineLabel(effectiveTeam)} · ${effectiveTeamSource}` : effectiveTeamSource}</dd></div>
+        <div><dt>Maximum turns</dt><dd>{effectiveMaxTurns !== null ? `${effectiveMaxTurns} · ${effectiveMaxTurnsSource}` : 'Not resolved'}</dd></div>
+        <div><dt>Start step</dt><dd>{startStep.trim() ? formatMachineLabel(startStep.trim()) : 'Workflow beginning'}</dd></div>
+      </dl>
+      <dl className="launch-review-requirements">
+        <div>
+          <dt>Working tree</dt>
+          <dd>
+            {displayedWorktreePreflight.status === 'ready' && displayedWorktreePreflight.result
+              ? displayedWorktreePreflight.result.dirty
+                ? `${displayedWorktreePreflight.result.total_items} uncommitted change${displayedWorktreePreflight.result.total_items === 1 ? '' : 's'}${dirtyWorktreeConfirmed ? ' · acknowledged' : ' · acknowledgement required'}`
+                : 'Clean checkout'
+              : displayedWorktreePreflight.status === 'error'
+                ? 'Inspection failed — refresh before starting'
+                : 'Inspection in progress'}
+          </dd>
+        </div>
+        <div>
+          <dt>Checkout</dt>
+          <dd className="mono">{displayedWorktreePreflight.result?.checkout_path ?? 'Not inspected'}</dd>
+        </div>
+        <div>
+          <dt>Start readiness</dt>
+          <dd>
+            {!startReviewReady
+              ? 'Choices changed — close this review and review again.'
+              : launchBlocker ?? (worktreeLaunchBlocked ? 'Complete the working-tree acknowledgement or wait for inspection.' : 'Ready for the final start action.')}
+          </dd>
+        </div>
+      </dl>
+    </div>
+  )
   const restartSourcePlan = restartSource?.plan_path ?? String(restartSource?.evidence.plan_path ?? '')
   const restartSourceWorkflow = restartSource?.workflow_name ?? ''
   const restartSourceTeam = restartSource?.team ?? ''
@@ -3148,9 +3275,9 @@ export function RunDashboard({ visible = true, page, onNewRun, onCancelNewRun, o
   const hosted = useHeaderSlots(`run-dashboard:${projectId}`, {
     context: <h2 className="header-context-title">{newRunPage ? 'New run' : 'Runs'}</h2>,
     local: newRunPage ? <button className="btn btn-secondary btn-sm" onClick={cancelNewRun}>← Run history</button> : <label className="header-filter-select"><span>Run history</span><select aria-label="Run history" value={historyFilter} onChange={event => setHistoryFilter(event.target.value as typeof historyFilter)}><option value="visible">Visible</option><option value="archived">Archived</option><option value="all">All history</option></select></label>,
-    primary: newRunPage ? <button className="btn btn-primary btn-sm" onClick={() => void handleStart()} disabled={startDisabled || Boolean(restartActions)}>{busyAction === 'start' ? 'Starting…' : 'Start run'}</button> : <button className="btn btn-primary btn-sm" onClick={openNewRunPage}>New run</button>,
+    primary: newRunPage ? <button className="btn btn-primary btn-sm" onClick={() => void (startReviewIdentity ? confirmStart() : openStartReview())} disabled={startReviewIdentity ? startDisabled || !startReviewReady || Boolean(restartActions) : startDisabled || Boolean(restartActions)}>{busyAction === 'start' ? 'Starting…' : startReviewIdentity ? 'Start run' : 'Review start…'}</button> : <button className="btn btn-primary btn-sm" onClick={openNewRunPage}>New run</button>,
     more: <MoreMenu label={newRunPage ? 'More new run actions' : 'More run page actions'} triggerLabel="More">
-      {newRunPage ? <MenuItem onClick={cancelNewRun}>Cancel</MenuItem> : <>
+      {newRunPage ? <MenuItem onClick={startReviewIdentity ? cancelStartReview : cancelNewRun}>{startReviewIdentity ? 'Cancel review' : 'Cancel'}</MenuItem> : <>
         <MenuItem onClick={() => void handleCopyLink()}>Copy link</MenuItem>
         <MenuItem disabled={refreshing || loading} onClick={() => void refreshPage()}>{refreshing ? 'Refreshing…' : 'Refresh'}</MenuItem>
       </>}
@@ -3651,6 +3778,7 @@ export function RunDashboard({ visible = true, page, onNewRun, onCancelNewRun, o
         setStartMaxTurns={setStartMaxTurns}
         startMaxTurnsProblem={startMaxTurnsProblem}
         configuredMaxTurns={configuredMaxTurns}
+        serverDefaultMaxTurns={serverDefaultMaxTurns}
         preview={launchPreview}
         worktreePreflight={worktreePreflightPanel}
         restartActions={restartActions}
@@ -3667,7 +3795,13 @@ export function RunDashboard({ visible = true, page, onNewRun, onCancelNewRun, o
         extraInstructionProblem={extraInstructionProblem}
         launchBlocker={launchBlocker}
         onOpenSettings={onOpenSettings}
-        handleStart={handleStart}
+        reviewOpen={startReviewIdentity !== null}
+        review={launchReview}
+        onOpenStartReview={openStartReview}
+        onCancelStartReview={cancelStartReview}
+        onConfirmStart={confirmStart}
+        startActionLabel="Review start…"
+        reviewReady={startReviewReady}
         startDisabled={startDisabled}
         busyAction={busyAction}
         hideActions={hosted}

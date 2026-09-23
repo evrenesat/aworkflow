@@ -456,6 +456,204 @@ def test_ui_demo_project_and_global_overview_captures(
     ("width", "height", "theme"),
     (
         pytest.param(1280, 720, "light", id="desktop-light"),
+        pytest.param(1280, 720, "dark", id="desktop-dark"),
+        pytest.param(390, 844, "light", id="mobile-light"),
+        pytest.param(390, 844, "dark", id="mobile-dark"),
+    ),
+)
+def test_ui_demo_cp8_plan_editor_and_review_captures(
+    control_client,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    width: int,
+    height: int,
+    theme: str,
+) -> None:
+    """Capture plan lifecycle, editor, launch draft, and read-only review states."""
+    _, root, units, _ = control_client
+    fixtures = seed_demo_fidelity_fixture(root)
+    running = fixtures["running"]
+    assert isinstance(running, dict)
+    manifest = load_reference_manifest()
+    dist = Path(__file__).resolve().parents[2] / "web" / "dist"
+    if not (dist / "index.html").exists():
+        pytest.fail("The CP8 capture requires the real built web app; run the web build first.")
+    monkeypatch.setenv("AFLOW_APP_WEB_DIST", str(dist))
+
+    plan_name = Path(running["plan"]).name
+    plan_path = Path(running["plan"]).relative_to(root).as_posix()
+    reference_path = tmp_path / f"cp8-reference-{theme}-{width}x{height}.png"
+    captures: dict[str, object] = {
+        "reference_sha256": manifest["demo_sha256"],
+        "viewport": {"width": width, "height": height},
+        "theme": theme,
+        "screenshots": {},
+        "states": {},
+    }
+
+    with live_server() as url, sync_playwright() as playwright:
+        browser = _browser(playwright)
+        page = browser.new_page(viewport={"width": width, "height": height})
+        try:
+            _login(page, url)
+            reference = capture_reference_surface(
+                page,
+                width=width,
+                height=height,
+                theme=theme,
+                screenshot_path=reference_path,
+            )
+            _assert_reference_capture(reference)
+            captures["reference_anchor_order"] = list(reference["anchors"])
+            captures["screenshots"]["reference"] = reference_path.name
+
+            page.goto(f"{url}/?project={PROJECT_ID}&view=plans", wait_until="load")
+            plan_list = page.locator(".plan-list")
+            plan_list.wait_for()
+            _assert_theme(page, theme)
+            _assert_header_and_flow(page)
+            lifecycle_headings = page.locator(".plan-list > section h3").all_text_contents()
+            assert lifecycle_headings == ["Draft", "Ready", "Done"]
+            assert page.locator(".plan-list > section").count() == 3
+            plan_screenshot = tmp_path / f"cp8-plans-{theme}-{width}x{height}.png"
+            page.screenshot(path=str(plan_screenshot), full_page=True)
+            captures["screenshots"]["plans"] = plan_screenshot.name
+            captures["states"]["plans"] = {
+                "lifecycle_headings": lifecycle_headings,
+                "ready_rows": page.locator(".plan-list > section").nth(1).locator("button.content-button").count(),
+                "done_rows": page.locator(".plan-list > section").nth(2).locator("button.content-button").count(),
+                "anchors": measure_named_anchors(page, {
+                    "plan_list": ".plan-list",
+                    "draft": ".plan-list > section:nth-of-type(1)",
+                    "ready": ".plan-list > section:nth-of-type(2)",
+                    "done": ".plan-list > section:nth-of-type(3)",
+                }),
+            }
+
+            ready_row = page.locator(".plan-list > section").nth(1).locator("button.content-button").filter(has_text=plan_name).first
+            expect(ready_row).to_be_visible()
+            ready_row.click()
+            page.get_by_label("Plan content", exact=True).wait_for()
+            expect(page.locator(".plan-save-state:visible")).to_have_text(re.compile(r"^Saved$"))
+            metadata = page.locator("details.plan-metadata")
+            history = page.locator("details.plan-backup-history")
+            assert metadata.get_attribute("open") is None
+            assert history.get_attribute("open") is None
+            editor_screenshot = tmp_path / f"cp8-editor-{theme}-{width}x{height}.png"
+            page.screenshot(path=str(editor_screenshot), full_page=True)
+            captures["screenshots"]["editor"] = editor_screenshot.name
+            captures["states"]["editor"] = {
+                "plan_path": plan_path,
+                "save_state": page.locator(".plan-save-state:visible").inner_text(),
+                "metadata_open": metadata.get_attribute("open") is not None,
+                "history_open": history.get_attribute("open") is not None,
+                "anchors": measure_named_anchors(page, {
+                    "editor": ".plan-editor",
+                    "content": "[aria-label='Plan content']",
+                    "metadata": "details.plan-metadata",
+                    "history": "details.plan-backup-history",
+                }),
+            }
+
+            page.get_by_role("button", name="More", exact=True).click()
+            page.get_by_role("menuitem", name="Configure run…", exact=True).click()
+            page.get_by_label("Run plan", exact=True).wait_for()
+            expect(page.get_by_label("Run plan", exact=True)).to_have_value(plan_path)
+            expect(page.get_by_label("Run workflow", exact=True)).to_be_visible()
+            expect(page.get_by_label("Run team", exact=True)).to_be_visible()
+            expect(page.get_by_label("Run max turns", exact=True)).to_be_visible()
+            expect(page.get_by_text("Server default: 15.", exact=True)).to_be_visible()
+            expect(page.get_by_label("Effective choices for this launch", exact=True)).to_contain_text("15 — server default")
+            advanced = page.get_by_role("button", name="Advanced options", exact=True)
+            expect(advanced).to_have_attribute("aria-expanded", "false")
+            preflight = page.locator(".worktree-preflight")
+            preflight.wait_for()
+            page.wait_for_function(
+                "() => document.querySelector('.worktree-preflight')?.dataset.preflightStatus === 'ready'"
+            )
+            expect(preflight).to_have_attribute("data-preflight-status", "ready")
+            confirmation = page.get_by_role(
+                "checkbox",
+                name="Continue despite uncommitted changes",
+                exact=True,
+            )
+            if confirmation.count():
+                confirmation.check()
+                page.wait_for_function(
+                    "() => document.querySelector('.worktree-preflight')?.dataset.preflightStatus === 'ready'"
+                )
+                expect(preflight).to_have_attribute("data-preflight-status", "ready")
+            review_button = page.get_by_role("button", name="Review start…", exact=True)
+            expect(review_button).to_be_enabled()
+            expect(page.get_by_role("button", name="Start run", exact=True)).to_have_count(0)
+            preflight_status = preflight.get_attribute("data-preflight-status")
+            assert preflight_status == "ready", preflight_status
+            new_run_screenshot = tmp_path / f"cp8-new-run-{theme}-{width}x{height}.png"
+            page.evaluate("window.scrollTo(0, 0)")
+            page.screenshot(path=str(new_run_screenshot), full_page=True)
+            captures["screenshots"]["new_run"] = new_run_screenshot.name
+            captures["states"]["new_run"] = {
+                "plan": page.get_by_label("Run plan", exact=True).input_value(),
+                "workflow": page.get_by_label("Run workflow", exact=True).input_value(),
+                "team": page.get_by_label("Run team", exact=True).input_value(),
+                "max_turns": page.get_by_label("Run max turns", exact=True).input_value(),
+                "advanced_open": advanced.get_attribute("aria-expanded") == "true",
+                "preflight_status": preflight_status,
+                "start_calls_before_review": len(units.start_calls),
+                "anchors": measure_named_anchors(page, {
+                    "new_run": ".start-run-form.card",
+                    "plan": "[aria-label='Run plan']",
+                    "preflight": ".worktree-preflight",
+                    "review_action": "button:has-text('Review start…')",
+                }),
+            }
+
+            review_button.click()
+            review_region = page.get_by_role("region", name="Review start", exact=True)
+            review_region.wait_for()
+            expect(review_region).to_contain_text("Read-only check — no run has been allocated.")
+            expect(review_region).to_contain_text("Ready for the final start action.")
+            expect(review_region).to_contain_text(plan_path)
+            expect(review_region).to_contain_text("15 · server default")
+            final_start = page.get_by_role("button", name="Start run", exact=True)
+            expect(final_start).to_be_enabled()
+            expect(page.get_by_role("button", name="Review start…", exact=True)).to_have_count(0)
+            review_screenshot = tmp_path / f"cp8-review-{theme}-{width}x{height}.png"
+            page.evaluate("window.scrollTo(0, 0)")
+            page.screenshot(path=str(review_screenshot), full_page=True)
+            captures["screenshots"]["review"] = review_screenshot.name
+            captures["states"]["review"] = {
+                "read_only_notice": "Read-only check — no run has been allocated.",
+                "resolved_max_turns": "15 · server default",
+                "final_action_enabled": not final_start.is_disabled(),
+                "start_calls_before_cancel": len(units.start_calls),
+                "anchors": measure_named_anchors(page, {
+                    "review": "[aria-label='Review start']",
+                    "summary": ".launch-review-summary",
+                    "requirements": ".launch-review-requirements",
+                    "final_action": "button:has-text('Start run')",
+                }),
+            }
+            review_region.get_by_role("button", name="Cancel review", exact=True).click()
+            expect(page.get_by_role("region", name="Review start", exact=True)).to_have_count(0)
+            assert len(units.start_calls) == 0
+        finally:
+            browser.close()
+
+    _write_artifact_manifest(
+        tmp_path / f"cp8-plan-launch-{theme}-{width}x{height}.json",
+        {
+            **captures,
+            "disposable": True,
+            "comparison": "Each production state records the matching frozen reference checksum, viewport/theme, named anchor boxes, text values, disclosure state, screenshot names, and zero-start review evidence.",
+        },
+    )
+
+
+@pytest.mark.parametrize(
+    ("width", "height", "theme"),
+    (
+        pytest.param(1280, 720, "light", id="desktop-light"),
         pytest.param(390, 844, "dark", id="mobile-dark"),
     ),
 )

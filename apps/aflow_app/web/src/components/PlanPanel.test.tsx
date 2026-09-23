@@ -78,16 +78,16 @@ describe('PlanPanel', () => {
 
   it('groups contained plans by lifecycle status and reads the selected plan', async () => {
     render(<PlanPanel project={project} onDirtyChange={vi.fn()} onOpenRunDashboard={vi.fn()} />)
-    await screen.findByText('Draft (todo)')
-    expect(screen.getByText('Ready (in progress)')).toBeDefined()
+    await screen.findByRole('heading', { name: 'Draft', exact: true })
+    expect(screen.getByRole('heading', { name: 'Ready', exact: true })).toBeDefined()
     expect(screen.getByText('Done')).toBeDefined()
     await openPlan(todoPlan, '# Plan A\n')
     expect(api.readProjectPlan).toHaveBeenCalledWith('alpha', 'todo', 'plan-a.md')
     expect((screen.getByLabelText('Plan content') as HTMLTextAreaElement).value).toBe('# Plan A\n')
-    expect(screen.getByText(todoPlan.path)).toBeDefined()
+    expect(screen.getAllByText(todoPlan.path, { exact: true })).toHaveLength(2)
   })
 
-  it('explains the lifecycle and offers Run this plan only for a saved Ready plan', async () => {
+  it('explains the lifecycle and offers Configure run only for a saved Ready plan', async () => {
     const onOpenRunDashboard = vi.fn()
     const donePlan: PlanDocument = {
       project_id: 'alpha', name: 'plan-c.md', path: 'plans/done/plan-c.md',
@@ -96,23 +96,23 @@ describe('PlanPanel', () => {
     vi.mocked(api.listProjectPlans).mockResolvedValue([todoPlan, inProgressPlan, donePlan])
     render(<PlanPanel project={project} onDirtyChange={vi.fn()} onOpenRunDashboard={onOpenRunDashboard} />)
 
-    await screen.findByText('Draft (todo)')
-    expect(screen.getByText(/A draft is not runnable yet/)).toBeDefined()
-    expect(screen.getByText(/Runnable plans/)).toBeDefined()
+    await screen.findByRole('heading', { name: 'Draft', exact: true })
+    expect(screen.getByText(/Working notes/)).toBeDefined()
+    expect(screen.getByText(/Saved plans available/)).toBeDefined()
     expect(screen.getByText(/kept for the record/)).toBeDefined()
 
     // A saved Ready plan offers the exact relative path handoff.
     await openPlan(inProgressPlan, '# Ready plan\n')
     expect(screen.getByText(/startup checks run when you start the plan/)).toBeDefined()
     expect(screen.queryByText('Ready — runnable')).toBeNull()
-    const run = screen.getByRole('button', { name: 'Run this plan' })
+    const run = screen.getByRole('button', { name: 'Configure run…' })
     expect(run.getAttribute('disabled')).toBeNull()
     fireEvent.click(run)
     expect(onOpenRunDashboard).toHaveBeenCalledWith('plans/in-progress/plan-b.md')
 
     // A dirty Ready draft must be saved before it can run.
     fireEvent.change(screen.getByLabelText('Plan content'), { target: { value: '# Unsaved\n' } })
-    expect(screen.getByRole('button', { name: 'Run this plan' }).getAttribute('disabled')).not.toBeNull()
+    expect(screen.getByRole('button', { name: 'Configure run…' }).getAttribute('disabled')).not.toBeNull()
     expect(screen.getByText(/Save this draft before running the plan/)).toBeDefined()
     fireEvent.click(screen.getByRole('button', { name: '← Back to Plans' }))
     expect(screen.getByRole('alertdialog', { name: 'Unsaved plan edits' })).toBeDefined()
@@ -120,13 +120,13 @@ describe('PlanPanel', () => {
 
     // Drafts explain how to become runnable instead of offering a no-op.
     await openPlan(todoPlan, '# Draft plan\n')
-    expect(screen.queryByRole('button', { name: 'Run this plan' })).toBeNull()
+    expect(screen.queryByRole('button', { name: 'Configure run…' })).toBeNull()
     expect(screen.getByText(/not runnable yet\. Save it and move it to Ready/)).toBeDefined()
 
     // Done plans explain that they are archival.
     fireEvent.click(screen.getByRole('button', { name: '← Back to Plans' }))
     await openPlan(donePlan, '# Done plan\n')
-    expect(screen.queryByRole('button', { name: 'Run this plan' })).toBeNull()
+    expect(screen.queryByRole('button', { name: 'Configure run…' })).toBeNull()
     expect(screen.getByText(/kept for the record and cannot run/)).toBeDefined()
   })
 
@@ -276,7 +276,7 @@ describe('PlanPanel', () => {
     await waitFor(() => expect(api.promoteProjectPlan).toHaveBeenCalledWith(
       'alpha', 'todo', 'plan-a.md', { expected_revision: todoPlan.revision },
     ))
-    await screen.findByText(promoted.path)
+    await screen.findAllByText(promoted.path, { exact: true })
     await waitFor(() => expect(api.listProjectPlans).toHaveBeenCalledTimes(2))
   })
 

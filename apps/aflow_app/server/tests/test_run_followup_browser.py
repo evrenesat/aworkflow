@@ -123,11 +123,11 @@ def test_failed_run_creates_edits_promotes_and_explicitly_launches_followup(
             page.get_by_role("button", name="More", exact=True).click()
             page.get_by_role("menuitem", name="Move to Ready", exact=True).click()
             page.get_by_role("button", name="More", exact=True).click()
-            page.get_by_role("menuitem", name="Run this plan", exact=True).wait_for()
+            page.get_by_role("menuitem", name="Configure run…", exact=True).wait_for()
             assert len(units.start_calls) == 0
             page.screenshot(path=str(_artifact_path(tmp_path, "followup-plan-edited.png")), full_page=True)
 
-            page.get_by_role("menuitem", name="Run this plan", exact=True).click()
+            page.get_by_role("menuitem", name="Configure run…", exact=True).click()
             run_plan = page.get_by_label("Run plan", exact=True)
             expect(run_plan).to_have_value(ready_path)
             preflight = page.locator(".worktree-preflight")
@@ -142,9 +142,13 @@ def test_failed_run_creates_edits_promotes_and_explicitly_launches_followup(
             )
             if confirmation.count():
                 confirmation.check()
+            assert len(units.start_calls) == 0
+            review = page.get_by_role("button", name="Review start…", exact=True)
+            expect(review).to_be_enabled()
+            review.click()
+            page.get_by_role("region", name="Review start", exact=True).wait_for()
             start = page.get_by_role("button", name="Start run", exact=True)
             expect(start).to_be_enabled()
-            assert len(units.start_calls) == 0
             start.click()
             page.locator(".run-detail").wait_for()
             assert len(units.start_calls) == 1
