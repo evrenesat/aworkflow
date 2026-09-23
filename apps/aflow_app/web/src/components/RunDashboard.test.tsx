@@ -572,6 +572,51 @@ describe('RunDashboard', () => {
     expect(handled).toHaveBeenCalledTimes(1)
   })
 
+  it('shows a failed plan load instead of presenting an empty Ready list as complete', async () => {
+    vi.mocked(api.listControlPlanePlans).mockRejectedValueOnce(new Error('later page unavailable'))
+    renderDashboard()
+
+    await waitFor(() => expect(screen.getByRole('alert').textContent).toBe(
+      'later page unavailable. Existing run data remains visible.',
+    ))
+    await openNewRun()
+    expect(screen.getByText('Choose a Ready plan to enable Start run.')).toBeDefined()
+    expect(api.preflightControlPlaneRun).not.toHaveBeenCalled()
+  })
+
+  it('retains the selected plan across a failed refresh and restores a fresh list on retry', async () => {
+    const selected = {
+      path: 'plans/in-progress/selected-über ?&=.md',
+      status: 'in_progress',
+      modified_at: '2026-01-01T00:00:00Z',
+      schema_version: 1,
+    }
+    vi.mocked(api.listControlPlanePlans)
+      .mockResolvedValueOnce([selected])
+      .mockRejectedValueOnce(new Error('later page unavailable'))
+      .mockResolvedValueOnce([selected])
+    renderDashboard()
+
+    await openNewRun()
+    choose('Run plan', selected.path)
+    await waitFor(() => expect((screen.getByLabelText('Run plan') as HTMLInputElement).value).toBe(selected.path))
+    fireEvent.click(screen.getByRole('button', { name: 'Cancel', exact: true }))
+    await screen.findByRole('button', { name: 'New run', exact: true })
+
+    fireEvent.click(screen.getByRole('button', { name: 'Refresh', exact: true }))
+    await screen.findByText(/later page unavailable/)
+    await openNewRun()
+    expect((screen.getByLabelText('Run plan') as HTMLInputElement).value).toBe(selected.path)
+    fireEvent.click(screen.getByRole('button', { name: 'Cancel', exact: true }))
+
+    await screen.findByRole('button', { name: 'New run', exact: true })
+    fireEvent.click(screen.getByRole('button', { name: 'Refresh', exact: true }))
+    await waitFor(() => expect(api.listControlPlanePlans).toHaveBeenCalledTimes(3))
+    await waitFor(() => expect(screen.queryByText(/later page unavailable/)).toBeNull())
+    await openNewRun()
+    expect((screen.getByLabelText('Run plan') as HTMLInputElement).value).toBe(selected.path)
+  })
+
   it('restarts an inactive failed source with the same workflow and editable options without owner-stop', async () => {
     const failed = { ...ownedRun, status: 'failed', launch_phase: 'failed' }
     vi.mocked(api.listControlPlaneRuns).mockResolvedValue({ runs: [failed], next_cursor: null, schema_version: 1 })

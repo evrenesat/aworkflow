@@ -1381,7 +1381,10 @@ retains per-project dashboard state across navigation so pending writes, drafts
 and startup answers keep their original identity. Legacy Overview links replace
 to Runs. Diagnostics and Adjust run disclose technical evidence and live controls.
 Hidden dashboards suspend streams/timers and reject stale loads; plan handoffs
-resolve only against fresh project plans and survive transient failures.
+resolve only against fresh project plans and survive transient failures. Project
+plan reads traverse the control-plane's 100-record pages until a short response,
+using each page's exact final path as the cursor and retaining server order;
+Ready filtering occurs only after the complete listing is loaded.
 
 Unscoped URLs open All runs. The browser follows every project run-list cursor
 with at most four project fetches, keeps all ongoing runs, then limits recent

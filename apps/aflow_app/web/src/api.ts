@@ -392,9 +392,52 @@ export async function getControlPlaneCapabilities(projectId: string): Promise<Co
   return fetchJson<ControlPlaneCapabilities>(`${controlProjectPath(projectId)}/capabilities`)
 }
 
+const CONTROL_PLANE_PLAN_PAGE_SIZE = 100
+
+function incompletePlanListError(reason: string): Error {
+  return new Error(`Could not load the complete plan list: ${reason}. Refresh to retry.`)
+}
+
 export async function listControlPlanePlans(projectId: string): Promise<ControlPlanePlan[]> {
-  const response = await fetchJson<{ plans: ControlPlanePlan[] }>(`${controlProjectPath(projectId)}/plans`)
-  return response.plans
+  const plans: ControlPlanePlan[] = []
+  const seenPaths = new Set<string>()
+  const seenCursors = new Set<string>()
+  let cursor: string | undefined
+
+  while (true) {
+    const response = await fetchJson<{ plans: ControlPlanePlan[] }>(
+      `${controlProjectPath(projectId)}/plans${buildQuery({
+        limit: CONTROL_PLANE_PLAN_PAGE_SIZE,
+        ...(cursor === undefined ? {} : { cursor }),
+      })}`,
+    )
+    const nextCursor = response.plans.length === CONTROL_PLANE_PLAN_PAGE_SIZE
+      ? response.plans[response.plans.length - 1]?.path
+      : undefined
+    if (response.plans.length === CONTROL_PLANE_PLAN_PAGE_SIZE && !nextCursor) {
+      throw incompletePlanListError('the server returned a full page without a final plan path')
+    }
+    if (nextCursor && seenCursors.has(nextCursor)) {
+      throw incompletePlanListError(`the server repeated plan cursor ${JSON.stringify(nextCursor)}`)
+    }
+    for (const plan of response.plans) {
+      if (seenPaths.has(plan.path)) {
+        throw incompletePlanListError(`the server repeated plan path ${JSON.stringify(plan.path)}`)
+      }
+      seenPaths.add(plan.path)
+      plans.push(plan)
+    }
+
+    if (response.plans.length < CONTROL_PLANE_PLAN_PAGE_SIZE) return plans
+
+    // The full-page check above proves this is present; retain the explicit
+    // guard so a future refactor cannot silently return a partial page.
+    if (!nextCursor) {
+      throw incompletePlanListError('the server returned a full page without a final plan path')
+    }
+    seenCursors.add(nextCursor)
+    cursor = nextCursor
+  }
 }
 
 export async function preflightControlPlaneRun(

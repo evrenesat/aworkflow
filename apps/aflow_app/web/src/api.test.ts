@@ -211,6 +211,99 @@ describe('workflow control API client', () => {
     expect(global.fetch).toHaveBeenLastCalledWith('/api/projects/project-1/plans/todo/demo.md/promote', expect.objectContaining({ method: 'POST' }))
   })
 
+  it('traverses every plan page without a total-count cap', async () => {
+    const plan = (path: string) => ({ path, status: 'done', modified_at: '2026-01-01T00:00:00Z', schema_version: 1 })
+    const records = Array.from({ length: 1_101 }, (_, index) => plan(`plans/done/plan-${index.toString().padStart(4, '0')}.md`))
+    vi.mocked(global.fetch).mockImplementation(async (input) => {
+      const url = new URL(String(input), 'http://test.local')
+      const cursor = url.searchParams.get('cursor')
+      const start = cursor === null ? 0 : records.findIndex((item) => item.path === cursor) + 1
+      return {
+        ok: true,
+        status: 200,
+        json: async () => ({ plans: records.slice(start, start + 100) }),
+      } as Response
+    })
+
+    await expect(api.listControlPlanePlans('project-1')).resolves.toEqual(records)
+    expect(global.fetch).toHaveBeenCalledTimes(12)
+    expect(global.fetch).toHaveBeenNthCalledWith(1, '/api/control-plane/projects/project-1/plans?limit=100', expect.anything())
+    const lastUrl = String(vi.mocked(global.fetch).mock.calls.at(-1)?.[0])
+    expect(new URL(lastUrl, 'http://test.local').searchParams.get('cursor')).toBe(records[1_099].path)
+  })
+
+  it('requests an empty page after an exact page multiple', async () => {
+    const plan = (path: string) => ({ path, status: 'done', modified_at: '', schema_version: 1 })
+    const records = Array.from({ length: 200 }, (_, index) => plan(`plans/done/exact-${index}.md`))
+    vi.mocked(global.fetch).mockImplementation(async (input) => {
+      const url = new URL(String(input), 'http://test.local')
+      const cursor = url.searchParams.get('cursor')
+      const start = cursor === null ? 0 : records.findIndex((item) => item.path === cursor) + 1
+      return { ok: true, status: 200, json: async () => ({ plans: records.slice(start, start + 100) }) } as Response
+    })
+
+    await expect(api.listControlPlanePlans('project-1')).resolves.toEqual(records)
+    expect(global.fetch).toHaveBeenCalledTimes(3)
+    expect(new URL(String(vi.mocked(global.fetch).mock.calls[2][0]), 'http://test.local').searchParams.get('cursor')).toBe(records[199].path)
+  })
+
+  it('returns an empty first page without inventing a cursor', async () => {
+    mockOkJson({ plans: [] })
+
+    await expect(api.listControlPlanePlans('project-1')).resolves.toEqual([])
+    expect(global.fetch).toHaveBeenCalledWith('/api/control-plane/projects/project-1/plans?limit=100', expect.anything())
+  })
+
+  it('preserves exact Unicode and query-sensitive path cursors', async () => {
+    const firstPage = Array.from({ length: 99 }, (_, index) => ({
+      path: `plans/done/before-${index}.md`, status: 'done', modified_at: '', schema_version: 1,
+    }))
+    const cursorPath = 'plans/done/über plan ?&=%.md'
+    firstPage.push({ path: cursorPath, status: 'done', modified_at: '', schema_version: 1 })
+    const ready = { path: 'plans/in-progress/選択.md', status: 'in_progress', modified_at: '', schema_version: 1 }
+    mockOkJson({ plans: firstPage })
+    mockOkJson({ plans: [ready] })
+
+    await expect(api.listControlPlanePlans('project-1')).resolves.toEqual([...firstPage, ready])
+    const secondUrl = String(vi.mocked(global.fetch).mock.calls[1][0])
+    expect(new URL(secondUrl, 'http://test.local').searchParams.get('cursor')).toBe(cursorPath)
+  })
+
+  it('rejects repeated cursors and repeated paths instead of returning partial data', async () => {
+    const plan = (path: string) => ({ path, status: 'done', modified_at: '', schema_version: 1 })
+    const firstPage = Array.from({ length: 100 }, (_, index) => plan(`plans/done/repeat-${index}.md`))
+    const repeatedCursorPage = [
+      ...Array.from({ length: 99 }, (_, index) => plan(`plans/done/new-${index}.md`)),
+      firstPage[99],
+    ]
+    mockOkJson({ plans: firstPage })
+    mockOkJson({ plans: repeatedCursorPage })
+    await expect(api.listControlPlanePlans('project-1')).rejects.toThrow(/repeated plan cursor/)
+
+    vi.mocked(global.fetch).mockReset()
+    vi.mocked(global.fetch).mockResolvedValueOnce({ ok: true, status: 200, json: async () => ({ plans: firstPage }) } as Response)
+    vi.mocked(global.fetch).mockResolvedValueOnce({
+      ok: true,
+      status: 200,
+      json: async () => ({ plans: [...Array.from({ length: 99 }, (_, index) => plan(`plans/done/other-${index}.md`)), firstPage[0]] }),
+    } as Response)
+    await expect(api.listControlPlanePlans('project-1')).rejects.toThrow(/repeated plan path/)
+  })
+
+  it('propagates a later-page failure and succeeds on a fresh retry', async () => {
+    const firstPage = Array.from({ length: 100 }, (_, index) => ({
+      path: `plans/done/failure-${index}.md`, status: 'done', modified_at: '', schema_version: 1,
+    }))
+    vi.mocked(global.fetch).mockResolvedValueOnce({ ok: true, status: 200, json: async () => ({ plans: firstPage }) } as Response)
+    vi.mocked(global.fetch).mockResolvedValueOnce({ ok: false, status: 503, text: async () => 'page unavailable' } as Response)
+    await expect(api.listControlPlanePlans('project-1')).rejects.toMatchObject({ status: 503, message: 'page unavailable' })
+
+    vi.mocked(global.fetch).mockReset()
+    const current = { path: 'plans/in-progress/retried.md', status: 'in_progress', modified_at: '', schema_version: 1 }
+    mockOkJson({ plans: [current] })
+    await expect(api.listControlPlanePlans('project-1')).resolves.toEqual([current])
+  })
+
   it('keeps idempotency keys out of mutation URLs and storage', async () => {
     api.setAuthToken('test-token')
     window.localStorage.clear(); window.sessionStorage.clear()
