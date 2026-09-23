@@ -1,5 +1,36 @@
 # DEVLOG
 
+## 2026-09-23 — Repair delayed canonical checkpoint selection gate
+
+- The managed branch was based on `9eb433e4`, so the required published redesign
+  baseline `8e9187d9500f5da51ecc97ba65594132c3df4bb5` was merged cleanly before
+  source changes. The merge preserved both histories and did not touch the
+  primary checkout.
+- CI run `35817652794` / Dashboard Ubuntu Python 3.13 job `107042531255`
+  exposed a readiness race: canonical checkpoint rows can render when delayed
+  `getRunContext` data arrives before `CheckpointHistory`'s selection
+  reconciliation effect commits `aria-current`. The original immediate read at
+  `RunDashboard.test.tsx:3487` could therefore observe `null`; the reconciliation
+  itself preserves exact run/checkpoint identity and was left unchanged.
+- The dashboard regression now holds `getRunContext` behind a deferred response,
+  resolves it under `act`, and queries the current checkpoint inside `waitFor`
+  until the real `aria-current="true"` contract is present. Existing action-order,
+  evidence, explicit-selection, equal-refresh, and run-change assertions remain
+  intact through the focused suite.
+- The Plans-after-Settings-save journey now waits for the acknowledged
+  `Workflow settings saved` status before navigating, closing the pending-save
+  boundary behind the one-off `App.test.tsx:627` timeout without changing draft,
+  conflict, or navigation-guard behavior.
+- Verification: the required focused command passed 207/207 tests in five
+  sequential successful repetitions (1,035 test executions); the full web suite
+  passed 568/568 tests across 28 files; the web build passed; and the disposable
+  UI fidelity browser suite passed 14/14 tests. Two earlier full-focused attempts
+  exposed unrelated existing follow-up/recovery readiness flakes and passed when
+  retried or isolated; no unrelated test was changed. `git diff --check` passed.
+- Scope limit: only the two named test files and this log/plan are changed; no
+  production selection code, backend/controller/config/workflow code, visual
+  redesign scope, live mutation, or publication/CI claim is included.
+
 ## 2026-09-23 — Verify populated calm-workspace fidelity
 
 - Tightened the desktop workspace content boundary while retaining the mobile

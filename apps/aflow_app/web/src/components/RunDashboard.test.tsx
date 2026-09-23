@@ -3462,18 +3462,23 @@ describe('RunDashboard', () => {
   it('keeps owner actions ahead of the complete canonical checkpoint evidence', async () => {
     const listed = { ...ownedRun, evidence: {}, plan_path: null, progress: canonicalListProgress() }
     const canonicalDetail = canonicalDetailProgress()
+    const delayedContext = deferred<RunContext>()
     vi.mocked(api.listControlPlaneRuns).mockResolvedValue({ runs: [listed], next_cursor: null, schema_version: 1 })
     vi.mocked(api.getControlPlaneRun).mockResolvedValue(listed)
-    vi.mocked(api.getRunContext).mockResolvedValue({
-      run_id: listed.run_id,
-      level: 'lite',
-      schema_version: 1,
-      data: { progress: canonicalDetail },
-    })
+    vi.mocked(api.getRunContext).mockImplementation(() => delayedContext.promise)
 
     const { container } = renderDashboard()
     const detail = await screen.findByLabelText('Run details')
-    const currentCheckpoint = await within(detail).findByRole('button', { name: /Checkpoint 5: Active/ })
+    await waitFor(() => expect(api.getRunContext).toHaveBeenCalledTimes(1))
+    await act(async () => {
+      delayedContext.resolve({
+        run_id: listed.run_id,
+        level: 'lite',
+        schema_version: 1,
+        data: { progress: canonicalDetail },
+      })
+      await delayedContext.promise
+    })
     const identity = container.querySelector('.run-progress-header')
     const adjust = within(detail).getByText('Adjust run', { selector: 'summary' }).closest('details')
     const actions = within(detail).getByRole('button', { name: 'Actions', exact: true }).closest('.run-actions-menu')
@@ -3484,7 +3489,10 @@ describe('RunDashboard', () => {
     expect(actions).not.toBeNull()
     expect(identity!.compareDocumentPosition(adjust!) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy()
     expect(adjust!.compareDocumentPosition(evidence) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy()
-    expect(currentCheckpoint.getAttribute('aria-current')).toBe('true')
+    await waitFor(() => {
+      const currentCheckpoint = within(detail).getByRole('button', { name: /Checkpoint 5: Active/ })
+      expect(currentCheckpoint.getAttribute('aria-current')).toBe('true')
+    })
     expect(within(detail).getByRole('button', { name: /Checkpoint 4: Reviewed/ })).toBeDefined()
     expect(within(detail).getByText('Run settings & changes', { selector: 'summary' })).toBeDefined()
   })
