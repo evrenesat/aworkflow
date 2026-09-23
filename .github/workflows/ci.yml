@@ -60,6 +60,7 @@ jobs:
     # interpreter so its environment cannot silently use another installed minor.
     env:
       UV_PYTHON: ${{ matrix.python-version }}
+      AFLOW_BROWSER_ARTIFACT_DIR: ${{ github.workspace }}/artifacts/responsive-browser
     strategy:
       fail-fast: false
       matrix:
@@ -109,6 +110,9 @@ jobs:
         working-directory: apps/aflow_app/web
         run: npm run build
 
+      - name: Prepare responsive browser artifacts
+        run: mkdir -p "$AFLOW_BROWSER_ARTIFACT_DIR"
+
       - name: Run server tests
         working-directory: apps/aflow_app/server
         run: |
@@ -121,15 +125,14 @@ jobs:
         env:
           AFLOW_TEST_BROWSER: webkit
         run: |
-          mkdir -p "$GITHUB_WORKSPACE/artifacts/responsive-browser"
           uv run playwright install --with-deps webkit
           uv run pytest -q tests/test_responsive_browser.py --basetemp="$GITHUB_WORKSPACE/artifacts/responsive-browser"
 
       - name: Upload responsive browser artifacts
-        if: always() && matrix.os == 'ubuntu-latest' && matrix.python-version == '3.12'
+        if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: responsive-browser-${{ github.run_id }}
+          name: responsive-browser-${{ github.run_id }}-${{ matrix.os }}-py${{ matrix.python-version }}
           path: artifacts/responsive-browser
           if-no-files-found: warn
 

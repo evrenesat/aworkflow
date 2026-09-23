@@ -363,6 +363,95 @@ def _compact(page: Page) -> bool:
     return width < 960 or height < 600
 
 
+def _team_family_geometry_snapshot(entry) -> dict[str, object]:
+    """Read one settled family row without allowing per-node scroll changes."""
+    entry.wait_for(state="visible")
+    for selector in (
+        ".team-family-list-title",
+        ".team-family-list-kind",
+        ".team-family-list-meta",
+    ):
+        entry.locator(selector).wait_for(state="visible")
+    entry.evaluate(
+        """element => new Promise(resolve => {
+            const settle = () => requestAnimationFrame(() => requestAnimationFrame(() => resolve()));
+            if (document.fonts && document.fonts.status === 'loading') {
+                document.fonts.ready.then(settle, settle);
+            } else {
+                settle();
+            }
+        })"""
+    )
+    return entry.evaluate(
+        """element => {
+            const selectors = {
+                entry: element,
+                title: element.querySelector('.team-family-list-title'),
+                kind: element.querySelector('.team-family-list-kind'),
+                meta: element.querySelector('.team-family-list-meta'),
+            };
+            const styleProperties = [
+                'display', 'flexDirection', 'flexWrap', 'alignItems', 'gap',
+                'whiteSpace', 'overflow', 'overflowY', 'position', 'boxSizing',
+                'width', 'minWidth', 'lineHeight',
+            ];
+            const rect = node => {
+                if (!(node instanceof Element)) return null;
+                const box = node.getBoundingClientRect();
+                return {
+                    x: box.x,
+                    y: box.y,
+                    width: box.width,
+                    height: box.height,
+                    top: box.top,
+                    right: box.right,
+                    bottom: box.bottom,
+                    left: box.left,
+                };
+            };
+            const styles = node => {
+                if (!(node instanceof Element)) return null;
+                const computed = getComputedStyle(node);
+                return Object.fromEntries(
+                    styleProperties.map(property => [property, computed[property]])
+                );
+            };
+            const active = document.activeElement;
+            return {
+                viewport: {
+                    innerWidth: window.innerWidth,
+                    innerHeight: window.innerHeight,
+                    devicePixelRatio: window.devicePixelRatio,
+                    visual: window.visualViewport ? {
+                        width: window.visualViewport.width,
+                        height: window.visualViewport.height,
+                        offsetLeft: window.visualViewport.offsetLeft,
+                        offsetTop: window.visualViewport.offsetTop,
+                        scale: window.visualViewport.scale,
+                    } : null,
+                },
+                scroll: {
+                    x: window.scrollX,
+                    y: window.scrollY,
+                    document: document.scrollingElement?.scrollTop ?? null,
+                },
+                focus: active ? {
+                    tag: active.tagName,
+                    id: active.id,
+                    className: String(active.className ?? ''),
+                    ariaLabel: active.getAttribute('aria-label'),
+                } : null,
+                rects: Object.fromEntries(
+                    Object.entries(selectors).map(([name, node]) => [name, rect(node)])
+                ),
+                computedStyles: Object.fromEntries(
+                    Object.entries(selectors).map(([name, node]) => [name, styles(node)])
+                ),
+            };
+        }"""
+    )
+
+
 def _login(page: Page, url: str) -> None:
     page.goto(url)
     page.get_by_placeholder("Auth token").fill(TOKEN)
@@ -2408,6 +2497,7 @@ def test_responsive_team_family_journey(
     strong_stage_id = "browser_family_stronger_worker"
     dist = Path(__file__).resolve().parents[2] / "web" / "dist"
     monkeypatch.setenv("AFLOW_APP_WEB_DIST", str(dist))
+    browser_name = os.environ.get("AFLOW_TEST_BROWSER", "chromium").strip().lower()
 
     def open_family_list(page: Page) -> None:
         if _compact(page):
@@ -2421,13 +2511,38 @@ def test_responsive_team_family_journey(
         entry = page.get_by_role("navigation", name="Team families", exact=True).get_by_role(
             "button", name=label, exact=True
         )
-        # Catch the shared .sidebar-entry rule collapsing metadata into inline text.
-        title = entry.locator(".team-family-list-title").bounding_box()
-        kind = entry.locator(".team-family-list-kind").bounding_box()
-        meta = entry.locator(".team-family-list-meta").bounding_box()
-        assert title and kind and meta
-        assert kind["y"] >= title["y"] + title["height"]
-        assert meta["y"] >= kind["y"] + kind["height"]
+        # Keep all rectangles in one DOM/scroll state. Locator.bounding_box()
+        # may scroll each descendant independently on short viewports.
+        snapshot = _team_family_geometry_snapshot(entry)
+        rects = snapshot["rects"]
+        title = rects["title"]
+        kind = rects["kind"]
+        meta = rects["meta"]
+        try:
+            assert title and kind and meta, snapshot
+            assert kind["y"] >= title["y"] + title["height"], snapshot
+            assert meta["y"] >= kind["y"] + kind["height"], snapshot
+        except AssertionError as error:
+            artifact = {
+                "browser": browser_name,
+                "viewport": {"width": width, "height": height},
+                "label": label,
+                "failure": str(error),
+                "snapshot": snapshot,
+            }
+            configured_artifact_dir = os.environ.get("AFLOW_BROWSER_ARTIFACT_DIR", "").strip()
+            artifact_dir = Path(configured_artifact_dir) if configured_artifact_dir else tmp_path
+            artifact_dir.mkdir(parents=True, exist_ok=True)
+            artifact_path = artifact_dir / f"team-family-geometry-{browser_name}-{width}x{height}.json"
+            artifact_path.write_text(json.dumps(artifact, indent=2), encoding="utf-8")
+            screenshot_path = artifact_dir / f"team-family-geometry-{browser_name}-{width}x{height}-failure.png"
+            try:
+                page.screenshot(path=str(screenshot_path), full_page=True)
+            except PlaywrightError as screenshot_error:
+                print("TEAM_FAMILY_GEOMETRY_SCREENSHOT_ERROR", screenshot_error)
+            print("TEAM_FAMILY_GEOMETRY_ARTIFACT", artifact_path)
+            print("TEAM_FAMILY_GEOMETRY_SCREENSHOT", screenshot_path)
+            raise
         entry.click()
         page.locator(".team-family-detail").wait_for()
         for stage in page.locator(".team-family-stage-selector button").all():
@@ -2706,7 +2821,6 @@ def test_responsive_team_family_journey(
             _assert_no_horizontal_overflow(page)
             _clear_test_text_zoom(page)
             _assert_header_and_flow(page)
-            browser_name = os.environ.get("AFLOW_TEST_BROWSER", "chromium").strip().lower()
             for theme in ("light", "dark"):
                 _set_theme_preference(page, theme)
                 page.reload()
