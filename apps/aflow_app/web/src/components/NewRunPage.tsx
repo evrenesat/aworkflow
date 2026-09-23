@@ -174,13 +174,14 @@ interface NewRunPageProps {
   startActionLabel: string
   reviewReady: boolean
   startDisabled: boolean
+  startRevalidationPending: boolean
   busyAction: string | null
   /** The hosted shell renders Start/Cancel in its shared row-2 slots. */
   hideActions?: boolean
 }
 
 /** Presentation only; the workspace retains request and answer identity across navigation. */
-export function NewRunPage({ startPlanPath, setStartPlanPath, planOptions, planBadges, restartDraftFrozen, startWorkflow, changeStartWorkflow, workflowOptions, workflowBadges, workflowPresentation, startTeamFamily, setStartTeamFamily, teamFamilyOptions, teamFamilyBadges, teamFamilyOptionLabel, teamFamilyOptionHint, teamFamilyPresentation, startTeamStage, setStartTeamStage, teamStageOptions, teamStageBadges, teamStageOptionLabel, teamStageOptionHint, teamStagePresentation, startMaxTurns, setStartMaxTurns, startMaxTurnsProblem, configuredMaxTurns, serverDefaultMaxTurns, preview, worktreePreflight, restartActions, onCancel, advancedOpen, setAdvancedOpen, startStep, setStartStep, effectiveWorkflow, runSteps, skippedByDraft, startExtraInstructions, setStartExtraInstructions, extraInstructionProblem, launchBlocker, onOpenSettings, reviewOpen, review, onOpenStartReview, onCancelStartReview, onConfirmStart, startActionLabel, reviewReady, startDisabled, busyAction, hideActions = false }: NewRunPageProps) {
+export function NewRunPage({ startPlanPath, setStartPlanPath, planOptions, planBadges, restartDraftFrozen, startWorkflow, changeStartWorkflow, workflowOptions, workflowBadges, workflowPresentation, startTeamFamily, setStartTeamFamily, teamFamilyOptions, teamFamilyBadges, teamFamilyOptionLabel, teamFamilyOptionHint, teamFamilyPresentation, startTeamStage, setStartTeamStage, teamStageOptions, teamStageBadges, teamStageOptionLabel, teamStageOptionHint, teamStagePresentation, startMaxTurns, setStartMaxTurns, startMaxTurnsProblem, configuredMaxTurns, serverDefaultMaxTurns, preview, worktreePreflight, restartActions, onCancel, advancedOpen, setAdvancedOpen, startStep, setStartStep, effectiveWorkflow, runSteps, skippedByDraft, startExtraInstructions, setStartExtraInstructions, extraInstructionProblem, launchBlocker, onOpenSettings, reviewOpen, review, onOpenStartReview, onCancelStartReview, onConfirmStart, startActionLabel, reviewReady, startDisabled, startRevalidationPending, busyAction, hideActions = false }: NewRunPageProps) {
   const advancedId = useId()
   return (
         <section className="card start-run-form">
@@ -330,9 +331,9 @@ export function NewRunPage({ startPlanPath, setStartPlanPath, planOptions, planB
                   {!hideActions && <button
                     className="btn btn-primary"
                     onClick={() => void onConfirmStart()}
-                    disabled={startDisabled || !reviewReady || Boolean(restartActions)}
+                    disabled={startDisabled || !reviewReady || startRevalidationPending || Boolean(restartActions)}
                   >
-                    {busyAction === 'start' ? 'Starting…' : 'Start run'}
+                    {busyAction === 'start' ? 'Starting…' : startRevalidationPending ? 'Checking…' : 'Start run'}
                   </button>}
                   <button className="btn btn-secondary" onClick={onCancelStartReview} disabled={busyAction === 'start'}>Cancel review</button>
                 </div>
