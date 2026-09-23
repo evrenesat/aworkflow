@@ -58,7 +58,7 @@ def _open_plan(page, name: str) -> None:
 
 def _open_run_for_selected_plan(page) -> None:
     page.get_by_role("button", name="More", exact=True).click()
-    page.get_by_role("menuitem", name="Run this plan", exact=True).click()
+    page.get_by_role("menuitem", name="Configure run…", exact=True).click()
     page.get_by_label("Run plan", exact=True).wait_for()
 
 
@@ -75,6 +75,16 @@ def _choose_workflow(page) -> None:
     workflow.press("ArrowDown")
     workflow.press("Enter")
     expect(workflow).to_have_value("Managed")
+
+
+def _start_after_review(page) -> None:
+    review = page.get_by_role("button", name="Review start…", exact=True)
+    expect(review).to_be_enabled()
+    review.click()
+    page.get_by_role("region", name="Review start", exact=True).wait_for()
+    start = page.get_by_role("button", name="Start run", exact=True)
+    expect(start).to_be_enabled()
+    start.click()
 
 
 def _capture_startup_gate_failure(page) -> None:
@@ -175,7 +185,7 @@ def _acknowledge_required_dirty_worktree(page) -> None:
         expect(confirmation).to_be_enabled()
         confirmation.check()
         expect(confirmation).to_be_checked()
-        expect(page.get_by_role("button", name="Start run", exact=True)).to_be_enabled()
+        expect(page.get_by_role("button", name="Review start…", exact=True)).to_be_enabled()
     except Exception:
         _capture_startup_gate_failure(page)
         raise
@@ -261,7 +271,7 @@ def test_chromium_preserves_ready_state_and_retries_a_corrected_plan(
             page.goto(f"{url}/?project={PROJECT_ID}&view=plans")
 
             _open_plan(page, "numbered-ready.md")
-            expect(page.locator(".header-context-title").first).to_contain_text("Ready")
+            expect(page.locator(".plan-header-context .status-pill").first).to_have_text("Ready")
             expect(page.get_by_text(
                 "Ready is a plan lifecycle state; startup checks run when you start the plan.",
                 exact=True,
@@ -274,7 +284,7 @@ def test_chromium_preserves_ready_state_and_retries_a_corrected_plan(
             _choose_workflow(page)
             _assert_tracked_modification(root, sentinel_path)
             _acknowledge_required_dirty_worktree(page)
-            page.get_by_role("button", name="Start run", exact=True).click()
+            _start_after_review(page)
             assert page.locator(".run-detail h3").inner_text() == "Numbered ready"
             assert len(units.start_calls) == 1
             assert numbered_path.read_text(encoding="utf-8") == numbered
@@ -291,7 +301,7 @@ def test_chromium_preserves_ready_state_and_retries_a_corrected_plan(
             _assert_tracked_modification(root, sentinel_path)
             _acknowledge_required_dirty_worktree(page)
             before_rejection = _run_ids(root)
-            page.get_by_role("button", name="Start run", exact=True).click()
+            _start_after_review(page)
             expect(page.get_by_role("alert").filter(has_text="Plan validation failed")).to_contain_text(
                 "Add or correct exactly one Git Tracking section"
             )
@@ -325,7 +335,7 @@ def test_chromium_preserves_ready_state_and_retries_a_corrected_plan(
             _choose_workflow(page)
             _assert_tracked_modification(root, sentinel_path)
             _acknowledge_required_dirty_worktree(page)
-            page.get_by_role("button", name="Start run", exact=True).click()
+            _start_after_review(page)
             assert page.locator(".run-detail h3").inner_text() == "Duplicate ready"
             assert len(units.start_calls) == 2
             assert len(_run_ids(root)) == len(before_rejection) + 1

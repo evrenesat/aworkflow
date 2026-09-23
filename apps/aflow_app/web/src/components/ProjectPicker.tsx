@@ -17,6 +17,8 @@ interface ProjectPickerProps {
   projects: ProjectInfo[]
   selectedProjectId: string | null
   loading: boolean
+  refreshing?: boolean
+  hasLoaded?: boolean
   error: string | null
   onSelectProject: (project: ProjectInfo) => void
   onRefresh: () => void | Promise<void>
@@ -83,12 +85,18 @@ function ProjectActions({
   </MoreMenu>
 }
 
-function ProjectRowButton({ project, selected, className, onClick }: {
+function ProjectRowButton({ project, selected, className, kind, onClick }: {
   project: ProjectInfo
   selected: boolean
   className: string
+  kind: 'git-root' | 'worktree' | 'not-git-root'
   onClick: () => void
 }) {
+  const kindLabel = kind === 'worktree'
+    ? 'Worktree'
+    : kind === 'git-root'
+      ? 'Git root'
+      : 'Not a Git root'
   return <button
     className={className}
     aria-pressed={selected}
@@ -101,7 +109,11 @@ function ProjectRowButton({ project, selected, className, onClick }: {
         {readinessLabel(project.readiness)}
       </span>
     </span>
-    <span className="row-subtitle text-dim mono">{project.current_path}</span>
+    <span className="row-subtitle text-dim project-row-facts">
+      <span>{kindLabel}</span>
+      <span aria-hidden="true">·</span>
+      <span className="mono">{project.current_path}</span>
+    </span>
   </button>
 }
 
@@ -114,6 +126,8 @@ export function ProjectPicker({
   projects,
   selectedProjectId,
   loading,
+  refreshing = false,
+  hasLoaded = true,
   error,
   onSelectProject,
   onRefresh,
@@ -195,6 +209,7 @@ export function ProjectPicker({
   }
 
   const query = search.trim().toLowerCase()
+  const showLoadedContent = !loading && (hasLoaded || !error)
   const projectGroups = groupProjectRegistrations(projects, query, selectedProjectId)
   const allCandidates = (discovery?.candidates ?? []).filter(candidate => candidate.registered_project_id === null)
   const filteredCandidates = allCandidates.filter((candidate) =>
@@ -218,7 +233,7 @@ export function ProjectPicker({
       aria-expanded={showCreateForm}
     >{showCreateForm ? 'Close form' : 'Add project'}</button>,
     more: <MoreMenu label="More project actions" triggerLabel="More">
-      <MenuItem disabled={loading || discoveryLoading} onClick={() => void handleRefresh()}>Refresh</MenuItem>
+      <MenuItem disabled={loading || refreshing || discoveryLoading} onClick={() => void handleRefresh()}>Refresh</MenuItem>
     </MoreMenu>,
   })
 
@@ -233,7 +248,7 @@ export function ProjectPicker({
           </div>
         </div>
         <div className="dashboard-actions">
-          <button className="btn btn-secondary btn-sm" onClick={handleRefresh} disabled={loading || discoveryLoading}>
+          <button className="btn btn-secondary btn-sm" onClick={handleRefresh} disabled={loading || refreshing || discoveryLoading}>
             Refresh
           </button>
           <button
@@ -257,7 +272,7 @@ export function ProjectPicker({
 
       {loading && <div className="dashboard-loading card"><div className="spinner" />Loading registered projects…</div>}
 
-      {!loading && !error && (
+      {showLoadedContent && (
         <>
           {hosted && discovery && <div className="project-server-context text-xs text-dim">
             Registered beneath the server's managed root — <span className="mono">{discovery.managed_root}</span>.
@@ -324,6 +339,7 @@ export function ProjectPicker({
                           project={primary}
                           selected={primarySelected}
                           className="compact-row-main content-button"
+                          kind={primary.is_git_root ? 'git-root' : 'not-git-root'}
                           onClick={() => onSelectProject(primary)}
                         />
                         {group.children.length > 0 && <details
@@ -361,6 +377,7 @@ export function ProjectPicker({
                                       project={child}
                                       selected={childSelected}
                                       className="worktree-row content-button"
+                                      kind="worktree"
                                       onClick={() => onSelectProject(child)}
                                     />
                                     <div className="compact-row-actions">
@@ -398,110 +415,6 @@ export function ProjectPicker({
 
           {unregisterError && <div className="error-message" role="alert">{unregisterError}</div>}
 
-          <h3 className="project-subheading">Available on this server</h3>
-          {discoveryLoading && (
-            <div className="dashboard-loading card"><div className="spinner" />Finding existing projects…</div>
-          )}
-          {discoveryError && (
-            <div className="error-message" role="alert">
-              Existing projects could not be listed: {discoveryError}
-              <div className="dashboard-actions" style={{ marginTop: 'var(--spacing-sm)' }}>
-                <button className="btn btn-secondary btn-sm" onClick={() => void loadDiscovery()}>Retry discovery</button>
-              </div>
-            </div>
-          )}
-          {!discoveryLoading && !discoveryError && discovery && allCandidates.length === 0 && (
-            <div className="card text-dim text-sm">
-              No discoverable Git projects beneath the managed root yet. Discovery covers direct
-              and nested directories up to two levels; deeper or skipped locations can still be
-              added by relative path with Add project.
-            </div>
-          )}
-          {!discoveryLoading && !discoveryError && discovery && allCandidates.length > 0 && filteredCandidates.length === 0 && (
-            <div className="card text-dim text-sm">
-              No available projects match “{search.trim()}”.
-              <div className="dashboard-actions" style={{ marginTop: 'var(--spacing-sm)' }}>
-                <button className="btn btn-secondary btn-sm" onClick={() => setSearch('')}>Clear search</button>
-              </div>
-            </div>
-          )}
-          {discovery && discovery.truncated && (
-            <div className="notice" role="status">
-              Results were limited: at most {discovery.limits.max_candidates} projects and{' '}
-              {discovery.limits.max_visited_entries} directory entries are inspected. Narrow the
-              layout or add deeper projects by relative path.
-            </div>
-          )}
-          {discovery && discovery.skipped_unreadable > 0 && (
-            <div className="notice" role="status">
-              Some directories could not be inspected by the server.
-            </div>
-          )}
-
-          <ul className="compact-list" role="list" aria-label="Available on this server">
-            {filteredCandidates.map((candidate) => {
-              const registered = candidate.registered_project_id !== null
-                ? projects.find((project) => project.id === candidate.registered_project_id) ?? null
-                : null
-              return (
-                <li
-                  key={candidate.relative_path}
-                  role="listitem"
-                  className="compact-row"
-                >
-                  {registered ? (
-                    <button
-                      className="compact-row-main content-button"
-                      title={candidate.display_name}
-                      onClick={() => onSelectProject(registered)}
-                    >
-                      <span className="row-title">
-                        {candidate.display_name}
-                        <span className="status-pill">Added</span>
-                      </span>
-                      <span className="row-subtitle text-dim mono">{candidate.relative_path}</span>
-                    </button>
-                  ) : (
-                    <div className="compact-row-main">
-                      <span className="row-title">
-                        {candidate.display_name}
-                        {candidate.registered_project_id !== null && <span className="status-pill">Added</span>}
-                      </span>
-                      <span className="row-subtitle text-dim mono">{candidate.relative_path}</span>
-                      {candidate.add_blocker && (
-                        <span className="row-subtitle text-dim">
-                          Cannot be added: {candidate.add_blocker}.
-                        </span>
-                      )}
-                    </div>
-                  )}
-                  <div className="compact-row-actions">
-                    {candidate.registered_project_id !== null && !registered && (
-                      <button className="btn btn-secondary btn-sm" onClick={handleRefresh}>
-                        Refresh to open
-                      </button>
-                    )}
-                    {!registered && candidate.addable && (
-                      <button
-                        className="btn btn-primary btn-sm"
-                        onClick={() => void handleAdd(candidate)}
-                        disabled={addingPath !== null}
-                      >
-                        {addingPath === candidate.relative_path ? 'Adding…' : 'Add'}
-                      </button>
-                    )}
-                  </div>
-                </li>
-              )
-            })}
-          </ul>
-
-          {addError && (
-            <div className="error-message" role="alert">
-              {addError}
-            </div>
-          )}
-
           {showCreateForm && (
             <ProjectCreateForm
               suggestions={suggestions}
@@ -514,6 +427,127 @@ export function ProjectPicker({
               onCancel={() => setShowCreateForm(false)}
             />
           )}
+
+          <details className="project-discovery-disclosure">
+            <summary>
+              <span>Find projects on this server</span>
+              <span className="project-discovery-summary-state text-xs text-dim">
+                {discoveryLoading
+                  ? 'Checking…'
+                  : discoveryError
+                    ? 'Unavailable'
+                    : discovery
+                      ? allCandidates.length > 0
+                        ? `${allCandidates.length} available`
+                        : 'No new projects found'
+                      : 'Not checked'}
+              </span>
+            </summary>
+            <div className="project-discovery-content">
+              {discoveryLoading && (
+                <div className="dashboard-loading card"><div className="spinner" />Finding existing projects…</div>
+              )}
+              {discoveryError && (
+                <div className="error-message" role="alert">
+                  Existing projects could not be listed: {discoveryError}
+                  <div className="dashboard-actions" style={{ marginTop: 'var(--spacing-sm)' }}>
+                    <button className="btn btn-secondary btn-sm" onClick={() => void loadDiscovery()}>Retry discovery</button>
+                  </div>
+                </div>
+              )}
+              {!discoveryLoading && !discoveryError && discovery && allCandidates.length === 0 && (
+                <div className="card text-dim text-sm">
+                  No discoverable Git projects beneath the managed root yet. Discovery covers direct
+                  and nested directories up to two levels; deeper or skipped locations can still be
+                  added by relative path with Add project.
+                </div>
+              )}
+              {!discoveryLoading && !discoveryError && discovery && allCandidates.length > 0 && filteredCandidates.length === 0 && (
+                <div className="card text-dim text-sm">
+                  No available projects match “{search.trim()}”.
+                  <div className="dashboard-actions" style={{ marginTop: 'var(--spacing-sm)' }}>
+                    <button className="btn btn-secondary btn-sm" onClick={() => setSearch('')}>Clear search</button>
+                  </div>
+                </div>
+              )}
+              {discovery && discovery.truncated && (
+                <div className="notice" role="status">
+                  Results were limited: at most {discovery.limits.max_candidates} projects and{' '}
+                  {discovery.limits.max_visited_entries} directory entries are inspected. Narrow the
+                  layout or add deeper projects by relative path.
+                </div>
+              )}
+              {discovery && discovery.skipped_unreadable > 0 && (
+                <div className="notice" role="status">
+                  Some directories could not be inspected by the server.
+                </div>
+              )}
+
+              <ul className="compact-list" role="list" aria-label="Available on this server">
+                {filteredCandidates.map((candidate) => {
+                  const registered = candidate.registered_project_id !== null
+                    ? projects.find((project) => project.id === candidate.registered_project_id) ?? null
+                    : null
+                  return (
+                    <li
+                      key={candidate.relative_path}
+                      role="listitem"
+                      className="compact-row"
+                    >
+                      {registered ? (
+                        <button
+                          className="compact-row-main content-button"
+                          title={candidate.display_name}
+                          onClick={() => onSelectProject(registered)}
+                        >
+                          <span className="row-title">
+                            {candidate.display_name}
+                            <span className="status-pill">Added</span>
+                          </span>
+                          <span className="row-subtitle text-dim mono">{candidate.relative_path}</span>
+                        </button>
+                      ) : (
+                        <div className="compact-row-main">
+                          <span className="row-title">
+                            {candidate.display_name}
+                            {candidate.registered_project_id !== null && <span className="status-pill">Added</span>}
+                          </span>
+                          <span className="row-subtitle text-dim mono">{candidate.relative_path}</span>
+                          {candidate.add_blocker && (
+                            <span className="row-subtitle text-dim">
+                              Cannot be added: {candidate.add_blocker}.
+                            </span>
+                          )}
+                        </div>
+                      )}
+                      <div className="compact-row-actions">
+                        {candidate.registered_project_id !== null && !registered && (
+                          <button className="btn btn-secondary btn-sm" onClick={handleRefresh}>
+                            Refresh to open
+                          </button>
+                        )}
+                        {!registered && candidate.addable && (
+                          <button
+                            className="btn btn-primary btn-sm"
+                            onClick={() => void handleAdd(candidate)}
+                            disabled={addingPath !== null}
+                          >
+                            {addingPath === candidate.relative_path ? 'Adding…' : 'Add'}
+                          </button>
+                        )}
+                      </div>
+                    </li>
+                  )
+                })}
+              </ul>
+
+              {addError && (
+                <div className="error-message" role="alert">
+                  {addError}
+                </div>
+              )}
+            </div>
+          </details>
         </>
       )}
     </div>

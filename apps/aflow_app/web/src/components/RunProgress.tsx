@@ -98,11 +98,13 @@ export function RunProgressStrip({ progress }: { progress: RunProgressSummary })
 export function RunProgress({
   run,
   now: _now = Date.now(),
+  mode = 'detail',
   loadState = 'ready',
   loadMessage = null,
 }: {
   run: RunStatus
   now?: number
+  mode?: 'detail' | 'row'
   loadState?: RunProgressLoadState
   loadMessage?: string | null
 }): JSX.Element {
@@ -117,13 +119,30 @@ export function RunProgress({
           : 'Checkpoint progress unavailable')
   const observableState = loadState === 'ready' ? 'settled' : loadState
   if (!progress) {
-    return <span className={`compact-run-progress unavailable ${loadState}`} data-progress-availability="unavailable" data-progress-state={observableState}>
-      <span className="compact-run-progress-line"><strong>{loadNotice}</strong></span>
+    return <span className={`compact-run-progress unavailable ${loadState} ${mode === 'row' ? 'compact-run-progress-row' : ''}`} data-progress-availability="unavailable" data-progress-state={observableState} aria-label={loadNotice}>
+      <span className={mode === 'row' ? 'compact-run-progress-row-line' : 'compact-run-progress-line'}><strong>{loadNotice}</strong></span>
     </span>
   }
 
   const checkpointPosition = checkpointPositionText(progress, run)
   const notice = progressHistoryNotice(progress)
+  const rowLoadNotice = loadState === 'stale' || loadState === 'failed'
+
+  if (mode === 'row') {
+    return <span
+      className={`compact-run-progress compact-run-progress-row ${progress.availability} ${loadState}`}
+      data-progress-availability={progress.availability}
+      data-progress-state={observableState}
+      aria-label={[checkpointApprovalText(progress), checkpointPosition, notice, loadState !== 'ready' ? loadNotice : null].filter(Boolean).join(' · ')}
+    >
+      <span className="compact-run-progress-row-line">
+        <strong>{checkpointApprovalText(progress)}</strong>
+        {checkpointPosition && <span>{checkpointPosition}</span>}
+        {rowLoadNotice && <span className={`compact-run-progress-row-notice ${loadState}`} aria-live="polite" title={loadNotice}>{loadNotice}</span>}
+      </span>
+      {!rowLoadNotice && loadState !== 'ready' && <span className="sr-only">{loadNotice}</span>}
+    </span>
+  }
 
   return <span className={`compact-run-progress ${progress.availability} ${loadState}`} data-progress-availability={progress.availability} data-progress-state={observableState}>
     <span className="compact-run-progress-line">

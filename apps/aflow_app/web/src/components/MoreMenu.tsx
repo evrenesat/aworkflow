@@ -1,30 +1,55 @@
-import { createContext, useCallback, useContext, useId, useState, type ReactNode } from 'react'
+import { createContext, useCallback, useContext, useEffect, useId, useRef, useState, type ReactNode } from 'react'
 
-const MenuCloseContext = createContext<() => void>(() => {})
+type MenuClose = (restoreFocus?: boolean) => void
+
+const MenuCloseContext = createContext<MenuClose>(() => {})
 
 /**
  * Small secondary-action menu. The trigger is a compact button with an
  * accessible name; Escape and focus loss close it, and menu items close it
  * when activated. Primary actions never belong in here.
  */
-export function MoreMenu({ label, triggerLabel = label, children }: { label: string; triggerLabel?: string; children: ReactNode }) {
+export function MoreMenu({
+  label,
+  triggerLabel = label,
+  triggerContent = '⋯',
+  className,
+  children,
+}: {
+  label: string
+  triggerLabel?: string
+  triggerContent?: ReactNode
+  className?: string
+  children: ReactNode
+}) {
   const [open, setOpen] = useState(false)
-  const close = useCallback(() => setOpen(false), [])
+  const triggerRef = useRef<HTMLButtonElement>(null)
+  const restoreFocusRef = useRef(false)
+  const close = useCallback((restoreFocus = true) => {
+    restoreFocusRef.current = restoreFocus
+    setOpen(false)
+  }, [])
+  useEffect(() => {
+    if (open || !restoreFocusRef.current) return
+    restoreFocusRef.current = false
+    triggerRef.current?.focus()
+  }, [open])
   const menuId = useId()
   return <div
-    className="more-menu"
-    onBlur={event => { if (!event.currentTarget.contains(event.relatedTarget as Node | null)) setOpen(false) }}
-    onKeyDown={event => { if (event.key === 'Escape') { setOpen(false); event.currentTarget.querySelector('button')?.focus() } }}
+    className={`more-menu${className ? ` ${className}` : ''}`}
+    onBlur={event => { if (!event.currentTarget.contains(event.relatedTarget as Node | null)) close(false) }}
+    onKeyDown={event => { if (event.key === 'Escape') close(true) }}
   >
     <button
       type="button"
       className="btn btn-secondary btn-sm more-menu-trigger"
+      ref={triggerRef}
       aria-haspopup="menu"
       aria-expanded={open}
       aria-controls={menuId}
       aria-label={triggerLabel}
-      onClick={() => setOpen(current => !current)}
-    >⋯</button>
+      onClick={() => { restoreFocusRef.current = false; setOpen(current => !current) }}
+    >{triggerContent}</button>
     {open && (
       <div id={menuId} role="menu" aria-label={label}>
         <MenuCloseContext.Provider value={close}>{children}</MenuCloseContext.Provider>

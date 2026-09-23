@@ -316,6 +316,8 @@ export interface ProjectConfigFormResponse {
   choices: GuidedConfiguredChoices
   suggestions: GuidedSuggestions
   starter_defaults: GuidedStarterDefaults | null
+  /** Runtime fallback applied by the server when aflow.max_turns is omitted. */
+  server_default_max_turns?: number
 }
 
 export type PlanStatus = 'todo' | 'in_progress' | 'done'

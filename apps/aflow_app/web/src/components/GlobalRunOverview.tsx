@@ -2,16 +2,10 @@ import { useEffect, useRef, useState } from 'react'
 import * as api from '../api'
 import { fetchGlobalRuns, matchesGlobalRun, matchesGlobalRunProgressIdentity, matchesGlobalRunSnapshot, selectGlobalRuns, useRecentRunsLimit, type GlobalRunProgressUpdate } from '../globalRuns'
 import type { ProjectInfo, RunProgressSummary, RunStatus } from '../types'
-import {
-  checkpointApprovalText,
-  runActivityText,
-  runDurationText,
-  runPlanPresentationForRun,
-  statusLabel,
-} from '../runPresentation'
 import { projectContextLabel } from '../projectPresentation'
 import { useHeaderSlots } from './HeaderSlots'
-import { RunProgress, type RunProgressLoadState } from './RunProgress'
+import { RunListItem } from './RunListItem'
+import { type RunProgressLoadState } from './RunProgress'
 
 export function RecentRunsLimit() {
   const [limit, setLimit] = useRecentRunsLimit()
@@ -55,10 +49,31 @@ function runIdentity(projectId: string, runId: string): string {
   return JSON.stringify([projectId, runId])
 }
 
+function sameRunStatus(left: RunStatus, right: RunStatus): boolean {
+  return JSON.stringify(left) === JSON.stringify(right)
+}
+
+/** Reuse equal rows so background polling cannot remount their previews. */
+function reconcileRunRows(projectId: string, previousRows: RunStatus[], nextRows: RunStatus[]): RunStatus[] {
+  const previousById = new Map(previousRows.map(run => [runIdentity(projectId, run.run_id), run]))
+  const reconciled = nextRows.map(run => {
+    const previous = previousById.get(runIdentity(projectId, run.run_id))
+    return previous && sameRunStatus(previous, run) ? previous : run
+  })
+  if (reconciled.length === previousRows.length && reconciled.every((run, index) => run === previousRows[index])) {
+    return previousRows
+  }
+  return reconciled
+}
+
 function overlayRuns(projectId: string, previousRows: RunStatus[], freshRows: RunStatus[]): RunStatus[] {
   const rows = new Map<string, RunStatus>()
   for (const run of previousRows) rows.set(runIdentity(projectId, run.run_id), run)
-  for (const run of freshRows) rows.set(runIdentity(projectId, run.run_id), run)
+  for (const run of freshRows) {
+    const identity = runIdentity(projectId, run.run_id)
+    const previous = rows.get(identity)
+    rows.set(identity, previous && sameRunStatus(previous, run) ? previous : run)
+  }
   return [...rows.values()]
 }
 
@@ -96,12 +111,13 @@ export function GlobalRunOverview({ projects, onOpen, registryLoading = false, r
   const activeEnrichmentRef = useRef(new Map<string, EnrichmentRequest>())
   const visibleEnrichmentRef = useRef(new Map<string, EnrichmentTarget>())
   const enrichmentEpochRef = useRef(0)
-  const rowTokenRef = useRef(new WeakMap<RunStatus, number>())
+  const rowTokenRef = useRef(new Map<string, number>())
   const nextRowTokenRef = useRef(0)
   const pumpEnrichmentRef = useRef<(() => void) | null>(null)
   const [, setEnrichmentVersion] = useState(0)
   const [visibilityRevision, setVisibilityRevision] = useState(0)
   const [nonce, setNonce] = useState(0)
+  const explicitRefreshRef = useRef(false)
   const [limit] = useRecentRunsLimit()
   const [search, setSearch] = useState('')
   const [attentionVisible, setAttentionVisible] = useState(10)
@@ -115,7 +131,6 @@ export function GlobalRunOverview({ projects, onOpen, registryLoading = false, r
   const coverageComplete = registryReady && currentLoad !== null && projectIds.every(id => projectStates[id]?.coverage === 'complete')
   const progressAdmissionReady = registryReady && currentLoad !== null && currentLoad.settled
     && projectIds.every(id => projectStates[id] !== undefined && projectStates[id].coverage !== 'loading')
-  const incompleteCoverage = resultsPending || !coverageComplete
   const failedProjectIds = projectIds.filter(id => projectStates[id]?.coverage === 'failed')
 
   function updateLoadState(updater: (current: GlobalRunLoadState) => GlobalRunLoadState): void {
@@ -130,7 +145,7 @@ export function GlobalRunOverview({ projects, onOpen, registryLoading = false, r
     const identity = resultsIdentity
     const requestedProjectIds = ids ? ids.split('\n') : []
 
-    const beginRequest = (generation: number): void => {
+    const beginRequest = (generation: number, explicitRefresh: boolean): void => {
       const previous = loadStateRef.current
       const sameIdentity = previous.identity === identity
       const previousProjects = sameIdentity ? previous.projects : {}
@@ -145,7 +160,11 @@ export function GlobalRunOverview({ projects, onOpen, registryLoading = false, r
       }))
       updateLoadState(() => ({
         identity,
-        generation,
+        // `generation` is the rendered-data generation, not the request
+        // generation. Equal polls therefore keep enrichment and row identity.
+        generation: sameIdentity
+          ? previous.generation + (explicitRefresh ? 1 : 0)
+          : generation,
         mode: sameIdentity && previous.settled ? 'refresh' : 'initial',
         settled: requestedProjectIds.length === 0,
         projects: projectsState,
@@ -156,7 +175,9 @@ export function GlobalRunOverview({ projects, onOpen, registryLoading = false, r
       if (busy || document.visibilityState === 'hidden' || !registryReady) return
       busy = true
       const generation = ++requestGenerationRef.current
-      beginRequest(generation)
+      const explicitRefresh = explicitRefreshRef.current
+      explicitRefreshRef.current = false
+      beginRequest(generation, explicitRefresh)
       if (!ids) {
         busy = false
         return
@@ -169,8 +190,9 @@ export function GlobalRunOverview({ projects, onOpen, registryLoading = false, r
           if (!project) return previous
           const freshRows = [...update.runs]
           const displayedRows = update.state === 'complete'
-            ? [...freshRows]
+            ? reconcileRunRows(update.projectId, project.displayedRows, freshRows)
             : overlayRuns(update.projectId, project.previousRows, freshRows)
+          const dataChanged = displayedRows !== project.displayedRows
           const projectsState = {
             ...previous.projects,
             [update.projectId]: {
@@ -182,6 +204,7 @@ export function GlobalRunOverview({ projects, onOpen, registryLoading = false, r
           }
           return {
             ...previous,
+            generation: dataChanged ? previous.generation + 1 : previous.generation,
             settled: requestedProjectIds.every(projectId => projectsState[projectId]?.coverage !== 'loading'),
             projects: projectsState,
           }
@@ -197,11 +220,12 @@ export function GlobalRunOverview({ projects, onOpen, registryLoading = false, r
             const project = projectsState[projectId]
             if (!project) continue
             const freshRows = [...runs]
+            const displayedRows = reconcileRunRows(projectId, project.displayedRows, freshRows)
             projectsState[projectId] = {
               coverage: 'complete',
               freshRows,
               previousRows: project.previousRows,
-              displayedRows: [...freshRows],
+              displayedRows,
             }
           }
           for (const projectId of result.errors) {
@@ -209,7 +233,16 @@ export function GlobalRunOverview({ projects, onOpen, registryLoading = false, r
             if (!project) continue
             projectsState[projectId] = { ...project, coverage: 'failed' }
           }
-          return { ...previous, settled: true, projects: projectsState }
+          const dataChanged = Object.keys(projectsState).some(projectId => (
+            projectsState[projectId]?.displayedRows !== previous.projects[projectId]?.displayedRows
+          ))
+          return {
+            ...previous,
+            generation: dataChanged ? previous.generation + 1 : previous.generation,
+            mode: 'initial',
+            settled: true,
+            projects: projectsState,
+          }
         })
       } finally {
         busy = false
@@ -236,23 +269,30 @@ export function GlobalRunOverview({ projects, onOpen, registryLoading = false, r
   const attentionRows = selected.attention.slice(0, attentionVisible)
   const remainingAttention = selected.attention.length - attentionRows.length
   const hasUsableRows = rows.length > 0
+  const backgroundRefresh = currentLoad?.mode === 'refresh' && hasUsableRows && failedProjectIds.length === 0
+  const incompleteCoverage = !backgroundRefresh && (resultsPending || !coverageComplete)
   const showGroups = projects.length > 0 && (hasUsableRows || coverageComplete) && (!registryError || hasUsableRows)
   const groups = ([
     { key: 'ongoing', label: `${incompleteCoverage ? 'Loaded ongoing' : 'Ongoing'} (${selected.ongoing.length})`, rows: selected.ongoing },
     { key: 'recent', label: `${incompleteCoverage ? 'Loaded recent' : 'Recent'} (${selected.recent.length})`, rows: selected.recent },
     { key: 'attention', label: `${incompleteCoverage ? 'Loaded needs attention' : 'Needs attention'} (${selected.attention.length})`, rows: attentionRows },
   ] as const)
+  // A populated overview should spend space on meaningful groups only. Empty
+  // states remain explicit at the page level (no projects, no runs, or no
+  // search match) instead of becoming repeated decorative group cards.
+  const visibleGroups = groups.filter(group => group.rows.length > 0)
   useEffect(() => setAttentionVisible(10), [history, ids, search])
 
   const renderedRows = [...selected.ongoing, ...selected.recent, ...attentionRows]
   const currentGeneration = currentLoad?.generation ?? 0
   const renderedSnapshot = renderedRows.map(({ projectId, run }) => {
-    let token = rowTokenRef.current.get(run)
+    const identity = runIdentity(projectId, run.run_id)
+    let token = rowTokenRef.current.get(identity)
     if (token === undefined) {
       token = ++nextRowTokenRef.current
-      rowTokenRef.current.set(run, token)
+      rowTokenRef.current.set(identity, token)
     }
-    return `${runIdentity(projectId, run.run_id)}:${token}`
+    return `${identity}:${token}`
   }).join('\u0000')
 
   useEffect(() => {
@@ -434,12 +474,14 @@ export function GlobalRunOverview({ projects, onOpen, registryLoading = false, r
     setHistory(next)
   }
 
+  function requestRefresh(): void {
+    explicitRefreshRef.current = true
+    setNonce(n => n + 1)
+  }
+
   function renderRunRow({ projectId, run }: { projectId: string; run: RunStatus }) {
     const project = projects.find(candidate => candidate.id === projectId)
     const projectLabel = project ? projectContextLabel(project, projects) : projectId
-    const status = statusLabel(run)
-    const title = runPlanPresentationForRun(run)
-    const displayName = title.label
     const key = runIdentity(projectId, run.run_id)
     const enrichment = enrichmentRef.current.get(key)
     const currentEnrichment = enrichment
@@ -450,55 +492,39 @@ export function GlobalRunOverview({ projects, onOpen, registryLoading = false, r
       : null
     const progressRun = currentEnrichment ? { ...run, progress: currentEnrichment.progress } : run
     const progressState: RunProgressLoadState = currentEnrichment?.state ?? (run.progress ? 'ready' : 'loading')
-    const progressLabel = progressState === 'ready'
-      ? progressRun.progress ? checkpointApprovalText(progressRun.progress) : 'Checkpoint progress unavailable'
-      : currentEnrichment?.message
-        || (progressState === 'loading' ? 'Loading checkpoint progress…' : 'Checkpoint progress unavailable')
     return <li key={JSON.stringify([projectId, run.run_id])}>
-      <button
-        className="card global-run-row"
-        data-enrichment-state={progressState === 'ready' ? 'settled' : progressState}
-        aria-label={`${projectLabel} · ${status} · ${displayName} · ${progressLabel} · ${runDurationText(run)} · ${runActivityText(run)} · ${run.run_id}`}
-        onClick={() => onOpen(projectId, run.run_id)}
-      >
-        <span className="global-run-row-heading">
-          <strong className="global-run-row-title" title={displayName}>{displayName}</strong>
-          {title.date && <span className="run-title-date">{title.date}</span>}
-          <span className="global-run-row-project">{projectLabel}</span>
-          <span className="status-pill">{status}</span>
-          {run.history_state === 'archived' && <span className="status-pill">Archived</span>}
-        </span>
-        <span className="global-run-row-meta text-sm text-dim">
-          <span>{runDurationText(run)}</span>
-          <span>{runActivityText(run)}</span>
-        </span>
-        <RunProgress run={progressRun} loadState={progressState} loadMessage={currentEnrichment?.message} />
-      </button>
+      <RunListItem
+        run={progressRun}
+        stableKey={key}
+        projectLabel={projectLabel}
+        rowClassName="global-run-row"
+        dataEnrichmentState={progressState === 'ready' ? 'settled' : progressState}
+        loadState={progressState}
+        loadMessage={currentEnrichment?.message}
+        onSelect={() => onOpen(projectId, run.run_id)}
+      />
     </li>
   }
 
   const hosted = useHeaderSlots('global-run-overview', {
     context: <h2 className="header-context-title">All runs</h2>,
     local: <label className="header-filter-select"><span>Run history</span><select aria-label="Run history" value={history} onChange={event => changeHistory(event.target.value as typeof history)}><option value="visible">Visible</option><option value="archived">Archived</option><option value="all">All history</option></select></label>,
-    primary: <button className="btn btn-secondary btn-sm" onClick={() => setNonce(n => n + 1)}>Refresh</button>,
+    primary: <button className="btn btn-secondary btn-sm" onClick={requestRefresh}>Refresh</button>,
   })
   return <div className="workspace-content">
-    {!hosted && <div className="section-heading"><h2>All runs</h2><button className="btn btn-secondary" onClick={() => setNonce(n => n + 1)}>Refresh</button></div>}
+    {!hosted && <div className="section-heading"><h2>All runs</h2><button className="btn btn-secondary" onClick={requestRefresh}>Refresh</button></div>}
     {!hosted && <label>Run history<select className="input" aria-label="Run history" value={history} onChange={event => changeHistory(event.target.value as typeof history)}><option value="visible">Visible</option><option value="archived">Archived</option><option value="all">All history</option></select></label>}
     <label className="run-search-field">Search loaded runs<input className="input" type="search" aria-label="Search loaded runs" placeholder="Plan, project, status, or run ID" value={search} onChange={event => setSearch(event.target.value)} /></label>
-    <div className="global-run-results" aria-busy={resultsPending}>
-      {resultsPending && <p role="status" className="global-run-loading"><span className="spinner global-run-loading-spinner" aria-hidden="true" /><span>{currentLoad?.mode === 'refresh' ? 'Refreshing runs…' : 'Loading runs…'} Results are incomplete.</span></p>}
+    <div className="global-run-results" aria-busy={resultsPending && !backgroundRefresh}>
+      {resultsPending && !backgroundRefresh && <p role="status" className="global-run-loading"><span className="spinner global-run-loading-spinner" aria-hidden="true" /><span>{currentLoad?.mode === 'refresh' ? 'Refreshing runs…' : 'Loading runs…'} Results are incomplete.</span></p>}
       {failedProjectIds.length > 0 && <p role="alert" className="notice">{rows.length > 0 ? 'Partial or stale results' : 'Run results unavailable'} for: {failedProjectIds.join(', ')}. {rows.length > 0 ? 'Last available runs are retained.' : 'Use Refresh to try again.'}</p>}
       {registryError && <p role="alert">Project list unavailable: {registryError}. Open Projects to retry.</p>}
       {coverageComplete && !registryError && !projects.length && <p>No registered projects. Add a project in Projects to start.</p>}
       {coverageComplete && !registryError && !rows.length && projects.length > 0 && <p>No runs yet.</p>}
       {rows.length > 0 && filteredRows.length === 0 && search.trim() && <p className="text-sm text-dim">No loaded runs match “{search.trim()}”.</p>}
-      {showGroups && groups.map(group => <section key={group.key}>
+      {showGroups && visibleGroups.map(group => <section key={group.key}>
         <h3>{group.label}</h3>
-        {group.rows.length === 0 && <p className="text-sm text-dim">{incompleteCoverage
-          ? group.key === 'ongoing' ? 'No loaded ongoing runs yet.' : group.key === 'attention' ? 'No loaded runs need attention yet.' : 'No loaded recent runs yet.'
-          : group.key === 'ongoing' ? 'No ongoing runs.' : group.key === 'attention' ? 'No runs need attention.' : 'No recent runs.'}</p>}
-        {group.rows.length > 0 && <ul className="compact-list">{group.rows.map(renderRunRow)}</ul>}
+        <ul className="compact-list">{group.rows.map(renderRunRow)}</ul>
         {group.key === 'attention' && remainingAttention > 0 && <button type="button" className="btn btn-secondary" onClick={() => setAttentionVisible(count => count + 10)}>Show more ({remainingAttention} remaining)</button>}
       </section>)}
     </div>

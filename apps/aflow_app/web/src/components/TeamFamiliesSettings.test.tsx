@@ -241,7 +241,7 @@ describe('TeamFamiliesSettings', () => {
     expect(within(navigation).getByRole('button', { name: 'Product', exact: true })).toBeTruthy()
     expect(within(navigation).getByRole('button', { name: 'Legacy base', exact: true })).toBeTruthy()
     expect(within(navigation).getByRole('button', { name: 'Orphan', exact: true })).toBeTruthy()
-    expect(within(navigation).getAllByText('1 changed role')).toHaveLength(2)
+    expect(within(navigation).getAllByText(/ · 1 changed role$/)).toHaveLength(2)
 
     fireEvent.click(screen.getByRole('button', { name: 'Fast variant', exact: true }))
     expect(screen.getByText('Stored overrides')).toBeTruthy()
@@ -281,11 +281,26 @@ describe('TeamFamiliesSettings', () => {
     const onChange = vi.fn()
     renderEditor(familyDraft(), { selectedTeam: 'base', onChange })
     fireEvent.click(screen.getByRole('button', { name: 'Fast variant', exact: true }))
-    const override = screen.getByText(/Stored override · declared by Fast variant \(fast\)/).closest('.team-family-role-row') as HTMLElement
+    const override = screen.getByText('Local override').closest('.team-family-role-row') as HTMLElement
     fireEvent.click(within(override).getByRole('button', { name: 'Restore inheritance' }))
     const next = onChange.mock.lastCall?.[0] as GuidedFormProjection
     expect(next.teams.fast.roles).toEqual({})
     expect(next.teams.fast.effective_roles).toEqual(familyDraft().teams.fast.effective_roles)
+  })
+
+  it('shows the effective global profile for an undeclared legacy role and allows a local override', () => {
+    const draft = legacyDraft()
+    draft.teams.legacy_base.role_sources = { reviewer: 'global' }
+    const onChange = vi.fn()
+    renderEditor(draft, { selectedTeam: 'legacy_base', onChange })
+    const reviewer = screen.getByRole('combobox', { name: 'Reviewer', exact: true }) as HTMLInputElement
+    expect(reviewer.value).toContain('codex.reviewer')
+    const row = reviewer.closest('.team-family-role-row') as HTMLElement
+    expect(within(row).queryByRole('button', { name: 'Restore inheritance' })).toBeNull()
+    fireEvent.focus(reviewer)
+    fireEvent.change(reviewer, { target: { value: 'codex.deep' } })
+    fireEvent.keyDown(reviewer, { key: 'Enter' })
+    expect(onChange.mock.lastCall?.[0].teams.legacy_base.roles.reviewer).toBe('codex.deep')
   })
 
   it('keeps spaces while family and stage labels are being typed, then normalizes on blur', () => {
@@ -321,7 +336,7 @@ describe('TeamFamiliesSettings', () => {
     expect(screen.queryByRole('button', { name: 'Move stage earlier' })).toBeNull()
     expect(screen.queryByRole('button', { name: 'Move stage later' })).toBeNull()
     expect(screen.queryByRole('button', { name: 'Remove stage…' })).toBeNull()
-    expect(screen.getAllByText('complex_first')).toHaveLength(2)
+    expect(screen.getAllByTitle('complex_first')).toHaveLength(2)
     expect(screen.getByLabelText('Upgrade to for team Complex base')).toBeTruthy()
   })
 

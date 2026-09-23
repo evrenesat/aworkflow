@@ -1,5 +1,78 @@
 # DEVLOG
 
+## 2026-09-23 — Verify populated calm-workspace fidelity
+
+- Tightened the desktop workspace content boundary while retaining the mobile
+  document-flow layout. Populated production captures now assert the ordered
+  title/current/latest/recent/disclosure anchors, 56–72px run rows, the
+  390×844 Latest result start, and no canonical-fixture legacy warning.
+- Selecting a run closes a stale hover/touch preview before detail hit-testing;
+  a live stop-review action remains visible but disabled while capabilities are
+  pending, then follows the authoritative capability response.
+- Chromium and WebKit each passed the final 18-capture running/paused/completed
+  light/dark fixture matrix. Full web, build, server, responsive, run-progress,
+  and fidelity gates are recorded in
+  `docs/ui-reference/calm-workspace/verification.md` against the frozen demo
+  checksum `2465c0ac2bfef90af2b98a537ad5ac3e931b927c23a78379a8c532ce4dcbadf4`.
+
+## 2026-09-23 — Settings effective-value hierarchy
+
+- Settings now leads with populated effective profiles, role assignments,
+  workflow defaults, and existing content editors. Creation, inheritance,
+  conversion, password, installation, and raw configuration controls remain
+  available behind labelled native disclosures.
+- Team family rows retain stable IDs and inherited-role provenance while the
+  existing GlobalSettings draft/save/conflict/Undo coordinator and retained
+  Skills editor remain the only state owners across tabs.
+- Settings unit tests, the full web suite/build, responsive Settings/team
+  journeys, and Chromium/WebKit light/dark desktop/mobile captures passed
+  against the frozen reference checksum.
+
+## 2026-09-22 — Add compact run navigation and anchored previews
+
+- Mapped the approved calm-workspace shell tokens into light/dark themes while
+  retaining the two-row desktop header, mobile list/detail navigation and 44px
+  touch targets.
+- Added the shared `RunListItem` for project and All runs lists. Stable exact
+  run identities, concise status/checkpoint facts and richer anchored previews
+  now share one selection/Back-preserving implementation; row progress stays
+  compact while detailed evidence remains available in the preview and run
+  detail.
+- Extended the disposable fidelity smoke with row height, sibling geometry,
+  hover/focus/touch-toggle/Escape checks and six light/dark captures. The final
+  Chromium run passed with no page errors or legacy-manifest warnings.
+
+## 2026-09-22 — Repair calm-workspace fidelity capture evidence
+
+- Bound every disposable running, paused and completed fixture to its canonical
+  launch manifest and launch phase, and added real bounded turn activity so the
+  authenticated capture exercises control-plane identity and recent activity.
+- Replaced the broad progress wrapper with distinct latest-result, recent-
+  activity and disclosure anchors; desktop/mobile light/dark captures now
+  require visible ordered anchors and reject legacy ownership warnings.
+- Chromium and WebKit focused captures passed with six production manifests;
+  the remaining dense pre-redesign shell is intentionally left for the original
+  full-app fidelity checkpoints.
+
+## 2026-09-22 — Freeze calm-workspace fidelity reference
+
+- Added the byte-checked owner demo, local ownership rules, capture matrix,
+  anchor contract, intentional-difference manifest, and deterministic running,
+  paused, and completed disposable run fixtures.
+- Added a real-browser harness that renders the literal reference fragment and
+  captures the authenticated built app at the approved desktop/mobile widths
+  and light/dark themes. Screenshots and capture manifests remain disposable
+  pytest artifacts; later checkpoints will add production fidelity assertions.
+- Preserved the approved September 22 UI expectations in `UI_GUIDELINES.md`.
+
+## 2026-09-20 — Reset the same-step cap on plan progress
+
+- Fixed cumulative workflows consuming the same-step safety budget while they
+  were advancing checkpoint state. The guard now resets on verified forward
+  plan-snapshot movement and still terminates genuinely stalled same-node loops;
+  regression coverage exercises both productive traversal and post-progress
+  stalling. Refs evrenesat/aworkflow#44.
+
 ## 2026-09-14 — Repair assistant documentation CI coverage
 
 - Updated the installed-use documentation check to the assistant's current
