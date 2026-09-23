@@ -1016,7 +1016,7 @@ def project_capabilities(
 def control_plane_plans(
     project_id: str,
     limit: int = Query(default=100, ge=1, le=1_000),
-    cursor: str | None = Query(default=None, max_length=64),
+    cursor: str | None = Query(default=None, max_length=512),
     _: str = Depends(verify_token),
     service: ControlPlaneService = Depends(get_control_plane_service),
 ) -> PlanListResponse:

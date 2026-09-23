@@ -39,6 +39,28 @@
   `/tmp/aflow-fidelity-readiness.QrvZPp` and verified the expected y=219
   warning evidence and redaction. Coordinator CI remains required.
 
+## 2026-09-23 — Complete project plan pagination (Checkpoint 1)
+
+- The control-plane plans route now accepts path cursors up to 512 characters;
+  run-list cursors remain 64. The web client requests `limit=100`, follows each
+  page's exact final path with `URLSearchParams`, preserves server order, requests
+  the terminating empty page for exact multiples, and reports repeated
+  cursor/path or missing-cursor responses as actionable incomplete loads. Failed
+  page/auth/transport responses remain errors, while dashboard refresh preserves
+  the prior plans and selected identity.
+- API coverage exercised 1,101 records in 12 requests, 200 records in three
+  requests including the empty third page, an empty first page, encoded
+  Unicode/punctuation, repeated cursor/path, and later-page failure/retry.
+  Control-plane tests passed 62/62, including the long-path, 512/513, run-bound,
+  authentication, and project-containment cases.
+- A disposable fixture seeded 120 completed plans before a Ready plan. The
+  built app/server selected the exact path, completed read-only preflight, and
+  opened review with zero starts at 1280×720 and 390×844 in Chromium and WebKit
+  (2/2 in each engine). Focused web tests passed 164/164, the full web suite
+  passed 577/577, and build/lint passed. Publication, CI, activation, and the
+  real live picker remain coordinator-owned; this entry makes no deployment
+  claim.
+
 ## 2026-09-23 — Retain Teams geometry failure artifacts in CI
 
 - Teams geometry failures now select `AFLOW_BROWSER_ARTIFACT_DIR` when CI

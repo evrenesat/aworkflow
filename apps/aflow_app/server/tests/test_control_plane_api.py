@@ -1633,6 +1633,36 @@ def test_control_plane_reads_pending_start_and_idempotency(control_client) -> No
     assert conflict.json() == {"detail": {"code": "idempotency_conflict"}}
 
 
+def test_plan_cursor_bound_is_512_without_widening_run_cursors_or_access(
+    control_client,
+) -> None:
+    client, root, _, _ = control_client
+    long_name = f"{'x' * 72}.md"
+    long_path = root / "plans" / "todo" / long_name
+    long_path.write_text("# Long cursor\n", encoding="utf-8")
+    plan_url = f"/api/control-plane/projects/{PROJECT_ID}/plans"
+
+    existing_cursor = client.get(plan_url, params={"cursor": f"plans/todo/{long_name}"})
+    assert existing_cursor.status_code == 200, existing_cursor.text
+    assert isinstance(existing_cursor.json()["plans"], list)
+    assert all(item["path"] > f"plans/todo/{long_name}" for item in existing_cursor.json()["plans"])
+
+    accepted_boundary = client.get(plan_url, params={"cursor": "c" * 512})
+    assert accepted_boundary.status_code == 200, accepted_boundary.text
+    rejected_boundary = client.get(plan_url, params={"cursor": "c" * 513})
+    assert rejected_boundary.status_code == 422
+    rejected_run_cursor = client.get(
+        f"/api/control-plane/projects/{PROJECT_ID}/runs",
+        params={"cursor": "r" * 65},
+    )
+    assert rejected_run_cursor.status_code == 422
+    rejected_limit = client.get(plan_url, params={"limit": 1_001})
+    assert rejected_limit.status_code == 422
+
+    assert client.get(plan_url, headers={"Authorization": "Bearer wrong-token"}).status_code == 401
+    assert client.get("/api/control-plane/projects/not-allowed/plans").status_code == 404
+
+
 def test_control_events_context_controls_owner_stop_and_resume(control_client) -> None:
     client, root, units, monkeypatch = control_client
     pending = _start_pending(client, monkeypatch)
