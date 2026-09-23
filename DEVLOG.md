@@ -1,5 +1,21 @@
 # DEVLOG
 
+## 2026-09-23 — Prioritize Teams assignments in the selected editor (Checkpoint 1)
+
+- Teams now presents effective Worker and Reviewer assignments first for legacy,
+  family, standalone, and inherited stages. Secondary roles, prompts, routing,
+  identity, conversion, and declared TOML remain reachable in closed Advanced
+  details; inherited primary values stay nonmutating until Override is chosen.
+- Compact Settings headers retain accessible section labels and Save all changes
+  semantics while showing shorter labels at compact widths/heights. Existing
+  reload, draft, route, prompt, conversion, and exact save ownership remain
+  intact; the reload browser selector was updated for the new disclosure nesting.
+- Validation: focused web tests passed 148/148, the full web suite passed 610/610,
+  the production build passed, and the selected-editor plus Settings reload
+  browser gate passed 12/12 in Chromium and 12/12 in WebKit. Screenshots for
+  the initial legacy editor were inspected at 390x844 and 1280x720 in light
+  theme; publication, CI, and live activation remain coordinator-owned.
+
 ## 2026-09-23 — Reorder deployed Runs detail around current work (Checkpoint 1)
 
 - The Runs detail overview now leads with the readable run identity, truthful

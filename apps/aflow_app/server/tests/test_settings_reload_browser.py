@@ -94,10 +94,14 @@ def test_settings_reload_preserves_visible_editors(control_client, monkeypatch, 
             beta.wait_for(state="visible")
             beta.click()
             assert beta.get_attribute("aria-pressed") == "true"
-            identity = page.locator(
-                '[data-settings-tab="Teams"] details.team-family-disclosure'
+            advanced = page.locator(
+                '[data-settings-tab="Teams"] details.team-family-advanced-details'
+            )
+            advanced.locator(":scope > summary").click()
+            identity = advanced.locator(
+                ".team-family-advanced-content > details"
             ).filter(has_text="Name and identity")
-            identity.locator("summary").click()
+            identity.locator(":scope > summary").click()
             assert identity.get_attribute("open") is not None
 
             page.evaluate(
@@ -297,6 +301,12 @@ def test_skill_reload_preserves_draft_revision_and_conflict(control_client, monk
             while not state["held"] and time.monotonic() < deadline:
                 page.wait_for_timeout(25)
             assert state["held"], "the skill detail refresh was not held"
+            page.wait_for_function(
+                """() => {
+                    const panel = document.querySelector('#settings-domain-panel');
+                    return panel instanceof HTMLFieldSetElement && !panel.disabled;
+                }"""
+            )
             assert area.is_visible() and area.is_enabled()
             area.fill(edited_content)
             for route in state["held"]:

@@ -1733,6 +1733,10 @@ input::placeholder, textarea::placeholder {
   white-space: nowrap;
 }
 
+.settings-save-label-compact {
+  display: none;
+}
+
 .project-server-context {
   overflow-wrap: anywhere;
 }
@@ -2730,6 +2734,18 @@ input::placeholder, textarea::placeholder {
 .team-family-section-heading p { margin-block: 0; overflow-wrap: anywhere; }
 .team-family-role-list,
 .team-family-prompt-list { display: flex; flex-direction: column; gap: var(--spacing-sm); min-width: 0; }
+.team-family-primary-role-list { gap: var(--spacing-sm); }
+.team-family-primary-role .combobox > label {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  margin: -1px;
+  overflow: hidden;
+  clip: rect(0, 0, 0, 0);
+  white-space: nowrap;
+  border: 0;
+}
 .team-family-role-row { display: grid; grid-template-columns: minmax(10rem, 0.8fr) minmax(0, 1.2fr) minmax(0, 1fr); align-items: center; gap: var(--spacing-sm) var(--spacing-md); padding: var(--spacing-sm) var(--spacing-md); border: 1px solid var(--color-border); border-radius: var(--radius-md); min-width: 0; }
 .team-family-inherited-row { grid-template-columns: minmax(10rem, 0.8fr) minmax(0, 1.2fr) max-content; }
 .team-family-role-heading { display: flex; flex-direction: column; gap: 2px; min-width: 0; overflow-wrap: anywhere; }
@@ -2737,8 +2753,10 @@ input::placeholder, textarea::placeholder {
 .team-family-role-actions > * { min-width: 0; overflow-wrap: anywhere; }
 .team-family-role-actions .btn { white-space: normal; overflow-wrap: anywhere; text-align: left; }
 .team-family-effective-value { overflow-wrap: anywhere; }
-.team-family-disclosure { border-top: 1px solid var(--color-border); min-width: 0; }
-.team-family-disclosure > summary { display: flex; align-items: center; min-height: var(--tap-target); cursor: pointer; font-weight: 600; overflow-wrap: anywhere; }
+.team-family-disclosure,
+.team-family-advanced-details { border-top: 1px solid var(--color-border); min-width: 0; }
+.team-family-disclosure > summary,
+.team-family-advanced-details > summary { display: flex; align-items: center; min-height: var(--tap-target); cursor: pointer; font-weight: 600; overflow-wrap: anywhere; }
 .team-family-prompt-row { display: grid; grid-template-columns: minmax(10rem, 0.65fr) minmax(0, 1.5fr) minmax(0, 1fr); align-items: start; gap: var(--spacing-sm) var(--spacing-md); padding: var(--spacing-sm) var(--spacing-md); border: 1px solid var(--color-border); border-radius: var(--radius-md); min-width: 0; }
 .team-family-prompt-row > div:first-child { display: flex; flex-direction: column; gap: 2px; min-width: 0; overflow-wrap: anywhere; }
 .team-family-prompt-preview { margin: 0; white-space: pre-wrap; overflow-wrap: anywhere; color: var(--color-text-dim); }
@@ -2756,14 +2774,29 @@ input::placeholder, textarea::placeholder {
 .team-family-declared-toml > summary { display: flex; align-items: center; min-height: var(--tap-target); cursor: pointer; font-weight: 600; overflow-wrap: anywhere; }
 .team-family-declared-toml p { margin-block: 0 var(--spacing-sm); overflow-wrap: anywhere; }
 .team-family-declared-toml pre { margin: 0; padding: var(--spacing-md); background: var(--color-surface); border: 1px solid var(--color-border); border-radius: var(--radius-md); white-space: pre-wrap; overflow-wrap: anywhere; overflow-x: auto; }
+.team-family-advanced-details { margin-top: var(--spacing-sm); }
+.team-family-advanced-content { display: flex; flex-direction: column; gap: var(--spacing-sm); min-width: 0; padding-top: var(--spacing-sm); }
+.team-family-advanced-content > .team-family-disclosure,
+.team-family-advanced-content > .team-family-declared-toml { margin: 0; }
 
 @media (max-width: 640px) {
+  .header-section-label { position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px; overflow: hidden; clip: rect(0, 0, 0, 0); white-space: nowrap; border: 0; }
+  .settings-save-label-full { display: none; }
+  .settings-save-label-compact { display: inline; }
+  .header-section-select select { width: clamp(7.5rem, 34vw, 12rem); }
   .team-family-detail-heading-content,
   .team-family-conversion { flex-direction: column; }
   .team-family-summary-route { text-align: left; }
   .team-family-role-row,
   .team-family-inherited-row,
   .team-family-prompt-row { grid-template-columns: minmax(0, 1fr); }
+}
+
+@media (max-height: 599px) {
+  .header-section-label { position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px; overflow: hidden; clip: rect(0, 0, 0, 0); white-space: nowrap; border: 0; }
+  .settings-save-label-full { display: none; }
+  .settings-save-label-compact { display: inline; }
+  .header-section-select select { width: clamp(7.5rem, 34vw, 12rem); }
 }
 
 /* Family creation stays in the same detail surface and document flow as the

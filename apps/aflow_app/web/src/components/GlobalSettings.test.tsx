@@ -287,6 +287,24 @@ describe('GlobalSettings', () => {
       headerMedia.restore()
     }
   })
+  it('keeps the compact Settings header concise without losing accessible labels', async () => {
+    const headerMedia = installSettingsHeaderMedia(true)
+    const view = renderHostedGlobalSettings()
+    try {
+      await screen.findByLabelText('Effort codex.worker')
+      await waitFor(() => expect(screen.getByRole('button', { name: 'Save all changes', exact: true })).toBeTruthy())
+      const sectionLabel = view.container.querySelector('.header-section-label')
+      expect(sectionLabel?.getAttribute('aria-hidden')).toBe('true')
+      expect(screen.getByRole('combobox', { name: 'Settings section', exact: true })).toBeTruthy()
+      const save = screen.getByRole('button', { name: 'Save all changes', exact: true })
+      expect(save.getAttribute('aria-label')).toBe('Save all changes')
+      expect(save.querySelector('.settings-save-label-full')).toBeTruthy()
+      expect(save.querySelector('.settings-save-label-compact')).toBeTruthy()
+    } finally {
+      view.unmount()
+      headerMedia.restore()
+    }
+  })
   it('announces fallback preview pending state without an in-flow layout notice', async () => {
     const pending = deferred<ProjectConfigFormResponse>()
     vi.mocked(api.postGlobalConfigForm).mockImplementation(async request => request.action ? pending.promise : familyResponse)
