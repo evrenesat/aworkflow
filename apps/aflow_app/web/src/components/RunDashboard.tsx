@@ -3400,7 +3400,7 @@ export function RunDashboard({ visible = true, page, onNewRun, onCancelNewRun, o
                     {(canRestart || selectedRunHasLiveControls) && <MoreMenu label="Run actions" triggerLabel="Actions" triggerContent="Actions" className="run-actions-menu">
                       {canRestart && <MenuItem disabled={!canMutate || busyAction !== null} onClick={openRestart}>Configure restart…</MenuItem>}
                       {selectedRunHasLiveControls && <MenuItem disabled={!canMutate || busyAction !== null} onClick={() => { setStopReviewOpen(false); setConfirmOwnerStop(false); setAdjustRunOpen(true) }}>Adjust run settings…</MenuItem>}
-                      {hasSafeControl('owner_stop') && selectedRunHasLiveControls && <MenuItem disabled={!canMutate || busyAction !== null} onClick={() => { setAdjustRunOpen(false); setStopReviewOpen(true); setConfirmOwnerStop(false) }}>Review stop options…</MenuItem>}
+                      {selectedRunHasLiveControls && (hasSafeControl('owner_stop') || capabilities === null) && <MenuItem disabled={!canMutate || busyAction !== null || !hasSafeControl('owner_stop')} onClick={() => { setAdjustRunOpen(false); setStopReviewOpen(true); setConfirmOwnerStop(false) }}>Review stop options…</MenuItem>}
                     </MoreMenu>}
                     <MoreMenu label="More run actions">
                       {selectedRun.history_state !== 'archived' && <MenuItem disabled={busyAction === 'history' || historyConfirm !== null} onClick={() => { if (selectedRun.activity === 'active') { setHistoryConfirm('archive'); setAcknowledgeActive(false) } else void mutateHistory('archive') }}>Archive</MenuItem>}

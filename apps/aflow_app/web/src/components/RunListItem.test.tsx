@@ -39,6 +39,7 @@ describe('RunListItem', () => {
 
     fireEvent.click(selection)
     expect(onSelect).toHaveBeenCalledTimes(1)
+    expect(previewToggle.getAttribute('aria-expanded')).toBe('false')
   })
 
   it('opens after a pointer hover delay and closes after leaving without moving siblings', () => {

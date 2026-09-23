@@ -101,6 +101,18 @@ The same module runs in Chromium by default and WebKit when
 the generated screenshot artifacts. These emulated checks do not stand in for
 physical mobile keyboard or browser-toolbar verification.
 
+Checkpoint 10 extends that boundary with populated calm-workspace fidelity
+captures in `test_ui_demo_fidelity_browser.py`. The acceptance contract keeps
+representative desktop content within y=128, keeps the title/current/latest
+hierarchy above the fold, targets 56–72px run rows, and exposes the beginning
+of Latest result at 390×844. The harness records ordered semantic anchors,
+light/dark screenshots, and the complete responsive matrix rather than relying
+on a single pixel diff. Selecting a run closes any stale hover/touch preview so
+the detail's final action remains reachable; while live capabilities are still
+loading, review-stop remains visible but disabled and cannot mutate state.
+Disposable captures and the frozen-reference comparison are recorded in
+`docs/ui-reference/calm-workspace/verification.md`.
+
 ## Observer progress boundary
 
 `control_plane/run_progress.py` adds a bounded, read-only projection to the

@@ -92,6 +92,24 @@ def _assert_production_capture(page, capture: dict[str, object]) -> None:
         [*PRODUCTION_ANCHORS.values(), PRODUCTION_PROGRESS_SURFACE],
     ) is True
 
+    content = page.locator(
+        ".workspace-main > .dashboard-host:visible, .workspace-main > .workspace-content:visible"
+    ).first
+    content_box = content.bounding_box()
+    assert content_box is not None
+    title_box = anchors["title"]["box"]
+    latest_box = anchors["latest_result"]["box"]
+    if capture["width"] >= 960 and capture["height"] >= 600:
+        assert content_box["y"] <= 128, {"content": content_box, "capture": capture}
+        assert title_box["y"] + title_box["height"] <= capture["height"], title_box
+        assert current_box["y"] + current_box["height"] <= capture["height"], current_box
+        assert latest_box["y"] + latest_box["height"] <= capture["height"], latest_box
+    elif capture["width"] == 390 and capture["height"] == 844:
+        assert latest_box["y"] < capture["height"], {
+            "latest_result": latest_box,
+            "viewport": {"width": capture["width"], "height": capture["height"]},
+        }
+
 
 def _visible_run_row_boxes(page) -> list[dict[str, float]]:
     return page.evaluate(

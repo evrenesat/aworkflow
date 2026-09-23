@@ -205,6 +205,14 @@ export function RunListItem({
     setPreviewOpen(true)
   }
 
+  function handleSelect(): void {
+    // A hover/touch preview belongs to the list surface. Once the exact run
+    // is selected, close it before the detail surface can receive focus or
+    // hit-testing; a stale fixed preview must never cover detail actions.
+    closePreview()
+    onSelect()
+  }
+
   return <div
     ref={rowRef}
     className={`run-list-item ${rowClassName} ${selected ? 'selected' : ''}`.trim()}
@@ -223,7 +231,7 @@ export function RunListItem({
       className="content-button run-list-select"
       aria-current={selected ? 'true' : undefined}
       aria-label={accessibleName}
-      onClick={onSelect}
+      onClick={handleSelect}
     >
       <span className="run-list-context">
         <strong className="run-list-title" title={plan.label}>{plan.label}</strong>

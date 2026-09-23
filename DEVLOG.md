@@ -1,5 +1,20 @@
 # DEVLOG
 
+## 2026-09-23 — Verify populated calm-workspace fidelity
+
+- Tightened the desktop workspace content boundary while retaining the mobile
+  document-flow layout. Populated production captures now assert the ordered
+  title/current/latest/recent/disclosure anchors, 56–72px run rows, the
+  390×844 Latest result start, and no canonical-fixture legacy warning.
+- Selecting a run closes a stale hover/touch preview before detail hit-testing;
+  a live stop-review action remains visible but disabled while capabilities are
+  pending, then follows the authoritative capability response.
+- Chromium and WebKit each passed the final 18-capture running/paused/completed
+  light/dark fixture matrix. Full web, build, server, responsive, run-progress,
+  and fidelity gates are recorded in
+  `docs/ui-reference/calm-workspace/verification.md` against the frozen demo
+  checksum `2465c0ac2bfef90af2b98a537ad5ac3e931b927c23a78379a8c532ce4dcbadf4`.
+
 ## 2026-09-23 — Settings effective-value hierarchy
 
 - Settings now leads with populated effective profiles, role assignments,

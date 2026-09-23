@@ -58,6 +58,16 @@ or an appropriate skill. Internal assistant memory is not the primary record.
 Keep this existing document as the project source of truth; discover it from
 `AGENTS.md` and `ARCHITECTURE.md` rather than adding root-level summary files.
 
+The CP10 local evidence pass records the populated light/dark desktop and
+mobile comparison, ordered semantic anchors, compact row measurements, and
+responsive interaction checks in
+`docs/ui-reference/calm-workspace/verification.md`. It also records the
+intentional difference that real production run detail includes richer
+progress, checkpoint, delivery, and technical evidence below the compact
+overview shown by the frozen representative demo. This evidence supplements
+these acceptance rules; it does not waive them or establish deployed/live
+verification.
+
 ## Spend space on the task
 
 - On desktop, fit persistent app navigation, page context, section navigation,

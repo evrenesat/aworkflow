@@ -572,7 +572,8 @@ def test_new_draft_plan_template_smoke(control_client, monkeypatch):
             # Skeleton placeholders do not block promotion: no new validator.
             open_settings_more(page)
             page.get_by_role('menuitem', name='Move to Ready', exact=True).click()
-            page.locator('.header-context-title').filter(has_text='Ready').wait_for()
+            page.locator('.header-context-title').filter(has_text='draft-smoke.md').wait_for()
+            page.locator('.plan-header-context .status-pill').filter(has_text='Ready').wait_for()
             assert (root / 'plans' / 'in-progress' / 'draft-smoke.md').read_text() == long_content
         finally:
             browser.close()
