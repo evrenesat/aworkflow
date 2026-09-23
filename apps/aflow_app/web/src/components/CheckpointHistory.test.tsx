@@ -160,10 +160,10 @@ describe('CheckpointHistory', () => {
   it('shows the worker, rejection, repair and upgrade evidence without inventing delivery', () => {
     render(<CheckpointHistory projectId="project-current" run={run} progress={summary()} detail={detail()} />)
 
+    openDisclosure('Count definitions & evidence')
     expect(screen.getByText('1 of 3 checkpoints approved')).toBeDefined()
     expect(screen.getAllByText(/CP2 of 3 · Reviewing/).length).toBeGreaterThan(0)
     expect(screen.getAllByText(/codex.reviewer/).length).toBeGreaterThan(0)
-    openDisclosure('Details')
     expect(screen.getByText('Current attempt')).toBeDefined()
 
     fireEvent.click(screen.getByRole('button', { name: /Checkpoint 2: Repair/ }))
@@ -216,7 +216,7 @@ describe('CheckpointHistory', () => {
     expect((document.querySelector('details.checkpoint-history-checkpoints') as HTMLDetailsElement).hasAttribute('open')).toBe(true)
 
     fireEvent.click(screen.getByRole('button', { name: 'Expand all' }))
-    expect((screen.getByText('Details', { selector: 'summary' }).closest('details') as HTMLDetailsElement).hasAttribute('open')).toBe(true)
+    expect((screen.getByText('Count definitions & evidence', { selector: 'summary' }).closest('details') as HTMLDetailsElement).hasAttribute('open')).toBe(true)
     expect((document.querySelector('.checkpoint-history-event-disclosure') as HTMLDetailsElement).hasAttribute('open')).toBe(true)
     fireEvent.click(screen.getByRole('button', { name: 'Collapse all' }))
     expect((document.querySelector('details.checkpoint-history-checkpoints') as HTMLDetailsElement).hasAttribute('open')).toBe(false)
@@ -580,15 +580,8 @@ describe('CheckpointHistory', () => {
     })
     render(<CheckpointHistory projectId="project-current" run={run} progress={delivered} detail={delivered} />)
 
-    const summaryLine = document.querySelector('.checkpoint-history-delivery-summary') as HTMLElement
-    expect(summaryLine.textContent).toContain('Final review: Succeeded')
-    expect(summaryLine.textContent).toContain('Merge: Succeeded')
-    expect(summaryLine.textContent).toContain('Publication: Unknown')
-    expect(summaryLine.textContent).toContain('CI: Failed')
-    expect(summaryLine.textContent).toContain('Live: Not applicable')
-    expect(summaryLine.textContent).toContain('View detailed receipts')
-
-    fireEvent.click(screen.getByRole('link', { name: 'View detailed receipts' }))
+    expect(document.querySelector('.checkpoint-history-delivery-summary')).toBeNull()
+    openDisclosure('Delivery evidence')
     expect(document.getElementById('checkpoint-history-delivery-evidence')?.hasAttribute('open')).toBe(true)
     expect(screen.getByText('CI receipt failed.')).toBeDefined()
     expect(screen.getByText(/ci\/receipt\.json/)).toBeDefined()

@@ -463,6 +463,13 @@ input::placeholder, textarea::placeholder {
   min-height: 1.5rem;
 }
 
+.run-overview-header-duration {
+  display: block;
+  margin-top: var(--spacing-xs);
+  color: var(--color-text-dim);
+  font-size: 0.8rem;
+}
+
 .run-overview-inline-facts {
   display: flex;
   flex-wrap: wrap;
@@ -512,6 +519,27 @@ input::placeholder, textarea::placeholder {
   color: var(--color-primary);
   cursor: pointer;
   font-size: 0.8rem;
+}
+
+.run-overview-event-line {
+  display: flex;
+  align-items: baseline;
+  gap: var(--spacing-sm);
+  min-height: 1.25rem;
+  min-width: 0;
+  padding-block: var(--spacing-xs);
+}
+
+.run-overview-event-line .run-overview-event-summary,
+.run-overview-event > details > summary .run-overview-event-summary {
+  flex: 1 1 auto;
+}
+
+.run-overview-event-time {
+  flex: 0 0 auto;
+  color: var(--color-text-dim);
+  font-size: 0.75rem;
+  white-space: nowrap;
 }
 
 .run-overview-event-summary {
@@ -882,6 +910,21 @@ input::placeholder, textarea::placeholder {
   display: flex;
   flex-direction: column;
   gap: var(--spacing-sm);
+}
+
+.checkpoint-history-recorded-progress {
+  display: flex;
+  flex-direction: column;
+  gap: var(--spacing-xs);
+}
+
+.checkpoint-history-recorded-progress h6 {
+  margin: 0;
+}
+
+.checkpoint-history-recorded-progress p {
+  margin: 0;
+  overflow-wrap: anywhere;
 }
 
 .checkpoint-history-disclosure-controls {

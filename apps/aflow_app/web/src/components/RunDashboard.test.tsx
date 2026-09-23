@@ -371,6 +371,7 @@ async function waitForPreflightReady(
 }
 
 async function waitForControlAdmission(selectorLabel?: string) {
+  await openAdjustRun()
   await waitFor(() => {
     const team = screen.getByLabelText('Control team') as HTMLSelectElement
     expect(team.value).toBe('base')
@@ -385,13 +386,35 @@ function openTechnicalDetails() {
   fireEvent.click(screen.getByRole('button', { name: 'Diagnostics' }))
 }
 
+async function openRecordedProgress() {
+  fireEvent.click(await screen.findByText('Recorded progress', { selector: 'summary' }))
+}
+
+async function openCheckpointProgress() {
+  await waitFor(() => expect(api.getRunContext).toHaveBeenCalled())
+  fireEvent.click(await screen.findByText('Checkpoints', { selector: 'summary span' }))
+}
+
+async function openEvidenceDisclosure() {
+  fireEvent.click(await screen.findByText('Count definitions & evidence', { selector: 'summary' }))
+}
+
 function openAdvanced() {
   fireEvent.click(screen.getByRole('button', { name: 'Advanced options' }))
 }
 
 async function openRunActions() {
-  fireEvent.click(await screen.findByRole('button', { name: 'Actions', exact: true }))
+  const trigger = await screen.findByRole('button', { name: 'Actions', exact: true })
+  fireEvent.click(trigger)
   await screen.findByRole('menu', { name: 'Run actions' })
+}
+
+async function openAdjustRun() {
+  await openRunActions()
+  const item = await screen.findByRole('menuitem', { name: 'Adjust run settings…', exact: true })
+  await waitFor(() => expect((item as HTMLButtonElement).disabled).toBe(false))
+  fireEvent.click(item)
+  await screen.findByText('Adjust run', { selector: 'summary' })
 }
 
 async function openRestartConfiguration() {
@@ -536,11 +559,9 @@ describe('RunDashboard', () => {
         'run-owned',
         expect.objectContaining({ signal: expect.any(AbortSignal) }),
       )
-      const maxTurns = screen.getByLabelText('Control max turns') as HTMLInputElement
-      expect(maxTurns.disabled).toBe(false)
-      expect(maxTurns.value).toBe('8')
       expect(screen.getByRole('button', { name: 'run-owned' })).toBeDefined()
     })
+    await openAdjustRun()
 
     await act(async () => {
       initialRunDetail.resolve(ownedRun)
@@ -669,6 +690,7 @@ describe('RunDashboard', () => {
 
     await screen.findByRole('button', { name: 'run-owned' })
     openTechnicalDetails()
+    await openRecordedProgress()
     await waitFor(() => expect(screen.getByText(/aflow-run-run-owned\.service/)).toBeDefined())
     fireEvent.click(screen.getByRole('button', { name: 'Refresh' }))
 
@@ -814,6 +836,7 @@ describe('RunDashboard', () => {
 
     await screen.findByRole('button', { name: 'run-owned' })
     openTechnicalDetails()
+    await openRecordedProgress()
     await waitFor(() => expect(screen.getByText('successor of run-source')).toBeDefined())
     expect(screen.getByText('source of run-successor')).toBeDefined()
     expect(screen.getByText('implement · plan')).toBeDefined()
@@ -841,6 +864,7 @@ describe('RunDashboard', () => {
 
     renderDashboard()
 
+    await openRecordedProgress()
     expect(await screen.findByText('Checkpoint 4: Repair (4 of 14)')).toBeDefined()
     expect(screen.getByText('Repairing')).toBeDefined()
     expect(screen.getByText(/repair-overlay\.md/)).toBeDefined()
@@ -870,6 +894,8 @@ describe('RunDashboard', () => {
 
     renderDashboard()
 
+    await openCheckpointProgress()
+    await openEvidenceDisclosure()
     expect(await screen.findByRole('button', { name: /Checkpoint 5: Active/ })).toBeDefined()
     expect((await screen.findAllByText('4 of 11 checkpoints approved')).length).toBeGreaterThan(0)
     expect(screen.getByText('All 4 checkpoints complete')).toBeDefined()
@@ -888,6 +914,7 @@ describe('RunDashboard', () => {
 
     renderDashboard()
 
+    await openCheckpointProgress()
     expect(await screen.findByRole('button', { name: /Checkpoint 5: Active/ })).toBeDefined()
     expect(screen.queryByText(/Progress available — current checkpoint not reported/)).toBeNull()
     expect(screen.queryByText(/All \d+ checkpoints complete/)).toBeNull()
@@ -904,6 +931,7 @@ describe('RunDashboard', () => {
 
     renderDashboard()
 
+    await openRecordedProgress()
     expect(await screen.findByText('Checkpoint 4: Scope only (4)')).toBeDefined()
     expect(screen.queryByText(/Checkpoint 4: Scope only \(4 of/)).toBeNull()
     expect(screen.queryByText(/\? of 0/)).toBeNull()
@@ -920,6 +948,7 @@ describe('RunDashboard', () => {
 
     renderDashboard()
 
+    await openRecordedProgress()
     expect(await screen.findByText('Progress unavailable — the source is not a checkpoint plan.')).toBeDefined()
     expect(screen.queryByText(/All 0 checkpoints complete/)).toBeNull()
     expect(screen.queryByText(/\? of 0/)).toBeNull()
@@ -946,6 +975,7 @@ describe('RunDashboard', () => {
 
     renderDashboard()
 
+    await openRecordedProgress()
     expect(await screen.findByText('Checkpoint 4: Legacy scope (4)')).toBeDefined()
     expect(screen.queryByText(/All 0 checkpoints complete/)).toBeNull()
   })
@@ -967,6 +997,7 @@ describe('RunDashboard', () => {
 
     renderDashboard()
 
+    await openRecordedProgress()
     expect(await screen.findByText('Checkpoint 4: Repair (4 of 14)')).toBeDefined()
     expect(screen.getByText('Repairing')).toBeDefined()
     if (!emit) throw new Error('event subscription was not registered')
@@ -1990,6 +2021,7 @@ describe('RunDashboard', () => {
       .mockRejectedValueOnce(Object.assign(new Error('restart required'), { code: 'restart_required' }))
     vi.mocked(api.getControlPlaneRun).mockResolvedValue({ ...ownedRun, revision: 2 })
     renderDashboard()
+    await openAdjustRun()
 
     await waitFor(() => expect(screen.getByLabelText('Control max turns')).toBeDefined())
     openTechnicalDetails()
@@ -2224,6 +2256,7 @@ describe('RunDashboard', () => {
     })
     renderDashboard()
 
+    await openAdjustRun()
     await waitFor(() => expect(screen.getByLabelText('Selector for Worker')).toBeDefined())
     expect((screen.getByLabelText('Selector for Worker') as HTMLSelectElement).tagName).toBe('SELECT')
     expect(screen.getByRole('option', { name: 'harness/impl-a' })).toBeDefined()
@@ -2368,10 +2401,9 @@ describe('RunDashboard', () => {
 
     fireEvent.click(screen.getByRole('menuitem', { name: 'Adjust run settings…', exact: true }))
     await waitFor(() => expect(document.activeElement).toBe(actions))
-    const adjust = screen.getByText('Adjust run', { selector: 'summary' }).parentElement as HTMLDetailsElement
-    await waitFor(() => expect(adjust.hasAttribute('open')).toBe(true))
+    expect(screen.getByText('Adjust run', { selector: 'summary' }).parentElement?.hasAttribute('open')).toBe(true)
     fireEvent.click(screen.getByText('Adjust run', { selector: 'summary' }))
-    await waitFor(() => expect(adjust.hasAttribute('open')).toBe(false))
+    await waitFor(() => expect(screen.queryByText('Adjust run', { selector: 'summary' })).toBeNull())
 
     await openRunActions()
     const actionsMenu = screen.getByRole('menu', { name: 'Run actions', exact: true }).closest('.run-actions-menu')
@@ -2436,6 +2468,7 @@ describe('RunDashboard', () => {
       run: { ...ownedRun, revision: 2 },
     })
     renderDashboard()
+    await openAdjustRun()
 
     await screen.findByLabelText('Selector for Code review (code_review)')
     expect(screen.getByLabelText('Selector for Code review (code__review)')).toBeTruthy()
@@ -2688,7 +2721,7 @@ describe('RunDashboard', () => {
       return () => {}
     })
     renderDashboard()
-    await screen.findByText('Implement · 2')
+    await screen.findAllByText('Implement · turn 2')
     await waitFor(() => expect(api.subscribeToRunEvents).toHaveBeenCalled())
     vi.mocked(api.getControlPlaneRun).mockResolvedValue({
       ...ownedRun, status: 'completed', current_step: 'review', turns_completed: 3,
@@ -2701,7 +2734,7 @@ describe('RunDashboard', () => {
     })
     if (!onEventsHook) throw new Error('subscription hook was not registered')
     onEventsHook!([{ sequence: 2, event_type: 'run_completed', data: {}, schema_version: 1, timestamp: '2024-01-01T00:02:00Z' }])
-    await screen.findByText('Review · 3')
+    await screen.findAllByText('Review · turn 3')
     await screen.findByText('Decision #1: continue — checkpoint complete')
     await screen.findByText('All 1 checkpoints complete')
     expect(screen.getAllByText('Completed').length).toBeGreaterThan(0)
@@ -2715,7 +2748,7 @@ describe('RunDashboard', () => {
       return () => {}
     })
     renderDashboard()
-    await screen.findByText('Implement · 2')
+    await screen.findAllByText('Implement · turn 2')
     await waitFor(() => expect(api.subscribeToRunEvents).toHaveBeenCalled())
     let finishRefresh: ((run: Awaited<ReturnType<typeof api.getControlPlaneRun>>) => void) | undefined
     vi.mocked(api.getControlPlaneRun).mockImplementationOnce(() => new Promise((resolve) => { finishRefresh = resolve }))
@@ -2731,13 +2764,13 @@ describe('RunDashboard', () => {
     expect(vi.mocked(api.getControlPlaneRun).mock.calls.length).toBe(callsInFlight)
     vi.mocked(api.getControlPlaneRun).mockResolvedValue({ ...ownedRun, current_step: 'review', turns_completed: 4 })
     finishRefresh!({ ...ownedRun, turns_completed: 3 })
-    await screen.findByText('Review · 4')
+    await screen.findAllByText('Review · turn 4')
     expect(vi.mocked(api.getControlPlaneRun).mock.calls.length).toBe(callsInFlight + 1)
     expect(vi.mocked(api.listRunEvents).mock.calls.length).toBeGreaterThanOrEqual(1)
     vi.mocked(api.getControlPlaneRun).mockRejectedValue(new Error('summary temporarily unavailable'))
     emit(5)
     await screen.findByText('summary temporarily unavailable')
-    expect(screen.getByText('Review · 4')).toBeDefined()
+    expect(screen.getAllByText('Review · turn 4').length).toBeGreaterThan(0)
     expect(screen.getAllByText('Running').length).toBeGreaterThan(0)
   })
 
@@ -3052,6 +3085,7 @@ describe('RunDashboard', () => {
     })
     renderDashboard({ requestedRunId: active.run_id })
 
+    await openRunActions()
     await screen.findByText(/Restart unavailable: source worker activity is active or unknown/)
     expect(screen.queryByRole('button', { name: /Recover with another worker/ })).toBeNull()
     expect(api.resumeControlPlaneRun).not.toHaveBeenCalled()
@@ -3077,7 +3111,7 @@ describe('RunDashboard', () => {
       detailReady.resolve(confirmedRun)
       await detailReady.promise
     })
-    await screen.findByText('Review · 2')
+    await screen.findAllByText('Review · turn 2')
     const resumeButton = screen.getByRole('button', { name: /Resume as new run/ }) as HTMLButtonElement
     expect(resumeButton.disabled).toBe(false)
     fireEvent.click(resumeButton)
@@ -3114,7 +3148,7 @@ describe('RunDashboard', () => {
       })
       const listResumeButton = await screen.findByRole('button', { name: /Resume as new run/ }) as HTMLButtonElement
       expect(listResumeButton.disabled).toBe(false)
-      expect(screen.queryByText('Review · 2')).toBeNull()
+      expect(screen.queryByText('Review · turn 2')).toBeNull()
       await waitFor(() => expect(api.getControlPlaneRun).toHaveBeenCalledTimes(1))
 
       if (timing === 'before-detail-settlement') {
@@ -3124,14 +3158,14 @@ describe('RunDashboard', () => {
           detailReady.resolve(confirmedRun)
           await detailReady.promise
         })
-        await screen.findByText('Review · 2')
+        await screen.findAllByText('Review · turn 2')
         expect(screen.getByRole('button', { name: 'Confirm resume' })).toBeDefined()
       } else {
         await act(async () => {
           detailReady.resolve(confirmedRun)
           await detailReady.promise
         })
-        await screen.findByText('Review · 2')
+        await screen.findAllByText('Review · turn 2')
         const settledResumeButton = screen.getByRole('button', { name: /Resume as new run/ }) as HTMLButtonElement
         expect(settledResumeButton.disabled).toBe(false)
         fireEvent.click(settledResumeButton)
@@ -3623,12 +3657,13 @@ describe('RunDashboard', () => {
     expect(layout?.compareDocumentPosition(pendingHistory) & Node.DOCUMENT_POSITION_FOLLOWING).not.toBe(0)
     expect(screen.getAllByText(/Run history is still loading/)).toHaveLength(1)
     expect(screen.queryByText('No runs yet')).toBeNull()
-    expect(within(detail).getByText('Initial run controls are pending admission. Actions stay disabled until loading finishes.')).toBeDefined()
+    expect(within(detail).queryByText('Initial run controls are pending admission. Actions stay disabled until loading finishes.')).toBeNull()
     expect(within(detail).queryByText(/legacy read-only record/)).toBeNull()
-    expect((within(detail).getByLabelText('Control max turns') as HTMLInputElement).disabled).toBe(true)
     const actions = screen.getByRole('button', { name: 'Actions', exact: true })
     fireEvent.click(actions)
     expect((screen.getByRole('menuitem', { name: 'Adjust run settings…', exact: true }) as HTMLButtonElement).disabled).toBe(true)
+    expect(within(detail).queryByLabelText('Control max turns')).toBeNull()
+    fireEvent.click(actions)
 
     await act(async () => {
       history.resolve({ runs: [ownedRun], next_cursor: null, schema_version: 1 })
@@ -3637,13 +3672,14 @@ describe('RunDashboard', () => {
     await waitFor(() => expect(api.getGlobalConfig).toHaveBeenCalled())
     expect(screen.queryByText(/Run history is still loading/)).toBeNull()
     expect(within(detail).getByRole('button', { name: directRun.run_id, exact: true })).toBeDefined()
-    expect(within(detail).getByText('Initial run controls are pending admission. Actions stay disabled until loading finishes.')).toBeDefined()
+    expect(within(detail).queryByText('Initial run controls are pending admission. Actions stay disabled until loading finishes.')).toBeNull()
 
     await act(async () => {
       configuration.resolve(committedConfig)
       await configuration.promise
     })
     await screen.findByRole('button', { name: 'Refresh', exact: true })
+    await openAdjustRun()
     await waitFor(() => expect((within(detail).getByLabelText('Control max turns') as HTMLInputElement).disabled).toBe(false))
     expect(within(detail).queryByText(/pending admission/)).toBeNull()
     expect(within(detail).getByRole('button', { name: directRun.run_id, exact: true })).toBeDefined()
@@ -3909,7 +3945,7 @@ describe('RunDashboard', () => {
     expect(newRun.compareDocumentPosition(runList!) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy()
     expect(newRun.compareDocumentPosition(progressHeader!) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy()
     // The progress header carries the run's current step and turns.
-    expect(screen.getByText('Implement · 2')).toBeDefined()
+    expect(screen.getAllByText('Implement · turn 2').length).toBeGreaterThan(0)
     expect(screen.queryByText(/stream connected|stream stopped/)).toBeNull()
   })
 
@@ -3948,6 +3984,7 @@ describe('RunDashboard', () => {
       await delayedContext.promise
     })
     const identity = container.querySelector('.run-progress-header')
+    await openAdjustRun()
     const adjust = within(detail).getByText('Adjust run', { selector: 'summary' }).closest('details')
     const actions = within(detail).getByRole('button', { name: 'Actions', exact: true }).closest('.run-actions-menu')
     const evidence = within(detail).getByLabelText('Checkpoint history')
@@ -3980,7 +4017,7 @@ describe('RunDashboard', () => {
     renderDashboard()
     await screen.findByRole('button', { name: /Checkpoint 5: Active/ })
     const contextCallsBeforeBulk = vi.mocked(api.getRunContext).mock.calls.length
-    const details = screen.getByText('Details', { selector: 'summary' }).closest('details') as HTMLDetailsElement
+    const details = screen.getByText('Count definitions & evidence', { selector: 'summary' }).closest('details') as HTMLDetailsElement
     const diagnostics = screen.getByRole('button', { name: 'Diagnostics' })
     expect(details.hasAttribute('open')).toBe(false)
     expect(diagnostics.getAttribute('aria-expanded')).toBe('false')
@@ -4134,14 +4171,14 @@ describe('RunDashboard', () => {
       await listReady.promise
     })
     await screen.findByRole('button', { name: /run-owned Running/ })
-    expect(screen.queryByText('Review · 2')).toBeNull()
+    expect(screen.queryByText('Review · turn 2')).toBeNull()
     await waitFor(() => expect(onRunSelectionChange).toHaveBeenCalledWith({ runId: 'run-owned', userInitiated: false }))
     await waitFor(() => expect(api.getControlPlaneRun).toHaveBeenCalledTimes(1))
     await act(async () => {
       detailReady.resolve(confirmedRun)
       await detailReady.promise
     })
-    await screen.findByText('Review · 2')
+    await screen.findAllByText('Review · turn 2')
 
     const copyReady = deferred<void>()
     writeText.mockImplementationOnce(() => copyReady.promise)
@@ -4259,8 +4296,9 @@ describe('RunDashboard', () => {
     })
 
     renderDashboard()
+    await openAdjustRun()
     await waitFor(() => expect(screen.getByText(/Last executed/)).toBeDefined())
-    expect(screen.getByText(/executed-model/)).toBeDefined()
+    expect(screen.getAllByText(/executed-model/).length).toBeGreaterThan(0)
     expect(screen.getByText(/codex\.pending · pending-model · effort low/)).toBeDefined()
     expect(screen.getByText(/applies at the next turn or on resume/)).toBeDefined()
   })
@@ -4346,6 +4384,7 @@ describe('RunDashboard', () => {
     fireEvent.click(screen.getByRole('button', { name: /^run-other / }))
     openTechnicalDetails()
     await screen.findByText(/run run-other/)
+    await openRecordedProgress()
     await screen.findByText('Checkpoint 5: Fresh (5 of 14)')
     expect(screen.queryByText('Checkpoint 4: Stale (4 of 14)')).toBeNull()
     await waitFor(() => expect(screen.getByText(/"status": "fresh"/)).toBeDefined())
@@ -4383,7 +4422,7 @@ describe('RunDashboard', () => {
     vi.mocked(api.listControlPlaneRuns).mockResolvedValue({ runs: [waiting], next_cursor: null, schema_version: 1 })
     vi.mocked(api.getControlPlaneRun).mockResolvedValue(waiting)
     renderDashboard()
-    await screen.findByText('Adjust run')
+    await openAdjustRun()
     expect(screen.getAllByText('Waiting for valid override').length).toBe(2)
     await openStopReview()
     expect(screen.getByRole('button', { name: 'Request stop after current turn', exact: true })).toBeDefined()
@@ -4397,6 +4436,7 @@ describe('RunDashboard', () => {
       teams: ['fast_team', 'fast__team', 'slow_team'],
     })
     renderDashboard()
+    await openAdjustRun()
     const controlTeam = await screen.findByLabelText('Control team') as HTMLSelectElement
     expect(screen.getByRole('option', { name: 'Fast team (fast_team)', exact: true })).toBeTruthy()
     expect(screen.getByRole('option', { name: 'Fast team (fast__team)', exact: true })).toBeTruthy()
@@ -4418,7 +4458,7 @@ describe('RunDashboard', () => {
     expect(screen.getAllByText('Could not start').length).toBe(2)
     expect(screen.getByText('Untracked file: fixture.txt')).toBeDefined()
     await waitFor(() => expect(api.getRunContext).toHaveBeenCalled())
-    expect(await screen.findByText(/Progress unavailable/)).toBeDefined()
+    expect((await screen.findAllByText(/Progress unavailable/)).length).toBeGreaterThan(0)
     vi.useFakeTimers()
     try {
       vi.advanceTimersByTime(3600000)

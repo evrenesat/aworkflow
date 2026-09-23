@@ -2,6 +2,8 @@ import type {
   GuidedFormProjection,
   GuidedTeamSummary,
   RunProgressCount,
+  RunProgressDeliveryStage,
+  RunProgressExecutor,
   RunProgressSummary,
   RunEvent,
   RunStatus,
@@ -85,6 +87,9 @@ export interface RunEventPresentation {
   label: string
   summary: string | null
   detail: string
+  recordedAt: string | null
+  facts: string[]
+  hasPayload: boolean
 }
 
 const RUN_EVENT_TEXT_FIELDS = [
@@ -105,11 +110,56 @@ function eventText(value: unknown, limit = 240): string | null {
   return text.length <= limit ? text : `${text.slice(0, limit - 1)}…`
 }
 
-/** Return the newest bounded set without inventing a narrative between events. */
-export function meaningfulRunEvents(events: RunEvent[], limit = 5): RunEvent[] {
+function eventTextField(data: Record<string, unknown>, ...keys: string[]): string | null {
+  for (const key of keys) {
+    const value = eventText(data[key], 120)
+    if (value) return value
+  }
+  return null
+}
+
+function eventTurnNumber(data: Record<string, unknown>): number | null {
+  const value = data.turn_number
+  return typeof value === 'number' && Number.isSafeInteger(value) && value > 0 ? value : null
+}
+
+/** Keep recorded activity facts compact without changing their raw values. */
+export function runEventFacts(event: RunEvent): string[] {
+  const data = event.data ?? {}
+  const step = eventTextField(data, 'step_name', 'step', 'current_step')
+  const role = eventTextField(data, 'step_role', 'role')
+  const turn = eventTurnNumber(data)
+  return [
+    step ? formatMachineLabel(step) : null,
+    role ? formatMachineLabel(role) : null,
+    turn !== null ? `turn ${turn}` : null,
+  ].filter((value): value is string => Boolean(value))
+}
+
+/** Format an event's recorded time for the short activity list. */
+export function formatRunEventTime(value: string | null | undefined): string | null {
+  if (typeof value !== 'string' || !value.trim()) return null
+  const date = new Date(value)
+  if (Number.isNaN(date.getTime())) return null
+  return date.toLocaleTimeString(undefined, { hour: 'numeric', minute: '2-digit' })
+}
+
+function isPreferredRunEvent(event: RunEvent): boolean {
+  return /(?:turn|checkpoint|review|repair|complet|finish|fail|error|reject|stop|interrupt|cancel|recover|control)/i.test(event.event_type)
+}
+
+function isRunEventNoise(event: RunEvent): boolean {
+  return /(?:heartbeat|status[_ -]?(?:changed|observed|observation)|daemon[_ -]?(?:start|started|attempt|unit)|unit[_ -]?(?:start|started)|launch[_ -]?(?:start|started)|run[_ -]?started|health[_ -]?check|reconcile|poll)/i.test(event.event_type)
+}
+
+/** Return the newest bounded set while omitting lifecycle noise when work exists. */
+export function meaningfulRunEvents(events: RunEvent[], limit = 3): RunEvent[] {
   if (limit <= 0) return []
-  return events
+  const valid = events
     .filter(event => typeof event.event_type === 'string' && event.event_type.trim().length > 0)
+  const usable = valid.filter(event => !isRunEventNoise(event))
+  const preferred = usable.filter(isPreferredRunEvent)
+  return (preferred.length > 0 ? preferred : usable)
     .slice(-limit)
     .reverse()
 }
@@ -147,7 +197,31 @@ export function presentRunEvent(event: RunEvent): RunEventPresentation {
     label,
     summary,
     detail: JSON.stringify({ event_type: event.event_type, sequence: event.sequence, timestamp: event.timestamp, data: event.data }, null, 2),
+    recordedAt: formatRunEventTime(event.timestamp),
+    facts: runEventFacts(event),
+    hasPayload: Object.keys(event.data ?? {}).length > 0,
   }
+}
+
+/** Keep the current executor identity available without exposing raw payloads. */
+export function runExecutorFacts(executor: RunProgressExecutor | null): string[] {
+  if (!executor) return []
+  const role = executor.role?.trim() ? formatMachineLabel(executor.role) : null
+  const team = executor.team?.trim() ? formatMachineLabel(executor.team) : null
+  const model = (executor.model_display?.trim() || executor.model?.trim()) || null
+  const turn = executor.turn_number !== null && Number.isSafeInteger(executor.turn_number) && executor.turn_number > 0
+    ? `turn ${executor.turn_number}`
+    : null
+  return [role, team, model, turn].filter((value): value is string => Boolean(value))
+}
+
+/** Only a recorded failed stage is consequential enough for the collapsed view. */
+export function deliveryIssueText(stages: RunProgressDeliveryStage[]): string | null {
+  const failed = stages.find(stage => stage.status === 'failed')
+  if (!failed) return null
+  const stage = formatMachineLabel(failed.stage) || 'Delivery stage'
+  const reason = eventText(failed.reason, 200)
+  return `${stage} failed${reason ? ` — ${reason}` : ''}`
 }
 
 /** Find the latest event that records a finished or otherwise terminal result. */
