@@ -90,6 +90,7 @@ export function GlobalSettings({ onDirtyChange, onSaved }: { onDirtyChange: (dir
   // Skills never enter TOML documents and stay usable without the config projection.
   const [skills, setSkills] = useState<SkillSummary[] | null>(null)
   const [skillsError, setSkillsError] = useState<string | null>(null)
+  const [skillRefreshErrors, setSkillRefreshErrors] = useState<Record<string, string>>({})
   const [selectedSkill, setSelectedSkill] = useState('')
   const [skillContents, setSkillContents] = useState<Record<string, string>>({})
   const [skillRevisions, setSkillRevisions] = useState<Record<string, string>>({})
@@ -185,32 +186,63 @@ export function GlobalSettings({ onDirtyChange, onSaved }: { onDirtyChange: (dir
   function acceptSkills(list: SkillSummary[], epoch: number) {
     if (epochRef.current !== epoch) return
     setSkills(current => sameValue(current, list) ? current : list); setSkillsError(null)
+    setSkillRefreshErrors(errors => {
+      const next = Object.fromEntries(Object.entries(errors).filter(([name]) => {
+        const listed = list.find(skill => skill.name === name)
+        return listed && skillRevisions[name] !== listed.revision
+      }))
+      return sameValue(errors, next) ? errors : next
+    })
     setSelectedSkill(current => (current && list.some(skill => skill.name === current) ? current : list[0]?.name ?? ''))
   }
-  /** Loads one skill's content/revision baseline on selection; drafts win over reloads. */
+  function skillRevisionStale(name: string): boolean {
+    const listed = skills?.find(skill => skill.name === name)
+    return Boolean(listed && skillRevisions[name] !== listed.revision)
+  }
+  /** Loads one skill's content/revision baseline; genuinely dirty drafts survive reloads. */
   async function ensureSkillContent(name: string, epoch: number, refresh = false) {
-    if (!name || (!refresh && skillContents[name] !== undefined) || skillInflight.current.has(name)) return
+    if (!name || (!refresh && skillContents[name] !== undefined && !skillRevisionStale(name)) || skillInflight.current.has(name)) return
     const requestId = ++skillReadSequenceRef.current
-    const hadContent = skillContents[name] !== undefined
+    const previousContent = skillContents[name]
+    const hadContent = previousContent !== undefined
     skillInflight.current.set(name, requestId)
     if (!hadContent) setSkillContentLoading(true)
     setSkillContentError(null)
     try {
       const detail: SkillDetail = await api.readSkill(name)
-      if (epochRef.current !== epoch) return
-      setSkillContents(contents => ({ ...contents, [name]: detail.content }))
-      setSkillRevisions(revisions => ({ ...revisions, [name]: detail.revision }))
-      setSkills(list => list?.map(skill => (skill.name === name
-        ? { ...skill, revision: detail.revision, source: detail.source, edited: detail.edited, installed: detail.installed, links: detail.links, detected_harnesses: detail.detected_harnesses }
-        : skill)) ?? null)
+      if (epochRef.current !== epoch || skillInflight.current.get(name) !== requestId) return
+      setSkillContents(contents => contents[name] === detail.content ? contents : { ...contents, [name]: detail.content })
+      setSkillRevisions(revisions => revisions[name] === detail.revision ? revisions : { ...revisions, [name]: detail.revision })
+      // A draft that still equals the baseline being replaced is only a
+      // no-op editor artifact. Remove it after the response is accepted so
+      // changed server bytes become visible and cannot be saved as stale data.
+      setSkillDrafts(drafts => {
+        if (previousContent === undefined || drafts[name] !== previousContent) return drafts
+        const next = { ...drafts }
+        delete next[name]
+        return next
+      })
+      setSkills(list => {
+        if (!list) return null
+        const next = list.map(skill => (skill.name === name
+          ? { ...skill, revision: detail.revision, source: detail.source, edited: detail.edited, installed: detail.installed, links: detail.links, detected_harnesses: detail.detected_harnesses }
+          : skill))
+        return sameValue(list, next) ? list : next
+      })
+      if (hadContent) setSkillRefreshErrors(errors => {
+        if (!(name in errors)) return errors
+        const next = { ...errors }
+        delete next[name]
+        return next
+      })
     } catch (reason) {
-      if (epochRef.current !== epoch) return
+      if (epochRef.current !== epoch || skillInflight.current.get(name) !== requestId) return
       const message = reason instanceof Error ? reason.message : 'Could not load the skill content.'
       // A refresh must not replace an existing editor with an error-only
       // surface. The skills domain error remains visible while the old content
       // stays usable; initial selection still uses its ordinary loading/error
       // presentation.
-      if (hadContent) setSkillsError(message)
+      if (hadContent) setSkillRefreshErrors(errors => errors[name] === message ? errors : { ...errors, [name]: message })
       else setSkillContentError(message)
     } finally {
       if (skillInflight.current.get(name) === requestId) skillInflight.current.delete(name)
@@ -225,10 +257,10 @@ export function GlobalSettings({ onDirtyChange, onSaved }: { onDirtyChange: (dir
   // Selection defaults arrive asynchronously from the skill list; fetch the
   // baseline content for whatever ends up selected.
   useEffect(() => {
-    if (selectedSkill && skillContents[selectedSkill] === undefined && !skillInflight.current.has(selectedSkill)) {
+    if (selectedSkill && (skillContents[selectedSkill] === undefined || skillRevisionStale(selectedSkill)) && !skillInflight.current.has(selectedSkill)) {
       void ensureSkillContent(selectedSkill, epochRef.current)
     }
-  }, [selectedSkill, skills, skillContents]) // eslint-disable-line react-hooks/exhaustive-deps
+  }, [selectedSkill, skills, skillContents, skillRevisions]) // eslint-disable-line react-hooks/exhaustive-deps
   async function load(skillOverride: string | null = null) {
     const epoch = ++epochRef.current
     // Superseded skill reads remain harmless through the epoch check, while a
@@ -254,7 +286,12 @@ export function GlobalSettings({ onDirtyChange, onSaved }: { onDirtyChange: (dir
     const current = results[2]?.status === 'fulfilled'
       ? (requestedSkill && loaded.some(skill => skill.name === requestedSkill) ? requestedSkill : loaded[0]?.name || '')
       : ''
-    if (current) void ensureSkillContent(current, epoch, true)
+    const refreshNames = new Set<string>()
+    if (current) refreshNames.add(current)
+    for (const skill of loaded) {
+      if (skillContents[skill.name] !== undefined && skillRevisions[skill.name] !== skill.revision) refreshNames.add(skill.name)
+    }
+    for (const name of refreshNames) void ensureSkillContent(name, epoch, true)
   }
   /** Explicit confirmed discard: pending edits return to the loaded baselines. */
   function discardAndReload() {
@@ -608,7 +645,7 @@ export function GlobalSettings({ onDirtyChange, onSaved }: { onDirtyChange: (dir
         // new bytes are reflected. No draft can be dirty here; drop no-op duplicates.
         const list = await api.listSkills()
         if (epochRef.current !== epoch) return
-        setSkills(list); setSkillsError(null); setSkillDrafts({})
+        setSkills(list); setSkillsError(null); setSkillRefreshErrors({}); setSkillDrafts({})
         setSkillContents({})
         setSkillRevisions(Object.fromEntries(list.map(skill => [skill.name, skill.revision])))
         const next = selectedSkill && list.some(skill => skill.name === selectedSkill) ? selectedSkill : list[0]?.name ?? ''
@@ -743,6 +780,9 @@ export function GlobalSettings({ onDirtyChange, onSaved }: { onDirtyChange: (dir
     } finally { setBusy(false) }
   }
   const effectiveSkill = selectedSkill || skills?.[0]?.name || ''
+  const skillRefreshMessages = Object.entries(skillRefreshErrors).sort(([left], [right]) => left.localeCompare(right)).map(([name, message]) => `${name}: ${message}`)
+  const skillRefreshError = skillRefreshMessages.length === 1 ? Object.values(skillRefreshErrors)[0] : skillRefreshMessages.join(' ')
+  const skillsLoadError = [skillsError, skillRefreshError].filter(Boolean).join(' ') || null
   const teamNames = draft ? Object.keys(draft.teams).sort() : []
   const workflowNames = draft ? Object.keys(draft.workflows).sort() : []
   const selectors = draft ? Object.entries(draft.harnesses).flatMap(([h, profiles]) => Object.keys(profiles).map(p => `${h}.${p}`)) : []
@@ -813,7 +853,7 @@ export function GlobalSettings({ onDirtyChange, onSaved }: { onDirtyChange: (dir
     <fieldset disabled={busy} data-settings-tab={advanced ? 'Advanced TOML' : tab} className="settings-body" id="settings-domain-panel" role={advanced ? 'region' : 'tabpanel'} aria-label={advanced ? 'Advanced TOML editor' : undefined} aria-labelledby={advanced ? undefined : `settings-tab-${tabs.indexOf(tab)}`}>
     {advanced ? <div className="settings-fields">{texts.map((text, index) => <div className="text-editor-field" key={index}><span className="text-editor-label">{index ? 'workflows.toml' : 'aflow.toml'}</span><TextEditor className="mono config-textarea" aria-label={index ? 'workflows.toml contents' : 'aflow.toml contents'} value={text} onChange={e => { draftPreviewCoordinator.invalidate(); setDraftPreviewState(draftPreviewCoordinator.state()); const next: [string, string] = [...texts]; next[index] = e.target.value; setTexts(next); if (!rawEdited) { const form = candidate().form; setBaseline(form); setDraft(form); if (form) draftPreviewCoordinator.updateDraft(form); setPendingNames({}); setNewProfile({ harness: '', profile: '', model: '', effort: '' }); setNewProfileError(null); setNewRole({ role: '', selector: '' }); setNewRoleError(null); setNewTeamName(''); setNewTeamError(null); setPendingFocusTeam(null) } setRawEdited(true) }} /></div>)}</div> : <><div className="settings-retained-skills" hidden={tab !== 'Skills'} aria-hidden={tab !== 'Skills' || undefined}><SkillsSettings
       skills={skills}
-      loadError={skillsError}
+      loadError={skillsLoadError}
       selected={effectiveSkill}
       onSelect={selectSkill}
       content={effectiveSkill && skillContents[effectiveSkill] !== undefined ? skillContents[effectiveSkill] : null}

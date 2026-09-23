@@ -1,5 +1,49 @@
 # DEVLOG
 
+## 2026-09-23 — Preserve concurrent Settings refresh failures
+
+- Cached detail failures are now tracked by skill name and aggregated with
+  list-level errors only at render time. A successful refresh clears only its
+  own failure, so another stale skill's old content, revision mismatch, and
+  actionable error remain visible until that skill recovers.
+- Deferred coverage fails one cached refresh, lets another changed skill
+  succeed afterward, verifies the failed error and old content remain, then
+  retries the failed skill and checks the new revision on Save.
+- Validation: focused Settings tests passed 86/86; the full web suite had
+  584 passed and one unrelated RunDashboard failure in the concurrent
+  cancellation-owned area; the production build passed; and the Settings
+  browser journey passed 1/1 in Chromium and 1/1 in WebKit. Review,
+  publication, CI, and live activation remain coordinator gates.
+
+## 2026-09-23 — Retry stale skills after failed reload detail reads
+
+- Settings now compares each cached skill detail revision with the current
+  summary revision when selecting or resolving the selected-skill effect. A
+  failed newer-revision read keeps the old editor usable and the actionable
+  error visible, but the mismatch remains stale so a later selection retries.
+- The deferred regression loads two skills, fails a changed non-selected
+  refresh, retries it on selection, preserves old content while pending, and
+  verifies the successful new revision is used by Save.
+- Validation: focused Settings tests passed 85/85, full web tests passed
+  584/584, production build passed, and the Settings browser journey passed
+  1/1 in Chromium and 1/1 in WebKit. Review, publication, CI, and live
+  activation remain coordinator gates.
+
+## 2026-09-23 — Reconcile cached skill baselines during reload
+
+- Clean Settings reloads now refresh every previously loaded skill whose list
+  revision changed, while retaining the visible old content until each detail
+  read settles. An accepted detail response removes only a draft still equal to
+  the superseded baseline; genuinely newer drafts remain owned by GlobalSettings.
+- Deferred regressions cover non-selected revision refresh, equal and failed
+  detail reads, the no-op-draft changed-reload path, revision-sensitive save
+  requests, and existing stale-response/discard behavior.
+- Validation: focused Settings tests passed 84/84, full web tests passed 581/583
+  with two unrelated RunDashboard failures in the concurrent cancellation-owned
+  area, the production build passed, and the Settings browser journey passed
+  1/1 in Chromium and 1/1 in WebKit. Review, publication, CI, and live
+  activation remain coordinator gates.
+
 ## 2026-09-23 — Preserve Settings content during clean reload
 
 - Settings reloads now retain loaded config, server, and skill domains while
