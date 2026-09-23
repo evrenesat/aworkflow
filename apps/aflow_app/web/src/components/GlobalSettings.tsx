@@ -718,7 +718,7 @@ export function GlobalSettings({ onDirtyChange, onSaved }: { onDirtyChange: (dir
     context: <h2 className="header-context-title">Settings</h2>,
     local: sectionNavigation,
     primary: <>
-      {!changelogReadOnly && <button className="btn btn-primary btn-sm" disabled={!saveableDirty || busy} onClick={() => void save()}>{busy ? 'Working…' : 'Save all changes'}</button>}
+      {!changelogReadOnly && <button data-ui-fidelity-anchor="settings-save" className="btn btn-primary btn-sm" disabled={!saveableDirty || busy} onClick={() => void save()}>{busy ? 'Working…' : 'Save all changes'}</button>}
       {previewStatus}
     </>,
     more: <MoreMenu label="More settings actions" triggerLabel="More">
@@ -742,7 +742,7 @@ export function GlobalSettings({ onDirtyChange, onSaved }: { onDirtyChange: (dir
     {notice && <p className="success-message" role="status">{notice}</p>}
     {projectionError && <div className="error-message" role="alert">The guided settings view is unavailable: {projectionError} <button className="btn btn-secondary btn-sm" onClick={() => void retryProjection()} disabled={busy || !snapshot}>Retry</button> The saved documents stay editable under Advanced TOML.</div>}
     {draftPreviewState.error && <p className="error-message" role="alert">The current settings preview is unavailable: {draftPreviewState.error.message} Your edits remain in the draft; edit again or save to retry.</p>}
-    <fieldset disabled={busy} className="settings-body" id="settings-domain-panel" role={advanced ? 'region' : 'tabpanel'} aria-label={advanced ? 'Advanced TOML editor' : undefined} aria-labelledby={advanced ? undefined : `settings-tab-${tabs.indexOf(tab)}`}>
+    <fieldset disabled={busy} data-settings-tab={advanced ? 'Advanced TOML' : tab} className="settings-body" id="settings-domain-panel" role={advanced ? 'region' : 'tabpanel'} aria-label={advanced ? 'Advanced TOML editor' : undefined} aria-labelledby={advanced ? undefined : `settings-tab-${tabs.indexOf(tab)}`}>
     {advanced ? <div className="settings-fields">{texts.map((text, index) => <div className="text-editor-field" key={index}><span className="text-editor-label">{index ? 'workflows.toml' : 'aflow.toml'}</span><TextEditor className="mono config-textarea" aria-label={index ? 'workflows.toml contents' : 'aflow.toml contents'} value={text} onChange={e => { draftPreviewCoordinator.invalidate(); setDraftPreviewState(draftPreviewCoordinator.state()); const next: [string, string] = [...texts]; next[index] = e.target.value; setTexts(next); if (!rawEdited) { const form = candidate().form; setBaseline(form); setDraft(form); if (form) draftPreviewCoordinator.updateDraft(form); setPendingNames({}); setNewProfile({ harness: '', profile: '', model: '', effort: '' }); setNewProfileError(null); setNewRole({ role: '', selector: '' }); setNewRoleError(null); setNewTeamName(''); setNewTeamError(null); setPendingFocusTeam(null) } setRawEdited(true) }} /></div>)}</div> : <><div className="settings-retained-skills" hidden={tab !== 'Skills'} aria-hidden={tab !== 'Skills' || undefined}><SkillsSettings
       skills={skills}
       loadError={skillsError}
@@ -791,19 +791,24 @@ export function GlobalSettings({ onDirtyChange, onSaved }: { onDirtyChange: (dir
       <h3>Server settings</h3>
       {server && Object.values(server.restart).some(Boolean) && <p role="status">Saved server binding or root changes require a server restart.</p>}
       {(['bind_host', 'bind_port', 'managed_projects_root'] as const).map(key => <label key={key}>{({ bind_host: 'Bind host', bind_port: 'Bind port', managed_projects_root: 'Projects root' })[key]}<input className="input" value={serverDraft[key]} onChange={e => setServerDraft({ ...serverDraft, [key]: e.target.value })} /></label>)}
-      <label>New password (leave empty to keep current)<input className="input" type="password" autoComplete="new-password" value={password} onChange={e => setPassword(e.target.value)} /></label>
-      {password && <p>Saving the password ends existing sessions.</p>}
+      <details className="settings-disclosure"><summary>Change password</summary>
+        <div className="settings-fields"><label>New password (leave empty to keep current)<input className="input" type="password" autoComplete="new-password" value={password} onChange={e => setPassword(e.target.value)} /></label>
+        {password && <p>Saving the password ends existing sessions.</p>}</div>
+      </details>
       <details><summary>Connection settings TOML</summary><TextEditor className="config-textarea" aria-label="Advanced connection settings TOML" value={serverText} onChange={e => setServerText(e.target.value)} /></details>
     </div> : draft ? <div className="settings-guided-content">
       {rawEdited && <p className="notice">Advanced document edits are pending. Saving replaces only the edited documents, including subsequent guided changes.</p>}
       <fieldset className="settings-body">
       {tab === 'Agents & Roles' && <>
         <h3>Profiles</h3>
+        <p className="settings-section-lead">Effective profiles are shown first. New profiles are added to this shared draft and persist only with Save all changes.</p>
         {Object.entries(draft.harnesses).flatMap(([harness, profiles]) => Object.entries(profiles).map(([profile, value]) => <div className="card profile-editor-row" key={`${harness}.${profile}`}>
           <div className="profile-editor-name"><span className="text-xs text-dim">Profile</span><strong className="mono">{harness}.{profile}</strong></div>
           {profileFields(harness, profile, value.model ?? '', value.effort ?? '', (field, text) => change(next => { next.harnesses[harness][profile][field] = text || null }))}
         </div>))}
-        <div className="card profile-editor-row profile-editor-new">
+        <details className="settings-disclosure">
+          <summary>Add profile</summary>
+          <div className="card profile-editor-row profile-editor-new">
           <h4 className="profile-editor-name">New profile</h4>
           <label className="profile-editor-field">Harness<select className="input" aria-label="Harness" value={newProfile.harness} onChange={e => { setNewProfile({ ...newProfile, harness: e.target.value, model: '', effort: '' }); setNewProfileError(null) }}><option value="">Choose harness</option>{projection?.suggestions.harnesses.map(h => <option key={h.name}>{h.name}</option>)}</select></label>
           <div className="profile-editor-field" onKeyDown={event => {
@@ -817,19 +822,25 @@ export function GlobalSettings({ onDirtyChange, onSaved }: { onDirtyChange: (dir
           </div>
           {newProfile.harness && <div className="profile-editor-new-fields">{profileFields(newProfile.harness, newProfile.profile, newProfile.model, newProfile.effort, (field, text) => { setNewProfile({ ...newProfile, [field]: text }); setNewProfileError(null) })}</div>}
           <div className="profile-editor-actions"><button type="button" className="btn btn-secondary" onClick={() => addProfile()}>Add profile</button>{newProfileError && <span role="alert" className="text-sm add-team-error">{newProfileError}</span>}</div>
-        </div>
-        <h3>Global roles</h3>{Object.entries(draft.roles).map(([role, selector]) => <Combobox key={role} label={`Role ${formatMachineChoice(role, Object.keys(draft.roles))}`} value={selector} options={selectors} onChange={value => change(next => { next.roles[role] = value })} />)}
-        <div className="settings-fields" onKeyDown={event => {
+          </div>
+        </details>
+        <h3>Global roles</h3>
+        <p className="settings-section-lead">Effective global role assignments remain editable here; team-specific inheritance is shown in Teams.</p>
+        <div className="settings-effective-list">{Object.entries(draft.roles).map(([role, selector]) => <div className="settings-effective-row" key={role}><strong>{formatMachineChoice(role, Object.keys(draft.roles))}</strong><Combobox label={`Role ${formatMachineChoice(role, Object.keys(draft.roles))}`} visibleLabel="Effective profile" value={selector} options={selectors} onChange={value => change(next => { next.roles[role] = value })} /></div>)}</div>
+        <details className="settings-disclosure">
+          <summary>Add global role</summary>
+          <div className="settings-fields" onKeyDown={event => {
           if (event.key !== 'Enter' || event.defaultPrevented) return
           const target = event.target
           if (!(target instanceof HTMLInputElement) || target.getAttribute('aria-label') !== 'New role name') return
           event.preventDefault()
           addRole()
-        }}>
+          }}>
           <label>New role name<input className="input" aria-label="New role name" value={newRole.role} onChange={e => { setNewRole({ ...newRole, role: e.target.value }); setNewRoleError(null) }} /></label>
           <Combobox label="New role profile" value={newRole.selector} options={selectors} allowCustom onChange={selector => { setNewRole({ ...newRole, selector }); setNewRoleError(null) }} />
           <span className="inline-action"><button type="button" className="btn btn-secondary" onClick={addRole}>Add role</button>{newRoleError && <span role="alert" className="text-sm add-team-error">{newRoleError}</span>}</span>
-        </div>
+          </div>
+        </details>
       </>}
       {tab === 'Workflows' && <SidebarEditorLayout selection={selectedWorkflow} navigationVersion={navigationVersion} listLabel="Workflows" navigation={<div>{['Defaults', ...workflowNames].map(name => <button data-sidebar-editor-item={name} className={`btn sidebar-entry ${selectedWorkflow === name ? 'btn-primary' : 'btn-secondary'}`} aria-pressed={selectedWorkflow === name} key={name} onClick={() => { setSelectedWorkflow(name); setNavigationVersion(value => value + 1) }}>{name === 'Defaults' ? name : formatMachineChoice(name, workflowNames)}</button>)}</div>}><div className="settings-fields">{selectedWorkflow === 'Defaults' && <><h3>Defaults</h3><Combobox label="Default workflow" value={draft.default_workflow ?? ''} options={workflowNames} optionLabel={value => formatMachineChoice(value, workflowNames)} onChange={value => change(next => { next.default_workflow = value })} /><label>Max turns<input className="input" type="number" min="1" value={draft.max_turns ?? ''} onChange={e => change(next => { next.max_turns = e.target.value === '' ? null : Number(e.target.value) })} /></label><label>Manager supervision<select className="input" aria-label="Default manager supervision" value={draft.default_manager_enabled == null ? 'unset' : draft.default_manager_enabled ? 'enabled' : 'disabled'} onChange={e => change(next => { const raw = e.target.value; next.default_manager_enabled = raw === 'unset' ? null : raw === 'enabled' })}><option value="enabled">Enabled</option><option value="disabled">Disabled</option><option value="unset">Disabled (default)</option></select></label><p className="text-xs text-dim">Applies to new runs in every workflow without its own override. Omitted means disabled.</p></>}{Object.entries(draft.workflows).filter(([name]) => name === selectedWorkflow).map(([workflow, value]) => <div className="card" key={workflow}><h3>{formatMachineChoice(workflow, workflowNames)}</h3><p>{(value.executable_steps ?? value.declared_steps).map(formatMachineLabel).join(' → ')}</p><label>Default team<select className="input" value={draft.workflow_default_teams[workflow] ?? ''} onChange={e => change(next => { next.workflow_default_teams[workflow] = e.target.value || null })}><option value="">Unset</option>{teamNames.map(team => <option key={team} value={team}>{formatMachineChoice(team, teamNames)}</option>)}</select></label><label>Manager supervision<select className="input" aria-label={`Manager supervision for workflow ${formatMachineChoice(workflow, workflowNames)}`} value={value.manager_enabled == null ? 'inherit' : value.manager_enabled ? 'enabled' : 'disabled'} onChange={e => change(next => { const raw = e.target.value; next.workflows[workflow].manager_enabled = raw === 'inherit' ? null : raw === 'enabled' })}><option value="inherit">Inherit</option><option value="enabled">Enabled</option><option value="disabled">Disabled</option></select></label><p className="text-xs text-dim">Effective supervision: {(value.effective_manager_enabled ?? false) ? 'Enabled' : 'Disabled'} ({managerSourceLabel(value.manager_enabled_source)}). Applies to new runs; the launch-default workflow does not affect inheritance.</p></div>)}</div></SidebarEditorLayout>}
       {tab === 'Prompts' && <PromptsSettings selected={selectedPrompt} onSelect={setSelectedPrompt} draft={draft} change={change} names={pendingNames} rename={(name, target) => setPendingNames({ ...pendingNames, [name]: target })}

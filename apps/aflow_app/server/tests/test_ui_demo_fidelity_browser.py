@@ -12,7 +12,7 @@ from playwright.sync_api import expect, sync_playwright
 
 from aflow.control_plane.units import InMemoryUnitManager, UnitState
 from test_control_plane_api import PROJECT_ID, control_client, live_server  # noqa: F401
-from test_responsive_browser import _assert_header_and_flow, _assert_theme, _browser, _login, _set_theme_preference
+from test_responsive_browser import _assert_header_and_flow, _assert_theme, _browser, _login, _seed_team_family_fixture, _select_settings_section, _set_theme_preference
 from ui_demo_fidelity import (
     CAPTURE_THEMES,
     CAPTURE_VIEWPORTS,
@@ -648,6 +648,136 @@ def test_ui_demo_cp8_plan_editor_and_review_captures(
             "comparison": "Each production state records the matching frozen reference checksum, viewport/theme, named anchor boxes, text values, disclosure state, screenshot names, and zero-start review evidence.",
         },
     )
+
+
+@pytest.mark.parametrize(
+    ("width", "height", "theme"),
+    (
+        pytest.param(1280, 720, "light", id="desktop-light"),
+        pytest.param(1280, 720, "dark", id="desktop-dark"),
+        pytest.param(390, 844, "light", id="mobile-light"),
+        pytest.param(390, 844, "dark", id="mobile-dark"),
+    ),
+)
+def test_ui_demo_cp9_settings_effective_values_and_disclosures(
+    control_client,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    width: int,
+    height: int,
+    theme: str,
+) -> None:
+    """Capture each populated Settings section against the frozen surface."""
+    _, root, _, _ = control_client
+    _seed_team_family_fixture(root)
+    dist = Path(__file__).resolve().parents[2] / "web" / "dist"
+    if not (dist / "index.html").exists():
+        pytest.fail("The CP9 capture requires the real built web app; run the web build first.")
+    monkeypatch.setenv("AFLOW_APP_WEB_DIST", str(dist))
+
+    manifest = load_reference_manifest()
+    captures: dict[str, object] = {
+        "reference_sha256": manifest["demo_sha256"],
+        "viewport": {"width": width, "height": height},
+        "theme": theme,
+        "sections": {},
+    }
+    sections = ("Teams", "Agents & Roles", "Workflows", "Prompts", "Skills", "General")
+    sidebar_sections = {"Teams", "Workflows", "Prompts", "Skills"}
+
+    def visible_box(selector: str) -> dict[str, float] | None:
+        return page.evaluate(
+            """selector => {
+              const element = document.querySelector(selector);
+              if (!element) return null;
+              const style = getComputedStyle(element);
+              const box = element.getBoundingClientRect();
+              if (style.display === 'none' || style.visibility === 'hidden' || box.width <= 0 || box.height <= 0) return null;
+              return {x: box.x, y: box.y, width: box.width, height: box.height};
+            }""",
+            selector,
+        )
+
+    with live_server() as url, sync_playwright() as playwright:
+        browser = _browser(playwright)
+        page = browser.new_page(viewport={"width": width, "height": height})
+        try:
+            _login(page, url)
+            page.emulate_media(color_scheme=theme)  # type: ignore[arg-type]
+            _set_theme_preference(page, theme)
+            reference_path = tmp_path / f"cp9-reference-{theme}-{width}x{height}.png"
+            reference = capture_reference_surface(
+                page,
+                width=width,
+                height=height,
+                theme=theme,
+                screenshot_path=reference_path,
+            )
+            _assert_reference_capture(reference)
+            captures["reference"] = {"screenshot": reference_path.name, "anchors": reference["anchors"]}
+
+            page.goto(f"{url}/?project={PROJECT_ID}&view=settings", wait_until="load")
+            page.get_by_role("heading", name="Settings", exact=True).wait_for()
+            for section in sections:
+                _select_settings_section(page, section)
+                panel = page.locator("#settings-domain-panel")
+                panel.wait_for()
+                expect(panel).to_have_attribute("data-settings-tab", section)
+                if section in sidebar_sections and width < 960 and section != "Teams":
+                    navigation = page.locator(".sidebar-editor-navigation:visible").last
+                    navigation.wait_for()
+                    entry = navigation.locator("[data-sidebar-editor-item]:visible").first
+                    if entry.count():
+                        entry.click()
+                if section == "Skills" and width >= 960:
+                    page.locator(".sidebar-editor-navigation:visible [data-sidebar-editor-item]").first.wait_for()
+                _assert_theme(page, theme)
+                _assert_header_and_flow(page)
+                save = page.get_by_role("button", name="Save all changes", exact=True)
+                expect(save).to_be_visible()
+                first_disclosure = panel.locator("details:visible").first
+                disclosure_count = panel.locator("details").count()
+                first_summary = (
+                    first_disclosure.locator("summary").first.text_content()
+                    if disclosure_count and first_disclosure.locator("summary").count()
+                    else None
+                )
+                image = tmp_path / f"cp9-settings-{section.lower().replace(' & ', '-')}-{theme}-{width}x{height}.png"
+                page.screenshot(path=str(image), full_page=True)
+                content_box = visible_box("#settings-domain-panel")
+                save_box = visible_box("[data-ui-fidelity-anchor='settings-save']")
+                assert content_box is not None
+                assert save_box is not None
+                assert content_box["y"] >= save_box["y"]
+                if section == "Teams":
+                    expect(panel.locator(".team-family-list-entry").first).to_be_visible()
+                    expect(panel.get_by_text("Add standalone team", exact=True)).to_be_visible()
+                elif section == "Agents & Roles":
+                    expect(panel.get_by_role("heading", name="Profiles", exact=True)).to_be_visible()
+                    expect(panel.locator("details.settings-disclosure > summary", has_text="Add profile")).to_be_visible()
+                    expect(panel.get_by_role("heading", name="Global roles", exact=True)).to_be_visible()
+                elif section == "Workflows":
+                    expect(panel.locator(".sidebar-editor-detail:visible").first).to_be_visible()
+                elif section == "Prompts":
+                    expect(panel.locator("details.settings-disclosure > summary", has_text="Create prompt")).to_be_visible()
+                    expect(panel.locator(".text-editor:visible").first).to_be_visible()
+                elif section == "Skills":
+                    expect(panel.locator(".skill-editor-header:visible").first).to_be_visible()
+                elif section == "General":
+                    expect(panel.get_by_role("heading", name="Server settings", exact=True)).to_be_visible()
+                    expect(panel.get_by_text("Change password", exact=True)).to_be_visible()
+                captures["sections"][section] = {
+                    "screenshot": image.name,
+                    "save_enabled": not save.is_disabled(),
+                    "content_box": content_box,
+                    "save_box": save_box,
+                    "disclosure_count": disclosure_count,
+                    "first_disclosure": first_summary,
+                    "settings_tab": panel.get_attribute("data-settings-tab"),
+                }
+        finally:
+            browser.close()
+    _write_artifact_manifest(tmp_path / f"cp9-settings-{theme}-{width}x{height}.json", captures)
 
 
 @pytest.mark.parametrize(

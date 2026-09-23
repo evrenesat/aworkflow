@@ -606,6 +606,7 @@ export function GuidedConfigForm({
                 </tbody>
               </table>
             )}
+            <details className="settings-disclosure"><summary>Add or update profile</summary>
             <div className="dashboard-form-grid" aria-label="Add or update a profile">
               <div className="dashboard-field">
                 <label className="text-xs text-dim" htmlFor="profile-harness">Harness</label>
@@ -698,6 +699,7 @@ export function GuidedConfigForm({
               </button>
             </div>
             <p className="text-xs text-dim" role="note">{suggestions?.note}</p>
+            </details>
           </section>
 
           <section className="card guided-section" aria-labelledby="guided-roles-heading">
@@ -722,6 +724,7 @@ export function GuidedConfigForm({
                 </tbody>
               </table>
             )}
+            <details className="settings-disclosure"><summary>Assign global role</summary>
             <div className="dashboard-form-grid" aria-label="Assign a global role">
               <Combobox
                 label="Role"
@@ -747,6 +750,7 @@ export function GuidedConfigForm({
                 Apply role to draft
               </button>
             </div>
+            </details>
           </section>
 
           <section className="card guided-section" aria-labelledby="guided-teams-heading">
@@ -781,6 +785,7 @@ export function GuidedConfigForm({
                 </div>
               ))
             )}
+            <details className="settings-disclosure"><summary>Add or override team</summary>
             <div className="dashboard-form-grid" aria-label="Add a team">
               <div className="dashboard-field">
                 <label className="text-xs text-dim" htmlFor="new-team-name">New team name</label>
@@ -837,14 +842,17 @@ export function GuidedConfigForm({
                 </button>
               </div>
             )}
+            </details>
           </section>
 
           <section className="card guided-section" aria-labelledby="guided-workflows-heading">
             <h4 id="guided-workflows-heading" style={{ fontWeight: 600 }}>Workflows</h4>
+            <details className="settings-disclosure"><summary>Workflow inheritance and graph details</summary>
             <p className="text-xs text-dim">
               Each workflow runs its steps in order. Uncommon graph and prompt settings remain in
               Advanced TOML.
             </p>
+            </details>
             {Object.keys(projection.workflows).length === 0 ? (
               <p className="text-sm text-dim">No workflows are declared in this draft yet.</p>
             ) : (

@@ -955,7 +955,7 @@ def test_family_stage_click_survives_preview_completion(
             expect(reviewer_row).to_contain_text("codex.review_alt")
             reviewer_row.get_by_role("button", name="Override role", exact=True).click()
             choose_profile(page, "Reviewer", "codex.review_child")
-            expect(reviewer_row).to_contain_text("codex.review_child")
+            expect(reviewer_row.get_by_role("combobox")).to_have_value(re.compile(r"codex\.review_child"))
             detail.get_by_role("button", name="Base product", exact=True).click()
 
             field = page.get_by_role("combobox", name="Reviewer", exact=True)
@@ -1025,9 +1025,9 @@ def test_family_stage_click_survives_preview_completion(
             page.mouse.up()
             expect(target).to_have_attribute("aria-pressed", "true")
             reviewer_row = detail.locator(".team-family-role-row").filter(has_text="Reviewer").first
-            expect(reviewer_row).to_contain_text("codex.review_child")
+            expect(reviewer_row.get_by_role("combobox")).to_have_value(re.compile(r"codex\.review_child"))
             stronger_worker_pressed = target.get_attribute("aria-pressed")
-            child_reviewer_text = reviewer_row.text_content()
+            child_reviewer_text = reviewer_row.get_by_role("combobox").input_value()
             events = page.evaluate("() => window.__familyStageEvents ?? []")
             assert [event["kind"] for event in events[-3:]] == ["pointerdown", "pointerup", "click"], events
             assert all(event["target"] == "Stronger worker" for event in events[-3:]), events
@@ -1036,7 +1036,7 @@ def test_family_stage_click_survives_preview_completion(
             base = detail.get_by_role("button", name="Base product", exact=True)
             expect(base).to_have_attribute("aria-pressed", "true")
             base_reviewer = detail.locator(".team-family-role-row").filter(has_text="Reviewer").first
-            expect(base_reviewer).to_contain_text("codex.review_final")
+            expect(base_reviewer.get_by_role("combobox")).to_have_value(re.compile(r"codex\.review_final"))
 
             artifact = {
                 "viewport": {"width": width, "height": height},
@@ -2418,10 +2418,20 @@ def test_responsive_team_family_journey(
 
     def select_family(page: Page, label: str) -> None:
         open_family_list(page)
-        page.get_by_role("navigation", name="Team families", exact=True).get_by_role(
+        entry = page.get_by_role("navigation", name="Team families", exact=True).get_by_role(
             "button", name=label, exact=True
-        ).click()
+        )
+        # Catch the shared .sidebar-entry rule collapsing metadata into inline text.
+        title = entry.locator(".team-family-list-title").bounding_box()
+        kind = entry.locator(".team-family-list-kind").bounding_box()
+        meta = entry.locator(".team-family-list-meta").bounding_box()
+        assert title and kind and meta
+        assert kind["y"] >= title["y"] + title["height"]
+        assert meta["y"] >= kind["y"] + kind["height"]
+        entry.click()
         page.locator(".team-family-detail").wait_for()
+        for stage in page.locator(".team-family-stage-selector button").all():
+            expect(stage.locator("span")).to_have_count(1)
 
     def choose_profile(page: Page, label: str, selector: str) -> None:
         field = page.get_by_role("combobox", name=label, exact=True)
@@ -2482,7 +2492,7 @@ def test_responsive_team_family_journey(
             choose_profile(page, "Reviewer", "codex.review_final")
             detail.get_by_role("button", name="Stronger worker", exact=True).click()
             reviewer_row = detail.locator(".team-family-role-row").filter(has_text="Reviewer").first
-            expect(reviewer_row).to_contain_text("codex.review_child")
+            expect(reviewer_row.get_by_role("combobox")).to_have_value(re.compile(r"codex\.review_child"))
             detail.get_by_role("button", name="Base product", exact=True).click()
             save_settings(page)
             reload_team_settings(page)
@@ -2490,7 +2500,7 @@ def test_responsive_team_family_journey(
             detail = page.locator(".team-family-detail")
             detail.get_by_role("button", name="Stronger worker", exact=True).click()
             reviewer_row = detail.locator(".team-family-role-row").filter(has_text="Reviewer").first
-            expect(reviewer_row).to_contain_text("codex.review_child")
+            expect(reviewer_row.get_by_role("combobox")).to_have_value(re.compile(r"codex\.review_child"))
             reviewer_row.get_by_role("button", name="Restore inheritance", exact=True).click()
             inherited_roles = detail.locator("details").filter(has_text=re.compile(r"Inherited roles")).first
             if inherited_roles.get_attribute("open") is None:
@@ -2630,7 +2640,8 @@ def test_responsive_team_family_journey(
             expect(detail).to_contain_text("browser_family_strongest_worker")
 
             # A failed CAS write must keep the edited draft in the browser.
-            display_input = detail.locator("input").first
+            detail.get_by_text("Name and identity", exact=True).click()
+            display_input = detail.get_by_label("Display name", exact=True)
             conflict_value = "Conflict retained family"
             display_input.fill(conflict_value)
             display_input.press("Tab")
@@ -2662,6 +2673,12 @@ def test_responsive_team_family_journey(
             # Legacy conversion is preview-only until the explicit draft action.
             select_family(page, "Legacy base")
             detail = page.locator(".team-family-detail")
+            identity = detail.locator("details").filter(has=page.get_by_text("Name and identity", exact=True))
+            if identity.get_attribute("open") is not None:
+                identity.locator("summary").click()
+            detail.scroll_into_view_if_needed()
+            page.screenshot(path=str(tmp_path / "teams-legacy-default.png"), full_page=True)
+            detail.get_by_text("Convert to family…", exact=True).click()
             detail.get_by_role("button", name="Preview convert to family", exact=True).click()
             conversion = page.get_by_role("region", name="Legacy conversion preview", exact=True)
             conversion.wait_for()
@@ -2681,7 +2698,7 @@ def test_responsive_team_family_journey(
             # Family detail remains document-owned and usable across themes and zoom.
             select_family(page, family_label)
             _assert_document_moves(page)
-            focus_target = page.locator(".team-family-detail input").first
+            focus_target = page.get_by_role("combobox", name="Worker", exact=True)
             focus_target.focus()
             focus_target.press("Tab")
             assert page.evaluate("() => document.activeElement !== null")
@@ -2708,7 +2725,8 @@ def test_responsive_team_family_journey(
                     expect(page.locator(".team-families-settings .sidebar-editor-detail")).not_to_be_hidden()
                 select_family(page, family_label)
                 _assert_header_and_flow(page)
-            short_input = page.locator(".team-family-detail input").first
+            page.get_by_text("Name and identity", exact=True).click()
+            short_input = page.get_by_label("Display name", exact=True)
             short_input.focus()
             assert short_input.evaluate("element => document.activeElement === element")
             short_input.fill(f"{family_label} short")

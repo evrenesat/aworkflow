@@ -1,5 +1,18 @@
 # DEVLOG
 
+## 2026-09-23 — Settings effective-value hierarchy
+
+- Settings now leads with populated effective profiles, role assignments,
+  workflow defaults, and existing content editors. Creation, inheritance,
+  conversion, password, installation, and raw configuration controls remain
+  available behind labelled native disclosures.
+- Team family rows retain stable IDs and inherited-role provenance while the
+  existing GlobalSettings draft/save/conflict/Undo coordinator and retained
+  Skills editor remain the only state owners across tabs.
+- Settings unit tests, the full web suite/build, responsive Settings/team
+  journeys, and Chromium/WebKit light/dark desktop/mobile captures passed
+  against the frozen reference checksum.
+
 ## 2026-09-22 — Add compact run navigation and anchored previews
 
 - Mapped the approved calm-workspace shell tokens into light/dark themes while
