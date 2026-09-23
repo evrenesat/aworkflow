@@ -2,7 +2,7 @@ import { act, fireEvent, render, screen, waitFor, within } from '@testing-librar
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { ApiError } from '../api'
 import * as api from '../api'
-import type { RunContext, RunProgress, RunProgressDetail, RunProgressSummary, WorktreePreflight } from '../types'
+import type { RunContext, RunProgress, RunProgressDetail, RunProgressSummary, StartRunResponse, WorktreePreflight } from '../types'
 import { RunDashboard, type RunSelectionChange } from './RunDashboard'
 import { App } from '../App'
 
@@ -323,6 +323,13 @@ async function startRun() {
   fireEvent.click(review)
   const finalStart = screen.queryByRole('button', { name: 'Start run', exact: true })
   if (finalStart) fireEvent.click(finalStart)
+}
+
+async function openFinalStartReview() {
+  await openNewRun()
+  choose('Run plan', 'plans/in-progress/demo.md')
+  choose('Run workflow', 'managed')
+  return waitForPreflightReady()
 }
 
 function startActionButton(): HTMLElement {
@@ -1013,6 +1020,376 @@ describe('RunDashboard', () => {
       expect.objectContaining({ plan_path: alternatePlan.path, workflow_name: 'managed' }),
       expect.any(String),
     ))
+  })
+
+  it('cancels a held final revalidation without submitting a start', async () => {
+    const heldConfig = deferred<typeof committedConfig>()
+    vi.mocked(api.getGlobalConfig)
+      .mockResolvedValueOnce(committedConfig)
+      .mockReturnValueOnce(heldConfig.promise)
+    vi.mocked(api.listControlPlaneRuns).mockResolvedValue({ runs: [], next_cursor: null, schema_version: 1 })
+    vi.mocked(api.startControlPlaneRun).mockResolvedValue({
+      result: { run_id: 'run-started', created: true, status: 'running', schema_version: 1, manifest_path: null, reason: null, restarted_from_run_id: null },
+      startup_question: null,
+    })
+    renderDashboard()
+
+    const finalStart = await openFinalStartReview()
+    fireEvent.click(finalStart)
+    await waitFor(() => expect(api.getGlobalConfig).toHaveBeenCalledTimes(2))
+    expect((screen.getByRole('button', { name: 'Cancel review', exact: true }) as HTMLButtonElement).disabled).toBe(false)
+    expect((screen.getByRole('button', { name: 'Checking…', exact: true }) as HTMLButtonElement).disabled).toBe(true)
+
+    fireEvent.click(screen.getByRole('button', { name: 'Cancel review', exact: true }))
+    await waitFor(() => expect(screen.queryByRole('region', { name: 'Review start', exact: true })).toBeNull())
+    await act(async () => {
+      heldConfig.resolve(committedConfig)
+      await heldConfig.promise
+    })
+    expect(api.startControlPlaneRun).not.toHaveBeenCalled()
+  })
+
+  it('keeps a replacement identical review alive after the old read resolves', async () => {
+    const heldConfig = deferred<typeof committedConfig>()
+    vi.mocked(api.getGlobalConfig)
+      .mockResolvedValueOnce(committedConfig)
+      .mockReturnValueOnce(heldConfig.promise)
+    vi.mocked(api.listControlPlaneRuns).mockResolvedValue({ runs: [], next_cursor: null, schema_version: 1 })
+    renderDashboard()
+
+    const finalStart = await openFinalStartReview()
+    fireEvent.click(finalStart)
+    await waitFor(() => expect(api.getGlobalConfig).toHaveBeenCalledTimes(2))
+    fireEvent.click(screen.getByRole('button', { name: 'Cancel review', exact: true }))
+    await waitFor(() => expect(screen.queryByRole('region', { name: 'Review start', exact: true })).toBeNull())
+
+    fireEvent.click(screen.getByRole('button', { name: 'Review start…', exact: true }))
+    await screen.findByRole('region', { name: 'Review start', exact: true })
+    await act(async () => {
+      heldConfig.resolve(committedConfig)
+      await heldConfig.promise
+    })
+
+    expect(screen.getByRole('region', { name: 'Review start', exact: true })).toBeDefined()
+    expect(screen.queryByText(/Could not revalidate the committed launch configuration/)).toBeNull()
+    expect(api.startControlPlaneRun).not.toHaveBeenCalled()
+  })
+
+  it('drops a held confirmation when the mounted dashboard becomes hidden', async () => {
+    const heldConfig = deferred<typeof committedConfig>()
+    vi.mocked(api.getGlobalConfig)
+      .mockResolvedValueOnce(committedConfig)
+      .mockReturnValueOnce(heldConfig.promise)
+    vi.mocked(api.listControlPlaneRuns).mockResolvedValue({ runs: [], next_cursor: null, schema_version: 1 })
+    vi.mocked(api.startControlPlaneRun).mockResolvedValue({ result: null, startup_question: null })
+    const props = { projectId: 'control-project', initialPlanPath: null, onInitialPlanHandled: vi.fn(), onOpenSettings: vi.fn() }
+    const view = render(<RunDashboard {...props} />)
+
+    const finalStart = await openFinalStartReview()
+    fireEvent.click(finalStart)
+    await waitFor(() => expect(api.getGlobalConfig).toHaveBeenCalledTimes(2))
+    view.rerender(<RunDashboard {...props} visible={false} />)
+    await waitFor(() => expect(screen.queryByRole('region', { name: 'Review start', exact: true })).toBeNull())
+    await act(async () => {
+      heldConfig.resolve(committedConfig)
+      await heldConfig.promise
+    })
+    expect(api.startControlPlaneRun).not.toHaveBeenCalled()
+  })
+
+  it('drops a held confirmation on unmount without a stale update', async () => {
+    const heldConfig = deferred<typeof committedConfig>()
+    vi.mocked(api.getGlobalConfig)
+      .mockResolvedValueOnce(committedConfig)
+      .mockReturnValueOnce(heldConfig.promise)
+    vi.mocked(api.listControlPlaneRuns).mockResolvedValue({ runs: [], next_cursor: null, schema_version: 1 })
+    vi.mocked(api.startControlPlaneRun).mockResolvedValue({ result: null, startup_question: null })
+    const view = renderDashboardNode(dashboardNode())
+
+    const finalStart = await openFinalStartReview()
+    fireEvent.click(finalStart)
+    await waitFor(() => expect(api.getGlobalConfig).toHaveBeenCalledTimes(2))
+    view.unmount()
+    await act(async () => {
+      heldConfig.resolve(committedConfig)
+      await heldConfig.promise
+    })
+    expect(api.startControlPlaneRun).not.toHaveBeenCalled()
+  })
+
+  it('drops a held confirmation when the page context changes', async () => {
+    const heldConfig = deferred<typeof committedConfig>()
+    vi.mocked(api.getGlobalConfig)
+      .mockResolvedValueOnce(committedConfig)
+      .mockReturnValueOnce(heldConfig.promise)
+    vi.mocked(api.listControlPlaneRuns).mockResolvedValue({ runs: [], next_cursor: null, schema_version: 1 })
+    vi.mocked(api.startControlPlaneRun).mockResolvedValue({ result: null, startup_question: null })
+    const props = { projectId: 'control-project', initialPlanPath: null, onInitialPlanHandled: vi.fn(), onOpenSettings: vi.fn() }
+    const view = render(<RunDashboard {...props} />)
+
+    const finalStart = await openFinalStartReview()
+    fireEvent.click(finalStart)
+    await waitFor(() => expect(api.getGlobalConfig).toHaveBeenCalledTimes(2))
+    view.rerender(<RunDashboard {...props} page="runs" />)
+    await waitFor(() => expect(screen.queryByRole('region', { name: 'Review start', exact: true })).toBeNull())
+    await act(async () => {
+      heldConfig.resolve(committedConfig)
+      await heldConfig.promise
+    })
+    expect(api.startControlPlaneRun).not.toHaveBeenCalled()
+  })
+
+  it('drops a held confirmation when the project changes', async () => {
+    const heldConfig = deferred<typeof committedConfig>()
+    vi.mocked(api.getGlobalConfig)
+      .mockResolvedValueOnce(committedConfig)
+      .mockReturnValueOnce(heldConfig.promise)
+    vi.mocked(api.listControlPlaneRuns).mockResolvedValue({ runs: [], next_cursor: null, schema_version: 1 })
+    vi.mocked(api.startControlPlaneRun).mockResolvedValue({ result: null, startup_question: null })
+    const props = { projectId: 'control-project', initialPlanPath: null, onInitialPlanHandled: vi.fn(), onOpenSettings: vi.fn() }
+    const view = render(<RunDashboard {...props} />)
+
+    const finalStart = await openFinalStartReview()
+    fireEvent.click(finalStart)
+    await waitFor(() => expect(api.getGlobalConfig).toHaveBeenCalledTimes(2))
+    view.rerender(<RunDashboard {...props} projectId="other-project" />)
+    await act(async () => {
+      heldConfig.resolve(committedConfig)
+      await heldConfig.promise
+    })
+    expect(api.startControlPlaneRun).not.toHaveBeenCalled()
+  })
+
+  it('drops a held confirmation when the launch draft changes', async () => {
+    const heldConfig = deferred<typeof committedConfig>()
+    vi.mocked(api.getGlobalConfig)
+      .mockResolvedValueOnce(committedConfig)
+      .mockReturnValueOnce(heldConfig.promise)
+    vi.mocked(api.listControlPlaneRuns).mockResolvedValue({ runs: [], next_cursor: null, schema_version: 1 })
+    vi.mocked(api.startControlPlaneRun).mockResolvedValue({ result: null, startup_question: null })
+    renderDashboard()
+
+    const finalStart = await openFinalStartReview()
+    fireEvent.click(finalStart)
+    await waitFor(() => expect(api.getGlobalConfig).toHaveBeenCalledTimes(2))
+    openAdvanced()
+    fireEvent.change(screen.getByLabelText('Run max turns'), { target: { value: '7' } })
+    await waitFor(() => expect(screen.getByText('Choices changed — close this review and review again.')).toBeDefined())
+    await act(async () => {
+      heldConfig.resolve(committedConfig)
+      await heldConfig.promise
+    })
+    expect(api.startControlPlaneRun).not.toHaveBeenCalled()
+    expect(screen.getByRole('region', { name: 'Review start', exact: true })).toBeDefined()
+  })
+
+  it('does not let a stale changed-default projection replace a new review', async () => {
+    const changedConfig = { ...committedConfig, revision: 'b'.repeat(64) }
+    const heldProjection = deferred<typeof emptyProjection>()
+    let projectionReads = 0
+    vi.mocked(api.getGlobalConfig)
+      .mockResolvedValueOnce(committedConfig)
+      .mockResolvedValueOnce(changedConfig)
+    vi.mocked(api.postGlobalConfigForm).mockImplementation(async () => {
+      projectionReads += 1
+      return projectionReads === 1 ? emptyProjection : heldProjection.promise
+    })
+    vi.mocked(api.listControlPlaneRuns).mockResolvedValue({ runs: [], next_cursor: null, schema_version: 1 })
+    renderDashboard()
+
+    const finalStart = await openFinalStartReview()
+    fireEvent.click(finalStart)
+    await waitFor(() => expect(api.postGlobalConfigForm).toHaveBeenCalledTimes(2))
+    fireEvent.click(screen.getByRole('button', { name: 'Cancel review', exact: true }))
+    await waitFor(() => expect(screen.queryByRole('region', { name: 'Review start', exact: true })).toBeNull())
+    fireEvent.click(screen.getByRole('button', { name: 'Review start…', exact: true }))
+    await screen.findByRole('region', { name: 'Review start', exact: true })
+
+    await act(async () => {
+      heldProjection.resolve({ ...emptyProjection, server_default_max_turns: 42 })
+      await heldProjection.promise
+    })
+    expect(screen.getByRole('region', { name: 'Review start', exact: true })).toBeDefined()
+    expect(screen.getByText('Server default: 15.')).toBeDefined()
+    expect(api.startControlPlaneRun).not.toHaveBeenCalled()
+  })
+
+  it('does not show a stale revalidation error in a replacement review', async () => {
+    const heldConfig = deferred<typeof committedConfig>()
+    vi.mocked(api.getGlobalConfig)
+      .mockResolvedValueOnce(committedConfig)
+      .mockReturnValueOnce(heldConfig.promise)
+    vi.mocked(api.listControlPlaneRuns).mockResolvedValue({ runs: [], next_cursor: null, schema_version: 1 })
+    renderDashboard()
+
+    const finalStart = await openFinalStartReview()
+    fireEvent.click(finalStart)
+    await waitFor(() => expect(api.getGlobalConfig).toHaveBeenCalledTimes(2))
+    fireEvent.click(screen.getByRole('button', { name: 'Cancel review', exact: true }))
+    await waitFor(() => expect(screen.queryByRole('region', { name: 'Review start', exact: true })).toBeNull())
+    fireEvent.click(screen.getByRole('button', { name: 'Review start…', exact: true }))
+    await screen.findByRole('region', { name: 'Review start', exact: true })
+    await act(async () => {
+      heldConfig.reject(new Error('stale configuration failure'))
+      await Promise.resolve()
+    })
+
+    expect(screen.getByRole('region', { name: 'Review start', exact: true })).toBeDefined()
+    expect(screen.queryByText(/stale configuration failure/)).toBeNull()
+    expect(api.startControlPlaneRun).not.toHaveBeenCalled()
+  })
+
+  it('serializes double confirmation and submits one valid unchanged start', async () => {
+    const heldConfig = deferred<typeof committedConfig>()
+    vi.mocked(api.getGlobalConfig)
+      .mockResolvedValueOnce(committedConfig)
+      .mockReturnValueOnce(heldConfig.promise)
+    vi.mocked(api.listControlPlaneRuns).mockResolvedValue({ runs: [], next_cursor: null, schema_version: 1 })
+    vi.mocked(api.startControlPlaneRun).mockResolvedValue({
+      result: { run_id: 'run-started', created: true, status: 'running', schema_version: 1, manifest_path: null, reason: null, restarted_from_run_id: null },
+      startup_question: null,
+    })
+    renderDashboard()
+
+    const finalStart = await openFinalStartReview()
+    fireEvent.click(finalStart)
+    fireEvent.click(finalStart)
+    await waitFor(() => expect(api.getGlobalConfig).toHaveBeenCalledTimes(2))
+    expect(api.startControlPlaneRun).not.toHaveBeenCalled()
+    await act(async () => {
+      heldConfig.resolve(committedConfig)
+      await heldConfig.promise
+    })
+    await waitFor(() => expect(api.startControlPlaneRun).toHaveBeenCalledTimes(1))
+  })
+
+  it('releases a submitted start after leaving New run before success returns', async () => {
+    const heldStart = deferred<StartRunResponse>()
+    vi.mocked(api.listControlPlaneRuns).mockResolvedValue({ runs: [], next_cursor: null, schema_version: 1 })
+    vi.mocked(api.startControlPlaneRun).mockReturnValue(heldStart.promise)
+    const success: StartRunResponse = {
+      result: { run_id: 'run-started', created: true, status: 'running', schema_version: 1, manifest_path: null, reason: null, restarted_from_run_id: null },
+      startup_question: null,
+    }
+    const props = { projectId: 'control-project', initialPlanPath: null, onInitialPlanHandled: vi.fn(), onOpenSettings: vi.fn() }
+    const view = render(<RunDashboard {...props} />)
+
+    const finalStart = await openFinalStartReview()
+    fireEvent.click(finalStart)
+    await waitFor(() => expect(api.startControlPlaneRun).toHaveBeenCalledTimes(1))
+    view.rerender(<RunDashboard {...props} page="runs" />)
+    await screen.findByRole('button', { name: 'New run', exact: true })
+
+    await act(async () => {
+      heldStart.resolve(success)
+      await heldStart.promise
+    })
+    view.rerender(<RunDashboard {...props} page="new-run" />)
+    await waitFor(() => expect(screen.getByRole('button', { name: 'Review start…', exact: true })).toHaveProperty('disabled', false))
+    expect(screen.queryByText(/Start request created run run-started/)).toBeNull()
+  })
+
+  it('releases a submitted start after hiding the dashboard and preserves its retry key', async () => {
+    const heldStart = deferred<StartRunResponse>()
+    vi.mocked(api.listControlPlaneRuns).mockResolvedValue({ runs: [], next_cursor: null, schema_version: 1 })
+    vi.mocked(api.startControlPlaneRun)
+      .mockReturnValueOnce(heldStart.promise)
+      .mockRejectedValueOnce(new Error('retry response lost'))
+    const props = { projectId: 'control-project', initialPlanPath: null, onInitialPlanHandled: vi.fn(), onOpenSettings: vi.fn() }
+    const view = render(<RunDashboard {...props} />)
+
+    const finalStart = await openFinalStartReview()
+    fireEvent.click(finalStart)
+    await waitFor(() => expect(api.startControlPlaneRun).toHaveBeenCalledTimes(1))
+    const originalRetryKey = vi.mocked(api.startControlPlaneRun).mock.calls[0][2]
+    view.rerender(<RunDashboard {...props} visible={false} />)
+    await waitFor(() => expect(screen.queryByRole('region', { name: 'Review start', exact: true })).toBeNull())
+
+    await act(async () => {
+      heldStart.reject(new Error('response lost'))
+      await heldStart.promise.catch(() => undefined)
+    })
+    view.rerender(<RunDashboard {...props} visible />)
+    await waitFor(() => expect(screen.getByRole('button', { name: 'Review start…', exact: true })).toHaveProperty('disabled', false))
+    expect(screen.queryByText('response lost')).toBeNull()
+
+    await startRun()
+    await waitFor(() => expect(api.startControlPlaneRun).toHaveBeenCalledTimes(2))
+    expect(vi.mocked(api.startControlPlaneRun).mock.calls[1][2]).toBe(originalRetryKey)
+  })
+
+  it('releases a submitted start after a project change and preserves its retry key', async () => {
+    const heldStart = deferred<StartRunResponse>()
+    const otherProject = { project_id: 'other-project', root: '/workspace/beta', schema_version: 1 }
+    vi.mocked(api.listControlPlaneProjects).mockResolvedValue([project, otherProject])
+    vi.mocked(api.listControlPlaneRuns).mockResolvedValue({ runs: [], next_cursor: null, schema_version: 1 })
+    vi.mocked(api.startControlPlaneRun)
+      .mockReturnValueOnce(heldStart.promise)
+      .mockRejectedValueOnce(new Error('retry after project change'))
+    const props = { projectId: 'control-project', initialPlanPath: null, onInitialPlanHandled: vi.fn(), onOpenSettings: vi.fn() }
+    const view = render(<RunDashboard {...props} />)
+
+    const finalStart = await openFinalStartReview()
+    fireEvent.click(finalStart)
+    await waitFor(() => expect(api.startControlPlaneRun).toHaveBeenCalledTimes(1))
+    const originalRetryKey = vi.mocked(api.startControlPlaneRun).mock.calls[0][2]
+    view.rerender(<RunDashboard {...props} projectId="other-project" />)
+
+    await act(async () => {
+      heldStart.reject(new Error('response lost in old project'))
+      await heldStart.promise.catch(() => undefined)
+    })
+    view.rerender(<RunDashboard {...props} projectId="control-project" />)
+    await waitFor(() => {
+      expect(screen.getByText('No uncommitted changes detected.')).toBeDefined()
+      expect(screen.getByRole('button', { name: 'Review start…', exact: true })).toHaveProperty('disabled', false)
+    })
+    expect(screen.queryByText('response lost in old project')).toBeNull()
+
+    await startRun()
+    await waitFor(() => expect(api.startControlPlaneRun).toHaveBeenCalledTimes(2))
+    expect(vi.mocked(api.startControlPlaneRun).mock.calls[1][2]).toBe(originalRetryKey)
+  })
+
+  it('replays a stale dirty-worktree question with its original key after visibility returns', async () => {
+    const heldStart = deferred<StartRunResponse>()
+    const dirtyQuestionResponse: StartRunResponse = {
+      result: null,
+      startup_question: {
+        question_id: 'question-hidden',
+        kind: 'confirm_worktree_dirty',
+        message: 'Worktree became dirty while hidden.',
+        options: {},
+        choices: [],
+        run_id: 'pending-run',
+        schema_version: 1,
+      },
+    }
+    vi.mocked(api.listControlPlaneRuns).mockResolvedValue({ runs: [], next_cursor: null, schema_version: 1 })
+    vi.mocked(api.startControlPlaneRun)
+      .mockReturnValueOnce(heldStart.promise)
+      .mockResolvedValueOnce(dirtyQuestionResponse)
+    const props = { projectId: 'control-project', initialPlanPath: null, onInitialPlanHandled: vi.fn(), onOpenSettings: vi.fn() }
+    const view = render(<RunDashboard {...props} />)
+
+    const finalStart = await openFinalStartReview()
+    fireEvent.click(finalStart)
+    await waitFor(() => expect(api.startControlPlaneRun).toHaveBeenCalledTimes(1))
+    const originalRetryKey = vi.mocked(api.startControlPlaneRun).mock.calls[0][2]
+    view.rerender(<RunDashboard {...props} visible={false} />)
+
+    await act(async () => {
+      heldStart.resolve(dirtyQuestionResponse)
+      await heldStart.promise
+    })
+    view.rerender(<RunDashboard {...props} visible />)
+    await waitFor(() => expect(screen.getByRole('button', { name: 'Review start…', exact: true })).toHaveProperty('disabled', false))
+    expect(screen.queryByText('Worktree became dirty while hidden.')).toBeNull()
+
+    await startRun()
+    await waitFor(() => expect(api.startControlPlaneRun).toHaveBeenCalledTimes(2))
+    expect(vi.mocked(api.startControlPlaneRun).mock.calls[1][2]).toBe(originalRetryKey)
+    await screen.findByText('Worktree became dirty while hidden.')
   })
 
   it('answers confirmation startup questions with booleans for every question kind', async () => {

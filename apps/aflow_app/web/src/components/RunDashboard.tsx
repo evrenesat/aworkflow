@@ -137,6 +137,15 @@ interface WorktreePreflightState {
   identity: string
 }
 
+interface StartConfirmationToken {
+  generation: number
+  operationId: number
+  reviewIdentity: string
+  launchIdentity: string
+  projectId: string
+  submitted: boolean
+}
+
 interface RoleResolution {
   role: string
   selector: string | null
@@ -226,32 +235,31 @@ function requestKey(prefix: string): string {
   return `${prefix}-${identifier}`
 }
 
-interface PendingWriteKey {
-  intent: string
-  key: string
-}
-
 /**
  * Holds an idempotency key only while its write outcome is uncertain.  Keeping
  * this state in a ref makes retries survive renders without persisting either
  * bearer material or write metadata in browser storage.
  */
 function usePendingWriteKeys() {
-  const pendingKeys = useRef(new Map<string, PendingWriteKey>())
+  const pendingKeys = useRef(new Map<string, Map<string, string>>())
 
   const getKey = useCallback((operation: string, intent: Record<string, unknown>): string => {
     const serializedIntent = JSON.stringify(intent)
-    const pending = pendingKeys.current.get(operation)
-    if (pending?.intent === serializedIntent) return pending.key
+    const operationKeys = pendingKeys.current.get(operation) ?? new Map<string, string>()
+    const pending = operationKeys.get(serializedIntent)
+    if (pending) return pending
 
     const key = requestKey(operation)
-    pendingKeys.current.set(operation, { intent: serializedIntent, key })
+    operationKeys.set(serializedIntent, key)
+    pendingKeys.current.set(operation, operationKeys)
     return key
   }, [])
 
   const clearKey = useCallback((operation: string, intent: Record<string, unknown>) => {
-    const pending = pendingKeys.current.get(operation)
-    if (pending?.intent === JSON.stringify(intent)) pendingKeys.current.delete(operation)
+    const operationKeys = pendingKeys.current.get(operation)
+    if (!operationKeys) return
+    operationKeys.delete(JSON.stringify(intent))
+    if (operationKeys.size === 0) pendingKeys.current.delete(operation)
   }, [])
 
   const clearAll = useCallback(() => {
@@ -1111,6 +1119,16 @@ export function RunDashboard({ visible = true, page, onNewRun, onCancelNewRun, o
   const [failedRequestId, setFailedRequestId] = useState<string | null>(null)
   const [advancedOpen, setAdvancedOpen] = useState(false)
   const [startReviewIdentity, setStartReviewIdentity] = useState<string | null>(null)
+  const [startRevalidationPending, setStartRevalidationPending] = useState(false)
+  const startReviewIdentityRef = useRef<string | null>(null)
+  const startReviewGenerationRef = useRef(0)
+  const startReviewContextRef = useRef<string | null>(null)
+  const startConfirmationRef = useRef<StartConfirmationToken | null>(null)
+  const startSubmittedOperationRef = useRef<StartConfirmationToken | null>(null)
+  const startConfirmationSequenceRef = useRef(0)
+  const startReviewProjectRef = useRef(projectId)
+  const startReviewVisibleRef = useRef(visible)
+  const startReviewPageRef = useRef(newRunPage)
   const [technicalOpenByRun, setTechnicalOpenByRun] = useState<Record<string, boolean>>({})
   const [runChangesOpenByRun, setRunChangesOpenByRun] = useState<Record<string, boolean>>({})
   const technicalId = useId()
@@ -1118,8 +1136,18 @@ export function RunDashboard({ visible = true, page, onNewRun, onCancelNewRun, o
   const [copyKind, setCopyKind] = useState<'link' | 'run-id' | null>(null)
 
   useEffect(() => {
-    if (!newRunPage) setStartReviewIdentity(null)
-  }, [newRunPage])
+    if (newRunPage && visible) return
+    startReviewGenerationRef.current += 1
+    startConfirmationRef.current = null
+    startReviewIdentityRef.current = null
+    setStartReviewIdentity(null)
+    setStartRevalidationPending(false)
+  }, [newRunPage, visible])
+  useEffect(() => () => {
+    startReviewGenerationRef.current += 1
+    startConfirmationRef.current = null
+    startSubmittedOperationRef.current = null
+  }, [])
   const copyRequestRef = useRef(0)
   const [refreshNonce, setRefreshNonce] = useState(0)
   const selectedRunRef = useRef<string | null>(selectedRunId)
@@ -1153,7 +1181,7 @@ export function RunDashboard({ visible = true, page, onNewRun, onCancelNewRun, o
   const onRunSelectionChangeRef = useRef(onRunSelectionChange)
   onRunSelectionChangeRef.current = onRunSelectionChange
   missingRunRef.current = missingRunId
-  const { getKey: getPendingWriteKey, clearKey: clearPendingWriteKey, clearAll: clearPendingWriteKeys } = usePendingWriteKeys()
+  const { getKey: getPendingWriteKey, clearKey: clearPendingWriteKey } = usePendingWriteKeys()
 
   const selectedRun = useMemo(
     () => runs.find((run) => run.run_id === selectedRunId) ?? null,
@@ -1297,10 +1325,6 @@ export function RunDashboard({ visible = true, page, onNewRun, onCancelNewRun, o
     setRecoveryOpen(false)
     setRecoverySelector('')
   }, [selectedRunId])
-
-  useEffect(() => {
-    clearPendingWriteKeys()
-  }, [projectId, clearPendingWriteKeys])
 
   useEffect(() => {
     if (!selectedRun || controlsForRunRef.current === selectedRun.run_id) return
@@ -1918,7 +1942,8 @@ export function RunDashboard({ visible = true, page, onNewRun, onCancelNewRun, o
     }
   }
 
-  async function handleStart() {
+  async function handleStart(confirmationToken?: StartConfirmationToken) {
+    if (confirmationToken && !isCurrentStartConfirmation(confirmationToken)) return
     if (startupQuestion?.kind === 'confirm_worktree_dirty') {
       if (startDisabled || !dirtyWorktreeConfirmed) return
       await handleStartupAnswer(true)
@@ -1931,43 +1956,75 @@ export function RunDashboard({ visible = true, page, onNewRun, onCancelNewRun, o
     const startRequest = startRequestFromDraft()
     const intent = { project_id: projectId, ...startRequest }
     try {
+      if (confirmationToken) {
+        if (!isCurrentStartConfirmation(confirmationToken)) return
+        confirmationToken.submitted = true
+        startSubmittedOperationRef.current = confirmationToken
+        // The review is no longer cancellable once the mutation is sent. The
+        // token remains owned until the response is reconciled so an older
+        // operation cannot clear a newer review or pending state.
+        setStartReviewIdentity(null)
+      }
       setBusyAction('start')
       clearActionFeedback()
       setFeedback(null)
       // A new admission attempt owns its own failure link. A prior reserved
       // request must not remain attached to a later rejection without a run ID.
       const response = await api.startControlPlaneRun(projectId, startRequest, getPendingWriteKey('start', intent))
-      clearPendingWriteKey('start', intent)
-      await handleStartResponse(response, 'Start request')
+      let reconciled = false
+      if (confirmationToken) {
+        if (!ownsSubmittedStart(confirmationToken) || !isCurrentSubmittedStartContext(confirmationToken)) return
+        reconciled = await handleStartResponse(response, 'Start request', confirmationToken)
+      } else {
+        reconciled = await handleStartResponse(response, 'Start request')
+      }
+      if (reconciled) clearPendingWriteKey('start', intent)
     } catch (startError) {
+      if (confirmationToken && (!ownsSubmittedStart(confirmationToken) || !isCurrentSubmittedStartContext(confirmationToken))) {
+        if (startError instanceof ApiError && typeof startError.detail.run_id === 'string') {
+          clearPendingWriteKey('start', intent)
+        }
+        return
+      }
       setActionError(errorMessage(startError, 'Failed to start run'))
       if (startError instanceof ApiError && typeof startError.detail.run_id === 'string') {
         setFailedRequestId(startError.detail.run_id)
         clearPendingWriteKey('start', intent)
       }
     } finally {
-      setBusyAction(null)
+      if (!confirmationToken) {
+        setBusyAction(null)
+      } else if (startSubmittedOperationRef.current?.operationId === confirmationToken.operationId) {
+        startSubmittedOperationRef.current = null
+        setBusyAction((current) => current === 'start' ? null : current)
+      }
     }
   }
 
-  async function handleStartResponse(response: StartRunResponse, action: string) {
+  async function handleStartResponse(response: StartRunResponse, action: string, submittedToken?: StartConfirmationToken): Promise<boolean> {
+    const canReconcile = () => submittedToken === undefined || isCurrentSubmittedStartContext(submittedToken)
+    if (!canReconcile()) return false
     if (response.startup_question) {
-      setStartupQuestion(response.startup_question)
       if (response.startup_question.kind === 'confirm_worktree_dirty') {
         setDirtyWorktreeConfirmed(false)
         await refreshPreflight()
+        if (!canReconcile()) return false
       }
+      if (!canReconcile()) return false
+      setStartupQuestion(response.startup_question)
       setFeedback(`${action} is awaiting a startup answer. No workflow has been started.`)
-      return
+      return true
     }
-    if (!response.result) return
+    if (!response.result) return true
     const result = response.result
     if (result.status === 'needs_attention') {
+      if (!canReconcile()) return false
       setActionError(result.reason ?? 'Startup did not complete; the original error was not recorded.')
       setFailedRequestId(result.run_id)
       await loadDashboard(projectId)
-      return
+      return canReconcile()
     }
+    if (!canReconcile()) return false
     setFailedRequestId(null)
     setStartupQuestion(null)
     const lineage = result.restarted_from_run_id
@@ -1978,11 +2035,13 @@ export function RunDashboard({ visible = true, page, onNewRun, onCancelNewRun, o
       : `${action} replay returned existing run ${result.run_id}; no duplicate was created.`)
     setMissingRunId(null)
     await loadDashboard(projectId)
+    if (!canReconcile()) return false
     setSelectedRunId(result.run_id)
     setLocalPage('runs')
     onRunStarted?.(result.run_id)
     // Passive URL update: the dashboard link now identifies the returned run.
     onRunSelectionChangeRef.current?.({ runId: result.run_id, userInitiated: false })
+    return true
   }
 
   async function handleStartupAnswer(answer: string | number | boolean) {
@@ -2635,6 +2694,52 @@ export function RunDashboard({ visible = true, page, onNewRun, onCancelNewRun, o
   const startReviewReady = startReviewIdentity !== null && startReviewIdentity === currentLaunchIdentity
   const currentLaunchIdentityRef = useRef<string | null>(null)
   currentLaunchIdentityRef.current = currentLaunchIdentity
+  startReviewIdentityRef.current = startReviewIdentity
+  startReviewProjectRef.current = projectId
+  startReviewVisibleRef.current = visible
+  startReviewPageRef.current = newRunPage
+  const startReviewContext = JSON.stringify([projectId, visible, newRunPage, currentLaunchIdentity])
+  if (startReviewContextRef.current === null) {
+    startReviewContextRef.current = startReviewContext
+  } else if (startReviewContextRef.current !== startReviewContext) {
+    startReviewContextRef.current = startReviewContext
+    startReviewGenerationRef.current += 1
+    startConfirmationRef.current = null
+  }
+  const startRevalidationPendingForRender = startRevalidationPending && startConfirmationRef.current !== null
+
+  function isCurrentStartConfirmation(token: StartConfirmationToken): boolean {
+    return startConfirmationRef.current?.operationId === token.operationId
+      && startReviewGenerationRef.current === token.generation
+      && startReviewProjectRef.current === token.projectId
+      && startReviewVisibleRef.current
+      && startReviewPageRef.current
+      && currentLaunchIdentityRef.current === token.launchIdentity
+      && !token.submitted
+      && startReviewIdentityRef.current === token.reviewIdentity
+  }
+
+  function ownsSubmittedStart(token: StartConfirmationToken): boolean {
+    return startSubmittedOperationRef.current?.operationId === token.operationId
+      && token.submitted
+  }
+
+  function isCurrentSubmittedStartContext(token: StartConfirmationToken): boolean {
+    return ownsSubmittedStart(token)
+      && startReviewGenerationRef.current === token.generation
+      && startReviewProjectRef.current === token.projectId
+      && startReviewVisibleRef.current
+      && startReviewPageRef.current
+      && currentLaunchIdentityRef.current === token.launchIdentity
+  }
+
+  function invalidateStartReview() {
+    startReviewGenerationRef.current += 1
+    startConfirmationRef.current = null
+    startReviewIdentityRef.current = null
+    setStartReviewIdentity(null)
+    setStartRevalidationPending(false)
+  }
 
   function openStartReview() {
     // A dirty-worktree startup question is an answer to an already allocated
@@ -2644,50 +2749,74 @@ export function RunDashboard({ visible = true, page, onNewRun, onCancelNewRun, o
       return
     }
     if (startDisabled || (restartSource !== null && restartPhase !== null)) return
+    startReviewGenerationRef.current += 1
+    startConfirmationRef.current = null
+    startReviewIdentityRef.current = currentLaunchIdentity
+    setStartRevalidationPending(false)
     setStartReviewIdentity(currentLaunchIdentity)
   }
 
   function cancelStartReview() {
-    setStartReviewIdentity(null)
+    if (busyAction === 'start') return
+    invalidateStartReview()
   }
 
   async function confirmStart() {
-    if (!startReviewIdentity) return
+    const reviewIdentity = startReviewIdentityRef.current
+    if (!reviewIdentity || startConfirmationRef.current !== null) return
     if (!startReviewReady) {
-      setStartReviewIdentity(null)
+      invalidateStartReview()
       setActionError('Launch choices changed while the review was open. Review the current choices before starting.')
       return
     }
     if (!committed) {
-      setStartReviewIdentity(null)
+      invalidateStartReview()
       setActionError('The committed launch configuration is unavailable. Review the current choices before starting.')
       return
     }
+    const token: StartConfirmationToken = {
+      generation: startReviewGenerationRef.current,
+      operationId: ++startConfirmationSequenceRef.current,
+      reviewIdentity,
+      launchIdentity: currentLaunchIdentity,
+      projectId,
+      submitted: false,
+    }
+    startConfirmationRef.current = token
+    setStartRevalidationPending(true)
     try {
       const latestPair = await api.getGlobalConfig()
+      if (!isCurrentStartConfirmation(token)) return
       if (latestPair.revision !== committed.revision) {
         const latestProjection = await api.postGlobalConfigForm({
           aflow_toml: latestPair.aflow_toml,
           workflows_toml: latestPair.workflows_toml,
         })
+        if (!isCurrentStartConfirmation(token)) return
         setCommitted(committedProjectionFrom(latestPair, latestProjection))
         setCommittedError(null)
-        setStartReviewIdentity(null)
+        invalidateStartReview()
         setActionError('Committed launch defaults changed while the review was open. Review the current choices before starting.')
         return
       }
     } catch (revalidationError) {
-      setStartReviewIdentity(null)
+      if (!isCurrentStartConfirmation(token)) return
+      invalidateStartReview()
       setActionError(`Could not revalidate the committed launch configuration: ${errorMessage(revalidationError, 'configuration read failed')}. Review again before starting.`)
       return
     }
-    if (startReviewIdentity !== currentLaunchIdentityRef.current) {
-      setStartReviewIdentity(null)
+    if (!isCurrentStartConfirmation(token)) return
+    if (startReviewIdentityRef.current !== token.reviewIdentity || currentLaunchIdentityRef.current !== token.launchIdentity) {
+      invalidateStartReview()
       setActionError('Launch choices changed while the review was open. Review the current choices before starting.')
       return
     }
-    setStartReviewIdentity(null)
-    await handleStart()
+    await handleStart(token)
+    // Only the operation that still owns the lock may release the pending UI.
+    if (startConfirmationRef.current?.operationId === token.operationId) {
+      startConfirmationRef.current = null
+      setStartRevalidationPending(false)
+    }
   }
 
   const restartDraftChoicesReady = Boolean(restartDraftWorkflow && startPlanPath && planOptions.includes(startPlanPath))
@@ -3275,6 +3404,7 @@ export function RunDashboard({ visible = true, page, onNewRun, onCancelNewRun, o
 
   function cancelNewRun() {
     restartFocusPendingRef.current = false
+    invalidateStartReview()
     if (!restartInProgress && !pendingSuccessorStart) { setRestartPhase(null); setRestartSource(null) }
     setLocalPage('runs')
     onCancelNewRun?.()
@@ -3286,9 +3416,9 @@ export function RunDashboard({ visible = true, page, onNewRun, onCancelNewRun, o
   const hosted = useHeaderSlots(`run-dashboard:${projectId}`, {
     context: <h2 className="header-context-title">{newRunPage ? 'New run' : 'Runs'}</h2>,
     local: newRunPage ? <button className="btn btn-secondary btn-sm" onClick={cancelNewRun}>← Run history</button> : <label className="header-filter-select"><span>Run history</span><select aria-label="Run history" value={historyFilter} onChange={event => setHistoryFilter(event.target.value as typeof historyFilter)}><option value="visible">Visible</option><option value="archived">Archived</option><option value="all">All history</option></select></label>,
-    primary: newRunPage ? <button className="btn btn-primary btn-sm" onClick={() => void (startReviewIdentity ? confirmStart() : openStartReview())} disabled={startReviewIdentity ? startDisabled || !startReviewReady || Boolean(restartActions) : startDisabled || Boolean(restartActions)}>{busyAction === 'start' ? 'Starting…' : startReviewIdentity ? 'Start run' : 'Review start…'}</button> : <button className="btn btn-primary btn-sm" onClick={openNewRunPage}>New run</button>,
+    primary: newRunPage ? <button className="btn btn-primary btn-sm" onClick={() => void (startReviewIdentity ? confirmStart() : openStartReview())} disabled={startReviewIdentity ? startDisabled || !startReviewReady || startRevalidationPendingForRender || Boolean(restartActions) : startDisabled || Boolean(restartActions)}>{busyAction === 'start' ? 'Starting…' : startRevalidationPendingForRender ? 'Checking…' : startReviewIdentity ? 'Start run' : 'Review start…'}</button> : <button className="btn btn-primary btn-sm" onClick={openNewRunPage}>New run</button>,
     more: <MoreMenu label={newRunPage ? 'More new run actions' : 'More run page actions'} triggerLabel="More">
-      {newRunPage ? <MenuItem onClick={startReviewIdentity ? cancelStartReview : cancelNewRun}>{startReviewIdentity ? 'Cancel review' : 'Cancel'}</MenuItem> : <>
+      {newRunPage ? <MenuItem disabled={busyAction === 'start'} onClick={startReviewIdentity ? cancelStartReview : cancelNewRun}>{startReviewIdentity ? 'Cancel review' : 'Cancel'}</MenuItem> : <>
         <MenuItem onClick={() => void handleCopyLink()}>Copy link</MenuItem>
         <MenuItem disabled={refreshing || loading} onClick={() => void refreshPage()}>{refreshing ? 'Refreshing…' : 'Refresh'}</MenuItem>
       </>}
@@ -3793,7 +3923,7 @@ export function RunDashboard({ visible = true, page, onNewRun, onCancelNewRun, o
         preview={launchPreview}
         worktreePreflight={worktreePreflightPanel}
         restartActions={restartActions}
-        onCancel={() => { if (!restartInProgress && !pendingSuccessorStart) { setRestartPhase(null); setRestartSource(null) } setLocalPage('runs'); onCancelNewRun?.() }}
+        onCancel={cancelNewRun}
         advancedOpen={advancedOpen}
         setAdvancedOpen={setAdvancedOpen}
         startStep={startStep}
@@ -3814,6 +3944,7 @@ export function RunDashboard({ visible = true, page, onNewRun, onCancelNewRun, o
         startActionLabel="Review start…"
         reviewReady={startReviewReady}
         startDisabled={startDisabled}
+        startRevalidationPending={startRevalidationPendingForRender}
         busyAction={busyAction}
         hideActions={hosted}
       />}
