@@ -42,6 +42,8 @@ function shortRevision(revision: string): string {
  */
 export function ConfigEditor({ onDirtyChange, onSaved, onReady }: ConfigEditorProps) {
   const [snapshot, setSnapshot] = useState<ProjectConfig | null>(null)
+  const snapshotRef = useRef<ProjectConfig | null>(null)
+  const loadRequestRef = useRef(0)
   const [aflowText, setAflowText] = useState('')
   const [workflowsText, setWorkflowsText] = useState('')
   const [activeTab, setActiveTab] = useState<ConfigTab>('aflow')
@@ -61,6 +63,7 @@ export function ConfigEditor({ onDirtyChange, onSaved, onReady }: ConfigEditorPr
   const workflowsTabRef = useRef<HTMLButtonElement | null>(null)
   const aflowTextareaRef = useRef<HTMLTextAreaElement | null>(null)
   const workflowsTextareaRef = useRef<HTMLTextAreaElement | null>(null)
+  snapshotRef.current = snapshot
 
   useEffect(() => {
     if (mode !== 'toml' || pendingFocusDocument === null) return
@@ -109,6 +112,8 @@ export function ConfigEditor({ onDirtyChange, onSaved, onReady }: ConfigEditorPr
   }, [hasUnsavedWork])
 
   const load = useCallback(async () => {
+    const request = ++loadRequestRef.current
+    const retainedSnapshot = snapshotRef.current
     setLoading(true)
     setError(null)
     setNotice(null)
@@ -116,20 +121,26 @@ export function ConfigEditor({ onDirtyChange, onSaved, onReady }: ConfigEditorPr
     setConfirmReload(false)
     try {
       const loaded = await api.getGlobalConfig()
-      setSnapshot(loaded)
+      if (request !== loadRequestRef.current) return
+      snapshotRef.current = loaded
+      setSnapshot(current => current && JSON.stringify(current) === JSON.stringify(loaded) ? current : loaded)
       setAflowText(loaded.aflow_toml)
       setWorkflowsText(loaded.workflows_toml)
       setValidation(loaded.validation)
       setValidationPair({ aflow: loaded.aflow_toml, workflows: loaded.workflows_toml })
     } catch (err) {
-      setSnapshot(null)
-      setAflowText('')
-      setWorkflowsText('')
-      setValidation(null)
-      setValidationPair(null)
+      if (request !== loadRequestRef.current) return
+      if (retainedSnapshot === null) {
+        snapshotRef.current = null
+        setSnapshot(null)
+        setAflowText('')
+        setWorkflowsText('')
+        setValidation(null)
+        setValidationPair(null)
+      }
       setError(err instanceof Error ? err.message : 'Failed to load the configuration pair')
     } finally {
-      setLoading(false)
+      if (request === loadRequestRef.current) setLoading(false)
     }
   }, [])
 
@@ -215,7 +226,7 @@ export function ConfigEditor({ onDirtyChange, onSaved, onReady }: ConfigEditorPr
     ;(next === 'aflow' ? aflowTabRef : workflowsTabRef).current?.focus()
   }
 
-  if (loading) {
+  if (loading && !snapshot) {
     return <div className="card dashboard-loading"><div className="spinner" />Loading configuration…</div>
   }
 

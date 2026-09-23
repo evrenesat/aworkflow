@@ -1,0 +1,32 @@
+{
+  "schema_version": 1,
+  "demo_file": "demo.html",
+  "demo_sha256": "2465c0ac2bfef90af2b98a537ad5ac3e931b927c23a78379a8c532ce4dcbadf4",
+  "surface_selector": "#af-frame",
+  "excluded_selectors": [
+    ".af-demo-bar",
+    ".af-footer"
+  ],
+  "anchors": {
+    "title": "#af-run-name",
+    "current_work": ".af-now",
+    "latest_result": ".af-latest",
+    "recent_activity": "#af-events",
+    "first_disclosure": "details[data-explore]"
+  },
+  "capture_matrix": [
+    { "width": 1280, "height": 720, "theme": "light" },
+    { "width": 1280, "height": 720, "theme": "dark" },
+    { "width": 1440, "height": 900, "theme": "light" },
+    { "width": 1440, "height": 900, "theme": "dark" },
+    { "width": 390, "height": 844, "theme": "light" },
+    { "width": 390, "height": 844, "theme": "dark" }
+  ],
+  "intentional_differences": [
+    "The production shell uses the authenticated account, project registry, and real navigation labels.",
+    "Production captures use disposable server records with the same evidence shape, not the demo's simulated records.",
+    "The demo's device preview and progress simulation controls are reference-only and are excluded from product acceptance.",
+    "Production captures expand the existing Diagnostics disclosure so recent activity and the first informational disclosure remain comparable on desktop and mobile."
+  ],
+  "known_defects_at_checkpoint_1": []
+}

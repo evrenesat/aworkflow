@@ -397,6 +397,15 @@ def _ensure_project(page: Page) -> None:
     page.get_by_role("button", name="New run", exact=True).wait_for()
 
 
+def _open_start_review(page: Page):
+    """Open the read-only launch review and return its final action."""
+    review = page.get_by_role("button", name="Review start…", exact=True)
+    expect(review).to_be_enabled()
+    review.click()
+    page.get_by_role("region", name="Review start", exact=True).wait_for()
+    return page.get_by_role("button", name="Start run", exact=True)
+
+
 def _assert_no_horizontal_overflow(page: Page) -> None:
     metrics = page.evaluate("""() => ({
         width: innerWidth,
@@ -598,8 +607,8 @@ def _assert_global_run_row(
     status: str = "Completed",
 ):
     """Return the one global row with the exact project and full run identity."""
-    row = page.locator("button.global-run-row").and_(
-        page.get_by_role(
+    row_container = page.locator("div.global-run-row").filter(
+        has=page.get_by_role(
             "button", name=re.compile(rf" · {re.escape(run_id)}$")
         )
     ).filter(
@@ -607,10 +616,14 @@ def _assert_global_run_row(
             has_text=re.compile(rf"^{re.escape(project_label)}$")
         )
     )
+    expect(row_container).to_have_count(1)
+    row = row_container.get_by_role(
+        "button", name=re.compile(rf" · {re.escape(run_id)}$")
+    )
     expect(row).to_have_count(1)
     expect(row.locator(".global-run-row-project")).to_have_text(project_label)
-    expect(row.locator(".global-run-row-title")).to_have_text(title)
-    exact_status = row.locator(".global-run-row-heading > .status-pill").filter(
+    expect(row.locator(".run-list-title")).to_have_text(title)
+    exact_status = row.locator(".status-pill").filter(
         has_text=re.compile(rf"^{re.escape(status)}$")
     )
     expect(exact_status).to_have_count(1)
@@ -755,9 +768,9 @@ def test_responsive_action_hit_test_survives_late_context_growth(
             page.get_by_role("button", name="New run", exact=True).wait_for()
             page.locator(".run-list-item").first.wait_for()
             run_row = page.locator(
-                f".run-list-item[data-sidebar-editor-item='{RESPONSIVE_FIXTURE_RUN_ID}']"
+                f".run-list-item[data-run-key='{RESPONSIVE_FIXTURE_RUN_ID}']"
             )
-            run_row.click()
+            run_row.locator(".run-list-select").click()
             _assert_run_detail(page, RESPONSIVE_FIXTURE_TITLE, RESPONSIVE_FIXTURE_RUN_ID)
             page.wait_for_function(
                 "() => window.__aflowResponsiveContextCaptured === true"
@@ -942,7 +955,7 @@ def test_family_stage_click_survives_preview_completion(
             expect(reviewer_row).to_contain_text("codex.review_alt")
             reviewer_row.get_by_role("button", name="Override role", exact=True).click()
             choose_profile(page, "Reviewer", "codex.review_child")
-            expect(reviewer_row).to_contain_text("codex.review_child")
+            expect(reviewer_row.get_by_role("combobox")).to_have_value(re.compile(r"codex\.review_child"))
             detail.get_by_role("button", name="Base product", exact=True).click()
 
             field = page.get_by_role("combobox", name="Reviewer", exact=True)
@@ -1012,9 +1025,9 @@ def test_family_stage_click_survives_preview_completion(
             page.mouse.up()
             expect(target).to_have_attribute("aria-pressed", "true")
             reviewer_row = detail.locator(".team-family-role-row").filter(has_text="Reviewer").first
-            expect(reviewer_row).to_contain_text("codex.review_child")
+            expect(reviewer_row.get_by_role("combobox")).to_have_value(re.compile(r"codex\.review_child"))
             stronger_worker_pressed = target.get_attribute("aria-pressed")
-            child_reviewer_text = reviewer_row.text_content()
+            child_reviewer_text = reviewer_row.get_by_role("combobox").input_value()
             events = page.evaluate("() => window.__familyStageEvents ?? []")
             assert [event["kind"] for event in events[-3:]] == ["pointerdown", "pointerup", "click"], events
             assert all(event["target"] == "Stronger worker" for event in events[-3:]), events
@@ -1023,7 +1036,7 @@ def test_family_stage_click_survives_preview_completion(
             base = detail.get_by_role("button", name="Base product", exact=True)
             expect(base).to_have_attribute("aria-pressed", "true")
             base_reviewer = detail.locator(".team-family-role-row").filter(has_text="Reviewer").first
-            expect(base_reviewer).to_contain_text("codex.review_final")
+            expect(base_reviewer.get_by_role("combobox")).to_have_value(re.compile(r"codex\.review_final"))
 
             artifact = {
                 "viewport": {"width": width, "height": height},
@@ -1151,17 +1164,17 @@ def test_project_worktree_presentation(control_client, monkeypatch, width: int, 
                 )
                 page.get_by_role("button", name="New run", exact=True).wait_for()
                 history_row = page.locator(
-                    f".run-list-item[data-sidebar-editor-item='{RESPONSIVE_FIXTURE_RUN_ID}']"
+                    f".run-list-item[data-run-key='{RESPONSIVE_FIXTURE_RUN_ID}']"
                 )
                 history_row.wait_for()
                 expect(history_row).to_have_attribute(
-                    "data-sidebar-editor-item", RESPONSIVE_FIXTURE_RUN_ID
+                    "data-run-key", RESPONSIVE_FIXTURE_RUN_ID
                 )
                 expect(history_row.locator(".run-list-title")).to_have_text(
                     RESPONSIVE_FIXTURE_TITLE
                 )
                 _assert_document_moves(page)
-                history_row.click()
+                history_row.locator(".run-list-select").click()
                 _assert_run_detail(page, RESPONSIVE_FIXTURE_TITLE, RESPONSIVE_FIXTURE_RUN_ID)
                 _assert_header_and_flow(page)
 
@@ -1294,8 +1307,11 @@ def test_global_run_overview_loading_journey(control_client, monkeypatch, tmp_pa
                 re.compile(rf".*/api/control-plane/projects/{re.escape(PROJECT_ID)}/runs(?:\?.*)?$")
             ):
                 page.get_by_role("button", name="Refresh", exact=True).click()
-            expect(page.get_by_role("status")).to_contain_text("Refreshing runs…")
+            # A retained populated refresh is intentionally invisible: the
+            # existing rows remain usable and the surface is not marked busy.
+            expect(page.get_by_role("status")).to_have_count(0)
             expect(populated_row).to_be_visible()
+            assert page.locator(".global-run-results").get_attribute("aria-busy") == "false"
             phone_image = tmp_path / f"issue40-{browser_name}-phone-refresh.png"
             page.screenshot(path=str(phone_image), full_page=True)
             print("ISSUE40_SCREENSHOT", phone_image)
@@ -1306,7 +1322,8 @@ def test_global_run_overview_loading_journey(control_client, monkeypatch, tmp_pa
             run_mode["value"] = "empty"
             page.goto(f"{url}/?view=all-runs")
             expect(page.get_by_text("No runs yet.", exact=True)).to_be_visible()
-            expect(page.get_by_role("heading", name="Ongoing (0)", exact=True)).to_be_visible()
+            expect(page.locator(".global-run-results h3")).to_have_count(0)
+            expect(page.get_by_text("No ongoing runs.", exact=True)).to_have_count(0)
             expect(page.get_by_role("status")).to_have_count(0)
 
             run_mode["value"] = "error"
@@ -1551,7 +1568,7 @@ def test_selected_run_detail_does_not_wait_for_history(
                 expect(pending).to_have_count(0)
             else:
                 page.locator(
-                    f".run-list-item[data-sidebar-editor-item='{RESPONSIVE_FIXTURE_RUN_ID}']"
+                    f".run-list-item[data-run-key='{RESPONSIVE_FIXTURE_RUN_ID}']"
                 ).wait_for()
             _assert_run_detail(page, RESPONSIVE_FIXTURE_TITLE, RESPONSIVE_FIXTURE_RUN_ID)
             page.get_by_role("button", name="More", exact=True).click()
@@ -1657,6 +1674,10 @@ def test_history_completion_preserves_live_controls_pointer_target(
             held_history.clear()
             page.unroute(history_pattern, hold_initial_history)
             pending.wait_for(state="hidden")
+            checkpoint_disclosure = dashboard.locator(
+                "details.checkpoint-history-checkpoints"
+            ).first
+            checkpoint_disclosure.evaluate("element => { element.open = true }")
             checkpoint_layout = dashboard.locator(".checkpoint-history-layout")
             checkpoint_layout.wait_for(state="visible")
             expected_detail_heading = "Unassigned history"
@@ -1972,16 +1993,16 @@ def test_responsive_route_matrix(control_client, monkeypatch, tmp_path, width: i
             _assert_header_and_flow(page)
             _assert_document_moves(page)
             run_row = page.locator(
-                f".run-list-item[data-sidebar-editor-item='{RESPONSIVE_FIXTURE_RUN_ID}']"
+                f".run-list-item[data-run-key='{RESPONSIVE_FIXTURE_RUN_ID}']"
             )
             run_row.scroll_into_view_if_needed()
             expect(run_row).to_have_attribute(
-                "data-sidebar-editor-item", RESPONSIVE_FIXTURE_RUN_ID
+                "data-run-key", RESPONSIVE_FIXTURE_RUN_ID
             )
             expect(run_row.locator(".run-list-title")).to_have_text(
                 RESPONSIVE_FIXTURE_TITLE
             )
-            run_row.click()
+            run_row.locator(".run-list-select").click()
             _assert_run_detail(page, RESPONSIVE_FIXTURE_TITLE, RESPONSIVE_FIXTURE_RUN_ID)
             detail_box = _run_history_detail(page).bounding_box()
             assert detail_box and detail_box["height"] > 0
@@ -2048,7 +2069,7 @@ def test_responsive_route_matrix(control_client, monkeypatch, tmp_path, width: i
             extra = page.get_by_label("Run extra instructions", exact=True)
             expect(extra).to_be_visible()
             extra.fill("Long launch instruction. " * 100)
-            assert page.get_by_role("button", name="Start run", exact=True).is_visible()
+            assert page.get_by_role("button", name="Review start…", exact=True).is_visible()
             _assert_header_and_flow(page)
             _assert_last_action_hit_test(page)
         finally:
@@ -2189,11 +2210,11 @@ def test_responsive_focus_resize_and_screenshots(control_client, monkeypatch, tm
                     else:
                         page.get_by_role("button", name="New run", exact=True).wait_for()
                         row = page.locator(
-                            f".run-list-item[data-sidebar-editor-item='{RESPONSIVE_FIXTURE_RUN_ID}']"
+                            f".run-list-item[data-run-key='{RESPONSIVE_FIXTURE_RUN_ID}']"
                         )
                         row.wait_for()
                         if detail:
-                            row.click()
+                            row.locator(".run-list-select").click()
                             _assert_run_detail(page, RESPONSIVE_FIXTURE_TITLE, RESPONSIVE_FIXTURE_RUN_ID)
                     image = tmp_path / f"responsive-{theme}-{name}.png"
                     page.screenshot(path=str(image), full_page=True)
@@ -2324,14 +2345,15 @@ def test_compact_selection_survives_pending_configuration(
 
                 page.get_by_role("button", name="← Back to Run history", exact=True).click()
                 row = page.locator(
-                    f".run-list-item[data-sidebar-editor-item='{second_run}']"
+                    f".run-list-item[data-run-key='{second_run}']"
                 )
                 row.wait_for()
-                row.click()
+                selectable = row.locator(".run-list-select")
+                selectable.click()
                 _assert_run_detail(page, "Long plan 38", second_run)
 
                 page.get_by_role("button", name="← Back to Run history", exact=True).click()
-                expect(row).to_be_focused()
+                expect(selectable).to_be_focused()
 
                 assert len(held_form_requests) == 1, "more than one configuration projection was held"
                 hold_enabled["value"] = False
@@ -2346,7 +2368,7 @@ def test_compact_selection_survives_pending_configuration(
                 assert held_response.request is held_form_request
                 assert held_response.status == 200
                 held_response.body()
-                expect(row).to_be_focused()
+                expect(selectable).to_be_focused()
 
                 page.get_by_role("button", name="More", exact=True).click()
                 run_page_menu = page.get_by_role(
@@ -2396,10 +2418,20 @@ def test_responsive_team_family_journey(
 
     def select_family(page: Page, label: str) -> None:
         open_family_list(page)
-        page.get_by_role("navigation", name="Team families", exact=True).get_by_role(
+        entry = page.get_by_role("navigation", name="Team families", exact=True).get_by_role(
             "button", name=label, exact=True
-        ).click()
+        )
+        # Catch the shared .sidebar-entry rule collapsing metadata into inline text.
+        title = entry.locator(".team-family-list-title").bounding_box()
+        kind = entry.locator(".team-family-list-kind").bounding_box()
+        meta = entry.locator(".team-family-list-meta").bounding_box()
+        assert title and kind and meta
+        assert kind["y"] >= title["y"] + title["height"]
+        assert meta["y"] >= kind["y"] + kind["height"]
+        entry.click()
         page.locator(".team-family-detail").wait_for()
+        for stage in page.locator(".team-family-stage-selector button").all():
+            expect(stage.locator("span")).to_have_count(1)
 
     def choose_profile(page: Page, label: str, selector: str) -> None:
         field = page.get_by_role("combobox", name=label, exact=True)
@@ -2460,7 +2492,7 @@ def test_responsive_team_family_journey(
             choose_profile(page, "Reviewer", "codex.review_final")
             detail.get_by_role("button", name="Stronger worker", exact=True).click()
             reviewer_row = detail.locator(".team-family-role-row").filter(has_text="Reviewer").first
-            expect(reviewer_row).to_contain_text("codex.review_child")
+            expect(reviewer_row.get_by_role("combobox")).to_have_value(re.compile(r"codex\.review_child"))
             detail.get_by_role("button", name="Base product", exact=True).click()
             save_settings(page)
             reload_team_settings(page)
@@ -2468,7 +2500,7 @@ def test_responsive_team_family_journey(
             detail = page.locator(".team-family-detail")
             detail.get_by_role("button", name="Stronger worker", exact=True).click()
             reviewer_row = detail.locator(".team-family-role-row").filter(has_text="Reviewer").first
-            expect(reviewer_row).to_contain_text("codex.review_child")
+            expect(reviewer_row.get_by_role("combobox")).to_have_value(re.compile(r"codex\.review_child"))
             reviewer_row.get_by_role("button", name="Restore inheritance", exact=True).click()
             inherited_roles = detail.locator("details").filter(has_text=re.compile(r"Inherited roles")).first
             if inherited_roles.get_attribute("open") is None:
@@ -2608,7 +2640,8 @@ def test_responsive_team_family_journey(
             expect(detail).to_contain_text("browser_family_strongest_worker")
 
             # A failed CAS write must keep the edited draft in the browser.
-            display_input = detail.locator("input").first
+            detail.get_by_text("Name and identity", exact=True).click()
+            display_input = detail.get_by_label("Display name", exact=True)
             conflict_value = "Conflict retained family"
             display_input.fill(conflict_value)
             display_input.press("Tab")
@@ -2640,6 +2673,12 @@ def test_responsive_team_family_journey(
             # Legacy conversion is preview-only until the explicit draft action.
             select_family(page, "Legacy base")
             detail = page.locator(".team-family-detail")
+            identity = detail.locator("details").filter(has=page.get_by_text("Name and identity", exact=True))
+            if identity.get_attribute("open") is not None:
+                identity.locator("summary").click()
+            detail.scroll_into_view_if_needed()
+            page.screenshot(path=str(tmp_path / "teams-legacy-default.png"), full_page=True)
+            detail.get_by_text("Convert to family…", exact=True).click()
             detail.get_by_role("button", name="Preview convert to family", exact=True).click()
             conversion = page.get_by_role("region", name="Legacy conversion preview", exact=True)
             conversion.wait_for()
@@ -2659,7 +2698,7 @@ def test_responsive_team_family_journey(
             # Family detail remains document-owned and usable across themes and zoom.
             select_family(page, family_label)
             _assert_document_moves(page)
-            focus_target = page.locator(".team-family-detail input").first
+            focus_target = page.get_by_role("combobox", name="Worker", exact=True)
             focus_target.focus()
             focus_target.press("Tab")
             assert page.evaluate("() => document.activeElement !== null")
@@ -2686,7 +2725,8 @@ def test_responsive_team_family_journey(
                     expect(page.locator(".team-families-settings .sidebar-editor-detail")).not_to_be_hidden()
                 select_family(page, family_label)
                 _assert_header_and_flow(page)
-            short_input = page.locator(".team-family-detail input").first
+            page.get_by_text("Name and identity", exact=True).click()
+            short_input = page.get_by_label("Display name", exact=True)
             short_input.focus()
             assert short_input.evaluate("element => document.activeElement === element")
             short_input.fill(f"{family_label} short")
@@ -2735,7 +2775,7 @@ def test_responsive_team_family_journey(
             expect(clean_state.or_(dirty_confirmation)).to_be_visible()
             if dirty_confirmation.is_visible():
                 dirty_confirmation.check()
-            expect(page.get_by_role("button", name="Start run", exact=True).last).to_be_enabled()
+            expect(page.get_by_role("button", name="Review start…", exact=True)).to_be_enabled()
 
             start_requests: list[dict[str, object]] = []
             started = {"value": False}
@@ -2767,7 +2807,12 @@ def test_responsive_team_family_journey(
                 route.continue_()
 
             page.route(f"**/api/control-plane/projects/{PROJECT_ID}/runs**", intercept_launch)
-            page.get_by_role("button", name="Start run", exact=True).last.click()
+            with page.expect_response(
+                lambda response: response.request.method == "POST"
+                and urlsplit(response.url).path == launch_path
+            ) as launch_response:
+                _open_start_review(page).click()
+            assert launch_response.value.status == 201
             assert started["value"]
             assert len(start_requests) == 1
             assert start_requests[0]["team"] == strong_stage_id
@@ -3043,9 +3088,39 @@ def test_responsive_live_controls_and_restart(
             page.goto(f"{url}/?project={PROJECT_ID}&view=runs&run={run_id}")
             dashboard = _visible_dashboard(page)
             dashboard.locator(".run-detail h3").wait_for()
-            page.get_by_role("button", name="Restart with changes", exact=True).click()
+            actions = dashboard.get_by_role("button", name="Actions", exact=True)
+            actions.click()
+            actions_menu = dashboard.get_by_role("menu", name="Run actions", exact=True)
+            menu_box = actions_menu.bounding_box()
+            assert menu_box is not None
+            assert menu_box["x"] >= 0, menu_box
+            assert menu_box["x"] + menu_box["width"] <= page.viewport_size["width"], menu_box
+            for label in ("Configure restart…", "Adjust run settings…", "Review stop options…"):
+                item = actions_menu.get_by_role("menuitem", name=label, exact=True)
+                expect(item).to_be_visible()
+                item_box = item.bounding_box()
+                assert item_box is not None
+                assert item_box["x"] >= 0, {"label": label, "box": item_box}
+                assert item_box["x"] + item_box["width"] <= page.viewport_size["width"], {"label": label, "box": item_box}
+            page.keyboard.press("Escape")
+            assert actions.evaluate("element => document.activeElement === element")
+            actions.click()
+            actions_menu = dashboard.get_by_role("menu", name="Run actions", exact=True)
+            configure_restart = actions_menu.get_by_role(
+                "menuitem", name="Configure restart…", exact=True
+            )
+            configure_restart.wait_for(state="visible")
+            assert len(owner_stop_requests) == 0
+            assert len(successor_requests) == 0
+            configure_restart.focus()
+            configure_restart.press("Enter")
             dashboard = _visible_dashboard(page)
-            dashboard.get_by_label("Run plan", exact=True).wait_for()
+            run_plan = dashboard.get_by_label("Run plan", exact=True)
+            run_plan.wait_for()
+            assert run_plan.evaluate("element => document.activeElement === element")
+            assert page.evaluate("() => document.activeElement?.tagName !== 'BODY'")
+            assert len(owner_stop_requests) == 0
+            assert len(successor_requests) == 0
             _choose_combobox(dashboard, "Run team", "fast__team", "Fast team (fast__team)")
             if not dashboard.get_by_label("Run max turns", exact=True).is_visible():
                 dashboard.get_by_role("button", name="Advanced options", exact=True).click()
@@ -3059,14 +3134,14 @@ def test_responsive_live_controls_and_restart(
             assert not dirty_ack.is_checked()
             dirty_ack.check()
             assert dirty_ack.is_checked()
-            confirm = dashboard.get_by_role("button", name="Confirm stop and start successor", exact=True)
+            confirm = dashboard.get_by_role("button", name="Confirm restart", exact=True)
             confirm.wait_for(state="visible")
             expect(confirm).to_be_enabled()
             assert not confirm.is_disabled()
             confirm.click()
             page.get_by_role("button", name="Retry exact successor request", exact=True).wait_for()
             assert dashboard.get_by_label("Run workflow", exact=True).is_disabled()
-            assert page.get_by_role("button", name="Start run", exact=True).is_disabled()
+            assert page.get_by_role("button", name="Review start…", exact=True).is_disabled()
             image = tmp_path / f"responsive-{width}x{height}-light-restart-unknown.png"
             page.screenshot(path=str(image), full_page=True)
             print("RESPONSIVE_RESTART_SCREENSHOT", image)
@@ -3259,8 +3334,10 @@ go = [{ to = "END" }]
                 run_url = f"{url}/?project={PROJECT_ID}&view=runs&run={run_id}"
                 page.goto(run_url)
                 dashboard = _visible_dashboard(page)
+                dashboard.get_by_role("button", name="Actions", exact=True).click()
+                dashboard.get_by_role("menuitem", name="Review stop options…", exact=True).click()
                 boundary = dashboard.get_by_role(
-                    "button", name="Stop after current turn", exact=True
+                    "button", name="Request stop after current turn", exact=True
                 )
                 boundary.wait_for()
                 boundary.click()
@@ -3322,11 +3399,11 @@ go = [{ to = "END" }]
                             "Stop requested — finishing current turn", exact=False
                         )).to_be_visible()
                         assert fresh_page.get_by_text("Running", exact=True).count() > 0
-                        immediate_stop = fresh_dashboard.get_by_role(
-                            "button", name="Stop now…", exact=True
+                        fresh_dashboard.get_by_role("button", name="Actions", exact=True).click()
+                        immediate_review = fresh_dashboard.get_by_role(
+                            "menuitem", name="Review stop options…", exact=True
                         )
-                        if immediate_stop.count():
-                            expect(immediate_stop).to_be_disabled()
+                        expect(immediate_review).to_be_disabled()
                         assert len(held_capabilities) == 1, "admitted capabilities response was not held"
                         held_state = client.get(run_path)
                         assert held_state.status_code == 200, held_state.text
@@ -3339,6 +3416,8 @@ go = [{ to = "END" }]
                             "Stop requested — finishing current turn", exact=False
                         ).wait_for()
                         assert fresh_page.get_by_text("Running", exact=True).count() > 0
+                        expect(immediate_review).to_be_enabled()
+                        immediate_review.click()
                         expect(fresh_dashboard.get_by_role(
                             "button", name="Stop now…", exact=True
                         )).to_have_count(1)
@@ -3384,7 +3463,7 @@ go = [{ to = "END" }]
                     "Stopped", exact=True
                 ).wait_for()
                 assert page.get_by_role(
-                    "button", name="Stop after current turn", exact=True
+                    "button", name="Request stop after current turn", exact=True
                 ).count() == 0
                 assert page.get_by_role(
                     "button", name="Stop now…", exact=True

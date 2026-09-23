@@ -155,6 +155,7 @@ requires-dist = [
 
 [package.metadata.requires-dev]
 dev = [
+    { name = "pillow", specifier = ">=11.0.0" },
     { name = "playwright", specifier = ">=1.49.0" },
     { name = "pytest", specifier = ">=8.0.0" },
     { name = "ruff", specifier = "==0.16.5" },

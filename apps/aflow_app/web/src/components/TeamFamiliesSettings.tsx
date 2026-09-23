@@ -355,7 +355,7 @@ export function TeamFamiliesSettings({
     return <div className="team-family-role-row" key={`override-${role}`}>
       <div className="team-family-role-heading">
         <strong>{roleLabel(role)}</strong>
-        <span className="text-xs text-dim">Stored override · declared by {stageDisplay(activeTeamId)} ({activeTeamId})</span>
+        <span className="text-xs text-dim" title={`Declared by ${activeTeamId}`}>Local override</span>
       </div>
       <Combobox
         label={roleLabel(role)}
@@ -367,7 +367,6 @@ export function TeamFamiliesSettings({
         emptyOption="No configured profiles"
       />
       <div className="team-family-role-actions">
-        <span className="mono text-sm">{selectorSummary(draft, declared)}</span>
         <button type="button" className="btn btn-secondary btn-sm" onClick={() => updateRole(role, null)}>Restore inheritance</button>
       </div>
     </div>
@@ -412,9 +411,6 @@ export function TeamFamiliesSettings({
         onChange={selector => updateRole(role, selector)}
         emptyOption="No configured profiles"
       />
-      <div className="team-family-role-actions">
-        <span className="mono text-sm">{selectorSummary(draft, effective)}</span>
-      </div>
     </div>
   }
 
@@ -489,9 +485,8 @@ export function TeamFamiliesSettings({
   const detailHeading = wizardOpen ? <h3>Create team family</h3> : selectedGroup ? <div className="team-family-detail-heading-content">
     <div>
       <h3>{rootLabel(selectedGroup)}</h3>
-      <p className="text-xs text-dim"><span className="mono">{selectedGroup.rootId}</span> · {kindLabel(selectedGroup)}</p>
+      <p className="text-xs text-dim">{kindLabel(selectedGroup)}</p>
     </div>
-    <span className="team-family-summary-route">{routeForDisplay(selectedGroup).map(teamId => stageDisplay(teamId)).join(' → ')}</span>
   </div> : <h3>Teams</h3>
 
   return <section className="team-families-settings" aria-label="Team families">
@@ -504,13 +499,14 @@ export function TeamFamiliesSettings({
       navigation={<div className="team-family-navigation">
         <h3>Team families</h3>
         <button type="button" data-sidebar-editor-item="new-family" className="btn btn-primary" onClick={startWizard}>New family</button>
+        <details className="team-family-disclosure"><summary>Add standalone team</summary>
         <form className="add-team-form" onSubmit={event => { event.preventDefault(); onAddTeam() }}>
           <label>Add team<input className="input" aria-label="New team name" placeholder="team-name" value={newTeamName} onChange={event => onNewTeamNameChange(event.target.value)} onKeyDown={event => { if (event.key === 'Enter') { event.preventDefault(); onAddTeam() } }} /></label>
           <span className="inline-action"><button type="submit" className="btn btn-secondary">Add team</button>{newTeamError && <span role="alert" className="text-sm add-team-error">{newTeamError}</span>}</span>
         </form>
+        </details>
         {groups.map(group => {
           const count = changedRoleCount(draft, group)
-          const route = routeForDisplay(group).map(teamId => stageLabel(draft, group.rootId, teamId, group.kind)).join(' → ')
           const labelCollision = hasGroupLabelCollision(group, groups)
           return <button
             data-sidebar-editor-item={group.rootId}
@@ -523,8 +519,7 @@ export function TeamFamiliesSettings({
             <span className="team-family-list-title">{rootLabel(group)}</span>
             <span className="team-family-list-kind">{kindLabel(group)}</span>
             {labelCollision && <span className="mono text-xs text-dim">{group.rootId}</span>}
-            <span className="team-family-list-route">{route}</span>
-            <span className="team-family-list-meta">{count === null ? 'Effective differences unavailable' : `${count} changed role${count === 1 ? '' : 's'}`}</span>
+            <span className="team-family-list-meta">{group.memberIds.length} {group.memberIds.length === 1 ? 'team' : 'teams'}{count !== null && count > 0 ? ` · ${count} changed role${count === 1 ? '' : 's'}` : ''}</span>
           </button>
         })}
         {!groups.length && <p className="text-sm text-dim">No teams are configured in this draft yet.</p>}
@@ -543,31 +538,30 @@ export function TeamFamiliesSettings({
         />
       </div>}
       <div className="team-family-editor-surface" hidden={wizardOpen} aria-hidden={wizardOpen || undefined}>
-      {selectedGroup && activeSummary ? <fieldset className="team-family-detail" id={`team-editor-${activeTeamId}`} tabIndex={-1}>
-        <legend><span className="mono">{groupButtonLabel({ ...selectedGroup, rootId: activeTeamId, displayName: activeSummary.display_name ?? null }, groups)}</span>{!baseline?.teams[activeTeamId] && <span className="status-pill status-awaiting">new — saved with Save all</span>}</legend>
+      {selectedGroup && activeSummary ? <fieldset className="team-family-detail" aria-label={`Edit ${stageDisplay(activeTeamId)} (${activeTeamId})`} id={`team-editor-${activeTeamId}`} tabIndex={-1}>
+        {!baseline?.teams[activeTeamId] && <span className="status-pill status-awaiting">new — saved with Save all</span>}
         {selectedGroup.reason && <p className="notice" role="alert">{selectedGroup.reason}</p>}
         {grouping.errors.filter(error => error.team && selectedGroup.memberIds.includes(error.team) && error.message !== selectedGroup.reason).map(error => <p className="notice" role="alert" key={`${error.code}-${error.team}-${error.reference}`}>{error.message}</p>)}
         <div className="team-family-stage-selector" aria-label={`Stages in ${rootLabel(selectedGroup)}`}>
           {selectedGroup.memberIds.map(teamId => <button
             type="button"
             aria-pressed={activeTeamId === teamId}
+            title={teamId}
             aria-label={teamId === selectedGroup.rootId && selectedGroup.kind === 'family' ? `Base ${teamId}` : stageLabel(draft, selectedGroup.rootId, teamId, selectedGroup.kind)}
             className={`btn ${activeTeamId === teamId ? 'btn-primary' : 'btn-secondary'}`}
             key={teamId}
             onClick={() => selectStage(teamId)}
           >
             <span>{stageLabel(draft, selectedGroup.rootId, teamId, selectedGroup.kind)}</span>
-            <span className="mono text-xs">{teamId}</span>
           </button>)}
         </div>
 
-        {selectedGroup.kind === 'legacy_chain' && <div className="team-family-conversion card">
+        {selectedGroup.kind === 'legacy_chain' && <details className="team-family-disclosure"><summary>Convert to family…</summary><div className="team-family-conversion">
           <div>
-            <h4>Legacy chain</h4>
-            <p className="text-sm">This is a display grouping of standalone teams. Conversion adds direct Base inheritance only after a server preview confirms every effective role and prompt is unchanged.</p>
+            <p className="text-sm">These teams upgrade in sequence but do not inherit from each other. Preview sharing a Base configuration while preserving every effective role and prompt.</p>
           </div>
           <button type="button" className="btn btn-secondary" disabled={conversionBusy} onClick={previewConversion}>{conversionBusy ? 'Previewing conversion…' : 'Preview convert to family'}</button>
-        </div>}
+        </div></details>}
 
         {conversionPreview && conversionPreview.conversion.rootId === selectedGroup.rootId && <div className="team-family-conversion-preview card" role="region" aria-label="Legacy conversion preview">
           <h4>Conversion preview</h4>
@@ -581,29 +575,24 @@ export function TeamFamiliesSettings({
         </div>}
 
         <div className="team-family-stage-summary">
-          <div>
-            <h4>{stageDisplay(activeTeamId)} assignments</h4>
-            <p className="text-xs text-dim"><span className="mono">{activeTeamId}</span> is a stable team ID. Display-name edits and route reordering never rename it.</p>
-          </div>
           {activeTeamId !== selectedGroup.rootId && activeSummary.extends && <p className="text-sm">Inherits declared roles and prompts from <strong>{stageLabel(draft, selectedGroup.rootId, activeSummary.extends)}</strong> (<span className="mono">{activeSummary.extends}</span>).</p>}
           {activeTeamId === selectedGroup.rootId && selectedGroup.kind === 'family' && <p className="text-sm">Base assignments are the family source; stages inherit them unless they store an explicit override.</p>}
-          {activeTeamId === selectedGroup.rootId && selectedGroup.kind !== 'family' && <p className="text-sm">This {kindLabel(selectedGroup).toLowerCase()} keeps its own declared assignments; no family inheritance is implied by this display grouping.</p>}
           {activeSummary.backup_team && <p className="text-sm">Backup team: <span className="mono">{activeSummary.backup_team}</span> <span className="text-xs text-dim">(separate recovery route)</span></p>}
           {workerUnchanged && <p className="notice" role="status">This stage does not change the implementation worker. Worker-quality escalation from the preceding stage is not eligible.</p>}
         </div>
 
-        <div className="team-family-fields">
+        <details className="team-family-disclosure"><summary>Name and identity</summary><div className="team-family-fields">
           <label>Display name<input className="input" value={displayNameDrafts[activeTeamId]?.value ?? activeSummary.display_name ?? ''} placeholder={activeTeamId === selectedGroup.rootId ? 'Family label (optional)' : 'Stage label (optional)'} onChange={event => updateDisplayName(event.target.value)} onBlur={commitDisplayName} /></label>
           <p className="text-xs text-dim">Blank removes the label. The raw ID remains <span className="mono">{activeTeamId}</span>.</p>
           {activeSummary.extends && <p className="text-sm">Base relationship: <span className="mono">{activeSummary.extends}</span> (direct declaration)</p>}
           {!activeSummary.extends && activeTeamId !== selectedGroup.rootId && <p className="text-sm">No inheritance declaration. This team remains a standalone route until conversion or an explicit base assignment.</p>}
-        </div>
+        </div></details>
 
         <section className="team-family-section" aria-labelledby="team-family-roles-heading">
           <h4 id="team-family-roles-heading">Role assignments</h4>
           {activeTeamId !== selectedGroup.rootId && explicitRoles.length > 0 && <div className="team-family-role-list"><h5>Stored overrides</h5>{explicitRoles.map(renderOverrideRole)}</div>}
           {activeTeamId !== selectedGroup.rootId && explicitRoles.length === 0 && <p className="text-sm text-dim">No stored overrides. This stage is a valid inherited variant.</p>}
-          {activeTeamId === selectedGroup.rootId && selectedGroup.kind !== 'family' && roleNames.length > 0 && <div className="team-family-role-list"><h5>Declared roles</h5>{roleNames.map(renderOverrideRole)}</div>}
+          {activeTeamId === selectedGroup.rootId && selectedGroup.kind !== 'family' && roleNames.length > 0 && <div className="team-family-role-list">{roleNames.map(renderBaseRole)}</div>}
           {activeTeamId === selectedGroup.rootId && selectedGroup.kind === 'family' && preferredRoles.length > 0 && <div className="team-family-role-list"><h5>Base roles</h5>{preferredRoles.map(renderBaseRole)}</div>}
           {activeTeamId === selectedGroup.rootId && selectedGroup.kind === 'family' && preferredRoles.length === 0 && <p className="text-sm text-dim">Worker and reviewer roles are not configured in this draft.</p>}
           {activeTeamId === selectedGroup.rootId && selectedGroup.kind === 'family' && otherRoles.length > 0 && <details className="team-family-disclosure" open={preferredRoles.length === 0}><summary>Other roles ({otherRoles.length}) — Show all roles</summary><div className="team-family-role-list">{otherRoles.map(renderBaseRole)}</div></details>}
@@ -620,7 +609,7 @@ export function TeamFamiliesSettings({
           <h4 id="team-family-route-heading">Upgrade route</h4>
           <p className="text-xs text-dim">Worker chain: {workerRoute.map((teamId, index) => <span key={teamId}>{index > 0 && ' → '}<span className="mono">{formatMachineLabel(teamId)}</span>{workerText(draft, teamId) ? <> ({workerText(draft, teamId)})</> : null}</span>)}{workerRoute.length === 1 && !activeUpgradeChain.error ? ' — no further upgrade configured' : ''}</p>
           {activeUpgradeChain.error && <p className="text-sm add-team-error" role="alert">{activeUpgradeChain.error}</p>}
-          <p className="team-family-full-route">{fullRoute.map(teamId => <span key={teamId}><span className="mono">{teamId}</span> <span>{stageLabel(draft, selectedGroup.rootId, teamId, selectedGroup.kind)}</span>{teamId !== fullRoute[fullRoute.length - 1] && <span className="team-family-route-arrow">→</span>}</span>)}</p>
+          <p className="team-family-full-route team-family-summary-route">{fullRoute.map(teamId => <span key={teamId} title={teamId}><span>{stageLabel(draft, selectedGroup.rootId, teamId, selectedGroup.kind)}</span>{teamId !== fullRoute[fullRoute.length - 1] && <span className="team-family-route-arrow">{' → '}</span>}</span>)}</p>
           <label>Next upgrade<select className="input" aria-label={`Upgrade to for team ${formatMachineChoice(activeTeamId, teamNames)}`} value={activeSummary.upgrade_to ?? ''} onChange={event => updateUpgrade(event.target.value)}><option value="">None — no further upgrade</option>{teamNames.filter(teamId => teamId !== activeTeamId).map(teamId => <option key={teamId} value={teamId}>{formatMachineChoice(teamId, teamNames)}</option>)}</select></label>
           {selectedGroup.kind === 'family' && !selectedGroup.simpleRoute && <p className="notice" role="status">This family has an explicit complex route. Reorder and stage removal are disabled; use the next-upgrade controls and the full route above.</p>}
           {selectedGroup.kind === 'legacy_chain' && <p className="text-xs text-dim">Upgrade links remain standalone until an accepted conversion is added to the draft.</p>}
@@ -641,7 +630,6 @@ export function TeamFamiliesSettings({
           <pre className="mono">{declaredToml(activeTeamId, activeSummary)}</pre>
         </details>
         {operationError && <p className="error-message" role="alert">{operationError.message}</p>}
-        {baseline?.teams[activeTeamId] && !activeSummary.extends && selectedGroup.kind === 'legacy_chain' && <p className="text-xs text-dim">This legacy team is unchanged until you explicitly accept a conversion preview.</p>}
       </fieldset> : <p className="text-sm text-dim">Select a team family to inspect its declarations.</p>}
       </div>
     </SidebarEditorLayout>

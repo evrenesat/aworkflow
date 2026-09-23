@@ -138,6 +138,7 @@ def test_profile_combobox_enter_preserves_raw_identity(control_client, tmp_path,
             page.get_by_role('button', name='Settings', exact=True).click()
             select_settings_section(page, 'Agents & Roles')
 
+            page.locator('details.settings-disclosure > summary', has_text='Add profile').click()
             page.get_by_label('Harness', exact=True).select_option('codex')
             profile = page.get_by_label('New profile name', exact=True)
             profile.fill('luna')
@@ -571,7 +572,8 @@ def test_new_draft_plan_template_smoke(control_client, monkeypatch):
             # Skeleton placeholders do not block promotion: no new validator.
             open_settings_more(page)
             page.get_by_role('menuitem', name='Move to Ready', exact=True).click()
-            page.locator('.header-context-title').filter(has_text='Ready').wait_for()
+            page.locator('.header-context-title').filter(has_text='draft-smoke.md').wait_for()
+            page.locator('.plan-header-context .status-pill').filter(has_text='Ready').wait_for()
             assert (root / 'plans' / 'in-progress' / 'draft-smoke.md').read_text() == long_content
         finally:
             browser.close()

@@ -149,6 +149,7 @@ interface NewRunPageProps {
   setStartMaxTurns: (value: string) => void
   startMaxTurnsProblem: string | null
   configuredMaxTurns: number | null
+  serverDefaultMaxTurns: number | null
   preview: ReactNode
   worktreePreflight: ReactNode
   restartActions: ReactNode
@@ -165,7 +166,13 @@ interface NewRunPageProps {
   extraInstructionProblem: string | null
   launchBlocker: string | null
   onOpenSettings: (() => void) | undefined
-  handleStart: () => Promise<void>
+  reviewOpen: boolean
+  review: ReactNode
+  onOpenStartReview: () => void
+  onCancelStartReview: () => void
+  onConfirmStart: () => Promise<void>
+  startActionLabel: string
+  reviewReady: boolean
   startDisabled: boolean
   busyAction: string | null
   /** The hosted shell renders Start/Cancel in its shared row-2 slots. */
@@ -173,7 +180,7 @@ interface NewRunPageProps {
 }
 
 /** Presentation only; the workspace retains request and answer identity across navigation. */
-export function NewRunPage({ startPlanPath, setStartPlanPath, planOptions, planBadges, restartDraftFrozen, startWorkflow, changeStartWorkflow, workflowOptions, workflowBadges, workflowPresentation, startTeamFamily, setStartTeamFamily, teamFamilyOptions, teamFamilyBadges, teamFamilyOptionLabel, teamFamilyOptionHint, teamFamilyPresentation, startTeamStage, setStartTeamStage, teamStageOptions, teamStageBadges, teamStageOptionLabel, teamStageOptionHint, teamStagePresentation, startMaxTurns, setStartMaxTurns, startMaxTurnsProblem, configuredMaxTurns, preview, worktreePreflight, restartActions, onCancel, advancedOpen, setAdvancedOpen, startStep, setStartStep, effectiveWorkflow, runSteps, skippedByDraft, startExtraInstructions, setStartExtraInstructions, extraInstructionProblem, launchBlocker, onOpenSettings, handleStart, startDisabled, busyAction, hideActions = false }: NewRunPageProps) {
+export function NewRunPage({ startPlanPath, setStartPlanPath, planOptions, planBadges, restartDraftFrozen, startWorkflow, changeStartWorkflow, workflowOptions, workflowBadges, workflowPresentation, startTeamFamily, setStartTeamFamily, teamFamilyOptions, teamFamilyBadges, teamFamilyOptionLabel, teamFamilyOptionHint, teamFamilyPresentation, startTeamStage, setStartTeamStage, teamStageOptions, teamStageBadges, teamStageOptionLabel, teamStageOptionHint, teamStagePresentation, startMaxTurns, setStartMaxTurns, startMaxTurnsProblem, configuredMaxTurns, serverDefaultMaxTurns, preview, worktreePreflight, restartActions, onCancel, advancedOpen, setAdvancedOpen, startStep, setStartStep, effectiveWorkflow, runSteps, skippedByDraft, startExtraInstructions, setStartExtraInstructions, extraInstructionProblem, launchBlocker, onOpenSettings, reviewOpen, review, onOpenStartReview, onCancelStartReview, onConfirmStart, startActionLabel, reviewReady, startDisabled, busyAction, hideActions = false }: NewRunPageProps) {
   const advancedId = useId()
   return (
         <section className="card start-run-form">
@@ -244,6 +251,17 @@ export function NewRunPage({ startPlanPath, setStartPlanPath, planOptions, planB
                     <span className="text-xs text-dim">The selected stage submits its exact configured team ID.</span>
                   </div>}
                 </div>
+                <label className="dashboard-field">
+                  <span>Maximum turns</span>
+                  <input className="input" aria-label="Run max turns" type="number" min="1" value={startMaxTurns} disabled={restartDraftFrozen} onChange={(event) => setStartMaxTurns(event.target.value)} />
+                  {startMaxTurnsProblem
+                    ? <span className="error-message" role="alert">{startMaxTurnsProblem}</span>
+                    : <span className="text-xs text-dim">{configuredMaxTurns !== null
+                      ? `Global default: ${configuredMaxTurns}.`
+                      : serverDefaultMaxTurns !== null
+                        ? `Server default: ${serverDefaultMaxTurns}.`
+                        : 'No global default max turns is configured.'}</span>}
+                </label>
 
               </div>
               <section className="dashboard-section">
@@ -261,12 +279,6 @@ export function NewRunPage({ startPlanPath, setStartPlanPath, planOptions, planB
                 </h4>
                 {advancedOpen && (
                   <div id={advancedId} className="start-run-form">
-                <label className="dashboard-field"><span>Max turns</span>
-                  <input className="input" aria-label="Run max turns" type="number" min="1" value={startMaxTurns} disabled={restartDraftFrozen} onChange={(event) => setStartMaxTurns(event.target.value)} />
-                  {startMaxTurnsProblem
-                    ? <span className="error-message" role="alert">{startMaxTurnsProblem}</span>
-                    : <span className="text-xs text-dim">{configuredMaxTurns !== null ? `Global default: ${configuredMaxTurns}.` : 'No global default max turns is configured.'}</span>}
-                </label>
                     <label className="dashboard-field"><span>Start step</span>
                       <select className="input" aria-label="Run start step" value={startStep} onChange={(event) => setStartStep(event.target.value)} disabled={!effectiveWorkflow || restartDraftFrozen}>
                         <option value="">{effectiveWorkflow ? 'Workflow first step (default)' : 'Select a workflow first'}</option>
@@ -308,13 +320,30 @@ export function NewRunPage({ startPlanPath, setStartPlanPath, planOptions, planB
                 </div>
               )}
               {restartActions}
-              {!hideActions && <div className="dashboard-actions">
+              {reviewOpen && <section className="dashboard-section launch-review" aria-label="Review start" role="region">
+                <div className="section-heading">
+                  <h4>Review before starting</h4>
+                  <span className="text-xs text-dim">Read-only check — no run has been allocated.</span>
+                </div>
+                {review}
+                <div className="dashboard-actions">
+                  {!hideActions && <button
+                    className="btn btn-primary"
+                    onClick={() => void onConfirmStart()}
+                    disabled={startDisabled || !reviewReady || Boolean(restartActions)}
+                  >
+                    {busyAction === 'start' ? 'Starting…' : 'Start run'}
+                  </button>}
+                  <button className="btn btn-secondary" onClick={onCancelStartReview} disabled={busyAction === 'start'}>Cancel review</button>
+                </div>
+              </section>}
+              {!reviewOpen && !hideActions && <div className="dashboard-actions">
                 <button
                   className="btn btn-primary"
-                  onClick={() => void handleStart()}
+                  onClick={onOpenStartReview}
                   disabled={startDisabled || Boolean(restartActions)}
                 >
-                  {busyAction === 'start' ? 'Starting…' : 'Start run'}
+                  {startActionLabel}
                 </button>
                 <button className="btn btn-secondary" onClick={onCancel}>Cancel</button>
               </div>}

@@ -1,0 +1,25 @@
+{
+  "schema_version": 1,
+  "source": "demo.html",
+  "recorded_reference_sha256": "2465c0ac2bfef90af2b98a537ad5ac3e931b927c23a78379a8c532ce4dcbadf4",
+  "measurement_scope": "The #af-frame product surface only; host/demo chrome is excluded.",
+  "anchor_order": [
+    "title",
+    "current_work",
+    "latest_result",
+    "recent_activity",
+    "first_disclosure"
+  ],
+  "desktop": {
+    "content_start_y_max": 128,
+    "run_row_height_target_px": [56, 72],
+    "viewports": [[1280, 720], [1440, 900]]
+  },
+  "mobile": {
+    "viewports": [[390, 844]],
+    "list_detail_breakpoint_px": 960,
+    "document_scroll_owner": "document"
+  },
+  "themes": ["light", "dark"],
+  "recording_note": "Anchor boxes are emitted into disposable capture manifests by the browser harness; these values are the stable acceptance contract, not pixel-perfect browser snapshots."
+}

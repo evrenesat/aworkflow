@@ -73,6 +73,10 @@ rows; compact pages expose the same destinations through an in-flow hamburger
 menu with Escape-to-close and focus return. Settings uses the shared row for its
 section selector/tabs, save coordinator and More actions, while the consumer
 continues to own drafts and handlers. The web `SidebarEditorLayout` keeps detail and editor content in document flow.
+Project and All runs lists share `RunListItem`: exact run identity remains the
+selection key, while compact progress and an anchored preview expose available
+facts without growing rows or changing sibling geometry. The preview control is
+separate from selection and preserves the layout's mobile Back/focus ownership.
 In wide/tall mode its navigation may be sticky with a bounded local scroll
 surface; in compact/short mode its local presentation state exposes one
 already-mounted list or detail surface at a time. Selection remains owned by
@@ -96,6 +100,18 @@ The same module runs in Chromium by default and WebKit when
 `AFLOW_TEST_BROWSER=webkit`; CI installs the required WebKit browser and uploads
 the generated screenshot artifacts. These emulated checks do not stand in for
 physical mobile keyboard or browser-toolbar verification.
+
+Checkpoint 10 extends that boundary with populated calm-workspace fidelity
+captures in `test_ui_demo_fidelity_browser.py`. The acceptance contract keeps
+representative desktop content within y=128, keeps the title/current/latest
+hierarchy above the fold, targets 56–72px run rows, and exposes the beginning
+of Latest result at 390×844. The harness records ordered semantic anchors,
+light/dark screenshots, and the complete responsive matrix rather than relying
+on a single pixel diff. Selecting a run closes any stale hover/touch preview so
+the detail's final action remains reachable; while live capabilities are still
+loading, review-stop remains visible but disabled and cannot mutate state.
+Disposable captures and the frozen-reference comparison are recorded in
+`docs/ui-reference/calm-workspace/verification.md`.
 
 ## Observer progress boundary
 

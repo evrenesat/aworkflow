@@ -96,12 +96,14 @@ export function PromptsSettings({ draft, change, rename, names, deleted, onDelet
     else prompts[role] = text
   })
   return <section className="settings-guided-content">
-    <button className="btn btn-secondary" onClick={() => change(value => {
-      const prompts = value.prompts ??= {}
-      let key = 'new_prompt'
-      for (let index = 2; key in prompts; index++) key = `new_prompt_${index}`
-      prompts[key] = ''; select(`named:${key}`)
-    })}>New prompt</button>
+    <details className="settings-disclosure"><summary>Create prompt</summary>
+      <button className="btn btn-secondary" onClick={() => change(value => {
+        const prompts = value.prompts ??= {}
+        let key = 'new_prompt'
+        for (let index = 2; key in prompts; index++) key = `new_prompt_${index}`
+        prompts[key] = ''; select(`named:${key}`)
+      })}>New prompt</button>
+    </details>
     {deleted.map(item => <div className="notice" role="status" key={item.name}>
       Prompt <strong className="mono">{formatMachineLabel(item.name)}</strong> was removed from the unsaved draft; the deletion happens when you Save all.
       <label>Restore under key <input className="input" aria-label="Restore key" value={restoreKeys[item.name] ?? item.name} onChange={event => setRestoreKeys(keys => ({ ...keys, [item.name]: event.target.value }))} /></label>

@@ -58,6 +58,24 @@ VISUAL_CHECKPOINT_NAMES = {
 }
 
 
+def _open_checkpoint_history_list(history):
+    disclosure = history.locator("details.checkpoint-history-checkpoints")
+    if disclosure.get_attribute("open") is None:
+        disclosure.locator(":scope > summary").click()
+    expect(disclosure).to_have_attribute("open", "")
+    return disclosure.locator(".checkpoint-history-navigation")
+
+
+def _open_history_disclosure(history, label: str):
+    disclosure = history.locator("details.checkpoint-history-disclosure").filter(
+        has_text=label
+    ).first
+    if disclosure.get_attribute("open") is None:
+        disclosure.locator(":scope > summary").click()
+    expect(disclosure).to_have_attribute("open", "")
+    return disclosure
+
+
 def _write_json(path: Path, payload: object) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
@@ -1163,13 +1181,15 @@ def _assert_selected_run_identity(page, run_id: str) -> None:
 
 def _global_run_row(page, run_id: str):
     """Find the one global row ending in the exact full run identity."""
-    row = page.locator("button.global-run-row").and_(
-        page.get_by_role(
-            "button", name=re.compile(rf" · {re.escape(run_id)}$")
+    row = page.locator("div.run-list-item.global-run-row").filter(
+        has=page.locator(
+            f"button.run-list-select[aria-label$=' · {run_id}']"
         )
     )
     expect(row).to_have_count(1)
-    return row
+    selection = row.locator("button.run-list-select")
+    expect(selection).to_have_count(1)
+    return selection
 
 
 def test_checkpoint_history_review_evidence_and_generation_refresh(
@@ -1213,11 +1233,11 @@ def test_checkpoint_history_review_evidence_and_generation_refresh(
             search.fill(REVIEW_EVIDENCE_RUN_ID)
             row = _global_run_row(page, REVIEW_EVIDENCE_RUN_ID)
             row.wait_for()
-            markers = row.locator(".compact-run-progress-segment")
-            expect(markers).to_have_count(11)
-            expect(markers.nth(0)).to_have_class(re.compile(r"\bcurrent\b"))
-            expect(markers.nth(1)).to_have_class(re.compile(r"\bpending\b"))
-            expect(markers.nth(2)).to_have_class(re.compile(r"\bapproved\b"))
+            compact_progress = row.locator(".compact-run-progress-row")
+            expect(compact_progress).to_have_count(1)
+            expect(compact_progress).to_have_attribute(
+                "aria-label", re.compile(r"1 of 11 checkpoints approved")
+            )
             row.click()
             history = page.locator('.checkpoint-history[aria-label="Checkpoint history"]')
             history.wait_for()
@@ -1237,7 +1257,7 @@ def test_checkpoint_history_review_evidence_and_generation_refresh(
                 and event["decision_number"] == 3
                 for event in events
             )
-            navigation = history.locator(".checkpoint-history-navigation")
+            navigation = _open_checkpoint_history_list(history)
             assert navigation.get_by_role(
                 "button", name="Unassigned or omitted history", exact=True
             ).count() == 0
@@ -1259,10 +1279,7 @@ def test_checkpoint_history_review_evidence_and_generation_refresh(
             expect(history.locator(".checkpoint-history-timeline")).to_contain_text("Review rejection")
             expect(history.locator(".checkpoint-history-timeline")).to_contain_text("Rejected")
 
-            delivery = history.locator("details.checkpoint-history-disclosure").filter(
-                has_text="Delivery evidence"
-            )
-            delivery.locator("summary").click()
+            delivery = _open_history_disclosure(history, "Delivery evidence")
             expect(delivery).to_contain_text("Merge · Unknown")
             assert "Merge · Succeeded" not in delivery.inner_text()
 
@@ -1282,10 +1299,7 @@ def test_checkpoint_history_review_evidence_and_generation_refresh(
             expect(applied_changes).to_have_count(2)
             expect(applied_changes.filter(has_text="decision 1")).to_have_count(1)
             expect(applied_changes.filter(has_text="decision 2")).to_have_count(1)
-            changes = history.locator("details.checkpoint-history-disclosure").filter(
-                has_text="Team & change history"
-            )
-            changes.locator("summary").click()
+            changes = _open_history_disclosure(history, "Run settings & changes")
             expect(changes).to_contain_text("generation generation-one")
             expect(changes).to_contain_text("generation generation-two")
             expect(changes).to_contain_text("Hotplug")
@@ -1415,8 +1429,8 @@ def test_checkpoint_history_review_evidence_and_generation_refresh(
             expect(
                 history.locator(".checkpoint-history-summary dt").filter(
                     has_text="Last executor"
-                ).locator("xpath=following-sibling::dd")
-            ).to_have_text("Not reported")
+                )
+            ).to_have_count(0)
             _assert_document_moves(page)
             page.screenshot(path=str(_screenshot_path(tmp_path, "review-evidence", 390, 844)), full_page=True)
         finally:
@@ -1453,12 +1467,12 @@ def test_run_progress_transport_and_browser_parity(
             page.get_by_role("heading", name="Issue35 original", exact=True).wait_for()
             _assert_selected_run_identity(page, run_id)
 
-            current_work = page.locator(".checkpoint-history-at-a-glance dt").filter(
-                has_text=re.compile(r"^Current work$")
-            ).locator("xpath=following-sibling::dd[1]")
+            current_work = page.locator(
+                "[data-ui-fidelity-anchor='current-work'] .run-overview-content"
+            )
             expect(current_work).to_have_count(1)
             expect(current_work).to_have_text(
-                "CP4 of 14 · Unknown — Checkpoint 4: Stage 4"
+                "CP4 of 14 · Implement — Stage 4"
             )
             expect(current_work).to_be_visible()
             expect(
@@ -1480,7 +1494,7 @@ def test_run_progress_transport_and_browser_parity(
             page.get_by_role("button", name="More", exact=True).click()
             page.get_by_role("menuitem", name="Refresh", exact=True).click()
             expect(current_work).to_have_text(
-                "CP5 of 14 · Unknown — Checkpoint 5: Stage 5"
+                "CP5 of 14 · Implement — Stage 5"
             )
             expect(current_work).to_be_visible()
             detail_text = page.locator(".run-detail").inner_text()
@@ -1583,14 +1597,16 @@ def test_canonical_run_progress_visual_journey(
 
                 history = page.locator('.checkpoint-history[aria-label="Checkpoint history"]')
                 history.wait_for()
-                expect(history.locator(".checkpoint-history-at-a-glance")).to_contain_text("Current work")
+                expect(
+                    page.locator("[data-ui-fidelity-anchor='current-work']")
+                ).to_contain_text("Current work")
                 expect(history).to_contain_text("4 of 11 checkpoints approved")
                 expect(history).to_contain_text(re.compile(r"CP5 of 11\s+·\s+Implementing"))
                 expect(history).to_contain_text("6 attempts")
                 expect(history).to_contain_text("1 repair pass")
                 expect(history).to_contain_text("1 runtime retry")
                 expect(history).to_contain_text("1 upgrade")
-                expect(history.locator(".checkpoint-history-navigation")).to_contain_text("Repairing")
+                expect(_open_checkpoint_history_list(history)).to_contain_text("Repairing")
                 expect(history).to_contain_text("codex.repair")
                 _assert_header_and_flow(page)
                 page.screenshot(
@@ -1598,7 +1614,7 @@ def test_canonical_run_progress_visual_journey(
                     full_page=True,
                 )
 
-                navigation = history.locator(".checkpoint-history-navigation")
+                navigation = _open_checkpoint_history_list(history)
                 current_button = navigation.get_by_role("button", name=re.compile(r"Checkpoint 5: Inspect the long-lived executor"))
                 current_button.wait_for()
                 current_button.click()
@@ -1610,34 +1626,22 @@ def test_canonical_run_progress_visual_journey(
                 expect(timeline).to_contain_text("Repair attempt")
                 expect(timeline).to_contain_text("Runtime retry")
 
-                team_changes = history.locator("details.checkpoint-history-disclosure").filter(
-                    has_text="Team & change history"
-                )
-                team_changes.locator("summary").click()
+                team_changes = _open_history_disclosure(history, "Run settings & changes")
                 expect(team_changes).to_contain_text("Applied changes")
                 expect(team_changes).to_contain_text("base-team → repair-team")
                 expect(team_changes).to_contain_text("Pending changes")
                 expect(team_changes).to_contain_text("next-team")
 
-                delivery = history.locator("details.checkpoint-history-disclosure").filter(
-                    has_text="Delivery evidence"
-                )
-                delivery.locator("summary").click()
+                delivery = _open_history_disclosure(history, "Delivery evidence")
                 expect(delivery).to_contain_text("CI · Unknown")
                 expect(delivery).to_contain_text("Live · Unknown")
                 assert "CI · Succeeded" not in delivery.inner_text()
                 assert "Live verification · Succeeded" not in delivery.inner_text()
 
-                evidence = history.locator("details.checkpoint-history-disclosure").filter(
-                    has_text="Count definitions & evidence"
-                )
-                evidence.locator("summary").click()
+                evidence = _open_history_disclosure(history, "Count definitions & evidence")
                 expect(evidence).to_contain_text("Counts come from the bounded canonical evidence projection")
                 expect(evidence).to_contain_text("Complete evidence")
-                time_details = history.locator("details.checkpoint-history-disclosure").filter(
-                    has_text="Time details"
-                )
-                time_details.locator("summary").click()
+                time_details = _open_history_disclosure(history, "Time details")
                 expect(time_details).to_contain_text("Total run elapsed")
                 expect(time_details).to_contain_text("Workflow runtime is separate from browser data-load latency")
                 _assert_document_moves(page)
@@ -1690,7 +1694,7 @@ def test_canonical_run_progress_visual_journey(
                 )
                 expect(checkpoint_four_body).to_be_visible()
                 expect(checkpoint_four_body).to_contain_text("Event identity")
-                expect(checkpoint_four_body).to_contain_text("Reason:")
+                expect(checkpoint_four_body).not_to_contain_text("Reason:")
 
                 _advance_visual_progress(fixture)
                 page.get_by_role("button", name="More", exact=True).click()
@@ -1718,7 +1722,7 @@ def test_canonical_run_progress_visual_journey(
                     page.get_by_role("heading", name="All runs", exact=True).wait_for()
                     search = page.get_by_label("Search loaded runs", exact=True)
                     search.fill(many_prefix)
-                    many_rows = page.locator("button.global-run-row")
+                    many_rows = page.locator("div.run-list-item.global-run-row")
                     many_rows.first.wait_for()
                     loaded_many_rows = many_rows.evaluate_all(
                         """rows => rows.filter(row => row.closest('.global-run-results')).length"""
@@ -1782,10 +1786,7 @@ def test_canonical_run_progress_visual_journey(
                     )
                     expect(screenshot_delivery).to_contain_text("Final review: Succeeded")
                     expect(screenshot_delivery).to_contain_text("CI: Unknown")
-                    screenshot_time = screenshot_history.locator(
-                        "details.checkpoint-history-disclosure"
-                    ).filter(has_text="Time details")
-                    screenshot_time.locator("summary").click()
+                    screenshot_time = _open_history_disclosure(screenshot_history, "Time details")
                     reviewer_time = screenshot_time.locator(
                         ".checkpoint-history-time-group"
                     ).filter(has_text="Reviewer invocations")
@@ -1795,9 +1796,7 @@ def test_canonical_run_progress_visual_journey(
                     expect(screenshot_time).to_contain_text("Known invocation coverage")
                     expect(screenshot_time).to_contain_text("6m 13s")
                     assert "Recorded duration total: 4m 52s" not in screenshot_time.inner_text()
-                    screenshot_navigation = screenshot_history.locator(
-                        ".checkpoint-history-navigation"
-                    )
+                    screenshot_navigation = _open_checkpoint_history_list(screenshot_history)
                     unassigned = screenshot_navigation.get_by_role(
                         "button", name=re.compile(r"Unassigned history")
                     )
@@ -1847,7 +1846,7 @@ def test_canonical_run_progress_visual_journey(
                         )
                     ).to_be_visible()
                     selected_row = page.locator(
-                        f"button.run-list-item[data-sidebar-editor-item='{screenshot_run_id}']"
+                        f"button.run-list-select[data-sidebar-editor-item='{screenshot_run_id}']"
                     )
                     expect(selected_row).to_have_attribute("aria-current", "true")
 
@@ -1940,6 +1939,12 @@ def test_run_summary_wraps_without_document_overflow(
             checkpoint_detail = page.locator(
                 '[data-sidebar-editor-list="Checkpoints"] > .sidebar-editor-detail'
             )
+            checkpoint_disclosure = page.locator(
+                "details.checkpoint-history-checkpoints"
+            )
+            if checkpoint_disclosure.get_attribute("open") is None:
+                checkpoint_disclosure.locator(":scope > summary").click()
+            expect(checkpoint_disclosure).to_have_attribute("open", "")
             checkpoint_navigation.wait_for(state="visible")
             checkpoint_navigation.get_by_role(
                 "button", name=re.compile(r"^Checkpoint 4: Stage 4")
