@@ -257,6 +257,25 @@ export function runTurnBudgetText(run: RunStatus): string {
   return 'Turns used unknown · turn limit unknown'
 }
 
+/** Keep only a known turn fact when a compact preview has room for it. */
+export function runKnownTurnBudgetText(run: RunStatus): string | null {
+  const used = typeof run.turns_completed === 'number'
+    && Number.isSafeInteger(run.turns_completed)
+    && run.turns_completed >= 0
+    ? run.turns_completed
+    : null
+  const limit = typeof run.max_turns === 'number'
+    && Number.isSafeInteger(run.max_turns)
+    && run.max_turns > 0
+    ? run.max_turns
+    : null
+
+  if (used !== null && limit !== null) return `${used} of ${limit} turns used`
+  if (used !== null) return `${used} turns used`
+  if (limit !== null) return `${limit}-turn limit`
+  return null
+}
+
 /** Format a valid timestamp in the browser's local timezone with its zone visible. */
 export function formatLocalTimestamp(value: string | null | undefined): string | null {
   if (typeof value !== 'string' || !value.trim()) return null

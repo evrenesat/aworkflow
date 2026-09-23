@@ -167,6 +167,103 @@ describe('RunProgress', () => {
     expect(row.querySelector('.sr-only')).toBeNull()
   })
 
+  it('keeps a compact row to one truthful partial or zero-count fact', () => {
+    const { container } = render(<RunProgress
+      run={run({
+        status: 'waiting_for_input', activity: 'inactive', progress: progress({
+          availability: 'partial', phase: 'awaiting_review', activity: 'inactive',
+          approved_checkpoints: count(4, 'partial'), recorded_complete_checkpoints: count(5, 'partial'),
+        }),
+      })}
+      mode="row"
+    />)
+    expect(container.textContent).toContain('At least 4 of 11 checkpoints approved · partial history')
+    expect(container.textContent).not.toContain('CP5 of 11')
+
+    const zero = render(<RunProgress run={run({
+      status: 'paused', activity: 'inactive', progress: progress({
+        current_checkpoint_id: null, current_checkpoint_ordinal: null, current_checkpoint_title: null,
+        phase: null, activity: null, approved_checkpoints: count(0), recorded_complete_checkpoints: count(0),
+      }),
+    })} mode="row" />)
+    expect(zero.container.textContent).toContain('0 of 11 checkpoints approved')
+  })
+
+  it('omits ordinary unavailable filler in row and preview modes', () => {
+    const row = render(<RunProgress run={run({ progress: null })} mode="row" />)
+    expect(row.container.textContent).toBe('')
+    expect(row.container.querySelector('.compact-run-progress-row')?.getAttribute('aria-label')).toBeNull()
+
+    const preview = row.rerender(<RunProgress run={run({ progress: null })} mode="preview" />)
+    expect(preview).toBeUndefined()
+    expect(row.container.textContent).toBe('')
+  })
+
+  it.each([
+    ['known total', count(null, 'unavailable'), count(11), '11 checkpoints', '11 checkpoints · approval unknown', /CP5 of 11 · Implementing/],
+    ['known approved count', count(4), count(null, 'unavailable'), '4 approved', '4 approved · total unknown', /CP5 · Implementing/],
+  ] as const)('keeps %s without unknown-count filler in previews and preserves detail evidence', (
+    _caseName,
+    approved,
+    total,
+    previewApproval,
+    detailApproval,
+    position,
+  ) => {
+    const partialCounts = run({ progress: progress({ approved_checkpoints: approved, total_checkpoints: total }) })
+    const view = render(<RunProgress run={partialCounts} mode="preview" />)
+
+    expect(screen.getByText(previewApproval)).toBeTruthy()
+    expect(screen.getByText(position)).toBeTruthy()
+    expect(screen.getByText('8 of 12 turns used')).toBeTruthy()
+    expect(view.container.textContent).not.toContain('approval unknown')
+    expect(view.container.textContent).not.toContain('total unknown')
+
+    view.rerender(<RunProgress run={partialCounts} />)
+    expect(screen.getByText(detailApproval)).toBeTruthy()
+  })
+
+  it('omits unknown aggregate approval from preview strip accessibility but retains detail uncertainty', () => {
+    const unknownApproval = run({ progress: progress({
+      approved_checkpoints: count(null, 'unavailable'),
+      total_checkpoints: count(11),
+    }) })
+    const view = render(<RunProgress run={unknownApproval} mode="preview" />)
+    const previewStrip = screen.getByRole('img')
+
+    expect(previewStrip.getAttribute('aria-label')).not.toContain('aggregate approval count unknown')
+    expect(previewStrip.getAttribute('title')).not.toContain('aggregate approval count unknown')
+    expect(previewStrip.querySelector('.sr-only')?.textContent).not.toContain('aggregate approval count unknown')
+    expect(previewStrip.getAttribute('aria-label')).toContain('Checkpoint state bar')
+
+    view.rerender(<RunProgress run={unknownApproval} />)
+    const detailStrip = screen.getByRole('img')
+    expect(detailStrip.getAttribute('aria-label')).toContain('aggregate approval count unknown')
+    expect(detailStrip.getAttribute('title')).toContain('aggregate approval count unknown')
+    expect(detailStrip.querySelector('.sr-only')?.textContent).toContain('aggregate approval count unknown')
+  })
+
+  it('qualifies a partial total in compact and preview positions without changing detail output', () => {
+    const partialTotal = run({ progress: progress({
+      approved_checkpoints: count(null, 'unavailable'),
+      total_checkpoints: count(11, 'partial'),
+    }) })
+    const view = render(<RunProgress run={partialTotal} mode="row" />)
+
+    expect(view.container.textContent).toContain('CP5 of at least 11')
+    expect(view.container.querySelector('.compact-run-progress-row')?.getAttribute('aria-label')).toContain('CP5 of at least 11')
+
+    view.rerender(<RunProgress run={partialTotal} mode="preview" />)
+    expect(screen.getByText('at least 11 checkpoints')).toBeTruthy()
+    expect(screen.getByText(/CP5 of at least 11 · Implementing/)).toBeTruthy()
+    expect(screen.getByRole('img').getAttribute('aria-label')).not.toContain('aggregate approval count unknown')
+
+    view.rerender(<RunProgress run={partialTotal} />)
+    expect(screen.getByText('at least 11 checkpoints · approval unknown')).toBeTruthy()
+    expect(screen.getByText(/CP5 of 11 · Implementing/)).toBeTruthy()
+    expect(screen.getByRole('img').getAttribute('aria-label')).toContain('aggregate approval count unknown')
+  })
+
   it('keeps ordinary compact-row loading announcements out of the visible projection line', () => {
     const { container } = render(<RunProgress
       run={run()}

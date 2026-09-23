@@ -3,15 +3,25 @@
 from __future__ import annotations
 
 import json
+import os
 import re
 from pathlib import Path
+from urllib.parse import urlsplit
 
 import pytest
 from playwright.sync_api import expect, sync_playwright
 
 from aflow.control_plane.units import InMemoryUnitManager, UnitState
 from test_control_plane_api import PROJECT_ID, control_client, live_server  # noqa: F401
-from test_responsive_browser import _browser, _login, _set_theme_preference
+from test_responsive_browser import (
+    _assert_global_run_row,
+    _assert_no_horizontal_overflow,
+    _assert_theme,
+    _browser,
+    _login,
+    _register_responsive_worktree,
+    _set_theme_preference,
+)
 from test_ui_demo_fidelity_browser import (
     _fidelity_artifact_dir,
     _prepare_disposable_fidelity_config,
@@ -209,3 +219,462 @@ def test_ui_followup_run_detail(
             browser.close()
 
     assert page_errors == []
+
+
+RUN_ROW_VIEWPORTS = (
+    (320, 568),
+    (390, 844),
+    (768, 1024),
+    (844, 390),
+    (1280, 720),
+    (1440, 900),
+    (390, 420),
+)
+RUN_ROW_THEMES = ("light", "dark")
+RUN_ROW_PARENT_LABEL = "Suno Live Personas"
+RUN_ROW_WORKTREE_LABEL = "Suno checkpoint review-frequency arm"
+RUN_ROW_PROJECT_LABEL = f"{RUN_ROW_PARENT_LABEL} · Worktree: {RUN_ROW_WORKTREE_LABEL}"
+RUN_ROW_LONG_TITLE = "Automatic plan consumption with a very long repair policy review title"
+RUN_ROW_DATED_TITLE = "Readable run history"
+
+
+def _run_row_boxes(page) -> list[dict[str, float]]:
+    return page.evaluate(
+        """() => [...document.querySelectorAll('.global-run-row')]
+          .filter(element => {
+            const style = getComputedStyle(element)
+            const box = element.getBoundingClientRect()
+            return style.display !== 'none' && style.visibility !== 'hidden' && box.width > 0 && box.height > 0
+          })
+          .map(element => {
+            const box = element.getBoundingClientRect()
+            return {x: box.x, y: box.y, width: box.width, height: box.height}
+          })"""
+    )
+
+
+def _wait_for_render_settle(page) -> None:
+    page.evaluate(
+        """() => new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve)))"""
+    )
+
+
+def _rewrite_run_metadata(path: Path, **updates: object) -> None:
+    metadata = json.loads(path.read_text(encoding="utf-8"))
+    metadata.update(updates)
+    path.write_text(json.dumps(metadata, indent=2) + "\n", encoding="utf-8")
+
+
+def test_ui_followup_run_rows(
+    control_client,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Exercise populated rows against the deployed overflow shape and full viewport matrix."""
+    _, root, units, _ = control_client
+    fixtures = seed_demo_fidelity_fixture(root)
+    running = fixtures["running"]
+    paused = fixtures["paused"]
+    completed = fixtures["completed"]
+    assert isinstance(running, dict) and isinstance(paused, dict) and isinstance(completed, dict)
+    running_id = str(running["run_id"])
+    paused_id = str(paused["run_id"])
+    completed_id = str(completed["run_id"])
+    running_plan = Path(running["plan"])
+    long_plan = running_plan.with_name("automatic-plan-consumption-with-a-very-long-repair-policy-review-title.md")
+    plan_lines = running_plan.read_text(encoding="utf-8").splitlines()
+    plan_lines[0] = f"# {RUN_ROW_LONG_TITLE}"
+    long_plan.write_text("\n".join(plan_lines) + "\n", encoding="utf-8")
+    running_metadata_path = root / ".aflow" / "runs" / running_id / "run.json"
+    _rewrite_run_metadata(
+        running_metadata_path,
+        original_plan_display_name=RUN_ROW_LONG_TITLE,
+        original_plan_path=str(long_plan.resolve()),
+        active_plan_path=str(long_plan.resolve()),
+        plan_path=str(long_plan.resolve()),
+        progress_history_complete=False,
+    )
+    running_metadata = json.loads(running_metadata_path.read_text(encoding="utf-8"))
+    scope = running_metadata.get("active_implementation_scope")
+    if isinstance(scope, dict):
+        scope["original_plan_path"] = str(long_plan.resolve())
+        running_metadata_path.write_text(json.dumps(running_metadata, indent=2) + "\n", encoding="utf-8")
+    launch_manifest = root / ".aflow" / "launches" / f"{running_id}.json"
+    _rewrite_run_metadata(launch_manifest, plan_path=str(long_plan.resolve()))
+
+    completed_plan = Path(completed["plan"])
+    dated_plan = completed_plan.with_name("readable-run-history-20260923.md")
+    dated_plan.write_bytes(completed_plan.read_bytes())
+    completed_metadata_path = root / ".aflow" / "runs" / completed_id / "run.json"
+    _rewrite_run_metadata(
+        completed_metadata_path,
+        original_plan_display_name=dated_plan.name,
+        original_plan_path=str(dated_plan.resolve()),
+        active_plan_path=str(dated_plan.resolve()),
+        plan_path=str(dated_plan.resolve()),
+    )
+    completed_metadata = json.loads(completed_metadata_path.read_text(encoding="utf-8"))
+    completed_scope = completed_metadata.get("active_implementation_scope")
+    if isinstance(completed_scope, dict):
+        completed_scope["original_plan_path"] = str(dated_plan.resolve())
+        completed_metadata_path.write_text(json.dumps(completed_metadata, indent=2) + "\n", encoding="utf-8")
+    completed_launch_manifest = root / ".aflow" / "launches" / f"{completed_id}.json"
+    _rewrite_run_metadata(completed_launch_manifest, plan_path=str(dated_plan.resolve()))
+    assert isinstance(units, InMemoryUnitManager)
+    running_unit = f"aflow-run-{running_id}.service"
+    units.units[running_unit] = UnitState(name=running_unit, active_state="active", sub_state="running")
+
+    from aflow_app_server import main
+
+    worktree_id = _register_responsive_worktree(root)
+    child_launches = root.parent / worktree_id / ".aflow" / "launches"
+    child_launches.mkdir(parents=True, exist_ok=True)
+    for launch in (root / ".aflow" / "launches").iterdir():
+        if launch.is_file():
+            target = child_launches / launch.name
+            target.write_bytes(launch.read_bytes())
+            if target.suffix != ".json" or target.name.endswith(".state.json"):
+                continue
+            child_metadata = json.loads(target.read_text(encoding="utf-8"))
+            child_metadata["caller_scope"] = f"bearer:{worktree_id}"
+            child_metadata["project_root"] = str((root.parent / worktree_id).resolve())
+            plan_path = child_metadata.get("plan_path")
+            if isinstance(plan_path, str):
+                source_plan = Path(plan_path)
+                try:
+                    relative_plan = source_plan.resolve().relative_to(root.resolve())
+                except ValueError:
+                    relative_plan = None
+                if relative_plan is not None:
+                    child_plan = root.parent / worktree_id / relative_plan
+                    child_plan.parent.mkdir(parents=True, exist_ok=True)
+                    if source_plan.is_file():
+                        child_plan.write_bytes(source_plan.read_bytes())
+                    child_metadata["plan_path"] = str(child_plan.resolve())
+            target.write_text(json.dumps(child_metadata, indent=2) + "\n", encoding="utf-8")
+    assert main._project_registry is not None
+    assert main._project_registry.rename(PROJECT_ID, RUN_ROW_PARENT_LABEL) is not None
+    assert main._project_registry.rename(worktree_id, RUN_ROW_WORKTREE_LABEL) is not None
+
+    dist = Path(__file__).resolve().parents[2] / "web" / "dist"
+    if not (dist / "index.html").exists():
+        pytest.fail("The follow-up row fidelity test requires the real built web app; run the web build first.")
+    monkeypatch.setenv("AFLOW_APP_WEB_DIST", str(dist))
+
+    artifact_dir = _fidelity_artifact_dir(tmp_path)
+    artifact_dir.mkdir(parents=True, exist_ok=True)
+    browser_name = os.environ.get("AFLOW_TEST_BROWSER", "chromium").strip().lower()
+    requests: list[tuple[str, str]] = []
+    page_errors: list[str] = []
+    loading_mode = {"enabled": False}
+    held_loading_routes = []
+    stale_mode = {"enabled": False}
+    held_stale_routes = []
+
+    def intercept_row_requests(route) -> None:
+        parsed = urlsplit(route.request.url)
+        parts = parsed.path.strip("/").split("/")
+        if route.request.method != "GET" or len(parts) < 5 or parts[:3] != ["api", "control-plane", "projects"]:
+            route.continue_()
+            return
+        project_id = parts[3]
+        if len(parts) == 5 and parts[4] == "runs" and project_id == worktree_id and stale_mode["enabled"]:
+            response = route.fetch()
+            payload = response.json()
+            changed = next((candidate for candidate in payload.get("runs", []) if candidate.get("run_id") == running_id), None)
+            if changed is not None:
+                changed["revision"] = int(changed.get("revision", 0)) + 1
+            route.fulfill(response=response, json=payload)
+            return
+        if len(parts) == 6 and parts[4] == "runs" and project_id == worktree_id:
+            run_id = parts[5]
+            if run_id == paused_id:
+                route.abort(error_code="failed")
+                return
+            if run_id == running_id and loading_mode["enabled"]:
+                held_loading_routes.append(route)
+                return
+            if run_id == running_id and stale_mode["enabled"]:
+                held_stale_routes.append(route)
+                return
+        route.continue_()
+
+    with live_server() as url, sync_playwright() as playwright:
+        browser = _browser(playwright)
+        page = browser.new_page(viewport={"width": 1280, "height": 720})
+        page.on("request", lambda request: requests.append((request.method, request.url)))
+        page.on("pageerror", lambda error: page_errors.append(str(error)))
+        try:
+            _login(page, url)
+            page.route("**/api/control-plane/projects/*/runs**", intercept_row_requests)
+            for theme in RUN_ROW_THEMES:
+                for width, height in RUN_ROW_VIEWPORTS:
+                    page.set_viewport_size({"width": width, "height": height})
+                    _set_theme_preference(page, theme)
+                    exercise_loading = theme == "light" and (width, height) == (1280, 720)
+                    loading_mode["enabled"] = exercise_loading
+                    page.goto(f"{url}/?view=all-runs", wait_until="load")
+                    _wait_for_fidelity_readiness(page)
+                    _assert_theme(page, theme)
+                    page.get_by_role("heading", name="All runs", exact=True).wait_for()
+                    if exercise_loading:
+                        search = page.get_by_role("searchbox", name="Search loaded runs", exact=True)
+                        search.fill(running_id)
+                        loading_row = _assert_global_run_row(
+                            page,
+                            running_id,
+                            project_label=RUN_ROW_PROJECT_LABEL,
+                            title=RUN_ROW_LONG_TITLE,
+                            status="Running",
+                        )
+                        expect(loading_row).to_have_attribute("data-enrichment-state", "loading")
+                        loading_name = loading_row.get_attribute("aria-label") or ""
+                        assert "Loading checkpoint progress…" in loading_name, loading_name
+                        expect(loading_row.locator(".compact-run-progress-row-notice")).to_have_count(0)
+                        assert "Checkpoint progress unavailable" not in loading_row.inner_text()
+                        for route in held_loading_routes:
+                            route.continue_()
+                        held_loading_routes.clear()
+                        loading_mode["enabled"] = False
+                        expect(loading_row).to_have_attribute("data-enrichment-state", "settled")
+                    else:
+                        page.wait_for_function(
+                            """() => {
+                              const result = document.querySelector('.global-run-results')
+                              const rows = [...document.querySelectorAll('.global-run-row')]
+                              return result?.getAttribute('aria-busy') === 'false'
+                                && rows.length > 0
+                                && rows.every(row => row.getAttribute('data-enrichment-state') !== 'loading')
+                            }"""
+                        )
+                    _assert_no_horizontal_overflow(page)
+
+                    search = page.get_by_role("searchbox", name="Search loaded runs", exact=True)
+                    search.fill(running_id)
+                    long_row = _assert_global_run_row(
+                        page,
+                        running_id,
+                        project_label=RUN_ROW_PROJECT_LABEL,
+                        title=RUN_ROW_LONG_TITLE,
+                        status="Running",
+                    )
+                    long_row.scroll_into_view_if_needed()
+                    expect(long_row.locator(".global-run-row-project")).to_have_text(RUN_ROW_PROJECT_LABEL)
+                    assert "Duration not reported" not in long_row.inner_text()
+                    assert "Activity not reported" not in long_row.inner_text()
+                    assert "Approval progress unknown" not in long_row.inner_text()
+                    assert "Checkpoint progress unavailable" not in long_row.inner_text()
+                    row_item = long_row.locator("xpath=..")
+                    selection_box = long_row.bounding_box()
+                    preview_toggle = row_item.locator(".run-row-preview-toggle")
+                    preview_box = preview_toggle.bounding_box()
+                    assert selection_box and selection_box["height"] >= 44, selection_box
+                    assert preview_box and preview_box["width"] >= 44 and preview_box["height"] >= 44, preview_box
+
+                    search.fill(completed_id)
+                    dated_row = _assert_global_run_row(
+                        page,
+                        completed_id,
+                        project_label=RUN_ROW_PROJECT_LABEL,
+                        title=RUN_ROW_DATED_TITLE,
+                        status="Completed",
+                    )
+                    dated_row.scroll_into_view_if_needed()
+                    dated_name = dated_row.get_attribute("aria-label") or ""
+                    assert "2026" in dated_name, dated_name
+                    assert "2026" not in dated_row.inner_text()
+                    dated_box = dated_row.bounding_box()
+                    assert dated_box and dated_box["height"] >= 44, dated_box
+                    if width >= 1280 and height >= 600:
+                        assert 56 <= dated_box["height"] <= 72, dated_box
+                    if width < 680:
+                        expect(dated_row.locator(".run-list-title")).to_have_text(RUN_ROW_DATED_TITLE)
+                        expect(dated_row.locator(".run-list-title")).to_be_visible()
+                    if theme == "light" and (width, height) in {(390, 844), (1280, 720)}:
+                        dated_toggle = dated_row.locator("xpath=..").locator(".run-row-preview-toggle")
+                        dated_toggle.click()
+                        dated_preview = page.locator(".run-row-preview:visible").first
+                        expect(dated_preview).to_contain_text(RUN_ROW_DATED_TITLE)
+                        expect(dated_preview).to_contain_text("2026")
+                        expect(dated_preview).to_contain_text(completed_id)
+                        page.keyboard.press("Escape")
+                        expect(page.locator(".run-row-preview:visible")).to_have_count(0)
+                        assert page.evaluate("() => document.activeElement?.classList.contains('run-row-preview-toggle')") is True
+
+                    search.fill("")
+                    page.wait_for_function(
+                        """() => [...document.querySelectorAll('.global-run-row')]
+                          .every(row => row.getAttribute('data-enrichment-state') !== 'loading')"""
+                    )
+                    long_row = _assert_global_run_row(
+                        page,
+                        running_id,
+                        project_label=RUN_ROW_PROJECT_LABEL,
+                        title=RUN_ROW_LONG_TITLE,
+                        status="Running",
+                    )
+                    long_row.scroll_into_view_if_needed()
+                    _wait_for_render_settle(page)
+                    before_boxes = _run_row_boxes(page)
+                    if width >= 1280 and height >= 600:
+                        assert all(56 <= box["height"] <= 72 for box in before_boxes), before_boxes
+                    row_item = long_row.locator("xpath=..")
+                    preview_toggle = row_item.locator(".run-row-preview-toggle")
+
+                    # Focus-triggered previews return focus to their actual
+                    # selection opener rather than the sibling preview toggle,
+                    # without the restored focus scheduling a delayed reopen.
+                    page.mouse.move(1, 1)
+                    long_row.focus()
+                    expect(page.locator(".run-row-preview:visible")).to_have_count(1)
+                    preview_toggle.focus()
+                    page.keyboard.press("Escape")
+                    expect(page.locator(".run-row-preview:visible")).to_have_count(0)
+                    restored_focus = page.evaluate(
+                        """() => ({
+                          tag: document.activeElement?.tagName,
+                          classes: document.activeElement?.className,
+                          label: document.activeElement?.getAttribute('aria-label'),
+                        })"""
+                    )
+                    assert "run-list-select" in str(restored_focus.get("classes", "")), restored_focus
+                    page.wait_for_timeout(350)
+                    expect(page.locator(".run-row-preview:visible")).to_have_count(0)
+
+                    preview_toggle.click()
+                    preview = page.locator(".run-row-preview:visible").first
+                    expect(preview).to_be_visible()
+                    _wait_for_render_settle(page)
+                    expect(preview).to_contain_text(RUN_ROW_PROJECT_LABEL)
+                    expect(preview).to_contain_text(RUN_ROW_LONG_TITLE)
+                    expect(preview).to_contain_text(running_id)
+                    assert "Duration not reported" not in preview.inner_text()
+                    assert "Activity not reported" not in preview.inner_text()
+                    after_boxes = _run_row_boxes(page)
+                    assert after_boxes == before_boxes, {"before": before_boxes, "after": after_boxes}
+                    _assert_no_horizontal_overflow(page)
+                    page.keyboard.press("Escape")
+                    expect(page.locator(".run-row-preview:visible")).to_have_count(0)
+                    assert page.evaluate("() => document.activeElement?.classList.contains('run-row-preview-toggle')") is True
+
+                    # Pointer previews are non-modal: an unrelated search
+                    # control keeps focus even when the pointer enters selection.
+                    search.focus()
+                    search.hover()
+                    long_row.hover()
+                    expect(page.locator(".run-row-preview:visible")).to_have_count(1)
+                    page.keyboard.press("Escape")
+                    expect(page.locator(".run-row-preview:visible")).to_have_count(0)
+                    assert page.evaluate("() => document.activeElement?.getAttribute('aria-label')") == "Search loaded runs"
+
+                    # The exact global identity remains searchable and opens the
+                    # child project/run pair; the row presentation never rewrites it.
+                    if theme == "light" and (width, height) == (1280, 720):
+                        search.fill(RUN_ROW_LONG_TITLE)
+                        exact_row = _assert_global_run_row(
+                            page,
+                            running_id,
+                            project_label=RUN_ROW_PROJECT_LABEL,
+                            title=RUN_ROW_LONG_TITLE,
+                            status="Running",
+                        )
+                        exact_row.click()
+                        page.wait_for_function(
+                            """expected => {
+                              const params = new URL(location.href).searchParams
+                              return params.get('project') === expected.project
+                                && params.get('view') === 'runs'
+                                && params.get('run') === expected.run
+                            }""",
+                            arg={"project": worktree_id, "run": running_id},
+                        )
+                        page.goto(f"{url}/?view=all-runs", wait_until="load")
+                        _wait_for_fidelity_readiness(page)
+                        page.get_by_role("heading", name="All runs", exact=True).wait_for()
+
+                    # The parent copy has an evidenced zero approval count in
+                    # its anchored preview; the child copy is intentionally
+                    # failed below to prove the sighted retry state.
+                    if theme == "light" and (width, height) == (1280, 720):
+                        zero_row = _assert_global_run_row(
+                            page,
+                            paused_id,
+                            project_label=RUN_ROW_PARENT_LABEL,
+                            title="Provider recovery",
+                            status="Paused",
+                        )
+                        zero_row.locator("xpath=..").locator(".run-row-preview-toggle").click()
+                        zero_preview = page.locator(".run-row-preview:visible").first
+                        expect(zero_preview).to_contain_text("0 of 3 checkpoints approved")
+                        page.keyboard.press("Escape")
+
+                    search.fill(paused_id)
+                    failed_row = _assert_global_run_row(
+                        page,
+                        paused_id,
+                        project_label=RUN_ROW_PROJECT_LABEL,
+                        title="Provider recovery",
+                        status="Paused",
+                    )
+                    expect(failed_row.locator(".compact-run-progress-row-notice.failed")).to_contain_text("Refresh to retry")
+                    search.fill("")
+
+                    if theme == "light" and (width, height) == (1280, 720):
+                        stale_mode["enabled"] = True
+                        search.fill(running_id)
+                        stale_row = _assert_global_run_row(
+                            page,
+                            running_id,
+                            project_label=RUN_ROW_PROJECT_LABEL,
+                            title=RUN_ROW_LONG_TITLE,
+                            status="Running",
+                        )
+                        page.get_by_role("button", name="Refresh", exact=True).first.click()
+                        expect(stale_row).to_have_attribute("data-enrichment-state", "stale")
+                        expect(stale_row.locator(".compact-run-progress-row-notice.stale")).to_contain_text("Run changed; refresh")
+                        assert held_stale_routes
+                        for route in held_stale_routes:
+                            route.continue_()
+                        held_stale_routes.clear()
+                        expect(stale_row).to_have_attribute("data-enrichment-state", "stale")
+                        stale_mode["enabled"] = False
+
+                    screenshot = artifact_dir / f"run-rows-{browser_name}-{theme}-{width}x{height}.png"
+                    page.screenshot(path=str(screenshot), full_page=True)
+            writes = [
+                {"method": method, "url": request_url}
+                for method, request_url in requests
+                if method not in {"GET", "HEAD", "OPTIONS"}
+                and not request_url.endswith("/api/session")  # authentication setup
+            ]
+            assert writes == []
+        finally:
+            loading_mode["enabled"] = False
+            for route in held_loading_routes:
+                route.continue_()
+            for route in held_stale_routes:
+                route.continue_()
+            browser.close()
+
+    (artifact_dir / f"run-rows-{browser_name}.json").write_text(
+        json.dumps(
+            {
+                "browser": browser_name,
+                "viewports": RUN_ROW_VIEWPORTS,
+                "themes": RUN_ROW_THEMES,
+                "project_label": RUN_ROW_PROJECT_LABEL,
+                "long_title": RUN_ROW_LONG_TITLE,
+                "dated_title": RUN_ROW_DATED_TITLE,
+                "screenshots": [
+                    f"run-rows-{browser_name}-{theme}-{width}x{height}.png"
+                    for theme in RUN_ROW_THEMES
+                    for width, height in RUN_ROW_VIEWPORTS
+                ],
+                "writes": [],
+            },
+            indent=2,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    assert page_errors == [], page_errors

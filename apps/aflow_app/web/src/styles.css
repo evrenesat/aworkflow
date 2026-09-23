@@ -1236,10 +1236,18 @@ input::placeholder, textarea::placeholder {
 
 .run-list-context {
   display: flex;
-  align-items: center;
-  gap: var(--spacing-sm);
+  flex-direction: column;
+  align-items: stretch;
+  gap: 2px;
+  width: 100%;
   min-width: 0;
-  flex-wrap: nowrap;
+}
+
+.run-list-title-line {
+  display: flex;
+  align-items: baseline;
+  width: 100%;
+  min-width: 0;
 }
 
 .run-list-title {
@@ -1249,12 +1257,6 @@ input::placeholder, textarea::placeholder {
   text-overflow: ellipsis;
   white-space: nowrap;
   overflow-wrap: normal;
-}
-
-.run-list-select .status-pill,
-.run-list-select .run-title-date,
-.run-list-select .global-run-row-project {
-  flex: 0 0 auto;
 }
 
 .run-row-preview-toggle {
@@ -1340,8 +1342,9 @@ input::placeholder, textarea::placeholder {
 .compact-run-progress-row {
   display: inline-flex;
   flex: 0 1 auto;
+  min-width: 0;
   width: auto;
-  max-width: min(100%, 30rem);
+  max-width: 100%;
   vertical-align: middle;
 }
 
@@ -1369,8 +1372,11 @@ input::placeholder, textarea::placeholder {
 
 .compact-run-progress-row-notice {
   flex: 0 1 18rem;
+  min-width: 0;
+  max-width: 100%;
   color: var(--color-warning);
   font-weight: 600;
+  overflow-wrap: anywhere;
 }
 
 .compact-run-progress-row-notice.failed {
@@ -1427,27 +1433,18 @@ input::placeholder, textarea::placeholder {
 .run-row-meta,
 .global-run-row-meta {
   display: flex;
-  align-items: center;
+  align-items: baseline;
   flex-wrap: wrap;
-  gap: var(--spacing-xs) var(--spacing-md);
+  gap: 2px var(--spacing-sm);
+  width: 100%;
   min-width: 0;
   max-width: 100%;
   overflow: hidden;
-  white-space: nowrap;
-}
-
-.run-list-select .run-row-meta {
-  flex-wrap: nowrap;
+  line-height: 1.25;
 }
 
 .run-list-select .run-row-meta > span {
   min-width: 0;
-}
-
-.run-row-meta > span:not(:last-child)::after,
-.global-run-row-meta > span:not(:last-child)::after {
-  content: ' ·';
-  margin-left: var(--spacing-md);
 }
 
 .status-pill {
@@ -2550,12 +2547,22 @@ input::placeholder, textarea::placeholder {
   background: var(--color-surface-hover);
 }
 
-.global-run-row-project { color: var(--color-text-dim); }
+.global-run-row-project {
+  flex: 1 1 12rem;
+  min-width: 0;
+  max-width: min(100%, 32rem);
+  overflow: hidden;
+  color: var(--color-text-dim);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
 .run-search-field { display: flex; flex-direction: column; gap: var(--spacing-xs); max-width: 34rem; }
 .run-title-date {
+  display: block;
   flex: 0 0 auto;
   color: var(--color-text-dim);
   font-size: 0.75rem;
+  line-height: 1.2;
   white-space: nowrap;
 }
 .run-id-copy {
@@ -2972,42 +2979,54 @@ input::placeholder, textarea::placeholder {
     gap: 2px;
   }
   .global-run-row .run-list-context {
+    gap: 2px;
+  }
+  .run-list-title {
+    white-space: normal;
+    overflow-wrap: anywhere;
+    text-overflow: clip;
+  }
+  .global-run-row .run-row-meta {
+    flex-wrap: wrap;
     align-items: baseline;
-    flex-wrap: wrap;
-    gap: 2px var(--spacing-sm);
-  }
-  .global-run-row .run-list-title {
-    flex: 1 1 100%;
-  }
-  .global-run-row .run-list-select .run-row-meta {
-    flex-wrap: wrap;
     gap: 2px var(--spacing-sm);
     overflow: visible;
     white-space: normal;
   }
-  .global-run-row .run-list-select .run-row-meta > span {
+  .global-run-row .run-row-meta > span {
     max-width: 100%;
   }
-  .global-run-row .compact-run-progress-row {
+  .global-run-row-project {
     flex: 1 1 100%;
-    display: block;
-    width: 100%;
+    max-width: 100%;
+    overflow: visible;
+    overflow-wrap: anywhere;
+    text-overflow: clip;
+    white-space: normal;
+  }
+  .global-run-row .compact-run-progress-row {
+    flex: 1 1 auto;
     max-width: 100%;
   }
   .global-run-row .compact-run-progress-row-line {
     display: flex;
-    flex-direction: column;
-    align-items: flex-start;
+    align-items: baseline;
     width: 100%;
+    min-width: 0;
     gap: 2px;
     white-space: normal;
     overflow-wrap: anywhere;
   }
-  .global-run-row .compact-run-progress-row-line > span {
-    width: 100%;
-    overflow: visible;
-    text-overflow: clip;
+  .global-run-row .compact-run-progress-row-line strong {
+    flex: 0 1 auto;
+    min-width: 0;
+    max-width: 100%;
+    overflow-wrap: anywhere;
+    white-space: normal;
   }
+  .global-run-row .compact-run-progress-row-line > span { overflow: visible; text-overflow: clip; }
+  .run-list-title-line { min-height: 1.25rem; }
+  .run-title-date { max-width: 100%; overflow-wrap: anywhere; white-space: normal; }
   .compact-row { flex-wrap: wrap; }
   .compact-row-actions { flex-basis: 100%; justify-content: flex-end; }
   .worktree-item { flex-wrap: wrap; }
