@@ -1,6 +1,6 @@
 import { act, fireEvent, render, screen } from '@testing-library/react'
 import { afterEach, describe, expect, it, vi } from 'vitest'
-import type { RunStatus } from '../types'
+import type { RunProgressCount, RunProgressSummary, RunStatus } from '../types'
 import { RunListItem } from './RunListItem'
 
 const run: RunStatus = {
@@ -10,6 +10,21 @@ const run: RunStatus = {
   current_step: 'implement', turns_completed: 4, max_turns: 100, selected_start_step: 'implement',
   skipped_steps: [], restarted_from_run_id: null, started_at: '2026-09-22T10:00:00Z', ended_at: null,
   activity: 'active', evidence: {}, progress: null,
+}
+
+const progressCount = (value: number | null, coverage: RunProgressCount['coverage'] = 'complete'): RunProgressCount => ({ value, coverage })
+
+function previewProgress(approvedCheckpoints: RunProgressCount, totalCheckpoints: RunProgressCount): RunProgressSummary {
+  return {
+    schema_version: 1, availability: 'complete', observed_at: '2026-09-23T12:00:00Z', evidence_at: '2026-09-23T11:59:00Z',
+    reason_codes: [], original_plan_identity: 'plan-compact', original_plan_display_name: run.original_plan_display_name ?? null,
+    original_plan_path: '/srv/plans/automatic-plan-consumption.md', total_checkpoints: totalCheckpoints,
+    approved_checkpoints: approvedCheckpoints, recorded_complete_checkpoints: progressCount(3),
+    current_checkpoint_id: 'cp-5', current_checkpoint_ordinal: 5, current_checkpoint_title: 'Keep row evidence useful',
+    activity: 'active', phase: 'implementing', run_status: 'running', current_executor: null, last_executor: null,
+    worker_attempts: progressCount(4), repair_passes: progressCount(1), reviews: progressCount(2),
+    runtime_retries: progressCount(0), applied_upgrades: progressCount(0),
+  }
 }
 
 afterEach(() => vi.useRealTimers())
@@ -74,14 +89,161 @@ describe('RunListItem', () => {
     const previewToggle = screen.getByRole('button', { name: /Preview Automatic/ })
     fireEvent.pointerEnter(container.querySelector<HTMLElement>('[data-run-row]')!, { pointerType: 'touch' })
     expect(screen.queryByRole('dialog')).toBeNull()
+    previewToggle.focus()
     fireEvent.click(previewToggle)
     expect(previewToggle.getAttribute('aria-expanded')).toBe('true')
     expect(screen.getByRole('dialog').textContent).toContain(longRun.original_plan_display_name!)
     fireEvent.keyDown(document, { key: 'Escape' })
     expect(previewToggle.getAttribute('aria-expanded')).toBe('false')
+    expect(document.activeElement).toBe(previewToggle)
     fireEvent.focus(selection)
     act(() => vi.advanceTimersByTime(300))
     expect(screen.getByRole('dialog')).toBeTruthy()
+  })
+
+  it('restores selection focus after a focus-open preview closes with Escape', () => {
+    vi.useFakeTimers()
+    const { container } = render(<RunListItem run={run} stableKey="run-selection-focus" onSelect={vi.fn()} />)
+    const selection = container.querySelector<HTMLButtonElement>('.run-list-select')!
+    const previewToggle = screen.getByRole('button', { name: /Preview Automatic/ })
+    selection.focus()
+    act(() => vi.advanceTimersByTime(300))
+    expect(screen.getByRole('dialog')).toBeTruthy()
+    previewToggle.focus()
+
+    fireEvent.keyDown(document, { key: 'Escape' })
+
+    expect(screen.queryByRole('dialog')).toBeNull()
+    expect(document.activeElement).toBe(selection)
+    act(() => vi.advanceTimersByTime(301))
+    expect(screen.queryByRole('dialog')).toBeNull()
+  })
+
+  it('keeps an unrelated control focused after a pointer-open preview closes with Escape', () => {
+    vi.useFakeTimers()
+    const { container } = render(<>
+      <input aria-label="Search loaded runs" />
+      <RunListItem run={run} stableKey="run-pointer-focus" onSelect={vi.fn()} />
+    </>)
+    const search = screen.getByRole('textbox', { name: 'Search loaded runs' })
+    const selection = container.querySelector<HTMLButtonElement>('.run-list-select')!
+    search.focus()
+    fireEvent.pointerEnter(selection, { pointerType: 'mouse' })
+    act(() => vi.advanceTimersByTime(300))
+    expect(screen.getByRole('dialog')).toBeTruthy()
+
+    fireEvent.keyDown(document, { key: 'Escape' })
+
+    expect(screen.queryByRole('dialog')).toBeNull()
+    expect(document.activeElement).toBe(search)
+  })
+
+  it('includes loading progress in the selection accessibility name without a visible filler notice', () => {
+    const { container } = render(<RunListItem run={run} stableKey="run-loading" loadState="loading" onSelect={vi.fn()} />)
+    const selection = container.querySelector<HTMLButtonElement>('.run-list-select')!
+
+    expect(screen.getByRole('button', { name: /Loading checkpoint progress…/ })).toBe(selection)
+    expect(selection.getAttribute('aria-label')).toContain('Loading checkpoint progress…')
+    expect(container.querySelector('.compact-run-progress-row-notice')).toBeNull()
+  })
+
+  it.each([
+    ['known total', progressCount(null, 'unavailable'), progressCount(11), '11 checkpoints', 'CP5 of 11'],
+    ['known approved count', progressCount(4), progressCount(null, 'unavailable'), '4 approved', 'CP5 · Implementing'],
+  ] as const)('keeps %s in the anchored preview without unknown-count filler', (
+    _caseName,
+    approved,
+    total,
+    aggregateFact,
+    positionFact,
+  ) => {
+    const partialCountsRun: RunStatus = { ...run, progress: previewProgress(approved, total) }
+    render(<RunListItem run={partialCountsRun} stableKey={`run-preview-${_caseName}`} onSelect={vi.fn()} />)
+
+    fireEvent.click(screen.getByRole('button', { name: /Preview Automatic/ }))
+    const preview = screen.getByRole('dialog')
+    expect(preview.textContent).toContain(run.run_id)
+    expect(preview.textContent).toContain(aggregateFact)
+    expect(preview.textContent).toContain(positionFact)
+    expect(preview.textContent).toContain('4 of 100 turns used')
+    expect(preview.textContent).not.toContain('approval unknown')
+    expect(preview.textContent).not.toContain('total unknown')
+  })
+
+  it('keeps partial-total truth in the row and preview without accessible unknown-approval filler', () => {
+    const partialTotalRun: RunStatus = {
+      ...run,
+      progress: previewProgress(progressCount(null, 'unavailable'), progressCount(11, 'partial')),
+    }
+    const { container } = render(<RunListItem run={partialTotalRun} stableKey="run-preview-partial-total" onSelect={vi.fn()} />)
+    const selection = container.querySelector<HTMLButtonElement>('.run-list-select')!
+
+    expect(selection.textContent).toContain('CP5 of at least 11')
+    expect(selection.getAttribute('aria-label')).toContain('CP5 of at least 11')
+    fireEvent.click(screen.getByRole('button', { name: /Preview Automatic/ }))
+
+    const preview = screen.getByRole('dialog')
+    const strip = preview.querySelector<HTMLElement>('[role="img"]')!
+    expect(preview.textContent).toContain(run.run_id)
+    expect(preview.textContent).toContain('at least 11 checkpoints')
+    expect(preview.textContent).toContain('CP5 of at least 11')
+    expect(strip.getAttribute('aria-label')).not.toContain('aggregate approval count unknown')
+    expect(strip.getAttribute('title')).not.toContain('aggregate approval count unknown')
+    expect(strip.querySelector('.sr-only')?.textContent).not.toContain('aggregate approval count unknown')
+  })
+
+  it('keeps a path-derived date reachable without adding a third compact row line', () => {
+    const datedRun = {
+      ...run,
+      run_id: 'run-dated',
+      original_plan_display_name: 'readable-run-history-20260923.md',
+      original_plan_path: '/srv/plans/readable-run-history-20260923.md',
+    }
+    const { container } = render(<RunListItem run={datedRun} stableKey="run-dated" onSelect={vi.fn()} />)
+    const selection = container.querySelector<HTMLButtonElement>('.run-list-select')!
+
+    expect(selection.querySelector('.run-list-title')?.textContent).toBe('Readable run history')
+    expect(selection.querySelector('.run-title-date')).toBeNull()
+    expect(selection.textContent).not.toContain('2026')
+    expect(selection.getAttribute('aria-label')).toContain('2026')
+
+    fireEvent.click(screen.getByRole('button', { name: /Preview Readable run history/ }))
+    expect(screen.getByRole('dialog').textContent).toContain('2026')
+  })
+
+  it('bounds a long project identity and omits expected missing preview facts', () => {
+    const projectLabel = 'Suno Live Personas · Worktree: Suno checkpoint review-frequency arm'
+    const longRun = {
+      ...run,
+      original_plan_display_name: 'Automatic plan consumption with a very long repair-policy review title',
+      started_at: null,
+      workflow_name: null,
+      team: null,
+      current_step: null,
+      progress: null,
+    }
+    const { container } = render(<RunListItem
+      run={longRun}
+      stableKey="long-project:run-compact-1"
+      projectLabel={projectLabel}
+      onSelect={vi.fn()}
+    />)
+
+    const row = container.querySelector<HTMLElement>('[data-run-row]')!
+    expect(row.querySelector('.global-run-row-project')?.getAttribute('title')).toBe(projectLabel)
+    expect(row.querySelector('.run-list-title')?.textContent).toBe(longRun.original_plan_display_name)
+    expect(row.textContent).not.toContain('Duration not reported')
+    expect(row.textContent).not.toContain('Activity not reported')
+    expect(row.textContent).not.toContain('Checkpoint progress unavailable')
+
+    fireEvent.click(screen.getByRole('button', { name: /Preview Automatic/ }))
+    const preview = screen.getByRole('dialog')
+    expect(preview.textContent).toContain(projectLabel)
+    expect(preview.textContent).toContain(longRun.original_plan_display_name)
+    expect(preview.textContent).toContain(longRun.run_id)
+    expect(preview.textContent).not.toContain('Duration not reported')
+    expect(preview.textContent).not.toContain('Activity not reported')
+    expect(preview.textContent).not.toContain('Checkpoint progress unavailable')
   })
 
   it('clamps the preview to the viewport beside the anchored row', () => {

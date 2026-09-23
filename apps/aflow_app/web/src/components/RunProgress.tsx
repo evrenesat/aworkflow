@@ -4,6 +4,7 @@ import {
   checkpointApprovalText,
   isTerminalInactiveRun,
   progressHistoryNotice,
+  runKnownTurnBudgetText,
   runTurnBudgetText,
 } from '../runPresentation'
 
@@ -26,17 +27,59 @@ function countIsPartial(count: RunProgressCount | null | undefined): boolean {
   return count?.coverage === 'partial'
 }
 
-function checkpointPositionText(progress: RunProgressSummary, run: RunStatus): string | null {
+function checkpointPositionText(
+  progress: RunProgressSummary,
+  run: RunStatus,
+  includeTitle = true,
+  qualifyPartialTotal = false,
+): string | null {
   if (isTerminalInactiveRun(run) || progress.availability === 'not_applicable') return null
   const phase = trimmed(progress.phase) || trimmed(progress.activity)
   const ordinal = progress.current_checkpoint_ordinal
   const total = countValue(progress.total_checkpoints)
   const title = trimmed(progress.current_checkpoint_title)
   if (ordinal !== null && Number.isSafeInteger(ordinal) && ordinal > 0) {
-    const checkpoint = `CP${ordinal}${total !== null ? ` of ${total}` : ''}`
-    return `${checkpoint}${phase ? ` · ${formatMachineLabel(phase)}` : ''}${title ? ` — ${title}` : ''}`
+    const totalLabel = total !== null
+      ? `${qualifyPartialTotal && countIsPartial(progress.total_checkpoints) ? 'at least ' : ''}${total}`
+      : null
+    const checkpoint = `CP${ordinal}${totalLabel !== null ? ` of ${totalLabel}` : ''}`
+    return `${checkpoint}${phase ? ` · ${formatMachineLabel(phase)}` : ''}${includeTitle && title ? ` — ${title}` : ''}`
   }
   return phase ? `${formatMachineLabel(phase)} · current checkpoint not reported` : 'Current checkpoint not reported'
+}
+
+function compactCheckpointPositionText(progress: RunProgressSummary, run: RunStatus): string | null {
+  if (isTerminalInactiveRun(run) || progress.availability === 'not_applicable') return null
+  const ordinal = progress.current_checkpoint_ordinal
+  if (ordinal === null || !Number.isSafeInteger(ordinal) || ordinal <= 0) return null
+  return checkpointPositionText(progress, run, false, true)
+}
+
+function compactApprovalText(progress: RunProgressSummary): string | null {
+  if (progress.availability === 'not_applicable') return 'Non-checkpoint workflow'
+  if (progress.availability === 'unavailable') return null
+  const approved = countValue(progress.approved_checkpoints)
+  const total = countValue(progress.total_checkpoints)
+  if (approved !== null && total !== null) return checkpointApprovalText(progress)
+  if (approved !== null) return `${countIsPartial(progress.approved_checkpoints) ? 'At least ' : ''}${approved} approved`
+  return null
+}
+
+function previewApprovalText(progress: RunProgressSummary): string | null {
+  const approval = checkpointApprovalText(progress)
+  if (approval === 'Checkpoint progress unavailable' || approval === 'Approval progress unknown') return null
+  return approval.replace(/ · (?:approval|total) unknown$/, '')
+}
+
+/** One truthful fact for the collapsed row; full position/title stays in preview. */
+export function compactRunProgressText(progress: RunProgressSummary, run: RunStatus): string | null {
+  const approval = compactApprovalText(progress)
+  const position = compactCheckpointPositionText(progress, run)
+  const value = approval ?? position
+  if (!value) return null
+  return progressHistoryNotice(progress) && value !== 'Non-checkpoint workflow'
+    ? `${value} · partial history`
+    : value
 }
 
 function segmentState(progress: RunProgressSummary, ordinal: number): 'approved' | 'recorded' | 'current' | 'pending' | 'unknown' {
@@ -56,7 +99,7 @@ function stateLabel(state: ReturnType<typeof segmentState>): string {
   }
 }
 
-function checkpointStripText(progress: RunProgressSummary, total: number): string {
+function checkpointStripText(progress: RunProgressSummary, total: number, omitUnknownAggregateApproval = false): string {
   const counts = new Map<string, number>()
   for (let ordinal = 1; ordinal <= total; ordinal += 1) {
     const state = stateLabel(segmentState(progress, ordinal))
@@ -69,15 +112,25 @@ function checkpointStripText(progress: RunProgressSummary, total: number): strin
     .join(' · ')
   const approved = countValue(progress.approved_checkpoints)
   const approvedText = approved === null
-    ? 'aggregate approval count unknown'
+    ? omitUnknownAggregateApproval ? null : 'aggregate approval count unknown'
     : `${countIsPartial(progress.approved_checkpoints) ? 'at least ' : ''}${approved} approved by aggregate count`
-  return `Checkpoint state bar: ${breakdown || 'no states reported'}; ${approvedText}; it does not represent approval by fill alone.`
+  return [
+    `Checkpoint state bar: ${breakdown || 'no states reported'}`,
+    approvedText,
+    'it does not represent approval by fill alone',
+  ].filter(Boolean).join('; ') + '.'
 }
 
-export function RunProgressStrip({ progress }: { progress: RunProgressSummary }): JSX.Element | null {
+export function RunProgressStrip({
+  progress,
+  omitUnknownAggregateApproval = false,
+}: {
+  progress: RunProgressSummary
+  omitUnknownAggregateApproval?: boolean
+}): JSX.Element | null {
   const total = countValue(progress.total_checkpoints)
   if (total === null || total <= 0 || progress.availability === 'unavailable' || progress.availability === 'not_applicable') return null
-  const stripText = checkpointStripText(progress, total)
+  const stripText = checkpointStripText(progress, total, omitUnknownAggregateApproval)
   if (total > MAX_SEGMENTS) {
     const approved = countValue(progress.approved_checkpoints)
     const width = approved === null ? 0 : Math.min(100, (approved / total) * 100)
@@ -104,7 +157,7 @@ export function RunProgress({
 }: {
   run: RunStatus
   now?: number
-  mode?: 'detail' | 'row'
+  mode?: 'detail' | 'preview' | 'row'
   loadState?: RunProgressLoadState
   loadMessage?: string | null
 }): JSX.Element {
@@ -119,8 +172,23 @@ export function RunProgress({
           : 'Checkpoint progress unavailable')
   const observableState = loadState === 'ready' ? 'settled' : loadState
   if (!progress) {
-    return <span className={`compact-run-progress unavailable ${loadState} ${mode === 'row' ? 'compact-run-progress-row' : ''}`} data-progress-availability="unavailable" data-progress-state={observableState} aria-label={loadNotice}>
-      <span className={mode === 'row' ? 'compact-run-progress-row-line' : 'compact-run-progress-line'}><strong>{loadNotice}</strong></span>
+    if (mode === 'row' || mode === 'preview') {
+      const rowLoadNotice = loadState === 'stale' || loadState === 'failed' ? loadNotice : null
+      const accessibleNotice = rowLoadNotice || (loadState === 'loading' ? loadNotice : null)
+      return <span
+        className={`compact-run-progress unavailable ${loadState} compact-run-progress-${mode}`}
+        data-progress-availability="unavailable"
+        data-progress-state={observableState}
+        aria-label={accessibleNotice ?? undefined}
+      >
+        <span className={mode === 'row' ? 'compact-run-progress-row-line' : 'compact-run-progress-line'}>
+          {rowLoadNotice && <strong className={mode === 'row' ? `compact-run-progress-row-notice ${loadState}` : undefined}>{rowLoadNotice}</strong>}
+          {!rowLoadNotice && loadState === 'loading' && <span className="sr-only">{loadNotice}</span>}
+        </span>
+      </span>
+    }
+    return <span className={`compact-run-progress unavailable ${loadState}`} data-progress-availability="unavailable" data-progress-state={observableState} aria-label={loadNotice}>
+      <span className="compact-run-progress-line"><strong>{loadNotice}</strong></span>
     </span>
   }
 
@@ -128,16 +196,34 @@ export function RunProgress({
   const notice = progressHistoryNotice(progress)
   const rowLoadNotice = loadState === 'stale' || loadState === 'failed'
 
+  if (mode === 'preview') {
+    const approval = previewApprovalText(progress)
+    const previewCheckpointPosition = checkpointPositionText(progress, run, true, true)
+    const turnBudget = runKnownTurnBudgetText(run)
+    return <span className={`compact-run-progress compact-run-progress-preview ${progress.availability} ${loadState}`} data-progress-availability={progress.availability} data-progress-state={observableState}>
+      {(approval || previewCheckpointPosition) && <span className="compact-run-progress-line">
+        {approval && <strong>{approval}</strong>}
+        {previewCheckpointPosition && <span>{previewCheckpointPosition}</span>}
+      </span>}
+      <RunProgressStrip progress={progress} omitUnknownAggregateApproval />
+      {(turnBudget || notice || loadState !== 'ready') && <span className="compact-run-progress-meta">
+        {turnBudget && <span>{turnBudget}</span>}
+        {notice && <span>{notice}</span>}
+        {loadState !== 'ready' && <span>{loadNotice}</span>}
+      </span>}
+    </span>
+  }
+
   if (mode === 'row') {
+    const compactText = compactRunProgressText(progress, run)
     return <span
       className={`compact-run-progress compact-run-progress-row ${progress.availability} ${loadState}`}
       data-progress-availability={progress.availability}
       data-progress-state={observableState}
-      aria-label={[checkpointApprovalText(progress), checkpointPosition, notice, loadState !== 'ready' ? loadNotice : null].filter(Boolean).join(' · ')}
+      aria-label={[compactText, notice, loadState !== 'ready' ? loadNotice : null].filter(Boolean).join(' · ') || undefined}
     >
       <span className="compact-run-progress-row-line">
-        <strong>{checkpointApprovalText(progress)}</strong>
-        {checkpointPosition && <span>{checkpointPosition}</span>}
+        {compactText && <strong>{compactText}</strong>}
         {rowLoadNotice && <span className={`compact-run-progress-row-notice ${loadState}`} aria-live="polite" title={loadNotice}>{loadNotice}</span>}
       </span>
       {!rowLoadNotice && loadState !== 'ready' && <span className="sr-only">{loadNotice}</span>}

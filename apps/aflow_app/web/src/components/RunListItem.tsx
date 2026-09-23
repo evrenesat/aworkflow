@@ -2,13 +2,12 @@ import { useEffect, useId, useRef, useState } from 'react'
 import type { CSSProperties, FocusEvent, PointerEvent } from 'react'
 import type { RunStatus } from '../types'
 import {
-  checkpointApprovalText,
   runActivityText,
   runDurationText,
   runPlanPresentationForRun,
   statusLabel,
 } from '../runPresentation'
-import { RunProgress, type RunProgressLoadState } from './RunProgress'
+import { compactRunProgressText, RunProgress, type RunProgressLoadState } from './RunProgress'
 
 const PREVIEW_OPEN_DELAY_MS = 300
 const PREVIEW_CLOSE_DELAY_MS = 140
@@ -39,6 +38,10 @@ function viewportSize(): { width: number; height: number } {
   return { width, height }
 }
 
+function knownFact(value: string): string | null {
+  return /(?:not reported|unknown|unavailable)$/i.test(value.trim()) ? null : value
+}
+
 /**
  * Shared project/global run row. The selection and preview controls are
  * siblings so opening a preview can never select a run or create nested
@@ -60,25 +63,39 @@ export function RunListItem({
   const [previewStyle, setPreviewStyle] = useState<CSSProperties>({})
   const rowRef = useRef<HTMLDivElement>(null)
   const previewRef = useRef<HTMLDivElement>(null)
+  const selectionButtonRef = useRef<HTMLButtonElement>(null)
   const previewButtonRef = useRef<HTMLButtonElement>(null)
   const openTimerRef = useRef<number | null>(null)
   const closeTimerRef = useRef<number | null>(null)
-  const previewTriggerRef = useRef<'focus' | 'toggle' | null>(null)
+  const previewTriggerRef = useRef<'focus' | 'pointer' | 'toggle' | null>(null)
+  const previewOpenerRef = useRef<HTMLElement | null>(null)
+  const restoringSelectionFocusRef = useRef<HTMLButtonElement | null>(null)
   const previewId = `run-preview-${previewKey(useId())}`
   const plan = runPlanPresentationForRun(run)
   const status = statusLabel(run)
-  const progressLabel = loadState === 'ready'
-    ? run.progress ? checkpointApprovalText(run.progress) : 'Checkpoint progress unavailable'
-    : loadMessage || (loadState === 'loading' ? 'Loading checkpoint progress…' : 'Checkpoint progress unavailable')
+  const progressLabel = run.progress
+    ? compactRunProgressText(run.progress, run)
+    : loadState === 'stale' || loadState === 'failed'
+      ? loadMessage || (loadState === 'stale' ? 'Checkpoint progress stale — Refresh to update.' : 'Checkpoint progress unavailable — Refresh to retry.')
+      : null
+  const loadingProgressLabel = loadState === 'loading' ? 'Loading checkpoint progress…' : null
+  const duration = knownFact(runDurationText(run))
+  const activity = knownFact(runActivityText(run))
+  const accessibleFacts = [plan.label, plan.date, loadingProgressLabel, progressLabel, duration, activity].filter((value): value is string => Boolean(value))
   const accessibleName = projectLabel
-    ? [projectLabel, status, plan.label, progressLabel, runDurationText(run), runActivityText(run), run.run_id].join(' · ')
-    : `${run.run_id} ${status} · ${plan.label} · ${progressLabel} · ${runDurationText(run)} · ${runActivityText(run)}`
+    ? [projectLabel, status, ...accessibleFacts, run.run_id].join(' · ')
+    : [`${run.run_id} ${status}`, ...accessibleFacts].join(' · ')
 
   function clearTimers(): void {
     if (openTimerRef.current !== null) window.clearTimeout(openTimerRef.current)
     if (closeTimerRef.current !== null) window.clearTimeout(closeTimerRef.current)
     openTimerRef.current = null
     closeTimerRef.current = null
+  }
+
+  function selectionOpenerFor(target: EventTarget | null): HTMLButtonElement | null {
+    if (!(target instanceof HTMLElement)) return null
+    return target.closest('.run-list-select') === selectionButtonRef.current ? selectionButtonRef.current : null
   }
 
   function updatePreviewPosition(): void {
@@ -111,23 +128,37 @@ export function RunListItem({
     })
   }
 
-  function openPreview(trigger: 'focus' | 'toggle'): void {
+  function openPreview(trigger: 'focus' | 'pointer' | 'toggle', opener: HTMLElement | null): void {
     clearTimers()
     previewTriggerRef.current = trigger
+    previewOpenerRef.current = opener
     setPreviewOpen(true)
   }
 
-  function closePreview(): void {
+  function closePreview(restoreFocus = false): void {
+    const trigger = previewTriggerRef.current
+    const opener = previewOpenerRef.current
+    const activeElement = document.activeElement instanceof HTMLElement ? document.activeElement : null
     clearTimers()
     previewTriggerRef.current = null
+    previewOpenerRef.current = null
     setPreviewOpen(false)
+    if (restoreFocus) {
+      const focusTarget = trigger === 'toggle' ? previewButtonRef.current : opener ?? activeElement
+      if (focusTarget?.isConnected) {
+        const guardSelectionFocus = focusTarget === selectionButtonRef.current && document.activeElement !== focusTarget
+        restoringSelectionFocusRef.current = guardSelectionFocus ? selectionButtonRef.current : null
+        focusTarget.focus()
+        if (document.activeElement !== focusTarget) restoringSelectionFocusRef.current = null
+      }
+    }
   }
 
-  function scheduleOpen(): void {
+  function scheduleOpen(trigger: 'focus' | 'pointer', opener: HTMLElement | null): void {
     clearTimers()
     openTimerRef.current = window.setTimeout(() => {
       openTimerRef.current = null
-      openPreview('focus')
+      openPreview(trigger, opener)
     }, PREVIEW_OPEN_DELAY_MS)
   }
 
@@ -159,7 +190,7 @@ export function RunListItem({
     const handleEscape = (event: KeyboardEvent): void => {
       if (event.key !== 'Escape') return
       event.preventDefault()
-      closePreview()
+      closePreview(true)
     }
     document.addEventListener('keydown', handleEscape)
     return () => document.removeEventListener('keydown', handleEscape)
@@ -168,10 +199,12 @@ export function RunListItem({
   useEffect(() => () => clearTimers(), [])
 
   function handleFocus(event: FocusEvent<HTMLDivElement>): void {
-    const target = event.target
-    if (target instanceof HTMLElement && target.closest('.run-list-select')) {
-      scheduleOpen()
+    const opener = selectionOpenerFor(event.target)
+    if (opener && restoringSelectionFocusRef.current === opener) {
+      restoringSelectionFocusRef.current = null
+      return
     }
+    if (opener) scheduleOpen('focus', opener)
   }
 
   function handleBlur(event: FocusEvent<HTMLDivElement>): void {
@@ -182,7 +215,7 @@ export function RunListItem({
 
   function handlePointerEnter(event: PointerEvent<HTMLDivElement>): void {
     if (event.pointerType === 'touch') return
-    scheduleOpen()
+    scheduleOpen('pointer', null)
   }
 
   function handlePointerLeave(event: PointerEvent<HTMLDivElement>): void {
@@ -198,11 +231,11 @@ export function RunListItem({
     clearTimers()
     if (previewOpen && previewTriggerRef.current === 'toggle') {
       previewTriggerRef.current = null
+      previewOpenerRef.current = null
       setPreviewOpen(false)
       return
     }
-    previewTriggerRef.current = 'toggle'
-    setPreviewOpen(true)
+    openPreview('toggle', previewButtonRef.current)
   }
 
   function handleSelect(): void {
@@ -225,6 +258,7 @@ export function RunListItem({
     onBlurCapture={handleBlur}
   >
     <button
+      ref={selectionButtonRef}
       type="button"
       data-sidebar-editor-item={dataSidebarEditorItem}
       data-enrichment-state={dataEnrichmentState}
@@ -234,18 +268,15 @@ export function RunListItem({
       onClick={handleSelect}
     >
       <span className="run-list-context">
-        <strong className="run-list-title" title={plan.label}>{plan.label}</strong>
-        {plan.date && <span className="run-title-date">{plan.date}</span>}
-        <span className="status-pill">{status}</span>
-        {projectLabel && <span className="global-run-row-project">{projectLabel}</span>}
-        {run.history_state === 'archived' && <span className="status-pill">Archived</span>}
-      </span>
-      <span className="run-row-meta text-xs text-dim">
-        {projectLabel && <>
-          <span>{runDurationText(run)}</span>
-          <span>{runActivityText(run)}</span>
-        </>}
-        <RunProgress run={run} mode="row" loadState={loadState} loadMessage={loadMessage} />
+        <span className="run-list-title-line">
+          <strong className="run-list-title" title={plan.label}>{plan.label}</strong>
+        </span>
+        <span className="run-row-meta text-xs text-dim">
+          <span className="status-pill">{status}</span>
+          {run.history_state === 'archived' && <span className="status-pill">Archived</span>}
+          {projectLabel && <span className="global-run-row-project" title={projectLabel}>{projectLabel}</span>}
+          <RunProgress run={run} mode="row" loadState={loadState} loadMessage={loadMessage} />
+        </span>
       </span>
     </button>
     <button
@@ -271,10 +302,11 @@ export function RunListItem({
       onPointerLeave={scheduleClose}
     >
       <strong className="run-row-preview-title">{plan.label}</strong>
+      {plan.date && <p className="run-row-preview-facts">{plan.date}</p>}
       {projectLabel && <p className="text-xs text-dim">{projectLabel}</p>}
       <p className="run-row-preview-facts">{status}{run.history_state === 'archived' ? ' · Archived' : ''}</p>
-      <p className="run-row-preview-facts"><span>{runDurationText(run)}</span> · <span>{runActivityText(run)}</span></p>
-      <RunProgress run={run} loadState={loadState} loadMessage={loadMessage} />
+      {(duration || activity) && <p className="run-row-preview-facts">{[duration, activity].filter((value): value is string => Boolean(value)).join(' · ')}</p>}
+      <RunProgress run={run} mode="preview" loadState={loadState} loadMessage={loadMessage} />
       <p className="run-row-preview-id mono">{run.run_id}</p>
     </div>}
   </div>

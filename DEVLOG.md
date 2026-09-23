@@ -1,5 +1,106 @@
 # DEVLOG
 
+## 2026-09-23 — Keep preview accessibility and partial totals truthful (Checkpoint 2 review repair v05)
+
+- Preview checkpoint strips now omit an unavailable aggregate-approval clause
+  from their `aria-label`, title, and screen-reader text while retaining known
+  checkpoint-state evidence and known aggregate counts. Detail strips continue
+  to disclose the full aggregate uncertainty.
+- Compact rows and anchored previews now qualify partial totals in checkpoint
+  positions, such as `CP5 of at least 11`; complete totals, known approval
+  counts, terminal rows, and detail presentation remain unchanged.
+- Validation: focused web tests 83/83, full web tests 609/609, production build,
+  Python compilation, and Chromium/WebKit `run_rows` checks passed. Fresh
+  populated light/dark desktop and mobile screenshots were inspected, and the
+  frozen demo remains byte-identical. Settings, launch cancellation, request
+  replay, the shared editable runtime, publication, CI, and live activation
+  remain coordinator-owned.
+
+## 2026-09-23 — Omit unknown-count filler from row previews (Checkpoint 2 review repair v04)
+
+- Anchored row previews now remove only the `approval unknown` or `total unknown`
+  clause from one-known-count progress summaries. The known aggregate remains
+  visible as `N checkpoints` or `N approved`, alongside known checkpoint
+  position, turn usage, run identity, and partial/actionable notices.
+- Added progress and shared-row regressions for valid-total/unknown-approved and
+  valid-approved/unknown-total states. Detail mode still renders the complete
+  truthful uncertainty strings and compact-row projection remains unchanged.
+- Validation: focused web tests 80/80, full web tests 606/606, production build,
+  Python compilation, and Chromium/WebKit `run_rows` checks passed. Fresh
+  populated light/dark desktop and mobile screenshots were inspected, and the
+  frozen demo remains byte-identical. Settings, launch cancellation, request
+  replay, the shared editable runtime, publication, CI, and live activation
+  remain coordinator-owned.
+
+## 2026-09-23 — Keep Escape-closed row previews closed (Checkpoint 2 review repair v03)
+
+- Selection-opener restoration now arms a one-use local focus guard before
+  moving focus and consumes it in the matching row focus event. Escape restores
+  the selection control without scheduling the focus preview to reopen, while
+  ordinary focus, pointer hover, and explicit-toggle behavior remain unchanged.
+- Component and populated Chromium/WebKit regressions move focus from the
+  selection control to its sibling preview toggle, press Escape, verify selection
+  focus, and wait beyond the 300ms open delay to prove the preview stays closed.
+- Validation: focused web tests 76/76, full web tests 602/602, production build,
+  Python compilation, and Chromium/WebKit `run_rows` checks passed. Fresh
+  populated light/dark desktop and mobile screenshots were inspected, and the
+  frozen demo remains byte-identical. Settings, launch cancellation, request
+  replay, the shared editable runtime, publication, CI, and live activation
+  remain coordinator-owned.
+
+## 2026-09-23 — Keep dated rows compact and pointer focus stable (Checkpoint 2 review repair v02)
+
+- Pointer-opened row previews no longer record a focus-restoration opener, so
+  hovering the selection control and pressing Escape preserves focus on an
+  unrelated search/control. Focus-opened selection previews and explicit-toggle
+  previews retain their existing opener-specific Escape restoration.
+- Path-derived dates remain in the selection control's accessible name and the
+  anchored preview, but no longer add a third visible line to compact rows.
+  Component and populated Chromium/WebKit checks cover the 56–72px desktop
+  height, readable mobile rows, date reachability, and all three focus paths.
+- Validation: focused web tests 76/76, full web tests 602/602, production build,
+  Python compilation, and Chromium/WebKit `run_rows` checks passed. Populated
+  light/dark desktop and mobile screenshots were inspected, and the frozen demo
+  remains byte-identical. This is a scoped Runs/All runs repair; Settings,
+  launch cancellation, request replay, the shared editable runtime, publication,
+  CI, and live activation remain coordinator-owned.
+
+## 2026-09-23 — Preserve row preview focus and loading truth (Checkpoint 2 review repair)
+
+- Non-modal row previews now remember the actual selection opener for focus- and
+  pointer-triggered opens, keep unrelated search/control focus in place, and
+  restore the preview control only after an explicit toggle open. Loading
+  enrichment is included in the selection button's accessible name while the
+  compact row continues to omit visual missing-progress filler.
+- Added focused component/global loading regressions and extended the populated
+  `run_rows` journey for selection, pointer, and explicit-toggle Escape focus
+  behavior across the existing viewport/theme/engine matrix. The frozen demo
+  remains byte-identical.
+- Validation: focused web tests 75/75, full web tests 601/601, production
+  build, Python compilation, and Chromium/WebKit `run_rows` checks passed;
+  populated light/dark desktop and mobile screenshots were inspected. This is
+  a scoped Runs/All runs review repair; Settings, launch cancellation, request
+  replay, the shared editable runtime, publication, CI, and live activation
+  remain coordinator-owned.
+
+## 2026-09-23 — Keep deployed Runs rows compact and within the viewport (Checkpoint 2)
+
+- Shared run rows now give the full title its own primary line, retain status and
+  one meaningful progress fact, bound long global project identity, and omit
+  unknown duration/approval/count filler while preserving zero, partial, stale,
+  and failed evidence. The existing hover/focus/touch preview keeps full title,
+  project, stable ID, and known facts without shifting siblings; Escape restores
+  the preview control's focus.
+- Added component regressions and a populated `run_rows` browser matrix using
+  the deployed long project label at 320, 390, 768, 844×390, 1280, 1440, and
+  390×420 in light/dark Chromium/WebKit. Screenshots were inspected against the
+  frozen reference; the reference remains byte-identical.
+- Validation: focused web tests 72/72, full web tests 598/598, production build,
+  Python compilation, and the Chromium/WebKit `run_rows` checks passed. This
+  remains Runs/All runs presentation only; Settings, launch cancellation,
+  request replay, and the shared editable runtime remain preserved. Publication,
+  CI, and live activation remain coordinator-owned.
+
 ## 2026-09-23 — Reorder deployed Runs detail around current work (Checkpoint 1)
 
 - The Runs detail overview now leads with the readable run identity, truthful
