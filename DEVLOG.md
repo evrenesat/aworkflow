@@ -19,6 +19,66 @@
   launch cancellation, request replay and the shared editable runtime remain
   outside its scope. Publication, CI and live activation remain coordinator-owned.
 
+## 2026-09-23 — Preserve concurrent Settings refresh failures
+
+- Cached detail failures are now tracked by skill name and aggregated with
+  list-level errors only at render time. A successful refresh clears only its
+  own failure, so another stale skill's old content, revision mismatch, and
+  actionable error remain visible until that skill recovers.
+- Deferred coverage fails one cached refresh, lets another changed skill
+  succeed afterward, verifies the failed error and old content remain, then
+  retries the failed skill and checks the new revision on Save.
+- Validation: focused Settings tests passed 86/86; the full web suite had
+  584 passed and one unrelated RunDashboard failure in the concurrent
+  cancellation-owned area; the production build passed; and the Settings
+  browser journey passed 1/1 in Chromium and 1/1 in WebKit. Review,
+  publication, CI, and live activation remain coordinator gates.
+
+## 2026-09-23 — Retry stale skills after failed reload detail reads
+
+- Settings now compares each cached skill detail revision with the current
+  summary revision when selecting or resolving the selected-skill effect. A
+  failed newer-revision read keeps the old editor usable and the actionable
+  error visible, but the mismatch remains stale so a later selection retries.
+- The deferred regression loads two skills, fails a changed non-selected
+  refresh, retries it on selection, preserves old content while pending, and
+  verifies the successful new revision is used by Save.
+- Validation: focused Settings tests passed 85/85, full web tests passed
+  584/584, production build passed, and the Settings browser journey passed
+  1/1 in Chromium and 1/1 in WebKit. Review, publication, CI, and live
+  activation remain coordinator gates.
+
+## 2026-09-23 — Reconcile cached skill baselines during reload
+
+- Clean Settings reloads now refresh every previously loaded skill whose list
+  revision changed, while retaining the visible old content until each detail
+  read settles. An accepted detail response removes only a draft still equal to
+  the superseded baseline; genuinely newer drafts remain owned by GlobalSettings.
+- Deferred regressions cover non-selected revision refresh, equal and failed
+  detail reads, the no-op-draft changed-reload path, revision-sensitive save
+  requests, and existing stale-response/discard behavior.
+- Validation: focused Settings tests passed 84/84, full web tests passed 581/583
+  with two unrelated RunDashboard failures in the concurrent cancellation-owned
+  area, the production build passed, and the Settings browser journey passed
+  1/1 in Chromium and 1/1 in WebKit. Review, publication, CI, and live
+  activation remain coordinator gates.
+
+## 2026-09-23 — Preserve Settings content during clean reload
+
+- Settings reloads now retain loaded config, server, and skill domains while
+  replacement reads are pending, equivalent, or failed. Changed responses
+  reconcile through the existing owners; confirmed dirty reloads still discard
+  only the authorized drafts and invalidate superseded skill reads.
+- Deferred unit coverage verifies visible TOML values, independent-domain
+  failure, dirty discard, and stale skill responses. A disposable built-app
+  journey holds /api/config and passes in Chromium and WebKit, covering
+  editor identity, selection/scroll/disclosure continuity, failure retention,
+  changed guided values, and no config writes.
+- Validation: focused Settings tests 81/81, full web tests 580/580, production
+  build passed, and the new browser journey passed 1/1 in Chromium and 1/1 in
+  WebKit. Review, publication, CI, and live activation remain coordinator
+  gates.
+
 ## 2026-09-23 — Consume complete credentials in fidelity diagnostics
 
 - Python failure-text and browser alert scrubbers now consume the complete
@@ -3174,3 +3234,26 @@ HISTORY: Published clipboard history `c14f1f2`/`cd78d53` remains separate and mu
 - No deployment, publication, live activation, physical-device or full visual
   redesign acceptance is claimed. The concurrent diagnostic helper file was
   not changed.
+
+## 2026-09-23 — Preserve skill draft revisions during reload (Checkpoint 1)
+
+- Replaced text-only Settings skill drafts with `{ content, expectedRevision }`
+  pairs. The first meaningful edit captures the loaded revision; accepted
+  background reads remove only no-op artifacts and cannot silently rebase a
+  genuine draft. Save freezes each pair for both validation and PUT, while
+  conflicts retain the draft and its original revision.
+- Added deferred component coverage for the R1/R2 pending-read conflict,
+  equal-refresh editing, refreshed no-op editing, cached non-selected refresh,
+  superseded reads, and existing acknowledgement/error behavior. Added a
+  disposable Chromium/WebKit journey that holds the skill detail read, edits
+  the visible editor, intercepts validation and PUT, and verifies the R1
+  revision plus retained conflict draft. No real skill files are written.
+- Preserved prerequisite `6f7a72cc85d067653743f639eb8e8f495c3e88b6` and
+  published `af8ae222c906449b1243e93d11d8e869e8ec60fa` in the branch history.
+- Verification from the repository root/server:
+  - `npm --prefix apps/aflow_app/web test -- --run src/components/GlobalSettings.test.tsx` — 88 passed.
+  - `npm --prefix apps/aflow_app/web test -- --run` — 601 passed across 28 files.
+  - `npm --prefix apps/aflow_app/web run build` — passed; Vite emitted only the existing chunk-size warning.
+  - `uv run pytest -q tests/test_settings_reload_browser.py` — 2 passed in Chromium.
+  - `AFLOW_TEST_BROWSER=webkit uv run pytest -q tests/test_settings_reload_browser.py` — 2 passed in WebKit.
+  - `git diff --check` — passed.

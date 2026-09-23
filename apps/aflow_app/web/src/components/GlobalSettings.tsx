@@ -21,6 +21,7 @@ const tabs = ['Agents & Roles', 'Teams', 'Workflows', 'Prompts', 'Skills', 'Gene
 // Height does not affect horizontal fit; list/detail keeps its own breakpoint.
 const SETTINGS_HEADER_COMPACT_QUERY = '(max-width: 1199px)'
 const clone = <T,>(value: T): T => JSON.parse(JSON.stringify(value))
+type SkillDraft = { content: string; expectedRevision: string }
 
 function sameValue(left: unknown, right: unknown): boolean {
   return left === right || JSON.stringify(left) === JSON.stringify(right)
@@ -90,10 +91,11 @@ export function GlobalSettings({ onDirtyChange, onSaved }: { onDirtyChange: (dir
   // Skills never enter TOML documents and stay usable without the config projection.
   const [skills, setSkills] = useState<SkillSummary[] | null>(null)
   const [skillsError, setSkillsError] = useState<string | null>(null)
+  const [skillRefreshErrors, setSkillRefreshErrors] = useState<Record<string, string>>({})
   const [selectedSkill, setSelectedSkill] = useState('')
   const [skillContents, setSkillContents] = useState<Record<string, string>>({})
   const [skillRevisions, setSkillRevisions] = useState<Record<string, string>>({})
-  const [skillDrafts, setSkillDrafts] = useState<Record<string, string>>({})
+  const [skillDrafts, setSkillDrafts] = useState<Record<string, SkillDraft>>({})
   const [skillContentLoading, setSkillContentLoading] = useState(false)
   const [skillContentError, setSkillContentError] = useState<string | null>(null)
   const [installing, setInstalling] = useState(false)
@@ -101,21 +103,20 @@ export function GlobalSettings({ onDirtyChange, onSaved }: { onDirtyChange: (dir
   const [installError, setInstallError] = useState<string | null>(null)
   const [installDisclosureOpen, setInstallDisclosureOpen] = useState(false)
   // Bumped by every load/discard so a response that resolves after an
-  // explicit discard can never restore cleared edits.
+  // explicit discard can never restore discarded edits.
   const epochRef = useRef(0)
   const draftRef = useRef<GuidedFormProjection | null>(null)
+  const skillReadSequenceRef = useRef(0)
 
   useEffect(() => {
     draftRef.current = draft
   }, [draft])
 
-  async function acceptConfig(saved: ProjectConfig, epoch: number) {
-    draftPreviewCoordinator.invalidate()
-    setDraftPreviewState(draftPreviewCoordinator.state())
-    // The snapshot and raw texts are kept before the projection is attempted,
-    // so a mistyped prompt table (no guided projection) still leaves the
-    // documents inspectable and editable through Advanced TOML.
-    setSnapshot(saved); setTexts([saved.aflow_toml, saved.workflows_toml])
+  async function acceptConfig(saved: ProjectConfig, epoch: number, preserveLoaded = false) {
+    if (epochRef.current !== epoch) return
+    const previousSnapshot = snapshot
+    const previousProjection = projection
+    const previousRawEdited = rawEdited
     let form: ProjectConfigFormResponse | null = null
     let failure: string | null = null
     try {
@@ -124,9 +125,48 @@ export function GlobalSettings({ onDirtyChange, onSaved }: { onDirtyChange: (dir
       failure = reason instanceof Error ? reason.message : 'Could not build the guided view of the saved configuration.'
     }
     if (epochRef.current !== epoch) return
+
+    const projectionFailure = failure ?? (!form || !form.form
+      ? form?.validation.issues.map(issue => issue.message).join(' ') || 'Could not build the guided view of the saved configuration.'
+      : null)
+    if (!form || !form.form || projectionFailure) {
+      // A refresh is a transaction for the workflow-settings domain. Keep the
+      // last usable projection and documents when the replacement cannot be
+      // projected; the raw response is still useful on the first load, where
+      // Advanced TOML is the only available repair surface.
+      if (!preserveLoaded || !previousSnapshot) {
+        draftPreviewCoordinator.invalidate()
+        setSnapshot(saved); setTexts([saved.aflow_toml, saved.workflows_toml])
+        setProjection(form)
+        setBaseline(form?.form ?? null); setDraft(form?.form ? clone(form.form) : null); setPendingNames({})
+        if (form?.form) draftPreviewCoordinator.updateDraft(form.form, true)
+        setDraftPreviewState(draftPreviewCoordinator.state())
+        setRawEdited(false)
+      }
+      const message = projectionFailure ?? 'Could not build the guided view of the saved configuration.'
+      setProjectionError(message)
+      throw new Error(message)
+    }
+
+    const documentsEqual = Boolean(previousSnapshot
+      && previousSnapshot.aflow_toml === saved.aflow_toml
+      && previousSnapshot.workflows_toml === saved.workflows_toml)
+    const projectionEqual = Boolean(previousProjection && sameValue(previousProjection, form))
+    if (preserveLoaded && documentsEqual && projectionEqual && !previousRawEdited) {
+      // Revisions and validation metadata can advance without changing what is
+      // rendered. Update the authoritative snapshot, but leave projections,
+      // drafts, native editors, selections and disclosure owners untouched.
+      setSnapshot(current => sameValue(current, saved) ? current : saved)
+      setProjectionError(null)
+      return
+    }
+
+    draftPreviewCoordinator.invalidate()
+    setDraftPreviewState(draftPreviewCoordinator.state())
+    setSnapshot(saved); setTexts([saved.aflow_toml, saved.workflows_toml])
     setProjection(form)
-    setBaseline(form?.form ?? null); setDraft(form?.form ? clone(form.form) : null); setPendingNames({})
-    if (form?.form) draftPreviewCoordinator.updateDraft(form.form, true)
+    setBaseline(form.form); setDraft(clone(form.form)); setPendingNames({})
+    draftPreviewCoordinator.updateDraft(form.form, true)
     setDraftPreviewState(draftPreviewCoordinator.state())
     setRawEdited(false); setProjectionError(failure)
   }
@@ -137,36 +177,81 @@ export function GlobalSettings({ onDirtyChange, onSaved }: { onDirtyChange: (dir
   }, [draft, selectedTeam, selectedWorkflow])
   function acceptServer(saved: SettingsResponse, epoch: number) {
     if (epochRef.current !== epoch) return
-    setServer(current => sameValue(current, saved) ? current : saved); setServerText(saved.advanced_toml)
-    setServerDraft({ bind_host: saved.bind_host, bind_port: String(saved.bind_port), managed_projects_root: saved.managed_projects_root })
+    setServer(current => sameValue(current, saved) ? current : saved)
+    if (serverText !== saved.advanced_toml) setServerText(saved.advanced_toml)
+    const nextDraft = { bind_host: saved.bind_host, bind_port: String(saved.bind_port), managed_projects_root: saved.managed_projects_root }
+    if (serverDraft.bind_host !== nextDraft.bind_host || serverDraft.bind_port !== nextDraft.bind_port || serverDraft.managed_projects_root !== nextDraft.managed_projects_root) {
+      setServerDraft(nextDraft)
+    }
   }
   function acceptSkills(list: SkillSummary[], epoch: number) {
     if (epochRef.current !== epoch) return
     setSkills(current => sameValue(current, list) ? current : list); setSkillsError(null)
+    setSkillRefreshErrors(errors => {
+      const next = Object.fromEntries(Object.entries(errors).filter(([name]) => {
+        const listed = list.find(skill => skill.name === name)
+        return listed && skillRevisions[name] !== listed.revision
+      }))
+      return sameValue(errors, next) ? errors : next
+    })
     setSelectedSkill(current => (current && list.some(skill => skill.name === current) ? current : list[0]?.name ?? ''))
   }
-  /** Loads one skill's content/revision baseline on selection; drafts win over reloads. */
-  async function ensureSkillContent(name: string, epoch: number) {
-    if (!name || skillContents[name] !== undefined || skillInflight.current.has(name)) return
-    skillInflight.current.add(name)
-    setSkillContentLoading(true); setSkillContentError(null)
+  function skillRevisionStale(name: string): boolean {
+    const listed = skills?.find(skill => skill.name === name)
+    return Boolean(listed && skillRevisions[name] !== listed.revision)
+  }
+  /** Loads one skill's content/revision baseline; genuinely dirty drafts survive reloads. */
+  async function ensureSkillContent(name: string, epoch: number, refresh = false) {
+    if (!name || (!refresh && skillContents[name] !== undefined && !skillRevisionStale(name)) || skillInflight.current.has(name)) return
+    const requestId = ++skillReadSequenceRef.current
+    const previousContent = skillContents[name]
+    const hadContent = previousContent !== undefined
+    skillInflight.current.set(name, requestId)
+    if (!hadContent) setSkillContentLoading(true)
+    setSkillContentError(null)
     try {
       const detail: SkillDetail = await api.readSkill(name)
-      if (epochRef.current !== epoch) return
-      setSkillContents(contents => (contents[name] === undefined ? { ...contents, [name]: detail.content } : contents))
-      setSkillRevisions(revisions => (revisions[name] === undefined ? { ...revisions, [name]: detail.revision } : revisions))
-      setSkills(list => list?.map(skill => (skill.name === name
-        ? { ...skill, revision: detail.revision, source: detail.source, edited: detail.edited, installed: detail.installed, links: detail.links, detected_harnesses: detail.detected_harnesses }
-        : skill)) ?? null)
+      if (epochRef.current !== epoch || skillInflight.current.get(name) !== requestId) return
+      setSkillContents(contents => contents[name] === detail.content ? contents : { ...contents, [name]: detail.content })
+      setSkillRevisions(revisions => revisions[name] === detail.revision ? revisions : { ...revisions, [name]: detail.revision })
+      // A draft that still equals the baseline being replaced is only a
+      // no-op editor artifact. Remove it after the response is accepted so
+      // changed server bytes become visible and cannot be saved as stale data.
+      setSkillDrafts(drafts => {
+        const draft = drafts[name]
+        if (previousContent === undefined || !draft || draft.content !== previousContent) return drafts
+        const next = { ...drafts }
+        delete next[name]
+        return next
+      })
+      setSkills(list => {
+        if (!list) return null
+        const next = list.map(skill => (skill.name === name
+          ? { ...skill, revision: detail.revision, source: detail.source, edited: detail.edited, installed: detail.installed, links: detail.links, detected_harnesses: detail.detected_harnesses }
+          : skill))
+        return sameValue(list, next) ? list : next
+      })
+      if (hadContent) setSkillRefreshErrors(errors => {
+        if (!(name in errors)) return errors
+        const next = { ...errors }
+        delete next[name]
+        return next
+      })
     } catch (reason) {
-      if (epochRef.current !== epoch) return
-      setSkillContentError(reason instanceof Error ? reason.message : 'Could not load the skill content.')
+      if (epochRef.current !== epoch || skillInflight.current.get(name) !== requestId) return
+      const message = reason instanceof Error ? reason.message : 'Could not load the skill content.'
+      // A refresh must not replace an existing editor with an error-only
+      // surface. The skills domain error remains visible while the old content
+      // stays usable; initial selection still uses its ordinary loading/error
+      // presentation.
+      if (hadContent) setSkillRefreshErrors(errors => errors[name] === message ? errors : { ...errors, [name]: message })
+      else setSkillContentError(message)
     } finally {
-      skillInflight.current.delete(name)
-      if (epochRef.current === epoch) setSkillContentLoading(false)
+      if (skillInflight.current.get(name) === requestId) skillInflight.current.delete(name)
+      if (epochRef.current === epoch && !hadContent) setSkillContentLoading(false)
     }
   }
-  const skillInflight = useRef(new Set<string>())
+  const skillInflight = useRef(new Map<string, number>())
   function selectSkill(name: string) {
     setSelectedSkill(name)
     void ensureSkillContent(name, epochRef.current)
@@ -174,16 +259,19 @@ export function GlobalSettings({ onDirtyChange, onSaved }: { onDirtyChange: (dir
   // Selection defaults arrive asynchronously from the skill list; fetch the
   // baseline content for whatever ends up selected.
   useEffect(() => {
-    if (selectedSkill && skillContents[selectedSkill] === undefined && !skillInflight.current.has(selectedSkill)) {
+    if (selectedSkill && (skillContents[selectedSkill] === undefined || skillRevisionStale(selectedSkill)) && !skillInflight.current.has(selectedSkill)) {
       void ensureSkillContent(selectedSkill, epochRef.current)
     }
-  }, [selectedSkill, skills, skillContents]) // eslint-disable-line react-hooks/exhaustive-deps
-  async function load() {
+  }, [selectedSkill, skills, skillContents, skillRevisions]) // eslint-disable-line react-hooks/exhaustive-deps
+  async function load(skillOverride: string | null = null) {
     const epoch = ++epochRef.current
-    setBusy(true); setError(null)
+    // Superseded skill reads remain harmless through the epoch check, while a
+    // new read for the selected skill must not be blocked by their old marker.
+    skillInflight.current.clear()
+    setBusy(true); setError(null); setSkillContentLoading(false); setSkillContentError(null)
     const results = await Promise.allSettled([
-      api.getGlobalConfig().then(saved => acceptConfig(saved, epoch)), api.getSettings().then(saved => acceptServer(saved, epoch)),
-      api.listSkills().then(list => acceptSkills(list, epoch)),
+      api.getGlobalConfig().then(saved => acceptConfig(saved, epoch, true)), api.getSettings().then(saved => acceptServer(saved, epoch)),
+      api.listSkills().then(list => { acceptSkills(list, epoch); return list }),
     ])
     if (epochRef.current !== epoch) return
     const failures = results.filter(result => result.status === 'rejected')
@@ -196,25 +284,36 @@ export function GlobalSettings({ onDirtyChange, onSaved }: { onDirtyChange: (dir
     }
     setBusy(false)
     const loaded = results[2]?.status === 'fulfilled' ? ((results[2] as unknown as PromiseFulfilledResult<SkillSummary[]>).value ?? []) : []
-    const current = selectedSkill || loaded[0]?.name || ''
-    if (current) void ensureSkillContent(current, epoch)
+    const requestedSkill = skillOverride ?? selectedSkill
+    const current = results[2]?.status === 'fulfilled'
+      ? (requestedSkill && loaded.some(skill => skill.name === requestedSkill) ? requestedSkill : loaded[0]?.name || '')
+      : ''
+    const refreshNames = new Set<string>()
+    if (current) refreshNames.add(current)
+    for (const skill of loaded) {
+      if (skillContents[skill.name] !== undefined && skillRevisions[skill.name] !== skill.revision) refreshNames.add(skill.name)
+    }
+    for (const name of refreshNames) void ensureSkillContent(name, epoch, true)
   }
-  /** Explicit confirmed discard: every pending edit is dropped up front. */
+  /** Explicit confirmed discard: pending edits return to the loaded baselines. */
   function discardAndReload() {
     setDeletedPrompts([])
     draftPreviewCoordinator.invalidate()
-    setDraftPreviewState(draftPreviewCoordinator.state())
-    // Bumping the epoch invalidates stale skill reads/saves as well as config loads.
-    epochRef.current += 1
     setPassword(''); setNewProfile({ harness: '', profile: '', model: '', effort: '' }); setNewProfileError(null); setNewRole({ role: '', selector: '' }); setNewRoleError(null); setNewTeamName(''); setNewTeamError(null); setPendingFocusTeam(null); setTeamWizardDirty(false); setTeamWizardResetVersion(value => value + 1)
     setPendingNames({}); setRawEdited(false); setError(null); setNotice(null); setProjectionError(null)
-    setTexts(['', '']); setSnapshot(null); setProjection(null); setBaseline(null); setDraft(null)
-    setServer(null); setServerText(''); setServerDraft({ bind_host: '', bind_port: '', managed_projects_root: '' })
-    setSkills(null); setSkillsError(null); setSelectedSkill(''); setSkillContents({}); setSkillRevisions({}); setSkillDrafts({})
-    skillInflight.current.clear()
-    setSkillContentLoading(false); setInstallResult(null); setInstallError(null); setInstalling(false); setInstallDisclosureOpen(false)
+    if (snapshot) setTexts([snapshot.aflow_toml, snapshot.workflows_toml])
+    const resetDraft = baseline ? clone(baseline) : null
+    setDraft(resetDraft)
+    if (resetDraft) draftPreviewCoordinator.updateDraft(resetDraft, true)
+    setDraftPreviewState(draftPreviewCoordinator.state())
+    if (server) {
+      setServerText(server.advanced_toml)
+      setServerDraft({ bind_host: server.bind_host, bind_port: String(server.bind_port), managed_projects_root: server.managed_projects_root })
+    }
+    setSkillDrafts({})
+    setSelectedSkill('')
     setSkillContentError(null)
-    void load()
+    void load('')
   }
   async function retryProjection() {
     if (!snapshot) return
@@ -237,10 +336,18 @@ export function GlobalSettings({ onDirtyChange, onSaved }: { onDirtyChange: (dir
   const pendingCreation = Object.values(newProfile).some(Boolean) || Object.values(newRole).some(Boolean)
   const serverDirty = Boolean(server && (password || serverText !== server.advanced_toml || serverDraft.bind_host !== server.bind_host || serverDraft.bind_port !== String(server.bind_port) || serverDraft.managed_projects_root !== server.managed_projects_root))
   // Skill drafts live outside TOML documents and join the same dirty guard.
-  const dirtySkillNames = Object.keys(skillDrafts).filter(name => skillContents[name] !== undefined && skillDrafts[name] !== skillContents[name]).sort()
+  const dirtySkillNames = Object.keys(skillDrafts).sort()
   const skillsDirty = dirtySkillNames.length > 0
   const saveableDirty = configDirty || pendingCreation || serverDirty || skillsDirty
   const dirty = saveableDirty || teamWizardDirty
+  function reloadSettings() {
+    if (dirty) {
+      if (!window.confirm('Discard unsaved settings and reload?')) return
+      discardAndReload()
+      return
+    }
+    void load()
+  }
   useEffect(() => { onDirtyChange(dirty); return () => onDirtyChange(false) }, [dirty, onDirtyChange])
   useEffect(() => {
     if (!dirty) return
@@ -540,7 +647,7 @@ export function GlobalSettings({ onDirtyChange, onSaved }: { onDirtyChange: (dir
         // new bytes are reflected. No draft can be dirty here; drop no-op duplicates.
         const list = await api.listSkills()
         if (epochRef.current !== epoch) return
-        setSkills(list); setSkillsError(null); setSkillDrafts({})
+        setSkills(list); setSkillsError(null); setSkillRefreshErrors({}); setSkillDrafts({})
         setSkillContents({})
         setSkillRevisions(Object.fromEntries(list.map(skill => [skill.name, skill.revision])))
         const next = selectedSkill && list.some(skill => skill.name === selectedSkill) ? selectedSkill : list[0]?.name ?? ''
@@ -603,7 +710,14 @@ export function GlobalSettings({ onDirtyChange, onSaved }: { onDirtyChange: (dir
     try {
       // Validate all dirty domains before the first write; password is in the final write.
       // Skills prevalidate read-only; every PUT repeats its checks under the store lock.
-      const skillCandidates = dirtySkillNames.map(name => ({ name, content: skillDrafts[name], expected_revision: skillRevisions[name] ?? '' }))
+      // Freeze each text/revision pair before validation. The read-only check
+      // and each PUT must describe the same draft even if a background read
+      // settles while this save is in flight.
+      const skillSaveSnapshot = dirtySkillNames.flatMap(name => {
+        const draft = skillDrafts[name]
+        return draft ? [{ name, ...draft }] : []
+      })
+      const skillCandidates = skillSaveSnapshot.map(({ name, content, expectedRevision }) => ({ name, content, expected_revision: expectedRevision }))
       if (skillCandidates.length) {
         const verdicts = await api.validateSkills(skillCandidates)
         if (epochRef.current !== epoch) return
@@ -641,9 +755,9 @@ export function GlobalSettings({ onDirtyChange, onSaved }: { onDirtyChange: (dir
       }
       // Dirty skills save in sorted name order; each clears only on its own
       // acknowledgement, so a 409/network/write failure preserves the rest.
-      for (const name of dirtySkillNames) {
+      for (const { name, content, expectedRevision } of skillSaveSnapshot) {
         try {
-          const acked = await api.saveSkill(name, { content: skillDrafts[name], expected_revision: skillRevisions[name] ?? '' })
+          const acked = await api.saveSkill(name, { content, expected_revision: expectedRevision })
           if (epochRef.current !== epoch) return
           savedSkills.push(name)
           applySkillAck(acked)
@@ -675,6 +789,9 @@ export function GlobalSettings({ onDirtyChange, onSaved }: { onDirtyChange: (dir
     } finally { setBusy(false) }
   }
   const effectiveSkill = selectedSkill || skills?.[0]?.name || ''
+  const skillRefreshMessages = Object.entries(skillRefreshErrors).sort(([left], [right]) => left.localeCompare(right)).map(([name, message]) => `${name}: ${message}`)
+  const skillRefreshError = skillRefreshMessages.length === 1 ? Object.values(skillRefreshErrors)[0] : skillRefreshMessages.join(' ')
+  const skillsLoadError = [skillsError, skillRefreshError].filter(Boolean).join(' ') || null
   const teamNames = draft ? Object.keys(draft.teams).sort() : []
   const workflowNames = draft ? Object.keys(draft.workflows).sort() : []
   const selectors = draft ? Object.entries(draft.harnesses).flatMap(([h, profiles]) => Object.keys(profiles).map(p => `${h}.${p}`)) : []
@@ -722,7 +839,7 @@ export function GlobalSettings({ onDirtyChange, onSaved }: { onDirtyChange: (dir
       {previewStatus}
     </>,
     more: <MoreMenu label="More settings actions" triggerLabel="More">
-      {!changelogReadOnly && <MenuItem disabled={busy} onClick={() => { if (!dirty || window.confirm('Discard unsaved settings and reload?')) void discardAndReload() }}>Reload server settings</MenuItem>}
+      {!changelogReadOnly && <MenuItem disabled={busy} onClick={reloadSettings}>Reload server settings</MenuItem>}
       <MenuItem disabled={busy || !snapshot} onClick={() => void toggleAdvanced()}>{advanced ? 'Guided settings' : 'Advanced TOML'}</MenuItem>
       {!changelogReadOnly && <MenuItem disabled={busy} onClick={() => void openSkillsInstallation()}>Install skills</MenuItem>}
     </MoreMenu>,
@@ -731,7 +848,7 @@ export function GlobalSettings({ onDirtyChange, onSaved }: { onDirtyChange: (dir
   return <div className="workspace-content global-settings">
     {!hosted && <>
       <div className="section-heading"><h2>Settings</h2><button className="btn btn-secondary btn-sm" disabled={busy || !snapshot} onClick={() => void toggleAdvanced()}>{advanced ? 'Guided settings' : 'Advanced TOML'}</button></div>
-      {!changelogReadOnly && <button className="btn btn-secondary btn-sm" disabled={busy} onClick={() => { if (!dirty || window.confirm('Discard unsaved settings and reload?')) void discardAndReload() }}>Reload server settings</button>}
+      {!changelogReadOnly && <button className="btn btn-secondary btn-sm" disabled={busy} onClick={reloadSettings}>Reload server settings</button>}
       <div className="settings-fallback-controls">
         {sectionNavigation}
         {previewStatus}
@@ -745,15 +862,27 @@ export function GlobalSettings({ onDirtyChange, onSaved }: { onDirtyChange: (dir
     <fieldset disabled={busy} data-settings-tab={advanced ? 'Advanced TOML' : tab} className="settings-body" id="settings-domain-panel" role={advanced ? 'region' : 'tabpanel'} aria-label={advanced ? 'Advanced TOML editor' : undefined} aria-labelledby={advanced ? undefined : `settings-tab-${tabs.indexOf(tab)}`}>
     {advanced ? <div className="settings-fields">{texts.map((text, index) => <div className="text-editor-field" key={index}><span className="text-editor-label">{index ? 'workflows.toml' : 'aflow.toml'}</span><TextEditor className="mono config-textarea" aria-label={index ? 'workflows.toml contents' : 'aflow.toml contents'} value={text} onChange={e => { draftPreviewCoordinator.invalidate(); setDraftPreviewState(draftPreviewCoordinator.state()); const next: [string, string] = [...texts]; next[index] = e.target.value; setTexts(next); if (!rawEdited) { const form = candidate().form; setBaseline(form); setDraft(form); if (form) draftPreviewCoordinator.updateDraft(form); setPendingNames({}); setNewProfile({ harness: '', profile: '', model: '', effort: '' }); setNewProfileError(null); setNewRole({ role: '', selector: '' }); setNewRoleError(null); setNewTeamName(''); setNewTeamError(null); setPendingFocusTeam(null) } setRawEdited(true) }} /></div>)}</div> : <><div className="settings-retained-skills" hidden={tab !== 'Skills'} aria-hidden={tab !== 'Skills' || undefined}><SkillsSettings
       skills={skills}
-      loadError={skillsError}
+      loadError={skillsLoadError}
       selected={effectiveSkill}
       onSelect={selectSkill}
       content={effectiveSkill && skillContents[effectiveSkill] !== undefined ? skillContents[effectiveSkill] : null}
       contentLoading={skillContentLoading}
       contentError={skillContentError}
-      draft={effectiveSkill && skillDrafts[effectiveSkill] !== undefined ? skillDrafts[effectiveSkill] : null}
+      draft={effectiveSkill && skillDrafts[effectiveSkill] !== undefined ? skillDrafts[effectiveSkill].content : null}
       unsavedNames={dirtySkillNames}
-      onEdit={(name, text) => setSkillDrafts(drafts => ({ ...drafts, [name]: text }))}
+      onEdit={(name, text) => setSkillDrafts(drafts => {
+        const baseline = skillContents[name]
+        if (baseline === undefined) return drafts
+        if (text === baseline) {
+          if (!(name in drafts)) return drafts
+          const next = { ...drafts }
+          delete next[name]
+          return next
+        }
+        const current = drafts[name]
+        const expectedRevision = current?.expectedRevision ?? skillRevisions[name] ?? ''
+        return { ...drafts, [name]: { content: text, expectedRevision } }
+      })}
       hasUnsavedEdits={skillsDirty}
       onInstall={() => void installSkillsAction()}
       installing={installing}
@@ -765,6 +894,7 @@ export function GlobalSettings({ onDirtyChange, onSaved }: { onDirtyChange: (dir
       visible={tab === 'Skills'}
     /></div>{draft && <div className="settings-retained-team-families" hidden={tab !== 'Teams'} aria-hidden={tab !== 'Teams' || undefined}>
       <TeamFamiliesSettings
+        key={teamWizardResetVersion}
         draft={draft}
         baseline={baseline}
         selectedTeam={selectedTeam || teamNames[0] || ''}

@@ -918,15 +918,105 @@ describe('GlobalSettings', () => {
     await waitFor(() => expect(api.patchGlobalConfig).toHaveBeenCalledWith({ expected_revision: config.revision, documents: { 'aflow.toml': '[roles]\nworker = "codex.worker"\n' } }))
   })
 
+  it('retains visible values through clean equal, failed, and changed reloads', async () => {
+    const pendingConfig = deferred<typeof config>()
+    const changedConfig = { ...config, revision: 'f'.repeat(64), aflow_toml: 'changed config' }
+    const changedForm = structuredClone(form)
+    changedForm.harnesses.codex.worker.effort = 'changed-effort'
+    const changedResponse: ProjectConfigFormResponse = {
+      ...response,
+      aflow_toml: changedConfig.aflow_toml,
+      workflows_toml: changedConfig.workflows_toml,
+      form: changedForm,
+    }
+    let configReads = 0
+    vi.mocked(api.getGlobalConfig).mockImplementation(() => {
+      configReads += 1
+      if (configReads === 1) return Promise.resolve(config)
+      if (configReads === 2) return pendingConfig.promise
+      if (configReads === 3) return Promise.reject(new Error('config refresh failed'))
+      return Promise.resolve(changedConfig)
+    })
+    vi.mocked(api.postGlobalConfigForm).mockImplementation(async request => configReads >= 4 && !request.action ? changedResponse : response)
+
+    render(<GlobalSettings onDirtyChange={() => {}} onSaved={() => {}} />)
+    const effort = await screen.findByLabelText('Effort codex.worker') as HTMLInputElement
+    expect(effort.value).toBe('high')
+    fireEvent.click(screen.getByRole('button', { name: 'Advanced TOML', exact: true }))
+    const aflow = await screen.findByLabelText('aflow.toml contents') as HTMLTextAreaElement
+    const workflows = screen.getByLabelText('workflows.toml contents') as HTMLTextAreaElement
+    const aflowNode = aflow
+    expect(aflow.value).toBe('config')
+    expect(workflows.value).toBe('workflows')
+
+    fireEvent.click(screen.getByRole('button', { name: 'Reload server settings', exact: true }))
+    expect(api.getGlobalConfig).toHaveBeenCalledTimes(2)
+    expect((screen.getByLabelText('aflow.toml contents') as HTMLTextAreaElement).value).toBe('config')
+    expect(screen.getByLabelText('aflow.toml contents')).toBe(aflowNode)
+    expect((screen.getByLabelText('workflows.toml contents') as HTMLTextAreaElement).value).toBe('workflows')
+
+    await act(async () => {
+      pendingConfig.resolve(config)
+      await pendingConfig.promise
+    })
+    await waitFor(() => expect((screen.getByLabelText('aflow.toml contents') as HTMLTextAreaElement).value).toBe('config'))
+    expect(screen.getByLabelText('aflow.toml contents')).toBe(aflowNode)
+
+    fireEvent.click(screen.getByRole('button', { name: 'Reload server settings', exact: true }))
+    await screen.findByText('Some settings could not be loaded. Reload to retry.')
+    expect((screen.getByLabelText('aflow.toml contents') as HTMLTextAreaElement).value).toBe('config')
+    expect((screen.getByLabelText('workflows.toml contents') as HTMLTextAreaElement).value).toBe('workflows')
+
+    fireEvent.click(screen.getByRole('button', { name: 'Reload server settings', exact: true }))
+    await waitFor(() => expect((screen.getByLabelText('aflow.toml contents') as HTMLTextAreaElement).value).toBe('changed config'))
+    fireEvent.click(screen.getByRole('button', { name: 'Guided settings', exact: true }))
+    await waitFor(() => expect((screen.getByLabelText('Effort codex.worker') as HTMLInputElement).value).toBe('changed-effort'))
+  })
+
+  it('keeps an independent loaded domain when another clean reload fails', async () => {
+    let settingsReads = 0
+    vi.mocked(api.getSettings).mockImplementation(() => {
+      settingsReads += 1
+      return settingsReads === 1 ? Promise.resolve(server) : Promise.reject(new Error('server refresh failed'))
+    })
+    render(<GlobalSettings onDirtyChange={() => {}} onSaved={() => {}} />)
+    await screen.findByLabelText('Effort codex.worker')
+    fireEvent.click(screen.getByRole('tab', { name: 'General', exact: true }))
+    const bindHost = screen.getByLabelText('Bind host') as HTMLInputElement
+    fireEvent.click(screen.getByRole('button', { name: 'Reload server settings', exact: true }))
+    await screen.findByText('Some settings could not be loaded. Reload to retry.')
+    expect(bindHost.value).toBe('localhost')
+    expect(screen.getByLabelText('Projects root')).toBeTruthy()
+  })
+
   it('confirmed reload discards every pending edit including the password', async () => {
     const confirm = vi.spyOn(window, 'confirm').mockReturnValue(true)
+    const pendingConfig = deferred<typeof config>()
+    let configReads = 0
+    vi.mocked(api.getGlobalConfig).mockImplementation(() => {
+      configReads += 1
+      return configReads === 1 ? Promise.resolve(config) : pendingConfig.promise
+    })
     render(<GlobalSettings onDirtyChange={() => {}} onSaved={() => {}} />)
     fireEvent.change(await screen.findByLabelText('Effort codex.worker'), { target: { value: 'custom' } })
     fireEvent.click(screen.getByRole('tab', { name: 'General' }))
-    fireEvent.change(screen.getByLabelText('Bind host'), { target: { value: '0.0.0.0' } })
-    fireEvent.change(screen.getByLabelText('New password (leave empty to keep current)'), { target: { value: 'discarded-secret' } })
+    const bindHost = screen.getByLabelText('Bind host') as HTMLInputElement
+    const password = screen.getByLabelText('New password (leave empty to keep current)') as HTMLInputElement
+    fireEvent.change(bindHost, { target: { value: '0.0.0.0' } })
+    fireEvent.change(password, { target: { value: 'discarded-secret' } })
     fireEvent.click(screen.getByRole('button', { name: 'Reload server settings' }))
     expect(confirm).toHaveBeenCalledWith('Discard unsaved settings and reload?')
+    expect(configReads).toBe(2)
+    // Confirmed discard resets only the pending edits. The loaded display
+    // remains usable while replacement reads are in flight.
+    expect(bindHost.value).toBe('localhost')
+    expect(password.value).toBe('')
+    expect((screen.getByRole('button', { name: 'Working…' }) as HTMLButtonElement).disabled).toBe(true)
+
+    await act(async () => {
+      pendingConfig.resolve(config)
+      await pendingConfig.promise
+    })
     // The reloaded draft replaces every discarded edit.
     fireEvent.click(await screen.findByRole('tab', { name: 'Agents & Roles' }))
     await waitFor(() => expect(((screen.getByLabelText('Effort codex.worker') as HTMLInputElement | null)?.value)).toBe('high'))
@@ -1539,6 +1629,224 @@ describe('GlobalSettings', () => {
     const area = await screen.findByLabelText('SKILL.md for aflow-manager')
     expect((area as HTMLTextAreaElement).value).toBe(skillContent('aflow-manager'))
   })
+  it('refreshes previously loaded non-selected skills when list revisions change', async () => {
+    const refreshedManager = deferred<ReturnType<typeof skillDetail>>()
+    let listCalls = 0
+    vi.mocked(api.listSkills).mockImplementation(async () => {
+      listCalls += 1
+      return listCalls === 1
+        ? skillSummaries
+        : skillSummaries.map(skill => skill.name === 'aflow-manager'
+          ? { ...skill, revision: 'f'.repeat(64) }
+          : skill)
+    })
+    let readCalls = 0
+    vi.mocked(api.readSkill).mockImplementation((name: string) => {
+      readCalls += 1
+      if (readCalls === 1) return Promise.resolve(skillDetail(name, 'c'.repeat(64)))
+      if (name === 'aflow-manager') return refreshedManager.promise
+      return Promise.resolve(skillDetail(name, 'd'.repeat(64)))
+    })
+    render(<GlobalSettings onDirtyChange={() => {}} onSaved={() => {}} />)
+    await screen.findByLabelText('Effort codex.worker')
+    fireEvent.click(screen.getByRole('tab', { name: 'Skills' }))
+    await screen.findByLabelText('SKILL.md for aflow-manager')
+    fireEvent.click(screen.getByRole('button', { name: 'aflow-assistant (optional)', exact: true }))
+    await screen.findByLabelText('SKILL.md for aflow-assistant')
+    fireEvent.click(screen.getByRole('button', { name: 'Reload server settings', exact: true }))
+    await waitFor(() => expect(api.readSkill.mock.calls.filter(call => call[0] === 'aflow-manager')).toHaveLength(2))
+    expect(screen.getByRole('button', { name: 'aflow-assistant (optional)', exact: true }).getAttribute('aria-pressed')).toBe('true')
+    await act(async () => {
+      refreshedManager.resolve({ ...skillDetail('aflow-manager', 'f'.repeat(64)), content: 'Refreshed non-selected.' })
+      await refreshedManager.promise
+    })
+    fireEvent.click(screen.getByRole('button', { name: 'aflow-manager', exact: true }))
+    await waitFor(() => expect((screen.getByLabelText('SKILL.md for aflow-manager') as HTMLTextAreaElement).value).toContain('Refreshed non-selected.'))
+  })
+  it('keeps a skill draft paired with its original revision through a pending refresh and conflict', async () => {
+    const refreshedManager = deferred<ReturnType<typeof skillDetail>>()
+    const firstRevision = 'c'.repeat(64)
+    const refreshedRevision = 'f'.repeat(64)
+    let listCalls = 0
+    let managerReads = 0
+    const firstContent = skillContent('aflow-manager')
+    const edited = `${firstContent}\nEdit made while the refresh is pending.\n`
+    vi.mocked(api.listSkills).mockImplementation(async () => {
+      listCalls += 1
+      return listCalls === 1
+        ? skillSummaries
+        : skillSummaries.map(skill => skill.name === 'aflow-manager' ? { ...skill, revision: refreshedRevision } : skill)
+    })
+    vi.mocked(api.readSkill).mockImplementation((name: string) => {
+      managerReads += 1
+      return managerReads === 1 ? Promise.resolve(skillDetail(name, firstRevision)) : refreshedManager.promise
+    })
+    vi.mocked(api.saveSkill).mockRejectedValueOnce(Object.assign(new Error('revision conflict'), { status: 409, detail: { code: 'revision_conflict', current_revision: refreshedRevision } }))
+
+    render(<GlobalSettings onDirtyChange={() => {}} onSaved={() => {}} />)
+    await screen.findByLabelText('Effort codex.worker')
+    fireEvent.click(screen.getByRole('tab', { name: 'Skills' }))
+    const area = await screen.findByLabelText('SKILL.md for aflow-manager') as HTMLTextAreaElement
+    expect(area.value).toBe(firstContent)
+
+    fireEvent.click(screen.getByRole('button', { name: 'Reload server settings', exact: true }))
+    await waitFor(() => expect(managerReads).toBe(2))
+    expect(area.value).toBe(firstContent)
+    expect(area.disabled).toBe(false)
+    fireEvent.change(area, { target: { value: edited } })
+
+    await act(async () => {
+      refreshedManager.resolve({ ...skillDetail('aflow-manager', refreshedRevision), content: `${firstContent}\nConcurrent server change.\n` })
+      await refreshedManager.promise
+    })
+    expect(area.value).toBe(edited)
+
+    fireEvent.click(screen.getByRole('button', { name: 'Save all changes' }))
+    await screen.findByText(/Skill aflow-manager was not saved/)
+    expect(api.validateSkills).toHaveBeenCalledWith([{ name: 'aflow-manager', content: edited, expected_revision: firstRevision }])
+    expect(api.saveSkill).toHaveBeenCalledWith('aflow-manager', { content: edited, expected_revision: firstRevision })
+    expect(area.value).toBe(edited)
+    expect((screen.getByRole('button', { name: 'Save all changes' }) as HTMLButtonElement).disabled).toBe(false)
+  })
+  it('uses the equal refreshed revision for a later skill edit', async () => {
+    const equalRefresh = deferred<ReturnType<typeof skillDetail>>()
+    const revision = 'c'.repeat(64)
+    let readCalls = 0
+    vi.mocked(api.readSkill).mockImplementation((name: string) => {
+      readCalls += 1
+      return readCalls === 1 ? Promise.resolve(skillDetail(name, revision)) : equalRefresh.promise
+    })
+    render(<GlobalSettings onDirtyChange={() => {}} onSaved={() => {}} />)
+    await screen.findByLabelText('Effort codex.worker')
+    fireEvent.click(screen.getByRole('tab', { name: 'Skills' }))
+    const area = await screen.findByLabelText('SKILL.md for aflow-manager') as HTMLTextAreaElement
+    fireEvent.click(screen.getByRole('button', { name: 'Reload server settings', exact: true }))
+    await waitFor(() => expect(readCalls).toBe(2))
+    await act(async () => {
+      equalRefresh.resolve(skillDetail('aflow-manager', revision))
+      await equalRefresh.promise
+    })
+    const edited = `${area.value}\nEdit after equal refresh.\n`
+    fireEvent.change(area, { target: { value: edited } })
+    fireEvent.click(screen.getByRole('button', { name: 'Save all changes' }))
+    await waitFor(() => expect(api.saveSkill).toHaveBeenCalledWith('aflow-manager', { content: edited, expected_revision: revision }))
+  })
+  it('retries a failed stale skill refresh when it is selected again', async () => {
+    const failedRefresh = deferred<ReturnType<typeof skillDetail>>()
+    const retryRefresh = deferred<ReturnType<typeof skillDetail>>()
+    let listCalls = 0
+    let managerReads = 0
+    vi.mocked(api.listSkills).mockImplementation(async () => {
+      listCalls += 1
+      return listCalls === 1
+        ? skillSummaries
+        : skillSummaries.map(skill => skill.name === 'aflow-manager'
+          ? { ...skill, revision: 'f'.repeat(64) }
+          : skill)
+    })
+    vi.mocked(api.readSkill).mockImplementation((name: string) => {
+      if (name === 'aflow-manager') {
+        managerReads += 1
+        if (managerReads === 1) return Promise.resolve(skillDetail(name, 'c'.repeat(64)))
+        if (managerReads === 2) return failedRefresh.promise
+        return retryRefresh.promise
+      }
+      return Promise.resolve(skillDetail(name, 'd'.repeat(64)))
+    })
+    render(<GlobalSettings onDirtyChange={() => {}} onSaved={() => {}} />)
+    await screen.findByLabelText('Effort codex.worker')
+    fireEvent.click(screen.getByRole('tab', { name: 'Skills' }))
+    const managerArea = await screen.findByLabelText('SKILL.md for aflow-manager') as HTMLTextAreaElement
+    const oldContent = managerArea.value
+    fireEvent.click(screen.getByRole('button', { name: 'aflow-assistant (optional)', exact: true }))
+    await screen.findByLabelText('SKILL.md for aflow-assistant')
+    fireEvent.click(screen.getByRole('button', { name: 'Reload server settings', exact: true }))
+    await waitFor(() => expect(managerReads).toBe(2))
+    await act(async () => {
+      failedRefresh.reject(new Error('skill refresh failed'))
+      await failedRefresh.promise.catch(() => undefined)
+    })
+    await screen.findByText(/Skills could not be loaded: skill refresh failed/)
+    fireEvent.click(screen.getByRole('button', { name: 'aflow-manager', exact: true }))
+    const retryArea = await screen.findByLabelText('SKILL.md for aflow-manager') as HTMLTextAreaElement
+    expect(retryArea.value).toBe(oldContent)
+    await waitFor(() => expect(managerReads).toBe(3))
+    expect(retryArea.value).toBe(oldContent)
+    await act(async () => {
+      retryRefresh.resolve({ ...skillDetail('aflow-manager', 'f'.repeat(64)), content: 'Retried manager content.' })
+      await retryRefresh.promise
+    })
+    await waitFor(() => expect(retryArea.value).toBe('Retried manager content.'))
+    expect(screen.queryByText(/Skills could not be loaded: skill refresh failed/)).toBeNull()
+    const edited = `${retryArea.value}\nAfter retry edit.\n`
+    fireEvent.change(retryArea, { target: { value: edited } })
+    fireEvent.click(screen.getByRole('button', { name: 'Save all changes' }))
+    await waitFor(() => expect(api.saveSkill).toHaveBeenCalledWith('aflow-manager', { content: edited, expected_revision: 'f'.repeat(64) }))
+  })
+  it('retains one cached refresh failure when another skill refresh succeeds', async () => {
+    const managerFailure = deferred<ReturnType<typeof skillDetail>>()
+    const managerRetry = deferred<ReturnType<typeof skillDetail>>()
+    const assistantRefresh = deferred<ReturnType<typeof skillDetail>>()
+    let listCalls = 0
+    let managerReads = 0
+    let assistantReads = 0
+    vi.mocked(api.listSkills).mockImplementation(async () => {
+      listCalls += 1
+      return listCalls === 1
+        ? skillSummaries
+        : skillSummaries.map(skill => skill.name === 'aflow-manager'
+          ? { ...skill, revision: 'f'.repeat(64) }
+          : { ...skill, revision: 'e'.repeat(64) })
+    })
+    vi.mocked(api.readSkill).mockImplementation((name: string) => {
+      if (name === 'aflow-manager') {
+        managerReads += 1
+        if (managerReads === 1) return Promise.resolve(skillDetail(name, 'c'.repeat(64)))
+        if (managerReads === 2) return managerFailure.promise
+        return managerRetry.promise
+      }
+      assistantReads += 1
+      if (assistantReads === 1) return Promise.resolve(skillDetail(name, 'd'.repeat(64)))
+      return assistantRefresh.promise
+    })
+    render(<GlobalSettings onDirtyChange={() => {}} onSaved={() => {}} />)
+    await screen.findByLabelText('Effort codex.worker')
+    fireEvent.click(screen.getByRole('tab', { name: 'Skills' }))
+    const managerArea = await screen.findByLabelText('SKILL.md for aflow-manager') as HTMLTextAreaElement
+    const oldContent = managerArea.value
+    fireEvent.click(screen.getByRole('button', { name: 'aflow-assistant (optional)', exact: true }))
+    await screen.findByLabelText('SKILL.md for aflow-assistant')
+    fireEvent.click(screen.getByRole('button', { name: 'Reload server settings', exact: true }))
+    await waitFor(() => {
+      expect(managerReads).toBe(2)
+      expect(assistantReads).toBe(2)
+    })
+    await act(async () => {
+      managerFailure.reject(new Error('manager refresh failed'))
+      await managerFailure.promise.catch(() => undefined)
+    })
+    await screen.findByText(/Skills could not be loaded: manager refresh failed/)
+    await act(async () => {
+      assistantRefresh.resolve(skillDetail('aflow-assistant', 'e'.repeat(64)))
+      await assistantRefresh.promise
+    })
+    await screen.findByText(/Skills could not be loaded: manager refresh failed/)
+    fireEvent.click(screen.getByRole('button', { name: 'aflow-manager', exact: true }))
+    const retryArea = await screen.findByLabelText('SKILL.md for aflow-manager') as HTMLTextAreaElement
+    expect(retryArea.value).toBe(oldContent)
+    await waitFor(() => expect(managerReads).toBe(3))
+    await screen.findByText(/Skills could not be loaded: manager refresh failed/)
+    await act(async () => {
+      managerRetry.resolve({ ...skillDetail('aflow-manager', 'f'.repeat(64)), content: 'Retried manager content.' })
+      await managerRetry.promise
+    })
+    await waitFor(() => expect(retryArea.value).toBe('Retried manager content.'))
+    expect(screen.queryByText(/Skills could not be loaded: manager refresh failed/)).toBeNull()
+    const edited = `${retryArea.value}\nAfter concurrent retry.\n`
+    fireEvent.change(retryArea, { target: { value: edited } })
+    fireEvent.click(screen.getByRole('button', { name: 'Save all changes' }))
+    await waitFor(() => expect(api.saveSkill).toHaveBeenCalledWith('aflow-manager', { content: edited, expected_revision: 'f'.repeat(64) }))
+  })
   it('shows empty and error states for the skill registry', async () => {
     vi.mocked(api.listSkills).mockResolvedValueOnce([])
     render(<GlobalSettings onDirtyChange={() => {}} onSaved={() => {}} />)
@@ -1692,6 +2000,106 @@ describe('GlobalSettings', () => {
     expect(screen.getByText(/saved but not installed/)).toBeTruthy()
     expect(screen.getByText(/default install excludes it/)).toBeTruthy()
     expect(screen.queryByRole('button', { name: /reinstall edited/i })).toBeNull()
+  })
+  it('keeps selected skill visible through equal and failed detail refreshes', async () => {
+    const equalRefresh = deferred<ReturnType<typeof skillDetail>>()
+    const failedRefresh = deferred<ReturnType<typeof skillDetail>>()
+    let readCalls = 0
+    vi.mocked(api.readSkill).mockImplementation((name: string) => {
+      readCalls += 1
+      if (readCalls === 1) return Promise.resolve(skillDetail(name, 'c'.repeat(64)))
+      if (readCalls === 2) return equalRefresh.promise
+      return failedRefresh.promise
+    })
+    render(<GlobalSettings onDirtyChange={() => {}} onSaved={() => {}} />)
+    await screen.findByLabelText('Effort codex.worker')
+    fireEvent.click(screen.getByRole('tab', { name: 'Skills' }))
+    const area = await screen.findByLabelText('SKILL.md for aflow-manager') as HTMLTextAreaElement
+    const baseline = area.value
+    fireEvent.click(screen.getByRole('button', { name: 'Reload server settings', exact: true }))
+    await waitFor(() => expect(readCalls).toBe(2))
+    expect(area.value).toBe(baseline)
+    await act(async () => {
+      equalRefresh.resolve(skillDetail('aflow-manager', 'c'.repeat(64)))
+      await equalRefresh.promise
+    })
+    expect(area.value).toBe(baseline)
+    fireEvent.click(screen.getByRole('button', { name: 'Reload server settings', exact: true }))
+    await waitFor(() => expect(readCalls).toBe(3))
+    expect(area.value).toBe(baseline)
+    await act(async () => {
+      failedRefresh.reject(new Error('skill refresh failed'))
+      await failedRefresh.promise.catch(() => undefined)
+    })
+    await screen.findByText(/Skills could not be loaded: skill refresh failed/)
+    expect(area.value).toBe(baseline)
+    expect((screen.getByRole('button', { name: 'Save all changes' }) as HTMLButtonElement).disabled).toBe(true)
+  })
+  it('drops a no-op skill draft before applying changed content and revision', async () => {
+    const changedRefresh = deferred<ReturnType<typeof skillDetail>>()
+    let readCalls = 0
+    vi.mocked(api.listSkills).mockImplementation(async () => skillSummaries.map(skill => skill.name === 'aflow-manager'
+      ? { ...skill, revision: readCalls > 0 ? 'f'.repeat(64) : skill.revision }
+      : skill))
+    vi.mocked(api.readSkill).mockImplementation((name: string) => {
+      readCalls += 1
+      if (readCalls === 1) return Promise.resolve(skillDetail(name, 'c'.repeat(64)))
+      return changedRefresh.promise
+    })
+    render(<GlobalSettings onDirtyChange={() => {}} onSaved={() => {}} />)
+    await screen.findByLabelText('Effort codex.worker')
+    fireEvent.click(screen.getByRole('tab', { name: 'Skills' }))
+    const area = await screen.findByLabelText('SKILL.md for aflow-manager') as HTMLTextAreaElement
+    const baseline = area.value
+    fireEvent.change(area, { target: { value: baseline } })
+    await waitFor(() => expect((screen.getByRole('button', { name: 'Save all changes' }) as HTMLButtonElement).disabled).toBe(true))
+    fireEvent.click(screen.getByRole('button', { name: 'Reload server settings', exact: true }))
+    await waitFor(() => expect(readCalls).toBe(2))
+    expect(area.value).toBe(baseline)
+    await act(async () => {
+      changedRefresh.resolve({ ...skillDetail('aflow-manager', 'f'.repeat(64)), content: `${baseline}\nServer changed.\n` })
+      await changedRefresh.promise
+    })
+    await waitFor(() => expect(area.value).toContain('Server changed.'))
+    expect(screen.queryByRole('button', { name: 'aflow-manager · unsaved' })).toBeNull()
+    expect((screen.getByRole('button', { name: 'Save all changes' }) as HTMLButtonElement).disabled).toBe(true)
+    const userEdit = `${area.value}\nUser edit after refresh.\n`
+    fireEvent.change(area, { target: { value: userEdit } })
+    fireEvent.click(screen.getByRole('button', { name: 'Save all changes' }))
+    await waitFor(() => expect(api.saveSkill).toHaveBeenCalledWith('aflow-manager', { content: userEdit, expected_revision: 'f'.repeat(64) }))
+  })
+  it('ignores a superseded skill refresh and applies only the latest content', async () => {
+    render(<GlobalSettings onDirtyChange={() => {}} onSaved={() => {}} />)
+    await screen.findByLabelText('Effort codex.worker')
+    fireEvent.click(screen.getByRole('tab', { name: 'Skills' }))
+    const area = await screen.findByLabelText('SKILL.md for aflow-manager') as HTMLTextAreaElement
+    fireEvent.click(screen.getByRole('button', { name: 'aflow-manager', exact: true }))
+    const baseline = area.value
+    const stale = deferred<ReturnType<typeof skillDetail>>()
+    const current = deferred<ReturnType<typeof skillDetail>>()
+    let refreshCalls = 0
+    vi.mocked(api.readSkill).mockImplementation((name: string) => {
+      refreshCalls += 1
+      return refreshCalls === 1 ? stale.promise : current.promise
+    })
+
+    fireEvent.click(screen.getByRole('button', { name: 'Reload server settings', exact: true }))
+    await waitFor(() => expect(refreshCalls).toBe(1))
+    fireEvent.click(screen.getByRole('button', { name: 'Reload server settings', exact: true }))
+    await waitFor(() => expect(refreshCalls).toBe(2))
+
+    await act(async () => {
+      stale.resolve({ ...skillDetail('aflow-manager', 'g'.repeat(64)), content: `${baseline}\nStale response.\n` })
+      await stale.promise
+    })
+    expect(area.value).toBe(baseline)
+
+    await act(async () => {
+      current.resolve({ ...skillDetail('aflow-manager', 'h'.repeat(64)), content: `${baseline}\nCurrent response.\n` })
+      await current.promise
+    })
+    await waitFor(() => expect(area.value).toContain('Current response.'))
+    expect(area.value).not.toContain('Stale response.')
   })
   it('discards skill drafts on explicit reload and ignores late content', async () => {
     const confirm = vi.spyOn(window, 'confirm').mockReturnValue(true)
