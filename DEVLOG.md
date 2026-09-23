@@ -1,5 +1,21 @@
 # DEVLOG
 
+## 2026-09-23 — Preserve Settings content during clean reload
+
+- Settings reloads now retain loaded config, server, and skill domains while
+  replacement reads are pending, equivalent, or failed. Changed responses
+  reconcile through the existing owners; confirmed dirty reloads still discard
+  only the authorized drafts and invalidate superseded skill reads.
+- Deferred unit coverage verifies visible TOML values, independent-domain
+  failure, dirty discard, and stale skill responses. A disposable built-app
+  journey holds /api/config and passes in Chromium and WebKit, covering
+  editor identity, selection/scroll/disclosure continuity, failure retention,
+  changed guided values, and no config writes.
+- Validation: focused Settings tests 81/81, full web tests 580/580, production
+  build passed, and the new browser journey passed 1/1 in Chromium and 1/1 in
+  WebKit. Review, publication, CI, and live activation remain coordinator
+  gates.
+
 ## 2026-09-23 — Consume complete credentials in fidelity diagnostics
 
 - Python failure-text and browser alert scrubbers now consume the complete
