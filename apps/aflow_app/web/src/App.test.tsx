@@ -623,6 +623,7 @@ describe('App workspace shell', () => {
     vi.mocked(api.postGlobalConfigForm).mockResolvedValue(guidedFormResponse(configPayload('ready').validation))
     fireEvent.click(screen.getByRole('button', { name: 'Save all changes' }))
     await waitFor(() => expect(api.patchGlobalConfig).toHaveBeenCalled())
+    await screen.findByText(/Workflow settings saved/)
     fireEvent.click(screen.getByRole('button', { name: 'Plans' }))
     await screen.findByLabelText('New plan filename')
   })
