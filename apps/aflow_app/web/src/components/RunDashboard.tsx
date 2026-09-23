@@ -1,4 +1,4 @@
-import { memo, useCallback, useEffect, useId, useMemo, useRef, useState } from 'react'
+import { memo, useCallback, useEffect, useId, useMemo, useRef, useState, type ReactNode } from 'react'
 import type {
   ConfigValidationIssue,
   ControlPlaneCapabilities,
@@ -44,7 +44,9 @@ import {
   isTerminalInactiveRun,
   latestRunResultEvent,
   presentRunEvent,
+  deliveryIssueText,
   runCurrentWorkText,
+  runExecutorFacts,
   shortRunId,
   statusLabel,
   executionDuration,
@@ -774,6 +776,19 @@ const LiveRunElapsed = memo(function LiveRunElapsed({ run, label }: { run: RunSt
   return elapsed ? ` · ${label} ${elapsed}` : null
 })
 
+const LiveRunHeaderTiming = memo(function LiveRunHeaderTiming({ run }: { run: RunStatus }) {
+  const [now, setNow] = useState(() => Date.now())
+  const ticking = run.status === 'running' || run.activity === 'active'
+  useEffect(() => {
+    if (!ticking) return
+    setNow(Date.now())
+    const timer = setInterval(() => setNow(Date.now()), 1_000)
+    return () => clearInterval(timer)
+  }, [ticking, run.started_at, run.ended_at])
+  const timing = runTimingSummary(run, executionDuration(run, now))
+  return timing === 'Not reported' ? null : <span className="run-overview-header-duration">{timing}</span>
+})
+
 function lastExecutedEvidence(
   events: RunEvent[],
   context: RunContext | null,
@@ -1207,7 +1222,11 @@ export function RunDashboard({ visible = true, page, onNewRun, onCancelNewRun, o
   useEffect(() => {
     if (!visible || !selectedRunId) return
     let active = true
-    setRestartAdmission(null)
+    // Keep an already-admitted action menu mounted while a status refresh
+    // requests the same run again. The direct snapshot and history snapshot
+    // can settle in either order; clearing the same-run admission here would
+    // make the menu disappear between those two responses.
+    setRestartAdmission(current => current?.run_id === selectedRunId ? current : null)
     void api.getRestartOptions(projectId, selectedRunId).then(result => {
       if (active) setRestartAdmission(result)
     }).catch(() => { /* The run remains readable if restart admission is unavailable. */ })
@@ -2968,25 +2987,55 @@ export function RunDashboard({ visible = true, page, onNewRun, onCancelNewRun, o
   const recoveryReplacementStarted = Boolean(
     recoveryWorkerEvidenceMatches && recoveryWorkerEvidence?.operation_started,
   )
-  const selectedRunTiming = selectedRun ? runTimingSummary(selectedRun, null) : 'Not reported'
   const latestResultEvent = latestRunResultEvent(events)
   const latestResultPresentation = latestResultEvent ? presentRunEvent(latestResultEvent) : null
   const observedInvocation = selectedRun?.current_step
-    ? `${formatMachineLabel(selectedRun.current_step)}${selectedRun.turns_completed !== null ? ` · ${selectedRun.turns_completed}` : ''}`
-    : null
+    ? [
+        formatMachineLabel(selectedRun.current_step),
+        selectedRun.turns_completed !== null ? `turn ${selectedRun.turns_completed}` : null,
+      ].filter((value): value is string => Boolean(value)).join(' · ')
+    : lastExecuted
+      ? [
+          lastExecuted.stepName ? formatMachineLabel(lastExecuted.stepName) : null,
+          lastExecuted.role ? formatMachineLabel(lastExecuted.role) : null,
+          lastExecuted.turnNumber !== null ? `turn ${lastExecuted.turnNumber}` : null,
+        ].filter((value): value is string => Boolean(value)).join(' · ') || null
+      : null
+  const deliveryWarning = canonicalDetail ? deliveryIssueText(canonicalDetail.delivery) : null
   const overviewCurrentWork = selectedRun
     ? (() => {
       const currentWork = isTerminalInactiveRun(selectedRun)
         ? `No current work — ${statusLabel(selectedRun)}.`
         : canonicalProgress
           ? runCurrentWorkText(canonicalProgress, selectedRun.current_step)
+          : selectedRun.current_step
+            ? [
+                formatMachineLabel(selectedRun.current_step),
+                selectedRun.turns_completed !== null ? `turn ${selectedRun.turns_completed}` : null,
+              ].filter((value): value is string => Boolean(value)).join(' · ')
           : checkpoints
             ? checkpointProgressText(checkpoints)
             : selectedRun.activity === 'active'
                 ? 'Active work is in progress.'
                 : `${statusLabel(selectedRun)} — current work is not reported.`
+      const executorFacts = [
+        selectedRun.current_step && !isTerminalInactiveRun(selectedRun) ? formatMachineLabel(selectedRun.current_step) : null,
+        ...(canonicalProgress?.current_executor
+          ? runExecutorFacts(canonicalProgress.current_executor)
+          : lastExecuted
+            ? [
+                lastExecuted.role ? formatMachineLabel(lastExecuted.role) : null,
+                lastExecuted.selector,
+                lastExecuted.model,
+                lastExecuted.turnNumber !== null ? `turn ${lastExecuted.turnNumber}` : null,
+              ]
+            : []),
+      ].filter((value): value is string => Boolean(value))
       return (
-        <p className="run-overview-lead">{currentWork}</p>
+        <>
+          <p className="run-overview-lead">{currentWork}</p>
+          {executorFacts.length > 0 && <p className="run-overview-inline-facts"><span>{executorFacts.join(' · ')}</span></p>}
+        </>
       )
     })()
     : null
@@ -2996,7 +3045,8 @@ export function RunDashboard({ visible = true, page, onNewRun, onCancelNewRun, o
         outcome?.finishedTurn
         || outcome?.finishedSummary
         || outcome?.resultText
-        || latestResultPresentation,
+        || latestResultPresentation?.summary
+        || latestResultPresentation?.hasPayload,
       )
       const latestEventStatus = typeof latestResultEvent?.data?.status === 'string'
         ? latestResultEvent.data.status
@@ -3016,7 +3066,9 @@ export function RunDashboard({ visible = true, page, onNewRun, onCancelNewRun, o
         : outcome?.resultText
           ? 'Recorded result:'
           : 'Recorded update:'
-      const latestDetail = outcome?.resultText ?? latestResultPresentation?.detail ?? null
+      const latestDetail = outcome?.resultText
+        ?? (latestResultPresentation?.hasPayload ? latestResultPresentation.detail : null)
+      if (!hasRecordedResult && !isTerminalInactiveRun(selectedRun)) return null
       return (
         <>
           {latestSummary && <p><span className="text-sm text-dim">{latestLabel}</span> {latestSummary}</p>}
@@ -3027,17 +3079,35 @@ export function RunDashboard({ visible = true, page, onNewRun, onCancelNewRun, o
             }}>{outcome?.resultText ? 'Read full result' : 'Read full update'}</summary>
             {reportOpen && <pre className="dashboard-payload">{latestDetail}</pre>}
           </details>}
-          {!hasRecordedResult && (
+          {!hasRecordedResult && isTerminalInactiveRun(selectedRun) && (
             <p className="text-sm text-dim">
-              {isTerminalInactiveRun(selectedRun)
-                ? `${statusLabel(selectedRun)} is recorded, but no result text was retained.`
-                : 'No finished result has been recorded yet.'}
+              {statusLabel(selectedRun)} is recorded, but no result text was retained.
             </p>
           )}
         </>
       )
     })()
     : null
+  const hasRecordedProgress = Boolean(
+    compatibilitySummary?.repairing
+    || compatibilityProgressText
+    || outcome?.currentTurn
+    || observedInvocation
+    || outcome?.decision
+    || outcome?.finishedTurn
+    || outcome?.finishedSummary
+    || checkpoints,
+  )
+  const recordedProgressContent: ReactNode | null = hasRecordedProgress ? <>
+    {compatibilitySummary?.repairing && <p><strong>Repairing</strong>{compatibilitySummary.overlayFileName ? <> · {compatibilitySummary.overlayFileName}</> : null}</p>}
+    {compatibilityProgressText && <p>{compatibilityProgressText}</p>}
+    {checkpoints && <p>{checkpointProgressText(checkpoints)}</p>}
+    {outcome?.currentTurn && <p>Current turn: {outcome.currentTurn}</p>}
+    {observedInvocation && <p>Last observed invocation: <span>{observedInvocation}</span></p>}
+    {outcome?.decision && <p>{outcome.decision}</p>}
+    {outcome?.finishedTurn && <p>Last finished turn: {outcome.finishedTurn}</p>}
+    {outcome?.finishedSummary && <p>Last finished summary: {outcome.finishedSummary}</p>}
+  </> : null
 
   const workflowRoleList = stepRoleMap ? [...new Set(Object.values(stepRoleMap))].sort() : []
   const otherConfiguredRoles = committedForm
@@ -3534,12 +3604,14 @@ export function RunDashboard({ visible = true, page, onNewRun, onCancelNewRun, o
                       <h3>{selectedPlanFileName === 'Not reported' ? `Run ${selectedRun.run_id}` : selectedPlanFileName}{selectedPlanPresentation?.date && <>{' '}<span className="run-title-date">{selectedPlanPresentation.date}</span></>}</h3>
                       <button className="text-xs text-dim mono run-id-copy" title="Copy full run ID" aria-label={selectedRun.run_id} aria-describedby={`${technicalId}-copy-run-id`} onClick={() => void handleCopyRunId()}>{shortRunId(selectedRun.run_id)}<span className="copy-full-id-label">Copy full ID</span></button>
                       <span id={`${technicalId}-copy-run-id`} className="sr-only">Copy full run ID</span>
+                      <LiveRunHeaderTiming run={selectedRun} />
                     </div>
                     <span className="status-pill">{statusLabel(selectedRun)}</span>
                     {selectedRun.history_state === 'archived' && <span className="status-pill">Archived</span>}
                     {selectedRun.history_state === 'archived' && <button className="btn btn-secondary" disabled={busyAction === 'history' || historyConfirm !== null} onClick={() => void mutateHistory('restore')}>Restore</button>}
-                    {(canRestart || selectedRunHasLiveControls) && <MoreMenu label="Run actions" triggerLabel="Actions" triggerContent="Actions" className="run-actions-menu">
+                    {(canRestart || selectedRunHasLiveControls || Boolean(restartAdmission?.reason)) && <MoreMenu label="Run actions" triggerLabel="Actions" triggerContent="Actions" className="run-actions-menu">
                       {canRestart && <MenuItem disabled={!canMutate || busyAction !== null} onClick={openRestart}>Configure restart…</MenuItem>}
+                      {!canRestart && restartAdmission?.reason && <MenuItem disabled onClick={() => {}}>Restart unavailable: {restartAdmission.reason}</MenuItem>}
                       {selectedRunHasLiveControls && <MenuItem disabled={!canMutate || busyAction !== null} onClick={() => { setStopReviewOpen(false); setConfirmOwnerStop(false); setAdjustRunOpen(true) }}>Adjust run settings…</MenuItem>}
                       {selectedRunHasLiveControls && (hasSafeControl('owner_stop') || capabilities === null) && <MenuItem disabled={!canMutate || busyAction !== null || !hasSafeControl('owner_stop')} onClick={() => { setAdjustRunOpen(false); setStopReviewOpen(true); setConfirmOwnerStop(false) }}>Review stop options…</MenuItem>}
                     </MoreMenu>}
@@ -3560,6 +3632,7 @@ export function RunDashboard({ visible = true, page, onNewRun, onCancelNewRun, o
                   {pendingBoundaryStop && <div className="notice" role="status">Stop requested — finishing current turn. The current worker/reviewer call may finish before the run becomes Stopped; this does not approve the checkpoint.</div>}
                   {selectedRun.evidence.no_agent_started === true && selectedRun.status !== 'running' && <p>No agent started.</p>}
                   {streamState === 'reconnecting' && <div className="notice">Updates are stale. Use Refresh to retry.</div>}
+                  {deliveryWarning && <div className="notice run-delivery-warning" role="alert">Recorded delivery issue: {deliveryWarning}. Open Delivery evidence for the receipt.</div>}
                   {selectedRunIssue && <section className={`run-issue-summary run-issue-${selectedRunIssue.kind}`} role={selectedRunIssue.kind === 'failure' ? 'alert' : undefined}>
                     <div>
                       <strong>{selectedRunIssue.kind === 'failure' ? 'Failure' : 'Needs attention'}</strong>
@@ -3581,7 +3654,7 @@ export function RunDashboard({ visible = true, page, onNewRun, onCancelNewRun, o
                 streamNotice={streamNotice}
               />
 
-              {selectedRunHasLiveControls && <details className="dashboard-section" open={adjustRunOpen}><summary onClick={event => { event.preventDefault(); setAdjustRunOpen(open => !open) }}>Adjust run</summary>
+              {selectedRunHasLiveControls && adjustRunOpen && <details className="dashboard-section" open><summary onClick={event => { event.preventDefault(); setAdjustRunOpen(false) }}>Adjust run</summary>
                 {!canMutate && loading && <div className="notice">Initial run controls are pending admission. Actions stay disabled until loading finishes.</div>}
                 <div className="notice">
                   Changes are saved now and apply at the next safe turn or when the run resumes. Refresh after saving Settings to use newly saved teams and profiles; restarting is not required.
@@ -3644,26 +3717,6 @@ export function RunDashboard({ visible = true, page, onNewRun, onCancelNewRun, o
               </section>}
 
               {!canResume && selectedRun.evidence.no_agent_started === true && <p className="text-sm">No execution state is available to Resume.</p>}
-              {!canRestart && restartAdmission?.reason && <p className="text-sm">Restart unavailable: {restartAdmission.reason}</p>}
-
-              {(compatibilitySummary?.repairing || compatibilityProgressText || outcome?.currentTurn || observedInvocation || selectedRunTiming !== 'Not reported' || outcome?.decision || outcome?.finishedTurn || outcome?.finishedSummary || (isTerminalInactiveRun(selectedRun) && checkpoints)) && <section className="dashboard-section run-compatibility-evidence" aria-label="Recorded progress details">
-                <div className="section-heading">
-                  <div>
-                    <h4>Recorded progress details</h4>
-                    <span className="text-xs text-dim">Compatibility evidence retained below the overview</span>
-                  </div>
-                </div>
-                {compatibilitySummary?.repairing && <p><strong>Repairing</strong>{compatibilitySummary.overlayFileName ? <> · {compatibilitySummary.overlayFileName}</> : null}</p>}
-                {compatibilityProgressText && <p>{compatibilityProgressText}</p>}
-                {isTerminalInactiveRun(selectedRun) && checkpoints && <p><span>{checkpointProgressText(checkpoints)}</span></p>}
-                {outcome?.currentTurn && <p>Current turn: {outcome.currentTurn}</p>}
-                {observedInvocation && <p>Last observed invocation: <span>{observedInvocation}</span></p>}
-                {selectedRunTiming !== 'Not reported' && <p><LiveRunTiming run={selectedRun} /></p>}
-                {outcome?.decision && <p>{outcome.decision}</p>}
-                {outcome?.finishedTurn && <p>Last finished turn: {outcome.finishedTurn}</p>}
-                {outcome?.finishedSummary && <p>Last finished summary: {outcome.finishedSummary}</p>}
-              </section>}
-
               <div className="run-progress-evidence">
                 {canonicalProgress
                   ? <CheckpointHistory
@@ -3671,26 +3724,31 @@ export function RunDashboard({ visible = true, page, onNewRun, onCancelNewRun, o
                     run={selectedRun}
                     progress={canonicalProgress}
                     detail={canonicalDetail}
+                    recordedProgress={recordedProgressContent}
                     onBulkInformationalDisclosureChange={open => {
                       setTechnicalDisclosure(open)
                       if (savedOverrides) setRunChangesDisclosure(open)
                     }}
                   />
                   : <>
-                    <dl className="run-scan-summary">
-                      <div><dt>Project</dt><dd className="mono">{projectId}</dd></div>
-                      <div><dt>Worker / reviewer</dt><dd>{runActorSummary(lastExecuted)}</dd></div>
-                      <div><dt>Elapsed / completion</dt><dd><LiveRunTiming run={selectedRun} /></dd></div>
-                    </dl>
-                    <dl className="run-progress-strip">
-                      {selectedRun.workflow_name && <div><dt>Workflow</dt><dd>{formatMachineLabel(selectedRun.workflow_name)}</dd></div>}
-                      <div><dt>Team</dt><dd>{selectedRun.team ? formatMachineLabel(selectedRun.team) : 'Not recorded'}</dd></div>
-                      <div><dt>Max turns</dt><dd>{selectedRun.max_turns ?? 'Not reported'}</dd></div>
-                      {lastExecuted && <div><dt>Last executed</dt><dd>{lastExecuted.turnNumber !== null ? `turn ${lastExecuted.turnNumber}` : 'Not reported'}</dd></div>}
-                      {startTime ? <div><dt>Started</dt><dd>{timestamp(startTime)}<LiveRunElapsed run={selectedRun} label={selectedRunIsActive ? 'running for' : 'duration'} /></dd></div>
-                        : selectedRun.evidence.manifest_created_at ? <div><dt>Submitted</dt><dd>{timestamp(selectedRun.evidence.manifest_created_at)}</dd></div> : null}
-                      {selectedRun.ended_at && <div><dt>Ended</dt><dd>{timestamp(selectedRun.ended_at)}</dd></div>}
-                    </dl>
+                    {(recordedProgressContent || checkpoints) && <details className="checkpoint-history-disclosure run-legacy-progress-disclosure">
+                      <summary>Recorded progress</summary>
+                      {recordedProgressContent}
+                      <dl className="run-scan-summary">
+                        <div><dt>Project</dt><dd className="mono">{projectId}</dd></div>
+                        <div><dt>Worker / reviewer</dt><dd>{runActorSummary(lastExecuted)}</dd></div>
+                        <div><dt>Elapsed / completion</dt><dd><LiveRunTiming run={selectedRun} /></dd></div>
+                      </dl>
+                      <dl className="run-progress-strip">
+                        {selectedRun.workflow_name && <div><dt>Workflow</dt><dd>{formatMachineLabel(selectedRun.workflow_name)}</dd></div>}
+                        <div><dt>Team</dt><dd>{selectedRun.team ? formatMachineLabel(selectedRun.team) : 'Not recorded'}</dd></div>
+                        <div><dt>Max turns</dt><dd>{selectedRun.max_turns ?? 'Not reported'}</dd></div>
+                        {lastExecuted && <div><dt>Last executed</dt><dd>{lastExecuted.turnNumber !== null ? `turn ${lastExecuted.turnNumber}` : 'Not reported'}</dd></div>}
+                        {startTime ? <div><dt>Started</dt><dd>{timestamp(startTime)}<LiveRunElapsed run={selectedRun} label={selectedRunIsActive ? 'running for' : 'duration'} /></dd></div>
+                          : selectedRun.evidence.manifest_created_at ? <div><dt>Submitted</dt><dd>{timestamp(selectedRun.evidence.manifest_created_at)}</dd></div> : null}
+                        {selectedRun.ended_at && <div><dt>Ended</dt><dd>{timestamp(selectedRun.ended_at)}</dd></div>}
+                      </dl>
+                    </details>}
                   </>}
               </div>
               {canCreateFollowup && <section className="dashboard-section followup-draft-action" aria-label="Create follow-up draft">

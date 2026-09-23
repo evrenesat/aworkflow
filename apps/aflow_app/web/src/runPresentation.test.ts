@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest'
 import type { GuidedFormProjection, RunEvent, RunProgressCount, RunProgressSummary, RunStatus } from './types'
 import {
   checkpointApprovalText,
+  deliveryIssueText,
   executionDuration,
   formatLocalTimestamp,
   launchTeamFamilyGroups,
@@ -15,6 +16,8 @@ import {
   presentRunEvent,
   progressHistoryNotice,
   runCurrentWorkText,
+  runEventFacts,
+  runExecutorFacts,
   runActivityText,
   runFinishText,
   runPlanDisplayName,
@@ -221,6 +224,33 @@ describe('run overview presentation', () => {
     expect(presentRunEvent(event(10, 'run_failed')).summary).toBe('Failure reason unavailable.')
     expect(presentRunEvent(event(11, 'owner_stopped')).summary).toBe('Stop reason unavailable.')
     expect(presentRunEvent(event(12, 'run_completed')).summary).toBe('Recorded result unavailable.')
+  })
+
+  it('omits lifecycle noise when meaningful work evidence is available', () => {
+    const events = [
+      event(1, 'run_started'),
+      event(2, 'daemon_unit_started'),
+      event(3, 'status_changed', { status: 'running' }),
+      event(4, 'heartbeat'),
+      event(5, 'turn_started', { step_name: 'implement', step_role: 'worker', turn_number: 2 }),
+      event(6, 'review_rejected', { step_name: 'review', step_role: 'reviewer', turn_number: 3, reason: 'Needs a repair' }),
+    ]
+
+    expect(meaningfulRunEvents(events).map(item => item.sequence)).toEqual([6, 5])
+    expect(runEventFacts(events[4])).toEqual(['Implement', 'Worker', 'turn 2'])
+    expect(presentRunEvent(events[4])).toMatchObject({ recordedAt: '12:05 PM', hasPayload: true })
+  })
+
+  it('keeps executor facts and delivery failures concise', () => {
+    expect(runExecutorFacts({
+      role: 'reviewer', team: 'full', selector: 'codex.review', harness: 'codex', model: 'gpt-5', model_display: 'GPT-5', effort: 'high',
+      source_run_id: 'run-1', invocation_id: 'inv-1', turn_number: 4, started_at: null, ended_at: null, duration_seconds: null,
+    })).toEqual(['Reviewer', 'Full', 'GPT-5', 'turn 4'])
+    expect(deliveryIssueText([
+      { stage: 'ci', status: 'unknown', recorded_at: null, reason: 'No receipt', source_reference: null },
+      { stage: 'publish', status: 'failed', recorded_at: '2026-09-12T12:00:00Z', reason: 'push rejected', source_reference: null },
+    ])).toBe('Publish failed — push rejected')
+    expect(deliveryIssueText([{ stage: 'ci', status: 'unknown', recorded_at: null, reason: null, source_reference: null }])).toBeNull()
   })
 })
 

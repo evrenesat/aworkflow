@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from 'react'
+import { useEffect, useMemo, useState, type ReactNode } from 'react'
 import type {
   RunProgressChange,
   RunProgressCount,
@@ -30,10 +30,11 @@ interface CheckpointHistoryProps {
   run: RunStatus
   progress: RunProgressSummary | null
   detail: RunProgressDetail | null
+  recordedProgress?: ReactNode
   onBulkInformationalDisclosureChange?: (open: boolean) => void
 }
 
-type HistoryDisclosureKey = 'checkpoints' | 'changes' | 'delivery' | 'time' | 'evidence' | 'runDetails'
+type HistoryDisclosureKey = 'checkpoints' | 'changes' | 'delivery' | 'time' | 'evidence'
 
 interface HistoryDisclosureState {
   open: Record<HistoryDisclosureKey, boolean>
@@ -48,7 +49,6 @@ function initialHistoryDisclosureState(): HistoryDisclosureState {
       delivery: false,
       time: false,
       evidence: false,
-      runDetails: false,
     },
     openEventIds: new Set(),
   }
@@ -113,13 +113,13 @@ function countValue(count: RunProgressCount | null | undefined): number | null {
 
 function countText(count: RunProgressCount | null | undefined, singular: string, plural: string): string {
   const value = countValue(count)
-  if (value === null) return `Unknown ${plural}`
+  if (value === null) return '-'
   return `${count?.coverage === 'partial' ? 'At least ' : ''}${value} ${value === 1 ? singular : plural}`
 }
 
 function countShort(count: RunProgressCount | null | undefined): string {
   const value = countValue(count)
-  if (value === null) return 'Unknown'
+  if (value === null) return '-'
   return `${count?.coverage === 'partial' ? '≥' : ''}${value}`
 }
 
@@ -757,28 +757,6 @@ function deliveryStageLabel(value: string): string {
   return DELIVERY_SUMMARY_STAGES.find(stage => stage.key === key)?.label ?? formatMachineLabel(value)
 }
 
-function deliveryStageStatus(stages: RunProgressDeliveryStage[], key: string): string {
-  const matching = stages.filter(stage => deliveryStageKey(stage.stage) === key)
-  if (matching.length === 0) return 'Not reported'
-  const statuses = [...new Set(matching.map(stage => stage.status))]
-  return statuses.length === 1 ? formatMachineLabel(statuses[0]) : 'Conflicting evidence'
-}
-
-function DeliverySummary({ stages, onDetails }: { stages: RunProgressDeliveryStage[] | null; onDetails: () => void }): JSX.Element {
-  if (stages === null) return <p className="checkpoint-history-delivery-summary"><strong>Delivery</strong> Evidence not loaded</p>
-  const known = DELIVERY_SUMMARY_STAGES
-    .filter(stage => stages.some(candidate => deliveryStageKey(candidate.stage) === stage.key))
-    .map(stage => `${stage.label}: ${deliveryStageStatus(stages, stage.key)}`)
-  const other = stages
-    .filter(stage => deliveryStageKey(stage.stage) === null)
-    .map(stage => `${deliveryStageLabel(stage.stage)}: ${formatMachineLabel(stage.status)}`)
-  const summary = known.concat(other)
-  return <div className="checkpoint-history-delivery-summary">
-    <span><strong>Delivery</strong> {summary.length > 0 ? summary.join(' · ') : 'Evidence not reported'}</span>
-    {summary.length > 0 && <a href="#checkpoint-history-delivery-evidence" onClick={onDetails}>View detailed receipts</a>}
-  </div>
-}
-
 function DeliveryDisclosure({ stages }: { stages: RunProgressDeliveryStage[] }): JSX.Element {
   return <section>
     <h6>Delivery stages</h6>
@@ -921,79 +899,18 @@ function CheckpointDetail({
   </div>
 }
 
-function RunProgressDetails({
+function EvidenceDisclosure({
   run,
   progress,
-  runElapsed,
-  delivery,
-  onDeliveryDetails,
-  runDetailsOpen,
-  onRunDetailsChange,
-}: {
-  run: RunStatus
-  progress: RunProgressSummary
-  runElapsed: string | null
-  delivery: RunProgressDeliveryStage[] | null
-  onDeliveryDetails: () => void
-  runDetailsOpen: boolean
-  onRunDetailsChange: (open: boolean) => void
-}): JSX.Element {
-  const terminalInactive = isTerminalInactiveRun(run)
-  const currentExecutor = progress.current_executor
-  const currentAttempt = currentExecutor
-    ? [currentExecutor.turn_number !== null ? `turn ${currentExecutor.turn_number}` : null, formatDuration(currentExecutor.duration_seconds)].filter(Boolean).join(' · ')
-    : null
-  const activity = trimmed(progress.activity) || trimmed(progress.phase) || trimmed(progress.run_status)
-  const finish = runFinishText(run)
-  const notice = progressHistoryNotice(progress)
-
-  return <>
-    <dl className="checkpoint-history-at-a-glance">
-      <div><dt>Checkpoint result</dt><dd>{checkpointApprovalText(progress)}</dd></div>
-      <div><dt>Turns</dt><dd>{runTurnBudgetText(run)}</dd></div>
-      <div><dt>Elapsed</dt><dd>{runElapsed ?? '-'}</dd></div>
-      {terminalInactive
-        ? <div><dt>Finished</dt><dd>{finish ?? '-'}</dd></div>
-        : <div><dt>Evidence state</dt><dd>{activity ? formatMachineLabel(activity) : 'Active progress'}</dd></div>}
-    </dl>
-    <DeliverySummary stages={delivery} onDetails={onDeliveryDetails} />
-    {notice && <p className="notice" role="status">{notice}</p>}
-    <details
-      className="checkpoint-history-disclosure checkpoint-history-run-details"
-      open={runDetailsOpen}
-      onToggle={event => onRunDetailsChange(event.currentTarget.open)}
-    >
-      <summary>Details</summary>
-      <dl className="checkpoint-history-summary">
-        <div><dt>Availability</dt><dd>{availabilityText(progress.availability)}</dd></div>
-        <div><dt>Recorded complete</dt><dd>{countText(progress.recorded_complete_checkpoints, 'checkpoint', 'checkpoints')}</dd></div>
-        <div><dt>Worker attempts</dt><dd>{countText(progress.worker_attempts, 'attempt', 'attempts')}</dd></div>
-        <div><dt>Repair passes</dt><dd>{countText(progress.repair_passes, 'repair pass', 'repair passes')}</dd></div>
-        <div><dt>Reviews</dt><dd>{countText(progress.reviews, 'review', 'reviews')}</dd></div>
-        <div><dt>Runtime retries</dt><dd>{countText(progress.runtime_retries, 'runtime retry', 'runtime retries')}</dd></div>
-        <div><dt>Applied upgrades</dt><dd>{countText(progress.applied_upgrades, 'upgrade', 'upgrades')}</dd></div>
-        <div><dt>Turn budget</dt><dd>{runTurnBudgetText(run)}</dd></div>
-        {!terminalInactive && <>
-          <div><dt>Checkpoint position</dt><dd>{positionText(progress)}</dd></div>
-          {activity && <div><dt>Run activity</dt><dd>{formatMachineLabel(activity)}</dd></div>}
-          <ExecutorRow label="Current executor" executor={currentExecutor} runId={run.run_id} />
-          {currentExecutor && currentAttempt && <div><dt>Current attempt</dt><dd>{currentAttempt}</dd></div>}
-        </>}
-        <ExecutorRow label="Last executor" executor={progress.last_executor} runId={run.run_id} />
-        {progress.reason_codes.length > 0 && <div><dt>Reason codes</dt><dd>{progress.reason_codes.join(', ')}</dd></div>}
-      </dl>
-    </details>
-  </>
-}
-
-function EvidenceDisclosure({
-  progress,
   detail,
+  recordedProgress,
   open,
   onOpenChange,
 }: {
+  run: RunStatus
   progress: RunProgressSummary
   detail: RunProgressDetail | null
+  recordedProgress?: ReactNode
   open: boolean
   onOpenChange: (open: boolean) => void
 }): JSX.Element {
@@ -1012,11 +929,46 @@ function EvidenceDisclosure({
   const evidenceTimestamp = progress.evidence_at ? Date.parse(progress.evidence_at) : NaN
   const evidenceIsStale = Number.isFinite(evidenceTimestamp) && Date.now() - evidenceTimestamp > 15 * 60 * 1000
   const evidenceTimestampInvalid = Boolean(progress.evidence_at) && !Number.isFinite(evidenceTimestamp)
+  const terminalInactive = isTerminalInactiveRun(run)
+  const currentExecutor = progress.current_executor
+  const currentAttempt = currentExecutor
+    ? [currentExecutor.turn_number !== null ? `turn ${currentExecutor.turn_number}` : null, formatDuration(currentExecutor.duration_seconds)].filter(Boolean).join(' · ')
+    : null
+  const activity = trimmed(progress.activity) || trimmed(progress.phase) || trimmed(progress.run_status)
+  const finish = runFinishText(run)
+  const notice = progressHistoryNotice(progress)
   return <details className="checkpoint-history-disclosure" open={open} onToggle={event => onOpenChange(event.currentTarget.open)}>
     <summary>Count definitions &amp; evidence</summary>
+    <dl className="checkpoint-history-at-a-glance">
+      <div><dt>Checkpoint result</dt><dd>{checkpointApprovalText(progress)}</dd></div>
+      <div><dt>Turns</dt><dd>{runTurnBudgetText(run)}</dd></div>
+      <div><dt>Elapsed</dt><dd>{executionDuration(run, Date.now()) ?? '-'}</dd></div>
+      {terminalInactive
+        ? <div><dt>Finished</dt><dd>{finish ?? '-'}</dd></div>
+        : <div><dt>Evidence state</dt><dd>{activity ? formatMachineLabel(activity) : 'Active progress'}</dd></div>}
+    </dl>
+    {recordedProgress && <section className="checkpoint-history-recorded-progress">
+      <h6>Recorded progress</h6>
+      {recordedProgress}
+    </section>}
     <p>Counts come from the bounded canonical evidence projection. Partial values are lower bounds; unavailable values are not zero.</p>
+    {notice && <p className="notice" role="status">{notice}</p>}
     <dl className="checkpoint-history-evidence-meta">
       <div><dt>Availability</dt><dd>{availabilityText(progress.availability)}</dd></div>
+      <div><dt>Recorded complete</dt><dd>{countText(progress.recorded_complete_checkpoints, 'checkpoint', 'checkpoints')}</dd></div>
+      <div><dt>Worker attempts</dt><dd>{countText(progress.worker_attempts, 'attempt', 'attempts')}</dd></div>
+      <div><dt>Repair passes</dt><dd>{countText(progress.repair_passes, 'repair pass', 'repair passes')}</dd></div>
+      <div><dt>Reviews</dt><dd>{countText(progress.reviews, 'review', 'reviews')}</dd></div>
+      <div><dt>Runtime retries</dt><dd>{countText(progress.runtime_retries, 'runtime retry', 'runtime retries')}</dd></div>
+      <div><dt>Applied upgrades</dt><dd>{countText(progress.applied_upgrades, 'upgrade', 'upgrades')}</dd></div>
+      <div><dt>Turn budget</dt><dd>{runTurnBudgetText(run)}</dd></div>
+      {!terminalInactive && <>
+        <div><dt>Checkpoint position</dt><dd>{positionText(progress)}</dd></div>
+        {activity && <div><dt>Run activity</dt><dd>{formatMachineLabel(activity)}</dd></div>}
+        <ExecutorRow label="Current executor" executor={currentExecutor} runId={run.run_id} />
+        {currentExecutor && currentAttempt && <div><dt>Current attempt</dt><dd>{currentAttempt}</dd></div>}
+      </>}
+      <ExecutorRow label="Last executor" executor={progress.last_executor} runId={run.run_id} />
       {formatTimestamp(progress.observed_at) && <div><dt>Observed</dt><dd>{formatTimestamp(progress.observed_at)}</dd></div>}
       {formatTimestamp(progress.evidence_at) && <div><dt>Latest evidence</dt><dd>{formatTimestamp(progress.evidence_at)}</dd></div>}
       {evidenceAge && <div><dt>Evidence age</dt><dd>{evidenceAge}</dd></div>}
@@ -1033,7 +985,7 @@ function EvidenceDisclosure({
   </details>
 }
 
-export function CheckpointHistory({ projectId, run, progress, detail, onBulkInformationalDisclosureChange }: CheckpointHistoryProps): JSX.Element {
+export function CheckpointHistory({ projectId, run, progress, detail, recordedProgress, onBulkInformationalDisclosureChange }: CheckpointHistoryProps): JSX.Element {
   const summary = progress ?? detail
   const runKey = `${projectId}/${run.run_id}`
   const detailEvents = useMemo(() => uniqueEvents(detail?.events ?? []), [detail?.events])
@@ -1103,7 +1055,6 @@ export function CheckpointHistory({ projectId, run, progress, detail, onBulkInfo
   const selectionIsCurrent = selection.runKey === runKey
   const selectedEntryKey = selectionIsCurrent ? selection.key : null
   const selectedEntry = entries.find(entry => entry.key === selectedEntryKey) ?? null
-  const runElapsed = executionDuration(run, Date.now())
   const terminalInactive = isTerminalInactiveRun(run)
   const disclosureState = disclosureStates[runKey] ?? initialHistoryDisclosureState()
   const deliveryRelevant = detail !== null && (
@@ -1149,7 +1100,6 @@ export function CheckpointHistory({ projectId, run, progress, detail, onBulkInfo
             delivery: open && deliveryRelevant,
             time: open,
             evidence: open,
-            runDetails: open,
           },
           openEventIds: open ? new Set(detailEvents.map(event => event.event_id)) : new Set(),
         },
@@ -1178,22 +1128,6 @@ export function CheckpointHistory({ projectId, run, progress, detail, onBulkInfo
 
   const detailAvailable = detail !== null
   return <section className="checkpoint-history" aria-label="Checkpoint history">
-    <div className="section-heading checkpoint-history-heading">
-      <div>
-        <h4>Checkpoint progress</h4>
-        <p className="text-xs text-dim">{checkpointApprovalText(summary)} · {terminalInactive ? runFinishText(run) ?? 'Finished' : positionText(summary)}</p>
-      </div>
-      <span className="status-pill">{availabilityText(summary.availability)}</span>
-    </div>
-    <RunProgressDetails
-      run={run}
-      progress={summary}
-      runElapsed={runElapsed}
-      delivery={detail?.delivery ?? null}
-      onDeliveryDetails={() => updateDisclosure('delivery', true)}
-      runDetailsOpen={disclosureState.open.runDetails}
-      onRunDetailsChange={open => updateDisclosure('runDetails', open)}
-    />
     {selectionIsCurrent && selection.notice && <p className="notice" role="status">{selection.notice}</p>}
     {!detailAvailable && <p className="notice" role="status">Detailed checkpoint history is loading or unavailable; summary facts remain from the selected-run record.</p>}
     {detailAvailable && <>
@@ -1204,6 +1138,7 @@ export function CheckpointHistory({ projectId, run, progress, detail, onBulkInfo
       </div>
       <details
         className="checkpoint-history-disclosure checkpoint-history-checkpoints"
+        data-ui-fidelity-anchor="first-disclosure"
         open={disclosureState.open.checkpoints}
         onToggle={event => updateDisclosure('checkpoints', event.currentTarget.open)}
       >
@@ -1241,37 +1176,39 @@ export function CheckpointHistory({ projectId, run, progress, detail, onBulkInfo
         </div>
       </details>
     </>}
-    {detail && <div className="checkpoint-history-disclosures">
-      <details
-        className="checkpoint-history-disclosure"
-        open={disclosureState.open.changes}
-        onToggle={event => updateDisclosure('changes', event.currentTarget.open)}
-      >
-        <summary>Run settings &amp; changes</summary>
-        <ChangeDisclosure title="Applied changes" changes={detail.applied_changes ?? []} emptyText="No applied team/profile changes were returned." />
-        <ChangeDisclosure title="Pending changes" changes={detail.pending_changes ?? []} emptyText="No pending team/profile changes were returned." />
-      </details>
-      {deliveryRelevant && <details
-        id="checkpoint-history-delivery-evidence"
-        className="checkpoint-history-disclosure"
-        open={disclosureState.open.delivery}
-        onToggle={event => updateDisclosure('delivery', event.currentTarget.open)}
-      >
-        <summary>Delivery evidence</summary>
-        <DeliveryDisclosure stages={detail.delivery ?? []} />
-      </details>}
-      <TimeDisclosure
-        run={run}
-        detail={detail}
-        open={disclosureState.open.time}
-        onOpenChange={open => updateDisclosure('time', open)}
-      />
+    <div className="checkpoint-history-disclosures">
+      {detail && <details
+          className="checkpoint-history-disclosure"
+          open={disclosureState.open.changes}
+          onToggle={event => updateDisclosure('changes', event.currentTarget.open)}
+        >
+          <summary>Run settings &amp; changes</summary>
+          <ChangeDisclosure title="Applied changes" changes={detail.applied_changes ?? []} emptyText="No applied team/profile changes were returned." />
+          <ChangeDisclosure title="Pending changes" changes={detail.pending_changes ?? []} emptyText="No pending team/profile changes were returned." />
+        </details>}
+      {deliveryRelevant && detail && <details
+          id="checkpoint-history-delivery-evidence"
+          className="checkpoint-history-disclosure"
+          open={disclosureState.open.delivery}
+          onToggle={event => updateDisclosure('delivery', event.currentTarget.open)}
+        >
+          <summary>Delivery evidence</summary>
+          <DeliveryDisclosure stages={detail.delivery ?? []} />
+        </details>}
+      {detail && <TimeDisclosure
+          run={run}
+          detail={detail}
+          open={disclosureState.open.time}
+          onOpenChange={open => updateDisclosure('time', open)}
+        />}
       <EvidenceDisclosure
+        run={run}
         progress={summary}
         detail={detail}
+        recordedProgress={recordedProgress}
         open={disclosureState.open.evidence}
         onOpenChange={open => updateDisclosure('evidence', open)}
       />
-    </div>}
+    </div>
   </section>
 }

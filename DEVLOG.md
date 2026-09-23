@@ -1,5 +1,24 @@
 # DEVLOG
 
+## 2026-09-23 — Reorder deployed Runs detail around current work (Checkpoint 1)
+
+- The Runs detail overview now leads with the readable run identity, truthful
+  status/timing, current task and recorded executor facts, then an actual latest
+  result and three meaningful timestamped activity events. Lifecycle noise,
+  empty result/payload placeholders, expected future delivery states and the
+  duplicate compatibility block are omitted from the default view without
+  removing their recorded evidence.
+- Checkpoint history, delivery receipts, time details, counts and compatibility
+  progress are closed named disclosures. Expand all retains checkpoint selection,
+  exposes the full evidence, and sends no operational writes. Adjust run and
+  restart-admission detail stay behind their existing labelled action paths.
+- Added component/presentation regressions and the populated ten-checkpoint
+  `run_detail` browser fixture. Chromium and WebKit light/dark desktop/mobile
+  captures were inspected against the frozen reference; the reference remains
+  byte-identical. This checkpoint changes Runs presentation only; Settings,
+  launch cancellation, request replay and the shared editable runtime remain
+  outside its scope. Publication, CI and live activation remain coordinator-owned.
+
 ## 2026-09-23 — Consume complete credentials in fidelity diagnostics
 
 - Python failure-text and browser alert scrubbers now consume the complete
