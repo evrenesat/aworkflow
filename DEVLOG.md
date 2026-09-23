@@ -1,5 +1,44 @@
 # DEVLOG
 
+## 2026-09-23 — Consume complete credentials in fidelity diagnostics
+
+- Python failure-text and browser alert scrubbers now consume the complete
+  value after `Authorization`/auth markers, including optional `Bearer` or
+  `Basic` schemes, while retaining the bounded long-token fallback. Snapshot
+  size limits and the existing artifact routing are unchanged.
+- A focused browser regression covers short bearer, token, cookie, password,
+  secret, and long-token values in both representations without exposing the
+  synthetic values. The regression passed in Chromium and WebKit.
+- Validation after the repair: web tests 568/568, production build passed,
+  and the authenticated built-app fixture passed 5/5 in Chromium and 5/5 in
+  WebKit. The combined WebKit gate reached 56 passed with one unrelated,
+  transient phone live-controls timeout; its isolated rerun passed 1/1.
+
+## 2026-09-23 — Make real-app fidelity readiness deterministic
+
+- The populated fidelity fixture now points project readiness at the valid
+  disposable control-plane configuration pair already created by
+  `control_client`. A clean CI home previously rendered the truthful
+  configuration-required notice at y=128 and displaced the dashboard host to
+  y=219; the fixture now exercises the same ready state on every host without
+  hiding or changing production warnings. The desktop `<=128` assertion and
+  all existing themes, variants, widths, and anchor limits remain unchanged.
+- Before that assertion, the real app now waits for `document.fonts.ready` and
+  two render frames, then retains one bounded failure snapshot containing
+  semantic/header geometry, rendered notices/alerts, scroll/focus, font state,
+  configuration signals, and computed styles. Failure JSON and a viewport PNG
+  use `AFLOW_BROWSER_ARTIFACT_DIR` (CI path:
+  `artifacts/responsive-browser/ui-demo-fidelity-*-failure.{json,png}`), fall
+  back to pytest `tmp_path` locally, and redact token-like text.
+- Validation on Linux `codex`, source baseline `e7f4643005cf6bac5ad1d0883a81375c7aa45ae3` plus this uncommitted patch:
+  web tests 568/568; build passed; Chromium fixture 5/5; WebKit fixture 5/5;
+  full server suite 458 passed. The combined WebKit responsive/fidelity gate
+  reached 55 passed but failed the pre-existing CP8 `desktop-light` case, and
+  its focused rerun failed identically with preflight status `loading`; CP8
+  was not changed. Disposable failure probes wrote the JSON/PNG pair under
+  `/tmp/aflow-fidelity-readiness.QrvZPp` and verified the expected y=219
+  warning evidence and redaction. Coordinator CI remains required.
+
 ## 2026-09-23 — Retain Teams geometry failure artifacts in CI
 
 - Teams geometry failures now select `AFLOW_BROWSER_ARTIFACT_DIR` when CI

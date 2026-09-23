@@ -3,12 +3,13 @@
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 import re
 from urllib.parse import urlsplit
 
 import pytest
-from playwright.sync_api import expect, sync_playwright
+from playwright.sync_api import Error as PlaywrightError, expect, sync_playwright
 
 from aflow.control_plane.units import InMemoryUnitManager, UnitState
 from test_control_plane_api import PROJECT_ID, control_client, live_server  # noqa: F401
@@ -206,6 +207,320 @@ def _write_artifact_manifest(path: Path, payload: dict[str, object]) -> None:
     print("AFLOW_UI_DEMO_FIDELITY_ARTIFACT", path)
 
 
+_FIDELITY_DIAGNOSTIC_STYLE_PROPERTIES = (
+    "display",
+    "visibility",
+    "position",
+    "top",
+    "height",
+    "minHeight",
+    "paddingTop",
+    "paddingBottom",
+    "marginTop",
+    "marginBottom",
+    "gap",
+    "overflow",
+    "overflowY",
+    "flexDirection",
+    "flexWrap",
+    "alignItems",
+    "boxSizing",
+    "fontFamily",
+    "fontSize",
+    "lineHeight",
+)
+
+_FIDELITY_CREDENTIAL_REDACTION_PATTERN = (
+    r"(?i)(?:"
+    r"\b(?:authorization|auth(?:entication)?|token|password|secret|cookie)\b"
+    r"\s*[:=]?\s*(?:(?:bearer|basic)\s+)?\S+"
+    r"|\bbearer\b\s*[:=]?\s*\S+)"
+)
+
+
+def _redact_fidelity_text(value: object, *, limit: int = 1200) -> str:
+    """Keep failure messages useful without copying credentials into artifacts."""
+    text = str(value)
+    for pattern in (
+        _FIDELITY_CREDENTIAL_REDACTION_PATTERN,
+        r"\b[A-Za-z0-9_-]{32,}\b",
+    ):
+        text = re.sub(pattern, "[redacted]", text)
+    return text if len(text) <= limit else f"{text[:limit]}…"
+
+
+def _fidelity_artifact_dir(tmp_path: Path) -> Path:
+    configured = os.environ.get("AFLOW_BROWSER_ARTIFACT_DIR", "").strip()
+    return Path(configured) if configured else tmp_path
+
+
+def _prepare_disposable_fidelity_config(root: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Make project readiness use the control fixture's valid config pair."""
+    config_path = root.parent / "global" / "aflow.toml"
+    workflows_path = config_path.with_name("workflows.toml")
+    assert config_path.is_file()
+    assert workflows_path.is_file()
+
+    # The control fixture already supplies this pair to the daemon.  The
+    # project-list readiness projection uses aflow.config's default lookup,
+    # which otherwise depends on the host HOME and can add a real warning to
+    # the captured app only on clean CI workers.
+    import aflow.config as aflow_config
+
+    monkeypatch.setattr(aflow_config, "_config_path", lambda: config_path)
+    assert aflow_config.project_configuration_state() == "ready"
+
+
+def _wait_for_fidelity_readiness(page) -> None:
+    """Wait for font readiness and two render frames without a fixed sleep."""
+    page.evaluate(
+        """() => new Promise(resolve => {
+          const settle = () => requestAnimationFrame(() => requestAnimationFrame(resolve));
+          if (document.fonts && document.fonts.status === 'loading') {
+            document.fonts.ready.then(settle, settle);
+          } else {
+            settle();
+          }
+        })"""
+    )
+
+
+def _capture_fidelity_failure_snapshot(page, capture: dict[str, object]) -> dict[str, object]:
+    """Capture one bounded DOM state before the production geometry assertion."""
+    selectors = {
+        "app_shell": ".app-shell",
+        "app_header": ".app-header",
+        "header_row_one": ".app-header-row-one",
+        "header_row_two": ".app-header-row-two",
+        "workspace_main": ".workspace-main",
+        "workspace_content": ".workspace-main > .workspace-content",
+        "dashboard_host": ".workspace-main > .dashboard-host",
+        "readiness_notice": ".workspace-main > .notice[role='note']",
+        "run_detail": ".run-detail",
+        "progress_surface": PRODUCTION_PROGRESS_SURFACE,
+        **PRODUCTION_ANCHORS,
+    }
+    context = {
+        "fixture_variant": capture["fixture_variant"],
+        "status": capture["status"],
+        "width": capture["width"],
+        "height": capture["height"],
+        "theme": capture["theme"],
+        "browser": os.environ.get("AFLOW_TEST_BROWSER", "chromium").strip().lower(),
+    }
+    page_errors = capture.get("page_errors")
+    if isinstance(page_errors, list):
+        context["page_errors"] = [_redact_fidelity_text(error, limit=400) for error in page_errors]
+    return page.evaluate(
+        r"""({selectors, context, styleProperties}) => {
+          const rect = element => {
+            if (!(element instanceof Element)) return null;
+            const box = element.getBoundingClientRect();
+            return {
+              x: box.x, y: box.y, width: box.width, height: box.height,
+              top: box.top, right: box.right, bottom: box.bottom, left: box.left,
+            };
+          };
+          const style = element => {
+            if (!(element instanceof Element)) return null;
+            const computed = getComputedStyle(element);
+            return Object.fromEntries(styleProperties.map(property => [property, computed[property]]));
+          };
+          const visible = element => {
+            if (!(element instanceof Element)) return false;
+            const computed = getComputedStyle(element);
+            const box = element.getBoundingClientRect();
+            return computed.display !== 'none'
+              && computed.visibility !== 'hidden'
+              && box.width > 0
+              && box.height > 0;
+          };
+          const node = (selector, element) => ({
+            selector,
+            present: Boolean(element),
+            visible: visible(element),
+            rect: rect(element),
+            styles: style(element),
+            scroll: element instanceof Element ? {
+              top: element.scrollTop,
+              left: element.scrollLeft,
+              height: element.scrollHeight,
+              width: element.scrollWidth,
+            } : null,
+          });
+          const nodes = Object.fromEntries(Object.entries(selectors).map(([name, selector]) => {
+            const matches = [...document.querySelectorAll(selector)];
+            return [name, {
+              selector,
+              matchCount: matches.length,
+              matches: matches.slice(0, 8).map(element => node(selector, element)),
+            }];
+          }));
+          const redactText = value => String(value || '')
+            .replace(/(?:\b(?:authorization|auth(?:entication)?|token|password|secret|cookie)\b\s*[:=]?\s*(?:(?:bearer|basic)\s+)?\S+|\bbearer\b\s*[:=]?\s*\S+)/gi, '[redacted]')
+            .replace(/\b[A-Za-z0-9_-]{32,}\b/g, '[redacted]')
+            .slice(0, 240);
+          const alertElements = [...document.querySelectorAll(
+            '[role="alert"], [role="alertdialog"], [role="status"], [role="note"], .notice'
+          )];
+          const alerts = [...new Set(alertElements)].slice(0, 16).map(element => ({
+            role: element.getAttribute('role'),
+            className: String(element.className || ''),
+            text: redactText(element.textContent),
+            visible: visible(element),
+            rect: rect(element),
+            styles: style(element),
+          }));
+          const scrollingElement = document.scrollingElement;
+          const active = document.activeElement;
+          return {
+            context,
+            readyState: document.readyState,
+            viewport: {
+              innerWidth: window.innerWidth,
+              innerHeight: window.innerHeight,
+              devicePixelRatio: window.devicePixelRatio,
+              visual: window.visualViewport ? {
+                width: window.visualViewport.width,
+                height: window.visualViewport.height,
+                offsetLeft: window.visualViewport.offsetLeft,
+                offsetTop: window.visualViewport.offsetTop,
+                scale: window.visualViewport.scale,
+              } : null,
+            },
+            scroll: {
+              windowX: window.scrollX,
+              windowY: window.scrollY,
+              documentTop: scrollingElement?.scrollTop ?? null,
+              documentHeight: scrollingElement?.scrollHeight ?? null,
+              documentClientHeight: scrollingElement?.clientHeight ?? null,
+              bodyHeight: document.body?.scrollHeight ?? null,
+            },
+            focus: active ? {
+              tag: active.tagName,
+              id: active.id,
+              className: String(active.className || ''),
+              role: active.getAttribute('role'),
+              ariaLabel: active.getAttribute('aria-label'),
+            } : null,
+            fonts: {
+              status: document.fonts?.status ?? null,
+              count: document.fonts?.size ?? null,
+              sansReady: document.fonts ? document.fonts.check('16px sans-serif') : null,
+            },
+            configuration: {
+              theme: document.documentElement.getAttribute('data-theme'),
+              prefersDark: window.matchMedia('(prefers-color-scheme: dark)').matches,
+              readyState: document.readyState,
+              viewportMeta: document.querySelector('meta[name="viewport"]')?.getAttribute('content') ?? null,
+            },
+            nodes,
+            alerts,
+          };
+        }""",
+        {
+            "selectors": selectors,
+            "context": context,
+            "styleProperties": _FIDELITY_DIAGNOSTIC_STYLE_PROPERTIES,
+        },
+    )
+
+
+def _write_fidelity_failure_artifacts(
+    page,
+    *,
+    tmp_path: Path,
+    capture: dict[str, object],
+    snapshot: dict[str, object],
+    error: AssertionError,
+) -> None:
+    artifact_dir = _fidelity_artifact_dir(tmp_path)
+    artifact_dir.mkdir(parents=True, exist_ok=True)
+    browser = re.sub(r"[^A-Za-z0-9_.-]+", "-", str(snapshot["context"]["browser"]))
+    stem = (
+        f"ui-demo-fidelity-{capture['fixture_variant']}-{capture['theme']}"
+        f"-{capture['width']}x{capture['height']}-{browser}"
+    )
+    artifact_path = artifact_dir / f"{stem}-failure.json"
+    artifact_path.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "failure": _redact_fidelity_text(error),
+                "capture": {
+                    "fixture_variant": capture["fixture_variant"],
+                    "status": capture["status"],
+                    "width": capture["width"],
+                    "height": capture["height"],
+                    "theme": capture["theme"],
+                },
+                "snapshot": snapshot,
+            },
+            indent=2,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    screenshot_path = artifact_dir / f"{stem}-failure.png"
+    try:
+        page.screenshot(path=str(screenshot_path), full_page=False)
+    except PlaywrightError as screenshot_error:
+        print("AFLOW_UI_DEMO_FIDELITY_SCREENSHOT_ERROR", _redact_fidelity_text(screenshot_error))
+    print("AFLOW_UI_DEMO_FIDELITY_FAILURE_ARTIFACT", artifact_path)
+    print("AFLOW_UI_DEMO_FIDELITY_FAILURE_SCREENSHOT", screenshot_path)
+
+
+def test_fidelity_diagnostic_redaction_consumes_short_credentials() -> None:
+    """Both diagnostic representations remove complete short credentials."""
+    credential_values = (
+        "short-bearer",
+        "short-token",
+        "short-cookie",
+        "short-password",
+        "short-secret",
+        "short-standalone-bearer",
+        "long-" + "x" * 40,
+    )
+    diagnostic_text = (
+        "Authorization: Bearer short-bearer "
+        "token=short-token cookie=short-cookie password=short-password "
+        "secret=short-secret bearer short-standalone-bearer "
+        "long-"
+        + "x" * 40
+    )
+    python_redacted = _redact_fidelity_text(diagnostic_text)
+    assert all(value not in python_redacted for value in credential_values)
+    assert python_redacted.count("[redacted]") >= len(credential_values)
+    assert len(python_redacted) <= 1200
+
+    with sync_playwright() as playwright:
+        browser = _browser(playwright)
+        page = browser.new_page()
+        try:
+            page.set_content('<div class="notice" role="alert"></div>')
+            page.locator(".notice").evaluate(
+                "(element, value) => { element.textContent = value }",
+                diagnostic_text,
+            )
+            snapshot = _capture_fidelity_failure_snapshot(
+                page,
+                {
+                    "fixture_variant": "redaction",
+                    "status": "failed",
+                    "width": 1280,
+                    "height": 720,
+                    "theme": "light",
+                    "page_errors": [],
+                },
+            )
+            browser_redacted = "\n".join(alert["text"] for alert in snapshot["alerts"])
+            assert all(value not in browser_redacted for value in credential_values)
+            assert browser_redacted.count("[redacted]") >= len(credential_values)
+            assert all(len(alert["text"]) <= 240 for alert in snapshot["alerts"])
+        finally:
+            browser.close()
+
+
 def test_ui_demo_reference_renders_with_named_anchors(tmp_path: Path) -> None:
     """The frozen fragment opens in a real browser before product redesign work."""
     manifest = load_reference_manifest()
@@ -250,6 +565,7 @@ def test_ui_demo_fixture_captures_authenticated_built_app(
     """Capture the real built app against disposable running demo-shaped data."""
     _, root, units, _ = control_client
     fixtures = seed_demo_fidelity_fixture(root)
+    _prepare_disposable_fidelity_config(root, monkeypatch)
     assert isinstance(units, InMemoryUnitManager)
     running = fixtures["running"]
     assert isinstance(running, dict)
@@ -304,6 +620,7 @@ def test_ui_demo_fixture_captures_authenticated_built_app(
                         )
                         detail = page.locator(".run-detail:visible").first
                         detail.wait_for()
+                        _wait_for_fidelity_readiness(page)
                         expect(detail).to_contain_text(plan_name)
                         expect(detail.locator(".run-progress-header")).to_contain_text(expected_status)
                         if width >= 960 and height >= 600:
@@ -344,7 +661,19 @@ def test_ui_demo_fixture_captures_authenticated_built_app(
                             )["progress_surface"],
                             "screenshot": capture_path.name,
                         }
-                        _assert_production_capture(page, capture)
+                        failure_snapshot = _capture_fidelity_failure_snapshot(page, capture)
+                        try:
+                            expect(page.locator(".workspace-main > .notice[role='note']:visible")).to_have_count(0)
+                            _assert_production_capture(page, capture)
+                        except AssertionError as error:
+                            _write_fidelity_failure_artifacts(
+                                page,
+                                tmp_path=tmp_path,
+                                capture=capture,
+                                snapshot=failure_snapshot,
+                                error=error,
+                            )
+                            raise
                         diagnostics.click()
                         expect(detail.locator(".run-technical-details")).to_contain_text("control_plane")
                         desktop_rows = _assert_compact_run_rows(
