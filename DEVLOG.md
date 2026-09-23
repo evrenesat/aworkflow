@@ -3133,3 +3133,25 @@ HISTORY: Published clipboard history `c14f1f2`/`cd78d53` remains separate and mu
   passed, 34 deselected`; REST `7 passed, 54 deselected`; MCP `6 passed, 29
   deselected`. Production Ruff and `git diff --check` passed. The server tests
   emitted only the existing Starlette/httpx deprecation warning.
+
+## 2026-09-23 — Revocable launch confirmation (Checkpoint 1)
+
+- Defect: a final Start confirmation could continue after Cancel while its
+  committed-configuration read was held, because the async continuation could
+  retain authority and submit one start request. This was reproduced with
+  mocked/deferred component APIs; no live run was started.
+- Remedy: RunDashboard now owns a generation-scoped confirmation token and
+  synchronous in-flight lock. Review, page, project, visibility, draft and
+  unmount changes revoke it; revalidation checks it after each read and before
+  submission. NewRunPage exposes a separate read-only revalidation state so
+  Cancel remains available. Existing preflight, startup-question,
+  uncertain-result and idempotency-key paths remain intact.
+- Verification: the focused web command passed 195 tests; the full web suite
+  passed 579 tests across 28 files; and the production build passed. The
+  disposable launch-confirmation journey passed in Chromium and WebKit. The
+  combined browser gate passed 5 tests with 10 deselected in each engine; the
+  cancellation journey observed zero start POST requests and zero disposable
+  unit-manager starts after Cancel/release.
+- No deployment, publication, live activation, physical-device or full visual
+  redesign acceptance is claimed. The concurrent diagnostic helper file was
+  not changed.
