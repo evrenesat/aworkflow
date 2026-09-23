@@ -797,7 +797,7 @@ describe('App workspace shell', () => {
     await openAddedProject(/Alpha Project/)
     fireEvent.click(screen.getByRole('button', { name: 'Plans' }))
     fireEvent.click(await screen.findByRole('button', { name: /demo\.md/ }))
-    await clickHeaderMenuItem('Run this plan')
+    await clickHeaderMenuItem('Configure run…')
 
     await screen.findByRole('heading', { name: 'New run' })
     expect(push).toHaveBeenCalledWith(null, '', '/?project=alpha&view=new-run')
@@ -855,7 +855,7 @@ describe('App workspace shell', () => {
       root: '/srv/code/tools/kilo', created_at: '2026-01-01T00:00:00Z', readiness: 'configuration_required',
     })
     render(<App />)
-    expect(await screen.findByText('Available on this server')).toBeDefined()
+    expect(await screen.findByText('Find projects on this server')).toBeDefined()
     expect(screen.getByText('Added projects')).toBeDefined()
     expect(screen.getByText('tools/kilo')).toBeDefined()
     expect(screen.getByText(/Cannot be added: repository HEAD does not point to a commit/)).toBeDefined()
@@ -1204,7 +1204,7 @@ describe('App workspace shell', () => {
     // Ready-plan launch and an exact link reload.
     fireEvent.click(screen.getByRole('button', { name: 'Plans' }))
     fireEvent.click(await screen.findByRole('button', { name: /demo\.md/ }))
-    await clickHeaderMenuItem('Run this plan')
+    await clickHeaderMenuItem('Configure run…')
     await screen.findByRole('heading', { name: 'New run' })
     await waitFor(() => expect((screen.getByLabelText('Run plan') as HTMLInputElement).value).toBe('plans/in-progress/demo.md'))
   })

@@ -1075,7 +1075,7 @@ describe('GlobalSettings', () => {
     await waitFor(() => expect(screen.getAllByText(/codex\.deep/).length).toBeGreaterThan(0))
 
     fireEvent.click(screen.getByRole('button', { name: 'Stronger worker', exact: true }))
-    const childOverride = screen.getByText(/Stored override · declared by Stronger worker/).closest('.team-family-role-row') as HTMLElement
+    const childOverride = screen.getByText('Local override').closest('.team-family-role-row') as HTMLElement
     fireEvent.click(within(childOverride).getByRole('button', { name: 'Restore inheritance' }))
     await waitFor(() => expect(screen.getAllByText(/Inherited from global/).length).toBeGreaterThan(0))
     expect(screen.getAllByText(/codex\.deep/).length).toBeGreaterThan(0)
@@ -1873,5 +1873,23 @@ describe('GlobalSettings', () => {
     fireEvent.change(screen.getByLabelText('Upgrade to for team alpha-team'), { target: { value: 'beta-team' } })
     expect(screen.getAllByRole('alert').some(el => el.textContent.includes('cycle'))).toBe(true)
     expect(api.patchGlobalConfig).not.toHaveBeenCalled()
+  })
+
+  it('leads with effective assignments and keeps creation behind labelled disclosures', async () => {
+    const view = render(<GlobalSettings onDirtyChange={() => {}} onSaved={() => {}} />)
+    await screen.findByLabelText('Effort codex.worker')
+    expect(screen.getByRole('heading', { name: 'Profiles', exact: true })).toBeTruthy()
+    expect(screen.getByRole('heading', { name: 'Global roles', exact: true })).toBeTruthy()
+    const profileDisclosure = view.container.querySelector('details.settings-disclosure') as HTMLDetailsElement
+    expect(profileDisclosure.hasAttribute('open')).toBe(false)
+    profileDisclosure.setAttribute('open', '')
+    expect(profileDisclosure.hasAttribute('open')).toBe(true)
+    expect(screen.getByLabelText('New profile name')).toBeTruthy()
+
+    fireEvent.click(screen.getByRole('tab', { name: 'Teams', exact: true }))
+    const teamDisclosure = view.container.querySelector('details.team-family-disclosure') as HTMLDetailsElement
+    expect(teamDisclosure).toBeTruthy()
+    expect(teamDisclosure.hasAttribute('open')).toBe(false)
+    expect(screen.getByRole('button', { name: 'Save all changes', exact: true })).toBeTruthy()
   })
 })

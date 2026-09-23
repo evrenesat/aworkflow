@@ -17,6 +17,7 @@ from test_responsive_browser import (
     _register_responsive_worktree,
     _run_history_detail,
     _run_history_navigation,
+    _open_start_review,
     _select_settings_section,
     _set_theme_preference,
 )
@@ -363,13 +364,13 @@ def test_complete_navigation_and_launch_journeys(control_client, monkeypatch, tm
                     _assert_header_and_flow(page)
                     assert_document_contract(page)
 
-                    # Plans → Run this plan preserves the exact Ready path,
+                    # Plans → Configure run preserves the exact Ready path,
                     # resolves the workflow's default team, and accepts a
                     # keyboard-selected explicit team without changing IDs.
                     page.goto(f'{url}/?project={PROJECT_ID}&view=plans')
                     page.get_by_role('button', name='journey-ready.md', exact=False).first.click()
                     page.get_by_role('button', name='More', exact=True).click()
-                    page.get_by_role('menuitem', name='Run this plan', exact=True).click()
+                    page.get_by_role('menuitem', name='Configure run…', exact=True).click()
                     plan_input = page.get_by_label('Run plan', exact=True)
                     plan_input.wait_for()
                     expect(plan_input).to_have_value('plans/in-progress/journey-ready.md')
@@ -407,7 +408,7 @@ def test_complete_navigation_and_launch_journeys(control_client, monkeypatch, tm
                     advanced.focus()
                     advanced.press('Enter')
                     expect(page.get_by_label('Run start step', exact=True)).to_be_visible()
-                    expect(page.get_by_role('button', name='Start run', exact=True)).to_be_visible()
+                    expect(page.get_by_role('button', name='Review start…', exact=True)).to_be_visible()
                     _assert_last_action_hit_test(page)
                     _assert_document_moves(page)
                     _assert_header_and_flow(page)
@@ -637,10 +638,7 @@ def test_remaining_journeys_keep_compact_actions_and_drafts_reachable(control_cl
             assert not dirty_confirmation.is_checked()
             dirty_confirmation.check()
             assert dirty_confirmation.is_checked()
-            page.wait_for_function("""() => [...document.querySelectorAll('button')].some(
-                (button) => button.textContent?.trim() === 'Start run' && !button.disabled
-            )""")
-            assert page.get_by_role('button', name='Start run', exact=True).is_enabled()
+            expect(page.get_by_role('button', name='Review start…', exact=True)).to_be_enabled()
             launch_details = page.locator('details.launch-preview-details')
             launch_details.locator('summary').first.press('Enter')
             expect(launch_details).to_have_attribute('open', '')
@@ -648,7 +646,7 @@ def test_remaining_journeys_keep_compact_actions_and_drafts_reachable(control_cl
             assert_preview_captions_fill_tables(page)
             assert_compact_geometry(page, 320, 568)
             page.screenshot(path=str(tmp_path / 'cp06-compact-launch.png'), full_page=True)
-            page.get_by_role('button', name='Start run', exact=True).click()
+            _open_start_review(page).click()
             page.get_by_text('Choose a step for this disposable launch', exact=True).wait_for()
             answer = page.get_by_role('button', name='implement', exact=True)
             answer.scroll_into_view_if_needed()

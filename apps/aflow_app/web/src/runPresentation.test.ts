@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import type { GuidedFormProjection, RunProgressCount, RunProgressSummary, RunStatus } from './types'
+import type { GuidedFormProjection, RunEvent, RunProgressCount, RunProgressSummary, RunStatus } from './types'
 import {
   checkpointApprovalText,
   executionDuration,
@@ -10,7 +10,11 @@ import {
   launchTeamFamilyRoute,
   launchTeamUpgradeRoute,
   launchTeamStageLabel,
+  latestRunResultEvent,
+  meaningfulRunEvents,
+  presentRunEvent,
   progressHistoryNotice,
+  runCurrentWorkText,
   runActivityText,
   runFinishText,
   runPlanDisplayName,
@@ -167,6 +171,56 @@ describe('readable run evidence labels', () => {
     expect(runActivityText(failed)).toMatch(/^Finished /)
     expect(formatLocalTimestamp('2026-09-12T12:00:00Z')).toMatch(/2026.*(?:UTC|GMT|[A-Z]{2,5})/)
     expect(progressHistoryNotice(progressSummary({ availability: 'partial' }))).toContain('partial')
+  })
+})
+
+describe('run overview presentation', () => {
+  const event = (sequence: number, eventType: string, data: Record<string, unknown> = {}): RunEvent => ({
+    sequence,
+    event_type: eventType,
+    data,
+    schema_version: 1,
+    timestamp: `2026-09-12T12:0${sequence}:00Z`,
+  })
+
+  it('keeps current checkpoint position distinct from the recorded result', () => {
+    expect(runCurrentWorkText(progressSummary({
+      current_checkpoint_ordinal: 4,
+      current_checkpoint_title: 'Repair the worker',
+      phase: 'reviewing',
+      total_checkpoints: progressCount(8),
+    }))).toBe('CP4 of 8 · Reviewing — Repair the worker')
+    expect(runCurrentWorkText(progressSummary({ phase: 'running', current_checkpoint_ordinal: null }))).toBe('Running · current checkpoint not reported')
+    expect(runCurrentWorkText(progressSummary({ phase: 'unit_started', current_checkpoint_ordinal: 4, current_checkpoint_title: 'Repair the worker', total_checkpoints: progressCount(8) }), 'review')).toBe('CP4 of 8 · Review — Repair the worker')
+    expect(runCurrentWorkText(progressSummary({ phase: 'reviewing', current_checkpoint_ordinal: 4, current_checkpoint_title: 'Checkpoint 4: Repair the worker', total_checkpoints: progressCount(8) }))).toBe('CP4 of 8 · Reviewing — Repair the worker')
+  })
+
+  it('describes non-checkpoint work without inventing a missing checkpoint', () => {
+    expect(runCurrentWorkText(progressSummary({ availability: 'not_applicable', phase: 'reviewing' }))).toBe('Reviewing')
+    expect(runCurrentWorkText(progressSummary({ availability: 'not_applicable', phase: null }))).toBe('Non-checkpoint workflow')
+  })
+
+  it('bounds recent activity newest first and uses stored event text', () => {
+    const events = [
+      event(1, 'run_started'),
+      event(2, 'turn_finished', { status: 'completed', outcome: 'first result' }),
+      event(3, 'turn_started', { status: 'running' }),
+      event(4, 'control_changed', { reason: 'owner changed the team' }),
+      event(5, 'turn_finished', { status: 'failed', reason: 'provider unavailable' }),
+      event(6, 'turn_started', { status: 'running' }),
+    ]
+    expect(meaningfulRunEvents(events, 5).map(item => item.sequence)).toEqual([6, 5, 4, 3, 2])
+    expect(presentRunEvent(events[4])).toMatchObject({ label: 'Turn finished', summary: 'provider unavailable' })
+    expect(latestRunResultEvent(events)?.sequence).toBe(5)
+  })
+
+  it('keeps terminal failure, stop and success results distinct', () => {
+    expect(presentRunEvent(event(7, 'run_failed', { failure_reason: 'worker crashed' })).summary).toBe('worker crashed')
+    expect(presentRunEvent(event(8, 'owner_stopped', { end_reason: 'owner_stopped' })).summary).toBe('Owner stopped')
+    expect(presentRunEvent(event(9, 'run_completed', { end_reason: 'completed' })).summary).toBe('Completed')
+    expect(presentRunEvent(event(10, 'run_failed')).summary).toBe('Failure reason unavailable.')
+    expect(presentRunEvent(event(11, 'owner_stopped')).summary).toBe('Stop reason unavailable.')
+    expect(presentRunEvent(event(12, 'run_completed')).summary).toBe('Recorded result unavailable.')
   })
 })
 

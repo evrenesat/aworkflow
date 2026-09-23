@@ -576,7 +576,11 @@ On the last allowed turn:
 - A non-limit `END` is successful only when the post-turn original-plan
   snapshot is complete.
 
-`max_same_step_turns` limits consecutive selection of the same step in multi-step workflows. The streak resets only after a different step actually executes. Single-step workflows are not affected.
+`max_same_step_turns` limits consecutive non-progressing selections of the same
+step in multi-step workflows. The streak resets after a different step executes
+or the plan snapshot moves forward by completing work in the current checkpoint,
+advancing to a later checkpoint, or completing the plan. Single-step workflows
+are not affected.
 
 ## Interstep Manager Supervision
 

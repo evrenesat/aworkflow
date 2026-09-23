@@ -2446,6 +2446,28 @@ def _original_checkpoint_advanced(
         return False
     return snapshot.current_checkpoint_index > scope.checkpoint_index
 
+
+def _plan_snapshot_made_progress(
+    before: PlanSnapshot,
+    after: PlanSnapshot,
+) -> bool:
+    """Return whether one turn moved the active plan measurably forward."""
+    if not before.is_complete and after.is_complete:
+        return True
+    if (
+        before.current_checkpoint_index is not None
+        and after.current_checkpoint_index is not None
+        and after.current_checkpoint_index > before.current_checkpoint_index
+    ):
+        return True
+    return (
+        before.current_checkpoint_index == after.current_checkpoint_index
+        and before.current_checkpoint_name == after.current_checkpoint_name
+        and after.current_checkpoint_unchecked_step_count
+        < before.current_checkpoint_unchecked_step_count
+    )
+
+
 def _resume_completed_worker_can_use_original_plan(
     *,
     pending_turn: PendingFinalizedTurn | None,
@@ -13304,10 +13326,18 @@ def run_workflow(
                 manager_report=report,
             )
 
+        plan_progressed = _plan_snapshot_made_progress(snapshot_before, post_snapshot)
+
         # A same-step cap is a terminal controller boundary, not a normal
-        # transition followed by a second manager call.  Decide it before the
+        # transition followed by a second manager call. Decide it before the
         # ordinary gate so Full is invoked exactly once when supervision is on.
-        if len(wf.steps) > 1 and transition_target == current_step_name:
+        # Productive cumulative turns reset the streak even when the workflow
+        # deliberately routes back through the same worker node.
+        if (
+            len(wf.steps) > 1
+            and transition_target == current_step_name
+            and not plan_progressed
+        ):
             max_cap = workflow_config.aflow.max_same_step_turns
             new_streak = (
                 state.consec_step_count + 1
@@ -13442,7 +13472,7 @@ def run_workflow(
 
         if len(wf.steps) > 1:
             max_cap = workflow_config.aflow.max_same_step_turns
-            if transition_target == current_step_name:
+            if transition_target == current_step_name and not plan_progressed:
                 new_streak = (
                     state.consec_step_count + 1
                     if state.consec_step_name == current_step_name

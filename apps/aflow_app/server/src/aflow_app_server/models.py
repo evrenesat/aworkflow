@@ -7,6 +7,7 @@ from typing import Annotated, Any, Literal, Mapping
 from pydantic import BaseModel, ConfigDict, Field, StrictBool, model_validator
 from pydantic_core import core_schema
 
+from aflow.config import DEFAULT_MAX_TURNS
 from aflow.control_plane import (
     CapabilitySet,
     ContextBundle,
@@ -737,6 +738,10 @@ class ProjectConfigFormResponse(CanonicalTransportModel):
     choices: GuidedConfiguredChoices
     suggestions: GuidedSuggestions
     starter_defaults: GuidedStarterDefaults | None = None
+    # This is the same runtime fallback used by StartupRequest when
+    # ``aflow.max_turns`` is omitted.  Keep it beside the pure projection so
+    # clients can display the value without inventing a second default.
+    server_default_max_turns: int = DEFAULT_MAX_TURNS
 
 
 class ProjectDiscoveryCandidateModel(CanonicalTransportModel):

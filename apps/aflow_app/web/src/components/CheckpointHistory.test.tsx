@@ -92,6 +92,21 @@ const run = {
   started_at: '2026-09-11T09:00:00Z', ended_at: null, evidence: {},
 } as RunStatus
 
+function openDisclosure(label: string): HTMLDetailsElement {
+  const summaryElement = screen.getByText(label, { selector: 'summary' })
+  const detailsElement = summaryElement.closest('details') as HTMLDetailsElement
+  detailsElement.open = true
+  fireEvent(detailsElement, new Event('toggle'))
+  return detailsElement
+}
+
+function openCheckpointDisclosure(): HTMLDetailsElement {
+  const detailsElement = document.querySelector('details.checkpoint-history-checkpoints') as HTMLDetailsElement
+  detailsElement.open = true
+  fireEvent(detailsElement, new Event('toggle'))
+  return detailsElement
+}
+
 function installMedia(matches: boolean) {
   let current = matches
   const listeners = new Set<() => void>()
@@ -148,7 +163,7 @@ describe('CheckpointHistory', () => {
     expect(screen.getByText('1 of 3 checkpoints approved')).toBeDefined()
     expect(screen.getAllByText(/CP2 of 3 · Reviewing/).length).toBeGreaterThan(0)
     expect(screen.getAllByText(/codex.reviewer/).length).toBeGreaterThan(0)
-    fireEvent.click(screen.getByText('Details'))
+    openDisclosure('Details')
     expect(screen.getByText('Current attempt')).toBeDefined()
 
     fireEvent.click(screen.getByRole('button', { name: /Checkpoint 2: Repair/ }))
@@ -159,19 +174,53 @@ describe('CheckpointHistory', () => {
     fireEvent.click(screen.getByRole('button', { name: /Checkpoint 1: Build/ }))
     expect(screen.getByText(/Inherited from run run-predecessor/)).toBeDefined()
 
-    fireEvent.click(screen.getByText('Team & change history'))
+    openDisclosure('Run settings & changes')
     expect(screen.getAllByText(/base → full/).length).toBeGreaterThan(0)
     expect(screen.getByText('Pending changes')).toBeDefined()
     expect(screen.getByText(/applies on next safe turn/)).toBeDefined()
 
-    fireEvent.click(screen.getByText('Delivery evidence'))
+    openDisclosure('Delivery evidence')
     expect(screen.getAllByText('Final review').length).toBeGreaterThan(0)
     const delivery = document.querySelector('.checkpoint-history-delivery-list')
     expect(delivery?.textContent).toContain('Succeeded')
     expect(delivery?.textContent).toContain('CI')
     expect(delivery?.textContent).toContain('Unknown')
-    fireEvent.click(screen.getByText('Count definitions & evidence'))
+    openDisclosure('Count definitions & evidence')
     expect(screen.getByText(/Partial values are lower bounds/)).toBeDefined()
+  })
+
+  it('keeps history compact by default and preserves informational disclosures per run', () => {
+    const initial = detail()
+    const view = render(<CheckpointHistory projectId="project-current" run={run} progress={initial} detail={initial} />)
+    const checkpoints = document.querySelector('details.checkpoint-history-checkpoints') as HTMLDetailsElement
+    expect(checkpoints.hasAttribute('open')).toBe(false)
+    expect(screen.getByRole('button', { name: 'Expand all' })).toBeDefined()
+
+    openCheckpointDisclosure()
+    fireEvent.click(screen.getByRole('button', { name: /Checkpoint 1: Build/ }))
+    expect(document.querySelector('.checkpoint-history-detail-heading h5')?.textContent).toBe('Checkpoint 1: Build')
+    openDisclosure('Run settings & changes')
+    openDisclosure('Delivery evidence')
+    openDisclosure('Time details')
+    openDisclosure('Count definitions & evidence')
+
+    view.rerender(<CheckpointHistory projectId="project-current" run={run} progress={detail({ ...initial })} detail={detail({ ...initial })} />)
+    expect((document.querySelector('details.checkpoint-history-checkpoints') as HTMLDetailsElement).hasAttribute('open')).toBe(true)
+    expect((screen.getByText('Run settings & changes', { selector: 'summary' }).closest('details') as HTMLDetailsElement).hasAttribute('open')).toBe(true)
+    expect(document.querySelector('.checkpoint-history-detail-heading h5')?.textContent).toBe('Checkpoint 1: Build')
+
+    const successor = { ...run, run_id: 'run-successor' }
+    view.rerender(<CheckpointHistory projectId="project-current" run={successor} progress={initial} detail={initial} />)
+    expect((document.querySelector('details.checkpoint-history-checkpoints') as HTMLDetailsElement).hasAttribute('open')).toBe(false)
+    view.rerender(<CheckpointHistory projectId="project-current" run={run} progress={initial} detail={initial} />)
+    expect((document.querySelector('details.checkpoint-history-checkpoints') as HTMLDetailsElement).hasAttribute('open')).toBe(true)
+
+    fireEvent.click(screen.getByRole('button', { name: 'Expand all' }))
+    expect((screen.getByText('Details', { selector: 'summary' }).closest('details') as HTMLDetailsElement).hasAttribute('open')).toBe(true)
+    expect((document.querySelector('.checkpoint-history-event-disclosure') as HTMLDetailsElement).hasAttribute('open')).toBe(true)
+    fireEvent.click(screen.getByRole('button', { name: 'Collapse all' }))
+    expect((document.querySelector('details.checkpoint-history-checkpoints') as HTMLDetailsElement).hasAttribute('open')).toBe(false)
+    expect((screen.getByText('Time details', { selector: 'summary' }).closest('details') as HTMLDetailsElement).hasAttribute('open')).toBe(false)
   })
 
   it('links canonical retry completions only to the matching source run, turn, and role', () => {
@@ -340,7 +389,7 @@ describe('CheckpointHistory', () => {
     })
     render(<CheckpointHistory projectId="project-current" run={run} progress={generations} detail={generations} />)
     fireEvent.click(screen.getByRole('button', { name: /Checkpoint 1: Build/ }))
-    fireEvent.click(screen.getByText('Team & change history'))
+    openDisclosure('Run settings & changes')
     expect(screen.getByText(/generation generation-one/)).toBeDefined()
     expect(screen.getByText(/generation generation-two/)).toBeDefined()
   })
@@ -425,7 +474,7 @@ describe('CheckpointHistory', () => {
     fireEvent.click(screen.getByRole('button', { name: 'Current checkpoint' }))
     expect(document.querySelector('.checkpoint-history-detail-heading h5')?.textContent).toBe('Checkpoint 2: Repair')
 
-    fireEvent.click(screen.getByText('Count definitions & evidence'))
+    openDisclosure('Count definitions & evidence')
     expect(screen.getByText(/Earlier history unavailable in this bounded view/)).toBeDefined()
     act(() => media.setMatches(false))
     expect(detailSurface.hidden).toBe(false)
@@ -461,26 +510,26 @@ describe('CheckpointHistory', () => {
     expect(screen.getByText(/does not prove approval for a returned checkpoint/)).toBeDefined()
     fireEvent.click(screen.getByRole('button', { name: /History outside returned checkpoints/ }))
     expect(screen.getByText(/no placeholder checkpoint was created/)).toBeDefined()
-    fireEvent.click(screen.getByText('Count definitions & evidence'))
+    openDisclosure('Count definitions & evidence')
     expect(screen.getByText(/History omitted by the response limit: 4 records and 2 checkpoints\./)).toBeDefined()
   })
 
-  it('deduplicates repeated event identities and keeps unknown fields explicit', () => {
+  it('deduplicates repeated event identities and omits optional unknown fields', () => {
     const duplicate = event({ event_id: 'duplicate-1', kind: 'review', outcome: null, executor: null, duration_seconds: null, reason: null })
     const repeated = detail({ events: [duplicate, duplicate], availability: 'unavailable', reason_codes: ['missing_plan'], checkpoints: [] })
     render(<CheckpointHistory projectId="project-current" run={run} progress={repeated} detail={repeated} />)
     expect(screen.getAllByText('Evidence unavailable').length).toBeGreaterThan(0)
     fireEvent.click(screen.getByRole('button', { name: /Unassigned history/ }))
     expect(screen.getByText('1 unique event')).toBeDefined()
-    expect(screen.getByText('Outcome not reported')).toBeDefined()
-    expect(document.querySelector('.checkpoint-history-event-meta')?.textContent).toContain('Not reported')
-    expect(screen.getByText('Duration', { selector: 'dt' })).toBeDefined()
+    expect(screen.queryByText('Outcome not reported')).toBeNull()
+    expect(document.querySelector('.checkpoint-history-event-meta')?.textContent).not.toContain('Not reported')
+    expect(screen.queryByText('Duration', { selector: 'dt' })).toBeNull()
   })
 
   it('shows missing delivery evidence as unavailable instead of successful', () => {
     const missing = detail({ availability: 'partial', reason_codes: ['invalid_evidence'], delivery: [] })
     render(<CheckpointHistory projectId="project-current" run={run} progress={missing} detail={missing} />)
-    fireEvent.click(screen.getByText('Delivery evidence'))
+    openDisclosure('Delivery evidence')
     expect(screen.getByText('Delivery evidence not reported.')).toBeDefined()
     expect(screen.queryByText('Succeeded')).toBeNull()
   })
@@ -573,7 +622,7 @@ describe('CheckpointHistory', () => {
       ],
     })
     render(<CheckpointHistory projectId="project-current" run={terminalRun} progress={timed} detail={timed} />)
-    fireEvent.click(screen.getByText('Time details'))
+    openDisclosure('Time details')
 
     expect(screen.getByText('Total run elapsed', { selector: 'dt' }).parentElement?.textContent).toContain('1h 30m')
     expect(screen.getByText('Known invocation coverage', { selector: 'dt' }).parentElement?.textContent).toContain('20m 0s')
@@ -630,7 +679,7 @@ describe('CheckpointHistory', () => {
       events: [legacyWorker, legacyReview, legacyApproval, otherSourceReview, sameTurnWorker],
     })
     render(<CheckpointHistory projectId="project-current" run={terminalRun} progress={timed} detail={timed} />)
-    fireEvent.click(screen.getByText('Time details'))
+    openDisclosure('Time details')
 
     expect(screen.getByText('Known invocation coverage', { selector: 'dt' }).parentElement?.textContent).toContain('6m 13s')
     expect(screen.getByText('Recorded duration total: 3m 47s')).toBeDefined()
@@ -667,7 +716,7 @@ describe('CheckpointHistory', () => {
       truncation: { evidence_bytes: 100, records_read: 3, checkpoints_read: 3, events_read: 2, omitted_records: 1, omitted_checkpoints: 0, notices: ['Some timing history is missing'] },
     })
     render(<CheckpointHistory projectId="project-current" run={run} progress={partial} detail={partial} />)
-    fireEvent.click(screen.getByText('Time details'))
+    openDisclosure('Time details')
 
     expect(screen.getByText(/Timing breakdown is partial/)).toBeDefined()
     expect(screen.getByText(/Individual durations are shown/)).toBeDefined()

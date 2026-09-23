@@ -385,6 +385,71 @@ class RetryInconsistentCheckpointArtifactTests(unittest.TestCase):
 
 class SameStepCapWorkflowTests(unittest.TestCase):
 
+    @staticmethod
+    def _checkpoint_plan(completed: int, total: int = 4) -> str:
+        lines = ["# Plan", ""]
+        for index in range(1, total + 1):
+            checked = "x" if index <= completed else " "
+            lines.extend([
+                f"### [{checked}] Checkpoint {index}: Work {index}",
+                f"- [{checked}] step {index}",
+                "",
+            ])
+        return "\n".join(lines)
+
+    def test_productive_same_step_turns_reset_cap_across_checkpoints(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repo_root = Path(tmpdir)
+            plan_path = repo_root / "plan.md"
+            _write_plan(plan_path, self._checkpoint_plan(0))
+            wf_config = _make_multistep_wf_config(max_same_step_turns=2)
+            call_count = [0]
+
+            def runner(argv, **kwargs):
+                call_count[0] += 1
+                _write_plan(plan_path, self._checkpoint_plan(call_count[0]))
+                return subprocess.CompletedProcess(argv, 0, stdout="ok", stderr="")
+
+            result = run_workflow(
+                ControllerConfig(repo_root=repo_root, plan_path=plan_path, max_turns=8),
+                wf_config,
+                "loop",
+                config_dir=repo_root,
+                adapter=CodexAdapter(),
+                runner=runner,
+                snapshot_config=False,
+            )
+
+            assert result.final_snapshot.is_complete
+            assert call_count[0] == 4
+
+    def test_cap_starts_fresh_after_checkpoint_progress_then_stall(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repo_root = Path(tmpdir)
+            plan_path = repo_root / "plan.md"
+            _write_plan(plan_path, self._checkpoint_plan(0))
+            wf_config = _make_multistep_wf_config(max_same_step_turns=2)
+            call_count = [0]
+
+            def runner(argv, **kwargs):
+                call_count[0] += 1
+                if call_count[0] == 1:
+                    _write_plan(plan_path, self._checkpoint_plan(1))
+                return subprocess.CompletedProcess(argv, 0, stdout="ok", stderr="")
+
+            with pytest.raises(WorkflowError, match="same-step cap"):
+                run_workflow(
+                    ControllerConfig(repo_root=repo_root, plan_path=plan_path, max_turns=8),
+                    wf_config,
+                    "loop",
+                    config_dir=repo_root,
+                    adapter=CodexAdapter(),
+                    runner=runner,
+                    snapshot_config=False,
+                )
+
+            assert call_count[0] == 3
+
     def test_multi_step_same_step_cap_fails_before_sixth_consecutive_visit(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             repo_root = Path(tmpdir)

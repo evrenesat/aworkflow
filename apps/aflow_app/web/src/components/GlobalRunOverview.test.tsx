@@ -119,8 +119,10 @@ describe('GlobalRunOverview project context', () => {
     render(<GlobalRunOverview projects={[primary]} onOpen={vi.fn()} />)
 
     expect(await screen.findByText('No runs yet.')).toBeTruthy()
-    expect(screen.getByRole('heading', { name: 'Ongoing (0)' })).toBeTruthy()
-    expect(screen.getByText('No ongoing runs.')).toBeTruthy()
+    expect(screen.queryByRole('heading', { name: 'Ongoing (0)' })).toBeNull()
+    expect(screen.queryByText('No ongoing runs.')).toBeNull()
+    expect(screen.queryByRole('heading', { name: 'Recent (0)' })).toBeNull()
+    expect(screen.queryByRole('heading', { name: 'Needs attention (0)' })).toBeNull()
     expect(screen.queryByRole('status')).toBeNull()
   })
 
@@ -170,10 +172,10 @@ describe('GlobalRunOverview project context', () => {
     expect(screen.queryByRole('button', { name: /visible-run/ })).toBeNull()
 
     fireEvent.click(screen.getByRole('button', { name: 'Refresh' }))
-    await waitFor(() => expect(screen.getByRole('status').textContent).toBe('Refreshing runs… Results are incomplete.'))
+    await waitFor(() => expect(screen.queryByRole('status')).toBeNull())
     // The refresh is for the selected history, so the usable archived row stays visible.
     expect(screen.getByRole('button', { name: /archived-run/ })).toBeTruthy()
-    expect(view.container.querySelector('.global-run-results')?.getAttribute('aria-busy')).toBe('true')
+    expect(view.container.querySelector('.global-run-results')?.getAttribute('aria-busy')).toBe('false')
 
     refreshed.resolve(page([makeRun('refreshed-run', { history_state: 'archived', plan_path: 'plans/refreshed.md' })]))
     expect(await screen.findByRole('button', { name: /refreshed-run/ })).toBeTruthy()
@@ -400,7 +402,7 @@ describe('GlobalRunOverview project context', () => {
     expect(screen.getByRole('button', { name: /attention-old/ })).toBeTruthy()
 
     fireEvent.click(screen.getByRole('button', { name: 'Refresh' }))
-    await waitFor(() => expect(screen.getByRole('status').textContent).toBe('Refreshing runs… Results are incomplete.'))
+    await waitFor(() => expect(screen.queryByRole('status')).toBeNull())
     expect(screen.getByRole('button', { name: /ongoing-old/ })).toBeTruthy()
     expect(screen.getByRole('button', { name: /attention-old/ })).toBeTruthy()
 
@@ -561,6 +563,48 @@ describe('GlobalRunOverview project context', () => {
     expect(api.getControlPlaneRun).toHaveBeenCalledTimes(1)
   })
 
+  it.each([
+    ['stale', 'Run changed; refresh to update checkpoint progress.'],
+    ['failed', 'Checkpoint progress unavailable — Refresh to retry.'],
+  ] as const)('keeps the last known projection visible with a sighted %s enrichment notice', async (state, message) => {
+    const initial = makeRun('retained-enrichment', {
+      status: 'running', activity: 'active', revision: 1,
+      original_plan_display_name: 'Retained progress', original_plan_path: 'plans/retained.md',
+    })
+    const replacement = { ...initial, revision: 2 }
+    const initialResponse = deferred<RunStatus>()
+    const replacementResponse = deferred<RunStatus>()
+    let listCalls = 0
+    let detailCalls = 0
+    vi.mocked(api.listControlPlaneRuns).mockImplementation(async () => {
+      listCalls += 1
+      return page([listCalls === 1 ? initial : replacement])
+    })
+    vi.mocked(api.getControlPlaneRun).mockImplementation(async () => {
+      detailCalls += 1
+      return detailCalls === 1 ? initialResponse.promise : replacementResponse.promise
+    })
+
+    render(<GlobalRunOverview projects={[primary]} onOpen={vi.fn()} />)
+    const row = await screen.findByRole('button', { name: /Retained progress.*retained-enrichment/ })
+    await waitFor(() => expect(detailCalls).toBe(1))
+    initialResponse.resolve(canonicalDetail(initial, {
+      total_checkpoints: { value: 2, coverage: 'complete' },
+      approved_checkpoints: { value: 1, coverage: 'complete' },
+    }))
+    await waitFor(() => expect(row.textContent).toContain('1 of 2 checkpoints approved'))
+
+    fireEvent.click(screen.getByRole('button', { name: 'Refresh', exact: true }))
+    await waitFor(() => expect(listCalls).toBe(2))
+    await waitFor(() => expect(detailCalls).toBe(2))
+    if (state === 'stale') replacementResponse.resolve({ ...replacement, revision: 1 } as RunStatus)
+    else replacementResponse.reject(new Error('temporary detail failure'))
+
+    await waitFor(() => expect(row.getAttribute('data-enrichment-state')).toBe(state))
+    expect(row.textContent).toContain('1 of 2 checkpoints approved')
+    expect(row.querySelector('.compact-run-progress-row-notice')?.textContent).toBe(message)
+  })
+
   it('keeps a terminal stale mismatch from retrying after raw traversal settles', async () => {
     const staleRun = makeRun('review-stale', {
       original_plan_display_name: 'Review stale', original_plan_path: 'plans/review-stale.md',
@@ -687,7 +731,7 @@ describe('GlobalRunOverview project context', () => {
     await waitFor(() => expect(row.textContent).toContain('1 of 2 checkpoints approved'))
 
     fireEvent.click(screen.getByRole('button', { name: 'Refresh', exact: true }))
-    await waitFor(() => expect(screen.getByRole('status').textContent).toBe('Refreshing runs… Results are incomplete.'))
+    await waitFor(() => expect(screen.queryByRole('status')).toBeNull())
     expect(row.textContent).toContain('1 of 2 checkpoints approved')
     expect(detailCalls).toBe(1)
 
