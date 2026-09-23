@@ -55,7 +55,7 @@ export function RunOverview({ header, notices, currentWork, latestResult, events
       {header}
       {notices}
 
-      <section className="dashboard-section run-overview-section" data-ui-fidelity-anchor="current-work">
+      <section className="dashboard-section run-overview-section run-overview-current-work" data-ui-fidelity-anchor="current-work">
         <div className="section-heading">
           <h4>Current work</h4>
         </div>

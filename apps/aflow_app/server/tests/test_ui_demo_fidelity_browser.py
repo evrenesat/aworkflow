@@ -1194,8 +1194,8 @@ def test_ui_demo_cp9_settings_effective_values_and_disclosures(
                 first_disclosure = panel.locator("details:visible").first
                 disclosure_count = panel.locator("details").count()
                 first_summary = (
-                    first_disclosure.locator("summary").first.text_content()
-                    if disclosure_count and first_disclosure.locator("summary").count()
+                    first_disclosure.locator(":scope > summary").text_content()
+                    if disclosure_count and first_disclosure.locator(":scope > summary").count()
                     else None
                 )
                 image = tmp_path / f"cp9-settings-{section.lower().replace(' & ', '-')}-{theme}-{width}x{height}.png"
@@ -1322,7 +1322,7 @@ def test_ui_demo_equal_refresh_retains_detail_and_changed_rows_update(
             detail = page.locator(".run-detail:visible").first
             detail.wait_for()
             first_disclosure = detail.locator("details[data-ui-fidelity-anchor='first-disclosure']").first
-            first_disclosure.locator("summary").click()
+            first_disclosure.locator(":scope > summary").click()
             expect(first_disclosure).to_have_attribute("open", "")
             page.evaluate("window.scrollTo(0, Math.min(document.body.scrollHeight - window.innerHeight, 180))")
 

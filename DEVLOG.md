@@ -1,5 +1,28 @@
 # DEVLOG
 
+## 2026-09-23 — Repair progressive run-detail CI gate (Checkpoint 1)
+
+- Fast-forwarded to reviewed baseline `32f267f112253b415c91bc7fdeda5a37e94f9e46`.
+  Updated only the three existing browser modules to use the labelled Actions →
+  Adjust path, direct named disclosure summaries, truthful missing/partial
+  evidence, and separate Current work lead/executor facts. Existing request,
+  count, identity, safety, held-history geometry/scroll/focus/hit-target, and
+  refresh assertions remain intact.
+- Scoped Current work and Recent activity spacing/composition in `RunOverview.tsx`
+  and `styles.css` removes redundant section/content gaps while keeping the
+  existing readable font size. Mobile event disclosures retain 44px targets;
+  their time/label/action row and full-width facts row preserve all three
+  source-backed events without truncation. Final representative captures are
+  86px Current work and 156px Recent activity on mobile, with 72px and 87px on
+  desktop.
+- Reproduced the original Recent activity failure at 220.6875px in Chromium and
+  215.875px in WebKit, then fixed it without changing the 200px bound. Final
+  validation: web tests passed 605/605 across 29 files; the production build
+  passed; both Chromium and WebKit target browser suites passed 70/70; and the
+  full server suite passed 469/469. Screenshots covered light/dark desktop and
+  mobile captures, including the repaired event disclosure layout. Checkpoint 1
+  is verified; no checkpoint commit was created.
+
 ## 2026-09-23 — Reorder deployed Runs detail around current work (Checkpoint 1)
 
 - The Runs detail overview now leads with the readable run identity, truthful

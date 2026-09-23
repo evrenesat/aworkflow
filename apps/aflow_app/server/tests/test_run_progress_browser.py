@@ -1101,7 +1101,7 @@ def _summary_geometry(page) -> dict[str, object]:
     return page.evaluate(
         """() => {
             const paragraph = [...document.querySelectorAll(
-                '.run-detail .dashboard-section > p'
+                '.run-detail .checkpoint-history-recorded-progress > p'
             )].find(element => element.textContent?.startsWith('Last finished summary:'))
             if (!paragraph) throw new Error('last finished summary paragraph not found')
             const rect = paragraph.getBoundingClientRect()
@@ -1133,7 +1133,7 @@ def _disable_summary_wrapping(page) -> None:
         """() => {
             const style = document.createElement('style')
             style.dataset.testSummaryWrapping = 'disabled'
-            style.textContent = '.run-detail .dashboard-section > p { overflow-wrap: normal !important; }'
+            style.textContent = '.run-detail .checkpoint-history-recorded-progress > p { overflow-wrap: normal !important; }'
             document.head.append(style)
         }"""
     )
@@ -1422,12 +1422,13 @@ def test_checkpoint_history_review_evidence_and_generation_refresh(
             _inject_malformed_newest_review_turn(fixture)
             page.get_by_role("button", name="More", exact=True).click()
             page.get_by_role("menuitem", name="Refresh", exact=True).click()
-            expect(history.locator(".checkpoint-history-heading .status-pill")).to_have_text("Partial evidence")
-            expect(history.locator(".checkpoint-history-summary")).to_contain_text("At least 5 attempts")
+            evidence = _open_history_disclosure(history, "Count definitions & evidence")
+            expect(evidence).to_contain_text("Partial evidence")
+            expect(evidence).to_contain_text("At least 5 attempts")
             expect(detail_heading).to_contain_text("Reviewing")
             expect(history.locator(".checkpoint-history-timeline")).to_contain_text("codex.reviewer-active")
             expect(
-                history.locator(".checkpoint-history-summary dt").filter(
+                evidence.locator(".checkpoint-history-evidence-meta dt").filter(
                     has_text="Last executor"
                 )
             ).to_have_count(0)
@@ -1471,9 +1472,10 @@ def test_run_progress_transport_and_browser_parity(
                 "[data-ui-fidelity-anchor='current-work'] .run-overview-content"
             )
             expect(current_work).to_have_count(1)
-            expect(current_work).to_have_text(
+            expect(current_work.locator(".run-overview-lead")).to_have_text(
                 "CP4 of 14 · Implement — Stage 4"
             )
+            expect(current_work.locator(".run-overview-inline-facts")).to_contain_text("Implement")
             expect(current_work).to_be_visible()
             expect(
                 page.get_by_text(
@@ -1493,9 +1495,10 @@ def test_run_progress_transport_and_browser_parity(
             _close_issue35_repair_scope(fixture)
             page.get_by_role("button", name="More", exact=True).click()
             page.get_by_role("menuitem", name="Refresh", exact=True).click()
-            expect(current_work).to_have_text(
+            expect(current_work.locator(".run-overview-lead")).to_have_text(
                 "CP5 of 14 · Implement — Stage 5"
             )
+            expect(current_work.locator(".run-overview-inline-facts")).to_contain_text("Implement")
             expect(current_work).to_be_visible()
             detail_text = page.locator(".run-detail").inner_text()
             assert "? of 0" not in detail_text
@@ -1510,9 +1513,11 @@ def test_run_progress_transport_and_browser_parity(
             )
             page.get_by_role("heading", name="Missing evidence", exact=True).wait_for()
             _assert_selected_run_identity(page, missing_run_id)
-            expect(
-                page.locator(".checkpoint-history .status-pill")
-            ).to_have_text("Evidence unavailable")
+            unavailable_evidence = _open_history_disclosure(
+                page.locator('.checkpoint-history[aria-label="Checkpoint history"]'),
+                "Count definitions & evidence",
+            )
+            expect(unavailable_evidence).to_contain_text("Evidence unavailable")
             detail_text = page.locator(".run-detail").inner_text()
             assert "? of 0" not in detail_text
             assert "All 0 checkpoints complete" not in detail_text
@@ -1781,11 +1786,12 @@ def test_canonical_run_progress_visual_journey(
                     expect(terminal_summary).to_contain_text("11m 23s")
                     expect(terminal_summary).to_contain_text("Finished")
                     assert "Current work" not in terminal_summary.inner_text()
-                    screenshot_delivery = screenshot_history.locator(
-                        ".checkpoint-history-delivery-summary"
+                    screenshot_delivery = _open_history_disclosure(
+                        screenshot_history, "Delivery evidence"
                     )
-                    expect(screenshot_delivery).to_contain_text("Final review: Succeeded")
-                    expect(screenshot_delivery).to_contain_text("CI: Unknown")
+                    expect(screenshot_delivery).to_contain_text("Delivery stages")
+                    expect(screenshot_delivery).to_contain_text("Final review · Succeeded")
+                    expect(screenshot_delivery).to_contain_text("CI · Unknown")
                     screenshot_time = _open_history_disclosure(screenshot_history, "Time details")
                     reviewer_time = screenshot_time.locator(
                         ".checkpoint-history-time-group"
@@ -1876,8 +1882,11 @@ def test_canonical_run_progress_visual_journey(
                     stale_row.click()
                     stale_history = page.locator('.checkpoint-history[aria-label="Checkpoint history"]')
                     stale_history.wait_for()
-                    expect(stale_history).to_contain_text("Partial evidence")
-                    expect(stale_history).to_contain_text("11 checkpoints · approval unknown")
+                    stale_evidence = _open_history_disclosure(
+                        stale_history, "Count definitions & evidence"
+                    )
+                    expect(stale_evidence).to_contain_text("Partial evidence")
+                    expect(stale_evidence).to_contain_text("11 checkpoints · approval unknown")
 
                     page.goto(f"{url}/?view=all-runs")
                     search = page.get_by_label("Search loaded runs", exact=True)
@@ -1887,8 +1896,13 @@ def test_canonical_run_progress_visual_journey(
                     unknown_row.click()
                     unknown_history = page.locator('.checkpoint-history[aria-label="Checkpoint history"]')
                     unknown_history.wait_for()
-                    expect(unknown_history).to_contain_text("Evidence unavailable")
-                    expect(unknown_history).to_contain_text("Unknown checkpoints")
+                    unknown_evidence = _open_history_disclosure(
+                        unknown_history, "Count definitions & evidence"
+                    )
+                    expect(unknown_evidence).to_contain_text("Evidence unavailable")
+                    expect(unknown_evidence).to_contain_text(
+                        "Checkpoint progress unavailable"
+                    )
         finally:
             browser.close()
 
@@ -1960,8 +1974,14 @@ def test_run_summary_wraps_without_document_overflow(
                 expect(checkpoint_detail.get_by_role(
                     "heading", name="Checkpoint 4: Stage 4", exact=True
                 )).to_be_visible()
+            evidence = page.locator(
+                ".run-detail details.checkpoint-history-disclosure"
+            ).filter(has_text="Count definitions & evidence").first
+            expect(evidence).not_to_have_attribute("open", "")
+            evidence.locator(":scope > summary").click()
+            expect(evidence).to_have_attribute("open", "")
             summary = page.locator(
-                ".run-detail .dashboard-section > p"
+                ".run-detail .checkpoint-history-recorded-progress > p"
             ).filter(has_text="Last finished summary").first
             summary.wait_for()
             expect(summary).to_contain_text(LONG_SUMMARY_TOKEN)
