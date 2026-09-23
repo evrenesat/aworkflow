@@ -2586,7 +2586,18 @@ export function RunDashboard({ visible = true, page, onNewRun, onCancelNewRun, o
     startWorkflow.trim(),
     restartSource?.run_id ?? null,
   ])
-  const preflightRequestIdentity = JSON.stringify([projectId, preflightRequest])
+  // The request body intentionally omits values that follow committed
+  // defaults. Keep those resolved values (and the committed revision) in the
+  // UI identity as well, so a late configuration response cannot leave the
+  // previous ready inspection attached to the current launch draft.
+  const preflightRequestIdentity = JSON.stringify([
+    projectId,
+    preflightRequest,
+    committed?.revision ?? null,
+    effectiveWorkflow,
+    effectiveTeam,
+    effectiveMaxTurns,
+  ])
   // React renders once before the request effect runs. Treat an old state
   // identity as pending during that render so a previous inspection cannot
   // authorize the newly selected launch.

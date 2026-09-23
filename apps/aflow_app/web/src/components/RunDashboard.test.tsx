@@ -1288,6 +1288,52 @@ describe('RunDashboard', () => {
     ))
   })
 
+  it('blocks a prior ready inspection while committed defaults are refreshed', async () => {
+    const refreshedInspection = deferred<WorktreePreflight>()
+    const changedConfig = { ...committedConfig, revision: 'b'.repeat(64) }
+    let configReads = 0
+    let projectionReads = 0
+    vi.mocked(api.getGlobalConfig).mockImplementation(async () => {
+      configReads += 1
+      return configReads === 1 ? committedConfig : changedConfig
+    })
+    vi.mocked(api.postGlobalConfigForm).mockImplementation(async () => {
+      projectionReads += 1
+      return projectionReads === 1 ? emptyProjection : { ...emptyProjection, server_default_max_turns: 21 }
+    })
+    let preflightReads = 0
+    vi.mocked(api.preflightControlPlaneRun).mockImplementation(() => {
+      preflightReads += 1
+      return preflightReads === 1 ? Promise.resolve(preflightResult()) : refreshedInspection.promise
+    })
+    renderDashboard()
+
+    await openNewRun()
+    choose('Run plan', 'plans/in-progress/demo.md')
+    choose('Run workflow', 'managed')
+    await waitFor(() => {
+      expect(preflightReads).toBe(1)
+      expect(startActionButton().getAttribute('disabled')).toBeNull()
+    })
+
+    await act(async () => {
+      window.dispatchEvent(new Event('aflow-history-changed'))
+      await Promise.resolve()
+    })
+    await waitFor(() => {
+      expect(configReads).toBeGreaterThan(1)
+      expect(projectionReads).toBeGreaterThan(1)
+      expect(preflightReads).toBeGreaterThan(1)
+      const panel = screen.getByRole('region', { name: 'Working tree preflight' })
+      expect(panel.getAttribute('data-preflight-status')).toBe('loading')
+      expect(startActionButton().getAttribute('disabled')).not.toBeNull()
+    })
+
+    refreshedInspection.resolve(preflightResult())
+    await waitFor(() => expect(startActionButton().getAttribute('disabled')).toBeNull())
+    expect(api.startControlPlaneRun).not.toHaveBeenCalled()
+  })
+
   it('keeps Advanced draft controls ahead of a deferred inspection result', async () => {
     const inspection = deferred<WorktreePreflight>()
     vi.mocked(api.preflightControlPlaneRun).mockImplementation(() => inspection.promise)

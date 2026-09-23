@@ -508,10 +508,120 @@ def test_ui_demo_cp8_plan_editor_and_review_captures(
         "screenshots": {},
         "states": {},
     }
+    preflight_trace: list[dict[str, object]] = []
+    trace_active = False
+
+    def append_preflight_trace(event: dict[str, object]) -> None:
+        if trace_active and len(preflight_trace) < 48:
+            preflight_trace.append({"order": len(preflight_trace), **event})
+
+    def endpoint_for(url: str) -> str | None:
+        path = urlsplit(url).path
+        if path == "/api/config":
+            return "committed-config"
+        if path == "/api/config/form":
+            return "committed-defaults"
+        if path.endswith("/runs/preflight"):
+            return "preflight"
+        return None
+
+    def preflight_identity(request) -> dict[str, object]:
+        try:
+            payload = json.loads(request.post_data or "{}")
+        except (TypeError, ValueError):
+            payload = {}
+        if not isinstance(payload, dict):
+            payload = {}
+        return {
+            "plan_path_present": bool(payload.get("plan_path")),
+            "workflow_name": payload.get("workflow_name"),
+            "team": payload.get("team"),
+            "start_step": payload.get("start_step"),
+            "max_turns": payload.get("max_turns"),
+            "extra_instructions_present": bool(payload.get("extra_instructions")),
+            "dirty_worktree_confirmed": payload.get("dirty_worktree_confirmed"),
+            "offset": payload.get("offset"),
+            "limit": payload.get("limit"),
+        }
+
+    def trace_request(request) -> None:
+        endpoint = endpoint_for(request.url)
+        if endpoint is None or not trace_active:
+            return
+        event: dict[str, object] = {"kind": "request", "endpoint": endpoint}
+        if endpoint == "preflight":
+            event["identity"] = preflight_identity(request)
+        append_preflight_trace(event)
+
+    def trace_response(response) -> None:
+        endpoint = endpoint_for(response.url)
+        if endpoint is None or not trace_active:
+            return
+        append_preflight_trace({"kind": "response", "endpoint": endpoint, "status": response.status})
+
+    def trace_dom(label: str) -> dict[str, object]:
+        snapshot = page.evaluate(
+            """label => {
+              const preflight = document.querySelector('.worktree-preflight');
+              const review = [...document.querySelectorAll('button')]
+                .find(button => button.textContent?.trim() === 'Review start…') ?? null;
+              const confirmation = document.querySelector('input[type="checkbox"]');
+              return {
+                kind: 'dom',
+                label,
+                preflight_status: preflight?.dataset.preflightStatus ?? null,
+                review_present: review !== null,
+                review_disabled: review?.hasAttribute('disabled') ?? null,
+                review_enabled: review !== null && !review.hasAttribute('disabled'),
+                plan_selected: Boolean(document.querySelector('[aria-label="Run plan"]')?.value),
+                workflow_selected: Boolean(document.querySelector('[aria-label="Run workflow"]')?.value),
+                confirmation_checked: confirmation?.checked ?? null,
+              };
+            }""",
+            label,
+        )
+        append_preflight_trace(snapshot)
+        return snapshot
+
+    def trace_payload(label: str) -> dict[str, object]:
+        snapshot = trace_dom(label)
+        return {"events": list(preflight_trace), "final_dom": snapshot}
+
+    def wait_for_current_preflight(label: str, *, require_review: bool) -> dict[str, object]:
+        try:
+            snapshot = page.wait_for_function(
+                """({label, requireReview}) => {
+                  const preflight = document.querySelector('.worktree-preflight');
+                  const review = [...document.querySelectorAll('button')]
+                    .find(button => button.textContent?.trim() === 'Review start…') ?? null;
+                  if (!preflight || preflight.dataset.preflightStatus !== 'ready') return false;
+                  if (requireReview && (!review || review.hasAttribute('disabled'))) return false;
+                  const confirmation = document.querySelector('input[type="checkbox"]');
+                  return {
+                    kind: 'dom',
+                    label,
+                    preflight_status: preflight.dataset.preflightStatus,
+                    review_present: review !== null,
+                    review_disabled: review?.hasAttribute('disabled') ?? null,
+                    review_enabled: review !== null && !review.hasAttribute('disabled'),
+                    plan_selected: Boolean(document.querySelector('[aria-label="Run plan"]')?.value),
+                    workflow_selected: Boolean(document.querySelector('[aria-label="Run workflow"]')?.value),
+                    confirmation_checked: confirmation?.checked ?? null,
+                  };
+                }""",
+                arg={"label": label, "requireReview": require_review},
+            ).json_value()
+        except Exception:
+            print("AFLOW_CP8_PREFLIGHT_TRACE", json.dumps(trace_payload(f"{label}-timeout"), sort_keys=True))
+            raise
+        append_preflight_trace(snapshot)
+        return snapshot
 
     with live_server() as url, sync_playwright() as playwright:
         browser = _browser(playwright)
         page = browser.new_page(viewport={"width": width, "height": height})
+        page.on("request", trace_request)
+        page.on("response", trace_response)
         try:
             _login(page, url)
             reference = capture_reference_surface(
@@ -575,7 +685,9 @@ def test_ui_demo_cp8_plan_editor_and_review_captures(
 
             page.get_by_role("button", name="More", exact=True).click()
             page.get_by_role("menuitem", name="Configure run…", exact=True).click()
+            trace_active = True
             page.get_by_label("Run plan", exact=True).wait_for()
+            trace_dom("launch-form-visible")
             expect(page.get_by_label("Run plan", exact=True)).to_have_value(plan_path)
             expect(page.get_by_label("Run workflow", exact=True)).to_be_visible()
             expect(page.get_by_label("Run team", exact=True)).to_be_visible()
@@ -586,10 +698,9 @@ def test_ui_demo_cp8_plan_editor_and_review_captures(
             expect(advanced).to_have_attribute("aria-expanded", "false")
             preflight = page.locator(".worktree-preflight")
             preflight.wait_for()
-            page.wait_for_function(
-                "() => document.querySelector('.worktree-preflight')?.dataset.preflightStatus === 'ready'"
-            )
-            expect(preflight).to_have_attribute("data-preflight-status", "ready")
+            trace_dom("preflight-panel-visible")
+            initial_readiness = wait_for_current_preflight("current-preflight-ready", require_review=False)
+            assert initial_readiness["preflight_status"] == "ready", initial_readiness
             confirmation = page.get_by_role(
                 "checkbox",
                 name="Continue despite uncommitted changes",
@@ -597,15 +708,12 @@ def test_ui_demo_cp8_plan_editor_and_review_captures(
             )
             if confirmation.count():
                 confirmation.check()
-                page.wait_for_function(
-                    "() => document.querySelector('.worktree-preflight')?.dataset.preflightStatus === 'ready'"
-                )
-                expect(preflight).to_have_attribute("data-preflight-status", "ready")
+            current_readiness = wait_for_current_preflight("current-preflight-and-review-ready", require_review=True)
+            assert current_readiness["preflight_status"] == "ready", current_readiness
+            assert current_readiness["review_enabled"] is True, current_readiness
             review_button = page.get_by_role("button", name="Review start…", exact=True)
-            expect(review_button).to_be_enabled()
             expect(page.get_by_role("button", name="Start run", exact=True)).to_have_count(0)
-            preflight_status = preflight.get_attribute("data-preflight-status")
-            assert preflight_status == "ready", preflight_status
+            preflight_status = str(current_readiness["preflight_status"])
             new_run_screenshot = tmp_path / f"cp8-new-run-{theme}-{width}x{height}.png"
             page.evaluate("window.scrollTo(0, 0)")
             page.screenshot(path=str(new_run_screenshot), full_page=True)
@@ -618,6 +726,7 @@ def test_ui_demo_cp8_plan_editor_and_review_captures(
                 "advanced_open": advanced.get_attribute("aria-expanded") == "true",
                 "preflight_status": preflight_status,
                 "start_calls_before_review": len(units.start_calls),
+                "preflight_trace": list(preflight_trace),
                 "anchors": measure_named_anchors(page, {
                     "new_run": ".start-run-form.card",
                     "plan": "[aria-label='Run plan']",

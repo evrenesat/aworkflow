@@ -1,5 +1,26 @@
 # DEVLOG
 
+## 2026-09-23 — Repair CP8 WebKit launch readiness
+
+- The bounded CP8 trace showed that a late committed configuration/defaults
+  response could trigger a legitimate replacement preflight whose request body
+  was unchanged because default-following values are omitted. The old UI
+  identity did not include the committed revision or resolved workflow, team,
+  and turn limit, so separate browser reads could observe the earlier ready
+  state and the replacement loading state. `RunDashboard` now includes those
+  resolved values in the readiness identity while preserving default
+  inheritance and changed-input reinspection.
+- The CP8 browser journey records only bounded, redacted request identities,
+  response statuses, and DOM state. It waits for the same current preflight and
+  review eligibility in one atomic snapshot, then retains the exact review,
+  cancel, and zero-start assertions. A deferred-response unit regression keeps
+  a refreshed committed default from enabling a prior ready inspection.
+- Final verification passed: focused web tests (185), full web tests (569),
+  build, WebKit desktop-light repeated three times, the four-case WebKit CP8
+  matrix, and the four-case Chromium CP8 matrix. Review captures for desktop
+  and mobile light/dark states were inspected; the selected plan, `15 · server
+  default`, and acknowledged working-tree state remain visible.
+
 ## 2026-09-23 — Verify populated calm-workspace fidelity
 
 - Tightened the desktop workspace content boundary while retaining the mobile
