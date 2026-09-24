@@ -1185,9 +1185,15 @@ def test_ui_demo_cp8_plan_editor_and_review_captures(
                 expect(preflight).to_have_attribute("data-preflight-status", "loading")
                 loading_observation = trace_dom("review-click-refresh-loading")
                 assert loading_observation["preflight_status"] == "loading", loading_observation
-                assert len(held_preflight_routes) == 1, loading_observation
-                held_preflight_routes.pop().continue_()
+                assert held_preflight_routes, loading_observation
                 page.unroute("**/runs/preflight", hold_preflight)
+                for route in held_preflight_routes:
+                    try:
+                        route.continue_()
+                    except PlaywrightError:
+                        # A newer inspection can cancel an older intercepted
+                        # request before the test releases both routes.
+                        pass
 
             before_review_click = None
             review_region = launch_form.get_by_role("region", name="Review start", exact=True)
