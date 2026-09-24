@@ -518,19 +518,77 @@ export function launchTeamFamilyHint(
   return `${roles} · Upgrade route: ${route.map((teamId) => launchTeamStageLabel(projection, group, teamId)).join(' → ')}`
 }
 
-export function statusLabel(run: RunStatus): string {
+export type RunDisplayCategory =
+  | 'active'
+  | 'completed'
+  | 'failure'
+  | 'input-needed'
+  | 'actionable-attention'
+  | 'outcome-unrecorded'
+  | 'stopped'
+  | 'interrupted'
+  | 'other'
+
+export interface RunDisplayProjection {
+  category: RunDisplayCategory
+  label: string
+  tone: 'neutral' | 'attention' | 'danger' | 'muted'
+}
+
+/** Match only the fully evidenced historical gap; unknown cases stay visible as attention. */
+function isUnrecordedOutcome(run: RunStatus): boolean {
+  const activityIsInactiveOrUnknown = run.activity === 'inactive' || run.activity === 'unknown'
+  return run.status === 'needs_attention'
+    && activityIsInactiveOrUnknown
+    && run.evidence.unit_observation === 'missing'
+    && run.evidence.unit_active !== true
+    && run.evidence.has_run_metadata === false
+    && run.evidence.can_resume === false
+    && run.status_reason_code === 'unit_missing'
+}
+
+function rawStatusLabel(run: RunStatus): string {
   if (run.status === 'failed' && run.worker_exit && !run.evidence.has_run_metadata) return 'Could not start'
   if (run.status_reason_code === 'startup_failed') return 'Could not start'
+  if (run.status === 'awaiting_startup_answer') return 'Input needed'
   if (run.ownership === 'legacy' && !terminalStatuses.has(run.status)) return 'Needs attention'
   if (run.status === 'needs_attention') {
     const failure = run.evidence.startup_failure as { stage?: string } | null
     return failure?.stage === 'preparation' && run.evidence.no_agent_started ? 'Could not start' : 'Needs attention'
   }
-  if (run.status === 'awaiting_startup_answer') return 'Input needed'
   if (['manifest_only', 'launch_requested', 'unit_started', 'launch_started'].includes(run.status)) return run.activity === 'active' || run.evidence.unit_active === true ? 'Starting' : 'Needs attention'
   if (run.status === 'owner_stopped') return 'Stopped'
   if (run.status === 'done') return 'Completed'
   return formatMachineLabel(run.status)
+}
+
+/** Shared display projection for project lists, global history, and run details. */
+export function runDisplayProjection(run: RunStatus): RunDisplayProjection {
+  if (isUnrecordedOutcome(run)) {
+    return { category: 'outcome-unrecorded', label: 'Outcome not recorded', tone: 'muted' }
+  }
+
+  const label = rawStatusLabel(run)
+  let category: RunDisplayCategory
+  if (label === 'Could not start' || label === 'Failed') category = 'failure'
+  else if (label === 'Input needed' || ['waiting_for_input', 'waiting_for_valid_override'].includes(run.status)) category = 'input-needed'
+  else if (label === 'Needs attention') category = 'actionable-attention'
+  else if (label === 'Completed') category = 'completed'
+  else if (label === 'Stopped') category = 'stopped'
+  else if (label === 'Interrupted') category = 'interrupted'
+  else if (isRunActive(run)) category = 'active'
+  else category = 'other'
+
+  const tone = category === 'failure'
+    ? 'danger'
+    : category === 'input-needed' || category === 'actionable-attention'
+      ? 'attention'
+      : 'neutral'
+  return { category, label, tone }
+}
+
+export function statusLabel(run: RunStatus): string {
+  return runDisplayProjection(run).label
 }
 
 export function isRunActive(run: RunStatus): boolean {

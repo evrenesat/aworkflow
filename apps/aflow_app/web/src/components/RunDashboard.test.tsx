@@ -4074,7 +4074,7 @@ describe('RunDashboard', () => {
     await screen.findAllByText(/CP4 of 11/)
     const definitions = screen.getByText('Count definitions & evidence', { selector: 'summary' })
     const disclosure = definitions.closest('details')!
-    fireEvent.click(screen.getByRole('button', { name: 'Expand all' }))
+    fireEvent.click(await screen.findByRole('button', { name: 'Expand all' }))
     await waitFor(() => expect(disclosure.hasAttribute('open')).toBe(true))
 
     const detail = screen.getByLabelText('Run details')
@@ -4431,6 +4431,41 @@ describe('RunDashboard', () => {
     expect(screen.getByText('Original worker error was not retained.')).toBeTruthy()
     expect(screen.getByText(/Worker: inactive/)).toBeTruthy()
     expect(screen.getByText('Raw details').parentElement?.hasAttribute('open')).toBe(false)
+  })
+
+  it('shows an unresolved outcome in the detail header and keeps canonical status and reason in Diagnostics', async () => {
+    const historicalGap = {
+      ...ownedRun,
+      run_id: '20260911t140026z-d06cc7d7',
+      status: 'needs_attention',
+      status_reason_code: 'unit_missing',
+      reason: 'No current workflow unit was found and no normal outcome was recorded.',
+      activity: 'unknown',
+      unit_name: 'aflow-run-20260911t140026z-d06cc7d7.service',
+      workflow_name: null,
+      team: null,
+      current_step: null,
+      started_at: null,
+      ended_at: null,
+      evidence: {
+        unit_observation: 'missing',
+        has_run_metadata: false,
+        can_resume: false,
+        plan_path: 'plans/done/historical-plan.md',
+      },
+    }
+    vi.mocked(api.listControlPlaneRuns).mockResolvedValue({ runs: [historicalGap], next_cursor: null, schema_version: 1 })
+    vi.mocked(api.getControlPlaneRun).mockResolvedValue(historicalGap)
+
+    renderDashboard({ requestedRunId: historicalGap.run_id })
+
+    expect(await screen.findAllByText('Outcome not recorded', { selector: '.status-pill' })).toHaveLength(2)
+    expect(screen.queryByText(/Outcome not recorded — current work is not reported/)).toBeNull()
+    expect(screen.queryByText(historicalGap.reason)).toBeNull()
+    openTechnicalDetails()
+    expect(await screen.findByText(/Canonical status: needs_attention · unit_missing/)).toBeTruthy()
+    expect(screen.getByText(historicalGap.reason)).toBeTruthy()
+    expect(screen.getByText(/aflow-run-20260911t140026z-d06cc7d7\.service/)).toBeTruthy()
   })
 
   it('separates pending control model details from the last executed turn evidence', async () => {

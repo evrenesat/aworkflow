@@ -41,6 +41,7 @@ import {
   runPlanPresentation,
   runPlanPresentationForRun,
   runFinishText,
+  runDisplayProjection,
   isTerminalInactiveRun,
   latestRunResultEvent,
   presentRunEvent,
@@ -707,9 +708,9 @@ function recoveryProvenanceFromEvents(events: RunEvent[]): RecoveryProvenance | 
 }
 
 function runIssue(run: RunStatus): RunIssue | null {
-  const label = statusLabel(run)
-  const failure = run.status === 'failed' || label === 'Failed' || label === 'Could not start'
-  if (!failure && label !== 'Needs attention') return null
+  const category = runDisplayProjection(run).category
+  const failure = category === 'failure'
+  if (!failure && category !== 'actionable-attention') return null
 
   const startupFailure = contextObject(run.evidence.startup_failure)
   const cause = conciseRunText(run.reason)
@@ -3048,7 +3049,9 @@ export function RunDashboard({ visible = true, page, onNewRun, onCancelNewRun, o
       : null
   const deliveryWarning = canonicalDetail ? deliveryIssueText(canonicalDetail.delivery) : null
   const overviewCurrentWork = selectedRun
-    ? (() => {
+    ? runDisplayProjection(selectedRun).category === 'outcome-unrecorded'
+      ? null
+      : (() => {
       const currentWork = isTerminalInactiveRun(selectedRun)
         ? `No current work — ${statusLabel(selectedRun)}.`
         : canonicalProgress
@@ -3690,7 +3693,7 @@ export function RunDashboard({ visible = true, page, onNewRun, onCancelNewRun, o
                       <span id={`${technicalId}-copy-run-id`} className="sr-only">Copy full run ID</span>
                       <LiveRunHeaderTiming run={selectedRun} />
                     </div>
-                    <span className="status-pill">{statusLabel(selectedRun)}</span>
+                    <span className={`status-pill status-${runDisplayProjection(selectedRun).category}`} data-status-category={runDisplayProjection(selectedRun).category}>{statusLabel(selectedRun)}</span>
                     {selectedRun.history_state === 'archived' && <span className="status-pill">Archived</span>}
                     {selectedRun.history_state === 'archived' && <button className="btn btn-secondary" disabled={busyAction === 'history' || historyConfirm !== null} onClick={() => void mutateHistory('restore')}>Restore</button>}
                     {(canRestart || selectedRunHasLiveControls || Boolean(restartAdmission?.reason)) && <MoreMenu label="Run actions" triggerLabel="Actions" triggerContent="Actions" className="run-actions-menu">
@@ -3730,7 +3733,7 @@ export function RunDashboard({ visible = true, page, onNewRun, onCancelNewRun, o
                       {!canResume && !canRestart && <span className="text-sm text-dim">Open Diagnostics for the recorded details.</span>}
                     </div>
                   </section>}
-                  {!selectedRunIssue && selectedRun.reason && <div className="notice">{conciseRunText(selectedRun.reason) ?? 'A run reason was recorded.'}</div>}
+                  {!selectedRunIssue && selectedRun.reason && runDisplayProjection(selectedRun).category !== 'outcome-unrecorded' && <div className="notice">{conciseRunText(selectedRun.reason) ?? 'A run reason was recorded.'}</div>}
                 </>}
                 currentWork={overviewCurrentWork}
                 latestResult={overviewLatestResult}
@@ -3979,6 +3982,7 @@ export function RunDashboard({ visible = true, page, onNewRun, onCancelNewRun, o
                       <h4>Diagnostics summary</h4><span className="text-xs text-dim">run {selectedRun.run_id}</span>
                       {statusUpdatedAt && <p className="text-xs text-dim">Status observed: {timestamp(statusUpdatedAt)}</p>}
                       {contextError && <p className="notice">Diagnostic details are stale. Use Refresh to retry.</p>}
+                      <p>Canonical status: {selectedRun.status}{selectedRun.status_reason_code ? ` · ${selectedRun.status_reason_code}` : ''}</p>
                       <p>Observed state: {statusLabel(selectedRun)}. Worker: {selectedRun.evidence.unit_active === true ? 'active' : selectedRun.evidence.unit_active === false ? 'inactive' : 'activity unconfirmed'}.</p>
                       {selectedRun.worker_exit && <>
                         <p>{selectedRun.worker_exit.stage === 'wrapper_spawn' ? 'Worker could not be spawned' : !selectedRun.evidence.has_run_metadata ? 'Worker exited during startup' : 'Worker exited'}{selectedRun.worker_exit.exit_code !== null ? ` (code ${selectedRun.worker_exit.exit_code})` : ''}</p>

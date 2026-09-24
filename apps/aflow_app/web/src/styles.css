@@ -1450,6 +1450,12 @@ input::placeholder, textarea::placeholder {
   min-width: 0;
 }
 
+.run-list-select .run-row-meta-fact {
+  min-width: 0;
+  max-width: 100%;
+  overflow-wrap: anywhere;
+}
+
 @media (min-width: 960px) and (min-height: 600px) {
   .run-list-item {
     gap: 2px;
@@ -1462,6 +1468,13 @@ input::placeholder, textarea::placeholder {
   .run-list-item .run-row-meta {
     flex-wrap: nowrap;
     column-gap: 4px;
+  }
+
+  .run-list-item .run-row-meta-fact {
+    flex: 1 1 auto;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
   }
 
   .run-list-item .run-row-meta > .status-pill {
@@ -1478,6 +1491,32 @@ input::placeholder, textarea::placeholder {
   color: var(--color-text-dim);
   font-size: 0.75rem;
 
+}
+
+.status-pill.status-active {
+  background: color-mix(in srgb, var(--color-primary) 10%, var(--color-surface));
+  color: var(--color-primary);
+}
+
+.status-pill.status-input-needed,
+.status-pill.status-actionable-attention {
+  background: color-mix(in srgb, var(--color-warning) 14%, var(--color-surface));
+  color: var(--color-warning);
+}
+
+.status-pill.status-failure {
+  background: color-mix(in srgb, var(--color-error) 12%, var(--color-surface));
+  color: var(--color-error);
+}
+
+.status-pill.status-outcome-unrecorded {
+  border: 1px dashed var(--color-border);
+  background: transparent;
+  color: var(--color-text-dim);
+}
+
+.global-run-history-gap-group > h3 {
+  color: var(--color-text-dim);
 }
 
 .status-awaiting {
