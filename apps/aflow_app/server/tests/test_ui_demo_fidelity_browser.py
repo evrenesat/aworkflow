@@ -800,12 +800,13 @@ def test_ui_demo_project_and_global_overview_captures(
 
 
 @pytest.mark.parametrize(
-    ("width", "height", "theme"),
+    ("width", "height", "theme", "held_refresh"),
     (
-        pytest.param(1280, 720, "light", id="desktop-light"),
-        pytest.param(1280, 720, "dark", id="desktop-dark"),
-        pytest.param(390, 844, "light", id="mobile-light"),
-        pytest.param(390, 844, "dark", id="mobile-dark"),
+        pytest.param(1280, 720, "light", False, id="desktop-light"),
+        pytest.param(1280, 720, "dark", False, id="desktop-dark"),
+        pytest.param(390, 844, "light", False, id="mobile-light"),
+        pytest.param(390, 844, "dark", False, id="mobile-dark"),
+        pytest.param(1280, 720, "dark", True, id="desktop-dark-held-refresh"),
     ),
 )
 def test_ui_demo_cp8_plan_editor_and_review_captures(
@@ -815,6 +816,7 @@ def test_ui_demo_cp8_plan_editor_and_review_captures(
     width: int,
     height: int,
     theme: str,
+    held_refresh: bool,
 ) -> None:
     """Capture plan lifecycle, editor, launch draft, and read-only review states."""
     _, root, units, _ = control_client
@@ -1172,19 +1174,43 @@ def test_ui_demo_cp8_plan_editor_and_review_captures(
                 }),
             }
 
-            before_review_click = trace_dom("review-click-before")
+            held_preflight_routes = []
+            if held_refresh:
+                def hold_preflight(route) -> None:
+                    held_preflight_routes.append(route)
+
+                page.route("**/runs/preflight", hold_preflight)
+                with page.expect_request("**/runs/preflight"):
+                    preflight.get_by_role("button", name="Refresh worktree inspection", exact=True).click()
+                expect(preflight).to_have_attribute("data-preflight-status", "loading")
+                loading_observation = trace_dom("review-click-refresh-loading")
+                assert loading_observation["preflight_status"] == "loading", loading_observation
+                assert len(held_preflight_routes) == 1, loading_observation
+                held_preflight_routes.pop().continue_()
+
+            before_review_click = None
             review_region = launch_form.get_by_role("region", name="Review start", exact=True)
             try:
-                expect(review_button).to_be_enabled(timeout=30_000)
+                before_review_click = wait_for_current_preflight("review-click-before", require_review=True)
+                assert before_review_click["preflight_status"] == "ready", before_review_click
+                assert before_review_click["review_enabled"] is True, before_review_click
+                assert {key: before_review_click["launch_identity"][key] for key in ("plan_path", "workflow", "team", "max_turns")} == {
+                    "plan_path": plan_path,
+                    "workflow": "Managed",
+                    "team": "No team — global roles",
+                    "max_turns": "",
+                }, before_review_click
+                if before_review_click["latest_preflight_readiness"] and before_review_click["latest_preflight_readiness"].get("requires_confirmation"):
+                    assert before_review_click["launch_identity"]["dirty_worktree_confirmed"] is True, before_review_click
+                assert before_review_click["review_region_present"] is False, before_review_click
                 review_button.click()
                 expect(review_region).to_be_visible(timeout=30_000)
                 after_review_click = trace_dom("review-click-after")
-                assert before_review_click["preflight_status"] == "ready", before_review_click
-                assert before_review_click["review_enabled"] is True, before_review_click
-                assert before_review_click["review_region_present"] is False, before_review_click
-                assert after_review_click["preflight_status"] == "ready", after_review_click
                 assert after_review_click["review_region_visible"] is True, after_review_click
-                assert after_review_click["launch_identity"] == before_review_click["launch_identity"], {
+                stable_choices = ("plan_path", "workflow", "team", "team_stage", "max_turns", "start_step")
+                assert {key: after_review_click["launch_identity"][key] for key in stable_choices} == {
+                    key: before_review_click["launch_identity"][key] for key in stable_choices
+                }, {
                     "before": before_review_click["launch_identity"],
                     "after": after_review_click["launch_identity"],
                 }

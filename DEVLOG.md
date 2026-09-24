@@ -1,5 +1,28 @@
 # DEVLOG
 
+## 2026-09-24 — Repair the CP8 pre-click evidence race
+
+- CP8 now takes its contractual pre-click snapshot from the bounded predicate
+  after screenshot and anchor work, when the visible preflight is ready, the
+  required acknowledgement is checked, and Review is enabled. It compares
+  stable launch choices across review opening while retaining exact choices,
+  consequence, heading focus, sanitized failure evidence, and zero Start calls.
+- A desktop-dark browser case holds a same-choice preflight refresh after the
+  first ready capture, observes loading, releases the response, and requires
+  the final readiness predicate before the ordinary click. Both Chromium and
+  WebKit passed all five CP8 cases and repeated desktop-dark cases. The
+  desktop-light-dirty changed-files case passed in both engines. Inspected
+  desktop and 390px review captures in both engines; the review, consequence,
+  choices, and focused heading remained visible with zero allocation. Captures
+  are under `/tmp/aflow-cp8-race-captures-{chromium,webkit}`.
+- Web tests passed 632/632 and the production build passed. Full server suites
+  passed 493/493 on Python 3.13 and, on repeat, 493/493 on Python 3.12 (three
+  warnings each). The first 3.12 full run had 492 passes and one intermittent
+  `landscape-light-dirty` follow-up test failure: preflight refreshed back to
+  loading between its ready check and changed-files assertion. That exact case
+  passed in isolation. It remains a separate timing risk outside this focused
+  CP8 repair. `git diff --check` passed; changes are uncommitted for review.
+
 ## 2026-09-24 — Stabilize New run review and disclosure CI cases (Checkpoint 1)
 
 - Reviewed the exact failing CI logs: the Ubuntu CP8 case timed out waiting for
