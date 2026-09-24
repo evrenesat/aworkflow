@@ -370,6 +370,7 @@ def test_ui_followup_run_rows(
     held_loading_routes = []
     stale_mode = {"enabled": False}
     held_stale_routes = []
+    stale_revision_changes: list[tuple[str, str, int, int]] = []
 
     def intercept_row_requests(route) -> None:
         parsed = urlsplit(route.request.url)
@@ -383,7 +384,10 @@ def test_ui_followup_run_rows(
             payload = response.json()
             changed = next((candidate for candidate in payload.get("runs", []) if candidate.get("run_id") == running_id), None)
             if changed is not None:
-                changed["revision"] = int(changed.get("revision", 0)) + 1
+                previous_revision = int(changed.get("revision", 0))
+                changed_revision = previous_revision + 1
+                changed["revision"] = changed_revision
+                stale_revision_changes.append((project_id, running_id, previous_revision, changed_revision))
             route.fulfill(response=response, json=payload)
             return
         if len(parts) == 6 and parts[4] == "runs" and project_id == worktree_id:
@@ -458,6 +462,8 @@ def test_ui_followup_run_rows(
                         title=RUN_ROW_LONG_TITLE,
                         status="Running",
                     )
+                    expect(long_row).to_have_attribute("data-enrichment-state", "settled")
+                    expect(long_row.locator(".compact-run-progress-row")).to_have_attribute("data-progress-state", "settled")
                     long_row.scroll_into_view_if_needed()
                     expect(long_row.locator(".global-run-row-project")).to_have_text(RUN_ROW_PROJECT_LABEL)
                     assert "Duration not reported" not in long_row.inner_text()
@@ -620,7 +626,6 @@ def test_ui_followup_run_rows(
                     search.fill("")
 
                     if theme == "light" and (width, height) == (1280, 720):
-                        stale_mode["enabled"] = True
                         search.fill(running_id)
                         stale_row = _assert_global_run_row(
                             page,
@@ -629,15 +634,39 @@ def test_ui_followup_run_rows(
                             title=RUN_ROW_LONG_TITLE,
                             status="Running",
                         )
+                        expect(stale_row).to_have_attribute("data-enrichment-state", "settled")
+                        stale_progress = stale_row.locator(".compact-run-progress-row")
+                        expect(stale_progress).to_have_attribute("data-progress-state", "settled")
+                        assert stale_progress.get_attribute("data-progress-availability") != "unavailable"
+
+                        stale_mode["enabled"] = True
                         page.get_by_role("button", name="Refresh", exact=True).first.click()
                         expect(stale_row).to_have_attribute("data-enrichment-state", "stale")
                         expect(stale_row.locator(".compact-run-progress-row-notice.stale")).to_contain_text("Run changed; refresh")
                         assert held_stale_routes
-                        for route in held_stale_routes:
+                        expected_detail_path = f"/api/control-plane/projects/{worktree_id}/runs/{running_id}"
+                        assert all(urlsplit(route.request.url).path == expected_detail_path for route in held_stale_routes)
+                        assert any(
+                            project_id == worktree_id
+                            and run_id == running_id
+                            and changed_revision == previous_revision + 1
+                            for project_id, run_id, previous_revision, changed_revision in stale_revision_changes
+                        ), stale_revision_changes
+
+                        released_stale_routes = list(held_stale_routes)
+                        stale_mode["enabled"] = False
+                        for route in released_stale_routes:
                             route.continue_()
                         held_stale_routes.clear()
+                        for route in released_stale_routes:
+                            response = route.request.response()
+                            assert response is not None and response.ok, route.request.url
+                            response.body()
+                        _wait_for_render_settle(page)
                         expect(stale_row).to_have_attribute("data-enrichment-state", "stale")
-                        stale_mode["enabled"] = False
+                        expect(stale_row.locator(".compact-run-progress-row-notice.stale")).to_contain_text("Run changed; refresh")
+                        assert "Loading checkpoint progress…" not in (stale_row.get_attribute("aria-label") or "")
+                        assert "Checkpoint progress unavailable" not in stale_row.inner_text()
 
                     screenshot = artifact_dir / f"run-rows-{browser_name}-{theme}-{width}x{height}.png"
                     page.screenshot(path=str(screenshot), full_page=True)

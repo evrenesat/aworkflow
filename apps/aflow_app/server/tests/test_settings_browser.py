@@ -4,7 +4,7 @@ import os
 import pytest
 import sys
 from pathlib import Path
-from playwright.sync_api import sync_playwright
+from playwright.sync_api import expect, sync_playwright
 from test_control_plane_api import control_client, live_server, TOKEN, PROJECT_ID  # noqa: F401
 
 
@@ -63,12 +63,12 @@ def assert_settings_section_navigation(page, name, width):
     selector = page.get_by_role('combobox', name='Settings section', exact=True)
     tab = page.get_by_role('tab', name=name, exact=True)
     if width < 1200:
-        selector.wait_for(state='visible')
-        assert selector.input_value() == name
+        expect(selector).to_be_visible()
+        expect(selector).to_have_value(name)
         assert page.get_by_role('tab').count() == 0
     else:
-        tab.wait_for(state='visible')
-        assert tab.get_attribute('aria-selected') == 'true'
+        expect(tab).to_be_visible()
+        expect(tab).to_have_attribute('aria-selected', 'true')
         assert selector.count() == 0
 
 
@@ -77,8 +77,11 @@ def open_settings_more(page):
 
 
 def wait_for_changelog_read_only(page):
-    page.wait_for_function("""() => ![...document.querySelectorAll('button')]
-        .some(button => button.textContent?.trim() === 'Save all changes')""")
+    width = (page.viewport_size or {}).get('width', 1280)
+    assert_settings_section_navigation(page, 'Changelog', width)
+    expect(page.get_by_role('heading', name='Changelog', exact=True)).to_be_visible()
+    expect(page.get_by_text('Changes included in this version', exact=True)).to_be_visible()
+    expect(page.get_by_role('button', name='Save all changes', exact=True)).to_have_count(0)
 
 
 def launch_test_browser(playwright):
@@ -189,6 +192,8 @@ def test_changelog_settings_responsive_journey(control_client, tmp_path, monkeyp
         browser = launch_test_browser(playwright)
         try:
             page = browser.new_page(viewport={'width': 1280, 'height': 720})
+            page_errors = []
+            page.on('pageerror', lambda error: page_errors.append(str(error)))
             page.goto(url)
             page.get_by_placeholder('Auth token').fill(TOKEN)
             page.get_by_role('button', name='Login', exact=True).click()
@@ -300,6 +305,7 @@ def test_changelog_settings_responsive_journey(control_client, tmp_path, monkeyp
                     save.wait_for()
                     assert save.count() == 1
                     assert save.is_enabled()
+            assert page_errors == [], page_errors
         finally:
             browser.close()
 

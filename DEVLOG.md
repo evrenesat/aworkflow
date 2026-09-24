@@ -3450,6 +3450,52 @@ HISTORY: Published clipboard history `c14f1f2`/`cd78d53` remains separate and mu
   warning. Full server suite, CI, publication, and live activation remain
   coordinator-owned; this checkpoint is left uncommitted for review.
 
+## 2026-09-24 — Synchronize dashboard CI browser state (Checkpoint 1)
+
+- Inspected CI run `36003918987` on release SHA
+  `eafc3c5861217283507edd63679de4786cb2323e`: Ubuntu 3.12 saw the Save button
+  after Advanced → Guided and a loading row where stale was expected; macOS
+  3.13 failed the selected-tab assertion. The local built-app baseline focused
+  pair passed once, so the CI timing failures did not reproduce in that run.
+- Settings browser assertions now wait for the responsive selected tab or
+  section selector, visible Changelog heading/content, and Save-button absence
+  before confirming read-only state. Existing draft, save, responsive, theme,
+  and overflow assertions remain; the journey also checks for page errors.
+- The run-row journey waits for settled initial enrichment and available
+  progress before Refresh, records the list revision increase, verifies the
+  exact project/run detail request is held, then waits for released response
+  bodies and a render turn before confirming the stale notice remains. Existing
+  no-write, density, preview, partial/zero facts, viewport, overflow and page
+  error checks remain intact.
+- Inspected built-app screenshots at 1280×720 and 320×568 in WebKit. The
+  desktop Changelog shows its selected tab with no Save action; row evidence
+  shows the stale notice on desktop and readable Running status on phone with
+  no horizontal overflow. The phone Changelog capture was taken after the
+  document-scroll assertion; its selected compact selector was verified by
+  the browser assertion.
+- Verification: `uv run --directory apps/aflow_app/server pytest -q
+  tests/test_settings_browser.py::test_changelog_settings_responsive_journey
+  tests/test_ui_followup_fidelity_browser.py::test_ui_followup_run_rows` passed
+  three consecutive Chromium runs and one `AFLOW_TEST_BROWSER=webkit` run
+  (`2 passed` each). `npm --prefix apps/aflow_app/web test -- --run` passed
+  629 tests across 29 files; `npm --prefix apps/aflow_app/web run build` passed
+  with the existing chunk-size warning. `uv run --directory
+  apps/aflow_app/server pytest -q` passed once (`480 passed`) before the final
+  response-body wait cleanup; the final-state run had `479 passed` and one
+  unrelated CP8 Review modal timeout, whose isolated rerun passed.
+- `AFLOW_TEST_BROWSER=webkit uv run --directory apps/aflow_app/server pytest -q
+  tests/test_settings_browser.py tests/test_ui_followup_fidelity_browser.py
+  tests/test_run_progress_browser.py` on final-state tests had `23 passed` and one
+  repeatable unrelated failure: the existing dirty mobile Skills editor test
+  measured the textarea at y=`282.5625px`, exceeding its approved 280px limit.
+  This was reproduced four times. An earlier broad run also exposed row-page
+  access errors while using `Response.finished()`; after switching to response
+  body completion, the row test passed alone and in the final broader run.
+- The initial attempt left Checkpoint 1 open because the broader WebKit gate
+  exposed the Skills layout defect, outside the test-only scope. No checkpoint
+  commit, publication, or deployment was made; the scoped implementation stayed
+  uncommitted for review.
+
 ## 2026-09-24 — Restore mobile Skills editor viewport (Checkpoint 1)
 
 - Reproduced the WebKit 390×844 overflow: heading y=178/h=104.56; Back
@@ -3476,3 +3522,30 @@ HISTORY: Published clipboard history `c14f1f2`/`cd78d53` remains separate and mu
   build passed with its existing chunk-size warning. Physical mobile keyboard
   and browser-toolbar behavior remains unverified. The changes are uncommitted
   for checkpoint review.
+
+## 2026-09-24 — Resume dashboard CI browser gate (Checkpoint 1)
+
+- Verified the independently Sol/Astra-approved mobile commit
+  `6d0c273c9f0275e8eb9d9772f8fe014b41c60abb` has parent
+  `eafc3c5861217283507edd63679de4786cb2323e` and changes only this log plus the
+  mobile Back padding in `styles.css`. Fast-forwarded the managed branch to the
+  approved commit (no new commit), restored the two browser-test files
+  byte-for-byte from the predecessor backup, and retained both DEVLOG entries.
+- Combined verification on the worktree passed: web suite 629/29 files; build
+  passed with its existing chunk-size warning; focused Changelog/run-row pair
+  passed three consecutive Chromium runs and one WebKit run (2 passed each);
+  full server suite 480 passed; broader WebKit Settings/row/progress suite
+  24 passed; `git diff --check` passed. The existing deprecation warnings remain.
+- Inspected fresh WebKit captures: desktop Changelog shows its selected tab and
+  no Save action; the 320px page shows Changelog content without Save. The
+  compact selector's Playwright visibility/value assertions pass, though that
+  saved after-scroll phone capture does not visibly show the selector; this is
+  surfaced for Sol/Astra review. Desktop row evidence shows the stale notice;
+  phone row evidence keeps Running status readable. Browser checks report no
+  page errors, writes, or horizontal overflow. Skills light/dark 390×844 captures
+  show the editor starting near y=265; geometry and Back/Wrap target assertions
+  pass. Physical mobile keyboard and browser-toolbar behavior remains
+  unverified.
+- Checkpoint 1 is ready for normal Sol/Astra review, with its changes uncommitted
+  on top of approved HEAD `6d0c273c`. No publish or primary-checkout change was
+  made.
