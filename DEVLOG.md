@@ -1,5 +1,29 @@
 # DEVLOG
 
+## 2026-09-24 — Revalidate Teams browser journeys on compact-row candidate (Checkpoint 1)
+
+- Reproduced the stale desktop `Inherited roles` locator on `b81563a`: it
+  matched six nested summaries in the assignment-first DOM. Updated browser
+  checks to target the visible primary Worker/Reviewer rows and named nested
+  disclosures while retaining inheritance source, override/restore, save/reload,
+  launch identity, and viewport assertions. The stale compact-progress check now
+  verifies both the accessible full label and visible `1/2 approved` text.
+- The 320×568 held-pointer case uses real wheel and keyboard input to reveal the
+  stage control, verifies bounds and `elementFromPoint`, and dispatches real
+  pointer events. It retains the 0.5px geometry limit and waits for three stable
+  animation frames before measurement; no product source changed.
+- Validation: web tests passed 629/629; build passed; focused Teams matrices
+  passed 10/10 in Chromium and 10/10 in WebKit; the full server suite passed
+  480/480; broader WebKit responsive/progress/fidelity tests passed 70/70.
+  An earlier full-server attempt had one transient CP8 mobile-dark review timeout;
+  that case passed alone and the final full-server rerun was clean.
+- Inspected populated 1280×720 desktop and 320×568 phone light/dark captures in
+  both engines. Primary assignments remain visible before collapsed Advanced
+  details, keyboard focus is visible, and the responsive checks report no
+  horizontal overflow. The production build retains its existing 534.64kB
+  chunk-size warning. Scope is the browser test module, DEVLOG, and this plan;
+  no checkpoint commit was created.
+
 ## 2026-09-24 — Add local macOS AFlow dashboard launcher
 
 - Added `scripts/aflow_ui` for an explicit open-or-update choice when the local

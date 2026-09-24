@@ -475,6 +475,71 @@ def _select_settings_section(page: Page, name: str) -> None:
         page.get_by_role("tab", name=name, exact=True).click()
 
 
+def _team_family_primary_role_row(detail, role: str):
+    row = detail.locator(".team-family-primary-role").filter(
+        has_text=re.compile(rf"^{re.escape(role)}")
+    )
+    expect(row).to_have_count(1)
+    expect(row).to_be_visible()
+    return row
+
+
+def _open_team_family_disclosure(detail, label: str):
+    advanced = detail.locator("details.team-family-advanced-details")
+    advanced_summary = advanced.locator(":scope > summary")
+    expect(advanced_summary).to_be_visible()
+    if advanced.get_attribute("open") is None:
+        advanced_summary.click()
+    disclosure = advanced.locator("details.team-family-disclosure").filter(
+        has_text=re.compile(rf"^{re.escape(label)}")
+    )
+    expect(disclosure).to_have_count(1)
+    expect(disclosure.locator(":scope > summary")).to_be_visible()
+    if disclosure.get_attribute("open") is None:
+        disclosure.locator(":scope > summary").click()
+    assert advanced.get_attribute("open") is not None
+    assert disclosure.get_attribute("open") is not None
+    return disclosure
+
+
+def _wait_for_team_family_stage_to_settle(page: Page) -> None:
+    page.wait_for_function(
+        """() => {
+            const target = [...document.querySelectorAll('.team-family-stage-selector button')]
+                .find(button => button.getAttribute('aria-label') === 'Stronger worker');
+            if (!target) return false;
+            return new Promise(resolve => {
+                const frames = [];
+                const sample = () => {
+                    const rect = target.getBoundingClientRect();
+                    frames.push({top: rect.top, bottom: rect.bottom, scrollY: window.scrollY});
+                    if (frames.length < 3) {
+                        requestAnimationFrame(sample);
+                        return;
+                    }
+                    const first = frames[0];
+                    const stable = frames.every(frame =>
+                        Math.abs(frame.top - first.top) <= 0.5 &&
+                        Math.abs(frame.scrollY - first.scrollY) <= 0.5
+                    );
+                    const last = frames.at(-1);
+                    resolve(stable && last.top >= 0 && last.bottom <= innerHeight);
+                };
+                requestAnimationFrame(sample);
+            });
+        }"""
+    )
+
+
+def _focus_team_family_stage_with_keyboard(page: Page, target) -> None:
+    for _ in range(24):
+        if target.evaluate("element => element === document.activeElement"):
+            expect(target).to_be_focused()
+            return
+        page.keyboard.press("Shift+Tab")
+    raise AssertionError("Shift+Tab did not reach the Stronger worker stage button")
+
+
 def _ensure_project(page: Page) -> None:
     _open_destination(page, "Projects")
     project = page.get_by_role("button", name="Test project", exact=False).first
@@ -999,6 +1064,8 @@ def test_family_stage_click_survives_preview_completion(
                             label: button.getAttribute('aria-label'),
                             pressed: button.getAttribute('aria-pressed'),
                         })),
+                    scrollY: window.scrollY,
+                    viewport: {width: innerWidth, height: innerHeight},
                     pending: Boolean(document.querySelector('[aria-label="Preview refresh pending"]')),
                     announcement: [...document.querySelectorAll('[role="status"]')]
                         .map(node => node.textContent?.trim() ?? '')
@@ -1045,15 +1112,28 @@ def test_family_stage_click_survives_preview_completion(
             detail.wait_for()
             detail.get_by_role("button", name="Base product", exact=True).click()
             choose_profile(page, "Reviewer", "codex.review_alt")
+            advanced = detail.locator("details.team-family-advanced-details")
+            expect(advanced.locator(":scope > summary")).to_be_visible()
+            assert advanced.get_attribute("open") is None
+            base_worker_row = _team_family_primary_role_row(detail, "Worker")
+            base_reviewer_row = _team_family_primary_role_row(detail, "Reviewer")
+            expect(base_worker_row).to_contain_text("Local override")
+            expect(base_worker_row.get_by_role("combobox")).to_have_value(re.compile(r"codex\.standard"))
+            expect(base_reviewer_row).to_contain_text("Local override")
+            expect(base_reviewer_row.get_by_role("combobox")).to_have_value(re.compile(r"codex\.review_alt"))
             detail.get_by_role("button", name="Stronger worker", exact=True).click()
-            inherited_roles = detail.locator("details").filter(has_text=re.compile(r"Inherited roles")).first
-            if inherited_roles.get_attribute("open") is None:
-                inherited_roles.locator("summary").click()
-            reviewer_row = detail.locator(".team-family-role-row").filter(has_text="Reviewer").first
+            worker_row = _team_family_primary_role_row(detail, "Worker")
+            reviewer_row = _team_family_primary_role_row(detail, "Reviewer")
+            expect(worker_row).to_contain_text("Local override")
+            expect(worker_row.get_by_role("combobox")).to_have_value(re.compile(r"codex\.strong"))
+            expect(worker_row.get_by_role("button", name="Restore inheritance", exact=True)).to_be_visible()
+            expect(reviewer_row).to_contain_text("Inherited from declared by Base (product)")
             expect(reviewer_row).to_contain_text("codex.review_alt")
+            expect(reviewer_row.get_by_role("button", name="Override role", exact=True)).to_be_visible()
             reviewer_row.get_by_role("button", name="Override role", exact=True).click()
             choose_profile(page, "Reviewer", "codex.review_child")
             expect(reviewer_row.get_by_role("combobox")).to_have_value(re.compile(r"codex\.review_child"))
+            expect(reviewer_row).to_contain_text("Local override")
             detail.get_by_role("button", name="Base product", exact=True).click()
 
             field = page.get_by_role("combobox", name="Reviewer", exact=True)
@@ -1064,7 +1144,17 @@ def test_family_stage_click_survives_preview_completion(
             assert held_response is not None, "final reviewer preview was not intercepted"
 
             target = detail.get_by_role("button", name="Stronger worker", exact=True)
-            target.scroll_into_view_if_needed()
+            if width == 320:
+                initial_box = target.bounding_box()
+                assert initial_box is not None
+                page.mouse.move(width / 2, height / 2)
+                wheel_delta = round(initial_box["y"] + initial_box["height"] / 2 - height / 2)
+                page.mouse.wheel(0, wheel_delta if wheel_delta else -1)
+                _wait_for_team_family_stage_to_settle(page)
+                _focus_team_family_stage_with_keyboard(page, target)
+                _wait_for_team_family_stage_to_settle(page)
+            else:
+                target.scroll_into_view_if_needed()
             before_box = target.bounding_box()
             assert before_box is not None
             assert 0 <= before_box["x"] and before_box["x"] + before_box["width"] <= width, before_box
@@ -1086,15 +1176,40 @@ def test_family_stage_click_survives_preview_completion(
 
             pending_screenshot = tmp_path / f"family-stage-click-{browser_name}-{width}x{height}-pending.png"
             page.mouse.move(x, y)
-            page.screenshot(path=str(pending_screenshot), full_page=True)
+            page.screenshot(path=str(pending_screenshot))
+            before_box = target.bounding_box()
+            assert before_box is not None
+            assert 0 <= before_box["x"] and before_box["x"] + before_box["width"] <= width, before_box
+            assert 0 <= before_box["y"] and before_box["y"] + before_box["height"] <= height, before_box
+            x = before_box["x"] + before_box["width"] / 2
+            y = before_box["y"] + before_box["height"] / 2
+            before_snapshot = stage_snapshot(page, x, y)
+            assert before_snapshot["hit"]["buttonLabel"] == "Stronger worker", before_snapshot
+            page.mouse.move(x, y)
+            hover_snapshot = stage_snapshot(page, x, y)
+            assert hover_snapshot["hit"]["buttonLabel"] == "Stronger worker", hover_snapshot
             page.mouse.down()
             # Native focus can settle the surrounding fieldset as the prior
             # combobox blurs; compare the held preview response from the
             # pointer-down geometry through settlement.
+            _wait_for_team_family_stage_to_settle(page)
             down_box = target.bounding_box()
             down_snapshot = stage_snapshot(page, x, y)
             assert down_box is not None
-            assert down_snapshot["hit"]["buttonLabel"] == "Stronger worker", down_snapshot
+            pointerdown_debug = {
+                "scrollY_delta": down_snapshot["scrollY"] - before_snapshot["scrollY"],
+                "target_y_delta": down_box["y"] - before_box["y"],
+                "pointerdown_target": page.evaluate(
+                    "() => window.__familyStageEvents.slice(-1)[0]?.target ?? null"
+                ),
+                "pointer": {"x": x, "y": y},
+                "before_box": before_box,
+                "pointerdown_box": down_box,
+                "hit": down_snapshot["hit"],
+            }
+            if pointerdown_debug["hit"]["buttonLabel"] != "Stronger worker":
+                print("FAMILY_STAGE_POINTERDOWN_DEBUG", json.dumps(pointerdown_debug, sort_keys=True))
+            assert pointerdown_debug["hit"]["buttonLabel"] == "Stronger worker", pointerdown_debug
             assert down_snapshot["pending"] is True, down_snapshot
             assert down_snapshot["announcement"] == "Refreshing effective team and workflow projections…", down_snapshot
 
@@ -1103,10 +1218,13 @@ def test_family_stage_click_survives_preview_completion(
             response_released = True
             expect(page.get_by_role("img", name="Preview refresh pending", exact=True)).to_have_count(0)
             expect(page.get_by_role("img", name="Preview settled", exact=True)).to_be_visible()
+            settled_pre_screenshot_box = target.bounding_box()
+            assert settled_pre_screenshot_box is not None
+            settled_screenshot = tmp_path / f"family-stage-click-{browser_name}-{width}x{height}-settled.png"
+            page.screenshot(path=str(settled_screenshot))
+            _wait_for_team_family_stage_to_settle(page)
             settled_box = target.bounding_box()
             assert settled_box is not None
-            settled_screenshot = tmp_path / f"family-stage-click-{browser_name}-{width}x{height}-settled.png"
-            page.screenshot(path=str(settled_screenshot), full_page=True)
             settled_snapshot = stage_snapshot(page, x, y)
             assert settled_snapshot["hit"]["buttonLabel"] == "Stronger worker", settled_snapshot
             assert settled_snapshot["pending"] is False, settled_snapshot
@@ -1115,6 +1233,7 @@ def test_family_stage_click_survives_preview_completion(
                 assert abs(settled_box[key] - down_box[key]) <= 0.5, {
                     "key": key,
                     "pointerdown": down_box,
+                    "settled_pre_screenshot": settled_pre_screenshot_box,
                     "settled": settled_box,
                     "pointerdown_snapshot": down_snapshot,
                     "settled_snapshot": settled_snapshot,
@@ -1122,8 +1241,9 @@ def test_family_stage_click_survives_preview_completion(
 
             page.mouse.up()
             expect(target).to_have_attribute("aria-pressed", "true")
-            reviewer_row = detail.locator(".team-family-role-row").filter(has_text="Reviewer").first
+            reviewer_row = _team_family_primary_role_row(detail, "Reviewer")
             expect(reviewer_row.get_by_role("combobox")).to_have_value(re.compile(r"codex\.review_child"))
+            expect(reviewer_row).to_contain_text("Local override")
             stronger_worker_pressed = target.get_attribute("aria-pressed")
             child_reviewer_text = reviewer_row.get_by_role("combobox").input_value()
             events = page.evaluate("() => window.__familyStageEvents ?? []")
@@ -1133,8 +1253,9 @@ def test_family_stage_click_survives_preview_completion(
             detail.get_by_role("button", name="Base product", exact=True).click()
             base = detail.get_by_role("button", name="Base product", exact=True)
             expect(base).to_have_attribute("aria-pressed", "true")
-            base_reviewer = detail.locator(".team-family-role-row").filter(has_text="Reviewer").first
+            base_reviewer = _team_family_primary_role_row(detail, "Reviewer")
             expect(base_reviewer.get_by_role("combobox")).to_have_value(re.compile(r"codex\.review_final"))
+            expect(base_reviewer).to_contain_text("Local override")
 
             artifact = {
                 "viewport": {"width": width, "height": height},
@@ -1584,9 +1705,9 @@ def test_global_run_overview_visible_progress_journey(control_client, monkeypatc
             expect(row.locator(".compact-run-progress")).to_have_attribute(
                 "data-progress-availability", "complete"
             )
-            expect(row.locator(".compact-run-progress")).to_contain_text(
-                "1 of 2 checkpoints approved"
-            )
+            progress = row.locator(".compact-run-progress")
+            expect(progress).to_have_attribute("aria-label", "1 of 2 checkpoints approved")
+            expect(progress).to_contain_text("1/2 approved")
             page.wait_for_function(
                 "() => [...document.querySelectorAll('.global-run-row')].every(row => "
                 "row.getAttribute('data-enrichment-state') === 'settled')"
@@ -2599,55 +2720,73 @@ def test_responsive_team_family_journey(
             # Base propagation and child override restoration retain raw IDs.
             select_family(page, "Product development")
             detail = page.locator(".team-family-detail")
+            advanced = detail.locator("details.team-family-advanced-details")
+            expect(advanced.locator(":scope > summary")).to_be_visible()
+            assert advanced.get_attribute("open") is None
             detail.get_by_role("button", name="Base product", exact=True).click()
             choose_profile(page, "Reviewer", "codex.review_alt")
+            base_worker_row = _team_family_primary_role_row(detail, "Worker")
+            base_reviewer_row = _team_family_primary_role_row(detail, "Reviewer")
+            expect(base_worker_row).to_contain_text("Local override")
+            expect(base_worker_row.get_by_role("combobox")).to_have_value(re.compile(r"codex\.standard"))
+            expect(base_reviewer_row).to_contain_text("Local override")
+            expect(base_reviewer_row.get_by_role("combobox")).to_have_value(re.compile(r"codex\.review_alt"))
             detail.get_by_role("button", name="Stronger worker", exact=True).click()
-            inherited_roles = detail.locator("details").filter(has_text=re.compile(r"Inherited roles")).first
-            if inherited_roles.get_attribute("open") is None:
-                inherited_roles.locator("summary").click()
-            reviewer_row = detail.locator(".team-family-role-row").filter(has_text="Reviewer").first
+            worker_row = _team_family_primary_role_row(detail, "Worker")
+            reviewer_row = _team_family_primary_role_row(detail, "Reviewer")
+            expect(worker_row).to_contain_text("Local override")
+            expect(worker_row.get_by_role("combobox")).to_have_value(re.compile(r"codex\.strong"))
+            expect(worker_row.get_by_role("button", name="Restore inheritance", exact=True)).to_be_visible()
+            expect(reviewer_row).to_contain_text("Inherited from declared by Base (product)")
             expect(reviewer_row).to_contain_text("codex.review_alt")
+            expect(reviewer_row.get_by_role("button", name="Override role", exact=True)).to_be_visible()
             detail.get_by_role("button", name="Base product", exact=True).click()
             save_settings(page)
             reload_team_settings(page)
             select_family(page, "Product development")
             detail = page.locator(".team-family-detail")
             detail.get_by_role("button", name="Stronger worker", exact=True).click()
-            detail.locator("summary", has_text=re.compile(r"Inherited roles")).click()
-            reviewer_row = detail.locator(".team-family-role-row").filter(has_text="Reviewer").first
+            worker_row = _team_family_primary_role_row(detail, "Worker")
+            reviewer_row = _team_family_primary_role_row(detail, "Reviewer")
+            expect(worker_row).to_contain_text("Local override")
+            expect(reviewer_row).to_contain_text("Inherited from declared by Base (product)")
             expect(reviewer_row).to_contain_text("codex.review_alt")
+            expect(reviewer_row.get_by_role("button", name="Override role", exact=True)).to_be_visible()
             reviewer_row.get_by_role("button", name="Override role", exact=True).click()
             choose_profile(page, "Reviewer", "codex.review_child")
+            expect(reviewer_row).to_contain_text("Local override")
             detail.get_by_role("button", name="Base product", exact=True).click()
             choose_profile(page, "Reviewer", "codex.review_final")
             detail.get_by_role("button", name="Stronger worker", exact=True).click()
-            reviewer_row = detail.locator(".team-family-role-row").filter(has_text="Reviewer").first
+            reviewer_row = _team_family_primary_role_row(detail, "Reviewer")
             expect(reviewer_row.get_by_role("combobox")).to_have_value(re.compile(r"codex\.review_child"))
+            expect(reviewer_row).to_contain_text("Local override")
             detail.get_by_role("button", name="Base product", exact=True).click()
             save_settings(page)
             reload_team_settings(page)
             select_family(page, "Product development")
             detail = page.locator(".team-family-detail")
             detail.get_by_role("button", name="Stronger worker", exact=True).click()
-            reviewer_row = detail.locator(".team-family-role-row").filter(has_text="Reviewer").first
+            reviewer_row = _team_family_primary_role_row(detail, "Reviewer")
             expect(reviewer_row.get_by_role("combobox")).to_have_value(re.compile(r"codex\.review_child"))
+            expect(reviewer_row).to_contain_text("Local override")
             reviewer_row.get_by_role("button", name="Restore inheritance", exact=True).click()
-            inherited_roles = detail.locator("details").filter(has_text=re.compile(r"Inherited roles")).first
-            if inherited_roles.get_attribute("open") is None:
-                inherited_roles.locator("summary").click()
-            reviewer_row = detail.locator(".team-family-role-row").filter(has_text="Reviewer").first
+            reviewer_row = _team_family_primary_role_row(detail, "Reviewer")
+            expect(reviewer_row).to_contain_text("Inherited from declared by Base (product)")
+            expect(reviewer_row.get_by_role("button", name="Override role", exact=True)).to_be_visible()
             expect(reviewer_row).to_contain_text("codex.review_final")
             save_settings(page)
             reload_team_settings(page)
             select_family(page, "Product development")
             detail = page.locator(".team-family-detail")
             detail.get_by_role("button", name="Stronger worker", exact=True).click()
-            detail.locator("summary", has_text=re.compile(r"Inherited roles")).click()
-            reviewer_row = detail.locator(".team-family-role-row").filter(has_text="Reviewer").first
+            reviewer_row = _team_family_primary_role_row(detail, "Reviewer")
+            expect(reviewer_row).to_contain_text("Inherited from declared by Base (product)")
             expect(reviewer_row).to_contain_text("codex.review_final")
 
             # Existing simple-family route controls reorder and remove safely.
             detail.get_by_role("button", name="Strongest worker", exact=True).click()
+            _open_team_family_disclosure(detail, "Upgrade routing")
             detail.get_by_role("button", name="Move stage earlier", exact=True).click()
             expect(page.locator(".team-family-summary-route")).to_contain_text(
                 "Base → Strongest worker → Stronger worker"
@@ -2770,7 +2909,7 @@ def test_responsive_team_family_journey(
             expect(detail).to_contain_text("browser_family_strongest_worker")
 
             # A failed CAS write must keep the edited draft in the browser.
-            detail.get_by_text("Name and identity", exact=True).click()
+            _open_team_family_disclosure(detail, "Name and identity")
             display_input = detail.get_by_label("Display name", exact=True)
             conflict_value = "Conflict retained family"
             display_input.fill(conflict_value)
@@ -2803,12 +2942,13 @@ def test_responsive_team_family_journey(
             # Legacy conversion is preview-only until the explicit draft action.
             select_family(page, "Legacy base")
             detail = page.locator(".team-family-detail")
-            identity = detail.locator("details").filter(has=page.get_by_text("Name and identity", exact=True))
-            if identity.get_attribute("open") is not None:
-                identity.locator("summary").click()
+            advanced = detail.locator("details.team-family-advanced-details")
+            if advanced.get_attribute("open") is not None:
+                advanced.locator(":scope > summary").click()
+            expect(advanced.locator(":scope > summary")).to_be_visible()
             detail.scroll_into_view_if_needed()
             page.screenshot(path=str(tmp_path / "teams-legacy-default.png"), full_page=True)
-            detail.get_by_text("Convert to family…", exact=True).click()
+            _open_team_family_disclosure(detail, "Convert to family…")
             detail.get_by_role("button", name="Preview convert to family", exact=True).click()
             conversion = page.get_by_role("region", name="Legacy conversion preview", exact=True)
             conversion.wait_for()
@@ -2837,6 +2977,7 @@ def test_responsive_team_family_journey(
             _clear_test_text_zoom(page)
             _assert_header_and_flow(page)
             for theme in ("light", "dark"):
+                page.set_viewport_size({"width": width, "height": height})
                 _set_theme_preference(page, theme)
                 page.reload()
                 page.get_by_role("heading", name="Settings", exact=True).wait_for()
@@ -2844,9 +2985,29 @@ def test_responsive_team_family_journey(
                 _assert_theme(page, theme)
                 select_family(page, family_label)
                 _assert_header_and_flow(page)
+                advanced = detail.locator("details.team-family-advanced-details")
+                if advanced.get_attribute("open") is not None:
+                    advanced.locator(":scope > summary").click()
+                expect(advanced.locator(":scope > summary")).to_be_visible()
+                assert advanced.get_attribute("open") is None
+                _team_family_primary_role_row(detail, "Worker")
+                _team_family_primary_role_row(detail, "Reviewer")
                 image = tmp_path / f"team-family-{browser_name}-{width}x{height}-{theme}.png"
                 page.screenshot(path=str(image), full_page=True)
                 print("TEAM_FAMILY_SCREENSHOT", image)
+
+                if (width, height) in {(320, 568), (1280, 720)}:
+                    focus_target = page.get_by_role("combobox", name="Worker", exact=True)
+                    focus_target.focus()
+                    focus_target.press("Tab")
+                    assert page.evaluate(
+                        "() => document.activeElement?.matches(':focus-visible') ?? false"
+                    )
+                    focus_image = tmp_path / (
+                        f"team-family-{browser_name}-{width}x{height}-{theme}-focus.png"
+                    )
+                    page.screenshot(path=str(focus_image), full_page=True)
+                    print("TEAM_FAMILY_FOCUS_SCREENSHOT", focus_image)
 
                 page.set_viewport_size({"width": 390, "height": 420})
                 if _compact(page):
@@ -2854,7 +3015,7 @@ def test_responsive_team_family_journey(
                     expect(page.locator(".team-families-settings .sidebar-editor-detail")).not_to_be_hidden()
                 select_family(page, family_label)
                 _assert_header_and_flow(page)
-            page.get_by_text("Name and identity", exact=True).click()
+            _open_team_family_disclosure(detail, "Name and identity")
             short_input = page.get_by_label("Display name", exact=True)
             short_input.focus()
             assert short_input.evaluate("element => document.activeElement === element")
