@@ -1187,6 +1187,7 @@ def test_ui_demo_cp8_plan_editor_and_review_captures(
                 assert loading_observation["preflight_status"] == "loading", loading_observation
                 assert len(held_preflight_routes) == 1, loading_observation
                 held_preflight_routes.pop().continue_()
+                page.unroute("**/runs/preflight", hold_preflight)
 
             before_review_click = None
             review_region = launch_form.get_by_role("region", name="Review start", exact=True)
