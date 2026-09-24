@@ -1,6 +1,6 @@
 # Architecture
 
-AFlow is a plan-driven workflow orchestrator that runs coding tasks through existing AI agent CLIs (Claude, Codex, Copilot, Gemini, Kiro, Muse, OpenCode, Pi, and Reasonix). It reads a checkpoint-based Markdown plan, dispatches steps to configurable harness profiles, evaluates condition-based transitions between steps, and logs every turn to disk.
+AFlow is a plan-driven workflow orchestrator that runs coding tasks through existing AI agent CLIs (Claude, Codex, Copilot, Gemini, Kiro, Muse, OpenCode, Pi, Reasonix, and Strands). It reads a checkpoint-based Markdown plan, dispatches steps to configurable harness profiles, evaluates condition-based transitions between steps, and logs every turn to disk.
 
 `RunMetadataWriter` is the workflow controller's bound schema-v2 persistence boundary, holding stable run identity while each write supplies mutable lifecycle state explicitly.
 
@@ -846,7 +846,7 @@ The condition evaluator is a full recursive-descent parser supporting `&&`, `||`
 Prompt templates support `file://` references (absolute, config-relative, or cwd-relative).
 
 ### `harnesses/`
-Adapter layer. Each harness implements `HarnessAdapter.build_invocation()` to produce a `HarnessInvocation` (argv, env, prompt texts). Ten adapters:
+Adapter layer. Each harness implements `HarnessAdapter.build_invocation()` to produce a `HarnessInvocation` (argv, env, prompt texts). The adapters include:
 
 | Harness    | CLI binary  | Prompt mode                    | Effort support |
 |------------|-------------|--------------------------------|----------------|
@@ -858,6 +858,7 @@ Adapter layer. Each harness implements `HarnessAdapter.build_invocation()` to pr
 | `muse`     | `muse`      | system prefixed into user prompt | Yes          |
 | `opencode` | `opencode`  | system prefixed into user prompt | No           |
 | `reasonix` | `reasonix`  | system prefixed into user prompt | Yes          |
+| `strands`  | `strands`   | native ACP prompt or print stdin | Yes          |
 | `pi`       | `pi`        | `--system-prompt` flag         | Yes            |
 | `zcode`    | `zcode`     | system prefixed into user prompt | No           |
 
@@ -882,6 +883,17 @@ prompt, and close. Before prompting it must negotiate the exact
 values. Any missing, malformed, rejected, or reset state closes the process and
 terminalizes the run before the prompt. A permissive global Reasonix permissions
 file is not AFlow's proof that an owned ACP session is noninteractive.
+
+Strands uses the published `@strands-agents/cli` 0.1.2 ACP server. Discovery
+negotiates `initialize` without opening a session. Each worker turn starts a
+fresh process in the execution workspace, sends one `session/new` and one
+`session/prompt`, and closes the process. The adapter passes model, effort,
+canonical skill directory, and a private provider env-file path through native
+CLI flags. It keeps final assistant text separate from protocol events and
+retains the terminal usage object when Strands sends one. It advertises no
+resume or steering capability. The ordinary one-shot path uses `strands
+--print`; credentials remain in the provider env file rather than
+`HarnessInvocation.env`, which is persisted to run artifacts.
 
 Codex uses the documented `codex exec ... -` form: the complete effective
 prompt is sent through stdin and is never added to argv. The subprocess
@@ -998,7 +1010,7 @@ records as words.
 Owns the bundled skill registry and package-resource lookup: `BUNDLED_SKILL_METADATA` with `DEFAULT_BUNDLED_SKILL_NAMES`, `OPTIONAL_BUNDLED_SKILL_NAMES`, and the sorted `BUNDLED_SKILL_NAMES` inventory, plus exact-name validation and `discover_bundled_skills()` over `importlib.resources`. The module depends only on package resources so the installer and the skill store share one registry without importing each other. `skill_installer` re-exports the registry names its CLI contract has always exposed.
 
 ### `skill_installer.py`
-One shared installation service behind `aflow install-skills`: it refreshes the selected bundled skills in the canonical store (through `skill_store.py`) and links each selected skill into every destination with an absolute directory symlink to `~/.config/aflow/skills/<name>` — nothing copies skill trees. The exact eleven-harness map is detected with `shutil.which` (including `kiro-cli` for kiro): `claude` → `~/.claude/skills`, `kiro` → `~/.kiro/skills`, `zcode` → `~/.zcode/skills`, and the eight harnesses `codex`, `copilot`, `dsh`, `gemini`, `muse`, `opencode`, `pi`, and `reasonix` share `~/.agents/skills` as one deduplicated operation per selected skill. Installations keep the existing selection semantics (default set excludes `aflow-assistant`, `--include-optional` adds it, repeated `--only` deduplicates, manual destinations, preview, cancellation, noninteractive `--yes`, and no-target errors). Links are idempotent; wrong or dangling links are replaced in place; an existing real directory is renamed to a unique temporary sibling, linked, and then removed, with the exact owned path reported if cleanup fails and the directory restored if linking fails. Manual destinations overlapping the canonical store are rejected, and the legacy `~/.config/opencode/skills` location is never migrated. Every run returns a structured `InstallResult` with per-skill/destination status (`linked`, `already_linked`, `failed`, `unattempted`), the canonical refresh status, and bounded error codes; the batch stops at the first mutation failure. The registry itself lives in `skill_catalog.py` and is re-exported here.
+One shared installation service behind `aflow install-skills` refreshes bundled skills in the canonical store and links each selected skill into every destination. The twelve-harness map is detected with `shutil.which` (including `kiro-cli` for Kiro): `claude` uses `~/.claude/skills`, `kiro` uses `~/.kiro/skills`, `zcode` uses `~/.zcode/skills`, and `codex`, `copilot`, `dsh`, `gemini`, `muse`, `opencode`, `pi`, `reasonix`, and `strands` share `~/.agents/skills`. Installation deduplicates that shared destination. Links point to saved canonical copies under `~/.config/aflow/skills/`; edits to a saved skill are visible through existing links. Preview, selection, cancellation, idempotence, displacement rollback, and structured result behavior remain in `skill_installer.py`.
 
 ### `skill_store.py`
 Owns the canonical per-account skill document store at `Path.home() / '.config' / 'aflow' / 'skills'`. Reads are pure: the effective `SKILL.md` is the saved canonical file when present, otherwise that name's bundled package resource, and a malformed canonical document is a bounded error rather than a silent package fallback. Reads never create, initialize, refresh, or reinstall anything. Documents are validated completely (UTF-8, no NUL bytes, at most 1 MiB, YAML frontmatter whose `name` matches and whose `description` is a nonempty string, nonempty Markdown body) with a safe YAML parser that rejects anchors/aliases before expansion; extra safe frontmatter fields are permitted and the Markdown body is never executed or templated. `save(name, content, expected_revision)` is a compare-and-swap on the SHA-256 revision of the effective `SKILL.md` UTF-8 bytes, compared and written under one POSIX advisory lock shared by later refresh flows. Identical bytes are a no-op; first initialization stages and validates the complete bundled directory, materializes it into canonical storage (preserving file permission/executable intent), records version-1 baseline metadata (per-file SHA-256 plus relative filenames of the package bytes) under `.metadata/<name>.json`, and only then atomically replaces `SKILL.md` through a same-directory temporary file with fsync and rename. Baseline metadata and the lock live outside installed skill directories; user saves never advance the baseline or touch supporting files. Canonical skill directories/files, baseline metadata, and resource paths must be real, contained, no-follow entries — symlink escapes and unmanaged pre-existing trees yield bounded errors with saved bytes unchanged.
@@ -1185,6 +1197,7 @@ aflow/
     opencode.py        # OpenCode adapter
     pi.py              # Pi adapter
     reasonix.py        # Reasonix adapter
+    strands.py         # Strands CLI ACP adapter
   bundled_skills/
     aflow-plan/              SKILL.md
     aflow-execute-plan/      SKILL.md

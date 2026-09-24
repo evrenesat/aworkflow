@@ -11,6 +11,7 @@ from .muse import MuseAdapter
 from .opencode import OpencodeAdapter
 from .pi import PiAdapter
 from .reasonix import ReasonixAdapter
+from .strands import StrandsAdapter
 from .zcode import ZcodeAdapter
 
 
@@ -25,6 +26,7 @@ ADAPTERS: dict[str, HarnessAdapter] = {
     "opencode": OpencodeAdapter(),
     "pi": PiAdapter(),
     "reasonix": ReasonixAdapter(),
+    "strands": StrandsAdapter(),
     "zcode": ZcodeAdapter(),
 }
 

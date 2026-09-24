@@ -70,7 +70,7 @@ class HarnessInstallSpec:
     destination_template: str
 
 
-# The exact harness map (Critical Invariants): eleven harnesses, eight of
+# The exact harness map (Critical Invariants): twelve harnesses, nine of
 # which share `~/.agents/skills`. Detection uses the harness CLI's executable
 # name, including `kiro-cli` for kiro.
 SUPPORTED_HARNESS_INSTALL_SPECS = (
@@ -84,6 +84,7 @@ SUPPORTED_HARNESS_INSTALL_SPECS = (
     HarnessInstallSpec("opencode", "opencode", "~/.agents/skills"),
     HarnessInstallSpec("pi", "pi", "~/.agents/skills"),
     HarnessInstallSpec("reasonix", "reasonix", "~/.agents/skills"),
+    HarnessInstallSpec("strands", "strands", "~/.agents/skills"),
     HarnessInstallSpec("zcode", "zcode", "~/.zcode/skills"),
 )
 
@@ -478,7 +479,7 @@ def _execute_install(plan: InstallPlan, store: SkillStore) -> InstallResult:
     for dest in unique_dests:
         dest.mkdir(parents=True, exist_ok=True)
 
-    # Deduplicate the eight harnesses sharing one destination into a single
+    # Deduplicate the nine harnesses sharing one destination into a single
     # operation per (destination, skill), keeping the first harness in map
     # order for reporting.
     operations: list[tuple[str, str, Path]] = []

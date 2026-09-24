@@ -149,6 +149,30 @@ merge_prompt = ["simple_merge"]
   cycles; neither route is inherited, and inheritance does not imply an
   upgrade stage.
 
+For a Strands DeepSeek Flash upgrade, install the native CLI with
+`npm install -g @strands-agents/cli@0.1.2` and use its `litellm` chat provider:
+
+```toml
+[harness.strands.profiles.ds41f]
+model = "litellm/deepseek-flash"
+
+[teams.sol_high]
+upgrade_to = "ds41f"
+[teams.sol_high.roles]
+worker = "codex.sol-high"
+
+[teams.ds41f.roles]
+worker = "strands.ds41f"
+```
+
+The CLI requires `LITELLM_API_KEY` and `LITELLM_BASE_URL` in its provider
+environment. AFlow points Strands at the private `~/.reasonix/.env` for `litellm/` profiles
+when that file exists, or the path in `AFLOW_STRANDS_ENV_FILE`. For Reasonix's
+DeepSeek key, set `LITELLM_API_KEY` to the same value as `DEEPSEEK_API_KEY` and
+`LITELLM_BASE_URL` to `https://api.deepseek.com` in that file. Keep it mode
+`0600`; no API key belongs in `aflow.toml` or an AFlow run artifact. Strands
+uses fresh ACP sessions for workers; it does not offer AFlow resume or steering.
+
 For example, a child can override only the worker while reusing the base's
 reviewer and prompts:
 

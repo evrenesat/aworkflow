@@ -7087,6 +7087,27 @@ def _emit_hotplug_event(
 
 def _discover_session_driver(adapter: HarnessAdapter, *, repo_root: Path | None = None) -> SessionDriver | None:
     """Enable native sessions only for a proven, supported production adapter."""
+    if getattr(adapter, "name", None) == "strands":
+        executable = shutil.which("strands")
+        if executable is None or repo_root is None:
+            return None
+        from .harnesses.strands import StrandsAcpDriver, StrandsAcpProcess
+        process = None
+        try:
+            invocation = adapter.build_invocation(
+                repo_root=repo_root, model=None, system_prompt="", user_prompt="",
+            )
+            process = StrandsAcpProcess.start(
+                repo_root=repo_root, argv=(executable, *invocation.argv[1:]),
+            )
+            driver = StrandsAcpDriver.from_initialize(process.initialize())
+            driver.executable = executable
+            return driver
+        except (OSError, RuntimeError, ValueError, subprocess.SubprocessError):
+            return None
+        finally:
+            if process is not None:
+                process.close()
     if getattr(adapter, "name", None) == "dsh":
         executable = shutil.which("dsh")
         if executable is None or repo_root is None:

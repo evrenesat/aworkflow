@@ -228,6 +228,7 @@ Supported auto targets:
   opencode -> ~/.agents/skills
   pi -> ~/.agents/skills
   reasonix -> ~/.agents/skills
+  strands -> ~/.agents/skills
 """
 
 

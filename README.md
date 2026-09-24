@@ -81,9 +81,19 @@ do not require a second acknowledgment or a controller restart.
 
 AFlow invokes existing CLIs rather than provider APIs. The selected harness must
 already be installed and authenticated. Adapters are included for Claude,
-Codex, Copilot, DSH (ACP), Gemini, Kiro, Muse, OpenCode, Pi, Reasonix, and ZCode.
+Codex, Copilot, DSH (ACP), Gemini, Kiro, Muse, OpenCode, Pi, Reasonix,
+Strands (ACP), and ZCode.
 ZCode uses its own project model/reasoning configuration; see the
 [ZCode profile setup](docs/configuration.md#zcode-profiles).
+
+Strands workers use the native `strands --acp-server` interface. Install
+`@strands-agents/cli` with npm, then configure a profile such as
+`model = "litellm/deepseek-flash"` under `[harness.strands.profiles.ds41f]`.
+The CLI reads `LITELLM_API_KEY` and `LITELLM_BASE_URL` from the private
+`~/.reasonix/.env` file for this provider, or from the file named by
+`AFLOW_STRANDS_ENV_FILE`. AFlow passes only that file path to the CLI; it does
+not save the key in run artifacts. The Strands adapter supports fresh worker
+turns and the CLI's one-shot print mode; it does not resume an ACP session.
 
 Before starting a harness, AFlow checks that its required local tools are
 available. If a requirement is missing, AFlow stops and explains what is

@@ -1,5 +1,17 @@
 # DEVLOG
 
+## 2026-09-24 — Native Strands worker adapter
+
+- Installed and verified Strands CLI 0.1.2 with a DeepSeek Flash live ACP
+  prompt. Added a fresh-turn ACP adapter, discovery, skill-target detection,
+  and fake-peer coverage for success, stderr pressure, provider errors,
+  interruption, timeout, and process cleanup. The adapter passes the private
+  provider env-file path to Strands without recording API keys in AFlow turns.
+- Kept native usage events in the raw structured channel; no token estimate or
+  resume capability is inferred. The account's DS4.1f credential source is
+  Reasonix's private `.env` file with Strands-compatible provider variable
+  names.
+
 ## 2026-09-24 — Restore New run preparation and review on the published baseline (Checkpoint 1)
 
 - Advanced the managed worktree to published `fdc9100f` and ported the preserved

@@ -1,6 +1,6 @@
 """Tests for the shared symlink installation service.
 
-Covers the exact eleven-harness destination map and executable detection, one
+Covers the exact twelve-harness destination map and executable detection, one
 deduplicated operation per shared destination, preview/confirmation flows,
 canonical refresh plus absolute directory links, idempotence, legacy-copy
 replacement without importing edits, hostile and dangling links, file
@@ -46,10 +46,11 @@ ALL_HARNESSES = (
     "opencode",
     "pi",
     "reasonix",
+    "strands",
     "zcode",
 )
 
-SHARED_HARNESSES = ("codex", "copilot", "dsh", "gemini", "muse", "opencode", "pi", "reasonix")
+SHARED_HARNESSES = ("codex", "copilot", "dsh", "gemini", "muse", "opencode", "pi", "reasonix", "strands")
 
 
 class _FakeStdin:
@@ -114,7 +115,7 @@ def test_discover_bundled_skills_uses_package_resources() -> None:
         assert skill_dir.joinpath("SKILL.md").is_file()
 
 
-def test_destination_map_covers_exactly_eleven_harnesses() -> None:
+def test_destination_map_covers_exactly_twelve_harnesses() -> None:
     specs = skill_installer_module.SUPPORTED_HARNESS_INSTALL_SPECS
     assert [spec.harness for spec in specs] == [
         "claude",
@@ -127,6 +128,7 @@ def test_destination_map_covers_exactly_eleven_harnesses() -> None:
         "opencode",
         "pi",
         "reasonix",
+        "strands",
         "zcode",
     ]
     by_harness = {spec.harness: spec for spec in specs}
@@ -159,7 +161,7 @@ def test_detect_auto_targets_selects_installed_executables_in_map_order(
     assert all(target.destination == Path("~/.agents/skills").expanduser() for target in targets[1:])
 
 
-def test_detect_auto_targets_reports_every_eleven_harness_entry(
+def test_detect_auto_targets_reports_every_twelve_harness_entry(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     bin_dir = tmp_path / "bin"
@@ -182,6 +184,7 @@ def test_detect_auto_targets_reports_every_eleven_harness_entry(
         "opencode",
         "pi",
         "reasonix",
+        "strands",
         "zcode",
     ]
     assert {target.destination for target in targets} == {
@@ -667,7 +670,7 @@ def test_shared_destination_installs_one_operation_per_skill(
 
     shared = Path("~/.agents/skills").expanduser()
     assert result.succeeded is True
-    assert len(result.operations) == 1, "eight harnesses share one destination operation"
+    assert len(result.operations) == 1, "nine harnesses share one destination operation"
     assert result.operations[0].destination == shared
     assert result.operations[0].harness == "codex", (
         "the first map-order harness represents the shared destination"
@@ -689,7 +692,7 @@ def test_auto_install_plan_groups_shared_harness_preview(
     preview = skill_installer_module.render_preview(plan)
 
     shared = str(Path("~/.agents/skills").expanduser())
-    assert "codex, copilot, dsh, gemini, muse, opencode, pi, reasonix" in preview
+    assert "codex, copilot, dsh, gemini, muse, opencode, pi, reasonix, strands" in preview
     assert f"Total link operations: {len(DEFAULT_BUNDLED_SKILL_NAMES)}" in preview
     assert preview.count(shared) == 1
 
@@ -870,7 +873,7 @@ def _installed_aflow_source() -> Path | None:
     return Path(completed.stdout.strip()).resolve()
 
 
-def test_installed_entry_point_smoke_links_all_eleven_harness_destinations(
+def test_installed_entry_point_smoke_links_all_twelve_harness_destinations(
     tmp_path: Path,
 ) -> None:
     """Disposable-HOME CLI smoke through the installed ``aflow`` executable.
