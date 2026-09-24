@@ -2987,11 +2987,11 @@ describe('RunDashboard', () => {
     renderDashboard({ onOpenPlan })
 
     await screen.findByRole('button', { name: 'Create follow-up draft', exact: true })
-    expect(api.getControlPlaneRun).toHaveBeenCalledWith(
+    await waitFor(() => expect(api.getControlPlaneRun).toHaveBeenCalledWith(
       project.project_id,
       failed.run_id,
       expect.objectContaining({ signal: expect.any(AbortSignal) }),
-    )
+    ))
     expect((screen.getByLabelText('Follow-up draft filename') as HTMLInputElement).value).toBe('followup-run-failed.md')
 
     await act(async () => {

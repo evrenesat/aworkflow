@@ -3703,3 +3703,35 @@ HISTORY: Published clipboard history `c14f1f2`/`cd78d53` remains separate and mu
 - At worker handoff, the checkpoint remained uncommitted for Sol/Astra review.
   Hosted CI for the resulting SHA and deployment activation remain with the
   coordinator.
+
+## 2026-09-24 — Settle residual launch and follow-up CI races (Checkpoint 1)
+
+- Fast-forwarded the clean managed worktree to reviewed base `ca89865e` and
+  confirmed its ancestry. CI run `36066404378` showed launch assertions seeing
+  `ready` before a later `Inspecting…` render; the recorded `36058346101`
+  follow-up test also asserted its deferred detail request before that call was
+  observed. The launch guard remains tied to the current preflight identity;
+  no persistent product state failure was reproduced locally.
+- The launch browser journey now waits for the matching plan/workflow preflight
+  response and the complete visible ready state, correct dirty count, and
+  Review button state together. It checks the effective no-team and 15-turn
+  defaults in the focused read-only review. Added clean and dirty 320×568
+  cases. The follow-up component test waits for the exact project/run/signal
+  detail call before resolving its deferred response; its one-draft and exact
+  returned-path assertions remain.
+- Web suite: 633 passed across 29 files. Production build passed with the
+  existing chunk-size warning. Chromium and WebKit follow-up browser modules
+  each passed 19 tests; Chromium's 14-case launch matrix passed separately.
+  Inspected light clean and dark dirty 320×568 review captures in both engines:
+  focus, effective choices, and read-only consequence were visible; no new
+  mismatch with the approved demo was identified.
+- Full server suite: Python 3.12 passed 495; Python 3.13 passed 495 on rerun.
+  The first 3.13 full pass had one intermittent focus-restoration failure in
+  the existing run-row browser journey (494 passed, 1 failed); the complete
+  follow-up browser module and subsequent full suite both passed without a
+  product or test edit for that row case. All runs used separate temporary
+  configuration and pytest/browser artifact directories. Hosted CI and live
+  deployment remain coordinator gates. After the effective-choice assertions,
+  the full WebKit follow-up module passed again (19), and focused Python 3.12
+  clean desktop/dirty 320×568 launch cases passed (2). `git diff --check`
+  passed.
