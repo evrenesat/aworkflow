@@ -1,5 +1,13 @@
 # DEVLOG
 
+## 2026-09-24 — Add local macOS AFlow dashboard launcher
+
+- Added `scripts/aflow_ui` for an explicit open-or-update choice when the local
+  dashboard is running. An update fast-forwards the local source, refreshes its
+  editable tool, synchronizes the p100 workflow pair with a backup, and opens
+  the dashboard. The script stops only the recorded UI process and refuses to
+  update while local workflow workers are active.
+
 ## 2026-09-23 — Reorder deployed Runs detail around current work (Checkpoint 1)
 
 - The Runs detail overview now leads with the readable run identity, truthful
