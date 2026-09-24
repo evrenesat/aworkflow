@@ -16,6 +16,7 @@ from dataclasses import asdict, dataclass, replace
 from enum import Enum
 from pathlib import Path
 from typing import TYPE_CHECKING, Callable, Literal, Mapping, NoReturn, Sequence
+from uuid import uuid4
 
 if TYPE_CHECKING:
     from aflow.api.events import ExecutionEvent, ExecutionObserver
@@ -123,7 +124,7 @@ from .recovery import (
     TeamLeadRecoveryDecision,
     TeamLeadRecoveryDecisionError,
 )
-from .run_state import ActiveImplementationScope, CheckpointRepartitionRecord, ControllerConfig, ControllerRunResult, ControllerState, ExecutionContext, FinalizedTurnBoundary, FrozenRunIdentity, HarnessRecoveryAction, HarnessRecoveryContext, ImplementationAttempt, IssueRecord, ManagerDecisionSummary, OverrideResult, PendingBoundaryDecision, PendingFinalizedTurn, PendingManagerNotes, PendingRepartitionV1, PendingTeamOverride, RecoverySessionContext, RetryContext, ResumeContext, ReviewRejectionRecord, TurnRecord, WorkflowEndReason, format_harness_model_display, load_override_request, merge_accepted_override_choices
+from .run_state import ActiveImplementationScope, CheckpointRepartitionRecord, ControllerConfig, ControllerRunResult, ControllerState, ExecutionContext, FinalizedTurnBoundary, FrozenRunIdentity, HarnessRecoveryAction, HarnessRecoveryContext, ImplementationAttempt, IssueRecord, ManagerDecisionSummary, OverrideResult, PendingBoundaryDecision, PendingFinalizedTurn, PendingManagerNotes, PendingRepartitionV1, PendingTeamOverride, RecoverySessionContext, RetryContext, ResumeContext, ReviewRejectionRecord, TurnRecord, WorkflowEndReason, _resume_context_validation_marker, format_harness_model_display, load_override_request, merge_accepted_override_choices
 from .control_plane.validation import ControlValidationError, validate_override_targets
 from .hotplug import (
     HarnessSessionRefV1, HotplugTransactionV1, bounded_hotplug_history,
@@ -143,6 +144,7 @@ from .stop_marker import (
 )
 from .scope_pressure import parse_scope_pressure
 from .status import BannerRenderer, WorkflowGraphSource
+from .control_plane.persistence import validate_run_id
 from aflow.api.events import (
     CheckpointRepartitionedEvent,
     ManagerDecidedEvent,
@@ -7051,6 +7053,56 @@ def _validate_terminal_completion_resume_context(
         )
 
 
+def _validated_resume_execution_context(
+    primary_root: Path,
+    resume_ctx: ResumeContext,
+    *,
+    terminal_completion_resume: bool,
+) -> ExecutionContext | None:
+    """Validate and materialize a resumed lifecycle boundary exactly once."""
+    if terminal_completion_resume:
+        _validate_terminal_completion_resume_context(primary_root, resume_ctx)
+        if resume_ctx.main_branch is not None and resume_ctx.feature_branch is not None:
+            return ExecutionContext(
+                primary_repo_root=primary_root,
+                execution_repo_root=primary_root,
+                main_branch=resume_ctx.main_branch,
+                feature_branch=resume_ctx.feature_branch,
+                worktree_path=None,
+                setup=resume_ctx.setup,
+                teardown=resume_ctx.teardown,
+            )
+        return None
+    if "worktree" in resume_ctx.setup:
+        _validate_worktree_resume_context(primary_root, resume_ctx)
+        assert resume_ctx.worktree_path is not None
+        assert resume_ctx.main_branch is not None
+        assert resume_ctx.feature_branch is not None
+        return ExecutionContext(
+            primary_repo_root=primary_root,
+            execution_repo_root=resume_ctx.worktree_path,
+            main_branch=resume_ctx.main_branch,
+            feature_branch=resume_ctx.feature_branch,
+            worktree_path=resume_ctx.worktree_path,
+            setup=resume_ctx.setup,
+            teardown=resume_ctx.teardown,
+        )
+    if "branch" in resume_ctx.setup:
+        _validate_branch_resume_context(primary_root, resume_ctx)
+        assert resume_ctx.main_branch is not None
+        assert resume_ctx.feature_branch is not None
+        return ExecutionContext(
+            primary_repo_root=primary_root,
+            execution_repo_root=primary_root,
+            main_branch=resume_ctx.main_branch,
+            feature_branch=resume_ctx.feature_branch,
+            worktree_path=None,
+            setup=resume_ctx.setup,
+            teardown=resume_ctx.teardown,
+        )
+    return None
+
+
 def _execute_merge_handoff(
     exec_ctx: ExecutionContext,
     wf: WorkflowConfig,
@@ -7276,7 +7328,7 @@ def _discover_session_driver(adapter: HarnessAdapter, *, repo_root: Path | None 
         return None
 
 
-def run_workflow(
+def _run_workflow_unchecked(
     config: ControllerConfig,
     workflow_config: WorkflowUserConfig,
     workflow_name: str,
@@ -7298,6 +7350,8 @@ def run_workflow(
     source_session_driver: SessionDriver | None = None,
     allow_existing_launch_manifest: bool = False,
     snapshot_config: bool = True,
+    _admission: object | None = None,
+    _admission_reservation_nonce: str | None = None,
 ) -> ControllerRunResult:
     config_dir = Path(config_dir)
     live_config_source_path: Path | None = None
@@ -7490,6 +7544,113 @@ def run_workflow(
         write_launch_phase,
     )
 
+    resumed_execution_context: ExecutionContext | None = None
+    resume_lifecycle_validated = False
+    direct_resume_admission_proof: object | None = None
+    validated_resume_marker = (
+        _resume_context_validation_marker(resume)
+        if resume is not None
+        else None
+    )
+    if (
+        _admission is not None
+        and _admission_reservation_nonce is None
+        and resume is not None
+        and config.restarted_from_run_id is None
+    ):
+        # Direct callers have already crossed the ResumeContext/lifecycle
+        # boundary. Materialize that validation as an opaque capability for
+        # shared admission; daemon-owned requests never receive this proof.
+        resumed_execution_context = _validated_resume_execution_context(
+            config.repo_root,
+            resume,
+            terminal_completion_resume=terminal_completion_resume,
+        )
+        resume_lifecycle_validated = True
+        if validated_resume_marker is not None:
+            # Admission authority comes only from the private marker attached
+            # by durable resume reconstruction.  Public lifecycle fields may
+            # still materialize an execution context, but they must fall
+            # through to canonical predecessor evidence for admission.
+            from .project_admission import _make_direct_resume_admission_proof
+
+            direct_resume_admission_proof = _make_direct_resume_admission_proof(
+                resume.resumed_from_run_id
+            )
+
+    admission_run_id: str | None = None
+    admission_nonce: str | None = None
+    admission_claimed = False
+    admission_bound = False
+
+    def release_unbound_admission(reason: str) -> None:
+        """Release only a claim that never reached launch identity binding."""
+        if (
+            _admission is None
+            or not admission_claimed
+            or admission_bound
+            or admission_run_id is None
+            or admission_nonce is None
+        ):
+            return
+        try:
+            _admission.release(
+                admission_run_id,
+                admission_nonce,
+                reason=reason,
+            )
+        except Exception:
+            # A partially published or otherwise ambiguous launch must remain
+            # fail-closed. Preserve the original pre-bind failure and let the
+            # admission journal be reconciled from canonical evidence.
+            pass
+
+    if _admission is not None:
+        # Startup/preflight above is deliberately side-effect free.  Admit
+        # only after it has passed, immediately before the existing immutable
+        # launch-manifest boundary and before lifecycle worktree/provider work.
+        requested_run_id = config.reserved_run_id
+        if requested_run_id is None:
+            requested_run_id = validate_run_id(
+                datetime.now(timezone.utc).strftime("%Y%m%dt%H%M%Sz").lower()
+                + "-"
+                + uuid4().hex[:8]
+            )
+            config = replace(config, reserved_run_id=requested_run_id)
+        admission_run_id = requested_run_id
+        source_run_id = config.restarted_from_run_id or (
+            resume.resumed_from_run_id if resume is not None else None
+        )
+        if source_run_id is not None and direct_resume_admission_proof is None:
+            if (
+                resume is not None
+                and config.restarted_from_run_id is None
+                and _admission_reservation_nonce is None
+            ):
+                from .project_admission import _validate_source_provenance_id
+
+                source_run_id = _validate_source_provenance_id(source_run_id)
+            else:
+                source_run_id = validate_run_id(source_run_id)
+        if _admission_reservation_nonce is not None:
+            _admission.consume(requested_run_id, _admission_reservation_nonce)
+            admission_nonce = _admission_reservation_nonce
+            admission_claimed = True
+            # A worker nonce is issued by the daemon after its launch intent
+            # exists, so consuming it is already a bound admission transition.
+            admission_bound = True
+        else:
+            reservation = _admission.acquire(
+                requested_run_id,
+                plan_path=config.plan_path.resolve(),
+                idempotency_key=config.idempotency_key or f"run-{requested_run_id}",
+                source_run_id=source_run_id,
+                _direct_resume_proof=direct_resume_admission_proof,
+            )
+            admission_nonce = reservation.nonce
+            admission_claimed = True
+            admission_bound = bool(getattr(reservation, "bound", False))
+
     try:
         reserved_run_id = reserve_run_id(config.repo_root, config.reserved_run_id)
         launch_manifest = LaunchManifest(
@@ -7528,7 +7689,19 @@ def run_workflow(
         else:
             launch_result = create_launch_manifest(config.repo_root, launch_manifest)
     except (ValueError, RunIdentityConflict) as exc:
+        release_unbound_admission(reason="launch_identity_rejected")
         raise WorkflowError(f"cannot reserve run identity: {exc}") from exc
+    except Exception:
+        release_unbound_admission(reason="launch_identity_failed")
+        raise
+
+    if _admission is not None and admission_claimed and not admission_bound:
+        # The immutable manifest is the logical-run boundary. Set the local
+        # guard before the journal transition so a transition failure cannot
+        # free a claim whose canonical identity is already published.
+        admission_bound = True
+        _admission.bind(reserved_run_id, admission_nonce)
+
     if not launch_result.created and not allow_existing_launch_manifest:
         # The daemon/service layer consumes this proven replay result directly.
         # A controller process must never attach itself as a second child.
@@ -8411,49 +8584,14 @@ def run_workflow(
 
             _validate_scope_envelope_bytes(scope, envelope_path.read_bytes())
         try:
-            if terminal_completion_resume:
-                _validate_terminal_completion_resume_context(config.repo_root, resume)
-                if resume.main_branch is not None and resume.feature_branch is not None:
-                    exec_ctx = ExecutionContext(
-                        primary_repo_root=config.repo_root,
-                        execution_repo_root=config.repo_root,
-                        main_branch=resume.main_branch,
-                        feature_branch=resume.feature_branch,
-                        worktree_path=None,
-                        setup=resume.setup,
-                        teardown=resume.teardown,
-                    )
-                else:
-                    exec_ctx = None
-            elif "worktree" in resume.setup:
-                _validate_worktree_resume_context(config.repo_root, resume)
-                assert resume.worktree_path is not None
-                assert resume.main_branch is not None
-                assert resume.feature_branch is not None
-                exec_ctx = ExecutionContext(
-                    primary_repo_root=config.repo_root,
-                    execution_repo_root=resume.worktree_path,
-                    main_branch=resume.main_branch,
-                    feature_branch=resume.feature_branch,
-                    worktree_path=resume.worktree_path,
-                    setup=resume.setup,
-                    teardown=resume.teardown,
-                )
-            elif "branch" in resume.setup:
-                _validate_branch_resume_context(config.repo_root, resume)
-                assert resume.main_branch is not None
-                assert resume.feature_branch is not None
-                exec_ctx = ExecutionContext(
-                    primary_repo_root=config.repo_root,
-                    execution_repo_root=config.repo_root,
-                    main_branch=resume.main_branch,
-                    feature_branch=resume.feature_branch,
-                    worktree_path=None,
-                    setup=resume.setup,
-                    teardown=resume.teardown,
-                )
+            if resume_lifecycle_validated:
+                exec_ctx = resumed_execution_context
             else:
-                exec_ctx = None
+                exec_ctx = _validated_resume_execution_context(
+                    config.repo_root,
+                    resume,
+                    terminal_completion_resume=terminal_completion_resume,
+                )
             if not terminal_completion_resume:
                 _sync_startup_plan_metadata_for_execution(
                     original_plan_path,
@@ -13777,3 +13915,78 @@ def run_workflow(
     )
     banner.stop(state)
     raise WorkflowError(summary, run_dir=run_paths.run_dir)
+
+
+def run_workflow(
+    config: ControllerConfig,
+    workflow_config: WorkflowUserConfig,
+    workflow_name: str,
+    *,
+    parsed_plan: ParsedPlan | None = None,
+    startup_retry: RetryContext | None = None,
+    startup_base_head_refresh_sha: str | None = None,
+    dirty_worktree_confirmed: bool | None = None,
+    config_dir: Path,
+    working_dir: Path | None = None,
+    adapter: HarnessAdapter | None = None,
+    runner: Callable[..., subprocess.CompletedProcess[str]] | None = None,
+    preflight_probe: HarnessPreflightProbe | None = None,
+    banner: BannerRenderer | None = None,
+    resume: ResumeContext | None = None,
+    observer: ExecutionObserver | None = None,
+    control_source: Callable[[], object] | None = None,
+    session_driver: SessionDriver | None = None,
+    source_session_driver: SessionDriver | None = None,
+    allow_existing_launch_manifest: bool = False,
+    snapshot_config: bool = True,
+    admission_reservation_nonce: str | None = None,
+) -> ControllerRunResult:
+    """Admit one logical run after preflight and before execution work.
+
+    The legacy controller body remains deliberately unaware of the scheduling
+    journal.  This wrapper is the public boundary used by the CLI, API runner,
+    and daemon worker, so all of them make one project-scoped capacity decision
+    after side-effect-free startup validation and before lifecycle/provider work.
+    A worker receives the parent's nonce and consumes that reservation instead
+    of creating a second one.
+    """
+    from .project_admission import ProjectAdmission
+
+    admission = ProjectAdmission(config.repo_root)
+    try:
+        return _run_workflow_unchecked(
+            config,
+            workflow_config,
+            workflow_name,
+            parsed_plan=parsed_plan,
+            startup_retry=startup_retry,
+            startup_base_head_refresh_sha=startup_base_head_refresh_sha,
+            dirty_worktree_confirmed=dirty_worktree_confirmed,
+            config_dir=config_dir,
+            working_dir=working_dir,
+            adapter=adapter,
+            runner=runner,
+            preflight_probe=preflight_probe,
+            banner=banner,
+            resume=resume,
+            observer=observer,
+            control_source=control_source,
+            session_driver=session_driver,
+            source_session_driver=source_session_driver,
+            allow_existing_launch_manifest=allow_existing_launch_manifest,
+            snapshot_config=snapshot_config,
+            _admission=admission,
+            _admission_reservation_nonce=admission_reservation_nonce,
+        )
+    finally:
+        # The journal only frees terminal or explicitly inactive claims.  It
+        # intentionally leaves an ambiguous launch occupied across crashes or
+        # missing-PID observations for a later reconciliation pass.
+        if admission.state_path.exists():
+            try:
+                admission.reconcile()
+            except Exception:
+                # The controller's own durable outcome remains authoritative.
+                # A transient observer failure must not replace it with a
+                # provider error or accidentally free capacity.
+                pass

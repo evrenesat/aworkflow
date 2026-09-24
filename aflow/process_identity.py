@@ -6,6 +6,10 @@ import os
 from pathlib import Path
 import subprocess
 import sys
+from typing import Literal
+
+
+ProcessLiveness = Literal["present", "absent", "unknown"]
 
 
 def _linux_procfs_is_usable() -> bool:
@@ -48,3 +52,54 @@ def process_birth_identity(pid: int) -> str | None:
     )
     value = completed.stdout.strip()
     return f"ps-lstart:{value}" if completed.returncode == 0 and value else None
+
+
+def process_liveness(pid: int) -> ProcessLiveness:
+    """Return only liveness evidence, keeping identity-observation gaps unknown.
+
+    A missing birth identity is not enough to release an owner reservation: the
+    process may still exist while procfs or ``ps`` cannot expose its birth
+    data.  This separate probe therefore reports confirmed absence only when
+    the operating system positively says that the PID is gone (or the process
+    is a zombie); all observation failures remain ``unknown``.
+    """
+    if pid < 1:
+        return "absent"
+
+    if sys.platform == "linux":
+        try:
+            stat = Path(f"/proc/{pid}/stat").read_text(encoding="utf-8")
+            closing = stat.rfind(")")
+            suffix = stat[closing + 2 :].split()
+            if closing < 0 or stat[closing + 1 : closing + 2] != " " or not suffix:
+                raise ValueError("malformed process stat")
+            return "absent" if suffix[0] == "Z" else "present"
+        except FileNotFoundError:
+            if _linux_procfs_is_usable():
+                try:
+                    os.kill(pid, 0)
+                except ProcessLookupError:
+                    return "absent"
+                except PermissionError:
+                    return "present"
+                except OSError:
+                    pass
+                else:
+                    return "present"
+        except (OSError, IndexError, UnicodeError, ValueError):
+            pass
+
+    try:
+        completed = subprocess.run(
+            ("ps", "-o", "pid=", "-p", str(pid)),
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return "unknown"
+    if completed.returncode == 0 and completed.stdout.strip():
+        return "present"
+    if completed.returncode != 0 and not completed.stdout.strip() and not completed.stderr.strip():
+        return "absent"
+    return "unknown"

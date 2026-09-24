@@ -852,6 +852,31 @@ class ResumeContext:
     resumed_from_team: str | None = None
     resume_team_override: str | None = None
     recovery_context: RecoverySessionContext | None = None
+    # Set only by the validated durable resume reconstruction path.  This is
+    # an in-process capability marker, not persisted resume input.
+    _validated_resume_context_marker: object | None = field(
+        default=None,
+        repr=False,
+        compare=False,
+    )
+
+
+_VALIDATED_RESUME_CONTEXT_MARKER = object()
+
+
+def _mark_validated_resume_context(context: ResumeContext) -> ResumeContext:
+    """Attach the private capability issued by durable resume validation."""
+    return replace(
+        context,
+        _validated_resume_context_marker=_VALIDATED_RESUME_CONTEXT_MARKER,
+    )
+
+
+def _resume_context_validation_marker(context: ResumeContext) -> object | None:
+    """Return the marker only for contexts built by the trusted resume path."""
+    if context._validated_resume_context_marker is _VALIDATED_RESUME_CONTEXT_MARKER:
+        return context._validated_resume_context_marker
+    return None
 
 
 @dataclass

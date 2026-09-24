@@ -1,5 +1,60 @@
 # DEVLOG
 
+## 2026-09-24 — Check direct resume ownership at admission (Checkpoint 2 repair)
+
+- A validated CLI resume marker retains its source and plan provenance role,
+  while shared admission now checks current source inactivity under the lock
+  before exempting the source's historical plan claim. Active and uncertain
+  sources cannot start a second controller for the same plan.
+- Marked-resume regressions cover live ownership, uncertain ownership, and a
+  running-looking source with a confirmed worker exit. Synthetic resume tests
+  now record terminal source ownership where continuation is expected.
+
+## 2026-09-24 — Keep one unresolved run claim per plan (Checkpoint 2 repair)
+
+- Shared admission now records a verified plan identity and checks live,
+  uncertain, reserved, and pending-startup owners under the project lock.
+  Distinct request keys cannot launch the same plan concurrently; exact replay,
+  confirmed inactive retries, supported continuations, and parallel different
+  plans remain available. Daemon, worker fallback, and direct controllers pass
+  their plan paths to the same boundary. Server conflicts use a bounded
+  `project_plan_claim_conflict` response with HTTP 409.
+- Added process-race, daemon, and direct-controller regressions for duplicate
+  plan claims and prelaunch cleanup.
+
+## 2026-09-24 — Align resume availability with admission (Checkpoint 2 repair)
+
+- The daemon's read-only resume preview now shares admission's authoritative
+  predecessor inactivity check. Stopping a unit while controller metadata still
+  says running leaves resume unavailable; terminal evidence permits it. The
+  mutation still rechecks under the project lock.
+- Server fixtures now use terminal evidence for successful resumes, retain an
+  uncertain-source rejection regression, and check the exact nonce-bearing
+  worker environment alongside project isolation and the configured secret.
+
+## 2026-09-24 — Prevent duplicate continuation ownership (Checkpoint 2 repair)
+
+- A project admission now rejects a distinct successor while another live,
+  held, or uncertain successor claims the same predecessor. The check runs
+  under the existing project lock and recovers lineage from launch, startup,
+  and controller artifacts when a journal entry is absent. Exact retries and
+  confirmed inactive successor handoffs remain available.
+- Verification: 333 runtime/repair tests and 327 admission/daemon/CLI/resume/
+  settings tests passed; Ruff and whitespace checks passed.
+
+## 2026-09-24 — Add shared project launch admission (Checkpoint 2)
+
+- Added a primary-project reservation journal and lock shared by managed starts,
+  resumes, daemon workers, and direct controllers. Canonical run evidence keeps
+  uncertain launches charged until confirmed inactive; pending startup input
+  retains its plan claim and reacquires capacity before launch.
+- Closed the rejected-start and rejected-resume transient instruction leak by
+  publishing those instructions only after admission succeeds. Focused tests
+  cover repeated capacity rejections and a subsequent admitted launch. The
+  server returns HTTP 409 for the bounded capacity conflict. Verification passed:
+  333 runtime/repair tests, 319 admission/daemon/CLI/resume/settings tests, the
+  focused REST capacity test, Ruff, compilation, and whitespace checks.
+
 ## 2026-09-24 — Restore New run preparation and review on the published baseline (Checkpoint 1)
 
 - Advanced the managed worktree to published `fdc9100f` and ported the preserved

@@ -41,6 +41,8 @@ from aflow.daemon import (
     ExtraInstructionsValidationError,
     _validate_extra_instructions,
 )
+from aflow.project_admission import ProjectAdmission
+from aflow.project_settings import ProjectSettings, ProjectSettingsService
 from aflow_app_server.config import ServerConfig
 from aflow_app_server.control_plane_service import ControlPlaneService
 from aflow_app_server.main import app
@@ -673,6 +675,53 @@ def _lifecycle_record_bytes(root: Path) -> dict[str, bytes]:
             }
         )
     return records
+
+
+def test_start_capacity_rejection_is_a_bounded_conflict(control_client) -> None:
+    client, root, units, _ = control_client
+    _commit_fixture_repository(root)
+    settings = ProjectSettingsService(root)
+    settings.update(
+        ProjectSettings(max_concurrent_implementations=1),
+        expected_revision=settings.read().revision,
+    )
+    admission = ProjectAdmission(root, unit_manager=units)
+    admission.acquire("occupied-api", idempotency_key="occupied-api")
+
+    response = client.post(
+        f"/api/control-plane/projects/{PROJECT_ID}/runs",
+        headers={"Idempotency-Key": "capacity-api"},
+        json={
+            "plan_path": "plans/todo/test-plan.md",
+            "workflow_name": "managed",
+        },
+    )
+
+    assert response.status_code == 409, response.text
+    assert response.json()["detail"]["code"] == "project_capacity_reached"
+    assert len(response.json()["detail"]["message"]) <= 256
+    assert admission.snapshot().occupied_count == 1
+    assert units.start_calls == []
+
+
+def test_start_same_plan_with_another_key_returns_bounded_conflict(control_client) -> None:
+    client, root, units, monkeypatch = control_client
+    _commit_fixture_repository(root)
+    monkeypatch.setattr("aflow.daemon.prepare_startup", _prepared)
+    endpoint = f"/api/control-plane/projects/{PROJECT_ID}/runs"
+    payload = {"plan_path": "plans/todo/test-plan.md", "workflow_name": "managed"}
+
+    first = client.post(endpoint, headers={"Idempotency-Key": "first-plan-key"}, json=payload)
+    assert first.status_code == 201, first.text
+    rejected = client.post(
+        endpoint, headers={"Idempotency-Key": "second-plan-key"}, json=payload
+    )
+    assert rejected.status_code == 409, rejected.text
+    detail = rejected.json()["detail"]
+    assert detail["code"] == "project_plan_claim_conflict"
+    assert len(detail["message"]) <= 256
+    assert len(units.start_calls) == 1
+    assert ProjectAdmission(root, unit_manager=units).snapshot().occupied_count == 1
 
 
 def test_extra_instructions_validation_boundaries() -> None:
@@ -1762,7 +1811,7 @@ def test_control_events_context_controls_owner_stop_and_resume(control_client) -
 
     units.stop(f"aflow-run-{run_id}.service")
     (root / ".aflow" / "runs" / run_id / "run.json").write_text(
-        '{"status":"running","workflow_name":"managed","team":null,'
+        '{"status":"failed","workflow_name":"managed","team":null,'
         '"selected_start_step":"implement","max_turns":3,"extra_instructions":[]}'
     )
     monkeypatch.setattr(
@@ -1777,6 +1826,9 @@ def test_control_events_context_controls_owner_stop_and_resume(control_client) -
             resume_context=object(),
         ),
     )
+    available = client.get(f"/api/control-plane/projects/{PROJECT_ID}/runs/{run_id}")
+    assert available.status_code == 200
+    assert available.json()["evidence"]["can_resume"] is True
     resumed = client.post(
         f"/api/control-plane/projects/{PROJECT_ID}/runs/{run_id}/resume",
         headers={"Idempotency-Key": "resume-1"},
@@ -1811,7 +1863,9 @@ def test_control_events_context_controls_owner_stop_and_resume(control_client) -
     assert len(units.stop_calls) == stop_call_count
 
 
-def test_rest_resume_persists_reviewer_start_step_and_replays_once(control_client) -> None:
+def test_stopped_unit_with_running_metadata_is_not_offered_or_admitted(
+    control_client,
+) -> None:
     client, root, units, monkeypatch = control_client
     pending = _start_pending(client, monkeypatch)
     started = _answer_pending(client, pending, monkeypatch)
@@ -1820,6 +1874,46 @@ def test_rest_resume_persists_reviewer_start_step_and_replays_once(control_clien
     source_path = root / ".aflow" / "runs" / run_id / "run.json"
     source_path.write_text(
         '{"status":"running","workflow_name":"managed","team":null,'
+        '"selected_start_step":"implement","max_turns":3,"extra_instructions":[]}'
+    )
+    before = source_path.read_bytes()
+    monkeypatch.setattr(
+        "aflow.cli._bootstrap_resume_invocation",
+        lambda **_kwargs: SimpleNamespace(
+            workflow_name="managed",
+            plan_path=root / "plans" / "todo" / "test-plan.md",
+            max_turns=3,
+            team=None,
+            start_step="implement",
+            extra_instructions=(),
+            resume_context=object(),
+        ),
+    )
+
+    shown = client.get(f"/api/control-plane/projects/{PROJECT_ID}/runs/{run_id}")
+    assert shown.status_code == 200
+    assert shown.json()["evidence"]["can_resume"] is False
+    assert source_path.read_bytes() == before
+
+    rejected = client.post(
+        f"/api/control-plane/projects/{PROJECT_ID}/runs/{run_id}/resume",
+        headers={"Idempotency-Key": "uncertain-resume"},
+    )
+    assert rejected.status_code == 422
+    assert rejected.json()["detail"]["code"] == "project_admission_error"
+    assert len(units.start_calls) == 1
+    assert source_path.read_bytes() == before
+
+
+def test_rest_resume_persists_reviewer_start_step_and_replays_once(control_client) -> None:
+    client, root, units, monkeypatch = control_client
+    pending = _start_pending(client, monkeypatch)
+    started = _answer_pending(client, pending, monkeypatch)
+    run_id = started["result"]["run_id"]
+    units.stop(f"aflow-run-{run_id}.service")
+    source_path = root / ".aflow" / "runs" / run_id / "run.json"
+    source_path.write_text(
+        '{"status":"failed","workflow_name":"managed","team":null,'
         '"selected_start_step":"implement","max_turns":3,'
         '"extra_instructions":[]}'
     )
@@ -1986,7 +2080,7 @@ def test_resume_extra_instructions_are_optional_and_idempotent(
     units.stop(f"aflow-run-{run_id}.service")
     source_path = root / ".aflow" / "runs" / run_id / "run.json"
     source_path.write_text(
-        '{"status":"running","workflow_name":"managed","team":null,'
+        '{"status":"failed","workflow_name":"managed","team":null,'
         '"selected_start_step":"implement","max_turns":3,'
         '"extra_instructions":["saved guidance"]}'
     )
@@ -2623,10 +2717,18 @@ def test_two_registered_projects_keep_exact_plan_and_launch_boundaries(
         assert start_record["selected_environment_file"]["path"] == str(
             (root / "aflowd.env").resolve()
         )
+        reservation_state = json.loads(
+            (project_root / ".aflow" / "project-admission.json").read_text(
+                encoding="utf-8"
+            )
+        )
         assert captured_starts[f"aflow-run-{run_id}.service"] == {
             "cwd": project_root.resolve(),
             "environment_file": (root / "aflowd.env").resolve(),
-            "environment": {"AFLOW_TEST_SECRET": secret},
+            "environment": {
+                "AFLOW_TEST_SECRET": secret,
+                "AFLOW_ADMISSION_RESERVATION_NONCE": reservation_state["reservations"][run_id]["nonce"],
+            },
         }
 
         events = client.get(

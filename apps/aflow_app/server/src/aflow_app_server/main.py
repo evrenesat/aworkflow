@@ -710,7 +710,11 @@ async def startup_failure_handler(_: Request, exception: DaemonStartupError) -> 
     if exception.run_id is not None:
         extra["run_id"] = exception.run_id
     return _error_response(
-        status.HTTP_422_UNPROCESSABLE_CONTENT,
+        (
+            status.HTTP_409_CONFLICT
+            if exception.code in {"project_capacity_reached", "project_plan_claim_conflict"}
+            else status.HTTP_422_UNPROCESSABLE_CONTENT
+        ),
         exception.code,
         **extra,
     )

@@ -4,12 +4,16 @@ from dataclasses import replace
 from unittest.mock import patch
 import errno
 import hashlib
+import os
 from typing import Mapping
 from aflow.analyzer import extract_text_signals
 from aflow.api import AnalyzeRequest, analyze_runs
 from aflow.config import ErrorHandlingConfig, HarnessErrorRecoveryConfig, HarnessErrorRecoveryRuleConfig, ManagerConfig, TeamConfig
+from aflow.control_plane import LaunchManifest, create_launch_manifest, write_launch_phase
 from aflow.hotplug import HotplugTransactionV1, hotplug_transaction_id
 from aflow.plan_backups import read_backup_provenance
+from aflow.project_admission import ProjectAdmission, ProjectAdmissionConflict
+from aflow.process_identity import process_birth_identity
 from aflow.repartition import create_envelope
 from aflow.api.events import CollectingObserver, ExecutionEventType, TurnFinishedEvent
 from aflow.run_state import (
@@ -24,6 +28,7 @@ from aflow.run_state import (
     PendingRepartitionV1,
     PendingTeamOverride,
     ResumeContext,
+    _mark_validated_resume_context,
     load_override_request,
     manager_resume_fields,
     resolve_resume_override,
@@ -53,6 +58,115 @@ from aflow.harnesses.session import SessionCapabilities
 def _runner_prompt(argv, kwargs) -> str:
     prompt = kwargs.get("input")
     return prompt if isinstance(prompt, str) else " ".join(argv)
+
+
+def _record_inactive_direct_source(run_dir: Path) -> None:
+    """Give synthetic resume sources the terminal record real CLI runs need."""
+    metadata_path = run_dir / "run.json"
+    run_dir.mkdir(parents=True, exist_ok=True)
+    metadata = (
+        json.loads(metadata_path.read_text(encoding="utf-8"))
+        if metadata_path.exists() else {}
+    )
+    metadata["status"] = "interrupted"
+    metadata_path.write_text(json.dumps(metadata) + "\n", encoding="utf-8")
+
+
+@pytest.mark.parametrize("source_state", ("active", "uncertain", "inactive"))
+def test_marked_direct_resume_requires_current_source_inactivity(
+    tmp_path: Path, source_state: str,
+) -> None:
+    plan_path = tmp_path / "plan.md"
+    _write_plan(plan_path, _VALID_PLAN)
+    source_run_id = "marked-source"
+    if source_state != "uncertain":
+        ProjectAdmission(tmp_path).acquire(
+            source_run_id, plan_path=plan_path, idempotency_key="source-key"
+        )
+    create_launch_manifest(
+        tmp_path,
+        LaunchManifest(
+            run_id=source_run_id,
+            project_root=str(tmp_path.resolve()),
+            plan_path=str(plan_path.resolve()),
+            workflow_name="resume_override",
+            max_turns=2,
+            idempotency_key="source-key",
+            caller_scope="test",
+        ),
+    )
+    write_launch_phase(tmp_path, source_run_id, "unit_started")
+    source_dir = tmp_path / ".aflow" / "runs" / source_run_id
+    source_dir.mkdir(parents=True)
+    (source_dir / "run.json").write_text(
+        json.dumps({"status": "running", "plan_path": str(plan_path)}) + "\n",
+        encoding="utf-8",
+    )
+    if source_state != "uncertain":
+        units = source_dir / "units"
+        units.mkdir()
+        unit = f"aflow-run-{source_run_id}.service"
+        start = {"schema": 1, "run_id": source_run_id, "unit": unit, "nonce": "source-nonce"}
+        if source_state == "active":
+            start.update(
+                wrapper_pid=os.getpid(), wrapper_birth=process_birth_identity(os.getpid())
+            )
+        (units / "start.json").write_text(json.dumps(start) + "\n", encoding="utf-8")
+        if source_state == "inactive":
+            (units / "exit.json").write_text(
+                json.dumps({
+                    "schema": 1, "nonce": "source-nonce", "returncode": 1,
+                    "at": "2026-09-24T00:00:00Z",
+                }) + "\n",
+                encoding="utf-8",
+            )
+
+    source_snapshot = ProjectAdmission(tmp_path).snapshot()
+    if source_state == "active":
+        assert source_snapshot.active_count == 1
+    elif source_state == "uncertain":
+        assert source_snapshot.uncertain_count == 1
+    else:
+        assert source_snapshot.occupied_count == 0
+
+    runner_calls: list[str] = []
+
+    def runner(argv, **kwargs):
+        runner_calls.append("called")
+        _write_plan(plan_path, _COMPLETE_PLAN)
+        return subprocess.CompletedProcess(argv, 0, "complete", "")
+
+    resume = _mark_validated_resume_context(ResumeContext(
+        resumed_from_run_id=source_run_id,
+        feature_branch=None,
+        worktree_path=None,
+        main_branch=None,
+        setup=(),
+        teardown=(),
+    ))
+    config = ControllerConfig(
+        repo_root=tmp_path, plan_path=plan_path, max_turns=2,
+        reserved_run_id="marked-successor",
+    )
+    if source_state == "inactive":
+        result = run_workflow(
+            config, _resume_override_workflow_config(), "resume_override",
+            config_dir=tmp_path, snapshot_config=False,
+            adapter=CodexAdapter(), runner=runner, resume=resume,
+        )
+        assert result.run_dir.name == "marked-successor"
+        assert runner_calls == ["called"]
+    else:
+        with pytest.raises(ProjectAdmissionConflict, match="predecessor inactivity"):
+            run_workflow(
+                config, _resume_override_workflow_config(), "resume_override",
+                config_dir=tmp_path, snapshot_config=False,
+                adapter=CodexAdapter(), runner=runner, resume=resume,
+            )
+        assert runner_calls == []
+        assert not (tmp_path / ".aflow" / "runs" / "marked-successor").exists()
+        assert not (tmp_path / ".aflow" / "launches" / "marked-successor.json").exists()
+        assert ProjectAdmission(tmp_path).reservation("marked-successor") is None
 
 
 def _runner_invocation_text(argv, kwargs) -> str:
@@ -183,11 +297,12 @@ def _resume_override_context(
     pending_notes: tuple[str, ...] = (),
     pending_target_step: str | None = None,
 ) -> ResumeContext:
+    _record_inactive_direct_source(predecessor_dir)
     resolution = resolve_resume_override(
         predecessor_dir,
         persisted_result,
     )
-    return ResumeContext(
+    return _mark_validated_resume_context(ResumeContext(
         resumed_from_run_id=predecessor_dir.name,
         feature_branch="feature/resume-override",
         worktree_path=worktree_path,
@@ -199,7 +314,7 @@ def _resume_override_context(
         pending_override_target_step=pending_target_step,
         override_source_run_dir=resolution.source_run_dir,
         override_file_present=resolution.file_present,
-    )
+    ))
 
 
 def _review_note_workflow_config() -> WorkflowUserConfig:
@@ -511,13 +626,14 @@ class WorkflowRuntimeTests(unittest.TestCase):
             repo_root = Path(tmpdir)
             plan_path = repo_root / "plan.md"
             _write_plan(plan_path, _VALID_PLAN)
+            _record_inactive_direct_source(repo_root / ".aflow" / "runs" / "predecessor")
             workflow_config = _resume_override_workflow_config()
             identity = _freeze_run_identity(
                 "resume_override",
                 workflow_config,
                 config_dir=repo_root,
             )
-            resume = ResumeContext(
+            resume = _mark_validated_resume_context(ResumeContext(
                 resumed_from_run_id="predecessor",
                 feature_branch="feature/resume-identity",
                 worktree_path=repo_root,
@@ -528,7 +644,7 @@ class WorkflowRuntimeTests(unittest.TestCase):
                     identity,
                     config_fingerprint="different-fingerprint",
                 ),
-            )
+            ))
             events: list[object] = []
 
             class Observer:
@@ -564,6 +680,7 @@ class WorkflowRuntimeTests(unittest.TestCase):
             repo_root = Path(tmpdir)
             plan_path = repo_root / "plan.md"
             _write_plan(plan_path, _VALID_PLAN)
+            _record_inactive_direct_source(repo_root / ".aflow" / "runs" / "predecessor")
             worktree_path = repo_root / "worktree"
             worktree_path.mkdir()
             workflow_config = _resume_override_workflow_config()
@@ -572,7 +689,7 @@ class WorkflowRuntimeTests(unittest.TestCase):
                 workflow_config,
                 config_dir=repo_root,
             )
-            resume = ResumeContext(
+            resume = _mark_validated_resume_context(ResumeContext(
                 resumed_from_run_id="predecessor",
                 feature_branch="feature/resume-identity",
                 worktree_path=worktree_path,
@@ -580,7 +697,7 @@ class WorkflowRuntimeTests(unittest.TestCase):
                 setup=("worktree", "branch"),
                 teardown=(),
                 frozen_run_identity=identity,
-            )
+            ))
             events: list[object] = []
 
             class Observer:
@@ -615,6 +732,171 @@ class WorkflowRuntimeTests(unittest.TestCase):
             validate_resume.assert_called_once()
             assert result.run_dir.is_dir()
             assert type(events[0]).__name__ == "RunStartedEvent"
+
+    def test_direct_resume_admission_accepts_legacy_source_provenance(self) -> None:
+        for predecessor, create_legacy_run in (
+            ("prior-before-worker", True),
+            ("prior-before_worker", True),
+        ):
+            with self.subTest(predecessor=predecessor), tempfile.TemporaryDirectory() as tmpdir:
+                repo_root = Path(tmpdir)
+                plan_path = repo_root / "plan.md"
+                _write_plan(plan_path, _VALID_PLAN)
+                if create_legacy_run:
+                    predecessor_dir = repo_root / ".aflow" / "runs" / predecessor
+                    predecessor_dir.mkdir(parents=True)
+                    (predecessor_dir / "run.json").write_text(
+                        '{"status":"failed"}\n', encoding="utf-8"
+                    )
+
+                occupied_during_controller: list[int] = []
+
+                def runner(argv, **kwargs):
+                    occupied_during_controller.append(
+                        ProjectAdmission(repo_root).snapshot().occupied_count
+                    )
+                    _write_plan(plan_path, _COMPLETE_PLAN)
+                    return subprocess.CompletedProcess(argv, 0, "complete", "")
+
+                result = run_workflow(
+                    ControllerConfig(
+                        repo_root=repo_root,
+                        plan_path=plan_path,
+                        max_turns=2,
+                    ),
+                    _resume_override_workflow_config(),
+                    "resume_override",
+                    config_dir=repo_root,
+                    snapshot_config=False,
+                    adapter=CodexAdapter(),
+                    runner=runner,
+                    resume=ResumeContext(
+                        resumed_from_run_id=predecessor,
+                        feature_branch=None,
+                        worktree_path=None,
+                        main_branch=None,
+                        setup=(),
+                        teardown=(),
+                    ),
+                )
+
+                reservation = ProjectAdmission(repo_root).reservation(result.run_dir.name)
+                assert reservation is not None
+                assert reservation.source_run_id == predecessor
+                assert reservation.bound is True
+                assert occupied_during_controller == [1]
+                assert ProjectAdmission(repo_root).snapshot().occupied_count == 0
+
+    def test_direct_resume_admission_rejects_unvalidated_empty_setup(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repo_root = Path(tmpdir)
+            plan_path = repo_root / "plan.md"
+            _write_plan(plan_path, _VALID_PLAN)
+            predecessor = "unit-started-predecessor"
+            create_launch_manifest(
+                repo_root,
+                LaunchManifest(
+                    run_id=predecessor,
+                    project_root=str(repo_root.resolve()),
+                    plan_path=str(plan_path.resolve()),
+                    workflow_name="resume_override",
+                    max_turns=2,
+                    idempotency_key="predecessor-key",
+                    caller_scope="test",
+                ),
+            )
+            write_launch_phase(repo_root, predecessor, "unit_started")
+            runner_called = False
+
+            def runner(argv, **kwargs):
+                nonlocal runner_called
+                runner_called = True
+                return subprocess.CompletedProcess(argv, 0, "unexpected", "")
+
+            with pytest.raises(ProjectAdmissionConflict, match="predecessor inactivity"):
+                run_workflow(
+                    ControllerConfig(
+                        repo_root=repo_root,
+                        plan_path=plan_path,
+                        max_turns=2,
+                    ),
+                    _resume_override_workflow_config(),
+                    "resume_override",
+                    config_dir=repo_root,
+                    snapshot_config=False,
+                    adapter=CodexAdapter(),
+                    runner=runner,
+                    resume=ResumeContext(
+                        resumed_from_run_id=predecessor,
+                        feature_branch=None,
+                        worktree_path=None,
+                        main_branch=None,
+                        setup=(),
+                        teardown=(),
+                    ),
+                )
+
+            assert runner_called is False
+
+    def test_direct_resume_admission_rejects_raw_lifecycle_fields_with_active_predecessor(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repo_root = Path(tmpdir)
+            plan_path = repo_root / "plan.md"
+            _write_plan(plan_path, _VALID_PLAN)
+            predecessor = "raw-lifecycle-predecessor"
+            create_launch_manifest(
+                repo_root,
+                LaunchManifest(
+                    run_id=predecessor,
+                    project_root=str(repo_root.resolve()),
+                    plan_path=str(plan_path.resolve()),
+                    workflow_name="resume_override",
+                    max_turns=2,
+                    idempotency_key="predecessor-key",
+                    caller_scope="test",
+                ),
+            )
+            write_launch_phase(repo_root, predecessor, "unit_started")
+            worktree_path = repo_root / "worktree"
+            worktree_path.mkdir()
+            runner_called = False
+
+            def runner(argv, **kwargs):
+                nonlocal runner_called
+                runner_called = True
+                return subprocess.CompletedProcess(argv, 0, "unexpected", "")
+
+            raw_resume = ResumeContext(
+                resumed_from_run_id=predecessor,
+                feature_branch="feature/raw-resume",
+                worktree_path=worktree_path,
+                main_branch="main",
+                setup=("worktree", "branch"),
+                teardown=(),
+            )
+            with patch(
+                "aflow.workflow._validate_worktree_resume_context",
+                return_value=None,
+            ):
+                with pytest.raises(ProjectAdmissionConflict, match="predecessor inactivity"):
+                    run_workflow(
+                        ControllerConfig(
+                            repo_root=repo_root,
+                            plan_path=plan_path,
+                            max_turns=2,
+                        ),
+                        _resume_override_workflow_config(),
+                        "resume_override",
+                        config_dir=repo_root,
+                        snapshot_config=False,
+                        adapter=CodexAdapter(),
+                        runner=runner,
+                        resume=raw_resume,
+                    )
+
+            assert runner_called is False
 
     def test_repartition_route_requires_generation_candidate_and_partition(self) -> None:
         state = ControllerState(
@@ -1013,8 +1295,9 @@ class WorkflowRuntimeTests(unittest.TestCase):
             _write_plan(plan_path, _VALID_PLAN)
             predecessor_dir = repo_root / ".aflow" / "runs" / "predecessor"
             predecessor_dir.mkdir(parents=True)
+            _record_inactive_direct_source(predecessor_dir)
             note = "Keep this recovery direction for the reviewer."
-            resume = ResumeContext(
+            resume = _mark_validated_resume_context(ResumeContext(
                 resumed_from_run_id=predecessor_dir.name,
                 feature_branch=None,
                 worktree_path=None,
@@ -1024,7 +1307,7 @@ class WorkflowRuntimeTests(unittest.TestCase):
                 interrupted_step_name="review",
                 pending_override_notes=(note,),
                 pending_override_target_step="review",
-            )
+            ))
             runner_calls: list[str] = []
 
             class BlockingProbe(NoOpHarnessPreflightProbe):
@@ -3098,6 +3381,7 @@ class WorkflowRuntimeTests(unittest.TestCase):
                 json.dumps({"active_turn": 5, "turns_completed": 5}),
                 encoding="utf-8",
             )
+            _record_inactive_direct_source(source_run)
             result_path.write_text(
                 json.dumps(
                     {
@@ -3167,7 +3451,7 @@ class WorkflowRuntimeTests(unittest.TestCase):
                 snapshot_config=False,
                 adapter=CodexAdapter(),
                 runner=runner,
-                resume=ResumeContext(
+                resume=_mark_validated_resume_context(ResumeContext(
                     resumed_from_run_id="prior-run",
                     feature_branch=None,
                     worktree_path=None,
@@ -3176,7 +3460,7 @@ class WorkflowRuntimeTests(unittest.TestCase):
                     teardown=(),
                     active_plan_path=active_overlay,
                     interrupted_step_name="review",
-                ),
+                )),
             )
 
             assert result.turns_completed == 1
@@ -6789,9 +7073,10 @@ class WorkflowEndToEndTests(unittest.TestCase):
             assert 'launch_requested' in numeric_events
             assert 'steps_skipped' in numeric_events
 
-            # Clean up runs directory
+            # Reset the disposable run's full durable state before comparing a
+            # second independent launch of the same plan.
             import shutil
-            shutil.rmtree(repo_root / '.aflow' / 'runs')
+            shutil.rmtree(repo_root / '.aflow')
 
             # Run with named start-step
             env_named = _workflow_test_env(repo_root, scenario='noop', plan_path=plan_path, count_file=count_file, home_dir=home_dir)
@@ -9962,6 +10247,7 @@ class WorkflowLifecycleRuntimeTests(unittest.TestCase):
             repo_root = Path(tmpdir)
             plan_path = repo_root / 'plan.md'
             _write_plan(plan_path, _VALID_PLAN)
+            _record_inactive_direct_source(repo_root / ".aflow" / "runs" / "preflight-blocked-run")
             wf_config = _make_simple_wf_config()
             calls: list[Path] = []
 
@@ -9983,7 +10269,7 @@ class WorkflowLifecycleRuntimeTests(unittest.TestCase):
                     snapshot_config=False,
                 adapter=CodexAdapter(),
                 runner=runner,
-                resume=ResumeContext(
+                resume=_mark_validated_resume_context(ResumeContext(
                     resumed_from_run_id='preflight-blocked-run',
                     feature_branch=None,
                     worktree_path=None,
@@ -9991,7 +10277,7 @@ class WorkflowLifecycleRuntimeTests(unittest.TestCase):
                     setup=(),
                     teardown=(),
                     interrupted_step_name='implement_plan',
-                ),
+                )),
             )
 
             assert calls == [repo_root]
@@ -10445,6 +10731,7 @@ class WorkflowLifecycleRuntimeTests(unittest.TestCase):
             root = Path(tmpdir)
             repo_root = root / 'repo'
             repo_root.mkdir()
+            _record_inactive_direct_source(repo_root / '.aflow' / 'runs' / 'prior-run')
             _make_lifecycle_git_repo(repo_root, branch='main')
             worktree_path = root / 'worktree'
             plan_path = repo_root / 'plan.md'
@@ -10567,7 +10854,7 @@ class WorkflowLifecycleRuntimeTests(unittest.TestCase):
                     snapshot_config=False,
                 adapter=CodexAdapter(),
                 runner=runner,
-                resume=ResumeContext(
+                resume=_mark_validated_resume_context(ResumeContext(
                     resumed_from_run_id='prior-run',
                     feature_branch='resume-feature',
                     worktree_path=worktree_path,
@@ -10576,7 +10863,7 @@ class WorkflowLifecycleRuntimeTests(unittest.TestCase):
                     teardown=(),
                     active_plan_path=logical_repair,
                     interrupted_step_name='review',
-                ),
+                )),
             )
 
             assert len(prompts) == 2
@@ -10602,6 +10889,7 @@ class WorkflowLifecycleRuntimeTests(unittest.TestCase):
             root = Path(tmpdir)
             repo_root = root / 'repo'
             repo_root.mkdir()
+            _record_inactive_direct_source(repo_root / '.aflow' / 'runs' / 'prior-run')
             _make_lifecycle_git_repo(repo_root, branch='main')
             worktree_path = root / 'worktree'
             plan_path = repo_root / 'plan.md'
@@ -10678,7 +10966,10 @@ class WorkflowLifecycleRuntimeTests(unittest.TestCase):
 
             def runner(argv, **kwargs):
                 captured_prompt.append(_runner_invocation_text(argv, kwargs))
-                run_dir = next((repo_root / '.aflow' / 'runs').iterdir())
+                run_dir = next(
+                    path for path in (repo_root / '.aflow' / 'runs').iterdir()
+                    if path.name != 'prior-run'
+                )
                 payload = json.loads((run_dir / 'run.json').read_text())
                 resumed_scope = payload['active_implementation_scope']
                 next_scope_captured_before_worker.append(
@@ -10703,7 +10994,7 @@ class WorkflowLifecycleRuntimeTests(unittest.TestCase):
                         snapshot_config=False,
                     adapter=CodexAdapter(),
                     runner=runner,
-                    resume=ResumeContext(
+                    resume=_mark_validated_resume_context(ResumeContext(
                     resumed_from_run_id='prior-run',
                     feature_branch='resume-feature',
                     worktree_path=worktree_path,
@@ -10737,7 +11028,7 @@ class WorkflowLifecycleRuntimeTests(unittest.TestCase):
                             f'{logical_repair}::checkpoint-complete'
                         ),
                     ),
-                    ),
+                    )),
                 )
 
             assert len(captured_prompt) == 1
@@ -10758,6 +11049,7 @@ class WorkflowLifecycleRuntimeTests(unittest.TestCase):
             root = Path(tmpdir)
             repo_root = root / 'repo'
             repo_root.mkdir()
+            _record_inactive_direct_source(repo_root / '.aflow' / 'runs' / 'prior-run')
             _make_lifecycle_git_repo(repo_root, branch='main')
             worktree_path = root / 'worktree'
             plan_path = repo_root / 'plan.md'
@@ -10974,7 +11266,7 @@ class WorkflowLifecycleRuntimeTests(unittest.TestCase):
                     snapshot_config=False,
                 adapter=CodexAdapter(),
                 runner=runner,
-                resume=ResumeContext(
+                resume=_mark_validated_resume_context(ResumeContext(
                     resumed_from_run_id='prior-run',
                     feature_branch='resume-feature',
                     worktree_path=worktree_path,
@@ -11012,7 +11304,7 @@ class WorkflowLifecycleRuntimeTests(unittest.TestCase):
                             'NEW_PLAN_EXISTS || !DONE'
                         ),
                     ),
-                ),
+                )),
             )
 
             assert calls[:2] == ['manager-lite', 'worker-high']
@@ -11211,6 +11503,7 @@ class WorkflowLifecycleRuntimeTests(unittest.TestCase):
             root = Path(tmpdir)
             repo_root = root / 'repo'
             repo_root.mkdir()
+            _record_inactive_direct_source(repo_root / '.aflow' / 'runs' / 'prior-run')
             _make_lifecycle_git_repo(repo_root, branch='main')
             worktree_path = root / 'worktree'
             plan_path = repo_root / 'plan.md'
@@ -11327,7 +11620,7 @@ class WorkflowLifecycleRuntimeTests(unittest.TestCase):
                     snapshot_config=False,
                 adapter=CodexAdapter(),
                 runner=runner,
-                resume=ResumeContext(
+                resume=_mark_validated_resume_context(ResumeContext(
                     resumed_from_run_id='prior-run',
                     feature_branch='resume-feature',
                     worktree_path=worktree_path,
@@ -11360,7 +11653,7 @@ class WorkflowLifecycleRuntimeTests(unittest.TestCase):
                         },
                         chosen_transition='review',
                     ),
-                ),
+                )),
             )
 
             assert [model for model, _ in calls] == ['review']
@@ -11629,6 +11922,7 @@ class WorkflowLifecycleRuntimeTests(unittest.TestCase):
     def test_branch_only_failed_terminal_merge_retries_integration_only(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             repo_root = Path(tmpdir)
+            _record_inactive_direct_source(repo_root / '.aflow' / 'runs' / 'failed-branch-merge-run')
             _make_lifecycle_git_repo(repo_root, branch='main')
             plan_path = repo_root / 'plan.md'
             _write_plan(plan_path, _COMPLETE_PLAN)
@@ -11682,7 +11976,7 @@ class WorkflowLifecycleRuntimeTests(unittest.TestCase):
                     snapshot_config=False,
                 adapter=CodexAdapter(),
                 runner=runner,
-                resume=ResumeContext(
+                resume=_mark_validated_resume_context(ResumeContext(
                     resumed_from_run_id='failed-branch-merge-run',
                     feature_branch='feature/terminal-integration',
                     worktree_path=None,
@@ -11692,7 +11986,7 @@ class WorkflowLifecycleRuntimeTests(unittest.TestCase):
                     active_plan_path=plan_path,
                     interrupted_step_name='impl',
                     terminal_integration_only=True,
-                ),
+                )),
             )
 
             assert calls == [repo_root]
@@ -11731,6 +12025,7 @@ class WorkflowLifecycleRuntimeTests(unittest.TestCase):
             root = Path(tmpdir)
             repo_root = root / 'repo'
             repo_root.mkdir()
+            _record_inactive_direct_source(repo_root / '.aflow' / 'runs' / 'failed-merge-run')
             _make_lifecycle_git_repo(repo_root, branch='main')
             worktree_root = root / 'worktrees'
             worktree_root.mkdir()
@@ -11789,7 +12084,7 @@ class WorkflowLifecycleRuntimeTests(unittest.TestCase):
                     snapshot_config=False,
                 adapter=CodexAdapter(),
                 runner=runner,
-                resume=ResumeContext(
+                resume=_mark_validated_resume_context(ResumeContext(
                     resumed_from_run_id='failed-merge-run',
                     feature_branch='feature/terminal-integration',
                     worktree_path=worktree_path,
@@ -11799,7 +12094,7 @@ class WorkflowLifecycleRuntimeTests(unittest.TestCase):
                     active_plan_path=plan_path,
                     interrupted_step_name='impl',
                     terminal_integration_only=True,
-                ),
+                )),
             )
 
             assert result.turns_completed == 0
@@ -12017,6 +12312,7 @@ class WorkflowLifecycleRuntimeTests(unittest.TestCase):
     def test_legacy_resume_scope_is_rejected_before_worker(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             repo_root = Path(tmpdir)
+            _record_inactive_direct_source(repo_root / '.aflow' / 'runs' / 'prior-run')
             plan_path = repo_root / "plan.md"
             _write_plan(plan_path, _VALID_PLAN)
             scope = ActiveImplementationScope(
@@ -12055,7 +12351,7 @@ class WorkflowLifecycleRuntimeTests(unittest.TestCase):
                     runner=lambda argv, **kwargs: subprocess.CompletedProcess(
                         argv, 0, "unexpected", ""
                     ),
-                    resume=ResumeContext(
+                    resume=_mark_validated_resume_context(ResumeContext(
                         resumed_from_run_id="prior-run",
                         feature_branch=None,
                         worktree_path=None,
@@ -12063,7 +12359,7 @@ class WorkflowLifecycleRuntimeTests(unittest.TestCase):
                         setup=(),
                         teardown=(),
                         active_implementation_scope=scope,
-                    ),
+                    )),
                 )
 
     def test_review_without_repair_plan_is_not_recorded_as_rejection(self) -> None:
@@ -17406,8 +17702,10 @@ def _run_upgrade_resume_scenario(
                 "carried_reviewer_rejection_count": 0,
             },
         })
-    resume = ResumeContext(
-        resumed_from_run_id=f"prior-{interruption}",
+    prior_run_id = f"prior-{interruption}"
+    _record_inactive_direct_source(repo_root / ".aflow" / "runs" / prior_run_id)
+    resume = _mark_validated_resume_context(ResumeContext(
+        resumed_from_run_id=prior_run_id,
         feature_branch="resume-feature",
         worktree_path=worktree_path,
         main_branch="main",
@@ -17416,7 +17714,7 @@ def _run_upgrade_resume_scenario(
         active_plan_path=repair_path,
         scope_envelope_bytes=scope_envelope_bytes,
         **resume_manager_fields,
-    )
+    ))
     workflow_models: list[str] = []
     workflow_prompts: list[str] = []
     manager_numbers: list[int] = []

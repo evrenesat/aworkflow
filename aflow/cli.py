@@ -49,6 +49,7 @@ from .run_state import (
     ResumeContext,
     ReviewRejectionRecord,
     WorkflowEndReason,
+    _mark_validated_resume_context,
     describe_end_reason,
     hotplug_resume_fields,
     manager_resume_fields,
@@ -135,6 +136,7 @@ from .recovery_runtime import (
     validate_recovery_runtime,
 )
 from .status import BannerRenderer, WorkflowGraphSource, build_workflow_show
+from .project_admission import ProjectAdmissionError, ProjectCapacityReached
 
 RUN_HELP = """\
 Flags:
@@ -3993,7 +3995,7 @@ def _reconstruct_resume_context(
         hotplug_fields["role_selectors"] = {}
         hotplug_fields["active_role_sessions"] = ()
 
-    return ResumeContext(
+    return _mark_validated_resume_context(ResumeContext(
         resumed_from_run_id=run_id,
         feature_branch=feature_branch,
         worktree_path=Path(worktree_path) if worktree_path is not None else None,
@@ -4103,7 +4105,7 @@ def _reconstruct_resume_context(
         resume_team_override=resume_team_override,
         **hotplug_fields,
         **manager_fields,
-    )
+    ))
 
 
 def _detect_resume_candidate(
@@ -5396,6 +5398,12 @@ def main(argv: list[str] | None = None) -> int:
             resume=resume_ctx,
             observer=observer,
         )
+    except ProjectCapacityReached as exc:
+        print(f"error: {exc.safe_message} [{exc.code}]", file=sys.stderr)
+        return 1
+    except ProjectAdmissionError as exc:
+        print(f"error: {exc.safe_message} [{exc.code}]", file=sys.stderr)
+        return 1
     except WorkflowError as exc:
         print(exc.summary, file=sys.stderr)
         return 1

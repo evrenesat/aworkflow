@@ -4,6 +4,35 @@ AFlow is a plan-driven workflow orchestrator that runs coding tasks through exis
 
 `RunMetadataWriter` is the workflow controller's bound schema-v2 persistence boundary, holding stable run identity while each write supplies mutable lifecycle state explicitly.
 
+## Project launch admission
+
+`aflow/project_admission.py` keeps nonce-bound reservations under one lock in
+the primary project's `.aflow` directory. It reconciles controller, startup,
+unit, receipt, and process-birth evidence before counting reserved, starting,
+active, and uncertain logical runs against the project scheduling limit. A
+daemon start or resume reserves before launch publication; its worker consumes
+the same reservation. Direct CLI and API controllers enter through
+`run_workflow`. Startup questions retain their plan claim while releasing the
+capacity slot, then reacquire a slot before launch. Ambiguous ownership keeps
+its slot until inactivity is proven. Manual capacity conflicts carry the
+`project_capacity_reached` code; automatic callers can defer on that code.
+The same lock also admits only one unresolved successor per predecessor,
+using reservation and persisted lineage evidence. Exact retries reuse their
+claim; another successor waits until the first is authoritatively inactive.
+The daemon's read-only `can_resume` hint uses the same predecessor inactivity
+check as locked admission; a stopped or missing unit with running controller
+metadata remains uncertain and cannot be offered for resume.
+The same lock also admits only one unresolved run claim for a validated plan
+path across daemon and direct controllers, including linked worktrees. A
+released pending startup question retains its claim; confirmed inactive runs
+can be retried or continued without blocking independent plans. Canonical
+external plan paths have their own bounded identity; plan-claim conflicts
+return HTTP 409 from the server.
+The CLI's validated resume marker permits the source's historical plan claim
+only after admission confirms its current ownership is inactive under that
+lock. Saved running metadata alone does not prove the prior controller stopped;
+terminal direct-controller records or identity-bound worker receipts do.
+
 ## Optional issue-intake boundary
 
 `aflow/issue_intake.py` is a short-lived host command. It loads one strict

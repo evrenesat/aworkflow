@@ -35,6 +35,7 @@ class RunnerConfig:
     session_driver: SessionDriver | None = None
     source_session_driver: SessionDriver | None = None
     allow_existing_launch_manifest: bool = False
+    admission_reservation_nonce: str | None = None
 
 
 class WorkflowRunner:
@@ -160,6 +161,7 @@ class WorkflowRunner:
             session_driver=self._config.session_driver,
             source_session_driver=self._config.source_session_driver,
             allow_existing_launch_manifest=self._config.allow_existing_launch_manifest,
+            admission_reservation_nonce=self._config.admission_reservation_nonce,
         )
         return result
 
@@ -177,6 +179,7 @@ def execute_workflow(
     session_driver: SessionDriver | None = None,
     source_session_driver: SessionDriver | None = None,
     allow_existing_launch_manifest: bool = False,
+    admission_reservation_nonce: str | None = None,
 ) -> ControllerRunResult:
     """Execute a prepared workflow with optional event observation.
 
@@ -207,6 +210,7 @@ def execute_workflow(
         session_driver=session_driver,
         source_session_driver=source_session_driver,
         allow_existing_launch_manifest=allow_existing_launch_manifest,
+        admission_reservation_nonce=admission_reservation_nonce,
     )
     runner_obj = WorkflowRunner(config)
     return runner_obj.run()

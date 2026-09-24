@@ -27,6 +27,7 @@ from aflow.run_state import (
     PlanSnapshot,
     ReviewRejectionRecord,
     ResumeContext,
+    _mark_validated_resume_context,
     manager_resume_fields,
     manager_resume_fields_strict,
 )
@@ -730,11 +731,18 @@ def test_selected_worker_route_survives_prelaunch_process_stop(
     assert persisted_override["selector"] == "codex.worker-high"
     assert source_payload["active_turn"] == source_payload["turns_completed"] + 1
 
+    # The synthetic BaseException has ended the source controller in this
+    # process; record that ownership transition before starting its successor.
+    (source_run / "run.json").write_text(
+        json.dumps({**source_payload, "status": "interrupted"}) + "\n",
+        encoding="utf-8",
+    )
+
     fields = manager_resume_fields(source_payload)
     scope = fields["active_implementation_scope"]
     assert scope is not None
     envelope_path = source_run / str(scope.envelope_artifact_path)
-    resume = ResumeContext(
+    resume = _mark_validated_resume_context(ResumeContext(
         resumed_from_run_id=source_run.name,
         feature_branch=None,
         worktree_path=None,
@@ -746,7 +754,7 @@ def test_selected_worker_route_survives_prelaunch_process_stop(
         effective_max_turns=10,
         scope_envelope_bytes=envelope_path.read_bytes(),
         **fields,
-    )
+    ))
 
     result = run_workflow(
         config=ControllerConfig(
@@ -840,11 +848,15 @@ def test_repair_threshold_survives_resume_with_reset_turn_numbers(
     attempt_rows = next(iter(source_payload["implementation_attempts"].values()))
     assert len(attempt_rows) == 1
     assert attempt_rows[0]["attempt_ordinal"] == 1
+    (source_run / "run.json").write_text(
+        json.dumps({**source_payload, "status": "interrupted"}) + "\n",
+        encoding="utf-8",
+    )
     fields = manager_resume_fields(source_payload)
     scope = fields["active_implementation_scope"]
     assert scope is not None
     envelope_path = source_run / str(scope.envelope_artifact_path)
-    resume = ResumeContext(
+    resume = _mark_validated_resume_context(ResumeContext(
         resumed_from_run_id=source_run.name,
         feature_branch=None,
         worktree_path=None,
@@ -856,7 +868,7 @@ def test_repair_threshold_survives_resume_with_reset_turn_numbers(
         effective_max_turns=10,
         scope_envelope_bytes=envelope_path.read_bytes(),
         **fields,
-    )
+    ))
     review_count = 0
 
     def resume_runner(
