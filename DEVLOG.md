@@ -1,5 +1,13 @@
 # DEVLOG
 
+## 2026-09-24 — Add local macOS AFlow dashboard launcher
+
+- Added `scripts/aflow_ui` for an explicit open-or-update choice when the local
+  dashboard is running. An update fast-forwards the local source, refreshes its
+  editable tool, synchronizes the p100 workflow pair with a backup, and opens
+  the dashboard. The script stops only the recorded UI process and refuses to
+  update while local workflow workers are active.
+
 ## 2026-09-23 — Prioritize Teams assignments in the selected editor (Checkpoint 1)
 
 - Teams now presents effective Worker and Reviewer assignments first for legacy,

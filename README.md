@@ -269,6 +269,16 @@ aflow ui --stop     # stop the UI; running workflows are not signalled
 aflow ui --host 127.0.0.1 --port 8765   # per-process overrides
 ```
 
+On Evren's macOS development machine, `~/bin/aflow_ui` is a convenience
+launcher for this dashboard. If one is already running, it offers to open it or
+stop and update it. The update fast-forwards `~/code/agent_flow` from
+`origin/main`, reinstalls its editable `aworkflow` tool, copies only the global
+`aflow.toml` and `workflows.toml` pair from p100 with a local backup, validates
+the pair, starts the UI, and opens the dashboard in the default browser. It
+preserves local `config.toml`, credentials, project registrations, and run state.
+The update refuses while local workflow workers are active. Use `--open` or
+`--restart` to select an action without the prompt.
+
 Workflows started from the UI keep running when the UI stops or restarts and
 reattach when it returns. Each run may retain a launch-time configuration
 snapshot as diagnostic provenance; execution uses the current global pair at

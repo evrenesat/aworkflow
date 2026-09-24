@@ -1,0 +1,301 @@
+#!/usr/bin/env python3
+"""Update the local AFlow dashboard and open it in the default macOS browser."""
+
+from __future__ import annotations
+
+import argparse
+import fcntl
+import io
+import os
+from pathlib import Path
+import re
+import shutil
+import subprocess
+import sys
+import tarfile
+import tempfile
+import tomllib
+from datetime import datetime, timezone
+
+HOME = Path.home()
+REPO = HOME / "code" / "agent_flow"
+CONFIG = HOME / ".config" / "aflow"
+AFLOW = HOME / ".local" / "share" / "uv" / "tools" / "aworkflow" / "bin" / "aflow"
+AFLOW_PYTHON = AFLOW.with_name("python3")
+PAIR = ("aflow.toml", "workflows.toml")
+STATUS_URL = re.compile(r"^aflow ui is running: (https?://\S+)", re.MULTILINE)
+MAX_CONFIG_BYTES = 1_000_000
+
+
+class LaunchError(Exception):
+    pass
+
+
+def run(
+    *args: str | Path, cwd: Path | None = None, capture: bool = False
+) -> subprocess.CompletedProcess[str]:
+    result = subprocess.run(
+        [str(arg) for arg in args],
+        cwd=cwd,
+        text=True,
+        stdout=subprocess.PIPE if capture else None,
+        stderr=subprocess.PIPE if capture else None,
+        check=False,
+    )
+    if result.returncode:
+        detail = ((result.stderr or "") + (result.stdout or "")).strip()
+        raise LaunchError(f"{args[0]} failed ({result.returncode}): {detail}")
+    return result
+
+
+def ui_status() -> tuple[str | None, bool]:
+    result = run(AFLOW, "ui", "--status", capture=True)
+    match = STATUS_URL.search(result.stdout)
+    return (match.group(1) if match else None, "HTTP: responding" in result.stdout)
+
+
+def choice() -> str:
+    if not sys.stdin.isatty():
+        raise LaunchError("UI is running; use --open or --restart without a terminal")
+    while True:
+        answer = (
+            input(
+                "AFlow UI is running. [o]pen dashboard (default), [r]estart and update, [q]uit? "
+            )
+            .strip()
+            .lower()
+        )
+        if answer in ("", "o", "open"):
+            return "open"
+        if answer in ("r", "restart"):
+            return "restart"
+        if answer in ("q", "quit"):
+            return "quit"
+
+
+def active_workers() -> list[str]:
+    result = run("ps", "-axo", "pid=,command=", capture=True)
+    workers = []
+    for line in result.stdout.splitlines():
+        parts = line.strip().split()
+        if len(parts) < 3:
+            continue
+        for index, token in enumerate(parts[1:-1], 1):
+            if Path(token).name == "aflow" and parts[index + 1] in {
+                "ui-worker",
+                "daemon-worker",
+                "run",
+            }:
+                workers.append(line.strip())
+                break
+    return workers
+
+
+def fetch_source() -> str:
+    if not (REPO / ".git").exists():
+        raise LaunchError(f"missing Git checkout: {REPO}")
+    if (
+        run(
+            "git", "symbolic-ref", "--short", "HEAD", cwd=REPO, capture=True
+        ).stdout.strip()
+        != "main"
+    ):
+        raise LaunchError(f"{REPO} must be on main")
+    if run(
+        "git", "status", "--porcelain", "--untracked-files=no", cwd=REPO, capture=True
+    ).stdout.strip():
+        raise LaunchError(f"{REPO} has tracked changes; preserve them before updating")
+    run("git", "fetch", "origin", "main", cwd=REPO)
+    candidate = run(
+        "git", "rev-parse", "FETCH_HEAD", cwd=REPO, capture=True
+    ).stdout.strip()
+    if subprocess.run(
+        ["git", "merge-base", "--is-ancestor", "HEAD", candidate], cwd=REPO, check=False
+    ).returncode:
+        raise LaunchError(
+            "local main diverged from origin/main; resolve Git history first"
+        )
+    print(f"Fetched origin/main {candidate[:12]}")
+    return candidate
+
+
+def remote_pair() -> dict[str, bytes]:
+    command = (
+        "flock -s /root/.config/aflow/.aflow-config-pair.lock "
+        "tar -C /root/.config/aflow -cf - aflow.toml workflows.toml"
+    )
+    result = subprocess.run(
+        ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10", "p100", command],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=False,
+    )
+    if result.returncode:
+        raise LaunchError(
+            f"cannot read p100 AFlow config: {result.stderr.decode(errors='replace').strip()}"
+        )
+    pair = {}
+    with tarfile.open(fileobj=io.BytesIO(result.stdout), mode="r:") as archive:
+        for name in PAIR:
+            member = archive.getmember(name)
+            if not member.isfile() or not 0 < member.size <= MAX_CONFIG_BYTES:
+                raise LaunchError(f"invalid p100 config size/type: {name}")
+            stream = archive.extractfile(member)
+            if stream is None:
+                raise LaunchError(f"cannot read p100 config: {name}")
+            data = stream.read()
+            if len(data) != member.size:
+                raise LaunchError(f"incomplete p100 config: {name}")
+            tomllib.loads(data.decode("utf-8"))
+            pair[name] = data
+    return pair
+
+
+def validate_pair(pair: dict[str, bytes], directory: Path) -> None:
+    for name, data in pair.items():
+        (directory / name).write_bytes(data)
+    code = (
+        "from pathlib import Path; "
+        "from aflow.config import load_workflow_config, validate_workflow_config; "
+        "c = load_workflow_config(Path(__import__('sys').argv[1])); "
+        "errors = validate_workflow_config(c); "
+        "assert not errors, '; '.join(errors)"
+    )
+    run(AFLOW_PYTHON, "-c", code, directory / "aflow.toml")
+
+
+def install_pair(pair: dict[str, bytes]) -> None:
+    CONFIG.mkdir(mode=0o700, parents=True, exist_ok=True)
+    lock_fd = os.open(CONFIG / ".aflow-config-pair.lock", os.O_CREAT | os.O_RDWR, 0o600)
+    try:
+        fcntl.flock(lock_fd, fcntl.LOCK_EX)
+        if all(
+            (CONFIG / name).exists() and (CONFIG / name).read_bytes() == pair[name]
+            for name in PAIR
+        ):
+            print("Local workflow config already matches p100")
+            return
+        stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+        backup = CONFIG / "backups" / f"aflow-ui-sync-{stamp}-{os.getpid()}"
+        backup.mkdir(mode=0o700, parents=True)
+        for name in PAIR:
+            if (CONFIG / name).exists():
+                shutil.copy2(CONFIG / name, backup / name)
+                os.chmod(backup / name, 0o600)
+        print(f"Previous local workflow config: {backup}")
+        try:
+            for name in PAIR:
+                with tempfile.NamedTemporaryFile(
+                    dir=CONFIG, prefix=f".{name}.", delete=False
+                ) as stage:
+                    stage.write(pair[name])
+                    stage.flush()
+                    os.fsync(stage.fileno())
+                    os.fchmod(stage.fileno(), 0o600)
+                    stage_path = Path(stage.name)
+                os.replace(stage_path, CONFIG / name)
+        except Exception:
+            for name in PAIR:
+                old = backup / name
+                if old.exists():
+                    shutil.copy2(old, CONFIG / name)
+                    os.chmod(CONFIG / name, 0o600)
+                else:
+                    (CONFIG / name).unlink(missing_ok=True)
+            raise
+    finally:
+        fcntl.flock(lock_fd, fcntl.LOCK_UN)
+        os.close(lock_fd)
+
+
+def open_dashboard() -> None:
+    url, healthy = ui_status()
+    if not url:
+        raise LaunchError("AFlow UI did not report a running dashboard")
+    if not healthy:
+        raise LaunchError(f"AFlow UI is not responding: {url}")
+    run("open", url)
+    print(f"Opened {url}")
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    actions = parser.add_mutually_exclusive_group()
+    actions.add_argument(
+        "--open", action="store_true", help="open the existing UI without updating"
+    )
+    actions.add_argument(
+        "--restart", action="store_true", help="stop the UI, update, and restart"
+    )
+    args = parser.parse_args()
+    if sys.platform != "darwin":
+        raise LaunchError("this launcher is for macOS")
+    if not AFLOW.is_file():
+        raise LaunchError(f"AFlow executable not found: {AFLOW}")
+    url, _ = ui_status()
+    action = (
+        "restart"
+        if args.restart
+        else "open"
+        if args.open
+        else choice()
+        if url
+        else "restart"
+    )
+    if action == "quit":
+        return 0
+    if action == "open":
+        if not url:
+            raise LaunchError("AFlow UI is not running; omit --open to start it")
+        open_dashboard()
+        return 0
+    workers = active_workers()
+    if workers:
+        raise LaunchError(
+            "local AFlow workflow workers are active; open the current UI and retry after they finish:\n"
+            + "\n".join(workers)
+        )
+    candidate = fetch_source()
+    pair = remote_pair()
+    stopped = False
+    try:
+        if url:
+            run(AFLOW, "ui", "--stop")
+            stopped = True
+        if active_workers():
+            raise LaunchError(
+                "a local AFlow worker started during preflight; update aborted"
+            )
+        run("git", "merge", "--ff-only", candidate, cwd=REPO)
+        run("uv", "tool", "install", "-e", ".", "--force", cwd=REPO)
+        with tempfile.TemporaryDirectory(prefix="aflow-ui-config-") as temp:
+            validate_pair(pair, Path(temp))
+        install_pair(pair)
+        run(AFLOW, "ui", "--daemon")
+        open_dashboard()
+        return 0
+    except Exception:
+        if stopped:
+            try:
+                current_url, _ = ui_status()
+                if not current_url:
+                    run(AFLOW, "ui", "--daemon")
+                    print("Restarted AFlow UI after the update failed", file=sys.stderr)
+            except Exception as recovery:
+                print(f"Could not restore AFlow UI: {recovery}", file=sys.stderr)
+        raise
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main())
+    except (
+        LaunchError,
+        OSError,
+        ValueError,
+        tarfile.TarError,
+        tomllib.TOMLDecodeError,
+        KeyError,
+    ) as error:
+        print(f"aflow_ui: {error}", file=sys.stderr)
+        sys.exit(1)
