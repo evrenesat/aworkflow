@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -840,6 +841,9 @@ def test_ui_demo_cp8_plan_editor_and_review_captures(
         "states": {},
     }
     preflight_trace: list[dict[str, object]] = []
+    routed_preflights: list[dict[str, object]] = []
+    routed_requests = []
+    routed_terminals: list[dict[str, object]] = []
     trace_active = False
     latest_preflight_identity: dict[str, object] | None = None
     latest_preflight_readiness: dict[str, object] | None = None
@@ -865,8 +869,12 @@ def test_ui_demo_cp8_plan_editor_and_review_captures(
             payload = {}
         if not isinstance(payload, dict):
             payload = {}
+        plan_path_value = payload.get("plan_path")
         return {
-            "plan_path_present": bool(payload.get("plan_path")),
+            "plan_path_present": bool(plan_path_value),
+            "plan_path_sha256": (
+                hashlib.sha256(str(plan_path_value).encode()).hexdigest() if plan_path_value else None
+            ),
             "workflow_name": payload.get("workflow_name"),
             "team": payload.get("team"),
             "start_step": payload.get("start_step"),
@@ -876,6 +884,22 @@ def test_ui_demo_cp8_plan_editor_and_review_captures(
             "offset": payload.get("offset"),
             "limit": payload.get("limit"),
         }
+
+    def route_index_for(request) -> int | None:
+        return next((index for index, routed in enumerate(routed_requests) if routed is request), None)
+
+    def routed_outcome_records() -> list[dict[str, object]]:
+        return [
+            {
+                "route_index": index,
+                **record,
+                "terminal_outcome": next(
+                    (event["kind"] for event in routed_terminals if event["route_index"] == index),
+                    None,
+                ),
+            }
+            for index, record in enumerate(routed_preflights[:24])
+        ]
 
     def trace_request(request) -> None:
         nonlocal latest_preflight_identity
@@ -917,6 +941,20 @@ def test_ui_demo_cp8_plan_editor_and_review_captures(
             }
             latest_preflight_readiness = event["readiness"]
             event["identity"] = preflight_identity(response.request)
+            event["route_index"] = route_index_for(response.request)
+        append_preflight_trace(event)
+
+    def trace_terminal(request, outcome: str) -> None:
+        route_index = route_index_for(request)
+        if route_index is None:
+            return
+        event = {
+            "kind": outcome,
+            "endpoint": "preflight",
+            "route_index": route_index,
+            "identity": preflight_identity(request),
+        }
+        routed_terminals.append(event)
         append_preflight_trace(event)
 
     def trace_dom(label: str) -> dict[str, object]:
@@ -970,7 +1008,12 @@ def test_ui_demo_cp8_plan_editor_and_review_captures(
 
     def trace_payload(label: str) -> dict[str, object]:
         snapshot = trace_dom(label)
-        return {"events": list(preflight_trace), "final_dom": snapshot}
+        return {
+            "events": list(preflight_trace),
+            "routed_count": len(routed_preflights),
+            "routed": routed_outcome_records(),
+            "final_dom": snapshot,
+        }
 
     def save_preflight_failure(label: str, error: Exception) -> None:
         artifact_dir = _fidelity_artifact_dir(tmp_path)
@@ -1050,8 +1093,11 @@ def test_ui_demo_cp8_plan_editor_and_review_captures(
     with live_server() as url, sync_playwright() as playwright:
         browser = _browser(playwright)
         page = browser.new_page(viewport={"width": width, "height": height})
+        page.expose_function("__aflowCp8TerminalCount", lambda: len(routed_terminals))
         page.on("request", trace_request)
         page.on("response", trace_response)
+        page.on("requestfinished", lambda request: trace_terminal(request, "requestfinished"))
+        page.on("requestfailed", lambda request: trace_terminal(request, "requestfailed"))
         try:
             _login(page, url)
             reference = capture_reference_surface(
@@ -1176,18 +1222,127 @@ def test_ui_demo_cp8_plan_editor_and_review_captures(
 
             held_preflight_routes = []
             if held_refresh:
+                held_route_released = False
+                route_registered = False
+
                 def hold_preflight(route) -> None:
-                    held_preflight_routes.append(route)
+                    identity = preflight_identity(route.request)
+                    if not held_preflight_routes and not routed_preflights:
+                        held_preflight_routes.append(route)
+                        action = "held"
+                    else:
+                        action = "continued"
+                    routed_requests.append(route.request)
+                    routed_preflights.append({
+                        "identity": identity,
+                        "action": action,
+                        "role": "held_refresh" if action == "held" else "other",
+                    })
+                    if action == "continued":
+                        route.continue_()
 
                 page.route("**/runs/preflight", hold_preflight)
-                with page.expect_request("**/runs/preflight"):
-                    preflight.get_by_role("button", name="Refresh worktree inspection", exact=True).click()
-                expect(preflight).to_have_attribute("data-preflight-status", "loading")
-                loading_observation = trace_dom("review-click-refresh-loading")
-                assert loading_observation["preflight_status"] == "loading", loading_observation
-                assert len(held_preflight_routes) == 1, loading_observation
-                held_preflight_routes.pop().continue_()
-                page.unroute("**/runs/preflight", hold_preflight)
+                route_registered = True
+                try:
+                    with page.expect_request("**/runs/preflight") as held_request_info:
+                        preflight.get_by_role("button", name="Refresh worktree inspection", exact=True).click()
+                    held_identity = preflight_identity(held_request_info.value)
+                    expect(preflight).to_have_attribute("data-preflight-status", "loading")
+                    loading_observation = trace_dom("review-click-refresh-loading")
+                    assert loading_observation["preflight_status"] == "loading", loading_observation
+                    assert len(held_preflight_routes) == 1, routed_preflights
+                    assert routed_requests[0] is held_request_info.value
+                    assert routed_preflights[0]["identity"] == held_identity
+                    assert routed_preflights[0]["action"] == "held"
+
+                    max_turns = page.get_by_label("Run max turns", exact=True)
+                    with page.expect_response(
+                        lambda response: endpoint_for(response.url) == "preflight"
+                        and preflight_identity(response.request)["max_turns"] == 16
+                        and response.request == routed_requests[-1]
+                    ) as changed_response_info:
+                        max_turns.fill("16")
+                    changed_response = changed_response_info.value
+                    assert changed_response.status == 200
+                    assert preflight_identity(changed_response.request)["max_turns"] == 16
+                    changed_route_index = route_index_for(changed_response.request)
+                    assert changed_route_index is not None
+                    routed_preflights[changed_route_index]["role"] = "changed_turns"
+
+                    routed_before_restore = len(routed_requests)
+                    with page.expect_response(
+                        lambda response: endpoint_for(response.url) == "preflight"
+                        and preflight_identity(response.request) == held_identity
+                        and len(routed_requests) > routed_before_restore
+                        and response.request in routed_requests[routed_before_restore:]
+                    ) as restored_response_info:
+                        max_turns.fill("")
+                    restored_response = restored_response_info.value
+                    restored_result = restored_response.json()
+                    assert restored_response.status == 200
+                    assert restored_result["blockers"] == []
+                    restored_route_index = route_index_for(restored_response.request)
+                    assert restored_route_index is not None
+                    routed_preflights[restored_route_index]["role"] = "restored_default"
+                    assert len(routed_preflights) >= 3, routed_preflights
+                    assert [item["action"] for item in routed_preflights] == [
+                        "held", *(["continued"] * (len(routed_preflights) - 1))
+                    ], routed_preflights
+                    assert routed_preflights[-1]["identity"] == held_identity, routed_preflights
+                    before_release = wait_for_current_preflight(
+                        "held-refresh-restored-ready", require_review=True
+                    )
+                    held_preflight_routes[0].continue_()
+                    held_route_released = True
+                    page.unroute("**/runs/preflight", hold_preflight)
+                    route_registered = False
+                    page.wait_for_function(
+                        "expected => window.__aflowCp8TerminalCount().then(count => count >= expected)",
+                        arg=len(routed_requests),
+                    )
+                    outcomes = routed_outcome_records()
+                    assert len(outcomes) == len(routed_preflights), outcomes
+                    assert all(record["terminal_outcome"] in ("requestfinished", "requestfailed") for record in outcomes), outcomes
+                    assert outcomes[changed_route_index]["terminal_outcome"] == "requestfinished", outcomes
+                    assert outcomes[restored_route_index]["terminal_outcome"] == "requestfinished", outcomes
+                    held_outcome = outcomes[0]["terminal_outcome"]
+                    if held_outcome == "requestfinished":
+                        assert any(
+                            event["kind"] == "response" and event.get("route_index") == 0
+                            for event in preflight_trace
+                        ), outcomes
+                    else:
+                        assert held_outcome == "requestfailed", outcomes
+                    after_release = wait_for_current_preflight(
+                        "held-refresh-after-terminal", require_review=True
+                    )
+                    assert after_release["launch_identity"]["max_turns"] == "", after_release
+                    assert after_release["review_enabled"] is True, after_release
+                    assert after_release["launch_identity"]["dirty_worktree_confirmed"] is True, after_release
+                    captures["states"]["held_refresh_overlap"] = {
+                        "routed": outcomes,
+                        "changed_response_status": changed_response.status,
+                        "restored_response_status": restored_response.status,
+                        "restored_readiness": {
+                            "requires_confirmation": restored_result["requires_confirmation"],
+                            "blocker_count": len(restored_result["blockers"]),
+                        },
+                        "before_release": before_release,
+                        "after_release": after_release,
+                    }
+                except Exception as error:
+                    save_preflight_failure("held-refresh-overlap", error)
+                    raise
+                finally:
+                    try:
+                        if not held_route_released:
+                            for held_route in held_preflight_routes:
+                                held_route.continue_()
+                    finally:
+                        if route_registered:
+                            page.unroute("**/runs/preflight", hold_preflight)
+                assert len(held_preflight_routes) == 1, routed_preflights
+                assert captures["states"]["held_refresh_overlap"]["before_release"]["preflight_status"] == "ready"
 
             before_review_click = None
             review_region = launch_form.get_by_role("region", name="Review start", exact=True)
