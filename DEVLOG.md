@@ -3449,3 +3449,30 @@ HISTORY: Published clipboard history `c14f1f2`/`cd78d53` remains separate and mu
   WebKit; `git diff --check` passed. The build retains its existing chunk-size
   warning. Full server suite, CI, publication, and live activation remain
   coordinator-owned; this checkpoint is left uncommitted for review.
+
+## 2026-09-24 — Restore mobile Skills editor viewport (Checkpoint 1)
+
+- Reproduced the WebKit 390×844 overflow: heading y=178/h=104.56; Back
+  x=16/y=178/w=84.17/h=48; title y=178/h=60.56 with a 36px status; control
+  y=238.56/h=44; editor y=282.56/h=421.98. The 265.8px title column forced
+  the status to wrap. Chromium kept the status at 18px and placed the editor
+  at y=264.56/h=422. At 320px both engines wrapped naturally: control
+  y=238.56/h=44 and editor y=282.56/h≈422, without horizontal overflow.
+- Reduced the mobile Back button's horizontal padding from 16px to 8px. At
+  390px WebKit now measures heading y=178/h=86.56; Back x=16/y=178/w=68.17/
+  h=48; title y=178/h=42.56 and status y=202.56/h=18; control y=220.56/h=44;
+  editor y=264.56/h=421.98. Chromium has the same heading, title, status,
+  control, and editor positions, with a 67.02px Back width and 422px editor
+  height. At 320px the status still wraps naturally, the Wrap and Back targets
+  remain 44px or taller, and the editor remains about 422px high.
+- Inspected light and dark 390×844 captures in Chromium and WebKit, plus desktop
+  1280×720 captures. The desktop editor starts at y=174.08 with 360px of
+  height. At 390×420 the document scrolled 172px to its end and restored to the
+  top; coordinate hit testing on Back returned to the Skills list at compact
+  widths in both engines.
+- Verification: focused Skills journey passed in Chromium and WebKit; the full
+  Settings and responsive browser modules passed in both engines (48 passed
+  each); the web suite passed (629 tests across 29 files); and the production
+  build passed with its existing chunk-size warning. Physical mobile keyboard
+  and browser-toolbar behavior remains unverified. The changes are uncommitted
+  for checkpoint review.
