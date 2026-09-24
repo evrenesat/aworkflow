@@ -1351,31 +1351,34 @@ input::placeholder, textarea::placeholder {
 .compact-run-progress-row-line {
   display: inline-flex;
   align-items: baseline;
+  flex-wrap: wrap;
   min-width: 0;
   gap: var(--spacing-xs);
   color: var(--color-text-dim);
   font-size: 0.75rem;
-  white-space: nowrap;
 }
 
 .compact-run-progress-row-line strong {
-  flex: 0 0 auto;
+  flex: 0 1 auto;
+  min-width: 0;
   color: var(--color-text);
   font-weight: 600;
 }
 
-.compact-run-progress-row-line > span {
+.compact-run-progress-row-line > span:not(.compact-run-progress-row-notice) {
   min-width: 0;
   overflow: hidden;
   text-overflow: ellipsis;
 }
 
 .compact-run-progress-row-notice {
-  flex: 0 1 18rem;
+  flex: 1 1 18rem;
   min-width: 0;
   max-width: 100%;
   color: var(--color-warning);
   font-weight: 600;
+  white-space: normal;
+  overflow: visible;
   overflow-wrap: anywhere;
 }
 
@@ -1445,6 +1448,25 @@ input::placeholder, textarea::placeholder {
 
 .run-list-select .run-row-meta > span {
   min-width: 0;
+}
+
+@media (min-width: 960px) and (min-height: 600px) {
+  .run-list-item {
+    gap: 2px;
+  }
+
+  .run-list-item .run-list-select {
+    padding-inline: 6px;
+  }
+
+  .run-list-item .run-row-meta {
+    flex-wrap: nowrap;
+    column-gap: 4px;
+  }
+
+  .run-list-item .run-row-meta > .status-pill {
+    padding-inline: 0.25rem;
+  }
 }
 
 .status-pill {

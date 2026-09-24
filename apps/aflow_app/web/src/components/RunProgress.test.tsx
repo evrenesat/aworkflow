@@ -160,7 +160,7 @@ describe('RunProgress', () => {
 
     const row = container.querySelector('.compact-run-progress-row')!
     const notice = row.querySelector('.compact-run-progress-row-notice')
-    expect(row.textContent).toContain('4 of 11 checkpoints approved')
+    expect(row.textContent).toContain('4/11 approved')
     expect(notice?.textContent).toBe(loadMessage)
     expect(notice?.className).toContain(loadState)
     expect(row.getAttribute('aria-label')).toContain(loadMessage)
@@ -177,7 +177,8 @@ describe('RunProgress', () => {
       })}
       mode="row"
     />)
-    expect(container.textContent).toContain('At least 4 of 11 checkpoints approved · partial history')
+    expect(container.textContent).toContain('At least 4 approved · partial history')
+    expect(container.querySelector('.compact-run-progress-row')?.getAttribute('aria-label')).toContain('At least 4 of 11 checkpoints approved')
     expect(container.textContent).not.toContain('CP5 of 11')
 
     const zero = render(<RunProgress run={run({
@@ -186,7 +187,22 @@ describe('RunProgress', () => {
         phase: null, activity: null, approved_checkpoints: count(0), recorded_complete_checkpoints: count(0),
       }),
     })} mode="row" />)
-    expect(zero.container.textContent).toContain('0 of 11 checkpoints approved')
+    expect(zero.container.textContent).toContain('0/11 approved')
+  })
+
+  it.each([
+    ['known exact counts', count(4), count(11), '4/11 approved', '4 of 11 checkpoints approved'],
+    ['meaningful zero', count(0), count(11), '0/11 approved', '0 of 11 checkpoints approved'],
+    ['all approved', count(5), count(5), '5/5 approved', '5 of 5 checkpoints approved'],
+  ] as const)('keeps %s compact while preserving full accessible evidence', (_caseName, approved, total, compact, full) => {
+    const { container } = render(<RunProgress
+      run={run({ progress: progress({ approved_checkpoints: approved, total_checkpoints: total }) })}
+      mode="row"
+    />)
+    const row = container.querySelector('.compact-run-progress-row')!
+
+    expect(row.textContent).toBe(compact)
+    expect(row.getAttribute('aria-label')).toContain(full)
   })
 
   it('omits ordinary unavailable filler in row and preview modes', () => {
@@ -197,6 +213,19 @@ describe('RunProgress', () => {
     const preview = row.rerender(<RunProgress run={run({ progress: null })} mode="preview" />)
     expect(preview).toBeUndefined()
     expect(row.container.textContent).toBe('')
+
+    row.rerender(<RunProgress run={run({ progress: progress({
+      availability: 'unavailable',
+      approved_checkpoints: count(null, 'unavailable'),
+      total_checkpoints: count(null, 'unavailable'),
+      current_checkpoint_id: null,
+      current_checkpoint_ordinal: null,
+      current_checkpoint_title: null,
+      phase: null,
+      activity: null,
+    }) })} mode="row" />)
+    expect(row.container.textContent).toBe('')
+    expect(row.container.querySelector('.compact-run-progress-row')?.getAttribute('aria-label')).toBeNull()
   })
 
   it.each([
@@ -250,7 +279,7 @@ describe('RunProgress', () => {
     }) })
     const view = render(<RunProgress run={partialTotal} mode="row" />)
 
-    expect(view.container.textContent).toContain('CP5 of at least 11')
+    expect(view.container.textContent).toContain('CP5 · Implementing')
     expect(view.container.querySelector('.compact-run-progress-row')?.getAttribute('aria-label')).toContain('CP5 of at least 11')
 
     view.rerender(<RunProgress run={partialTotal} mode="preview" />)
@@ -274,16 +303,33 @@ describe('RunProgress', () => {
     const row = container.querySelector('.compact-run-progress-row')!
     expect(row.querySelector('.compact-run-progress-row-notice')).toBeNull()
     expect(row.querySelector('.sr-only')?.textContent).toBe('Loading checkpoint progress…')
-    expect(row.textContent).toContain('4 of 11 checkpoints approved')
+    expect(row.textContent).toContain('4/11 approved')
   })
 
-  it('keeps an active waiting run position visible', () => {
-    render(<RunProgress run={run({ status: 'waiting_for_input', activity: 'inactive', progress: progress({ phase: null, activity: null }) })} />)
+  it('keeps the active position visible when aggregate approval is unavailable', () => {
+    const activeWaiting = run({
+      status: 'waiting_for_input',
+      activity: 'inactive',
+      progress: progress({
+        phase: null,
+        activity: null,
+        approved_checkpoints: count(null, 'unavailable'),
+      }),
+    })
+    const view = render(<RunProgress run={activeWaiting} mode="row" />)
+    expect(view.container.textContent).toBe('CP5')
+
+    view.rerender(<RunProgress run={activeWaiting} />)
     expect(screen.getByText(/CP5 of 11/)).toBeTruthy()
   })
 
-  it.each(['failed', 'owner_stopped'] as const)('removes current-position placeholders from terminal %s rows', (status) => {
-    render(<RunProgress run={run({ status, activity: 'inactive', progress: progress({ phase: null, activity: null }) })} />)
+  it.each(['completed', 'failed', 'owner_stopped'] as const)('hides current position in terminal %s rows but preserves approval', (status) => {
+    const terminal = run({ status, activity: 'inactive', progress: progress({ phase: null, activity: null }) })
+    const view = render(<RunProgress run={terminal} mode="row" />)
+    expect(view.container.textContent).toBe('4/11 approved')
+    expect(view.container.textContent).not.toContain('CP5')
+
+    view.rerender(<RunProgress run={terminal} />)
     expect(screen.getByText('4 of 11 checkpoints approved')).toBeTruthy()
     expect(screen.queryByText(/current checkpoint/i)).toBeNull()
   })

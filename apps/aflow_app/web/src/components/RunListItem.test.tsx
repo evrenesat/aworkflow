@@ -101,6 +101,25 @@ describe('RunListItem', () => {
     expect(screen.getByRole('dialog')).toBeTruthy()
   })
 
+  it('shows compact approval beside status while keeping full evidence in the accessible name and preview', () => {
+    const progressRun: RunStatus = { ...run, progress: previewProgress(progressCount(4), progressCount(11)) }
+    const { container } = render(<RunListItem run={progressRun} stableKey="run-compact-evidence" onSelect={vi.fn()} />)
+    const selection = container.querySelector<HTMLButtonElement>('.run-list-select')!
+
+    expect(selection.textContent).toContain('Running')
+    expect(selection.textContent).toContain('4/11 approved')
+    expect(selection.textContent).not.toContain('4 of 11 checkpoints approved')
+    expect(selection.getAttribute('aria-label')).toContain('run-compact-1')
+    expect(selection.getAttribute('aria-label')).toContain('Running')
+    expect(selection.getAttribute('aria-label')).toContain('4 of 11 checkpoints approved')
+
+    fireEvent.click(screen.getByRole('button', { name: /Preview Automatic/ }))
+    const preview = screen.getByRole('dialog')
+    expect(preview.textContent).toContain('4 of 11 checkpoints approved')
+    expect(preview.textContent).toContain('CP5 of 11 · Implementing — Keep row evidence useful')
+    expect(preview.textContent).toContain(run.run_id)
+  })
+
   it('restores selection focus after a focus-open preview closes with Escape', () => {
     vi.useFakeTimers()
     const { container } = render(<RunListItem run={run} stableKey="run-selection-focus" onSelect={vi.fn()} />)
@@ -178,7 +197,8 @@ describe('RunListItem', () => {
     const { container } = render(<RunListItem run={partialTotalRun} stableKey="run-preview-partial-total" onSelect={vi.fn()} />)
     const selection = container.querySelector<HTMLButtonElement>('.run-list-select')!
 
-    expect(selection.textContent).toContain('CP5 of at least 11')
+    expect(selection.textContent).toContain('CP5 · Implementing')
+    expect(selection.textContent).not.toContain('at least 11')
     expect(selection.getAttribute('aria-label')).toContain('CP5 of at least 11')
     fireEvent.click(screen.getByRole('button', { name: /Preview Automatic/ }))
 

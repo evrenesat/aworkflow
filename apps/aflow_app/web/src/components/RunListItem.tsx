@@ -7,7 +7,7 @@ import {
   runPlanPresentationForRun,
   statusLabel,
 } from '../runPresentation'
-import { compactRunProgressText, RunProgress, type RunProgressLoadState } from './RunProgress'
+import { RunProgress, runProgressAccessibleText, type RunProgressLoadState } from './RunProgress'
 
 const PREVIEW_OPEN_DELAY_MS = 300
 const PREVIEW_CLOSE_DELAY_MS = 140
@@ -73,15 +73,17 @@ export function RunListItem({
   const previewId = `run-preview-${previewKey(useId())}`
   const plan = runPlanPresentationForRun(run)
   const status = statusLabel(run)
-  const progressLabel = run.progress
-    ? compactRunProgressText(run.progress, run)
-    : loadState === 'stale' || loadState === 'failed'
-      ? loadMessage || (loadState === 'stale' ? 'Checkpoint progress stale — Refresh to update.' : 'Checkpoint progress unavailable — Refresh to retry.')
-      : null
-  const loadingProgressLabel = loadState === 'loading' ? 'Loading checkpoint progress…' : null
+  const progressLabel = run.progress ? runProgressAccessibleText(run.progress, run) : null
+  const progressLoadLabel = loadState === 'loading'
+    ? 'Loading checkpoint progress…'
+    : loadState === 'stale'
+      ? loadMessage || 'Checkpoint progress stale — Refresh to update.'
+      : loadState === 'failed'
+        ? loadMessage || 'Checkpoint progress unavailable — Refresh to retry.'
+        : null
   const duration = knownFact(runDurationText(run))
   const activity = knownFact(runActivityText(run))
-  const accessibleFacts = [plan.label, plan.date, loadingProgressLabel, progressLabel, duration, activity].filter((value): value is string => Boolean(value))
+  const accessibleFacts = [plan.label, plan.date, progressLabel, progressLoadLabel, duration, activity].filter((value): value is string => Boolean(value))
   const accessibleName = projectLabel
     ? [projectLabel, status, ...accessibleFacts, run.run_id].join(' · ')
     : [`${run.run_id} ${status}`, ...accessibleFacts].join(' · ')

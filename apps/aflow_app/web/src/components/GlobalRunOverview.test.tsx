@@ -306,7 +306,7 @@ describe('GlobalRunOverview project context', () => {
 
     render(<GlobalRunOverview projects={[primary]} onOpen={onOpen} />)
 
-    expect(await screen.findByText('4 of 11 checkpoints approved')).toBeTruthy()
+    expect(await screen.findByText('4/11 approved')).toBeTruthy()
     expect(screen.queryByText(/CP5 of 11 · Implementing/)).toBeNull()
     expect(screen.queryByText('Plan: /srv/plans/canonical-plan.md · Run: canonical-run')).toBeNull()
     expect(screen.queryByText(/^Duration /)).toBeNull()
@@ -381,7 +381,7 @@ describe('GlobalRunOverview project context', () => {
     expect((await screen.findByRole('alert')).textContent).toMatch(/Partial or stale results/)
     await waitFor(() => expect(api.getControlPlaneRun).toHaveBeenCalledWith('primary', usable.run_id, { signal: expect.anything() }))
     await waitFor(() => expect(row.getAttribute('data-enrichment-state')).toBe('settled'))
-    expect(row.textContent).toContain('1 of 1 checkpoint approved')
+    expect(row.textContent).toContain('1/1 approved')
   })
 
   it('retains old ongoing and attention rows until refresh coverage completes', async () => {
@@ -534,7 +534,7 @@ describe('GlobalRunOverview project context', () => {
 
     targetResponse.resolve(canonicalDetail(target, { total_checkpoints: { value: 1, coverage: 'complete' }, approved_checkpoints: { value: 1, coverage: 'complete' } }))
     await waitFor(() => expect(row.getAttribute('data-enrichment-state')).toBe('settled'))
-    expect(row.textContent).toContain('1 of 1 checkpoint approved')
+    expect(row.textContent).toContain('1/1 approved')
     fireEvent.click(row)
     expect(onOpen).toHaveBeenCalledWith('primary', target.run_id)
   })
@@ -594,7 +594,7 @@ describe('GlobalRunOverview project context', () => {
       total_checkpoints: { value: 2, coverage: 'complete' },
       approved_checkpoints: { value: 1, coverage: 'complete' },
     }))
-    await waitFor(() => expect(row.textContent).toContain('1 of 2 checkpoints approved'))
+    await waitFor(() => expect(row.textContent).toContain('1/2 approved'))
 
     fireEvent.click(screen.getByRole('button', { name: 'Refresh', exact: true }))
     await waitFor(() => expect(listCalls).toBe(2))
@@ -603,7 +603,7 @@ describe('GlobalRunOverview project context', () => {
     else replacementResponse.reject(new Error('temporary detail failure'))
 
     await waitFor(() => expect(row.getAttribute('data-enrichment-state')).toBe(state))
-    expect(row.textContent).toContain('1 of 2 checkpoints approved')
+    expect(row.textContent).toContain('1/2 approved')
     expect(row.querySelector('.compact-run-progress-row-notice')?.textContent).toBe(message)
   })
 
@@ -703,7 +703,7 @@ describe('GlobalRunOverview project context', () => {
       approved_checkpoints: { value: 1, coverage: 'complete' },
     }))
     await waitFor(() => expect(row.getAttribute('data-enrichment-state')).toBe('settled'))
-    expect(row.textContent).toContain('1 of 1 checkpoint approved')
+    expect(row.textContent).toContain('1/1 approved')
     expect(detailCalls).toBe(2)
   })
 
@@ -730,11 +730,11 @@ describe('GlobalRunOverview project context', () => {
 
     render(<GlobalRunOverview projects={[primary]} onOpen={vi.fn()} />)
     const row = await screen.findByRole('button', { name: /Refresh gated.*refresh-gated/ })
-    await waitFor(() => expect(row.textContent).toContain('1 of 2 checkpoints approved'))
+    await waitFor(() => expect(row.textContent).toContain('1/2 approved'))
 
     fireEvent.click(screen.getByRole('button', { name: 'Refresh', exact: true }))
     await waitFor(() => expect(screen.queryByRole('status')).toBeNull())
-    expect(row.textContent).toContain('1 of 2 checkpoints approved')
+    expect(row.textContent).toContain('1/2 approved')
     expect(detailCalls).toBe(1)
 
     refreshPage.resolve(page([run]))
@@ -743,7 +743,7 @@ describe('GlobalRunOverview project context', () => {
       total_checkpoints: { value: 2, coverage: 'complete' },
       approved_checkpoints: { value: 2, coverage: 'complete' },
     }))
-    await waitFor(() => expect(row.textContent).toContain('2 of 2 checkpoints approved'))
+    await waitFor(() => expect(row.textContent).toContain('2/2 approved'))
     expect(detailCalls).toBe(2)
   })
 
@@ -770,7 +770,7 @@ describe('GlobalRunOverview project context', () => {
     await waitFor(() => expect(detailCalls).toBe(2))
     retryResponse.resolve(canonicalDetail(run, { total_checkpoints: { value: 1, coverage: 'complete' }, approved_checkpoints: { value: 0, coverage: 'complete' } }))
     await waitFor(() => expect(row.getAttribute('data-enrichment-state')).toBe('settled'))
-    expect(row.textContent).toContain('0 of 1 checkpoint approved')
+    expect(row.textContent).toContain('0/1 approved')
     expect(detailCalls).toBe(2)
   })
 
@@ -808,8 +808,8 @@ describe('GlobalRunOverview project context', () => {
     oldResponse.resolve(canonicalDetail(first, { total_checkpoints: { value: 1, coverage: 'complete' }, approved_checkpoints: { value: 1, coverage: 'complete' } }))
     newResponse.resolve(canonicalDetail(replacement, { total_checkpoints: { value: 2, coverage: 'complete' }, approved_checkpoints: { value: 2, coverage: 'complete' } }))
     await waitFor(() => expect(screen.getByRole('button', { name: /Second title.*shared-run/ }).getAttribute('data-enrichment-state')).toBe('settled'))
-    expect(screen.getByRole('button', { name: /Second title.*shared-run/ }).textContent).toContain('2 of 2 checkpoints approved')
-    expect(screen.getByRole('button', { name: /Sibling title.*shared-run/ }).textContent).toContain('3 of 3 checkpoints approved')
+    expect(screen.getByRole('button', { name: /Second title.*shared-run/ }).textContent).toContain('2/2 approved')
+    expect(screen.getByRole('button', { name: /Sibling title.*shared-run/ }).textContent).toContain('3/3 approved')
     expect(screen.queryByRole('button', { name: /First title.*shared-run/ })).toBeNull()
     expect(view.container.querySelectorAll('[data-enrichment-state="stale"]').length).toBe(0)
   })
@@ -925,7 +925,7 @@ describe('GlobalRunOverview project context', () => {
       expect(api.getControlPlaneRun).toHaveBeenCalledTimes(1)
       const cancelledRow = screen.getByRole('button', { name: /cancelled-hidden/ })
       expect(cancelledRow.getAttribute('data-enrichment-state')).toBe('loading')
-      expect(cancelledRow.textContent).not.toContain('1 of 1 checkpoint approved')
+      expect(cancelledRow.textContent).not.toContain('1/1 approved')
     } finally {
       view?.unmount()
       cancelledResponse.resolve(matchingDetail(first))
@@ -988,7 +988,7 @@ describe('GlobalRunOverview project context', () => {
         approved_checkpoints: { value: 1, coverage: 'complete' },
       }))
       await waitFor(() => expect(row.getAttribute('data-enrichment-state')).toBe('settled'))
-      expect(row.textContent).toContain('1 of 1 checkpoint approved')
+      expect(row.textContent).toContain('1/1 approved')
       expect(detailCalls).toBe(1)
     } finally {
       view?.unmount()

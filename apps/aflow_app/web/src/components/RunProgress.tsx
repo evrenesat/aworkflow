@@ -32,6 +32,7 @@ function checkpointPositionText(
   run: RunStatus,
   includeTitle = true,
   qualifyPartialTotal = false,
+  includeTotal = true,
 ): string | null {
   if (isTerminalInactiveRun(run) || progress.availability === 'not_applicable') return null
   const phase = trimmed(progress.phase) || trimmed(progress.activity)
@@ -39,7 +40,7 @@ function checkpointPositionText(
   const total = countValue(progress.total_checkpoints)
   const title = trimmed(progress.current_checkpoint_title)
   if (ordinal !== null && Number.isSafeInteger(ordinal) && ordinal > 0) {
-    const totalLabel = total !== null
+    const totalLabel = includeTotal && total !== null
       ? `${qualifyPartialTotal && countIsPartial(progress.total_checkpoints) ? 'at least ' : ''}${total}`
       : null
     const checkpoint = `CP${ordinal}${totalLabel !== null ? ` of ${totalLabel}` : ''}`
@@ -49,10 +50,13 @@ function checkpointPositionText(
 }
 
 function compactCheckpointPositionText(progress: RunProgressSummary, run: RunStatus): string | null {
-  if (isTerminalInactiveRun(run) || progress.availability === 'not_applicable') return null
+  if (isTerminalInactiveRun(run) || progress.availability === 'not_applicable' || progress.availability === 'unavailable') return null
   const ordinal = progress.current_checkpoint_ordinal
-  if (ordinal === null || !Number.isSafeInteger(ordinal) || ordinal <= 0) return null
-  return checkpointPositionText(progress, run, false, true)
+  if (ordinal !== null && Number.isSafeInteger(ordinal) && ordinal > 0) {
+    return checkpointPositionText(progress, run, false, false, false)
+  }
+  const phase = trimmed(progress.phase) || trimmed(progress.activity)
+  return phase ? formatMachineLabel(phase) : null
 }
 
 function compactApprovalText(progress: RunProgressSummary): string | null {
@@ -60,8 +64,13 @@ function compactApprovalText(progress: RunProgressSummary): string | null {
   if (progress.availability === 'unavailable') return null
   const approved = countValue(progress.approved_checkpoints)
   const total = countValue(progress.total_checkpoints)
-  if (approved !== null && total !== null) return checkpointApprovalText(progress)
-  if (approved !== null) return `${countIsPartial(progress.approved_checkpoints) ? 'At least ' : ''}${approved} approved`
+  if (approved !== null) {
+    if (countIsPartial(progress.approved_checkpoints)) {
+      return approved > 0 ? `At least ${approved} approved` : null
+    }
+    if (total !== null && !countIsPartial(progress.total_checkpoints)) return `${approved}/${total} approved`
+    return `${approved} approved`
+  }
   return null
 }
 
@@ -80,6 +89,16 @@ export function compactRunProgressText(progress: RunProgressSummary, run: RunSta
   return progressHistoryNotice(progress) && value !== 'Non-checkpoint workflow'
     ? `${value} · partial history`
     : value
+}
+
+/** Full progress facts for the row's accessible name; the visible row stays compact. */
+export function runProgressAccessibleText(progress: RunProgressSummary, run: RunStatus): string | null {
+  if (progress.availability === 'unavailable') return null
+  const compactApproval = compactApprovalText(progress)
+  const approval = compactApproval ? previewApprovalText(progress) : null
+  const position = compactApproval ? null : checkpointPositionText(progress, run, false, true)
+  const notice = progressHistoryNotice(progress)
+  return [approval, position, notice].filter((value): value is string => Boolean(value)).join(' · ') || null
 }
 
 function segmentState(progress: RunProgressSummary, ordinal: number): 'approved' | 'recorded' | 'current' | 'pending' | 'unknown' {
@@ -220,7 +239,7 @@ export function RunProgress({
       className={`compact-run-progress compact-run-progress-row ${progress.availability} ${loadState}`}
       data-progress-availability={progress.availability}
       data-progress-state={observableState}
-      aria-label={[compactText, notice, loadState !== 'ready' ? loadNotice : null].filter(Boolean).join(' · ') || undefined}
+      aria-label={[runProgressAccessibleText(progress, run), loadState !== 'ready' ? loadNotice : null].filter(Boolean).join(' · ') || undefined}
     >
       <span className="compact-run-progress-row-line">
         {compactText && <strong>{compactText}</strong>}

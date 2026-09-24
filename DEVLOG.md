@@ -3397,3 +3397,23 @@ HISTORY: Published clipboard history `c14f1f2`/`cd78d53` remains separate and mu
   - `uv run pytest -q tests/test_settings_reload_browser.py` — 2 passed in Chromium.
   - `AFLOW_TEST_BROWSER=webkit uv run pytest -q tests/test_settings_reload_browser.py` — 2 passed in WebKit.
   - `git diff --check` — passed.
+
+## 2026-09-24 — Compact run-row progress facts (Checkpoint 1)
+
+- Reproduced the density regression on the built `bb510409` candidate: the
+  three populated 1280×720 fixture rows were 234px wide and 79.375px tall as
+  the long approval sentence wrapped. Collapsed rows now use concise exact
+  ratios, preserve meaningful zero, qualify partial lower bounds, and omit
+  unavailable facts. Full approval wording, checkpoint titles, run identity,
+  and state remain available in previews and accessible names. Desktop row
+  spacing keeps the status and progress together without reducing touch size;
+  the shared `GlobalRunOverview` expectations now assert the compact text.
+- Inspected Chromium and WebKit captures in light and dark at 1280×720,
+  1440×900, and 390×844. Populated desktop rows measured 63.375px and mobile
+  rows 64.375px. Preview bounds, sibling stability, explicit touch access, and
+  no-horizontal-overflow checks passed.
+- Verification: full web suite — 629 tests across 29 files; production build
+  passed; the authenticated built-app fidelity test passed in Chromium and
+  WebKit; `git diff --check` passed. The build retains its existing chunk-size
+  warning. Full server suite, CI, publication, and live activation remain
+  coordinator-owned; this checkpoint is left uncommitted for review.
