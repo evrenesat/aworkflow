@@ -120,6 +120,50 @@ describe('RunListItem', () => {
     expect(preview.textContent).toContain(run.run_id)
   })
 
+  it('presents an unresolved historical outcome with a muted label and no missing-data filler', () => {
+    const historicalGap: RunStatus = {
+      ...run,
+      run_id: '20260911t140026z-d06cc7d7',
+      status: 'needs_attention',
+      status_reason_code: 'unit_missing',
+      reason: 'No current workflow unit was found and no normal outcome was recorded.',
+      activity: 'unknown',
+      unit_name: 'aflow-run-20260911t140026z-d06cc7d7.service',
+      workflow_name: null,
+      team: null,
+      current_step: null,
+      started_at: null,
+      ended_at: null,
+      evidence: { unit_observation: 'missing', has_run_metadata: false, can_resume: false },
+      progress: null,
+    }
+    const { container } = render(<RunListItem run={historicalGap} stableKey={historicalGap.run_id} onSelect={vi.fn()} />)
+    const selection = container.querySelector<HTMLButtonElement>('.run-list-select')!
+    const status = selection.querySelector<HTMLElement>('[data-status-category]')
+
+    expect(status?.textContent).toBe('Outcome not recorded')
+    expect(status?.dataset.statusCategory).toBe('outcome-unrecorded')
+    expect(selection.textContent).not.toContain('Needs attention')
+    expect(selection.textContent).not.toMatch(/Duration not reported|Checkpoint progress unavailable|approval unknown|current checkpoint not reported/)
+    expect(selection.getAttribute('aria-label')).not.toMatch(/Duration not reported|Activity not reported/)
+    fireEvent.click(screen.getByRole('button', { name: /Preview/ }))
+    const preview = screen.getByRole('dialog')
+    expect(preview.querySelector('[data-status-category]')?.getAttribute('data-status-category')).toBe('outcome-unrecorded')
+    expect(preview.textContent).toContain('Outcome not recorded')
+  })
+
+  it('keeps a truthful zero checkpoint count in the compact row', () => {
+    const zeroProgressRun: RunStatus = {
+      ...run,
+      progress: previewProgress(progressCount(0), progressCount(11)),
+    }
+    const { container } = render(<RunListItem run={zeroProgressRun} stableKey="run-zero-progress" onSelect={vi.fn()} />)
+    const selection = container.querySelector<HTMLButtonElement>('.run-list-select')!
+
+    expect(selection.textContent).toContain('0/11 approved')
+    expect(selection.textContent).not.toMatch(/approval unknown|total unknown|unavailable/)
+  })
+
   it('restores selection focus after a focus-open preview closes with Escape', () => {
     vi.useFakeTimers()
     const { container } = render(<RunListItem run={run} stableKey="run-selection-focus" onSelect={vi.fn()} />)
@@ -129,6 +173,8 @@ describe('RunListItem', () => {
     act(() => vi.advanceTimersByTime(300))
     expect(screen.getByRole('dialog')).toBeTruthy()
     previewToggle.focus()
+    fireEvent.pointerEnter(container.querySelector<HTMLElement>('[data-run-row]')!, { pointerType: 'mouse' })
+    act(() => vi.advanceTimersByTime(300))
 
     fireEvent.keyDown(document, { key: 'Escape' })
 
@@ -164,6 +210,18 @@ describe('RunListItem', () => {
     expect(screen.getByRole('button', { name: /Loading checkpoint progress…/ })).toBe(selection)
     expect(selection.getAttribute('aria-label')).toContain('Loading checkpoint progress…')
     expect(container.querySelector('.compact-run-progress-row-notice')).toBeNull()
+  })
+
+  it('keeps a real failed progress request visible in the collapsed row', () => {
+    const { container } = render(<RunListItem
+      run={run}
+      stableKey="run-progress-failed"
+      loadState="failed"
+      loadMessage="Checkpoint evidence request failed — Refresh to retry."
+      onSelect={vi.fn()}
+    />)
+
+    expect(container.querySelector('.compact-run-progress-row-notice')?.textContent).toBe('Checkpoint evidence request failed — Refresh to retry.')
   })
 
   it.each([

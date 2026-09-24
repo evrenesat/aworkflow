@@ -19,6 +19,7 @@ import {
   runEventFacts,
   runExecutorFacts,
   runActivityText,
+  runDisplayProjection,
   runFinishText,
   runPlanDisplayName,
   runPlanDisplayNameForRun,
@@ -55,6 +56,82 @@ describe('honest run timing', () => {
     expect(statusLabel({ ...run, status: 'awaiting_startup_answer' })).toBe('Input needed')
     expect(statusLabel({ ...run, status: 'needs_attention', evidence: { no_agent_started: true, startup_failure: { stage: 'preparation' } } })).toBe('Could not start')
     expect(statusLabel({ ...run, status: 'needs_attention', evidence: { startup_failure: { stage: 'unit_launch' } } })).toBe('Needs attention')
+  })
+
+  it('separates only the fully evidenced missing-outcome record from actionable attention', () => {
+    const historicalGap: RunStatus = {
+      run_id: '20260911t140026z-d06cc7d7',
+      status: 'needs_attention',
+      schema_version: 1,
+      ownership: 'control_plane',
+      revision: 0,
+      status_reason_code: 'unit_missing',
+      reason: 'No current workflow unit was found and no normal outcome was recorded.',
+      activity: 'unknown',
+      unit_name: 'aflow-run-20260911t140026z-d06cc7d7.service',
+      launch_phase: 'unit_started',
+      workflow_name: 'managed',
+      team: 'base',
+      current_step: null,
+      turns_completed: null,
+      max_turns: 8,
+      selected_start_step: null,
+      skipped_steps: [],
+      restarted_from_run_id: null,
+      plan_path: 'plans/in-progress/historical-plan.md',
+      started_at: null,
+      ended_at: null,
+      evidence: {
+        unit_observation: 'missing',
+        has_run_metadata: false,
+        can_resume: false,
+      },
+    }
+
+    expect(runDisplayProjection(historicalGap)).toEqual({
+      category: 'outcome-unrecorded',
+      label: 'Outcome not recorded',
+      tone: 'muted',
+    })
+    expect(statusLabel(historicalGap)).toBe('Outcome not recorded')
+    expect(historicalGap.status).toBe('needs_attention')
+    expect(historicalGap.status_reason_code).toBe('unit_missing')
+    expect(historicalGap.reason).toContain('no normal outcome was recorded')
+    expect(historicalGap.unit_name).toBe('aflow-run-20260911t140026z-d06cc7d7.service')
+    expect(historicalGap.evidence.unit_observation).toBe('missing')
+    expect(runDisplayProjection({ ...historicalGap, activity: 'inactive', evidence: { ...historicalGap.evidence, unit_active: false } }).category).toBe('outcome-unrecorded')
+
+    const ambiguousVariants = [
+      { ...historicalGap, status_reason_code: 'worker_attention' },
+      { ...historicalGap, activity: 'active' },
+      { ...historicalGap, evidence: { ...historicalGap.evidence, unit_observation: 'observed' } },
+      { ...historicalGap, evidence: { ...historicalGap.evidence, unit_observation: 'unavailable' } },
+      { ...historicalGap, evidence: { ...historicalGap.evidence, unit_observation: 'identity_mismatch' } },
+      { ...historicalGap, evidence: { ...historicalGap.evidence, unit_observation: undefined } },
+      { ...historicalGap, evidence: { ...historicalGap.evidence, unit_active: true } },
+      { ...historicalGap, evidence: { ...historicalGap.evidence, can_resume: true } },
+      { ...historicalGap, evidence: { ...historicalGap.evidence, has_run_metadata: true } },
+      { ...historicalGap, activity: undefined },
+    ] as RunStatus[]
+    for (const variant of ambiguousVariants) {
+      expect(runDisplayProjection(variant).category).toBe('actionable-attention')
+      expect(statusLabel(variant)).toBe('Needs attention')
+    }
+    expect(runDisplayProjection({
+      ...historicalGap,
+      status_reason_code: 'startup_failed',
+      evidence: { ...historicalGap.evidence, startup_failure: { stage: 'preparation' }, no_agent_started: true },
+    })).toMatchObject({ category: 'failure', label: 'Could not start' })
+  })
+
+  it('keeps active phases, failures, input-needed runs, and legacy ownership distinct', () => {
+    const reviewing = { ...run, status: 'running', activity: 'active', progress: { phase: 'reviewing' } } as RunStatus
+    expect(runDisplayProjection(reviewing)).toMatchObject({ category: 'active', label: 'Running' })
+    expect(runDisplayProjection({ ...run, status: 'launch_started', activity: 'active', evidence: { unit_active: true } })).toMatchObject({ category: 'active', label: 'Starting' })
+    expect(runDisplayProjection({ ...run, status: 'failed', activity: 'inactive' })).toMatchObject({ category: 'failure', label: 'Failed' })
+    expect(runDisplayProjection({ ...run, status: 'needs_attention', evidence: { no_agent_started: true, startup_failure: { stage: 'preparation' } } })).toMatchObject({ category: 'failure', label: 'Could not start' })
+    expect(runDisplayProjection({ ...run, status: 'awaiting_startup_answer', ownership: 'legacy' })).toMatchObject({ category: 'input-needed', label: 'Input needed' })
+    expect(runDisplayProjection({ ...run, status: 'running', ownership: 'legacy', activity: 'unknown' })).toMatchObject({ category: 'actionable-attention', label: 'Needs attention' })
   })
 })
 

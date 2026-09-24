@@ -5,9 +5,9 @@ import {
   runActivityText,
   runDurationText,
   runPlanPresentationForRun,
-  statusLabel,
+  runDisplayProjection,
 } from '../runPresentation'
-import { RunProgress, runProgressAccessibleText, type RunProgressLoadState } from './RunProgress'
+import { RunProgress, compactRunProgressText, runProgressAccessibleText, type RunProgressLoadState } from './RunProgress'
 
 const PREVIEW_OPEN_DELAY_MS = 300
 const PREVIEW_CLOSE_DELAY_MS = 140
@@ -72,7 +72,8 @@ export function RunListItem({
   const restoringSelectionFocusRef = useRef<HTMLButtonElement | null>(null)
   const previewId = `run-preview-${previewKey(useId())}`
   const plan = runPlanPresentationForRun(run)
-  const status = statusLabel(run)
+  const statusPresentation = runDisplayProjection(run)
+  const status = statusPresentation.label
   const progressLabel = run.progress ? runProgressAccessibleText(run.progress, run) : null
   const progressLoadLabel = loadState === 'loading'
     ? 'Loading checkpoint progress…'
@@ -83,6 +84,8 @@ export function RunListItem({
         : null
   const duration = knownFact(runDurationText(run))
   const activity = knownFact(runActivityText(run))
+  const compactProgressFact = run.progress ? compactRunProgressText(run.progress, run) : null
+  const rowActivityFact = compactProgressFact ? null : activity
   const accessibleFacts = [plan.label, plan.date, progressLabel, progressLoadLabel, duration, activity].filter((value): value is string => Boolean(value))
   const accessibleName = projectLabel
     ? [projectLabel, status, ...accessibleFacts, run.run_id].join(' · ')
@@ -217,11 +220,14 @@ export function RunListItem({
 
   function handlePointerEnter(event: PointerEvent<HTMLDivElement>): void {
     if (event.pointerType === 'touch') return
+    // Pointer movement after keyboard focus must not replace the focus opener.
+    if (previewTriggerRef.current === 'focus' || document.activeElement === selectionButtonRef.current) return
     scheduleOpen('pointer', null)
   }
 
   function handlePointerLeave(event: PointerEvent<HTMLDivElement>): void {
     if (event.pointerType === 'touch') return
+    if (previewTriggerRef.current === 'focus') return
     scheduleClose()
   }
 
@@ -274,10 +280,11 @@ export function RunListItem({
           <strong className="run-list-title" title={plan.label}>{plan.label}</strong>
         </span>
         <span className="run-row-meta text-xs text-dim">
-          <span className="status-pill">{status}</span>
+          <span className={`status-pill status-${statusPresentation.category}`} data-status-category={statusPresentation.category}>{status}</span>
           {run.history_state === 'archived' && <span className="status-pill">Archived</span>}
           {projectLabel && <span className="global-run-row-project" title={projectLabel}>{projectLabel}</span>}
           <RunProgress run={run} mode="row" loadState={loadState} loadMessage={loadMessage} />
+          {rowActivityFact && <span className="run-row-meta-fact" title={rowActivityFact}>{rowActivityFact}</span>}
         </span>
       </span>
     </button>
@@ -306,7 +313,7 @@ export function RunListItem({
       <strong className="run-row-preview-title">{plan.label}</strong>
       {plan.date && <p className="run-row-preview-facts">{plan.date}</p>}
       {projectLabel && <p className="text-xs text-dim">{projectLabel}</p>}
-      <p className="run-row-preview-facts">{status}{run.history_state === 'archived' ? ' · Archived' : ''}</p>
+      <p className={`run-row-preview-facts status-${statusPresentation.category}`} data-status-category={statusPresentation.category}>{status}{run.history_state === 'archived' ? ' · Archived' : ''}</p>
       {(duration || activity) && <p className="run-row-preview-facts">{[duration, activity].filter((value): value is string => Boolean(value)).join(' · ')}</p>}
       <RunProgress run={run} mode="preview" loadState={loadState} loadMessage={loadMessage} />
       <p className="run-row-preview-id mono">{run.run_id}</p>

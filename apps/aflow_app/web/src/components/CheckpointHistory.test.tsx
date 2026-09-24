@@ -183,8 +183,8 @@ describe('CheckpointHistory', () => {
     expect(screen.getAllByText('Final review').length).toBeGreaterThan(0)
     const delivery = document.querySelector('.checkpoint-history-delivery-list')
     expect(delivery?.textContent).toContain('Succeeded')
-    expect(delivery?.textContent).toContain('CI')
-    expect(delivery?.textContent).toContain('Unknown')
+    expect(delivery?.textContent).not.toContain('CI')
+    expect(delivery?.textContent).not.toContain('Unknown')
     openDisclosure('Count definitions & evidence')
     expect(screen.getByText(/Partial values are lower bounds/)).toBeDefined()
   })
@@ -532,6 +532,17 @@ describe('CheckpointHistory', () => {
     openDisclosure('Delivery evidence')
     expect(screen.getByText('Delivery evidence not reported.')).toBeDefined()
     expect(screen.queryByText('Succeeded')).toBeNull()
+  })
+
+  it('omits unreached delivery stages for a terminal run with complete evidence', () => {
+    const finished = { ...run, status: 'failed' as const, activity: 'inactive' as const }
+    const beforeDelivery = detail({ delivery: [
+      { stage: 'final_review', status: 'unknown', recorded_at: null, reason: 'Not started.', source_reference: null },
+      { stage: 'publish', status: 'unknown', recorded_at: null, reason: null, source_reference: null },
+    ], availability: 'complete' })
+    render(<CheckpointHistory projectId="project-current" run={finished} progress={beforeDelivery} detail={beforeDelivery} />)
+    expect(screen.queryByText('Delivery evidence', { selector: 'summary' })).toBeNull()
+    expect(screen.queryByText(/Final review|Publication|Live verification/)).toBeNull()
   })
 
   it('renders compact event disclosures and retains an expanded event through refresh', () => {

@@ -41,6 +41,7 @@ import {
   runPlanPresentation,
   runPlanPresentationForRun,
   runFinishText,
+  runDisplayProjection,
   isTerminalInactiveRun,
   latestRunResultEvent,
   presentRunEvent,
@@ -707,9 +708,9 @@ function recoveryProvenanceFromEvents(events: RunEvent[]): RecoveryProvenance | 
 }
 
 function runIssue(run: RunStatus): RunIssue | null {
-  const label = statusLabel(run)
-  const failure = run.status === 'failed' || label === 'Failed' || label === 'Could not start'
-  if (!failure && label !== 'Needs attention') return null
+  const category = runDisplayProjection(run).category
+  const failure = category === 'failure'
+  if (!failure && category !== 'actionable-attention') return null
 
   const startupFailure = contextObject(run.evidence.startup_failure)
   const cause = conciseRunText(run.reason)
@@ -3052,9 +3053,27 @@ export function RunDashboard({ visible = true, page, onNewRun, onCancelNewRun, o
         ].filter((value): value is string => Boolean(value)).join(' · ') || null
       : null
   const deliveryWarning = canonicalDetail ? deliveryIssueText(canonicalDetail.delivery) : null
+  const failedReview = selectedRun?.status === 'failed'
+    && /review/i.test(selectedRun.current_step ?? lastExecuted?.stepName ?? '')
+  const recordedOrdinal = canonicalProgress?.current_checkpoint_ordinal ?? compatibilitySummary?.index
+  const recordedTitle = canonicalProgress?.current_checkpoint_title ?? compatibilitySummary?.name
+  const recordedPosition = recordedOrdinal
+    ? `CP${recordedOrdinal}${recordedTitle ? ` — ${recordedTitle.replace(/^Checkpoint\s+\d+\s*:\s*/i, '')}` : ''}`
+    : null
+  const lastReviewStep = [recordedPosition, observedInvocation].filter((value): value is string => Boolean(value)).join(' · ')
+  const reviewerHarnessFailed = failedReview && events.some(event => event.event_type === 'turn_finished'
+    && event.data?.outcome === 'harness-failed'
+    && /review/i.test(String(event.data?.step_name ?? '')))
+  const readableFailure = [selectedRun?.reason, latestResultPresentation?.summary, outcome?.finishedSummary, outcome?.resultText]
+    .map(value => conciseRunText(value))
+    .find(value => value && !/^exit\s+\d+\.?$/i.test(value) && !/^#|\s#+\s/.test(value) && !/reason unavailable|result unavailable/i.test(value) && !/^harness[-_ ]failed\.?$/i.test(value)) ?? null
   const overviewCurrentWork = selectedRun
-    ? (() => {
-      const currentWork = isTerminalInactiveRun(selectedRun)
+    ? runDisplayProjection(selectedRun).category === 'outcome-unrecorded'
+      ? null
+      : (() => {
+      const currentWork = failedReview
+        ? `Review stopped${lastReviewStep ? ` · ${lastReviewStep}` : ''}.`
+        : isTerminalInactiveRun(selectedRun)
         ? `No current work — ${statusLabel(selectedRun)}.`
         : canonicalProgress
           ? runCurrentWorkText(canonicalProgress, selectedRun.current_step)
@@ -3068,7 +3087,9 @@ export function RunDashboard({ visible = true, page, onNewRun, onCancelNewRun, o
             : selectedRun.activity === 'active'
                 ? 'Active work is in progress.'
                 : `${statusLabel(selectedRun)} — current work is not reported.`
-      const executorFacts = [
+      const executorFacts = failedReview
+        ? [lastExecuted?.selector, lastExecuted?.model].filter((value): value is string => Boolean(value))
+        : [
         selectedRun.current_step && !isTerminalInactiveRun(selectedRun) ? formatMachineLabel(selectedRun.current_step) : null,
         ...(canonicalProgress?.current_executor
           ? runExecutorFacts(canonicalProgress.current_executor)
@@ -3091,6 +3112,16 @@ export function RunDashboard({ visible = true, page, onNewRun, onCancelNewRun, o
     : null
   const overviewLatestResult = selectedRun
     ? (() => {
+      if (failedReview) return <>
+        <p>{readableFailure ?? (reviewerHarnessFailed
+          ? 'The reviewer harness failed before a decision.'
+          : 'Review stopped before a decision. The specific cause was not recorded in a short result.')}</p>
+        <p className="text-sm text-dim"><a href={`#${technicalId}`} onClick={() => setTechnicalDisclosure(true)}>Open Diagnostics</a> for technical detail and full activity.</p>
+        {(outcome?.resultText || latestResultPresentation?.hasPayload) && <details className="run-report" open={reportOpen}>
+          <summary onClick={(event) => { event.preventDefault(); setReportOpen((open) => !open) }}>Read full update</summary>
+          {reportOpen && <pre className="dashboard-payload">{outcome?.resultText ?? latestResultPresentation?.detail}</pre>}
+        </details>}
+      </>
       const hasRecordedResult = Boolean(
         outcome?.finishedTurn
         || outcome?.finishedSummary
@@ -3695,7 +3726,7 @@ export function RunDashboard({ visible = true, page, onNewRun, onCancelNewRun, o
                       <span id={`${technicalId}-copy-run-id`} className="sr-only">Copy full run ID</span>
                       <LiveRunHeaderTiming run={selectedRun} />
                     </div>
-                    <span className="status-pill">{statusLabel(selectedRun)}</span>
+                    <span className={`status-pill status-${runDisplayProjection(selectedRun).category}`} data-status-category={runDisplayProjection(selectedRun).category}>{statusLabel(selectedRun)}</span>
                     {selectedRun.history_state === 'archived' && <span className="status-pill">Archived</span>}
                     {selectedRun.history_state === 'archived' && <button className="btn btn-secondary" disabled={busyAction === 'history' || historyConfirm !== null} onClick={() => void mutateHistory('restore')}>Restore</button>}
                     {(canRestart || selectedRunHasLiveControls || Boolean(restartAdmission?.reason)) && <MoreMenu label="Run actions" triggerLabel="Actions" triggerContent="Actions" className="run-actions-menu">
@@ -3725,7 +3756,7 @@ export function RunDashboard({ visible = true, page, onNewRun, onCancelNewRun, o
                   {selectedRunIssue && <section className={`run-issue-summary run-issue-${selectedRunIssue.kind}`} role={selectedRunIssue.kind === 'failure' ? 'alert' : undefined}>
                     <div>
                       <strong>{selectedRunIssue.kind === 'failure' ? 'Failure' : 'Needs attention'}</strong>
-                      <p>{selectedRunIssue.cause}</p>
+                      <p>{failedReview ? 'Review stopped before a decision.' : selectedRunIssue.cause}</p>
                     </div>
                     <div className="dashboard-actions">
                       {canResume && (!confirmResume
@@ -3735,7 +3766,7 @@ export function RunDashboard({ visible = true, page, onNewRun, onCancelNewRun, o
                       {!canResume && !canRestart && <span className="text-sm text-dim">Open Diagnostics for the recorded details.</span>}
                     </div>
                   </section>}
-                  {!selectedRunIssue && selectedRun.reason && <div className="notice">{conciseRunText(selectedRun.reason) ?? 'A run reason was recorded.'}</div>}
+                  {!selectedRunIssue && selectedRun.reason && runDisplayProjection(selectedRun).category !== 'outcome-unrecorded' && <div className="notice">{conciseRunText(selectedRun.reason) ?? 'A run reason was recorded.'}</div>}
                 </>}
                 currentWork={overviewCurrentWork}
                 latestResult={overviewLatestResult}
@@ -3984,6 +4015,7 @@ export function RunDashboard({ visible = true, page, onNewRun, onCancelNewRun, o
                       <h4>Diagnostics summary</h4><span className="text-xs text-dim">run {selectedRun.run_id}</span>
                       {statusUpdatedAt && <p className="text-xs text-dim">Status observed: {timestamp(statusUpdatedAt)}</p>}
                       {contextError && <p className="notice">Diagnostic details are stale. Use Refresh to retry.</p>}
+                      <p>Canonical status: {selectedRun.status}{selectedRun.status_reason_code ? ` · ${selectedRun.status_reason_code}` : ''}</p>
                       <p>Observed state: {statusLabel(selectedRun)}. Worker: {selectedRun.evidence.unit_active === true ? 'active' : selectedRun.evidence.unit_active === false ? 'inactive' : 'activity unconfirmed'}.</p>
                       {selectedRun.worker_exit && <>
                         <p>{selectedRun.worker_exit.stage === 'wrapper_spawn' ? 'Worker could not be spawned' : !selectedRun.evidence.has_run_metadata ? 'Worker exited during startup' : 'Worker exited'}{selectedRun.worker_exit.exit_code !== null ? ` (code ${selectedRun.worker_exit.exit_code})` : ''}</p>

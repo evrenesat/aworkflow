@@ -182,6 +182,54 @@ describe('GlobalRunOverview project context', () => {
     expect(screen.queryByRole('status')).toBeNull()
   })
 
+  it('keeps a history-gap row mounted across equal and changed refreshes and retains it on failure', async () => {
+    const historicalGap = makeRun('refresh-history-gap', {
+      status: 'needs_attention',
+      status_reason_code: 'unit_missing',
+      activity: 'unknown',
+      unit_name: 'aflow-run-refresh-history-gap.service',
+      evidence: { unit_observation: 'missing', has_run_metadata: false, can_resume: false },
+      original_plan_display_name: 'Original history title',
+      original_plan_path: 'plans/original-history-title.md',
+    })
+    const equalRefresh = deferred<ReturnType<typeof page>>()
+    let calls = 0
+    vi.mocked(api.listControlPlaneRuns).mockImplementation(() => {
+      calls += 1
+      if (calls === 1) return Promise.resolve(page([historicalGap]))
+      if (calls === 2) return equalRefresh.promise
+      if (calls === 3) return Promise.resolve(page([{
+        ...historicalGap,
+        original_plan_display_name: 'Updated history title',
+        original_plan_path: 'plans/updated-history-title.md',
+      }]))
+      return Promise.reject(new Error('history refresh unavailable'))
+    })
+
+    const view = render(<GlobalRunOverview projects={[primary]} onOpen={vi.fn()} />)
+    expect(await screen.findByText('Original history title')).toBeTruthy()
+    const row = view.container.querySelector<HTMLElement>('.global-run-row')
+    expect(row).toBeTruthy()
+
+    fireEvent.click(screen.getByRole('button', { name: 'Refresh' }))
+    await waitFor(() => expect(api.listControlPlaneRuns).toHaveBeenCalledTimes(2))
+    expect(view.container.querySelector('.global-run-row')).toBe(row)
+    await act(async () => {
+      equalRefresh.resolve(page([historicalGap]))
+      await equalRefresh.promise
+    })
+    expect(view.container.querySelector('.global-run-row')).toBe(row)
+
+    fireEvent.click(screen.getByRole('button', { name: 'Refresh' }))
+    await screen.findByText('Updated history title')
+    expect(view.container.querySelector('.global-run-row')).toBe(row)
+
+    fireEvent.click(screen.getByRole('button', { name: 'Refresh' }))
+    expect((await screen.findByRole('alert')).textContent).toMatch(/Partial or stale results/)
+    expect(screen.getByText('Updated history title')).toBeTruthy()
+    expect(view.container.querySelector('.global-run-row')).toBe(row)
+  })
+
   it('stops initial loading and exposes a registry failure', () => {
     const view = render(<GlobalRunOverview projects={[]} registryError="registry unavailable" onOpen={vi.fn()} />)
 
@@ -238,6 +286,57 @@ describe('GlobalRunOverview project context', () => {
 
     fireEvent.change(search, { target: { value: '' } })
     await waitFor(() => expect(screen.getAllByRole('button', { name: /attention-/ })).toHaveLength(10))
+  })
+
+  it('shows unresolved outcomes in a separate history group while keeping attention and archive filters intact', async () => {
+    const historicalGap = makeRun('20260911t140026z-d06cc7d7', {
+      status: 'needs_attention', status_reason_code: 'unit_missing',
+      reason: 'No current workflow unit was found and no normal outcome was recorded.',
+      activity: 'unknown', unit_name: 'aflow-run-20260911t140026z-d06cc7d7.service', ended_at: null,
+      evidence: { unit_observation: 'missing', has_run_metadata: false, can_resume: false },
+    })
+    const archivedGap = makeRun('archived-gap', {
+      ...historicalGap,
+      run_id: 'archived-gap',
+      unit_name: 'aflow-run-archived-gap.service',
+      history_state: 'archived',
+    })
+    const actionable = makeRun('actionable-attention', {
+      status: 'needs_attention', status_reason_code: 'worker_attention',
+    })
+    const recent = makeRun('recent-record')
+    const deleted = makeRun('deleted-gap', {
+      ...historicalGap,
+      run_id: 'deleted-gap',
+      unit_name: 'aflow-run-deleted-gap.service',
+      history_state: 'deleted',
+    })
+    const allHistory = [historicalGap, archivedGap, actionable, recent, deleted]
+    vi.mocked(api.listControlPlaneRuns).mockImplementation(async (_projectId, request) => ({
+      runs: request?.history === 'all' ? allHistory : [historicalGap, actionable, recent, deleted],
+      next_cursor: null,
+      schema_version: 1,
+    }))
+    const onOpen = vi.fn()
+
+    render(<GlobalRunOverview projects={[primary]} onOpen={onOpen} />)
+
+    expect(await screen.findByRole('heading', { name: 'Outcome not recorded (1)' })).toBeTruthy()
+    expect(screen.getByRole('heading', { name: 'Needs attention (1)' })).toBeTruthy()
+    expect(screen.getByRole('heading', { name: 'Recent (1)' })).toBeTruthy()
+    expect(screen.getByRole('button', { name: /Outcome not recorded/ })).toBeTruthy()
+    expect(screen.getByRole('button', { name: /Needs attention.*actionable-attention/ })).toBeTruthy()
+
+    fireEvent.change(screen.getByLabelText('Run history'), { target: { value: 'all' } })
+    expect(await screen.findByRole('heading', { name: 'Outcome not recorded (2)' })).toBeTruthy()
+    const archivedRow = screen.getByRole('button', { name: /Outcome not recorded.*archived-gap/ })
+    expect(archivedRow.textContent).toContain('Archived')
+
+    fireEvent.change(screen.getByRole('searchbox', { name: 'Search loaded runs' }), { target: { value: 'Outcome not recorded' } })
+    expect(await screen.findByRole('heading', { name: 'Outcome not recorded (2)' })).toBeTruthy()
+    expect(screen.queryByRole('heading', { name: /Needs attention/ })).toBeNull()
+    fireEvent.click(screen.getByRole('button', { name: /Outcome not recorded.*archived-gap/ }))
+    expect(onOpen).toHaveBeenCalledWith('primary', 'archived-gap')
   })
 
   it('searches a loaded recent run outside the recent display limit', async () => {

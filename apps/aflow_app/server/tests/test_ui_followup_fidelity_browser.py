@@ -11,6 +11,8 @@ from urllib.parse import urlsplit
 import pytest
 from playwright.sync_api import expect, sync_playwright
 
+from aflow.control_plane import LaunchManifest, create_launch_manifest, write_launch_phase
+from aflow.control_plane.persistence import append_run_event
 from aflow.control_plane.units import InMemoryUnitManager, UnitState
 from test_control_plane_api import (
     PROJECT_ID,
@@ -268,6 +270,152 @@ def _rewrite_run_metadata(path: Path, **updates: object) -> None:
     metadata = json.loads(path.read_text(encoding="utf-8"))
     metadata.update(updates)
     path.write_text(json.dumps(metadata, indent=2) + "\n", encoding="utf-8")
+
+
+FAILED_REVIEW_ID = "20260923t140751z-c60d53d7"
+
+
+def _seed_failed_reviewer_run(root: Path, running: dict[str, object]) -> str:
+    """Write an owned failed review through the same durable records read by the API."""
+    source_plan = Path(str(running["plan"]))
+    plan = source_plan.with_name("failed-review-evidence-20260923.md")
+    plan.write_bytes(source_plan.read_bytes())
+    run_id = FAILED_REVIEW_ID
+    create_launch_manifest(root, LaunchManifest(
+        run_id=run_id, project_root=str(root.resolve()), plan_path=str(plan.resolve()),
+        workflow_name="managed", max_turns=8, team="base", start_step="implement",
+        idempotency_key="ui-followup-failed-review", caller_scope=f"bearer:{PROJECT_ID}",
+        created_at="2026-09-23T14:07:51Z",
+    ))
+    launch_state = write_launch_phase(root, run_id, "failed")
+    _rewrite_run_metadata(launch_state, updated_at="2026-09-23T14:09:01Z")
+    source_metadata = json.loads((root / ".aflow" / "runs" / str(running["run_id"]) / "run.json").read_text(encoding="utf-8"))
+    source_metadata.update({
+        "run_id": run_id, "status": "failed", "activity": "inactive", "phase": "failed",
+        "failure_reason": "# AFlow manager report\n## Summary", "original_plan_path": str(plan),
+        "active_plan_path": str(plan), "plan_path": str(plan),
+        "current_step_name": "review_checkpoint", "turns_completed": 4,
+        "run_started_at": "2026-09-23T14:07:51Z",
+        "implementation_attempts": {},
+        "active_implementation_scope": {
+            "scope_id": "original::checkpoint-2", "original_plan_path": str(plan),
+            "checkpoint_index": 2, "checkpoint_name": "Checkpoint 2: Review history",
+            "opened_turn_number": 3, "awaiting_review": True,
+        },
+    })
+    run_dir = root / ".aflow" / "runs" / run_id
+    run_dir.mkdir(parents=True, exist_ok=True)
+    (run_dir / "run.json").write_text(json.dumps(source_metadata, indent=2) + "\n", encoding="utf-8")
+    append_run_event(run_dir, "turn_started", {
+        "turn_number": 4, "step_name": "review_checkpoint", "step_role": "reviewer", "role": "reviewer",
+    })
+    append_run_event(run_dir, "turn_finished", {
+        "turn_number": 4, "step_name": "review_checkpoint", "step_role": "reviewer", "role": "reviewer",
+        "status": "failed", "outcome": "harness-failed", "returncode": 1,
+    })
+    append_run_event(run_dir, "run_failed", {
+        "turn_number": 4, "status": "failed", "message": "# AFlow manager report ## Summary",
+    })
+    journal = run_dir / "events.jsonl"
+    records = [json.loads(line) for line in journal.read_text(encoding="utf-8").splitlines()]
+    for record, timestamp in zip(records, (
+        "2026-09-23T14:07:51Z", "2026-09-23T14:09:00Z", "2026-09-23T14:09:01Z",
+    ), strict=True):
+        record["timestamp"] = timestamp
+    journal.write_text("".join(json.dumps(record) + "\n" for record in records), encoding="utf-8")
+    return run_id
+
+
+@pytest.mark.parametrize("width,height", RUN_ROW_VIEWPORTS[:6])
+@pytest.mark.parametrize("theme", RUN_ROW_THEMES)
+def test_ui_followup_failed_review_history(
+    control_client, monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+    width: int, height: int, theme: str,
+) -> None:
+    """Read mixed history and a failed review through the owned-run API and built UI."""
+    client, root, units, _ = control_client
+    fixtures = seed_demo_fidelity_fixture(root)
+    running = fixtures["running"]
+    assert isinstance(running, dict)
+    failed_id = _seed_failed_reviewer_run(root, running)
+    assert isinstance(units, InMemoryUnitManager)
+    running_unit = f"aflow-run-{running['run_id']}.service"
+    units.units[running_unit] = UnitState(name=running_unit, active_state="active", sub_state="running")
+    _prepare_disposable_fidelity_config(root, monkeypatch)
+    response = client.get(f"/api/control-plane/projects/{PROJECT_ID}/runs/{failed_id}")
+    assert response.status_code == 200, response.text
+    assert response.json()["run_id"] == failed_id
+    assert response.json()["status"] == "failed"
+
+    dist = Path(__file__).resolve().parents[2] / "web" / "dist"
+    assert (dist / "index.html").is_file(), "Build the real web app before browser fidelity checks."
+    monkeypatch.setenv("AFLOW_APP_WEB_DIST", str(dist))
+    artifact_dir = _fidelity_artifact_dir(tmp_path)
+    artifact_dir.mkdir(parents=True, exist_ok=True)
+    browser_name = os.environ.get("AFLOW_TEST_BROWSER", "chromium").strip().lower()
+    stem = f"failed-review-{browser_name}-{theme}-{width}x{height}"
+    requests: list[tuple[str, str]] = []
+    page_errors: list[str] = []
+    with live_server() as url, sync_playwright() as playwright:
+        browser = _browser(playwright)
+        page = browser.new_page(viewport={"width": width, "height": height}, has_touch=width <= 390)
+        page.on("request", lambda request: requests.append((request.method, request.url)))
+        page.on("pageerror", lambda error: page_errors.append(str(error)))
+        try:
+            _login(page, url)
+            _set_theme_preference(page, theme)
+            page.goto(f"{url}/?view=all-runs", wait_until="load")
+            _wait_for_fidelity_readiness(page)
+            expect(page.locator(".global-run-row")).to_have_count(4)
+            row_text = " ".join(page.locator(".global-run-row").all_inner_texts())
+            assert all(status in row_text for status in ("Running", "Paused", "Completed", "Failed")), row_text
+            search = page.get_by_role("searchbox", name="Search loaded runs", exact=True)
+            search.fill(failed_id)
+            failed_row = page.locator(".global-run-row").first
+            expect(failed_row).to_contain_text("Failed")
+            expect(failed_row).to_contain_text("Failed review evidence")
+            _assert_no_horizontal_overflow(page)
+            page.goto(f"{url}/?project={PROJECT_ID}&view=runs&run={failed_id}", wait_until="load")
+            _wait_for_fidelity_readiness(page)
+            detail = page.locator(".run-detail:visible").first
+            detail.wait_for()
+            detail.locator(".checkpoint-history-disclosure-controls").wait_for()
+            page_errors.clear()
+            expect(detail.locator(".run-overview-current-work")).to_contain_text("Review stopped")
+            expect(detail.locator(".run-overview-current-work")).to_contain_text("CP2")
+            expect(detail.locator(".run-overview-current-work")).to_contain_text("turn 4")
+            expect(detail).to_contain_text("Duration 1m 10s")
+            latest_result = detail.locator("[data-ui-fidelity-anchor='latest-result']")
+            expect(latest_result).to_contain_text("The reviewer harness failed before a decision.")
+            assert "harness-failed" not in latest_result.inner_text()
+            assert "# AFlow manager report" not in latest_result.inner_text()
+            assert "exit 1" not in latest_result.inner_text()
+            assert "No current work — Failed" not in detail.inner_text()
+            assert "Recorded update: exit 1" not in detail.inner_text()
+            assert "# AFlow manager report" not in detail.inner_text()
+            assert detail.locator(".run-overview-event").count() == 2
+            expect(detail.locator("#checkpoint-history-delivery-evidence")).to_have_count(0)
+            expect(detail.locator("#checkpoint-history-delivery-evidence[open]")).to_have_count(0)
+            _assert_no_horizontal_overflow(page)
+            page.screenshot(path=str(artifact_dir / f"{stem}.png"), full_page=True)
+            detail.get_by_role("button", name="Expand all", exact=True).click()
+            expect(detail.get_by_text("Count definitions & evidence", exact=True)).to_be_visible()
+            event_summary = detail.locator(".run-overview-event summary").first
+            if width <= 390:
+                event_summary.tap()
+            else:
+                event_summary.focus()
+                page.keyboard.press("Enter")
+            expect(detail.locator(".run-overview-event pre")).to_contain_text('"outcome": "harness-failed"')
+            expect(detail.locator(".run-overview-event pre")).to_contain_text('"returncode": 1')
+            page.screenshot(path=str(artifact_dir / f"{stem}-expanded.png"), full_page=True)
+            writes = [(method, path) for method, path in requests
+                      if method not in {"GET", "HEAD", "OPTIONS"}
+                      and not path.endswith(("/api/session", "/api/config/form"))]
+            assert writes == []
+            assert page_errors == []
+        finally:
+            browser.close()
 
 
 def test_ui_followup_run_rows(

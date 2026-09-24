@@ -121,6 +121,7 @@ export function GlobalRunOverview({ projects, onOpen, registryLoading = false, r
   const [limit] = useRecentRunsLimit()
   const [search, setSearch] = useState('')
   const [attentionVisible, setAttentionVisible] = useState(10)
+  const [historyGapVisible, setHistoryGapVisible] = useState(10)
   const projectIds = projects.map(p => p.id).sort()
   const ids = projectIds.join('\n')
   const resultsIdentity = JSON.stringify([history, projectIds])
@@ -268,6 +269,8 @@ export function GlobalRunOverview({ projects, onOpen, registryLoading = false, r
   const selected = selectGlobalRuns(filteredRows, limit, history)
   const attentionRows = selected.attention.slice(0, attentionVisible)
   const remainingAttention = selected.attention.length - attentionRows.length
+  const historyGapRows = selected.historyGaps.slice(0, historyGapVisible)
+  const remainingHistoryGaps = selected.historyGaps.length - historyGapRows.length
   const hasUsableRows = rows.length > 0
   const backgroundRefresh = currentLoad?.mode === 'refresh' && hasUsableRows && failedProjectIds.length === 0
   const incompleteCoverage = !backgroundRefresh && (resultsPending || !coverageComplete)
@@ -276,14 +279,18 @@ export function GlobalRunOverview({ projects, onOpen, registryLoading = false, r
     { key: 'ongoing', label: `${incompleteCoverage ? 'Loaded ongoing' : 'Ongoing'} (${selected.ongoing.length})`, rows: selected.ongoing },
     { key: 'recent', label: `${incompleteCoverage ? 'Loaded recent' : 'Recent'} (${selected.recent.length})`, rows: selected.recent },
     { key: 'attention', label: `${incompleteCoverage ? 'Loaded needs attention' : 'Needs attention'} (${selected.attention.length})`, rows: attentionRows },
+    { key: 'history-gaps', label: `Outcome not recorded (${selected.historyGaps.length})`, rows: historyGapRows },
   ] as const)
   // A populated overview should spend space on meaningful groups only. Empty
   // states remain explicit at the page level (no projects, no runs, or no
   // search match) instead of becoming repeated decorative group cards.
   const visibleGroups = groups.filter(group => group.rows.length > 0)
-  useEffect(() => setAttentionVisible(10), [history, ids, search])
+  useEffect(() => {
+    setAttentionVisible(10)
+    setHistoryGapVisible(10)
+  }, [history, ids, search])
 
-  const renderedRows = [...selected.ongoing, ...selected.recent, ...attentionRows]
+  const renderedRows = [...selected.ongoing, ...selected.recent, ...attentionRows, ...historyGapRows]
   const currentGeneration = currentLoad?.generation ?? 0
   const renderedSnapshot = renderedRows.map(({ projectId, run }) => {
     const identity = runIdentity(projectId, run.run_id)
@@ -471,6 +478,7 @@ export function GlobalRunOverview({ projects, onOpen, registryLoading = false, r
   function changeHistory(next: 'visible' | 'archived' | 'all') {
     updateLoadState(() => emptyGlobalRunLoadState)
     setAttentionVisible(10)
+    setHistoryGapVisible(10)
     setHistory(next)
   }
 
@@ -522,10 +530,11 @@ export function GlobalRunOverview({ projects, onOpen, registryLoading = false, r
       {coverageComplete && !registryError && !projects.length && <p>No registered projects. Add a project in Projects to start.</p>}
       {coverageComplete && !registryError && !rows.length && projects.length > 0 && <p>No runs yet.</p>}
       {rows.length > 0 && filteredRows.length === 0 && search.trim() && <p className="text-sm text-dim">No loaded runs match “{search.trim()}”.</p>}
-      {showGroups && visibleGroups.map(group => <section key={group.key}>
+      {showGroups && visibleGroups.map(group => <section key={group.key} className={group.key === 'history-gaps' ? 'global-run-history-gap-group' : undefined}>
         <h3>{group.label}</h3>
         <ul className="compact-list">{group.rows.map(renderRunRow)}</ul>
         {group.key === 'attention' && remainingAttention > 0 && <button type="button" className="btn btn-secondary" onClick={() => setAttentionVisible(count => count + 10)}>Show more ({remainingAttention} remaining)</button>}
+        {group.key === 'history-gaps' && remainingHistoryGaps > 0 && <button type="button" className="btn btn-secondary" onClick={() => setHistoryGapVisible(count => count + 10)}>Show more ({remainingHistoryGaps} remaining)</button>}
       </section>)}
     </div>
   </div>

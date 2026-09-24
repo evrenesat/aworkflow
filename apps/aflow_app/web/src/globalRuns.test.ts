@@ -111,12 +111,55 @@ it('keeps unresolved records outside Recent and hides archived/deleted records b
   expect(selectGlobalRuns(rows, 10, 'archived').recent.map(row => row.run.run_id)).toEqual(['archive'])
 })
 
+it('separates a confirmed history gap from actionable attention across history filters', () => {
+  const historicalGap: RunStatus = {
+    ...run('20260911t140026z-d06cc7d7', 'needs_attention'),
+    status_reason_code: 'unit_missing',
+    reason: 'No current workflow unit was found and no normal outcome was recorded.',
+    activity: 'unknown',
+    unit_name: 'aflow-run-20260911t140026z-d06cc7d7.service',
+    evidence: { unit_observation: 'missing', has_run_metadata: false, can_resume: false },
+    ended_at: null,
+  }
+  const archivedGap = { ...historicalGap, run_id: 'archived-gap', unit_name: 'aflow-run-archived-gap.service', history_state: 'archived' as const }
+  const actionable = { ...run('actionable', 'needs_attention'), status_reason_code: 'worker_attention' }
+  const completed = run('completed-history')
+  const deletedGap = { ...historicalGap, run_id: 'deleted-gap', unit_name: 'aflow-run-deleted-gap.service', history_state: 'deleted' as const }
+  const rows = [historicalGap, archivedGap, actionable, completed, deletedGap].map(run => ({ projectId: 'project', run }))
+
+  const visible = selectGlobalRuns(rows, 1)
+  expect(visible.historyGaps.map(row => row.run.run_id)).toEqual([historicalGap.run_id])
+  expect(visible.attention.map(row => row.run.run_id)).toEqual(['actionable'])
+  expect(visible.recent.map(row => row.run.run_id)).toEqual(['completed-history'])
+
+  const all = selectGlobalRuns(rows, 1, 'all')
+  expect(all.historyGaps.map(row => row.run.run_id)).toEqual([historicalGap.run_id, 'archived-gap'])
+  expect(all.attention.map(row => row.run.run_id)).toEqual(['actionable'])
+  expect(selectGlobalRuns(rows, 1, 'archived').historyGaps.map(row => row.run.run_id)).toEqual(['archived-gap'])
+})
+
 it('searches loaded run identities and readable labels without changing the source rows', () => {
   const row = { projectId: 'project-a', run: { ...run('run-exact'), plan_path: 'plans/clear-run-ui.md', workflow_name: 'managed', team: 'full', current_step: 'review' } }
   expect(matchesGlobalRun(row, 'clear review', 'AFlow project')).toBe(true)
   expect(matchesGlobalRun(row, 'run-exact', 'AFlow project')).toBe(true)
   expect(matchesGlobalRun(row, 'other', 'AFlow project')).toBe(false)
   expect(row.run.plan_path).toBe('plans/clear-run-ui.md')
+})
+
+it('keeps a history gap searchable by both its display label and raw canonical status', () => {
+  const row = {
+    projectId: 'project-a',
+    run: {
+      ...run('history-gap', 'needs_attention'),
+      status_reason_code: 'unit_missing',
+      activity: 'unknown',
+      unit_name: 'aflow-run-history-gap.service',
+      evidence: { unit_observation: 'missing', has_run_metadata: false, can_resume: false },
+    },
+  }
+
+  expect(matchesGlobalRun(row, 'Outcome not recorded')).toBe(true)
+  expect(matchesGlobalRun(row, 'needs_attention')).toBe(true)
 })
 
 it('searches the raw canonical title before visible grouping and enrichment', () => {

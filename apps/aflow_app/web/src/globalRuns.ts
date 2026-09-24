@@ -1,6 +1,6 @@
 import { useEffect, useState } from 'react'
 import * as api from './api'
-import { runCanonicalIdentity, runPlanDisplayNameForRun, runPlanPath, statusLabel } from './runPresentation'
+import { runCanonicalIdentity, runDisplayProjection, runPlanDisplayNameForRun, runPlanPath, statusLabel } from './runPresentation'
 import type { RunStatus } from './types'
 
 export const RECENT_LIMIT_KEY = 'aflow.recentRunsLimit'
@@ -131,6 +131,7 @@ export function matchesGlobalRun(row: GlobalRun, query: string, projectLabel = '
     planPath,
     run.original_plan_path,
     run.run_id,
+    run.status,
     statusLabel(run),
     run.workflow_name,
     run.team,
@@ -142,7 +143,8 @@ export function matchesGlobalRun(row: GlobalRun, query: string, projectLabel = '
 }
 
 export function isOngoing(run: RunStatus): boolean {
-  if (['Completed', 'Failed', 'Could not start', 'Stopped', 'Interrupted', 'Needs attention'].includes(statusLabel(run))) return false
+  const category = runDisplayProjection(run).category
+  if (['completed', 'failure', 'actionable-attention', 'outcome-unrecorded', 'stopped', 'interrupted'].includes(category)) return false
   return run.activity === 'active' || run.evidence.unit_active === true || ['paused', 'waiting_for_input', 'waiting_for_valid_override', 'awaiting_startup_answer'].includes(run.status)
 }
 function orderingTime(run: RunStatus): number {
@@ -151,11 +153,16 @@ function orderingTime(run: RunStatus): number {
   }
   return 0
 }
-export function selectGlobalRuns(rows: GlobalRun[], limit: number, history: 'visible' | 'archived' | 'all' = 'visible'): { ongoing: GlobalRun[]; attention: GlobalRun[]; recent: GlobalRun[] } {
+export function selectGlobalRuns(rows: GlobalRun[], limit: number, history: 'visible' | 'archived' | 'all' = 'visible'): { ongoing: GlobalRun[]; attention: GlobalRun[]; historyGaps: GlobalRun[]; recent: GlobalRun[] } {
   const unique = [...new Map(rows.filter(row => row.run.history_state !== 'deleted' && (history === 'all' || (row.run.history_state ?? 'visible') === history)).map(row => [JSON.stringify([row.projectId, row.run.run_id]), row])).values()]
   unique.sort((a, b) => orderingTime(b.run) - orderingTime(a.run)
     || a.projectId.localeCompare(b.projectId) || a.run.run_id.localeCompare(b.run.run_id))
-  return { ongoing: unique.filter(row => isOngoing(row.run)), attention: unique.filter(row => !isOngoing(row.run) && statusLabel(row.run) === 'Needs attention'), recent: unique.filter(row => !isOngoing(row.run) && statusLabel(row.run) !== 'Needs attention').slice(0, limit) }
+  const ongoing = unique.filter(row => isOngoing(row.run))
+  const attention = unique.filter(row => !isOngoing(row.run) && runDisplayProjection(row.run).category === 'actionable-attention')
+  const historyGaps = unique.filter(row => runDisplayProjection(row.run).category === 'outcome-unrecorded')
+  const recent = unique.filter(row => !isOngoing(row.run)
+    && !['actionable-attention', 'outcome-unrecorded'].includes(runDisplayProjection(row.run).category)).slice(0, limit)
+  return { ongoing, attention, historyGaps, recent }
 }
 export async function fetchGlobalRuns(
   projectIds: string[],
