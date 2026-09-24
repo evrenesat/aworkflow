@@ -789,15 +789,14 @@ def test_ui_followup_launch_review(
             # plan, so its first preflight identity is not superseded when
             # the background configuration read finishes.
             expect(page.get_by_text("Server default: 15.", exact=True)).to_be_visible(timeout=30_000)
-            plan_input.click()
-            plan_input.fill(running_plan.name)
-            page.get_by_role("option", name=running_plan.name, exact=False).click()
-            expect(plan_input).to_have_value(running_plan.relative_to(root).as_posix())
-
             workflow = page.get_by_label("Run workflow", exact=True)
-            # A prior implicit-workflow inspection can be ready while the
-            # explicit combobox selection is still settling. Observe the
-            # response for this exact launch choice before checking readiness.
+            # Choose the explicit workflow before the plan. Selecting the
+            # plan then starts one inspection for the final launch draft.
+            workflow.click()
+            workflow.fill("managed")
+            workflow.press("ArrowDown")
+            workflow.press("Enter")
+            expect(workflow).to_have_value("Managed")
             with page.expect_response(
                 lambda response: response.request.method == "POST"
                 and response.url.endswith("/runs/preflight")
@@ -806,11 +805,10 @@ def test_ui_followup_launch_review(
                 and response.request.post_data_json.get("workflow_name") == "managed",
                 timeout=30_000,
             ):
-                workflow.click()
-                workflow.fill("managed")
-                workflow.press("ArrowDown")
-                workflow.press("Enter")
-            expect(workflow).to_have_value("Managed")
+                plan_input.click()
+                plan_input.fill(running_plan.name)
+                page.get_by_role("option", name=running_plan.name, exact=False).click()
+            expect(plan_input).to_have_value(running_plan.relative_to(root).as_posix())
 
             visible_dashboard = page.locator('.dashboard-host:not([hidden])').first
             preflight = visible_dashboard.locator('section[aria-label="Working tree preflight"]')
