@@ -1,5 +1,41 @@
 # DEVLOG
 
+## 2026-09-24 — Prove CP8 held-request termination before Review (follow-up v01)
+
+- The held-refresh fixture now matches Playwright requests by object identity
+  and records `requestfinished` or `requestfailed` for every routed preflight.
+  It releases the held route, unregisters the handler, waits for those terminal
+  events, then rechecks ready Review for the restored default launch. Success
+  and failure evidence carry bounded route roles, identities, and outcomes.
+  In Chromium and WebKit captures the held request was canceled, the `16`-turn
+  and restored-default requests finished, dirty acknowledgement stayed checked,
+  and Review opened with zero Start calls.
+- An initial Chromium full run timed out on `networkidle` even though all six
+  routed requests had terminal events and Review was ready; background traffic
+  continued. The final fixture waits on the recorded terminal events instead.
+  Web tests passed 633/633 and the build passed. All five CP8 cases passed in
+  both engines on Python 3.12 and on Python 3.13 in Chromium. The held case
+  passed five isolated repeats per engine. Exact-SHA CI and live activation
+  remain unverified coordinator gates.
+
+## 2026-09-24 — Drain overlapping CP8 held-refresh routes (Checkpoint 1)
+
+- CI run `36069910428` (Ubuntu Python 3.12, `desktop-dark-held-refresh`)
+  intercepted two preflight requests and continued only one; Review stayed in
+  `loading`. The local capture reproduced four routed requests in the controlled
+  window: one held, an additional default-identity request, a `16`-turn request,
+  and the restored-default request. The latter three continued and returned
+  ready responses. The route fixture now holds only the first request, releases
+  it and unregisters the handler on every exit, and records a hashed plan path
+  with workflow, team, and turn identity in its sanitized trace. It requires
+  the restored request's completed response, dirty acknowledgement, and visible
+  ready Review state before the read-only click. Production code was unchanged.
+- Web tests passed 633/633 and the production build passed. All five CP8 cases
+  passed in Chromium and WebKit on Python 3.12, and in Chromium on Python 3.13.
+  The held-refresh case passed five isolated repeats per engine on Python 3.12.
+  Reviewed publication, exact-SHA CI, and live activation remain coordinator
+  gates.
+
 ## 2026-09-24 — Preserve a new follow-up filename after run selection
 
 - Move the follow-up draft reset and selected-run ref update before paint when
