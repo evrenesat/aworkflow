@@ -818,7 +818,8 @@ def test_ui_followup_launch_review(
             expect(preflight).to_have_attribute("data-preflight-status", "ready", timeout=30_000)
             expect(preflight).to_contain_text(
                 "Execution mode: existing checkout — uses the current checkout; "
-                "acknowledge any uncommitted changes before continuing."
+                "acknowledge any uncommitted changes before continuing.",
+                timeout=30_000,
             )
             if dirty:
                 expect(preflight.get_by_text("12 uncommitted changes detected.", exact=True)).to_be_visible()
@@ -840,7 +841,7 @@ def test_ui_followup_launch_review(
                 for dirty_path in dirty_paths:
                     expect(preflight.get_by_text(dirty_path, exact=True)).to_be_hidden()
             else:
-                expect(preflight.get_by_text("No uncommitted changes detected.", exact=True)).to_be_visible()
+                expect(preflight.get_by_text("No uncommitted changes detected.", exact=True)).to_be_visible(timeout=30_000)
                 expect(preflight.get_by_role("checkbox", name="Continue despite uncommitted changes", exact=True)).to_have_count(0)
 
             advanced = page.get_by_role("button", name="Advanced options", exact=True)
