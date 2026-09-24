@@ -825,7 +825,9 @@ def test_ui_followup_launch_review(
                 expect(first_path).to_be_visible()
                 expect(changed_files.get_by_text(dirty_paths[-1], exact=True)).to_be_visible()
                 changed_files.locator(":scope > summary").click()
-                assert changed_files.get_attribute("open") is None
+                expect(changed_files).not_to_have_attribute("open", "")
+                for dirty_path in dirty_paths:
+                    expect(preflight.get_by_text(dirty_path, exact=True)).to_be_hidden()
             else:
                 expect(preflight.get_by_text("No uncommitted changes detected.", exact=True)).to_be_visible()
                 expect(preflight.get_by_role("checkbox", name="Continue despite uncommitted changes", exact=True)).to_have_count(0)

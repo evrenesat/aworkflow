@@ -1,5 +1,40 @@
 # DEVLOG
 
+## 2026-09-24 — Stabilize New run review and disclosure CI cases (Checkpoint 1)
+
+- Reviewed the exact failing CI logs: the Ubuntu CP8 case timed out waiting for
+  Review start after its click, while the macOS case read the native `open`
+  attribute immediately after closing Show changed files. CP8 browser evidence
+  now records the visible launch form, preflight status and request identity,
+  committed-config/default read summaries, dirty acknowledgement, Review state,
+  region visibility, feedback, and focus before and after the click. Readiness
+  and click failures save a screenshot and sanitized JSON trace in test
+  artifacts; no auth headers or private response bodies are recorded.
+- The Python 3.12 full suite exposed a timeout in the CP8 desktop-light case at
+  the ready-and-Review-enabled wait. The fixture now scopes the preflight and
+  dirty-worktree checkbox to the visible launch form, waits for the required
+  checkbox to be visible and checked, and then waits for ready preflight and an
+  enabled Review action. The passing pre/post trace keeps the same launch
+  inputs, opens the visible review with heading focus and consequence text, and
+  records zero Start run calls. The evidence points to fixture synchronization;
+  no product source change was needed. The existing held-response component
+  regression also verifies that an invalidated review stays visible with
+  actionable feedback and can be reopened against refreshed defaults.
+- The changed-files test now waits for the native disclosure to close and
+  checks that every returned file path is hidden again. It adds no delay and
+  retains the opening, path, and acknowledgement checks.
+- Validation: web tests passed 632/632 across 29 files; the production build
+  passed with its existing large-chunk warning; full server suites passed
+  492/492 on Python 3.12 (3 warnings, 1082.61s) and Python 3.13 (3 warnings,
+  972.80s). The focused CP8 desktop-dark case passed twice each in Chromium and
+  WebKit on Python 3.13; the CP8 desktop-light case passed twice in Chromium on
+  Python 3.12. The changed-files desktop-light-dirty case passed twice each in
+  Chromium and WebKit on Python 3.13. `git diff --check` passed. Inspected the
+  final 1280×720 desktop and 390×844 phone review captures: the review and
+  consequence remain visible, focus stays on its heading, and the final Start
+  run action remains separate from opening the review. No run is allocated by
+  review. Checkpoint changes remain uncommitted for review.
+
 ## 2026-09-24 — Restore New run preparation and review on the published baseline (Checkpoint 1)
 
 - Advanced the managed worktree to published `fdc9100f` and ported the preserved
