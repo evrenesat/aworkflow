@@ -1,7 +1,7 @@
 """Authenticated Skills API tests: contract, revisions, shared services.
 
 All HOME/PATH fixtures are disposable: stub harness executables stand in
-for the eleven supported harnesses and every canonical store, destination,
+for the twelve supported harnesses and every canonical store, destination,
 and link lives beneath a temporary HOME. No live home is ever mutated.
 """
 
@@ -34,6 +34,7 @@ HARNESS_EXECUTABLES = (
     "opencode",
     "pi",
     "reasonix",
+    "strands",
     "zcode",
 )
 

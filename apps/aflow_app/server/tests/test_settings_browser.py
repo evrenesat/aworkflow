@@ -19,6 +19,7 @@ HARNESS_EXECUTABLES = (
     "opencode",
     "pi",
     "reasonix",
+    "strands",
     "zcode",
 )
 
@@ -589,7 +590,7 @@ def test_skills_edit_save_and_install_through_links(control_client, tmp_path, mo
     """Edit bundled Markdown in Settings and prove bytes flow through real links.
 
     Every HOME, PATH executable, store, destination, and link lives beneath a
-    disposable directory: stub harness executables stand in for the eleven
+    disposable directory: stub harness executables stand in for the twelve
     supported harnesses and no live home is ever mutated.
     """
     from aflow_app_server import main, config as config_module
