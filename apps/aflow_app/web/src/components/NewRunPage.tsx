@@ -1,4 +1,4 @@
-import { useId, type ReactNode, type Dispatch, type SetStateAction } from 'react'
+import { useEffect, useId, useRef, type ReactNode, type Dispatch, type SetStateAction } from 'react'
 import type { WorktreePreflight, WorktreeStatusItem } from '../types'
 import { formatMachineChoice, formatMachineLabel } from '../label'
 import { Combobox } from './Combobox'
@@ -40,6 +40,18 @@ function worktreeItemDescription(item: WorktreeStatusItem): string {
 export function WorktreePreflightPanel({ status, result, error, dirtyWorktreeConfirmed, onDirtyWorktreeConfirmedChange, onRefresh, onLoadMore, dirtyQuestionMessage }: WorktreePreflightPanelProps) {
   const acknowledgmentRequired = status === 'ready' && Boolean(result?.requires_confirmation || dirtyQuestionMessage)
   const canShowResult = result !== null && status !== 'idle' && status !== 'error'
+  const returnedPathCount = result ? result.items.length : 0
+  const reportedChangeCount = result ? Math.max(result.total_items, returnedPathCount) : 0
+  const changeLabel = reportedChangeCount === 1 ? 'change' : 'changes'
+  const changedFilesSummary = result?.dirty
+    ? returnedPathCount === 0
+      ? reportedChangeCount > 0
+        ? `${reportedChangeCount} uncommitted ${changeLabel} detected; file names were not returned.`
+        : 'Uncommitted changes detected; file names were not returned.'
+      : returnedPathCount < reportedChangeCount
+        ? `${reportedChangeCount} uncommitted ${changeLabel} detected; ${returnedPathCount} returned so far.`
+        : `${reportedChangeCount} uncommitted ${changeLabel} detected.`
+    : 'No uncommitted changes detected.'
   return (
     <section
       className="dashboard-section worktree-preflight"
@@ -59,39 +71,42 @@ export function WorktreePreflightPanel({ status, result, error, dirtyWorktreeCon
       {canShowResult && result && (
         <>
           <p className="text-sm text-dim">
-            Checkout: <span className="mono">{result.checkout_path}</span>
-          </p>
-          <p className="text-sm text-dim">
             {result.execution_mode === 'new_worktree'
-              ? 'A new worktree starts from the selected commit and leaves these changes in the current checkout.'
-              : 'This run uses the existing checkout, so it sees the uncommitted changes listed here.'}
+              ? 'Execution mode: new worktree — starts from the selected commit; any uncommitted changes stay in the current checkout.'
+              : 'Execution mode: existing checkout — uses the current checkout; acknowledge any uncommitted changes before continuing.'}
           </p>
+          <details className="worktree-checkout-details">
+            <summary>Checkout details</summary>
+            <p className="text-sm text-dim">
+              Checkout: <span className="mono">{result.checkout_path}</span>
+            </p>
+          </details>
           {result.blockers.length > 0 && (
             <div className="error-message" role="alert">
               <strong>Preflight blocks this start:</strong>
               <ul>{result.blockers.map((blocker) => <li key={blocker}>{blocker}</li>)}</ul>
             </div>
           )}
-          {status === 'ready' && !result.dirty && <p>No uncommitted changes detected.</p>}
-          {result.dirty && result.items.length === 0 && (
-            <p className="notice">The checkout has uncommitted changes, but no individual paths were returned.</p>
-          )}
+          {status === 'ready' && <p className={result.dirty ? 'notice' : 'text-sm'}>{changedFilesSummary}</p>}
           {result.items.length > 0 && (
-            <ul className="worktree-preflight-list">
-              {result.items.map((item) => (
-                <li key={`${item.path}:${item.original_path ?? ''}`}>
-                  <span className="status-pill">{worktreeItemDescription(item)}</span>{' '}
-                  <span className="mono">{item.path}</span>
-                  <span className="text-xs text-dim"> ({item.index_status}{item.worktree_status})</span>
-                  {item.original_path && <span className="text-sm text-dim"> — renamed from <span className="mono">{item.original_path}</span></span>}
-                </li>
-              ))}
-            </ul>
-          )}
-          {result.next_offset !== null && (
-            <button type="button" className="btn btn-secondary btn-sm" onClick={onLoadMore} disabled={status === 'loading'}>
-              {status === 'loading' ? 'Loading more…' : `Show more (${Math.max(result.total_items - result.next_offset, 0)} remaining)`}
-            </button>
+            <details className="worktree-changed-files">
+              <summary>Show changed files ({returnedPathCount}{returnedPathCount < reportedChangeCount ? ` of ${reportedChangeCount}` : ''})</summary>
+              <ul className="worktree-preflight-list">
+                {result.items.map((item) => (
+                  <li key={`${item.path}:${item.original_path ?? ''}`}>
+                    <span className="status-pill">{worktreeItemDescription(item)}</span>{' '}
+                    <span className="mono">{item.path}</span>
+                    <span className="text-xs text-dim"> ({item.index_status}{item.worktree_status})</span>
+                    {item.original_path && <span className="text-sm text-dim"> — renamed from <span className="mono">{item.original_path}</span></span>}
+                  </li>
+                ))}
+              </ul>
+              {result.next_offset !== null && (
+                <button type="button" className="btn btn-secondary btn-sm" onClick={onLoadMore} disabled={status === 'loading'}>
+                  {status === 'loading' ? 'Loading more…' : `Show more (${Math.max(result.total_items - result.next_offset, 0)} remaining)`}
+                </button>
+              )}
+            </details>
           )}
         </>
       )}
@@ -168,7 +183,7 @@ interface NewRunPageProps {
   onOpenSettings: (() => void) | undefined
   reviewOpen: boolean
   review: ReactNode
-  onOpenStartReview: () => void
+  onOpenStartReview: (trigger: HTMLElement) => void
   onCancelStartReview: () => void
   onConfirmStart: () => Promise<void>
   startActionLabel: string
@@ -183,6 +198,23 @@ interface NewRunPageProps {
 /** Presentation only; the workspace retains request and answer identity across navigation. */
 export function NewRunPage({ startPlanPath, setStartPlanPath, planOptions, planBadges, restartDraftFrozen, startWorkflow, changeStartWorkflow, workflowOptions, workflowBadges, workflowPresentation, startTeamFamily, setStartTeamFamily, teamFamilyOptions, teamFamilyBadges, teamFamilyOptionLabel, teamFamilyOptionHint, teamFamilyPresentation, startTeamStage, setStartTeamStage, teamStageOptions, teamStageBadges, teamStageOptionLabel, teamStageOptionHint, teamStagePresentation, startMaxTurns, setStartMaxTurns, startMaxTurnsProblem, configuredMaxTurns, serverDefaultMaxTurns, preview, worktreePreflight, restartActions, onCancel, advancedOpen, setAdvancedOpen, startStep, setStartStep, effectiveWorkflow, runSteps, skippedByDraft, startExtraInstructions, setStartExtraInstructions, extraInstructionProblem, launchBlocker, onOpenSettings, reviewOpen, review, onOpenStartReview, onCancelStartReview, onConfirmStart, startActionLabel, reviewReady, startDisabled, startRevalidationPending, busyAction, hideActions = false }: NewRunPageProps) {
   const advancedId = useId()
+  const reviewHeadingRef = useRef<HTMLHeadingElement>(null)
+  const advancedIndicators = [
+    startTeamStage.trim() ? `Baseline stage: ${teamStageOptionLabel(startTeamStage.trim())}` : null,
+    startStep.trim() ? `Start at: ${formatMachineLabel(startStep.trim())}` : null,
+    startExtraInstructions.trim() ? 'Extra instructions added' : null,
+  ].filter((indicator): indicator is string => Boolean(indicator))
+
+  useEffect(() => {
+    if (!reviewOpen) return
+    const heading = reviewHeadingRef.current
+    if (!heading) return
+    const reducedMotion = typeof window.matchMedia === 'function'
+      && window.matchMedia('(prefers-reduced-motion: reduce)').matches
+    heading.scrollIntoView?.({ behavior: reducedMotion ? 'auto' : 'smooth', block: 'start' })
+    heading.focus({ preventScroll: true })
+  }, [reviewOpen])
+
   return (
         <section className="card start-run-form">
             <div className="start-run-form">
@@ -233,24 +265,6 @@ export function NewRunPage({ startPlanPath, setStartPlanPath, planOptions, planB
                     resolvedBadge={teamFamilyPresentation.resolvedBadge}
                     defaultOption={{ value: '', label: teamFamilyPresentation.defaultLabel, hint: teamFamilyPresentation.defaultHint }}
                   />
-                  {teamStageOptions.length > 1 && <div className="dashboard-field">
-                    <Combobox
-                      label="Run team stage"
-                      visibleLabel="Baseline stage"
-                      value={startTeamStage}
-                      onChange={setStartTeamStage}
-                      options={teamStageOptions}
-                      optionBadges={teamStageBadges}
-                      optionLabel={teamStageOptionLabel}
-                      optionHint={teamStageOptionHint}
-                      disabled={restartDraftFrozen}
-                      placeholder="Search stages"
-                      resolvedDisplay={teamStagePresentation.resolvedDisplay}
-                      resolvedBadge={teamStagePresentation.resolvedBadge}
-                      defaultOption={{ value: '', label: teamStagePresentation.defaultLabel, hint: teamStagePresentation.defaultHint }}
-                    />
-                    <span className="text-xs text-dim">The selected stage submits its exact configured team ID.</span>
-                  </div>}
                 </div>
                 <label className="dashboard-field">
                   <span>Maximum turns</span>
@@ -265,7 +279,7 @@ export function NewRunPage({ startPlanPath, setStartPlanPath, planOptions, planB
                 </label>
 
               </div>
-              <section className="dashboard-section">
+              <section className="dashboard-section launch-advanced-options">
                 <h4>
                   <button
                     type="button"
@@ -278,8 +292,27 @@ export function NewRunPage({ startPlanPath, setStartPlanPath, planOptions, planB
                     Advanced options
                   </button>
                 </h4>
+                {advancedIndicators.length > 0 && <p className="text-xs text-dim launch-advanced-indicator">Changed: {advancedIndicators.join(' · ')}</p>}
                 {advancedOpen && (
                   <div id={advancedId} className="start-run-form">
+                    {teamStageOptions.length > 1 && <div className="dashboard-field">
+                      <Combobox
+                        label="Run team stage"
+                        visibleLabel="Baseline stage"
+                        value={startTeamStage}
+                        onChange={setStartTeamStage}
+                        options={teamStageOptions}
+                        optionBadges={teamStageBadges}
+                        optionLabel={teamStageOptionLabel}
+                        optionHint={teamStageOptionHint}
+                        disabled={restartDraftFrozen}
+                        placeholder="Search stages"
+                        resolvedDisplay={teamStagePresentation.resolvedDisplay}
+                        resolvedBadge={teamStagePresentation.resolvedBadge}
+                        defaultOption={{ value: '', label: teamStagePresentation.defaultLabel, hint: teamStagePresentation.defaultHint }}
+                      />
+                      <span className="text-xs text-dim">The selected stage submits its exact configured team ID.</span>
+                    </div>}
                     <label className="dashboard-field"><span>Start step</span>
                       <select className="input" aria-label="Run start step" value={startStep} onChange={(event) => setStartStep(event.target.value)} disabled={!effectiveWorkflow || restartDraftFrozen}>
                         <option value="">{effectiveWorkflow ? 'Workflow first step (default)' : 'Select a workflow first'}</option>
@@ -308,8 +341,6 @@ export function NewRunPage({ startPlanPath, setStartPlanPath, planOptions, planB
                 )}
               </section>
               {extraInstructionProblem && <div className="error-message" role="alert">{extraInstructionProblem} Open Advanced options to edit the instructions.</div>}
-              {preview}
-              {worktreePreflight}
               {launchBlocker && (
                 <div className="notice" role="note">
                   {launchBlocker}
@@ -320,10 +351,12 @@ export function NewRunPage({ startPlanPath, setStartPlanPath, planOptions, planB
                   )}
                 </div>
               )}
+              {preview}
+              {worktreePreflight}
               {restartActions}
               {reviewOpen && <section className="dashboard-section launch-review" aria-label="Review start" role="region">
                 <div className="section-heading">
-                  <h4>Review before starting</h4>
+                  <h4 ref={reviewHeadingRef} className="launch-review-heading" tabIndex={-1}>Review before starting</h4>
                   <span className="text-xs text-dim">Read-only check — no run has been allocated.</span>
                 </div>
                 {review}
@@ -340,8 +373,9 @@ export function NewRunPage({ startPlanPath, setStartPlanPath, planOptions, planB
               </section>}
               {!reviewOpen && !hideActions && <div className="dashboard-actions">
                 <button
+                  data-launch-review-trigger="true"
                   className="btn btn-primary"
-                  onClick={onOpenStartReview}
+                  onClick={(event) => onOpenStartReview(event.currentTarget)}
                   disabled={startDisabled || Boolean(restartActions)}
                 >
                   {startActionLabel}

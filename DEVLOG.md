@@ -1,5 +1,33 @@
 # DEVLOG
 
+## 2026-09-24 — Restore New run preparation and review on the published baseline (Checkpoint 1)
+
+- Advanced the managed worktree to published `fdc9100f` and ported the preserved
+  New run presentation while retaining current run refresh, Actions, Teams,
+  Settings, and history behavior. The preparation form leads with Plan,
+  Workflow, Team, and Maximum turns; secondary choices and full preflight paths
+  remain behind named disclosures. Review keeps allocation behind its final
+  Start run action and returns focus to the preparation trigger on Cancel.
+- Browser capture checks now wait for the focused review heading to settle in
+  the viewport and verify the consequence text is visible before capturing.
+  Clean and 12-change desktop, 390×844 phone, and 844×390 landscape states were
+  captured in light/dark Chromium and WebKit. The frozen reference remains at
+  SHA-256 `2465c0ac2bfef90af2b98a537ad5ac3e931b927c23a78379a8c532ce4dcbadf4`;
+  it depicts Runs detail rather than New run, so New run visuals were checked
+  against the accepted hierarchy and interaction criteria. No material gap was
+  found in the inspected captures; physical devices were not tested.
+- Validation: web tests passed 632/632 across 29 files; the production build
+  passed with its existing large-chunk warning; the full server suite passed
+  492/492; the broad WebKit responsive/demo/follow-up/launch/pagination suite
+  passed 77/77. After the final capture-wait refinement, launch-review cases
+  passed 12/12 in Chromium and 12/12 in WebKit, and the history completion
+  pointer case passed 2/2 in each engine. Captures are in
+  `/tmp/aflow-cp3-port-20260924/chromium-final-captures-v3` and
+  `/tmp/aflow-cp3-port-20260924/webkit-final-captures-v3`.
+- The old evidence worktree remains unchanged at `d23cb6f8` with its six-file
+  diff SHA-256 `5c5254e62eebaefa37d091cb1d01dff49133ad86364c32abac9addcb41c3a4b7`.
+  Checkpoint changes are left uncommitted for normal review.
+
 ## 2026-09-24 — Revalidate Teams browser journeys on compact-row candidate (Checkpoint 1)
 
 - Reproduced the stale desktop `Inherited roles` locator on `b81563a`: it

@@ -1062,6 +1062,49 @@ describe('RunDashboard', () => {
     expect(api.startControlPlaneRun).not.toHaveBeenCalled()
   })
 
+  it('focuses the review heading, reports its consequence, and restores the preparation trigger', async () => {
+    const scrollIntoView = vi.fn()
+    const originalScrollIntoView = Object.getOwnPropertyDescriptor(HTMLElement.prototype, 'scrollIntoView')
+    Object.defineProperty(HTMLElement.prototype, 'scrollIntoView', { configurable: true, value: scrollIntoView })
+    try {
+      vi.mocked(api.listControlPlaneRuns).mockResolvedValue({ runs: [], next_cursor: null, schema_version: 1 })
+      renderDashboard()
+
+      await openNewRun()
+      choose('Run plan', 'plans/in-progress/demo.md')
+      choose('Run workflow', 'managed')
+      await screen.findByText('No uncommitted changes detected.')
+
+      const advanced = screen.getByRole('button', { name: 'Advanced options', exact: true })
+      fireEvent.click(advanced)
+      fireEvent.change(screen.getByLabelText('Run start step'), { target: { value: 'implement' } })
+      fireEvent.change(screen.getByLabelText('Run extra instructions'), { target: { value: 'Keep the draft visible.' } })
+      expect(screen.getByText('Changed: Start at: Implement · Extra instructions added')).toBeDefined()
+
+      await waitFor(() => expect((screen.getByRole('button', { name: 'Review start…', exact: true }) as HTMLButtonElement).disabled).toBe(false))
+      const preparationTrigger = screen.getByRole('button', { name: 'Review start…', exact: true })
+      fireEvent.click(preparationTrigger)
+      const review = await screen.findByRole('region', { name: 'Review start', exact: true })
+      const heading = within(review).getByRole('heading', { name: 'Review before starting', exact: true })
+      await waitFor(() => expect(document.activeElement).toBe(heading))
+      expect(heading.getAttribute('tabindex')).toBe('-1')
+      expect(scrollIntoView).toHaveBeenCalledWith(expect.objectContaining({ block: 'start' }))
+      expect(review.textContent).toContain('No run is allocated until you choose Start run.')
+      expect(review.textContent).toContain('Execution mode')
+      expect(review.textContent).toContain('15 · server default')
+      const details = within(review).getByText('Full launch details', { selector: 'summary' }).closest('details')
+      expect(details).not.toBeNull()
+      expect(details?.getAttribute('open')).toBeNull()
+
+      fireEvent.click(within(review).getByRole('button', { name: 'Cancel review', exact: true }))
+      await waitFor(() => expect(document.activeElement).toBe(screen.getByRole('button', { name: 'Review start…', exact: true })))
+      expect(api.startControlPlaneRun).not.toHaveBeenCalled()
+    } finally {
+      if (originalScrollIntoView) Object.defineProperty(HTMLElement.prototype, 'scrollIntoView', originalScrollIntoView)
+      else Reflect.deleteProperty(HTMLElement.prototype, 'scrollIntoView')
+    }
+  })
+
   it('invalidates a launch review when its request identity changes', async () => {
     const alternatePlan = { path: 'plans/in-progress/alternate.md', status: 'in_progress' as const, modified_at: '2024-01-02T00:00:00Z', schema_version: 1 }
     vi.mocked(api.listControlPlanePlans).mockResolvedValue([
@@ -1574,6 +1617,37 @@ describe('RunDashboard', () => {
     ))
   })
 
+  it('keeps dirty preflight counts visible while putting returned paths behind a disclosure', async () => {
+    vi.mocked(api.preflightControlPlaneRun).mockResolvedValue(preflightResult({
+      dirty: true,
+      requires_confirmation: true,
+      total_items: 12,
+      next_offset: 2,
+      items: [
+        { path: 'src/first.ts', index_status: ' ', worktree_status: 'M', original_path: null },
+        { path: 'src/second.ts', index_status: '?', worktree_status: '?', original_path: null },
+      ],
+    }))
+    renderDashboard()
+    await openNewRun()
+    choose('Run plan', 'plans/in-progress/demo.md')
+    choose('Run workflow', 'managed')
+
+    await screen.findByText('12 uncommitted changes detected; 2 returned so far.')
+    const filesSummary = screen.getByText('Show changed files (2 of 12)', { selector: 'summary' })
+    const filesDetails = filesSummary.closest('details')
+    expect(filesDetails).not.toBeNull()
+    expect(filesDetails?.getAttribute('open')).toBeNull()
+    expect(screen.getByText('src/first.ts').closest('details')?.getAttribute('open')).toBeNull()
+    expect(screen.getByRole('checkbox', { name: 'Continue despite uncommitted changes' })).toBeDefined()
+    expect(within(filesDetails as HTMLElement).queryByRole('checkbox')).toBeNull()
+
+    fireEvent.click(filesSummary)
+    expect(screen.getByText('src/first.ts')).toBeDefined()
+    expect(screen.getByText('src/second.ts')).toBeDefined()
+    expect(screen.getByRole('button', { name: 'Show more (10 remaining)' })).toBeDefined()
+  })
+
   it('appends the next preflight page only through Show more', async () => {
     vi.mocked(api.preflightControlPlaneRun)
       .mockResolvedValueOnce(preflightResult({
@@ -1621,8 +1695,8 @@ describe('RunDashboard', () => {
     choose('Run workflow', 'managed')
 
     await screen.findByText('plans/in-progress/demo.md')
-    expect(screen.getByText(/A new worktree starts from the selected commit/)).toBeDefined()
-    expect(screen.getByText(/leaves these changes in the current checkout/)).toBeDefined()
+    expect(screen.getByText(/starts from the selected commit/)).toBeDefined()
+    expect(screen.getByText(/any uncommitted changes stay in the current checkout/)).toBeDefined()
     expect(screen.queryByRole('checkbox', { name: 'Continue despite uncommitted changes' })).toBeNull()
     await waitFor(() => expect(startActionButton().getAttribute('disabled')).toBeNull())
   })
@@ -4709,6 +4783,7 @@ describe('RunDashboard', () => {
     renderDashboard()
     await openNewRun()
     choose('Run plan', 'plans/in-progress/demo.md')
+    openAdvanced()
 
     expect((screen.getByLabelText('Run team') as HTMLInputElement).value).toBe('Product')
     expect((screen.getByLabelText('Run team stage') as HTMLInputElement).value).toBe('Fast')
@@ -4736,6 +4811,7 @@ describe('RunDashboard', () => {
     // Clearing the stage returns both selectors to the resolved child while
     // the request again omits team so the server applies that exact default.
     await openNewRun()
+    if (screen.getByRole('button', { name: 'Advanced options' }).getAttribute('aria-expanded') !== 'true') openAdvanced()
     const stageInput = screen.getByLabelText('Run team stage')
     fireEvent.focus(stageInput)
     fireEvent.change(stageInput, { target: { value: '' } })
@@ -4785,6 +4861,7 @@ describe('RunDashboard', () => {
     renderDashboard()
     await openNewRun()
     choose('Run plan', 'plans/in-progress/demo.md')
+    openAdvanced()
 
     expect((screen.getByLabelText('Run team') as HTMLInputElement).value).toBe('Product')
     expect((screen.getByLabelText('Run team stage') as HTMLInputElement).value).toBe('Fast')
@@ -4839,6 +4916,7 @@ describe('RunDashboard', () => {
     renderDashboard()
     await openNewRun()
     choose('Run plan', 'plans/in-progress/demo.md')
+    openAdvanced()
     choose('Run team stage', 'middle')
 
     const preview = screen.getByLabelText('Effective choices for this launch')

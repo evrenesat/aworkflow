@@ -1169,6 +1169,7 @@ export function RunDashboard({ visible = true, page, onNewRun, onCancelNewRun, o
   const requestedRunRef = useRef<string | null>(requestedRunId)
   const missingRunRef = useRef<string | null>(null)
   const restartFocusPendingRef = useRef(false)
+  const startReviewTriggerRef = useRef<HTMLElement | null>(null)
   const snapshotRequestRef = useRef(0)
   const contextRequestRef = useRef(0)
   const followupRequestRef = useRef(0)
@@ -2793,7 +2794,7 @@ export function RunDashboard({ visible = true, page, onNewRun, onCancelNewRun, o
     setStartRevalidationPending(false)
   }
 
-  function openStartReview() {
+  function openStartReview(trigger?: HTMLElement) {
     // A dirty-worktree startup question is an answer to an already allocated
     // request, not a new launch. Keep that explicit continuation path intact.
     if (startupQuestion?.kind === 'confirm_worktree_dirty') {
@@ -2803,6 +2804,7 @@ export function RunDashboard({ visible = true, page, onNewRun, onCancelNewRun, o
     if (startDisabled || (restartSource !== null && restartPhase !== null)) return
     startReviewGenerationRef.current += 1
     startConfirmationRef.current = null
+    startReviewTriggerRef.current = trigger ?? null
     startReviewIdentityRef.current = currentLaunchIdentity
     setStartRevalidationPending(false)
     setStartReviewIdentity(currentLaunchIdentity)
@@ -2810,7 +2812,17 @@ export function RunDashboard({ visible = true, page, onNewRun, onCancelNewRun, o
 
   function cancelStartReview() {
     if (busyAction === 'start') return
+    const trigger = startReviewTriggerRef.current
     invalidateStartReview()
+    const restoreFocus = () => {
+      if (trigger?.isConnected) {
+        trigger.focus()
+        return
+      }
+      document.querySelector<HTMLElement>('[data-launch-review-trigger="true"]')?.focus()
+    }
+    if (trigger?.isConnected) restoreFocus()
+    else window.setTimeout(restoreFocus, 0)
   }
 
   async function confirmStart() {
@@ -3185,7 +3197,10 @@ export function RunDashboard({ visible = true, page, onNewRun, onCancelNewRun, o
   }
 
   const launchPreview = (
-              <section className="dashboard-section" aria-label="Effective choices for this launch">
+              <section className="dashboard-section launch-preparation-preview" aria-label="Effective choices for this launch">
+                <details className="launch-preparation-details">
+                  <summary>Effective choices and role details</summary>
+                  <div className="launch-preparation-details-body">
                 <div className="section-heading">
                   <h4>Effective choices for this launch</h4>
                   <span className="text-xs text-dim">from your selections and the committed configuration</span>
@@ -3370,6 +3385,8 @@ export function RunDashboard({ visible = true, page, onNewRun, onCancelNewRun, o
                 )}
                   </div>
                 </details>
+                  </div>
+                </details>
               </section>
 
   )
@@ -3385,31 +3402,40 @@ export function RunDashboard({ visible = true, page, onNewRun, onCancelNewRun, o
       dirtyQuestionMessage={dirtyStartupQuestion ? startupQuestion?.message ?? 'The working tree changed while starting. Review it before continuing.' : null}
     />
   )
+  const reviewedPreflight = displayedWorktreePreflight.status === 'ready' ? displayedWorktreePreflight.result : null
+  const reviewedChangeCount = reviewedPreflight ? Math.max(reviewedPreflight.total_items, reviewedPreflight.items.length) : 0
+  const reviewedExecutionMode = reviewedPreflight?.execution_mode === 'new_worktree'
+    ? 'New worktree'
+    : reviewedPreflight?.execution_mode === 'same_checkout'
+      ? 'Existing checkout'
+      : 'Not inspected'
+  const reviewedWorkingTree = reviewedPreflight
+    ? reviewedPreflight.dirty
+      ? reviewedChangeCount > 0
+        ? `${reviewedChangeCount} uncommitted change${reviewedChangeCount === 1 ? '' : 's'}${dirtyWorktreeConfirmed ? ' · acknowledged' : ' · acknowledgement required'}`
+        : `Uncommitted changes detected${dirtyWorktreeConfirmed ? ' · acknowledged' : ' · acknowledgement required'}`
+      : 'Clean checkout'
+    : displayedWorktreePreflight.status === 'error'
+      ? 'Inspection failed — refresh before starting'
+      : 'Inspection in progress'
   const launchReview = (
     <div className="launch-review-summary">
+      <p className="launch-review-consequence">Review the effective choices and working-tree consequence below. No run is allocated until you choose Start run.</p>
       <dl className="run-preview-list">
         <div><dt>Plan</dt><dd className="mono">{startPlanPath.trim() || 'Not chosen'}</dd></div>
         <div><dt>Workflow</dt><dd>{effectiveWorkflow ? formatMachineLabel(effectiveWorkflow) : 'Not resolved'}</dd></div>
         <div><dt>Team</dt><dd>{effectiveTeam ? `${resolvedTeamFamilyLabel ?? formatMachineLabel(effectiveTeam)} · ${effectiveTeamSource}` : effectiveTeamSource}</dd></div>
-        <div><dt>Maximum turns</dt><dd>{effectiveMaxTurns !== null ? `${effectiveMaxTurns} · ${effectiveMaxTurnsSource}` : 'Not resolved'}</dd></div>
+        <div><dt>Turn limit</dt><dd>{effectiveMaxTurns !== null ? `${effectiveMaxTurns} · ${effectiveMaxTurnsSource}` : 'Not resolved'}</dd></div>
         <div><dt>Start step</dt><dd>{startStep.trim() ? formatMachineLabel(startStep.trim()) : 'Workflow beginning'}</dd></div>
       </dl>
       <dl className="launch-review-requirements">
         <div>
           <dt>Working tree</dt>
-          <dd>
-            {displayedWorktreePreflight.status === 'ready' && displayedWorktreePreflight.result
-              ? displayedWorktreePreflight.result.dirty
-                ? `${displayedWorktreePreflight.result.total_items} uncommitted change${displayedWorktreePreflight.result.total_items === 1 ? '' : 's'}${dirtyWorktreeConfirmed ? ' · acknowledged' : ' · acknowledgement required'}`
-                : 'Clean checkout'
-              : displayedWorktreePreflight.status === 'error'
-                ? 'Inspection failed — refresh before starting'
-                : 'Inspection in progress'}
-          </dd>
+          <dd>{reviewedWorkingTree}</dd>
         </div>
         <div>
-          <dt>Checkout</dt>
-          <dd className="mono">{displayedWorktreePreflight.result?.checkout_path ?? 'Not inspected'}</dd>
+          <dt>Execution mode</dt>
+          <dd>{reviewedExecutionMode}</dd>
         </div>
         <div>
           <dt>Start readiness</dt>
@@ -3420,6 +3446,31 @@ export function RunDashboard({ visible = true, page, onNewRun, onCancelNewRun, o
           </dd>
         </div>
       </dl>
+      <details className="launch-review-details">
+        <summary>Full launch details</summary>
+        <dl className="launch-review-details-list">
+          <div>
+            <dt>Checkout</dt>
+            <dd className="mono">{reviewedPreflight?.checkout_path ?? 'Not inspected'}</dd>
+          </div>
+          <div>
+            <dt>Baseline stage</dt>
+            <dd>{startTeamStage.trim() ? teamStageOptionLabel(startTeamStage.trim()) : 'Workflow default'}</dd>
+          </div>
+          <div>
+            <dt>Extra instructions</dt>
+            <dd>{extraInstructions.length > 0 ? `${extraInstructions.length} line${extraInstructions.length === 1 ? '' : 's'}` : 'None'}</dd>
+          </div>
+          <div>
+            <dt>Worker upgrade chain</dt>
+            <dd>{workerUpgradeStages.length > 0 ? workerUpgradeStages.map((stage) => formatMachineLabel(stage.team)).join(' → ') : 'No configured upgrade chain'}</dd>
+          </div>
+          <div>
+            <dt>Reviewer</dt>
+            <dd className="mono">{reviewerResolution.selector ?? 'Not assigned'}</dd>
+          </div>
+        </dl>
+      </details>
     </div>
   )
   const restartSourcePlan = restartSource?.plan_path ?? String(restartSource?.evidence.plan_path ?? '')
@@ -3519,7 +3570,7 @@ export function RunDashboard({ visible = true, page, onNewRun, onCancelNewRun, o
   const hosted = useHeaderSlots(`run-dashboard:${projectId}`, {
     context: <h2 className="header-context-title">{newRunPage ? 'New run' : 'Runs'}</h2>,
     local: newRunPage ? <button className="btn btn-secondary btn-sm" onClick={cancelNewRun}>← Run history</button> : <label className="header-filter-select"><span>Run history</span><select aria-label="Run history" value={historyFilter} onChange={event => setHistoryFilter(event.target.value as typeof historyFilter)}><option value="visible">Visible</option><option value="archived">Archived</option><option value="all">All history</option></select></label>,
-    primary: newRunPage ? <button className="btn btn-primary btn-sm" onClick={() => void (startReviewIdentity ? confirmStart() : openStartReview())} disabled={startReviewIdentity ? startDisabled || !startReviewReady || startRevalidationPendingForRender || Boolean(restartActions) : startDisabled || Boolean(restartActions)}>{busyAction === 'start' ? 'Starting…' : startRevalidationPendingForRender ? 'Checking…' : startReviewIdentity ? 'Start run' : 'Review start…'}</button> : <button className="btn btn-primary btn-sm" onClick={openNewRunPage}>New run</button>,
+    primary: newRunPage ? <button className="btn btn-primary btn-sm" onClick={(event) => void (startReviewIdentity ? confirmStart() : openStartReview(event.currentTarget))} disabled={startReviewIdentity ? startDisabled || !startReviewReady || startRevalidationPendingForRender || Boolean(restartActions) : startDisabled || Boolean(restartActions)}>{busyAction === 'start' ? 'Starting…' : startRevalidationPendingForRender ? 'Checking…' : startReviewIdentity ? 'Start run' : 'Review start…'}</button> : <button className="btn btn-primary btn-sm" onClick={openNewRunPage}>New run</button>,
     more: <MoreMenu label={newRunPage ? 'More new run actions' : 'More run page actions'} triggerLabel="More">
       {newRunPage ? <MenuItem disabled={busyAction === 'start'} onClick={startReviewIdentity ? cancelStartReview : cancelNewRun}>{startReviewIdentity ? 'Cancel review' : 'Cancel'}</MenuItem> : <>
         <MenuItem onClick={() => void handleCopyLink()}>Copy link</MenuItem>

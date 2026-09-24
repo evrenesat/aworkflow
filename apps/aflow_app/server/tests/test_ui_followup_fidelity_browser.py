@@ -12,7 +12,12 @@ import pytest
 from playwright.sync_api import expect, sync_playwright
 
 from aflow.control_plane.units import InMemoryUnitManager, UnitState
-from test_control_plane_api import PROJECT_ID, control_client, live_server  # noqa: F401
+from test_control_plane_api import (
+    PROJECT_ID,
+    _commit_fixture_repository,
+    control_client,
+    live_server,
+)  # noqa: F401
 from test_responsive_browser import (
     _assert_global_run_row,
     _assert_no_horizontal_overflow,
@@ -707,3 +712,185 @@ def test_ui_followup_run_rows(
         encoding="utf-8",
     )
     assert page_errors == [], page_errors
+
+
+@pytest.mark.parametrize(
+    ("width", "height", "theme", "dirty"),
+    (
+        pytest.param(1280, 720, "light", False, id="desktop-light-clean"),
+        pytest.param(1280, 720, "dark", False, id="desktop-dark-clean"),
+        pytest.param(390, 844, "light", False, id="phone-light-clean"),
+        pytest.param(390, 844, "dark", False, id="phone-dark-clean"),
+        pytest.param(844, 390, "light", False, id="landscape-light-clean"),
+        pytest.param(844, 390, "dark", False, id="landscape-dark-clean"),
+        pytest.param(1280, 720, "light", True, id="desktop-light-dirty"),
+        pytest.param(1280, 720, "dark", True, id="desktop-dark-dirty"),
+        pytest.param(390, 844, "light", True, id="phone-light-dirty"),
+        pytest.param(390, 844, "dark", True, id="phone-dark-dirty"),
+        pytest.param(844, 390, "light", True, id="landscape-light-dirty"),
+        pytest.param(844, 390, "dark", True, id="landscape-dark-dirty"),
+    ),
+)
+def test_ui_followup_launch_review(
+    control_client,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    width: int,
+    height: int,
+    theme: str,
+    dirty: bool,
+) -> None:
+    """Keep launch preparation concise while making the final action deliberate."""
+    _, root, units, _ = control_client
+    fixtures = seed_demo_fidelity_fixture(root)
+    running = fixtures["running"]
+    assert isinstance(running, dict)
+    running_plan = Path(running["plan"])
+    _commit_fixture_repository(root)
+    dirty_paths = [f"launch-review-dirty-{index:02}.txt" for index in range(12)]
+    if dirty:
+        for path in dirty_paths:
+            (root / path).write_text(path, encoding="utf-8")
+    assert isinstance(units, InMemoryUnitManager)
+    _prepare_disposable_fidelity_config(root, monkeypatch)
+
+    dist = Path(__file__).resolve().parents[2] / "web" / "dist"
+    if not (dist / "index.html").exists():
+        pytest.fail("The launch-review fidelity test requires the real built web app; run the web build first.")
+    monkeypatch.setenv("AFLOW_APP_WEB_DIST", str(dist))
+
+    artifact_dir = _fidelity_artifact_dir(tmp_path)
+    artifact_dir.mkdir(parents=True, exist_ok=True)
+    stem = f"launch-review-{'dirty' if dirty else 'clean'}-{theme}-{width}x{height}"
+    preparation_path = artifact_dir / f"{stem}-preparation.png"
+    review_path = artifact_dir / f"{stem}-review.png"
+    review_details_path = artifact_dir / f"{stem}-review-details.png"
+    page_errors: list[str] = []
+
+    with live_server() as url, sync_playwright() as playwright:
+        browser = _browser(playwright)
+        page = browser.new_page(viewport={"width": width, "height": height})
+        page.on("pageerror", lambda error: page_errors.append(str(error)))
+        try:
+            page.emulate_media(color_scheme=theme)  # type: ignore[arg-type]
+            _login(page, url)
+            page.goto(f"{url}/?project={PROJECT_ID}&view=runs", wait_until="load")
+            _wait_for_fidelity_readiness(page)
+            # WebKit can finish the authenticated history bootstrap after the
+            # session redirect; only retain runtime errors from the settled
+            # launch-review surface below.
+            page_errors.clear()
+            assert load_reference_manifest()["demo_sha256"] == "2465c0ac2bfef90af2b98a537ad5ac3e931b927c23a78379a8c532ce4dcbadf4"
+            page.get_by_role("button", name="New run", exact=True).click()
+
+            plan_input = page.get_by_label("Run plan", exact=True)
+            plan_input.wait_for()
+            # Wait for the committed launch projection before selecting a
+            # plan, so its first preflight identity is not superseded when
+            # the background configuration read finishes.
+            expect(page.get_by_text("Server default: 15.", exact=True)).to_be_visible(timeout=30_000)
+            plan_input.click()
+            plan_input.fill(running_plan.name)
+            page.get_by_role("option", name=running_plan.name, exact=False).click()
+            expect(plan_input).to_have_value(running_plan.relative_to(root).as_posix())
+
+            workflow = page.get_by_label("Run workflow", exact=True)
+            workflow.click()
+            workflow.fill("managed")
+            workflow.press("ArrowDown")
+            workflow.press("Enter")
+            expect(workflow).to_have_value("Managed")
+
+            visible_dashboard = page.locator('.dashboard-host:not([hidden])').first
+            preflight = visible_dashboard.locator('section[aria-label="Working tree preflight"]')
+            preflight.wait_for(state="visible")
+            expect(preflight).to_have_attribute("data-preflight-status", "ready", timeout=30_000)
+            expect(preflight).to_contain_text(
+                "Execution mode: existing checkout — uses the current checkout; "
+                "acknowledge any uncommitted changes before continuing."
+            )
+            if dirty:
+                expect(preflight.get_by_text("12 uncommitted changes detected.", exact=True)).to_be_visible()
+                changed_files = preflight.locator("details.worktree-changed-files")
+                assert changed_files.get_attribute("open") is None
+                first_path = preflight.get_by_text(dirty_paths[0], exact=True)
+                assert not first_path.is_visible()
+                confirmation = preflight.get_by_role(
+                    "checkbox", name="Continue despite uncommitted changes", exact=True
+                )
+                expect(confirmation).to_be_visible()
+                confirmation.check()
+                changed_files.locator(":scope > summary").click()
+                expect(changed_files).to_have_attribute("open", "")
+                expect(first_path).to_be_visible()
+                expect(changed_files.get_by_text(dirty_paths[-1], exact=True)).to_be_visible()
+                changed_files.locator(":scope > summary").click()
+                assert changed_files.get_attribute("open") is None
+            else:
+                expect(preflight.get_by_text("No uncommitted changes detected.", exact=True)).to_be_visible()
+                expect(preflight.get_by_role("checkbox", name="Continue despite uncommitted changes", exact=True)).to_have_count(0)
+
+            advanced = page.get_by_role("button", name="Advanced options", exact=True)
+            expect(advanced).to_have_attribute("aria-expanded", "false")
+            launch_details = page.locator("details.launch-preparation-details")
+            assert launch_details.get_attribute("open") is None
+            expect(page.get_by_role("button", name="Review start…", exact=True)).to_be_enabled()
+            page.screenshot(path=str(preparation_path), full_page=True)
+
+            review_trigger = page.get_by_role("button", name="Review start…", exact=True)
+            review_trigger.click()
+            review_region = page.get_by_role("region", name="Review start", exact=True)
+            review_region.wait_for(state="visible")
+            heading = review_region.locator("h4.launch-review-heading")
+            expect(heading).to_be_visible()
+            expect(heading).to_have_attribute("tabindex", "-1")
+            assert heading.evaluate("element => document.activeElement === element")
+            page.wait_for_function(
+                "height => { const heading = document.querySelector('.launch-review-heading')?.getBoundingClientRect(); const consequence = document.querySelector('.launch-review-consequence')?.getBoundingClientRect(); if (!heading || !consequence || heading.top < 0 || heading.top > height / 2 || consequence.bottom > height) return false; const previous = window.__aflowLaunchReviewScroll; const stableFrames = previous && Math.abs(previous.top - heading.top) <= 0.5 ? previous.stableFrames + 1 : 0; window.__aflowLaunchReviewScroll = { top: heading.top, stableFrames }; return stableFrames >= 4; }",
+                arg=height,
+            )
+            heading_box = heading.bounding_box()
+            assert heading_box is not None
+            assert 0 <= heading_box["y"] <= height / 2, heading_box
+            expect(review_region.locator(".launch-review-consequence")).to_be_visible()
+            expect(review_region).to_contain_text("No run is allocated until you choose Start run.")
+            expect(review_region).to_contain_text("Execution mode")
+            expect(review_region).to_contain_text("Turn limit")
+            full_details = review_region.locator("details.launch-review-details")
+            assert full_details.get_attribute("open") is None
+            assert units.start_calls == []
+            page.screenshot(path=str(review_path), full_page=False)
+
+            full_details.locator(":scope > summary").click()
+            expect(full_details).to_have_attribute("open", "")
+            assert units.start_calls == []
+            page.screenshot(path=str(review_details_path), full_page=False)
+
+            should_start = not dirty and width == 1280 and height == 720 and theme == "light"
+            if should_start:
+                with page.expect_response(
+                    lambda response: response.request.method == "POST"
+                    and urlsplit(response.url).path == f"/api/control-plane/projects/{PROJECT_ID}/runs"
+                ) as start_response:
+                    page.get_by_role("button", name="Start run", exact=True).click()
+                assert start_response.value.status == 201
+                result = start_response.value.json()["result"]
+                returned_run_id = result["run_id"]
+                page.wait_for_function(
+                    "runId => new URL(location.href).searchParams.get('run') === runId",
+                    arg=returned_run_id,
+                )
+                assert len(units.start_calls) == 1
+                assert units.start_calls[0][0] == f"aflow-run-{returned_run_id}.service"
+            else:
+                review_region.get_by_role("button", name="Cancel review", exact=True).click()
+                expect(page.get_by_role("region", name="Review start", exact=True)).to_have_count(0)
+                page.wait_for_function(
+                    "() => document.activeElement?.textContent?.trim() === 'Review start…'"
+                )
+                assert units.start_calls == []
+        finally:
+            page.close()
+            browser.close()
+
+    assert page_errors == []

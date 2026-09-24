@@ -2458,7 +2458,10 @@ def test_responsive_focus_resize_and_screenshots(control_client, monkeypatch, tm
                 workflow.press("ArrowDown")
                 workflow.press("Enter")
                 visible_dashboard = page.locator('.dashboard-host:not([hidden])').first
-                visible_dashboard.locator(".run-preview-list").wait_for()
+                launch_choices = visible_dashboard.locator("details.launch-preparation-details")
+                launch_choices.wait_for(state="visible")
+                expect(launch_choices).not_to_have_attribute("open", "")
+                expect(launch_choices.locator(":scope > summary")).to_have_text("Effective choices and role details")
                 preflight = visible_dashboard.locator('section[aria-label="Working tree preflight"]')
                 preflight.wait_for(state="visible")
                 preflight.get_by_role("button", name="Refresh worktree inspection", exact=True).wait_for()
@@ -3035,6 +3038,10 @@ def test_responsive_team_family_journey(
             plan.click()
             page.get_by_role("option", name=re.compile(r"ready-launch-plan\.md")).click()
             expect(page.get_by_label("Run team", exact=True)).to_have_value("Product development")
+            advanced = page.get_by_role("button", name="Advanced options", exact=True)
+            expect(advanced).to_have_attribute("aria-expanded", "false")
+            advanced.click()
+            expect(advanced).to_have_attribute("aria-expanded", "true")
             expect(page.get_by_label("Run team stage", exact=True)).to_have_value("Stronger worker")
             run_team = page.get_by_label("Run team", exact=True)
 
