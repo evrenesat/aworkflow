@@ -1659,32 +1659,65 @@ export function RunDashboard({ visible = true, page, onNewRun, onCancelNewRun, o
   }
 
   const pageRefreshRef = useRef<Promise<void> | null>(null)
+  const manualRefreshRef = useRef<Promise<void> | null>(null)
   const refreshEpochRef = useRef(0)
   useEffect(() => {
     refreshEpochRef.current += 1
     pageRefreshRef.current = null
+    manualRefreshRef.current = null
     return () => { requestAbortRef.current.abort(); contextAbortRef.current.abort(); refreshEpochRef.current += 1; snapshotRequestRef.current += 1; contextRequestRef.current += 1 }
   }, [projectId, selectedRunId, visible])
   async function refreshPage({ background = false }: { background?: boolean } = {}) {
     if (!visible || !projectId) return
     if (projectAvailable !== true) { setRefreshNonce(nonce => nonce + 1); return }
-    if (pageRefreshRef.current) return pageRefreshRef.current
     const epoch = refreshEpochRef.current
     const active = () => epoch === refreshEpochRef.current
-    const task = (async () => {
-      if (!background) setRefreshing(true)
-      if (handoffError) setRefreshNonce(nonce => nonce + 1)
-      await loadDashboard(projectId, active, { background })
-      if (!active()) return
-      if (!background) setRefreshing(true)
-      await Promise.all([
-        selectedRunId ? loadSelectedRun(projectId, selectedRunId, active) : Promise.resolve(),
-        loadContext(desiredContextLevelRef.current, selectedRunId, { background }),
-        newRunPage ? refreshPreflight() : Promise.resolve(),
-      ])
-    })().finally(() => { if (active()) { pageRefreshRef.current = null; if (!background) setRefreshing(false) } })
-    pageRefreshRef.current = task
-    return task
+    const startRefresh = (runInBackground: boolean): Promise<void> => {
+      let task: Promise<void>
+      task = (async () => {
+        if (!runInBackground) setRefreshing(true)
+        if (handoffError) setRefreshNonce(nonce => nonce + 1)
+        await loadDashboard(projectId, active, { background: runInBackground })
+        if (!active()) return
+        if (!runInBackground) setRefreshing(true)
+        await Promise.all([
+          selectedRunId ? loadSelectedRun(projectId, selectedRunId, active) : Promise.resolve(),
+          loadContext(desiredContextLevelRef.current, selectedRunId, { background: runInBackground }),
+          newRunPage ? refreshPreflight() : Promise.resolve(),
+        ])
+      })().finally(() => {
+        if (active() && pageRefreshRef.current === task) {
+          pageRefreshRef.current = null
+          if (!runInBackground) setRefreshing(false)
+        }
+      })
+      pageRefreshRef.current = task
+      return task
+    }
+
+    if (!background && manualRefreshRef.current) return manualRefreshRef.current
+    if (pageRefreshRef.current) {
+      if (background) return pageRefreshRef.current
+      const olderRefresh = pageRefreshRef.current
+      let queuedRefresh: Promise<void>
+      queuedRefresh = olderRefresh.catch(() => undefined).then(() => {
+        if (!active() || !visible || !projectId) return
+        return startRefresh(false)
+      }).finally(() => {
+        if (manualRefreshRef.current === queuedRefresh) manualRefreshRef.current = null
+      })
+      manualRefreshRef.current = queuedRefresh
+      return queuedRefresh
+    }
+
+    const task = startRefresh(background)
+    if (background) return task
+    let manualRefresh: Promise<void>
+    manualRefresh = task.finally(() => {
+      if (manualRefreshRef.current === manualRefresh) manualRefreshRef.current = null
+    })
+    manualRefreshRef.current = manualRefresh
+    return manualRefresh
   }
   const refreshPageRef = useRef(refreshPage)
   refreshPageRef.current = refreshPage

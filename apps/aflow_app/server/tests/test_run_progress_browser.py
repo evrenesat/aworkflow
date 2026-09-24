@@ -1493,13 +1493,19 @@ def test_run_progress_transport_and_browser_parity(
             )
 
             _close_issue35_repair_scope(fixture)
-            page.get_by_role("button", name="More", exact=True).click()
+            page.evaluate("document.scrollingElement.scrollTop = 20")
+            scroll_before_refresh = page.evaluate("window.scrollY")
+            assert scroll_before_refresh == 20
+            refresh_trigger = page.get_by_role("button", name="More", exact=True)
+            refresh_trigger.click()
             page.get_by_role("menuitem", name="Refresh", exact=True).click()
             expect(current_work.locator(".run-overview-lead")).to_have_text(
                 "CP5 of 14 · Implement — Stage 5"
             )
             expect(current_work.locator(".run-overview-inline-facts")).to_contain_text("Implement")
             expect(current_work).to_be_visible()
+            expect(refresh_trigger).to_be_focused()
+            assert page.evaluate("window.scrollY") == scroll_before_refresh
             detail_text = page.locator(".run-detail").inner_text()
             assert "? of 0" not in detail_text
             assert "All 0 checkpoints complete" not in detail_text

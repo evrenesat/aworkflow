@@ -3549,3 +3549,33 @@ HISTORY: Published clipboard history `c14f1f2`/`cd78d53` remains separate and mu
 - Checkpoint 1 is ready for normal Sol/Astra review, with its changes uncommitted
   on top of approved HEAD `6d0c273c`. No publish or primary-checkout change was
   made.
+
+## 2026-09-24 — Make manual run Refresh authoritative (Checkpoint 1)
+
+- Read exact-SHA CI run `36024455704`: the only failing test was
+  `test_run_progress_transport_and_browser_parity[mobile-390]` in the macOS
+  Python 3.12 dashboard job. After the disposable fixture closes its repair
+  scope, direct API reads return CP5; the displayed CP4 came from the client
+  returning the already-running `pageRefreshRef` promise to a manual click.
+- Kept passive refreshes coalesced. When an explicit Refresh arrives during a
+  page refresh, it now waits for that pass and starts one fresh page pass. The
+  request uses the existing refresh epoch and selected-run guards; a failed
+  older pass does not prevent the manual pass from running.
+- Added a deferred component regression for CP4 → CP5. It verifies a stale
+  passive snapshot cannot satisfy the click, a later direct read displays CP5,
+  and a failed passive read still permits the explicit refresh to succeed. The
+  selected row, mounted detail, open disclosure and passive-read focus remain
+  stable; request counts stop after the fresh pass.
+- Strengthened the issue35 browser journey to check the More menu restores focus
+  and preserves document scroll while CP5 replaces CP4. Inspected Chromium and
+  WebKit desktop and 390px captures: Current work shows CP5 and detail stays
+  mounted without a blank state.
+- Verification: `RunDashboard.test.tsx` 149 passed; full web suite 630 tests
+  across 29 files; production build passed with its existing chunk-size warning;
+  Chromium parity 2 passed; WebKit parity plus responsive suite 44 passed;
+  full server suite 480 passed; final Chromium and WebKit parity runs with the
+  added scroll/focus assertions passed 2 each. Existing Starlette/httpx and
+  WebSockets deprecation warnings remain.
+- At worker handoff, the checkpoint remained uncommitted for Sol/Astra review.
+  Hosted CI for the resulting SHA and deployment activation remain with the
+  coordinator.

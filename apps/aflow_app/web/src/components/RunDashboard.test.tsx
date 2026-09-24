@@ -3963,6 +3963,100 @@ describe('RunDashboard', () => {
     expect(api.getRunContext).toHaveBeenCalledWith('control-project', 'run-owned', 'lite', false, expect.objectContaining({ signal: expect.any(AbortSignal) }))
   })
 
+  it('runs an explicit Refresh after an in-flight passive selected-run read', async () => {
+    let currentOrdinal = 4
+    const runAt = (ordinal: number) => {
+      const title = `Checkpoint ${ordinal}: Stage ${ordinal}`
+      return {
+        ...ownedRun,
+        evidence: {},
+        plan_path: null,
+        progress: {
+          ...canonicalListProgress(),
+          current_checkpoint_id: `cp-${ordinal}`,
+          current_checkpoint_ordinal: ordinal,
+          current_checkpoint_title: title,
+        },
+      }
+    }
+    const contextAt = (ordinal: number) => {
+      const title = `Checkpoint ${ordinal}: Stage ${ordinal}`
+      return progressContext({
+        ...canonicalDetailProgress(),
+        current_checkpoint_id: `cp-${ordinal}`,
+        current_checkpoint_ordinal: ordinal,
+        current_checkpoint_title: title,
+      })
+    }
+    const currentRun = () => runAt(currentOrdinal)
+    vi.mocked(api.listControlPlaneRuns).mockImplementation(async () => ({
+      runs: [currentRun()], next_cursor: null, schema_version: 1,
+    }))
+    vi.mocked(api.getControlPlaneRun).mockImplementation(async () => currentRun())
+    vi.mocked(api.getRunContext).mockImplementation(async () => contextAt(currentOrdinal))
+
+    const { container } = renderDashboard()
+    await screen.findByLabelText('Run details')
+    await screen.findAllByText(/CP4 of 11/)
+    const definitions = screen.getByText('Count definitions & evidence', { selector: 'summary' })
+    const disclosure = definitions.closest('details')!
+    fireEvent.click(screen.getByRole('button', { name: 'Expand all' }))
+    await waitFor(() => expect(disclosure.hasAttribute('open')).toBe(true))
+
+    const detail = screen.getByLabelText('Run details')
+    const selectedRow = container.querySelector('.run-list-select[aria-current="true"]')!
+    expect(selectedRow.getAttribute('data-sidebar-editor-item')).toBe('run-owned')
+    selectedRow.focus()
+    const callsBeforePassive = vi.mocked(api.getControlPlaneRun).mock.calls.length
+    const passiveSnapshot = deferred<ReturnType<typeof runAt>>()
+    vi.mocked(api.getControlPlaneRun).mockImplementationOnce(() => passiveSnapshot.promise)
+    act(() => window.dispatchEvent(new Event('aflow-history-changed')))
+    await waitFor(() => expect(api.getControlPlaneRun).toHaveBeenCalledTimes(callsBeforePassive + 1))
+    expect(document.activeElement).toBe(selectedRow)
+
+    currentOrdinal = 5
+    fireEvent.click(screen.getByRole('button', { name: 'Refresh', exact: true }))
+    expect(api.getControlPlaneRun).toHaveBeenCalledTimes(callsBeforePassive + 1)
+    expect(screen.getByLabelText('Run details')).toBe(detail)
+    expect(container.querySelector('.run-list-select[aria-current="true"]')).toBe(selectedRow)
+    expect(screen.getByRole('button', { name: 'run-owned', exact: true })).toBeDefined()
+    expect(disclosure.hasAttribute('open')).toBe(true)
+    expect(screen.getAllByText(/CP4 of 11/).length).toBeGreaterThan(0)
+
+    await act(async () => {
+      passiveSnapshot.resolve(runAt(4))
+      await passiveSnapshot.promise
+    })
+    await waitFor(() => expect(api.getControlPlaneRun).toHaveBeenCalledTimes(callsBeforePassive + 2))
+    expect(api.getControlPlaneRun).toHaveBeenLastCalledWith(
+      'control-project', 'run-owned', expect.objectContaining({ signal: expect.any(AbortSignal) }),
+    )
+    expect((await screen.findAllByText(/CP5 of 11/)).length).toBeGreaterThan(0)
+    expect(screen.getByLabelText('Run details')).toBe(detail)
+    expect(screen.getByRole('button', { name: 'run-owned', exact: true })).toBeDefined()
+    expect(disclosure.hasAttribute('open')).toBe(true)
+    expect(container.querySelector('.run-detail')).toBe(detail)
+    expect(container.querySelector('.run-list-select[aria-current="true"]')).toBe(selectedRow)
+    await waitFor(() => expect((screen.getByRole('button', { name: 'Refresh', exact: true }) as HTMLButtonElement).disabled).toBe(false))
+    expect(api.getControlPlaneRun).toHaveBeenCalledTimes(callsBeforePassive + 2)
+
+    const failedPassive = deferred<ReturnType<typeof runAt>>()
+    const callsBeforeFailure = vi.mocked(api.getControlPlaneRun).mock.calls.length
+    vi.mocked(api.getControlPlaneRun).mockImplementationOnce(() => failedPassive.promise)
+    act(() => window.dispatchEvent(new Event('aflow-history-changed')))
+    await waitFor(() => expect(api.getControlPlaneRun).toHaveBeenCalledTimes(callsBeforeFailure + 1))
+    fireEvent.click(screen.getByRole('button', { name: 'Refresh', exact: true }))
+    await act(async () => {
+      failedPassive.reject(new Error('older passive read failed'))
+      await failedPassive.promise.catch(() => undefined)
+    })
+    await waitFor(() => expect(api.getControlPlaneRun).toHaveBeenCalledTimes(callsBeforeFailure + 2))
+    expect((await screen.findAllByText(/CP5 of 11/)).length).toBeGreaterThan(0)
+    expect(screen.queryByText(/older passive read failed/)).toBeNull()
+    await waitFor(() => expect((screen.getByRole('button', { name: 'Refresh', exact: true }) as HTMLButtonElement).disabled).toBe(false))
+    expect(api.getControlPlaneRun).toHaveBeenCalledTimes(callsBeforeFailure + 2)
+  })
+
   it('keeps owner actions ahead of the complete canonical checkpoint evidence', async () => {
     const listed = { ...ownedRun, evidence: {}, plan_path: null, progress: canonicalListProgress() }
     const canonicalDetail = canonicalDetailProgress()
