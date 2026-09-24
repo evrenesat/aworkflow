@@ -795,10 +795,21 @@ def test_ui_followup_launch_review(
             expect(plan_input).to_have_value(running_plan.relative_to(root).as_posix())
 
             workflow = page.get_by_label("Run workflow", exact=True)
-            workflow.click()
-            workflow.fill("managed")
-            workflow.press("ArrowDown")
-            workflow.press("Enter")
+            # A prior implicit-workflow inspection can be ready while the
+            # explicit combobox selection is still settling. Observe the
+            # response for this exact launch choice before checking readiness.
+            with page.expect_response(
+                lambda response: response.request.method == "POST"
+                and response.url.endswith("/runs/preflight")
+                and response.status == 200
+                and response.request.post_data_json.get("plan_path") == running_plan.relative_to(root).as_posix()
+                and response.request.post_data_json.get("workflow_name") == "managed",
+                timeout=30_000,
+            ):
+                workflow.click()
+                workflow.fill("managed")
+                workflow.press("ArrowDown")
+                workflow.press("Enter")
             expect(workflow).to_have_value("Managed")
 
             visible_dashboard = page.locator('.dashboard-host:not([hidden])').first
@@ -825,7 +836,9 @@ def test_ui_followup_launch_review(
                 expect(first_path).to_be_visible()
                 expect(changed_files.get_by_text(dirty_paths[-1], exact=True)).to_be_visible()
                 changed_files.locator(":scope > summary").click()
-                assert changed_files.get_attribute("open") is None
+                expect(changed_files).not_to_have_attribute("open", "")
+                for dirty_path in dirty_paths:
+                    expect(preflight.get_by_text(dirty_path, exact=True)).to_be_hidden()
             else:
                 expect(preflight.get_by_text("No uncommitted changes detected.", exact=True)).to_be_visible()
                 expect(preflight.get_by_role("checkbox", name="Continue despite uncommitted changes", exact=True)).to_have_count(0)

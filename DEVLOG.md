@@ -19,6 +19,12 @@
   Web tests passed 633/633, the production build passed, the launch-review
   browser matrix passed 12/12 in Chromium, and two previously failing cases
   passed in WebKit.
+- CI then showed the browser check could accept an implicit-workflow inspection
+  before the explicit workflow selection settled. The check now waits for the
+  preflight response with the exact plan and workflow. It also waits for the
+  changed-files disclosure to close and verifies every path is hidden. The
+  launch-review matrix passed 12/12 in Chromium, with four selected cases
+  passing in WebKit after these test changes.
 
 ## 2026-09-24 — Native Strands worker adapter
 
