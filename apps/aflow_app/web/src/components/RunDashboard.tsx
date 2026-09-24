@@ -1684,7 +1684,7 @@ export function RunDashboard({ visible = true, page, onNewRun, onCancelNewRun, o
         await Promise.all([
           selectedRunId ? loadSelectedRun(projectId, selectedRunId, active) : Promise.resolve(),
           loadContext(desiredContextLevelRef.current, selectedRunId, { background: runInBackground }),
-          newRunPage ? refreshPreflight() : Promise.resolve(),
+          newRunPage ? refreshPreflight(runInBackground) : Promise.resolve(),
         ])
       })().finally(() => {
         if (active() && pageRefreshRef.current === task) {
@@ -2901,17 +2901,23 @@ export function RunDashboard({ visible = true, page, onNewRun, onCancelNewRun, o
     identity: string,
     offset: number,
     append: boolean,
+    preserveReady = false,
   ): Promise<void> {
     const requestNumber = ++preflightRequestRef.current
     preflightAbortRef.current.abort()
     const controller = new AbortController()
     preflightAbortRef.current = controller
-    setWorktreePreflight((current) => ({
-      status: 'loading',
-      identity,
-      result: append && current.identity === identity ? current.result : null,
-      error: null,
-    }))
+    setWorktreePreflight((current) => preserveReady
+      && current.identity === identity
+      && current.status === 'ready'
+      && current.result !== null
+      ? current
+      : {
+          status: 'loading',
+          identity,
+          result: append && current.identity === identity ? current.result : null,
+          error: null,
+        })
     try {
       const result = await api.preflightControlPlaneRun(projectId, request, { offset, limit: 200, signal: controller.signal })
       if (requestNumber !== preflightRequestRef.current) return
@@ -2931,9 +2937,9 @@ export function RunDashboard({ visible = true, page, onNewRun, onCancelNewRun, o
     }
   }
 
-  async function refreshPreflight(): Promise<void> {
+  async function refreshPreflight(preserveReady = false): Promise<void> {
     if (!preflightEligible || !preflightRequest) return
-    await requestWorktreePreflight(preflightRequest, preflightRequestIdentity, 0, false)
+    await requestWorktreePreflight(preflightRequest, preflightRequestIdentity, 0, false, preserveReady)
   }
 
   async function loadMorePreflight(): Promise<void> {

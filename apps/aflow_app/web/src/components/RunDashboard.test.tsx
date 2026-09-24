@@ -1815,6 +1815,45 @@ describe('RunDashboard', () => {
     ))
   })
 
+  it('keeps a ready inspection visible during an unchanged background refresh', async () => {
+    const refreshedInspection = deferred<WorktreePreflight>()
+    let preflightReads = 0
+    vi.mocked(api.preflightControlPlaneRun).mockImplementation(() => {
+      preflightReads += 1
+      return preflightReads === 1 ? Promise.resolve(preflightResult()) : refreshedInspection.promise
+    })
+    renderDashboard()
+    await openNewRun()
+    choose('Run plan', 'plans/in-progress/demo.md')
+    choose('Run workflow', 'managed')
+
+    const panel = () => screen.getByRole('region', { name: 'Working tree preflight' })
+    await waitFor(() => {
+      expect(preflightReads).toBe(1)
+      expect(panel().getAttribute('data-preflight-status')).toBe('ready')
+      expect(startActionButton().getAttribute('disabled')).toBeNull()
+    })
+    act(() => window.dispatchEvent(new Event('aflow-history-changed')))
+    await waitFor(() => expect(preflightReads).toBe(2))
+    expect(panel().getAttribute('data-preflight-status')).toBe('ready')
+    expect(screen.getByText('No uncommitted changes detected.')).toBeDefined()
+    expect(startActionButton().getAttribute('disabled')).toBeNull()
+
+    await act(async () => {
+      refreshedInspection.resolve(preflightResult({
+        dirty: true,
+        requires_confirmation: true,
+        total_items: 1,
+        items: [{ path: 'new-change.ts', index_status: ' ', worktree_status: 'M', original_path: null }],
+      }))
+      await refreshedInspection.promise
+    })
+    await screen.findByText('new-change.ts')
+    expect(panel().getAttribute('data-preflight-status')).toBe('ready')
+    expect(startActionButton().getAttribute('disabled')).not.toBeNull()
+    expect(api.startControlPlaneRun).not.toHaveBeenCalled()
+  })
+
   it('blocks a prior ready inspection while committed defaults are refreshed', async () => {
     const refreshedInspection = deferred<WorktreePreflight>()
     const changedConfig = { ...committedConfig, revision: 'b'.repeat(64) }

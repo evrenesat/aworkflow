@@ -1,5 +1,17 @@
 # DEVLOG
 
+## 2026-09-24 — Keep New run preflight steady during passive refresh
+
+- A same-selection background refresh now keeps the last ready working-tree
+  inspection visible and Review start available until the new response arrives.
+  Selection or committed-default changes still block on a fresh inspection;
+  explicit Refresh still shows loading. A changed result replaces the old one
+  and applies its confirmation requirement.
+- A held-response component test covers the pending and changed-result states.
+  Web tests passed 633/633, the production build passed, the launch-review
+  browser matrix passed 12/12 in Chromium, and two previously failing cases
+  passed in WebKit.
+
 ## 2026-09-24 — Native Strands worker adapter
 
 - Installed and verified Strands CLI 0.1.2 with a DeepSeek Flash live ACP
