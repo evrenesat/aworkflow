@@ -1,4 +1,4 @@
-import { memo, useCallback, useEffect, useId, useMemo, useRef, useState, type ReactNode } from 'react'
+import { memo, useCallback, useEffect, useId, useLayoutEffect, useMemo, useRef, useState, type ReactNode } from 'react'
 import type {
   ConfigValidationIssue,
   ControlPlaneCapabilities,
@@ -1214,7 +1214,10 @@ export function RunDashboard({ visible = true, page, onNewRun, onCancelNewRun, o
     if (projectAvailable === true && selectedDetailAccepted) setExposedShellProjectId(projectId)
   }, [projectAvailable, projectId, selectedDetailAccepted])
 
-  useEffect(() => {
+  useLayoutEffect(() => {
+    // Clear selection-scoped state before the new run's form can be edited.
+    // A passive effect can erase a fast filename edit after navigation.
+    selectedRunRef.current = selectedRunId
     followupRequestRef.current += 1
     setFollowupDraft(null)
     setFollowupError(null)
@@ -1305,10 +1308,6 @@ export function RunDashboard({ visible = true, page, onNewRun, onCancelNewRun, o
     selectedRun?.ownership === 'control_plane'
     && ['running', 'paused', 'waiting_for_valid_override', 'waiting_for_input'].includes(selectedRun.status),
   )
-
-  useEffect(() => {
-    selectedRunRef.current = selectedRunId
-  }, [selectedRunId])
 
   // The public URL is authoritative for a requested run: every new request
   // selects exactly that run and is validated through the direct

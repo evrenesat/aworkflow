@@ -1,5 +1,13 @@
 # DEVLOG
 
+## 2026-09-24 — Preserve a new follow-up filename after run selection
+
+- Move the follow-up draft reset and selected-run ref update before paint when
+  the selected run changes. CI caught a fast filename edit being erased by the
+  later passive reset, causing the default name to be submitted instead.
+- Web tests passed 633/633, the production build passed, and the failed-run
+  follow-up browser journey passed.
+
 ## 2026-09-24 — Keep New run preflight steady during passive refresh
 
 - A same-selection background refresh now keeps the last ready working-tree
