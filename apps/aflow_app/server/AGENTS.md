@@ -10,7 +10,7 @@
 - Browser sessions (`browser_session.py`) are signed HMAC-SHA256 cookies derived from the current deployment token; they never contain it, expire after 30 days, roll forward only on `X-AFlow-Activity: 1` responses, and require exact same-origin `Origin` for cookie-authenticated unsafe methods. Session endpoints send `Cache-Control: no-store`.
 - Lifecycle endpoints call `ControlPlaneService`, then daemon/application services. They do not start workflow subprocesses, write run state, or invent run identities in the HTTP layer.
 - The versioned project registry is the explicit allowlist beneath one configured managed root. Resolve exact registry records only; reject URL tokens, arbitrary roots, traversal, and unsafe plan paths.
-- `plan_service.py` edits only direct regular Markdown files in the three lifecycle directories. Preserve expected-revision checks and source bytes on rejected writes or moves.
+- `plan_service.py` edits only direct regular Markdown files in the five lifecycle directories (`todo`, `in-progress`, `done`, `failed`, `needs-plan-change`). Preserve expected-revision checks and source bytes on rejected writes or moves. Failed/invalid classification and requeue use the shared lifecycle journal and admission guard; transport resumes recorded eligible lineage through the control plane.
 - `skill_service.py` is a thin facade over the shared `aflow.skill_store` and
   `aflow.skill_installer` services: reads/saves never initialize, refresh, or
   install, and install reuses the default `install-skills --yes` selection

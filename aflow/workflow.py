@@ -90,6 +90,7 @@ from .harnesses.base import (
     adapter_manager_workspace_read,
 )
 from .plan import (
+    GitTrackingMetadataError,
     ParsedPlan,
     PlanParseError,
     PlanSnapshot,
@@ -4533,6 +4534,94 @@ def _done_plan_path(repo_root: Path, plan_path: Path) -> Path | None:
     except ValueError:
         return None
     return plans_root / "done" / relative_plan_path
+
+
+def _classify_failed_original_plan(
+    config: ControllerConfig,
+    error: WorkflowError,
+    admission: object,
+) -> None:
+    """Move only an exact original plan after terminal failure evidence."""
+    from .control_plane import RunRepository
+    from .plan_lifecycle import PlanLifecycle, PlanLifecycleError
+    from .project_admission import ProjectAdmissionConflict
+
+    root = config.repo_root.resolve()
+    source = Path(config.plan_path)
+    if source.parent != root / "plans" / "in-progress" or source.suffix != ".md":
+        return
+    try:
+        data = source.read_bytes()
+    except OSError:
+        return
+    revision = hashlib.sha256(data).hexdigest()
+    lifecycle = PlanLifecycle(root)
+
+    invalid_plan = error.failure_kind == "missing_git_tracking"
+    if not invalid_plan:
+        try:
+            load_plan(source)
+            tracking = parse_git_tracking_metadata(data.decode("utf-8"))
+            if tracking is not None and (
+                tracking.plan_branch is None
+                or tracking.pre_handoff_base_head is None
+            ):
+                invalid_plan = True
+        except (PlanParseError, GitTrackingMetadataError, UnicodeError):
+            invalid_plan = True
+
+    if error.run_dir is None:
+        if invalid_plan:
+            try:
+                with admission.plan_lifecycle_guard(source):
+                    lifecycle.move(
+                        source, "needs_plan_change", expected_revision=revision,
+                        reason_code="invalid_plan", reason="Plan structure requires correction",
+                    )
+            except ProjectAdmissionConflict:
+                return
+        return
+
+    if error.failure_kind in {"environment_preflight", "completion_publication"}:
+        return
+    run_dir = Path(error.run_dir)
+    if run_dir.parent != root / ".aflow" / "runs" or run_dir.is_symlink():
+        return
+    run_id = run_dir.name
+    metadata_path = run_dir / "run.json"
+    if metadata_path.is_symlink() or not metadata_path.is_file():
+        return
+    try:
+        metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+        status = RunRepository(root).get_run_status(run_id, include_progress=False)
+    except (OSError, ValueError):
+        return
+    if (
+        not isinstance(metadata, Mapping)
+        or metadata.get("original_plan_path") != str(source)
+        or status.status not in {"failed", "interrupted"}
+        or not admission.predecessor_inactive_for_preview(run_id)
+    ):
+        return
+    try:
+        with admission.plan_lifecycle_guard(source, source_run_id=run_id):
+            lifecycle.move(
+                source, "needs_plan_change" if invalid_plan else "failed",
+                expected_revision=revision,
+                reason_code="invalid_plan" if invalid_plan else "terminal_execution_failure",
+                reason=(
+                    "Plan structure requires correction" if invalid_plan
+                    else "Confirmed terminal execution failure"
+                ),
+                source_run_id=run_id,
+            )
+    except ProjectAdmissionConflict:
+        return
+    except PlanLifecycleError as exc:
+        raise WorkflowError(
+            "terminal plan classification could not be completed",
+            run_dir=run_dir,
+        ) from exc
 
 
 def _prepare_controller_plan_provenance(
@@ -13951,8 +14040,13 @@ def run_workflow(
     of creating a second one.
     """
     from .project_admission import ProjectAdmission
+    from .plan_lifecycle import PlanLifecycle, PlanLifecycleError
 
     admission = ProjectAdmission(config.repo_root)
+    try:
+        PlanLifecycle(config.repo_root).recover_for_path(config.plan_path)
+    except PlanLifecycleError as exc:
+        raise WorkflowError("plan lifecycle recovery needs attention") from exc
     try:
         return _run_workflow_unchecked(
             config,
@@ -13978,6 +14072,9 @@ def run_workflow(
             _admission=admission,
             _admission_reservation_nonce=admission_reservation_nonce,
         )
+    except WorkflowError as exc:
+        _classify_failed_original_plan(config, exc, admission)
+        raise
     finally:
         # The journal only frees terminal or explicitly inactive claims.  It
         # intentionally leaves an ambiguous launch occupied across crashes or

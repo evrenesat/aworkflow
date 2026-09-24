@@ -14,12 +14,17 @@ import pytest
 from fastapi.testclient import TestClient
 
 from aflow import plan_backups
-from aflow.control_plane import ContextBundle, RunStatus
+from aflow.control_plane import (
+    ContextBundle, LaunchManifest, RunStatus, create_launch_manifest, write_launch_phase,
+)
 from aflow.plan_backups import PROVENANCE_DIRECTORY_NAME, read_backup_provenance
+from aflow.plan_lifecycle import PlanLifecycle, PlanLifecycleError
 from aflow_app_server.config import ServerConfig
+from aflow_app_server.control_plane_service import ControlPlaneService
 from aflow_app_server.main import app
 from aflow_app_server.plan_service import (
     PlanAlreadyExists,
+    PlanInvalid,
     PlanRevisionConflict,
     PlanService,
     PlanServiceError,
@@ -1537,3 +1542,310 @@ def test_authenticated_plan_routes_and_removed_remote_routes(plan_client: TestCl
         "/api/transcribe",
     ):
         assert plan_client.get(removed, headers=headers).status_code == 404
+
+
+def test_invalid_plan_correction_requeues_same_identity_and_revision(plan_fixture) -> None:
+    service, root, _ = plan_fixture
+    invalid = "# Plan\n\n### [x] Checkpoint 1: Work\n- [ ] fix\n"
+    created = service.create("project", "correction.md", invalid)
+    ready = service.promote("project", "todo", created.name, created.revision)
+    original = root / ready.path
+    identity = plan_backups.plan_identity_for_path(root, original)
+    needs = service.classify(
+        "project", ready.name, ready.revision,
+        target="needs_plan_change", reason_code="invalid_plan",
+        reason="Checkpoint state needs correction",
+    )
+    assert needs.status == "needs_plan_change"
+    assert needs.lifecycle is not None
+    assert needs.lifecycle["original_path"] == str(original)
+    assert needs.lifecycle["reason_code"] == "invalid_plan"
+    assert not original.exists()
+    corrected = (
+        "# Plan\n\n## Git Tracking\n\n- Plan Branch: `feature/correction`\n"
+        "- Pre-Handoff Base HEAD: `abc123`\n\n"
+        "### [ ] Checkpoint 1: Work\n- [ ] fix\n"
+    )
+    edited = service.update(
+        "project", "needs_plan_change", needs.name, corrected, needs.revision
+    )
+    with pytest.raises(PlanRevisionConflict):
+        service.requeue("project", "needs_plan_change", needs.name, needs.revision)
+    requeued = service.requeue(
+        "project", "needs_plan_change", needs.name, edited.revision
+    )
+    assert requeued.path == "plans/in-progress/correction.md"
+    assert (root / requeued.path).read_text(encoding="utf-8") == corrected
+    assert plan_backups.plan_identity_for_path(root, root / requeued.path) == identity
+    assert service.requeue(
+        "project", "needs_plan_change", needs.name, edited.revision
+    ).path == requeued.path
+
+
+def test_requeue_rejects_owner_stopped_source(plan_fixture) -> None:
+    service, root, _ = plan_fixture
+    corrected = (
+        "# Plan\n\n## Git Tracking\n\n- Plan Branch: `feature/test`\n"
+        "- Pre-Handoff Base HEAD: `abc123`\n\n"
+        "### [ ] Checkpoint 1: Work\n- [ ] fix\n"
+    )
+    created = service.create("project", "stopped.md", corrected)
+    ready = service.promote("project", "todo", created.name, created.revision)
+    original = root / ready.path
+    failed = PlanLifecycle(root).move(
+        original, "failed", expected_revision=ready.revision,
+        reason_code="terminal_execution_failure", reason="Failed",
+        source_run_id="stopped-run",
+    )
+    with pytest.raises(PlanInvalid, match="not eligible"):
+        service.requeue(
+            "project", "failed", ready.name, ready.revision,
+            run_status_reader=lambda *_: RunStatus(run_id="stopped-run", status="owner_stopped"),
+        )
+    assert failed.read_text(encoding="utf-8") == corrected
+
+
+def test_requeue_route_requires_auth_and_returns_corrected_plan(
+    plan_client: TestClient, plan_fixture,
+) -> None:
+    from aflow_app_server import main
+
+    service, _, _ = plan_fixture
+    created = service.create("project", "route-requeue.md", "# invalid\n")
+    ready = service.promote("project", "todo", created.name, created.revision)
+    needs = service.classify(
+        "project", ready.name, ready.revision,
+        target="needs_plan_change", reason_code="invalid_plan", reason="Invalid",
+    )
+    corrected = (
+        "# Plan\n\n## Git Tracking\n\n- Plan Branch: `feature/test`\n"
+        "- Pre-Handoff Base HEAD: `abc123`\n\n"
+        "### [ ] Checkpoint 1: Work\n- [ ] fix\n"
+    )
+    edited = service.update(
+        "project", "needs_plan_change", needs.name, corrected, needs.revision
+    )
+    path = "/api/projects/project/plans/needs_plan_change/route-requeue.md/requeue"
+    payload = {"expected_revision": edited.revision}
+    assert plan_client.post(path, json=payload).status_code == 401
+    main._control_plane_service = SimpleNamespace(run_status=lambda *_args: None)
+    try:
+        response = plan_client.post(
+            path, headers={"Authorization": f"Bearer {TOKEN}"}, json=payload
+        )
+    finally:
+        main._control_plane_service = None
+    assert response.status_code == 200
+    assert response.json()["plan"]["path"] == "plans/in-progress/route-requeue.md"
+
+
+def _managed_failed_requeue_fixture(
+    service: PlanService, root: Path, *, project_id: str, name: str,
+    run_id: str = "20260924t230000z-abcdef12",
+) -> tuple[Path, str, str]:
+    content = (
+        "# Plan\n\n## Git Tracking\n\n- Plan Branch: `feature/requeue`\n"
+        "- Pre-Handoff Base HEAD: `abc123`\n\n"
+        "### [ ] Checkpoint 1: Work\n- [ ] fix\n"
+    )
+    created = service.create(project_id, name, content)
+    ready = service.promote(project_id, "todo", name, created.revision)
+    original = root / ready.path
+    create_launch_manifest(
+        root,
+        LaunchManifest(
+            run_id=run_id, project_root=str(root.resolve()),
+            plan_path=str(original), workflow_name="managed", max_turns=2,
+            idempotency_key="source", caller_scope=f"bearer:{project_id}",
+        ),
+    )
+    write_launch_phase(root, run_id, "completed")
+    run_dir = root / ".aflow" / "runs" / run_id
+    run_dir.mkdir(parents=True, exist_ok=True)
+    (run_dir / "run.json").write_text(
+        json.dumps({
+            "schema_version": 2, "status": "failed",
+            "original_plan_path": str(original),
+        }) + "\n", encoding="utf-8",
+    )
+    PlanLifecycle(root).move(
+        original, "failed", expected_revision=ready.revision,
+        reason_code="terminal_execution_failure", reason="Failed",
+        source_run_id=run_id,
+    )
+    return root / "plans" / "failed" / name, ready.revision, run_id
+
+
+def _scope_checked_requeue_control_plane(project_id, run_status, daemon_resume):
+    """Keep the real transport check while replacing only daemon execution."""
+    control_plane = ControlPlaneService(())
+    control_plane.run_status = run_status
+
+    def project(requested_project_id):
+        assert requested_project_id == project_id
+        return SimpleNamespace(daemon=SimpleNamespace(
+            service=SimpleNamespace(resume=daemon_resume),
+        ))
+
+    control_plane._project = project
+    return control_plane
+
+
+def test_default_http_requeue_resumes_recorded_run_and_replays(
+    plan_client: TestClient, plan_fixture,
+) -> None:
+    from aflow_app_server import main
+
+    service, root, _ = plan_fixture
+    failed, revision, run_id = _managed_failed_requeue_fixture(
+        service, root, project_id="project", name="managed-requeue.md",
+    )
+    calls: list[tuple[str, str, str]] = []
+    source_status = ["failed"]
+
+    def daemon_resume(source: str, **kwargs):
+        calls.append((kwargs["caller_scope"], source, kwargs["idempotency_key"]))
+        return SimpleNamespace(to_dict=lambda: {"run_id": "successor-run"})
+
+    main._control_plane_service = _scope_checked_requeue_control_plane(
+        "project",
+        lambda *_: RunStatus(run_id=run_id, status=source_status[0]),
+        daemon_resume,
+    )
+    path = "/api/projects/project/plans/failed/managed-requeue.md/requeue"
+    payload = {"expected_revision": revision}
+    try:
+        first = plan_client.post(path, headers={"Authorization": f"Bearer {TOKEN}"}, json=payload)
+        replay = plan_client.post(path, headers={"Authorization": f"Bearer {TOKEN}"}, json=payload)
+        source_status[0] = "owner_stopped"
+        stopped = plan_client.post(path, headers={"Authorization": f"Bearer {TOKEN}"}, json=payload)
+    finally:
+        main._control_plane_service = None
+    assert first.status_code == replay.status_code == 200
+    assert stopped.status_code == 422
+    assert first.json() == replay.json()
+    assert first.json()["run"] == {"run_id": "successor-run"}
+    assert len(calls) == 2
+    assert calls[0] == calls[1]
+    assert calls[0][:2] == ("bearer:project", run_id)
+    assert calls[0][2].startswith("plan-requeue-")
+    assert not failed.exists()
+    assert (root / "plans" / "in-progress" / "managed-requeue.md").is_file()
+
+
+def test_http_requeue_rejects_mismatched_source_and_reports_resume_conflict(
+    plan_client: TestClient, plan_fixture,
+) -> None:
+    from aflow.daemon import DaemonError
+    from aflow_app_server import main
+
+    service, root, _ = plan_fixture
+    failed, revision, run_id = _managed_failed_requeue_fixture(
+        service, root, project_id="project", name="conflict-requeue.md",
+    )
+    main._control_plane_service = SimpleNamespace(
+        run_status=lambda *_: RunStatus(run_id=run_id, status="failed"),
+        resume=lambda *_args, **_kwargs: (_ for _ in ()).throw(DaemonError("unavailable")),
+    )
+    path = "/api/projects/project/plans/failed/conflict-requeue.md/requeue"
+    headers = {"Authorization": f"Bearer {TOKEN}"}
+    try:
+        mismatched = plan_client.post(
+            path, headers=headers,
+            json={"expected_revision": revision, "source_run_id": "other-run"},
+        )
+        assert mismatched.status_code == 422
+        assert failed.is_file()
+        rejected = plan_client.post(path, headers=headers, json={"expected_revision": revision})
+        replay = plan_client.post(path, headers=headers, json={"expected_revision": revision})
+    finally:
+        main._control_plane_service = None
+    assert rejected.status_code == replay.status_code == 409
+    assert rejected.json()["detail"]["code"] == "plan_requeue_resume_conflict"
+    assert rejected.json()["detail"]["plan_path"] == "plans/in-progress/conflict-requeue.md"
+    assert not failed.exists()
+
+
+@pytest.mark.parametrize("crash_phase", ["prepared", "linked", "post_unlink"])
+def test_plan_service_recovers_interrupted_move_before_read_edit_and_requeue(
+    plan_fixture, monkeypatch: pytest.MonkeyPatch, crash_phase: str,
+) -> None:
+    import aflow.plan_lifecycle as lifecycle_module
+
+    service, root, _ = plan_fixture
+    content = (
+        "# Plan\n\n## Git Tracking\n\n- Plan Branch: `feature/recover`\n"
+        "- Pre-Handoff Base HEAD: `abc123`\n\n"
+        "### [ ] Checkpoint 1: Work\n- [ ] fix\n"
+    )
+    created = service.create("project", f"recover-{crash_phase}.md", content)
+    ready = service.promote("project", "todo", created.name, created.revision)
+    source = root / ready.path
+    identity = plan_backups.plan_identity_for_path(root, source)
+    assert identity is not None
+    lifecycle = PlanLifecycle(root)
+    destination = lifecycle.path("needs_plan_change", source.name, create=True)
+    if crash_phase == "prepared":
+        monkeypatch.setattr(
+            lifecycle, "_complete",
+            lambda *_: (_ for _ in ()).throw(RuntimeError("prepared crash")),
+        )
+    elif crash_phase == "linked":
+        original_fsync = lifecycle_module._fsync_dir
+
+        def fail_linked(path: Path) -> None:
+            if path == destination.parent:
+                raise RuntimeError("linked crash")
+            original_fsync(path)
+
+        monkeypatch.setattr(lifecycle_module, "_fsync_dir", fail_linked)
+    else:
+        monkeypatch.setattr(
+            lifecycle_module, "record_plan_lifecycle_move",
+            lambda *_args, **_kwargs: (_ for _ in ()).throw(OSError("post unlink crash")),
+        )
+    with pytest.raises((RuntimeError, PlanLifecycleError), match="crash|incomplete"):
+        lifecycle.move(
+            source, "needs_plan_change", expected_revision=ready.revision,
+            reason_code="invalid_plan", reason="Needs correction",
+        )
+    monkeypatch.undo()
+    recovered = service.read("project", "needs_plan_change", source.name)
+    assert recovered.content == content
+    assert destination.read_text(encoding="utf-8") == content
+    assert not source.exists()
+    assert plan_backups.plan_identity_for_path(root, destination) == identity
+    edited = service.update(
+        "project", "needs_plan_change", source.name, content + "\n", recovered.revision,
+    )
+    requeued = service.requeue(
+        "project", "needs_plan_change", source.name, edited.revision,
+    )
+    assert requeued.content == content + "\n"
+    assert plan_backups.plan_identity_for_path(root, root / requeued.path) == identity
+
+
+def test_plan_service_recovery_leaves_colliding_plan_untouched(
+    plan_fixture, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    service, root, _ = plan_fixture
+    created = service.create("project", "recovery-collision.md", "# Plan\n")
+    ready = service.promote("project", "todo", created.name, created.revision)
+    source = root / ready.path
+    lifecycle = PlanLifecycle(root)
+    monkeypatch.setattr(
+        lifecycle, "_complete",
+        lambda *_: (_ for _ in ()).throw(RuntimeError("prepared crash")),
+    )
+    with pytest.raises(RuntimeError, match="prepared crash"):
+        lifecycle.move(
+            source, "needs_plan_change", expected_revision=ready.revision,
+            reason_code="invalid_plan", reason="Needs correction",
+        )
+    os.link(source, root / "retained-source-inode")
+    source.unlink()
+    collision = lifecycle.path("needs_plan_change", source.name, create=True)
+    collision.write_bytes(b"# Plan\n")
+    with pytest.raises(PlanServiceError, match="recovery needs attention"):
+        service.read("project", "needs_plan_change", source.name)
+    assert collision.read_bytes() == b"# Plan\n"

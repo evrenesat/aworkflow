@@ -102,6 +102,7 @@ from .plan_service import (
     PlanAlreadyExists,
     PlanProjectNotFound,
     PlanRevisionConflict,
+    PlanRequeueResumeConflict,
     PlanService,
     PlanServiceError,
 )
@@ -869,6 +870,16 @@ async def plan_revision_conflict_handler(
 @app.exception_handler(PlanAlreadyExists)
 async def plan_already_exists_handler(_: Request, __: PlanAlreadyExists) -> JSONResponse:
     return _error_response(status.HTTP_409_CONFLICT, "plan_exists")
+
+
+@app.exception_handler(PlanRequeueResumeConflict)
+async def plan_requeue_resume_conflict_handler(
+    _: Request, exc: PlanRequeueResumeConflict,
+) -> JSONResponse:
+    return _error_response(
+        status.HTTP_409_CONFLICT, "plan_requeue_resume_conflict",
+        plan_path=exc.plan_path,
+    )
 
 
 @app.exception_handler(GuidedConfigError)

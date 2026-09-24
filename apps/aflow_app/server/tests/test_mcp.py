@@ -36,6 +36,10 @@ from test_control_plane_api import (
     _start_pending as _rest_start_pending,
     control_client as _control_client_fixture,  # noqa: F401
 )
+from test_plan_store import (
+    _managed_failed_requeue_fixture,
+    _scope_checked_requeue_control_plane,
+)
 
 MCP_PROTOCOL_VERSION = "2025-11-25"
 MCP_HEADERS = {
@@ -66,6 +70,7 @@ AUTHORING_TOOL_NAMES = {
     "create_plan_from_run",
     "update_plan",
     "promote_plan",
+    "requeue_plan",
     "list_plan_documents",
     "get_global_config",
     "patch_global_config",
@@ -105,7 +110,7 @@ def test_shared_and_fastapi_mcp_registries_have_identical_public_contract() -> N
     web_tool_by_name = {tool.name: tool.to_mcp_tool() for tool in web_tools}
     assert web_tool_by_name["read_plan"].annotations.readOnlyHint is True
     assert web_tool_by_name["list_plan_documents"].annotations.idempotentHint is True
-    for name in ("create_plan", "create_plan_from_run", "update_plan", "promote_plan"):
+    for name in ("create_plan", "create_plan_from_run", "update_plan", "promote_plan", "requeue_plan"):
         assert web_tool_by_name[name].annotations.readOnlyHint is False
         assert web_tool_by_name[name].annotations.idempotentHint is False
     shared_resources = asyncio.run(shared.list_resource_templates())
@@ -1312,6 +1317,51 @@ def test_mcp_two_projects_keep_identical_plan_names_and_run_histories(
         assert detail["plan_path"].endswith(f"/{plan_name}")
 
 
+def test_mcp_default_requeue_resumes_recorded_source_on_replay(mcp_client) -> None:
+    from aflow.daemon import DaemonError
+    from aflow_app_server import main
+
+    client, root, _, _ = mcp_client
+    service = main._plan_service
+    assert service is not None
+    _, revision, run_id = _managed_failed_requeue_fixture(
+        service, root, project_id=PROJECT_ID, name="mcp-managed-requeue.md",
+    )
+    calls: list[tuple[str, str, str]] = []
+    reject_resume = [False]
+
+    def daemon_resume(source: str, **kwargs):
+        calls.append((kwargs["caller_scope"], source, kwargs["idempotency_key"]))
+        if reject_resume[0]:
+            raise DaemonError("admission rejected")
+        return SimpleNamespace(to_dict=lambda: {"run_id": "successor-run"})
+
+    original_control_plane = main._control_plane_service
+    main._control_plane_service = _scope_checked_requeue_control_plane(
+        PROJECT_ID,
+        lambda *_: RunStatus(run_id=run_id, status="failed"),
+        daemon_resume,
+    )
+    arguments = {
+        "project_id": PROJECT_ID, "plan_status": "failed",
+        "name": "mcp-managed-requeue.md", "expected_revision": revision,
+    }
+    try:
+        first = _mcp_tool(client, "requeue_plan", arguments)
+        replay = _mcp_tool(client, "requeue_plan", arguments)
+        reject_resume[0] = True
+        conflict = _mcp_tool_error(client, "requeue_plan", arguments)
+    finally:
+        main._control_plane_service = original_control_plane
+    assert first == replay
+    assert first["run"] == {"run_id": "successor-run"}
+    assert conflict == "plan_requeue_resume_conflict"
+    assert len(calls) == 3
+    assert calls[0] == calls[1]
+    assert calls[1] == calls[2]
+    assert calls[0][:2] == (f"bearer:{PROJECT_ID}", run_id)
+
+
 def test_mcp_plan_authoring_matches_rest_and_preserves_stale_bytes(mcp_client) -> None:
     client, root, _, _ = mcp_client
     headers = {"Authorization": f"Bearer {TOKEN}"}
@@ -1757,7 +1807,7 @@ def test_mcp_startup_control_and_resume_are_idempotent_and_match_rest(mcp_client
 
     units.stop(f"aflow-run-{run_id}.service")
     (root / ".aflow" / "runs" / run_id / "run.json").write_text(
-        '{"status":"running","workflow_name":"managed","team":null,'
+        '{"status":"failed","workflow_name":"managed","team":null,'
         '"selected_start_step":"implement","max_turns":3,"extra_instructions":[]}'
     )
     monkeypatch.setattr(
@@ -1852,7 +1902,7 @@ def test_mcp_resume_persists_reviewer_start_step_and_replays_once(mcp_client) ->
     units.stop(f"aflow-run-{run_id}.service")
     source_path = root / ".aflow" / "runs" / run_id / "run.json"
     source_path.write_text(
-        '{"status":"running","workflow_name":"managed","team":null,'
+        '{"status":"failed","workflow_name":"managed","team":null,'
         '"selected_start_step":"implement","max_turns":3,'
         '"extra_instructions":[]}'
     )
@@ -1963,7 +2013,7 @@ def test_mcp_resume_extra_instructions_inherit_replace_and_clear(
     units.stop(f"aflow-run-{run_id}.service")
     source_path = root / ".aflow" / "runs" / run_id / "run.json"
     source_path.write_text(
-        '{"status":"running","workflow_name":"managed","team":null,'
+        '{"status":"failed","workflow_name":"managed","team":null,'
         '"selected_start_step":"implement","max_turns":3,'
         '"extra_instructions":["saved guidance"]}'
     )

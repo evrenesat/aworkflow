@@ -1360,13 +1360,27 @@ its registered parent.
 
 `plan_service.py` resolves each project through that registry and addresses
 only direct regular UTF-8 Markdown files under `plans/todo`,
-`plans/in-progress`, and `plans/done`. It returns SHA-256 revisions, requires an
+`plans/in-progress`, `plans/done`, `plans/failed`, and `plans/needs-plan-change`. It returns SHA-256 revisions, requires an
 expected revision for edits and moves, writes through fsynced temporary files,
 and permits only `todo -> in_progress -> done` promotion. Rejected validation,
 stale edits, and occupied destinations leave the original bytes in place.
 `plan_routes.py` provides the authenticated project-scoped REST adapter. The web
 client uses this same contract for plan creation, editing, promotion, and run
 dashboard launch.
+
+Terminal execution failures and invalid plan content use `plan_lifecycle.py`
+to move the original plan into distinct correction states. A per-identity
+journal records the source revision, file identity, reason, source run, and
+original/current paths before a no-clobber move; replay completes interrupted
+moves. Plan service access and direct controller entry recover prepared moves
+before using affected paths. Admission guards classification and explicit
+requeue against unresolved run claims. Requeue validates the edited revision,
+returns its checked source run with a stable resume replay key, and resumes a
+recorded recoverable run through control-plane admission. Successful delivery retains
+its receipt-backed done transition; a failed receipt retains its run claim and
+gates unrelated later publication until a descendant in the recorded run
+lineage has a valid published receipt for the same configured target. Historical
+failed receipts remain intact.
 
 `project_config_service.py` owns exactly `.aflow/config/aflow.toml` and
 `.aflow/config/workflows.toml` as one validated revisioned pair. Configuration

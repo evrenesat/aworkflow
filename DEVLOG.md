@@ -1,5 +1,38 @@
 # DEVLOG
 
+## 2026-09-24 — Resume requeued plans through the supported control-plane transport
+
+- Requeue now uses the control-plane REST default, which maps both HTTP and MCP
+  requests to the same project bearer scope before daemon resume.
+
+## 2026-09-24 — Release repaired publication lineage gates
+
+- Publication keeps historical failed receipts and blocks unrelated delivery
+  until a descendant in the recorded resume lineage has a valid published
+  receipt for the same configured target. Pending, failed, malformed, and
+  unrelated receipts do not release the gate.
+
+## 2026-09-24 — Repair managed requeue and lifecycle crash access
+
+- HTTP and MCP requeue now carry the checked journal source through the plan
+  service, using a stable request key for retries and reporting rejected resume
+  admission while retaining the corrected plan for retry.
+- Normal plan access and direct controller entry recover prepared lifecycle
+  moves before reading affected paths. Recovery keeps exact byte, inode, and
+  identity checks and leaves colliding files untouched.
+
+## 2026-09-24 — Classify failed plans and requeue corrected originals (Checkpoint 3)
+
+- Added a journaled, revision-checked lifecycle move for original plans. It
+  preserves stable identity and run provenance, rejects destination collisions,
+  and recovers interrupted moves without accepting replacement files.
+- Invalid content enters `needs-plan-change`; confirmed inactive terminal
+  execution failures enter `failed`. Failed publication retains its claim and
+  gates unrelated publication until the owning lineage repairs its receipt.
+  Authenticated REST and MCP requeue validate corrected content and resume a
+  recorded eligible run through shared admission. Owner-stopped runs remain
+  ineligible.
+
 ## 2026-09-24 — Check direct resume ownership at admission (Checkpoint 2 repair)
 
 - A validated CLI resume marker retains its source and plan provenance role,

@@ -749,7 +749,7 @@ class ProjectAdmission:
         self,
         plan_key: str,
         source_run_id: str | None,
-        requested_run_id: str,
+        requested_run_id: str | None,
         reservations: Mapping[str, AdmissionReservation],
         *,
         direct_resume_proven: bool = False,
@@ -757,6 +757,8 @@ class ProjectAdmission:
         """Admit at most one unresolved owner of a project-relative plan."""
         evidence = self._all_run_evidence()
         artifact_claims: list[tuple[str, str]] = []
+        publication_claims: set[str] = set()
+        lineage_parents: dict[str, str] = {}
         project_roots = self._repository_roots()
         try:
             for root in project_roots:
@@ -783,6 +785,17 @@ class ProjectAdmission:
                         root, root / ".aflow" / "runs" / run_id / "run.json"
                     )
                     metadata = _read_json_file(metadata_path) if metadata_path else None
+                    if isinstance(metadata, Mapping) and isinstance(
+                        metadata.get("resumed_from_run_id"), str
+                    ):
+                        lineage_parents[run_id] = _validate_source_provenance_id(
+                            metadata["resumed_from_run_id"]
+                        )
+                    if isinstance(metadata, Mapping) and (
+                        metadata.get("failure_kind") == "completion_publication"
+                        and metadata.get("status") != "completed"
+                    ):
+                        publication_claims.add(run_id)
                     request = startup.get("request")
                     prepared = startup.get("prepared")
                     raw_plan = manifest.plan_path if manifest is not None else None
@@ -802,7 +815,14 @@ class ProjectAdmission:
                 "plan ownership evidence is unavailable"
             ) from exc
 
+        lineage_ancestors: set[str] = set()
         if direct_resume_proven and source_run_id is not None:
+            predecessor = source_run_id
+            while predecessor not in lineage_ancestors:
+                lineage_ancestors.add(predecessor)
+                predecessor = lineage_parents.get(predecessor)
+                if predecessor is None:
+                    break
             source_keys = {
                 key for run_id, key in artifact_claims if run_id == source_run_id
             }
@@ -835,7 +855,14 @@ class ProjectAdmission:
                 continue
             observed = evidence.get(run_id, _RunEvidence("uncertain"))
             if (
-                observed.state != "inactive"
+                run_id in lineage_ancestors
+                and run_id in publication_claims
+                and observed.state == "inactive"
+            ):
+                continue
+            if (
+                run_id in publication_claims
+                or observed.state != "inactive"
                 or observed.claim_retained
             ):
                 raise ProjectPlanClaimConflict(
@@ -867,6 +894,33 @@ class ProjectAdmission:
         except ProjectAdmissionConflict:
             return False
         return True
+
+    @contextmanager
+    def plan_lifecycle_guard(
+        self, plan_path: Path, *, source_run_id: str | None = None,
+        require_file: bool = True,
+    ) -> Iterator[None]:
+        """Hold admission while classifying an unclaimed original plan.
+
+        A terminal source can retain historical plan artifacts, but it must
+        first be confirmed inactive. Other live or uncertain owners prevent a
+        lifecycle move until their ownership is resolved.
+        """
+        source = (
+            _validate_source_provenance_id(source_run_id)
+            if source_run_id is not None else None
+        )
+        plan_key = self._plan_key(
+            plan_path, root=self._checkout_root, require_file=require_file
+        )
+        with self._locked():
+            reservations = self._reconcile_locked(self._load_locked())
+            self._require_inactive_predecessor_locked(source)
+            self._require_unique_plan_claim_locked(
+                plan_key, source, None, reservations,
+                direct_resume_proven=source is not None,
+            )
+            yield
 
     def _authoritative_inactive_predecessor_locked(self, source_run_id: str) -> bool:
         """Accept only current, identity-matched inactivity evidence.

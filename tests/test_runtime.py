@@ -12,6 +12,7 @@ from aflow.config import ErrorHandlingConfig, HarnessErrorRecoveryConfig, Harnes
 from aflow.control_plane import LaunchManifest, create_launch_manifest, write_launch_phase
 from aflow.hotplug import HotplugTransactionV1, hotplug_transaction_id
 from aflow.plan_backups import read_backup_provenance
+from aflow.plan_lifecycle import PlanLifecycle
 from aflow.project_admission import ProjectAdmission, ProjectAdmissionConflict
 from aflow.process_identity import process_birth_identity
 from aflow.repartition import create_envelope
@@ -70,6 +71,17 @@ def _record_inactive_direct_source(run_dir: Path) -> None:
     )
     metadata["status"] = "interrupted"
     metadata_path.write_text(json.dumps(metadata) + "\n", encoding="utf-8")
+
+
+def _requeue_failed_plan_for_test(root: Path, name: str) -> None:
+    """Make a retry explicit after the terminal failure move."""
+    failed = root / "plans" / "failed" / name
+    assert failed.is_file()
+    PlanLifecycle(root).move(
+        failed, "in_progress",
+        expected_revision=hashlib.sha256(failed.read_bytes()).hexdigest(),
+        reason_code="explicit_requeue", reason="Test correction and retry",
+    )
 
 
 @pytest.mark.parametrize("source_state", ("active", "uncertain", "inactive"))
@@ -8874,6 +8886,8 @@ class WorkflowLifecycleRuntimeTests(unittest.TestCase):
         )
         steps = workflow_config.workflows["wt_wf"].steps
 
+        _requeue_failed_plan_for_test(root, "continuation.md")
+
         def failing_runner(argv, **kwargs):
             return subprocess.CompletedProcess(
                 argv, 1, "", "planned continuation failure"
@@ -8921,6 +8935,8 @@ class WorkflowLifecycleRuntimeTests(unittest.TestCase):
         assert payload_b["continuation_from_head"] == accepted_head
         assert payload_b["continuation_mode"] == "current_branch"
         assert payload_b["frozen_config"]["continuation_from_head"] == accepted_head
+
+        _requeue_failed_plan_for_test(root, "continuation.md")
 
         resume_b, plan_path_b = self._continuation_resume_context_from_run(
             root, run_b_dir, steps
@@ -9752,8 +9768,10 @@ class WorkflowLifecycleRuntimeTests(unittest.TestCase):
                     adapter=CodexAdapter(), runner=runner,
                 )
 
-            # Plan edits were synced back to primary for restart correctness.
-            assert _COMPLETE_PLAN in plan_path.read_text(encoding='utf-8')
+            # The synced original is retained under failed for explicit requeue.
+            failed_plan = repo_root / 'plans' / 'failed' / plan_path.name
+            assert _COMPLETE_PLAN in failed_plan.read_text(encoding='utf-8')
+            assert not plan_path.exists()
 
     def test_worktree_sync_creates_parent_directories_in_worktree(self) -> None:
         """Verify sync-to-worktree creates parent directories if they don't exist."""

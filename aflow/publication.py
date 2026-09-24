@@ -79,6 +79,103 @@ def _write_atomic_receipt(path: Path, receipt: dict[str, object]) -> None:
             pass
 
 
+_RUN_ID_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]{0,63}")
+
+
+def _publication_parent(runs_dir: Path, run_id: str) -> str | None:
+    """Read only a contained, bounded lineage parent from controller metadata."""
+    directory = runs_dir / run_id
+    if directory.is_symlink():
+        raise PublicationError("publication run directory is unsafe")
+    metadata_path = directory / "run.json"
+    if metadata_path.is_symlink():
+        raise PublicationError("publication lineage is unsafe")
+    if not metadata_path.is_file():
+        return None
+    try:
+        if metadata_path.stat().st_size > 4 * 1024 * 1024:
+            raise PublicationError("publication lineage is too large")
+        metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, ValueError) as exc:
+        raise PublicationError("publication lineage is unreadable") from exc
+    parent = metadata.get("resumed_from_run_id") if isinstance(metadata, dict) else None
+    if not isinstance(parent, str) or _RUN_ID_RE.fullmatch(parent) is None:
+        return None
+    return parent
+
+
+def _publication_ancestors(runs_dir: Path, run_id: str) -> set[str]:
+    ancestors: set[str] = set()
+    current = run_id
+    while True:
+        if current in ancestors:
+            raise PublicationError("publication lineage is cyclic")
+        ancestors.add(current)
+        parent = _publication_parent(runs_dir, current)
+        if parent is None:
+            break
+        current = parent
+    return ancestors
+
+
+def _valid_published_receipt(receipt: dict[str, object]) -> bool:
+    commit = receipt.get("commit")
+    source_commit = receipt.get("source_commit")
+    return (
+        receipt.get("status") == "published"
+        and isinstance(commit, str)
+        and _SHA_RE.fullmatch(commit) is not None
+        and isinstance(source_commit, str)
+        and _SHA_RE.fullmatch(source_commit) is not None
+        and isinstance(receipt.get("remote"), str)
+        and bool(receipt["remote"])
+        and isinstance(receipt.get("branch"), str)
+        and bool(receipt["branch"])
+    )
+
+
+def _require_no_other_failed_publication(run_dir: Path) -> None:
+    """Keep unresolved failed receipts as the delivery gate."""
+    ancestors = _publication_ancestors(run_dir.parent, run_dir.name)
+    failed: dict[str, dict[str, object]] = {}
+    published: dict[str, dict[str, object]] = {}
+    for candidate in run_dir.parent.iterdir():
+        if candidate.name in ancestors:
+            continue
+        if candidate.is_symlink():
+            raise PublicationError("publication run directory is unsafe")
+        if not candidate.is_dir():
+            continue
+        receipt_path = candidate / "publication.json"
+        if receipt_path.is_symlink():
+            raise PublicationError("publication receipt is unsafe")
+        if receipt_path.is_file() and receipt_path.stat().st_size > 4 * 1024 * 1024:
+            raise PublicationError("publication receipt is too large")
+        if receipt_path.is_file():
+            receipt = _load_receipt(receipt_path)
+            if receipt.get("status") == "failed":
+                if any(
+                    receipt.get(field) is not None
+                    and not isinstance(receipt[field], str)
+                    for field in ("remote", "branch")
+                ):
+                    raise PublicationError("failed publication target is invalid")
+                failed[candidate.name] = receipt
+            elif _valid_published_receipt(receipt):
+                published[candidate.name] = receipt
+    for failed_run_id, failed_receipt in failed.items():
+        if not any(
+            failed_run_id in _publication_ancestors(run_dir.parent, published_run_id)
+            and all(
+                not failed_receipt.get(field)
+                or failed_receipt.get(field) == published_receipt.get(field)
+                for field in ("remote", "branch")
+            )
+            for published_run_id, published_receipt in published.items()
+        ):
+            raise PublicationError("an earlier failed publication must be repaired first")
+
+
 def _git(root: Path, *args: str, optional: bool = False) -> str:
     try:
         result = subprocess.run(
@@ -979,6 +1076,7 @@ def publish_completed_run(root: Path, run_dir: Path, *, source_ref: str = "HEAD"
     branch = _git(root, "config", "--local", "--get", "aflow.publishBranch", optional=True)
     if not remote and not branch:
         return None
+    _require_no_other_failed_publication(run_dir)
     path = run_dir / "publication.json"
     receipt = _load_receipt(path)
     receipt.update(status="pending", remote=remote, branch=branch)

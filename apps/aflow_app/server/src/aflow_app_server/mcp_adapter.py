@@ -39,6 +39,7 @@ from .plan_service import (
     PlanNotFound,
     PlanProjectNotFound,
     PlanRevisionConflict,
+    PlanRequeueResumeConflict,
     PlanServiceError,
 )
 from .project_config_service import ProjectConfigError, ProjectConfigRevisionConflict
@@ -91,6 +92,7 @@ def create_control_plane_mcp(
             PlanNotFound: "plan_not_found",
             PlanInvalid: "invalid_plan",
             PlanAlreadyExists: "plan_exists",
+            PlanRequeueResumeConflict: "plan_requeue_resume_conflict",
             PlanServiceError: "operation_rejected",
             ProjectConfigRevisionConflict: "revision_conflict",
             GuidedConfigError: "operation_rejected",
