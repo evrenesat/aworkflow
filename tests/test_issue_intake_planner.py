@@ -466,6 +466,55 @@ def _wait_for_file(path: Path, *, timeout: float = 3.0) -> str:
     raise AssertionError(f"timed out waiting for {path}")
 
 
+def _wait_for_pid(path: Path, *, timeout: float = 3.0) -> int:
+    deadline = time.monotonic() + timeout
+    content = "<missing>"
+    while time.monotonic() < deadline:
+        try:
+            content = path.read_text(encoding="ascii")
+        except FileNotFoundError:
+            pass
+        else:
+            # The newline is written last, so a partial write cannot be a PID.
+            digits = content[:-1] if content.endswith("\n") else ""
+            if digits.isascii() and digits.isdecimal() and int(digits) > 0:
+                return int(digits)
+        time.sleep(0.01)
+    raise AssertionError(f"timed out waiting for positive PID in {path}: {content!r}")
+
+
+def test_wait_for_pid_retries_empty_file_until_complete(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    pid_path = tmp_path / "delayed.pid"
+    pid_path.write_text("", encoding="ascii")
+    original_read_text = Path.read_text
+    reads = 0
+
+    def complete_after_empty_read(path: Path, *args: object, **kwargs: object) -> str:
+        nonlocal reads
+        content = original_read_text(path, *args, **kwargs)
+        if path == pid_path and reads == 0:
+            assert content == ""
+            reads += 1
+            pid_path.write_text("1234\n", encoding="ascii")
+        return content
+
+    monkeypatch.setattr(Path, "read_text", complete_after_empty_read)
+    assert _wait_for_pid(pid_path) == 1234
+    assert reads == 1
+
+
+@pytest.mark.parametrize("content", ["", "1234", "0\n", "-1\n", "12x\n"])
+def test_wait_for_pid_rejects_incomplete_or_invalid_content(
+    tmp_path: Path, content: str
+) -> None:
+    pid_path = tmp_path / "invalid.pid"
+    pid_path.write_text(content, encoding="ascii")
+    with pytest.raises(AssertionError, match="timed out waiting for positive PID"):
+        _wait_for_pid(pid_path, timeout=0.03)
+
+
 def test_real_process_runner_deadline_applies_while_stdin_is_blocked(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -477,7 +526,7 @@ def test_real_process_runner_deadline_applies_while_stdin_is_blocked(
             "-c",
             (
                 "import os, pathlib, sys, time; "
-                f"pathlib.Path({str(pid_path)!r}).write_text(str(os.getpid())); "
+                f"pathlib.Path({str(pid_path)!r}).write_text(str(os.getpid()) + '\\n'); "
                 "time.sleep(10)"
             ),
         ],
@@ -485,7 +534,7 @@ def test_real_process_runner_deadline_applies_while_stdin_is_blocked(
         b"x" * 131072,
     )
     assert result.timed_out is True
-    pid = int(_wait_for_file(pid_path))
+    pid = _wait_for_pid(pid_path)
     assert not _pid_is_alive(pid)
 
 
@@ -500,7 +549,7 @@ def test_real_process_runner_overflow_applies_while_stdin_is_blocked(
             "-c",
             (
                 "import os, pathlib, sys, time; "
-                f"pathlib.Path({str(pid_path)!r}).write_text(str(os.getpid())); "
+                f"pathlib.Path({str(pid_path)!r}).write_text(str(os.getpid()) + '\\n'); "
                 "sys.stdout.write('x' * (2 * 1024 * 1024 + 1)); "
                 "sys.stdout.flush(); time.sleep(10)"
             ),
@@ -509,7 +558,7 @@ def test_real_process_runner_overflow_applies_while_stdin_is_blocked(
         b"x" * 131072,
     )
     assert result.overflowed is True
-    pid = int(_wait_for_file(pid_path))
+    pid = _wait_for_pid(pid_path)
     assert not _pid_is_alive(pid)
 
 
@@ -532,12 +581,12 @@ def test_owned_group_escalates_after_leader_exit(
     descendant_code = (
         "import os, pathlib, signal, time; "
         "signal.signal(signal.SIGTERM, signal.SIG_IGN); "
-        f"pathlib.Path({str(descendant_pid_path)!r}).write_text(str(os.getpid())); "
+        f"pathlib.Path({str(descendant_pid_path)!r}).write_text(str(os.getpid()) + '\\n'); "
         "time.sleep(60)"
     )
     leader_code = (
         "import os, pathlib, subprocess, sys, time; "
-        f"pathlib.Path({str(leader_pid_path)!r}).write_text(str(os.getpid())); "
+        f"pathlib.Path({str(leader_pid_path)!r}).write_text(str(os.getpid()) + '\\n'); "
         f"subprocess.Popen([sys.executable, '-c', {descendant_code!r}], stdin=None, stdout=None, stderr=None); "
         "time.sleep(60)"
     )
@@ -558,8 +607,8 @@ def test_owned_group_escalates_after_leader_exit(
     leader_pid: int | None = None
     descendant_pid: int | None = None
     try:
-        leader_pid = int(_wait_for_file(leader_pid_path))
-        descendant_pid = int(_wait_for_file(descendant_pid_path))
+        leader_pid = _wait_for_pid(leader_pid_path)
+        descendant_pid = _wait_for_pid(descendant_pid_path)
         if termination == "sigterm":
             os.kill(supervisor.pid, signal.SIGTERM)
         started = time.monotonic()
