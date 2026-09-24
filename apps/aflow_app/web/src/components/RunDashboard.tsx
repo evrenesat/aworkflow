@@ -3048,11 +3048,27 @@ export function RunDashboard({ visible = true, page, onNewRun, onCancelNewRun, o
         ].filter((value): value is string => Boolean(value)).join(' · ') || null
       : null
   const deliveryWarning = canonicalDetail ? deliveryIssueText(canonicalDetail.delivery) : null
+  const failedReview = selectedRun?.status === 'failed'
+    && /review/i.test(selectedRun.current_step ?? lastExecuted?.stepName ?? '')
+  const recordedOrdinal = canonicalProgress?.current_checkpoint_ordinal ?? compatibilitySummary?.index
+  const recordedTitle = canonicalProgress?.current_checkpoint_title ?? compatibilitySummary?.name
+  const recordedPosition = recordedOrdinal
+    ? `CP${recordedOrdinal}${recordedTitle ? ` — ${recordedTitle.replace(/^Checkpoint\s+\d+\s*:\s*/i, '')}` : ''}`
+    : null
+  const lastReviewStep = [recordedPosition, observedInvocation].filter((value): value is string => Boolean(value)).join(' · ')
+  const reviewerHarnessFailed = failedReview && events.some(event => event.event_type === 'turn_finished'
+    && event.data?.outcome === 'harness-failed'
+    && /review/i.test(String(event.data?.step_name ?? '')))
+  const readableFailure = [selectedRun?.reason, latestResultPresentation?.summary, outcome?.finishedSummary, outcome?.resultText]
+    .map(value => conciseRunText(value))
+    .find(value => value && !/^exit\s+\d+\.?$/i.test(value) && !/^#|\s#+\s/.test(value) && !/reason unavailable|result unavailable/i.test(value) && !/^harness[-_ ]failed\.?$/i.test(value)) ?? null
   const overviewCurrentWork = selectedRun
     ? runDisplayProjection(selectedRun).category === 'outcome-unrecorded'
       ? null
       : (() => {
-      const currentWork = isTerminalInactiveRun(selectedRun)
+      const currentWork = failedReview
+        ? `Review stopped${lastReviewStep ? ` · ${lastReviewStep}` : ''}.`
+        : isTerminalInactiveRun(selectedRun)
         ? `No current work — ${statusLabel(selectedRun)}.`
         : canonicalProgress
           ? runCurrentWorkText(canonicalProgress, selectedRun.current_step)
@@ -3066,7 +3082,9 @@ export function RunDashboard({ visible = true, page, onNewRun, onCancelNewRun, o
             : selectedRun.activity === 'active'
                 ? 'Active work is in progress.'
                 : `${statusLabel(selectedRun)} — current work is not reported.`
-      const executorFacts = [
+      const executorFacts = failedReview
+        ? [lastExecuted?.selector, lastExecuted?.model].filter((value): value is string => Boolean(value))
+        : [
         selectedRun.current_step && !isTerminalInactiveRun(selectedRun) ? formatMachineLabel(selectedRun.current_step) : null,
         ...(canonicalProgress?.current_executor
           ? runExecutorFacts(canonicalProgress.current_executor)
@@ -3089,6 +3107,16 @@ export function RunDashboard({ visible = true, page, onNewRun, onCancelNewRun, o
     : null
   const overviewLatestResult = selectedRun
     ? (() => {
+      if (failedReview) return <>
+        <p>{readableFailure ?? (reviewerHarnessFailed
+          ? 'The reviewer harness failed before a decision.'
+          : 'Review stopped before a decision. The specific cause was not recorded in a short result.')}</p>
+        <p className="text-sm text-dim"><a href={`#${technicalId}`} onClick={() => setTechnicalDisclosure(true)}>Open Diagnostics</a> for technical detail and full activity.</p>
+        {(outcome?.resultText || latestResultPresentation?.hasPayload) && <details className="run-report" open={reportOpen}>
+          <summary onClick={(event) => { event.preventDefault(); setReportOpen((open) => !open) }}>Read full update</summary>
+          {reportOpen && <pre className="dashboard-payload">{outcome?.resultText ?? latestResultPresentation?.detail}</pre>}
+        </details>}
+      </>
       const hasRecordedResult = Boolean(
         outcome?.finishedTurn
         || outcome?.finishedSummary
@@ -3723,7 +3751,7 @@ export function RunDashboard({ visible = true, page, onNewRun, onCancelNewRun, o
                   {selectedRunIssue && <section className={`run-issue-summary run-issue-${selectedRunIssue.kind}`} role={selectedRunIssue.kind === 'failure' ? 'alert' : undefined}>
                     <div>
                       <strong>{selectedRunIssue.kind === 'failure' ? 'Failure' : 'Needs attention'}</strong>
-                      <p>{selectedRunIssue.cause}</p>
+                      <p>{failedReview ? 'Review stopped before a decision.' : selectedRunIssue.cause}</p>
                     </div>
                     <div className="dashboard-actions">
                       {canResume && (!confirmResume

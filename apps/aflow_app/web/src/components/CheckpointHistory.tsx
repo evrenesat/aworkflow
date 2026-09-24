@@ -764,7 +764,7 @@ function DeliveryDisclosure({ stages }: { stages: RunProgressDeliveryStage[] }):
       ? <ul className="checkpoint-history-delivery-list">{stages.map((stage, index) => {
         const sourceReference = sourceReferenceText(stage.source_reference)
         return <li key={`${stage.stage}-${index}`}>
-          <span><strong>{deliveryStageLabel(stage.stage)}</strong> · {formatMachineLabel(stage.status)}</span>
+          <span><strong>{deliveryStageLabel(stage.stage)}</strong> · {stage.status === 'unknown' ? '-' : formatMachineLabel(stage.status)}</span>
           {stage.reason && <span className="text-xs text-dim">{stage.reason}</span>}
           {stage.recorded_at && <span className="text-xs text-dim">{formatTimestamp(stage.recorded_at)}</span>}
           {sourceReference && <span className="text-xs text-dim">Receipt: <span className="mono">{sourceReference}</span></span>}
@@ -1057,10 +1057,14 @@ export function CheckpointHistory({ projectId, run, progress, detail, recordedPr
   const selectedEntry = entries.find(entry => entry.key === selectedEntryKey) ?? null
   const terminalInactive = isTerminalInactiveRun(run)
   const disclosureState = disclosureStates[runKey] ?? initialHistoryDisclosureState()
+  const recordedDelivery = detail?.delivery.filter(stage =>
+    !['unknown', 'not_applicable'].includes(stage.status)
+    || stage.recorded_at !== null
+    || stage.source_reference !== null,
+  ) ?? []
   const deliveryRelevant = detail !== null && (
-    detail.delivery.length > 0
+    recordedDelivery.length > 0
     || summary?.availability === 'partial'
-    || terminalInactive
   )
 
   function updateDisclosure(key: HistoryDisclosureKey, open: boolean): void {
@@ -1193,7 +1197,7 @@ export function CheckpointHistory({ projectId, run, progress, detail, recordedPr
           onToggle={event => updateDisclosure('delivery', event.currentTarget.open)}
         >
           <summary>Delivery evidence</summary>
-          <DeliveryDisclosure stages={detail.delivery ?? []} />
+          <DeliveryDisclosure stages={recordedDelivery} />
         </details>}
       {detail && <TimeDisclosure
           run={run}

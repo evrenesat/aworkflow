@@ -220,11 +220,14 @@ export function RunListItem({
 
   function handlePointerEnter(event: PointerEvent<HTMLDivElement>): void {
     if (event.pointerType === 'touch') return
+    // Pointer movement after keyboard focus must not replace the focus opener.
+    if (previewTriggerRef.current === 'focus' || document.activeElement === selectionButtonRef.current) return
     scheduleOpen('pointer', null)
   }
 
   function handlePointerLeave(event: PointerEvent<HTMLDivElement>): void {
     if (event.pointerType === 'touch') return
+    if (previewTriggerRef.current === 'focus') return
     scheduleClose()
   }
 

@@ -159,7 +159,15 @@ export function meaningfulRunEvents(events: RunEvent[], limit = 3): RunEvent[] {
     .filter(event => typeof event.event_type === 'string' && event.event_type.trim().length > 0)
   const usable = valid.filter(event => !isRunEventNoise(event))
   const preferred = usable.filter(isPreferredRunEvent)
-  return (preferred.length > 0 ? preferred : usable)
+  const selected = preferred.length > 0 ? preferred : usable
+  const withoutDuplicateLifecycle = selected.filter(event => {
+    if (!/^run_(?:failed|completed|finished)$/.test(event.event_type)) return true
+    const turn = eventTurnNumber(event.data ?? {})
+    return turn === null || !selected.some(other => other !== event
+      && other.event_type === 'turn_finished'
+      && eventTurnNumber(other.data ?? {}) === turn)
+  })
+  return withoutDuplicateLifecycle
     .slice(-limit)
     .reverse()
 }
@@ -190,7 +198,7 @@ export function presentRunEvent(event: RunEvent): RunEventPresentation {
       const value = eventText(event.data?.[field])
       return value && (field === 'failure_reason' || field === 'end_reason') ? formatMachineLabel(value) : value
     })
-    .find((value): value is string => value !== null) ?? null
+    .find((value): value is string => value !== null && !/^#|\s#+\s/.test(value)) ?? null
   const summary = storedSummary ?? terminalResultUnavailable(runEventOutcome(event))
   return {
     event,

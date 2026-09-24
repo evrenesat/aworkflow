@@ -173,6 +173,8 @@ describe('RunListItem', () => {
     act(() => vi.advanceTimersByTime(300))
     expect(screen.getByRole('dialog')).toBeTruthy()
     previewToggle.focus()
+    fireEvent.pointerEnter(container.querySelector<HTMLElement>('[data-run-row]')!, { pointerType: 'mouse' })
+    act(() => vi.advanceTimersByTime(300))
 
     fireEvent.keyDown(document, { key: 'Escape' })
 

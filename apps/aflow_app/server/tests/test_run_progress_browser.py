@@ -1280,7 +1280,7 @@ def test_checkpoint_history_review_evidence_and_generation_refresh(
             expect(history.locator(".checkpoint-history-timeline")).to_contain_text("Rejected")
 
             delivery = _open_history_disclosure(history, "Delivery evidence")
-            expect(delivery).to_contain_text("Merge · Unknown")
+            expect(delivery).to_contain_text("Merge · -")
             assert "Merge · Succeeded" not in delivery.inner_text()
 
             page.get_by_role("button", name="← Back to Checkpoints", exact=True).click()
@@ -1644,8 +1644,8 @@ def test_canonical_run_progress_visual_journey(
                 expect(team_changes).to_contain_text("next-team")
 
                 delivery = _open_history_disclosure(history, "Delivery evidence")
-                expect(delivery).to_contain_text("CI · Unknown")
-                expect(delivery).to_contain_text("Live · Unknown")
+                expect(delivery).to_contain_text("CI · -")
+                expect(delivery).to_contain_text("Live · -")
                 assert "CI · Succeeded" not in delivery.inner_text()
                 assert "Live verification · Succeeded" not in delivery.inner_text()
 
@@ -1797,7 +1797,7 @@ def test_canonical_run_progress_visual_journey(
                     )
                     expect(screenshot_delivery).to_contain_text("Delivery stages")
                     expect(screenshot_delivery).to_contain_text("Final review · Succeeded")
-                    expect(screenshot_delivery).to_contain_text("CI · Unknown")
+                    expect(screenshot_delivery).to_contain_text("CI · -")
                     screenshot_time = _open_history_disclosure(screenshot_history, "Time details")
                     reviewer_time = screenshot_time.locator(
                         ".checkpoint-history-time-group"
@@ -1877,7 +1877,7 @@ def test_canonical_run_progress_visual_journey(
                     ).filter(has_text="Delivery evidence")
                     terminal_delivery.locator("summary").click()
                     expect(terminal_delivery).to_contain_text("Publication · Pending")
-                    expect(terminal_delivery).to_contain_text("CI · Unknown")
+                    expect(terminal_delivery).to_contain_text("CI · -")
                     assert "CI · Succeeded" not in terminal_delivery.inner_text()
 
                     page.goto(f"{url}/?view=all-runs")
