@@ -1,5 +1,17 @@
 # DEVLOG
 
+## 2026-09-24 — Admit numbered plans after delivered predecessors (Checkpoint 4)
+
+- Added a durable series inventory at the shared admission lock. Known lower
+  members survive deletion, and duplicate or malformed members hold their
+  series while unrelated plans retain capacity.
+- Linked-worktree launches include numbered files in the verified launching
+  checkout and coalesce copies of the same filename across checkouts. A linked
+  member clears only with matching receipt-backed delivery evidence, including
+  when its successor is launched later from the primary checkout.
+- Delivery credit requires the same plan identity's Done ownership and a
+  matching valid published receipt with a completed lifecycle record.
+
 ## 2026-09-24 — Resume requeued plans through the supported control-plane transport
 
 - Requeue now uses the control-plane REST default, which maps both HTTP and MCP

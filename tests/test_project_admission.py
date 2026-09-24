@@ -11,6 +11,7 @@ import pytest
 
 import aflow.project_admission as admission_module
 from aflow.config import WorkflowConfig, WorkflowStepConfig, WorkflowUserConfig
+from aflow.plan_backups import move_plan_identity
 from aflow.control_plane import (
     InMemoryUnitManager,
     LaunchManifest,
@@ -25,6 +26,7 @@ from aflow.project_admission import (
     ProjectAdmissionError,
     ProjectAdmissionSafetyError,
     ProjectCapacityReached,
+    ProjectPlanDependencyBlocked,
 )
 from aflow.project_settings import ProjectSettings, ProjectSettingsService
 from aflow.run_state import ControllerConfig, ResumeContext
@@ -350,6 +352,165 @@ def test_linked_worktrees_share_a_plan_claim(tmp_path: Path) -> None:
             "second-worktree-run", plan_path=second / "plan.md", idempotency_key="second"
         )
     assert ProjectAdmission(primary).snapshot().occupied_count == 1
+
+
+def test_linked_worktree_sequence_predecessor_blocks_before_reservation(tmp_path: Path) -> None:
+    primary = _committed_separate_git_repo(tmp_path / "primary")
+    linked = tmp_path / "linked-worktree"
+    _git(primary, "worktree", "add", "-q", "-b", "linked", str(linked))
+    plans = linked / "plans" / "in-progress"
+    plans.mkdir(parents=True)
+    predecessor = plans / "feature_P01_intro.md"
+    predecessor.write_text("# First\n", encoding="utf-8")
+    successor = plans / "feature_P03_finish.md"
+    successor.write_text("# Third\n", encoding="utf-8")
+    unrelated = plans / "other_P07_work.md"
+    unrelated.write_text("# Other\n", encoding="utf-8")
+
+    admission = ProjectAdmission(linked)
+    with pytest.raises(ProjectPlanDependencyBlocked, match="predecessor"):
+        admission.acquire("linked-successor", plan_path=successor)
+    assert ProjectAdmission(primary).snapshot().occupied_count == 0
+    assert admission.acquire("linked-unrelated", plan_path=unrelated).run_id == "linked-unrelated"
+    predecessor.unlink()
+    with pytest.raises(ProjectPlanDependencyBlocked, match="predecessor"):
+        admission.acquire("linked-successor-retry", plan_path=successor)
+
+
+def test_primary_and_linked_plan_copies_are_one_sequence_member(tmp_path: Path) -> None:
+    primary = _committed_separate_git_repo(tmp_path / "primary")
+    linked = tmp_path / "linked-worktree"
+    _git(primary, "worktree", "add", "-q", "-b", "linked", str(linked))
+    for root in (primary, linked):
+        plans = root / "plans" / "in-progress"
+        plans.mkdir(parents=True)
+        (plans / "feature_P03_finish.md").write_text("# Third\n", encoding="utf-8")
+
+    successor = linked / "plans" / "in-progress" / "feature_P03_finish.md"
+    admitted = ProjectAdmission(primary).acquire(
+        "one-logical-plan", plan_path=successor, idempotency_key="copy",
+    )
+    assert admitted.run_id == "one-logical-plan"
+    ProjectAdmission(primary).release(admitted.run_id, admitted.nonce)
+    for root in (primary, linked):
+        (root / "plans" / "in-progress" / "feature_P01_intro.md").write_text(
+            "# First\n", encoding="utf-8"
+        )
+    with pytest.raises(ProjectPlanDependencyBlocked, match="predecessor"):
+        ProjectAdmission(linked).acquire(
+            "blocked-successor", plan_path=successor, idempotency_key="blocked",
+        )
+
+
+def test_distinct_cross_worktree_names_at_one_position_block_series(tmp_path: Path) -> None:
+    primary = _committed_separate_git_repo(tmp_path / "primary")
+    linked = tmp_path / "linked-worktree"
+    _git(primary, "worktree", "add", "-q", "-b", "linked", str(linked))
+    primary_plans = primary / "plans" / "in-progress"
+    linked_plans = linked / "plans" / "in-progress"
+    primary_plans.mkdir(parents=True)
+    linked_plans.mkdir(parents=True)
+    (primary_plans / "feature_P01_intro.md").write_text("# One\n", encoding="utf-8")
+    (linked_plans / "feature_P01_alternative.md").write_text("# Other one\n", encoding="utf-8")
+    successor = linked_plans / "feature_P03_finish.md"
+    successor.write_text("# Third\n", encoding="utf-8")
+
+    with pytest.raises(ProjectPlanDependencyBlocked, match="correction"):
+        ProjectAdmission(linked).acquire("duplicate-series", plan_path=successor)
+
+
+def test_linked_predecessor_requires_its_published_delivery(tmp_path: Path) -> None:
+    primary = _committed_separate_git_repo(tmp_path / "primary")
+    linked = tmp_path / "linked-worktree"
+    _git(primary, "worktree", "add", "-q", "-b", "linked", str(linked))
+    plans = linked / "plans" / "in-progress"
+    plans.mkdir(parents=True)
+    predecessor = plans / "feature_P01_intro.md"
+    predecessor.write_text("# First\n", encoding="utf-8")
+    successor = plans / "feature_P03_finish.md"
+    successor.write_text("# Third\n", encoding="utf-8")
+    admission = ProjectAdmission(linked)
+    with pytest.raises(ProjectPlanDependencyBlocked, match="predecessor"):
+        admission.acquire("linked-successor", plan_path=successor)
+
+    done = linked / "plans" / "done" / predecessor.name
+    done.parent.mkdir()
+    predecessor.rename(done)
+    assert move_plan_identity(
+        linked, source_plan_path=predecessor, destination_plan_path=done,
+    )
+    with pytest.raises(ProjectPlanDependencyBlocked, match="predecessor"):
+        admission.acquire("linked-successor", plan_path=successor)
+    receipt = linked / ".aflow" / "runs" / "delivered-run" / "publication.json"
+    receipt.parent.mkdir(parents=True)
+    receipt.write_text(json.dumps({
+        "status": "published", "commit": "a" * 40, "source_commit": "b" * 40,
+        "remote": "origin", "branch": "main",
+        "plan_lifecycle": {
+            "phase": "committed", "complete": True,
+            "source": "plans/in-progress/feature_P01_intro.md",
+            "destination": "plans/done/feature_P01_intro.md",
+        },
+    }), encoding="utf-8")
+    assert admission.acquire("linked-successor", plan_path=successor).run_id == "linked-successor"
+
+
+def test_linked_delivery_remains_valid_for_primary_successor(tmp_path: Path) -> None:
+    primary = _committed_separate_git_repo(tmp_path / "primary")
+    linked = tmp_path / "linked-worktree"
+    _git(primary, "worktree", "add", "-q", "-b", "linked", str(linked))
+    linked_plans = linked / "plans" / "in-progress"
+    primary_plans = primary / "plans" / "in-progress"
+    linked_plans.mkdir(parents=True)
+    primary_plans.mkdir(parents=True)
+    predecessor = linked_plans / "feature_P01_intro.md"
+    predecessor.write_text("# First\n", encoding="utf-8")
+    linked_successor = linked_plans / "feature_P03_finish.md"
+    primary_successor = primary_plans / linked_successor.name
+    for path in (linked_successor, primary_successor):
+        path.write_text("# Third\n", encoding="utf-8")
+    linked_admission = ProjectAdmission(linked)
+    primary_admission = ProjectAdmission(primary)
+    for admission, plan in (
+        (linked_admission, linked_successor),
+        (primary_admission, primary_successor),
+    ):
+        with pytest.raises(ProjectPlanDependencyBlocked, match="predecessor"):
+            admission.acquire("before-delivery", plan_path=plan)
+
+    done = linked / "plans" / "done" / predecessor.name
+    done.parent.mkdir()
+    predecessor.rename(done)
+    assert move_plan_identity(
+        linked, source_plan_path=predecessor, destination_plan_path=done,
+    )
+    with pytest.raises(ProjectPlanDependencyBlocked, match="predecessor"):
+        primary_admission.acquire("done-only", plan_path=primary_successor)
+    receipt = linked / ".aflow" / "runs" / "delivered-run" / "publication.json"
+    receipt.parent.mkdir(parents=True)
+    receipt.write_text('{"status":"published","commit":"invalid"}', encoding="utf-8")
+    with pytest.raises(ProjectPlanDependencyBlocked, match="predecessor"):
+        primary_admission.acquire("invalid-receipt", plan_path=primary_successor)
+    receipt.write_text(json.dumps({
+        "status": "published", "commit": "a" * 40, "source_commit": "b" * 40,
+        "remote": "origin", "branch": "main",
+        "plan_lifecycle": {
+            "phase": "committed", "complete": True,
+            "source": "plans/in-progress/feature_P01_intro.md",
+            "destination": "plans/done/feature_P01_intro.md",
+        },
+    }), encoding="utf-8")
+    linked_run = linked_admission.acquire("linked-ready", plan_path=linked_successor)
+    linked_admission.release(linked_run.run_id, linked_run.nonce)
+    primary_run = primary_admission.acquire("primary-ready", plan_path=primary_successor)
+    primary_admission.release(primary_run.run_id, primary_run.nonce)
+    receipt.unlink()
+    for admission, plan in (
+        (primary_admission, primary_successor),
+        (linked_admission, linked_successor),
+    ):
+        with pytest.raises(ProjectPlanDependencyBlocked, match="predecessor"):
+            admission.acquire("after-receipt-loss", plan_path=plan)
 
 
 def test_cli_and_managed_admission_share_idempotent_reservation_state(tmp_path: Path) -> None:

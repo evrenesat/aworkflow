@@ -1382,6 +1382,20 @@ gates unrelated later publication until a descendant in the recorded run
 lineage has a valid published receipt for the same configured target. Historical
 failed receipts remain intact.
 
+`plan_dependencies.py` inventories numbered filenames in the five lifecycle
+directories of the primary and verified launching checkout, plus retained plan
+identities, into one additive project journal. Equal filenames in separate Git
+worktrees represent one logical member; different names at one position remain
+duplicates.
+`ProjectAdmission.acquire()` checks the series under the shared admission lock
+before reserving capacity. Known lower positions, malformed sequence members,
+and duplicate positions hold only their series. A lower member clears after
+its identity reaches Done and a matching completed lifecycle has a valid
+published receipt in a verified project checkout; a missing number is not a
+dependency. Delivery checks read verified project worktrees even when the next
+launch uses a different checkout; inventory discovery still touches only the
+primary and launching checkout.
+
 `project_config_service.py` owns exactly `.aflow/config/aflow.toml` and
 `.aflow/config/workflows.toml` as one validated revisioned pair. Configuration
 reads, commits, capability loads, and launch reservation share one per-project

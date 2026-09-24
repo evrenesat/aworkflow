@@ -39,6 +39,7 @@ from aflow.control_plane.repository import (
 )
 from aflow.control_plane.worker_diagnostics import confirmed_inactive
 from aflow.process_identity import process_birth_identity, process_liveness
+from aflow.plan_dependencies import PlanDependencies, PlanDependencyBlocked, PlanDependencyError
 from aflow.project_settings import (
     ProjectSettingsError,
     ProjectSettingsService,
@@ -95,6 +96,12 @@ class ProjectPlanClaimConflict(ProjectAdmissionConflict):
     """A different run still owns the requested plan."""
 
     code = "project_plan_claim_conflict"
+
+
+class ProjectPlanDependencyBlocked(ProjectAdmissionConflict):
+    """A known series predecessor has not completed delivery."""
+
+    code = "project_plan_dependency_blocked"
 
 
 class ProjectCapacityReached(ProjectAdmissionError):
@@ -558,6 +565,38 @@ class ProjectAdmission:
                     plan_key, source_run_id, valid_run_id, reservations,
                     direct_resume_proven=direct_resume_proof is not None,
                 )
+                try:
+                    checkout_root = self._root
+                    verified_roots = (self._root,)
+                    if plan_key.startswith("plans/") and plan_path is not None:
+                        try:
+                            selected_path = Path(plan_path).resolve(
+                                strict=direct_resume_proof is None
+                            )
+                        except (OSError, RuntimeError, ValueError) as exc:
+                            raise ProjectAdmissionSafetyError(
+                                "dependency plan checkout is unavailable"
+                            ) from exc
+                        verified_roots = self._repository_roots()
+                        checkout_root = next(
+                            (
+                                root for root in verified_roots
+                                if selected_path == root / plan_key
+                            ),
+                            None,
+                        )
+                        if checkout_root is None:
+                            raise ProjectAdmissionSafetyError(
+                                "dependency plan checkout is not verified"
+                            )
+                    PlanDependencies(self._root).require_ready(
+                        plan_key, checkout_root=checkout_root,
+                        evidence_roots=verified_roots,
+                    )
+                except PlanDependencyBlocked as exc:
+                    raise ProjectPlanDependencyBlocked(str(exc)) from exc
+                except PlanDependencyError as exc:
+                    raise ProjectAdmissionSafetyError(str(exc)) from exc
 
             evidence = self._run_evidence(valid_run_id)
             snapshot = self._snapshot_locked(
