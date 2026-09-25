@@ -979,15 +979,16 @@ input::placeholder, textarea::placeholder {
 }
 
 .checkpoint-history-disclosure-controls {
-  display: flex;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
   align-items: center;
-  flex-wrap: wrap;
-  gap: var(--spacing-xs) var(--spacing-sm);
+  gap: var(--spacing-sm);
   padding-top: var(--spacing-xs);
 }
 
 .checkpoint-history-disclosure-controls > span {
-  margin-right: auto;
+  min-width: 0;
+  overflow-wrap: anywhere;
 }
 
 .checkpoint-history-delivery-summary {

@@ -326,7 +326,7 @@ def _seed_failed_reviewer_run(root: Path, running: dict[str, object]) -> str:
     return run_id
 
 
-@pytest.mark.parametrize("width,height", RUN_ROW_VIEWPORTS[:6])
+@pytest.mark.parametrize("width,height", RUN_ROW_VIEWPORTS[:2] + ((375, 667),) + RUN_ROW_VIEWPORTS[2:6])
 @pytest.mark.parametrize("theme", RUN_ROW_THEMES)
 def test_ui_followup_failed_review_history(
     control_client, monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
@@ -403,7 +403,25 @@ def test_ui_followup_failed_review_history(
             label_box = controls.locator("span").bounding_box()
             button_box = bulk.bounding_box()
             assert label_box is not None and button_box is not None
+            control_layout = page.evaluate(
+                """() => {
+                  const row = document.querySelector('.run-detail:has(.checkpoint-history-disclosure-controls) .checkpoint-history-disclosure-controls');
+                  const label = row.querySelector('span');
+                  const button = row.querySelector('button');
+                  const box = node => {
+                    const {x, y, width, height} = node.getBoundingClientRect();
+                    return {x, y, width, height, scrollWidth: node.scrollWidth};
+                  };
+                  return {fonts: document.fonts.status, display: getComputedStyle(row).display,
+                    row: box(row), label: box(label), button: box(button)};
+                }"""
+            )
+            (artifact_dir / f"{stem}-controls.json").write_text(
+                json.dumps(control_layout, indent=2) + "\n", encoding="utf-8",
+            )
+            assert control_layout["fonts"] == "loaded"
             assert abs(label_box["y"] + label_box["height"] / 2 - button_box["y"] - button_box["height"] / 2) < 2
+            assert control_layout["label"]["scrollWidth"] <= label_box["width"] + 1
             assert button_box["x"] + button_box["width"] <= width
             if width <= 390:
                 assert button_box["height"] >= 44
@@ -435,6 +453,18 @@ def test_ui_followup_failed_review_history(
                       and not path.endswith(("/api/session", "/api/config/form"))]
             assert writes == []
             assert page_errors == []
+            if (width, height) == (390, 844):
+                page.set_viewport_size({"width": 390, "height": 420})
+                page.evaluate("document.documentElement.style.fontSize = '24px'")
+                _wait_for_fidelity_readiness(page)
+                enlarged_label = controls.locator("span").bounding_box()
+                enlarged_button = bulk.bounding_box()
+                assert enlarged_label is not None and enlarged_button is not None
+                assert enlarged_label["height"] > label_box["height"]
+                assert enlarged_button["height"] >= 44
+                assert enlarged_button["x"] + enlarged_button["width"] <= 390
+                _assert_no_horizontal_overflow(page)
+                page.screenshot(path=str(artifact_dir / f"{stem}-enlarged.png"), full_page=True)
         finally:
             browser.close()
 

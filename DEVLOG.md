@@ -3896,3 +3896,34 @@ HISTORY: Published clipboard history `c14f1f2`/`cd78d53` remains separate and mu
   `git diff --check` passed. The scoped source/test diff is 2 files,
   190 insertions and 8 deletions. No original core run or worktree was resumed
   or edited. Changes remain uncommitted for checkpoint review.
+
+## 2026-09-25 — Align the run disclosure control on narrow phones (Checkpoint 1)
+
+- Fast-forwarded the clean managed worktree to published `d2b07244`. CI run
+  `36119713331`, Ubuntu Python 3.12 job `108022074541`, measured a 21px
+  label/button center mismatch in dark 390×844: label y=840.14, h=18;
+  button y=848.14, h=44. The existing flex row allowed wrapping. Local
+  pre-change Chromium and WebKit runs had loaded fonts and 0px center
+  difference at 375 and 390, so the CI wrap is environment dependent; the
+  test already waited for font readiness and two render frames.
+- Replaced only that flex row with `minmax(0, 1fr) auto` grid columns. The
+  label can wrap in its cell; the one intrinsic-width button remains mounted
+  and centered. The browser test now includes 375px, records font/layout boxes,
+  checks label clipping, and exercises 24px root text at 390×420.
+- After the fix, loaded-font control captures in light/dark Chromium and
+  WebKit at 320/375/390 show 0px center difference and a 44px phone button.
+  At 320, row width is 238px; label/button widths are 130.61/99.39px in
+  Chromium and 122.83/107.17px in WebKit. At 390, row width is 308px;
+  label/button widths are 200.61/99.39px and 192.83/107.17px respectively.
+  The row height is 48px including its top padding. Inspected light/dark
+  screenshots at 320 and 390 plus enlarged 390×420 screenshots in both
+  engines: the control remains readable with no side scroll; enlarged text
+  wraps the label within its cell. The broader enlarged page has tighter
+  wrapping in recent activity, outside this control's scope. Physical mobile
+  keyboard and hosted Ubuntu font behavior remain unverified locally.
+- Verification: web suite 649 passed across 29 files; production build passed
+  with its existing chunk-size warning; focused Chromium and WebKit browser
+  matrices passed 14 each; combined follow-up and demo fidelity browser suite
+  passed 49; `git diff --check` passed. Existing dependency deprecation
+  warnings remain. Exact-SHA CI, publication, and live activation are
+  coordinator gates; checkpoint changes remain uncommitted for review.
