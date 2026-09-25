@@ -20,7 +20,9 @@ from aflow.control_plane.repository import RunRepository
 from aflow.control_plane.models import startup_failure
 from aflow.daemon import DaemonError
 from aflow.plan import PlanParseError, parse_git_tracking_metadata, parse_plan_text
-from aflow.plan_lifecycle import PlanLifecycle, PlanLifecycleConflict, PlanLifecycleError
+from aflow.plan_lifecycle import (
+    PlanLifecycle, PlanLifecycleConflict, PlanLifecycleError, canonical_direct_child,
+)
 from aflow.project_admission import ProjectAdmission, ProjectAdmissionError
 
 from aflow.plan_backups import (
@@ -828,7 +830,7 @@ class PlanService:
 
     @staticmethod
     def _run_owns_plan(root: Path, run_id: str, original: Path) -> bool:
-        """Match an exact saved original path, never a repair overlay alias."""
+        """Match one original plan through verified parent aliases only."""
         try:
             run_dir = RunRepository(root).run_directory(run_id)
             metadata_path = run_dir / "run.json"
@@ -837,10 +839,18 @@ class PlanService:
             metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
         except (OSError, ValueError):
             return False
-        return (
-            isinstance(metadata, Mapping)
-            and metadata.get("original_plan_path") == str(original)
-        )
+        if not isinstance(metadata, Mapping):
+            return False
+        recorded = metadata.get("original_plan_path")
+        if not isinstance(recorded, str):
+            return False
+        parent = root / "plans" / "in-progress"
+        try:
+            return canonical_direct_child(Path(recorded), parent) == canonical_direct_child(
+                original, parent
+            )
+        except PlanLifecycleError:
+            return False
 
     def _root(self, project_id: str) -> Path:
         try:

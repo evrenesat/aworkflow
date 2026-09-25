@@ -2,6 +2,15 @@
 
 ## 2026-09-25 — Repair failed-plan moves through parent path aliases
 
+- Explicit requeue now compares the source run's recorded original path with
+  the lifecycle journal's original through verified parent directories. An
+  aliased parent preserves source-run lineage and the stable replay key;
+  outside-root, mismatched-name, and symlinked final entries remain rejected.
+  Verification: plan-store 51 passed; focused runtime/lifecycle 18 passed;
+  symlinked temporary-root runtime 2 passed; Python 3.12 runtime/lifecycle
+  325 passed and 45 subtests passed. Ruff passes on edited Python files.
+  The unchanged `tests/test_runtime.py` still has seven baseline Ruff findings
+  at `d443267e98c9ff8b07f3bc74b04db39c7084c298`.
 - Terminal failure classification now compares verified canonical parent
   directories for the source plan, run, and recorded original plan. Lifecycle
   moves, prepared recovery, and record lookup use the same parent identity while

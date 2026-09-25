@@ -1642,6 +1642,7 @@ def test_requeue_route_requires_auth_and_returns_corrected_plan(
 def _managed_failed_requeue_fixture(
     service: PlanService, root: Path, *, project_id: str, name: str,
     run_id: str = "20260924t230000z-abcdef12",
+    recorded_original: Path | None = None,
 ) -> tuple[Path, str, str]:
     content = (
         "# Plan\n\n## Git Tracking\n\n- Plan Branch: `feature/requeue`\n"
@@ -1665,7 +1666,7 @@ def _managed_failed_requeue_fixture(
     (run_dir / "run.json").write_text(
         json.dumps({
             "schema_version": 2, "status": "failed",
-            "original_plan_path": str(original),
+            "original_plan_path": str(recorded_original or original),
         }) + "\n", encoding="utf-8",
     )
     PlanLifecycle(root).move(
@@ -1674,6 +1675,93 @@ def _managed_failed_requeue_fixture(
         source_run_id=run_id,
     )
     return root / "plans" / "failed" / name, ready.revision, run_id
+
+
+def test_failed_requeue_accepts_verified_original_parent_alias(plan_fixture) -> None:
+    service, root, _ = plan_fixture
+    name = "alias-requeue.md"
+    alias = root.with_name(f"{root.name}-alias")
+    alias.symlink_to(root, target_is_directory=True)
+    try:
+        recorded_original = alias / "plans" / "in-progress" / name
+        failed, revision, run_id = _managed_failed_requeue_fixture(
+            service, root, project_id="project", name=name,
+            recorded_original=recorded_original,
+        )
+        expected_bytes = failed.read_bytes()
+        lifecycle = PlanLifecycle(root)
+        record = lifecycle.record_for(failed)
+        assert record is not None
+        assert record["original_path"] == str(root / "plans" / "in-progress" / name)
+        identity = record["identity"]
+        metadata = json.loads(
+            (root / ".aflow" / "runs" / run_id / "run.json").read_text(encoding="utf-8")
+        )
+        assert metadata["original_plan_path"] == str(recorded_original)
+
+        def failed_status(_project_id: str, source_run_id: str) -> RunStatus:
+            assert source_run_id == run_id
+            return RunStatus(run_id=source_run_id, status="failed")
+
+        first = service.requeue(
+            "project", "failed", name, revision,
+            source_run_id=run_id, run_status_reader=failed_status,
+        )
+        replay = service.requeue(
+            "project", "failed", name, revision,
+            source_run_id=run_id, run_status_reader=failed_status,
+        )
+        restored = root / "plans" / "in-progress" / name
+        assert restored.read_bytes() == expected_bytes
+        assert not failed.exists()
+        assert first.resume_source_run_id == replay.resume_source_run_id == run_id
+        assert first.resume_idempotency_key == replay.resume_idempotency_key
+        assert first.resume_idempotency_key.startswith("plan-requeue-")
+        assert first.lifecycle == replay.lifecycle
+        assert lifecycle.record_for(restored)["identity"] == identity
+        assert plan_backups.plan_identity_for_path(root, restored) == identity
+    finally:
+        alias.unlink()
+
+
+@pytest.mark.parametrize("recorded_kind", ["outside", "different", "symlink"])
+def test_failed_requeue_rejects_invalid_original_alias(plan_fixture, recorded_kind: str) -> None:
+    service, root, _ = plan_fixture
+    name = "unsafe-alias-requeue.md"
+    alias = root.with_name(f"{root.name}-alias")
+    alias.symlink_to(root, target_is_directory=True)
+    original = root / "plans" / "in-progress" / name
+    if recorded_kind == "outside":
+        outside = root.parent / "outside" / "plans" / "in-progress"
+        outside.mkdir(parents=True)
+        recorded_original = outside / name
+    elif recorded_kind == "different":
+        recorded_original = alias / "plans" / "in-progress" / "other.md"
+    else:
+        recorded_original = alias / "plans" / "in-progress" / name
+    try:
+        failed, revision, run_id = _managed_failed_requeue_fixture(
+            service, root, project_id="project", name=name,
+            recorded_original=recorded_original,
+        )
+        expected_bytes = failed.read_bytes()
+        lifecycle = PlanLifecycle(root)
+        record = lifecycle.record_for(failed)
+        assert record is not None
+        if recorded_kind == "symlink":
+            original.symlink_to(failed)
+        with pytest.raises(PlanInvalid, match="not eligible"):
+            service.requeue(
+                "project", "failed", name, revision,
+                source_run_id=run_id,
+                run_status_reader=lambda *_: RunStatus(run_id=run_id, status="failed"),
+            )
+        assert failed.read_bytes() == expected_bytes
+        assert lifecycle.record_for(failed)["current_location"] == "failed"
+        assert lifecycle.record_for(failed)["identity"] == record["identity"]
+        assert original.is_symlink() == (recorded_kind == "symlink")
+    finally:
+        alias.unlink()
 
 
 def _scope_checked_requeue_control_plane(project_id, run_status, daemon_resume):
