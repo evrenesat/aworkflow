@@ -3022,6 +3022,18 @@ def _append_replayed_review_rejection(
     rejection: ReviewRejectionRecord,
 ) -> bool:
     """Append one finalized rejection exactly once during resume replay."""
+    if (
+        rejection.checkpoint_index is None
+        and rejection.scope_id.endswith("::cumulative-review")
+        and any(
+            item.scope_id == rejection.scope_id
+            and item.reviewed_attempt_ordinal == rejection.reviewed_attempt_ordinal
+            and item.reviewed_implementation_turn_number
+            == rejection.reviewed_implementation_turn_number
+            for item in state.review_rejection_history
+        )
+    ):
+        return False
     if any(
         item.scope_id == rejection.scope_id
         and item.rejection_number == rejection.rejection_number
@@ -3034,6 +3046,103 @@ def _append_replayed_review_rejection(
         return False
     state.review_rejection_history.append(rejection)
     return True
+
+
+def _cumulative_review_attempt(
+    state: ControllerState,
+    *,
+    original_plan_path: Path,
+    completed_snapshot: PlanSnapshot,
+) -> tuple[str, ImplementationAttempt] | None:
+    """Find the exact last worker eligible for a completed-plan review.
+
+    Checkpoint approval closes its active scope.  Retained attempts are usable
+    only when they belong to the final checkpoint of this original plan.  A
+    cumulative repair attempt, once present, supersedes that initial worker.
+    Ambiguous or legacy attempts cannot create repair credit.
+    """
+    scope_id = f"{original_plan_path}::cumulative-review"
+    attempts = state.implementation_attempts.get(scope_id)
+    if not attempts:
+        checkpoint_prefix = (
+            f"{original_plan_path}::checkpoint-"
+            f"{completed_snapshot.total_checkpoint_count}::"
+        )
+        candidates = [
+            rows for key, rows in state.implementation_attempts.items()
+            if key.startswith(checkpoint_prefix) and rows
+        ]
+        if len(candidates) != 1:
+            return None
+        attempts = candidates[0]
+    ordinals = [item.attempt_ordinal for item in attempts]
+    if (
+        any(
+            not isinstance(value, int) or isinstance(value, bool) or value < 1
+            for value in ordinals
+        )
+        or len(set(ordinals)) != len(ordinals)
+        or ordinals != sorted(ordinals)
+    ):
+        return None
+    attempt = attempts[-1]
+    if (
+        attempt.role != "worker"
+        or attempt.outcome != "accepted"
+        or not attempt.team
+        or not attempt.selector
+    ):
+        return None
+    return scope_id, attempt
+
+
+def _has_resumable_cumulative_repair(
+    resume: ResumeContext | None,
+    *,
+    repo_root: Path,
+    original_plan_path: Path,
+    completed_snapshot: PlanSnapshot,
+) -> bool:
+    """Admit a saved focused repair after the original plan became complete."""
+    if resume is None or resume.active_plan_path is None:
+        return False
+    active_path = resume.active_plan_path
+    if active_path == original_plan_path or not active_path.is_file():
+        return False
+    evidence_state = ControllerState(last_snapshot=completed_snapshot)
+    evidence_state.implementation_attempts = _mutable_implementation_attempts(
+        resume.implementation_attempts
+    )
+    cumulative = _cumulative_review_attempt(
+        evidence_state,
+        original_plan_path=original_plan_path,
+        completed_snapshot=completed_snapshot,
+    )
+    if cumulative is None:
+        return False
+    scope_id, attempt = cumulative
+    scope_rejections = [
+        record for record in resume.review_rejection_history
+        if record.scope_id == scope_id
+    ]
+    if not scope_rejections:
+        return False
+    latest_number = max(record.rejection_number for record in scope_rejections)
+    matching = [
+        record for record in scope_rejections
+        if record.rejection_number == latest_number
+        and record.checkpoint_index is None
+        and record.reviewed_implementation_turn_number == attempt.turn_number
+        and record.reviewed_attempt_ordinal == attempt.attempt_ordinal
+        and record.reviewed_worker_team == attempt.team
+        and record.reviewed_worker_selector == attempt.selector
+        and record.repair_plan_path is not None
+        and (
+            (repo_root / record.repair_plan_path).resolve()
+            == active_path.resolve()
+        )
+    ]
+    return len(matching) == 1
 
 
 def _pending_matches_scope_and_plan(
@@ -8491,11 +8600,41 @@ def _run_workflow_unchecked(
     terminal_integration_only = bool(
         resume is not None and resume.terminal_integration_only
     )
+    if (
+        done
+        and resume is not None
+        and not terminal_integration_only
+        and not terminal_completion_resume
+        and not pending_review_resume
+        and resume.pending_finalized_turn is None
+        and resume.active_plan_path is not None
+        and resume.active_plan_path != original_plan_path
+        and any(
+            record.scope_id == f"{original_plan_path}::cumulative-review"
+            for record in resume.review_rejection_history
+        )
+        and not _has_resumable_cumulative_repair(
+            resume,
+            repo_root=config.repo_root,
+            original_plan_path=original_plan_path,
+            completed_snapshot=original_snapshot,
+        )
+    ):
+        raise WorkflowError(
+            "cannot resume final-review repair with ambiguous worker or overlay evidence",
+            run_dir=run_paths.run_dir,
+        )
     if done and not terminal_integration_only and not terminal_completion_resume and not pending_review_resume and not (
         resume is not None
         and (
             resume.pending_finalized_turn is not None
             or resume.pending_cumulative_review is not None
+            or _has_resumable_cumulative_repair(
+                resume,
+                repo_root=config.repo_root,
+                original_plan_path=original_plan_path,
+                completed_snapshot=original_snapshot,
+            )
         )
     ):
         prior_original_plan_path = original_plan_path
@@ -11023,6 +11162,38 @@ def _run_workflow_unchecked(
             )
         replayed_rejection = replayed_boundary.review_rejection
         replay_scope = state.active_implementation_scope
+        if (
+            replayed_rejection is not None
+            and replay_scope is None
+            and replayed_boundary.step_name == "final_review"
+            and replayed_boundary.step_role in {"architect", "final_reviewer"}
+            and replayed_boundary.snapshot_after.is_complete
+            and replayed_boundary.snapshot_before == replayed_boundary.snapshot_after
+            and replayed_boundary.conditions["NEW_PLAN_EXISTS"]
+            and wf.steps.get(replayed_boundary.chosen_transition) is not None
+            and wf.steps[replayed_boundary.chosen_transition].role == "worker"
+        ):
+            cumulative = _cumulative_review_attempt(
+                state,
+                original_plan_path=original_plan_path,
+                completed_snapshot=replayed_boundary.snapshot_after,
+            )
+            if (
+                cumulative is None
+                or replayed_rejection.scope_id != cumulative[0]
+                or replayed_rejection.reviewed_implementation_turn_number
+                != cumulative[1].turn_number
+                or replayed_rejection.reviewed_attempt_ordinal
+                != cumulative[1].attempt_ordinal
+                or replayed_rejection.reviewed_worker_team != cumulative[1].team
+                or replayed_rejection.reviewed_worker_selector != cumulative[1].selector
+            ):
+                raise WorkflowError(
+                    "cannot resume final-review rejection with ambiguous worker evidence",
+                    run_dir=run_paths.run_dir,
+                )
+            state.implementation_attempts.setdefault(cumulative[0], [cumulative[1]])
+            _append_replayed_review_rejection(state, replayed_rejection)
         if (
             replayed_rejection is not None
             and replay_scope is not None
@@ -13807,14 +13978,50 @@ def _run_workflow_unchecked(
                 and controller_next_step is not None
                 and controller_next_step.role == "worker"
             )
-            if is_scoped_rejection:
-                attempts = state.implementation_attempts.get(scope_before_finalize.scope_id, [])
+            cumulative_review = (
+                current_step_name == "final_review"
+                and step.role in {"architect", "final_reviewer"}
+                and scope_before_finalize is None
+                and done
+                and review_overlay_at_expected_path
+                and new_plan_exists
+                and snapshot_before == post_snapshot
+                and controller_next_step is not None
+                and controller_next_step.role == "worker"
+            )
+            cumulative_attempt = (
+                _cumulative_review_attempt(
+                    state,
+                    original_plan_path=original_plan_path,
+                    completed_snapshot=post_snapshot,
+                )
+                if cumulative_review else None
+            )
+            if is_scoped_rejection or cumulative_attempt is not None:
+                rejection_scope_id = (
+                    scope_before_finalize.scope_id
+                    if is_scoped_rejection and scope_before_finalize is not None
+                    else cumulative_attempt[0]
+                )
+                attempts = (
+                    state.implementation_attempts.get(rejection_scope_id, [])
+                    if is_scoped_rejection
+                    else [cumulative_attempt[1]]
+                )
                 if not attempts:
                     raise WorkflowError(
                         "internal error: review rejection has no implementation attempt",
                         run_dir=run_paths.run_dir,
                     )
                 reviewed_attempt = attempts[-1]
+                if cumulative_attempt is not None and not is_scoped_rejection:
+                    # The first cumulative review links the final checkpoint's
+                    # accepted worker into its own durable repair lineage.
+                    # Later review retries of that same worker earn no new
+                    # rejection credit.
+                    state.implementation_attempts.setdefault(
+                        rejection_scope_id, [reviewed_attempt],
+                    )
                 repair_path = new_plan_path if new_plan_exists else None
                 try:
                     repair_path_text = str(repair_path.relative_to(run_paths.repo_root)) if repair_path else None
@@ -13822,29 +14029,42 @@ def _run_workflow_unchecked(
                     repair_path_text = str(repair_path) if repair_path else None
                 matching = [
                     item.rejection_number for item in state.review_rejection_history
-                    if item.scope_id == scope_before_finalize.scope_id
+                    if item.scope_id == rejection_scope_id
                 ]
-                review_rejection = ReviewRejectionRecord(
-                    scope_id=scope_before_finalize.scope_id,
-                    rejection_number=max(matching, default=0) + 1,
-                    source_run_id=state.run_id or run_paths.run_dir.name,
-                    review_turn_number=turn_number,
-                    review_step_name=current_step_name,
-                    reviewer_selector=selector,
-                    checkpoint_index=scope_before_finalize.checkpoint_index,
-                    checkpoint_name=scope_before_finalize.checkpoint_name,
-                    reviewed_implementation_turn_number=reviewed_attempt.turn_number,
-                    reviewed_worker_team=reviewed_attempt.team,
-                    reviewed_worker_selector=reviewed_attempt.selector,
-                    reviewed_attempt_ordinal=reviewed_attempt.attempt_ordinal,
-                    review_summary=summarize_review_rejection(completed.stdout),
-                    repair_plan_summary=summarize_repair_plan(repair_path),
-                    review_stdout_artifact_path=_turn_artifact_display_path(
-                        run_paths.repo_root, turn_dir, "stdout.txt",
-                        content=completed.stdout,
-                    ),
-                    repair_plan_path=repair_path_text,
+                already_rejected = any(
+                    item.scope_id == rejection_scope_id
+                    and item.reviewed_attempt_ordinal == reviewed_attempt.attempt_ordinal
+                    and item.reviewed_implementation_turn_number == reviewed_attempt.turn_number
+                    for item in state.review_rejection_history
                 )
+                if is_scoped_rejection or not already_rejected:
+                    review_rejection = ReviewRejectionRecord(
+                        scope_id=rejection_scope_id,
+                        rejection_number=max(matching, default=0) + 1,
+                        source_run_id=state.run_id or run_paths.run_dir.name,
+                        review_turn_number=turn_number,
+                        review_step_name=current_step_name,
+                        reviewer_selector=selector,
+                        checkpoint_index=(
+                            scope_before_finalize.checkpoint_index
+                            if is_scoped_rejection and scope_before_finalize is not None else None
+                        ),
+                        checkpoint_name=(
+                            scope_before_finalize.checkpoint_name
+                            if is_scoped_rejection and scope_before_finalize is not None else None
+                        ),
+                        reviewed_implementation_turn_number=reviewed_attempt.turn_number,
+                        reviewed_worker_team=reviewed_attempt.team,
+                        reviewed_worker_selector=reviewed_attempt.selector,
+                        reviewed_attempt_ordinal=reviewed_attempt.attempt_ordinal,
+                        review_summary=summarize_review_rejection(completed.stdout),
+                        repair_plan_summary=summarize_repair_plan(repair_path),
+                        review_stdout_artifact_path=_turn_artifact_display_path(
+                            run_paths.repo_root, turn_dir, "stdout.txt",
+                            content=completed.stdout,
+                        ),
+                        repair_plan_path=repair_path_text,
+                    )
 
             _finalize_turn_record(
                 status="completed" if done or limit_terminal else "running",

@@ -696,6 +696,16 @@ an active scope awaits review, with a prior worker attempt, an unchanged
 original snapshot, and a selected worker transition. A checked original box
 does not mean the reviewer accepted the implementation. A clean approval or a
 final architect follow-up does not create a checkpoint rejection.
+After all original checkpoints are approved, a final reviewer creating the
+expected focused overlay can instead create a separate cumulative rejection.
+The original must remain complete and unchanged in checkpoint state, the
+transition must target a worker, and the retained final-checkpoint worker
+attempt must have exact team, selector and ordinal evidence. The controller
+stores that attempt under a stable completed-plan scope and records the final
+review rejection there. An unmatched overlay, clean approval or missing worker
+evidence earns no credit. Resume retains the record and focused overlay; a
+repeated review of the same worker attempt cannot count twice. This evidence
+does not itself select the follow-up worker.
 For newly finalized reviewer turns, the controller stores an explicit
 `review_rejection` object (or JSON `null`) in `result.json` and retains the
 scope history in `run.json`. It records bounded plain-text reviewer and repair

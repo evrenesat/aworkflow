@@ -4510,3 +4510,15 @@ HISTORY: Published clipboard history `c14f1f2`/`cd78d53` remains separate and mu
   change. The approved demo SHA-256 is unchanged at
   `2465c0ac2bfef90af2b98a537ad5ac3e931b927c23a78379a8c532ce4dcbadf4`.
   Deployment and physical-device checks remain separate gates.
+
+## 2026-09-25 — Final-review repair evidence, checkpoint 1
+
+- A completed three-checkpoint plan now records a validated final-review fix
+  overlay as a separate cumulative rejection tied to its exact final worker
+  attempt. Checkpoint approval state stays closed, and retrying the same review
+  cannot add repair credit.
+- Resume accepts the focused overlay when the persisted rejection and worker
+  evidence agree. Clean approval, unmatched overlays, changed original
+  checkpoint state and missing worker evidence create no rejection.
+- Focused verification: 88 tests passed across repair upgrades and both resume
+  suites. Worker routing remains the next checkpoint's work.

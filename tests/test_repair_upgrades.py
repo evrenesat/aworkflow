@@ -61,6 +61,18 @@ _REPAIR_PLAN = """# Repair
 - [ ] repair the first checkpoint
 """
 
+_CUMULATIVE_PLAN = """# Cumulative plan
+
+### [ ] Checkpoint 1: First
+- [ ] first
+
+### [ ] Checkpoint 2: Second
+- [ ] second
+
+### [ ] Checkpoint 3: Third
+- [ ] third
+"""
+
 
 def _workflow_config(
     *, manager_enabled: bool, threshold: int,
@@ -177,6 +189,168 @@ def _attempt(
         outcome=outcome,
         attempt_ordinal=ordinal,
     )
+
+
+@pytest.mark.parametrize(
+    "scenario", ["rejection", "clean", "unmatched", "changed_original", "no_attempt", "ambiguous_resume"],
+)
+def test_completed_plan_final_review_attribution(
+    tmp_path: Path, scenario: str, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    plan_path = tmp_path / "plan.md"
+    plan_path.write_text(_CUMULATIVE_PLAN, encoding="utf-8")
+    config = _workflow_config(manager_enabled=False, threshold=0)
+    base_team = config.teams["base"]
+    config = replace(config, teams={
+        **config.teams,
+        "base": replace(base_team, roles={
+            **base_team.roles, "architect": "codex.final-reviewer",
+        }),
+    })
+    workflow = config.workflows["repair"]
+    steps = dict(workflow.steps)
+    steps["implement"] = replace(steps["implement"], go=(GoTransition(to="review"),))
+    steps["review"] = replace(steps["review"], go=(
+        GoTransition(to="final_review", when="DONE"),
+        GoTransition(to="implement"),
+    ))
+    steps["final_review"] = WorkflowStepConfig(
+        role="architect", prompts=("p",),
+        go=(GoTransition(to="implement", when="NEW_PLAN_EXISTS"), GoTransition(to="END")),
+    )
+    config = replace(config, workflows={"repair": replace(workflow, steps=steps)})
+
+    if scenario == "no_attempt":
+        original_write = RunMetadataWriter.write
+
+        def erase_attempts(writer: RunMetadataWriter, **kwargs: object) -> None:
+            if kwargs.get("current_step_name") == "final_review" and writer.state is not None:
+                writer.state.implementation_attempts.clear()
+            original_write(writer, **kwargs)
+
+        monkeypatch.setattr(RunMetadataWriter, "write", erase_attempts)
+
+    class StopBeforeRepair(BaseException):
+        pass
+
+    workers = 0
+    models: list[str] = []
+
+    def runner(argv: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+        nonlocal workers
+        model = argv[argv.index("--model") + 1]
+        models.append(model)
+        if model == "worker-base":
+            if workers == 3:
+                raise StopBeforeRepair
+            workers += 1
+            text = plan_path.read_text(encoding="utf-8")
+            plan_path.write_text(
+                text.replace(
+                    f"### [ ] Checkpoint {workers}: ",
+                    f"### [x] Checkpoint {workers}: ",
+                ).replace(f"- [ ] {('first', 'second', 'third')[workers - 1]}",
+                          f"- [x] {('first', 'second', 'third')[workers - 1]}"),
+                encoding="utf-8",
+            )
+        elif model == "final-reviewer":
+            if scenario == "changed_original":
+                plan_path.write_text(_CUMULATIVE_PLAN, encoding="utf-8")
+            if scenario in {"rejection", "changed_original", "no_attempt", "ambiguous_resume"}:
+                (tmp_path / "plan-cp01-v01.md").write_text(_REPAIR_PLAN, encoding="utf-8")
+            if scenario == "unmatched":
+                (tmp_path / "plan-other.md").write_text(_REPAIR_PLAN, encoding="utf-8")
+        return subprocess.CompletedProcess(argv, 0, "synthetic output", "")
+
+    try:
+        run_workflow(
+            config=ControllerConfig(repo_root=tmp_path, plan_path=plan_path,
+                                    max_turns=9, team="base"),
+            workflow_config=config, workflow_name="repair", config_dir=tmp_path,
+            snapshot_config=False, adapter=CodexAdapter(), runner=runner,
+        )
+    except StopBeforeRepair:
+        pass
+
+    run_dir = next((tmp_path / ".aflow" / "runs").iterdir())
+    review = json.loads((run_dir / "turns" / "turn-007" / "result.json").read_text())
+    run = json.loads((run_dir / "run.json").read_text())
+    if scenario in {"rejection", "ambiguous_resume"}:
+        rejection = review["review_rejection"]
+        assert rejection["scope_id"] == f"{plan_path}::cumulative-review"
+        assert rejection["checkpoint_index"] is None
+        assert rejection["reviewed_implementation_turn_number"] == 5
+        assert rejection["reviewed_worker_selector"] == "codex.worker-base"
+        assert rejection["reviewed_attempt_ordinal"] == 1
+        assert run["review_rejection_history"] == [rejection]
+        assert run["implementation_attempts"][rejection["scope_id"]][0]["turn_number"] == 5
+        assert models[-1] == "worker-base"
+        fields = manager_resume_fields(run)
+        assert fields["review_rejection_history"][0] == ReviewRejectionRecord(**rejection)
+        assert fields["implementation_attempts"][rejection["scope_id"]][0].turn_number == 5
+        policy = _policy(
+            threshold=0,
+            scope_id=rejection["scope_id"],
+            attempts=list(fields["implementation_attempts"][rejection["scope_id"]]),
+            rejections=list(fields["review_rejection_history"]),
+        )
+        assert policy.active and policy.repair_ordinal == 1
+        replay_state = ControllerState(last_snapshot=PlanSnapshot(None, 0, 3, True))
+        replay_state.review_rejection_history = list(fields["review_rejection_history"])
+        assert not _append_replayed_review_rejection(
+            replay_state,
+            replace(fields["review_rejection_history"][0],
+                    rejection_number=2, review_turn_number=8),
+        )
+        assert len(replay_state.review_rejection_history) == 1
+        (run_dir / "run.json").write_text(
+            json.dumps({**run, "status": "interrupted"}) + "\n", encoding="utf-8",
+        )
+        if scenario == "ambiguous_resume":
+            attempts = fields["implementation_attempts"][rejection["scope_id"]]
+            fields["implementation_attempts"] = {
+                **fields["implementation_attempts"],
+                rejection["scope_id"]: (*attempts, attempts[0]),
+            }
+        resume = _mark_validated_resume_context(ResumeContext(
+            resumed_from_run_id=run_dir.name,
+            feature_branch=None, worktree_path=None, main_branch=None,
+            setup=(), teardown=(),
+            active_plan_path=tmp_path / "plan-cp01-v01.md",
+            interrupted_step_name="implement",
+            effective_max_turns=9,
+            **fields,
+        ))
+        if scenario == "ambiguous_resume":
+            with pytest.raises(WorkflowError, match="ambiguous worker or overlay evidence"):
+                run_workflow(
+                    config=ControllerConfig(repo_root=tmp_path, plan_path=plan_path,
+                                            max_turns=9, team="base"),
+                    workflow_config=config, workflow_name="repair", config_dir=tmp_path,
+                    snapshot_config=False, adapter=CodexAdapter(), runner=runner,
+                    resume=resume,
+                )
+            return
+        with pytest.raises(StopBeforeRepair):
+            run_workflow(
+                config=ControllerConfig(repo_root=tmp_path, plan_path=plan_path,
+                                        max_turns=9, team="base"),
+                workflow_config=config, workflow_name="repair", config_dir=tmp_path,
+                snapshot_config=False, adapter=CodexAdapter(), runner=runner,
+                resume=resume,
+            )
+        successor = next(
+            path for path in (tmp_path / ".aflow" / "runs").iterdir()
+            if path != run_dir
+        )
+        resumed = json.loads((successor / "run.json").read_text())
+        assert resumed["review_rejection_history"] == [rejection]
+        assert resumed["implementation_attempts"][rejection["scope_id"]] == [
+            run["implementation_attempts"][rejection["scope_id"]][0]
+        ]
+    else:
+        assert review["review_rejection"] is None
+        assert run["review_rejection_history"] == []
 
 
 def _policy(

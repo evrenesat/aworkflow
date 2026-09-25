@@ -674,6 +674,15 @@ Each controller-confirmed rejection is persisted as a bounded
 `ReviewRejectionRecord` in `run.json` and in the reviewer turn artifact. The
 record identifies the reviewed worker and source run, while the raw reviewer
 stdout remains the durable detailed evidence.
+After the final checkpoint is approved, a completed-plan final reviewer can
+request a focused repair without reopening that checkpoint scope. The
+controller links an expected new overlay and unchanged completed checkpoint state to
+the retained accepted worker from the final checkpoint, then persists one
+separate `::cumulative-review` rejection lineage. The exact worker attempt,
+team and selector remain in the existing attempt and rejection ledgers. Resume
+admits the focused overlay only when those records agree; review retries of the
+same attempt do not create another rejection. Worker selection from this
+cumulative evidence is a separate routing boundary.
 
 ## Module Breakdown
 
