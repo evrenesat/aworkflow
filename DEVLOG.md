@@ -1,5 +1,19 @@
 # DEVLOG
 
+## 2026-09-24 — Background automatic plan consumption (Checkpoint 5)
+
+- Added server-owned, per-project scanner election and stable two-scan
+  observation for direct in-progress plans. API mutations and filesystem
+  plan/run artifacts wake the scanner; periodic passes cover missed events.
+- Automatic starts use the managed control-plane path with a durable plan key;
+  the daemon resolves the current global default workflow/team and requires
+  isolated worktree lifecycle.
+  Admission rechecks plan bytes and opt-out under the shared project lock.
+- Added focused process, restart, capacity, opt-out, file-change, invalid-plan,
+  and transport-boundary tests. Scanner shutdown leaves workflow units running.
+- Serialized shared-main publication with a separate primary-root lock; the
+  admission lock is never held for fetch, merge, or push.
+
 ## 2026-09-24 — Admit numbered plans after delivered predecessors (Checkpoint 4)
 
 - Added a durable series inventory at the shared admission lock. Known lower

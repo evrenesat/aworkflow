@@ -2,15 +2,21 @@
 from __future__ import annotations
 
 from collections.abc import Callable
+from contextlib import contextmanager
 from dataclasses import dataclass
+import fcntl
 import hashlib
 import json
 import os
 from pathlib import Path
 import re
 import shutil
+import stat
 import subprocess
 import tempfile
+from typing import Iterator
+
+from aflow.project_settings import ProjectSettingsError, resolve_project_identity
 
 
 class PublicationError(RuntimeError):
@@ -1066,6 +1072,45 @@ def finalize_completed_plan(
     )
 
 
+@contextmanager
+def _publication_lock(root: Path) -> Iterator[None]:
+    """Serialize shared-main publication across independent worktree workers."""
+    try:
+        primary = resolve_project_identity(root).primary_root
+    except ProjectSettingsError as exc:
+        raise PublicationError("publication project identity is unavailable") from exc
+    directory = primary / ".aflow"
+    if directory.is_symlink():
+        raise PublicationError("publication state directory is unsafe")
+    try:
+        directory.mkdir(mode=0o700, exist_ok=True)
+    except OSError as exc:
+        raise PublicationError("publication state directory is unavailable") from exc
+    if not directory.is_dir() or directory.is_symlink():
+        raise PublicationError("publication state directory is unsafe")
+    try:
+        descriptor = os.open(
+            directory / "publication.lock",
+            os.O_RDWR | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0), 0o600,
+        )
+    except OSError as exc:
+        raise PublicationError("publication lock is unavailable") from exc
+    try:
+        info = os.fstat(descriptor)
+        if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
+            raise PublicationError("publication lock is unsafe")
+        try:
+            fcntl.flock(descriptor, fcntl.LOCK_EX)
+        except OSError as exc:
+            raise PublicationError("publication lock is unavailable") from exc
+        try:
+            yield
+        finally:
+            fcntl.flock(descriptor, fcntl.LOCK_UN)
+    finally:
+        os.close(descriptor)
+
+
 def publish_completed_run(root: Path, run_dir: Path, *, source_ref: str = "HEAD") -> str | None:
     """Publish only after verified plan completion; never mutate the execution tree.
 
@@ -1076,6 +1121,13 @@ def publish_completed_run(root: Path, run_dir: Path, *, source_ref: str = "HEAD"
     branch = _git(root, "config", "--local", "--get", "aflow.publishBranch", optional=True)
     if not remote and not branch:
         return None
+    with _publication_lock(root):
+        return _publish_completed_run_locked(root, run_dir, source_ref, remote, branch)
+
+
+def _publish_completed_run_locked(
+    root: Path, run_dir: Path, source_ref: str, remote: str, branch: str,
+) -> str:
     _require_no_other_failed_publication(run_dir)
     path = run_dir / "publication.json"
     receipt = _load_receipt(path)

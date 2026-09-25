@@ -9,6 +9,9 @@
 - Keep provider-independent plan routes and daemon-backed lifecycle routes separate, with the shared bearer-or-browser-session dependency in `main.py`. MCP transports stay header-only: the `/mcp` mount never accepts the session cookie.
 - Browser sessions (`browser_session.py`) are signed HMAC-SHA256 cookies derived from the current deployment token; they never contain it, expire after 30 days, roll forward only on `X-AFlow-Activity: 1` responses, and require exact same-origin `Origin` for cookie-authenticated unsafe methods. Session endpoints send `Cache-Control: no-store`.
 - Lifecycle endpoints call `ControlPlaneService`, then daemon/application services. They do not start workflow subprocesses, write run state, or invent run identities in the HTTP layer.
+- The app lifespan owns `PlanConsumer`: it scans registered primary projects,
+  calls `ControlPlaneService.start_run` for eligible stable plans, and releases
+  only scanner ownership on shutdown. Plan mutations may wake the scanner.
 - The versioned project registry is the explicit allowlist beneath one configured managed root. Resolve exact registry records only; reject URL tokens, arbitrary roots, traversal, and unsafe plan paths.
 - `plan_service.py` edits only direct regular Markdown files in the five lifecycle directories (`todo`, `in-progress`, `done`, `failed`, `needs-plan-change`). Preserve expected-revision checks and source bytes on rejected writes or moves. Failed/invalid classification and requeue use the shared lifecycle journal and admission guard; transport resumes recorded eligible lineage through the control plane.
 - `skill_service.py` is a thin facade over the shared `aflow.skill_store` and

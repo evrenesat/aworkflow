@@ -1396,6 +1396,23 @@ dependency. Delivery checks read verified project worktrees even when the next
 launch uses a different checkout; inventory discovery still touches only the
 primary and launching checkout.
 
+`plan_consumer.py` is owned by the app server lifespan. A nonblocking file lock
+in each registered primary project's `.aflow` directory elects one scanner
+across server processes. Five-second scans require unchanged regular-file
+identity and content in `plans/in-progress` across two observations. The
+consumer rechecks the content revision, plan identity, and project opt-out
+under admission, then calls the existing control-plane start service with a
+stable key derived from plan identity. It checks the saved global default
+before dispatch; the daemon resolves that
+default and its team again for admission. Only isolated worktree delivery
+workflows are eligible. The consumer holds no publication or provider lock;
+capacity and plan claims remain with project admission, and the controller
+continues to own publication. Publication itself holds a separate primary-root
+file lock across fetch, reconciliation, push, and receipt so concurrent
+worktree runs serialize shared-main delivery. Plan and run-artifact watches wake
+the relevant project scanner between bounded periodic passes. Server shutdown releases scanner ownership
+without stopping already launched workflow units.
+
 `project_config_service.py` owns exactly `.aflow/config/aflow.toml` and
 `.aflow/config/workflows.toml` as one validated revisioned pair. Configuration
 reads, commits, capability loads, and launch reservation share one per-project

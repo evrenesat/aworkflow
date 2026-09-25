@@ -152,6 +152,10 @@ class ControlPlaneService:
         with self._project_locks_guard:
             return self._project_locks.setdefault(project_id, RLock())
 
+    @property
+    def workflow_config_path(self) -> Path:
+        return self._workflow_config_path
+
     def _validate_shared_release_inputs(self) -> None:
         """Canonicalize immutable process inputs once for all project daemons."""
         assert self._aflow_executable is not None
@@ -397,6 +401,9 @@ class ControlPlaneService:
         dirty_worktree_confirmed: bool = False,
         idempotency_key: str | None = None,
         caller_scope: str = "rest",
+        expected_plan_revision: str | None = None,
+        expected_plan_identity: str | None = None,
+        automatic: bool = False,
     ) -> StartRunResult | StartupQuestionRecord:
         with self.project_lock(project_id):
             item = self._project(project_id)
@@ -417,6 +424,9 @@ class ControlPlaneService:
                 request,
                 caller_scope=self._caller_scope(project_id, caller_scope),
                 idempotency_key=idempotency_key,
+                expected_plan_revision=expected_plan_revision,
+                expected_plan_identity=expected_plan_identity,
+                automatic=automatic,
             )
 
     def answer_startup(

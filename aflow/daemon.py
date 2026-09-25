@@ -85,6 +85,7 @@ from aflow.project_admission import (
     ProjectAdmission,
     ProjectAdmissionError,
     ProjectCapacityReached,
+    ProjectAutomaticPlanChanged,
 )
 from aflow.control_plane.units import UnitManager, UnitState
 from aflow.git_status import WorktreePreflight
@@ -425,6 +426,9 @@ class DaemonService:
         plan_path: Path,
         idempotency_key: str | None,
         source_run_id: str | None = None,
+        expected_plan_revision: str | None = None,
+        expected_plan_identity: str | None = None,
+        automatic: bool = False,
     ):
         """Ensure one daemon request owns a shared project reservation."""
         try:
@@ -433,6 +437,9 @@ class DaemonService:
                 plan_path=plan_path,
                 idempotency_key=idempotency_key,
                 source_run_id=source_run_id,
+                expected_plan_revision=expected_plan_revision,
+                expected_plan_identity=expected_plan_identity,
+                automatic=automatic,
             )
         except ProjectCapacityReached as exc:
             raise DaemonStartupError(
@@ -576,11 +583,22 @@ class DaemonService:
         *,
         caller_scope: str = "local",
         idempotency_key: str | None = None,
+        expected_plan_revision: str | None = None,
+        expected_plan_identity: str | None = None,
+        automatic: bool = False,
     ) -> StartRunResult | StartupQuestionRecord:
         """Reserve durable intent before evaluating the interactive startup gate."""
         lineage_lock = self._durable_lock(".restart-locks", validate_run_id(request.restarted_from_run_id)) if request.restarted_from_run_id else nullcontext()
         with self._lock, lineage_lock, self._idempotency_lock("start", caller_scope, idempotency_key):
-            self._refresh_workflow_config()
+            try:
+                self._refresh_workflow_config()
+            except DaemonError as exc:
+                if not automatic:
+                    raise
+                raise DaemonStartupError(
+                    None, "automatic default workflow configuration is unavailable",
+                    code="automatic_default_unavailable",
+                ) from exc
             normalized = self._normalize_request(
                 request,
                 caller_scope=caller_scope,
@@ -616,7 +634,33 @@ class DaemonService:
                 self._transient_extra_instructions[existing.run_id] = normalized.extra_instructions
                 return self._recover_start_manifest(existing, normalized, request_digest)
 
-            self._prepare_required_git_tracking_before_reservation(normalized)
+            if automatic:
+                name = self._workflow_config.aflow.default_workflow
+                workflow = self._workflow_config.workflows.get(name) if name else None
+                if (
+                    request.workflow_name is not None or request.team is not None
+                    or workflow is None
+                    or tuple(workflow.setup or ()) != ("worktree", "branch")
+                    or tuple(workflow.teardown or ()) != ("merge", "rm_worktree")
+                    or workflow.main_branch is None
+                    or not self._workflow_config.aflow.worktree_root
+                    or (workflow.team is not None and workflow.team not in self._workflow_config.teams)
+                ):
+                    raise DaemonStartupError(
+                        None, "automatic default workflow is unavailable or not isolated",
+                        code="automatic_default_unavailable",
+                    )
+            try:
+                if expected_plan_revision is not None:
+                    # Reject an external edit before daemon-owned preparation.
+                    self._admission._require_plan_revision_locked(
+                        normalized.plan_path, expected_plan_revision,
+                    )
+                prepared_revision = self._prepare_required_git_tracking_before_reservation(
+                    normalized, expected_plan_revision=expected_plan_revision,
+                )
+            except ProjectAdmissionError as exc:
+                raise DaemonStartupError(None, exc.safe_message, code=exc.code) from exc
             run_id = reserve_run_id(self._config.repo_root)
             effective_key = idempotency_key or f"daemon-{run_id}"
             reservation = self._ensure_admission(
@@ -624,6 +668,9 @@ class DaemonService:
                 plan_path=normalized.plan_path,
                 idempotency_key=effective_key,
                 source_run_id=normalized.restarted_from_run_id,
+                expected_plan_revision=prepared_revision or expected_plan_revision,
+                expected_plan_identity=expected_plan_identity,
+                automatic=automatic,
             )
             self._transient_extra_instructions[run_id] = normalized.extra_instructions
             try:
@@ -1377,7 +1424,9 @@ class DaemonService:
     def _prepare_required_git_tracking_before_reservation(
         self,
         request: StartupRequest,
-    ) -> None:
+        *,
+        expected_plan_revision: str | None = None,
+    ) -> str | None:
         """Normalize required plan metadata before daemon run allocation."""
         workflow_name = (
             request.workflow_name or self._workflow_config.aflow.default_workflow
@@ -1407,9 +1456,16 @@ class DaemonService:
         )
 
         if not _workflow_requires_git_tracking(workflow, self._workflow_config):
-            return
+            return None
         try:
             source_bytes = request.plan_path.read_bytes()
+            if (
+                expected_plan_revision is not None
+                and hashlib.sha256(source_bytes).hexdigest() != expected_plan_revision
+            ):
+                raise ProjectAutomaticPlanChanged(
+                    "automatic plan changed before Git Tracking preparation"
+                )
             plan_text = source_bytes.decode("utf-8")
             metadata = parse_git_tracking_metadata(plan_text)
             if metadata is not None:
@@ -1419,18 +1475,18 @@ class DaemonService:
                     parsed_plan = load_plan(request.plan_path)
                 except PlanParseError as exc:
                     if exc.error_kind == "inconsistent_checkpoint_state":
-                        return
+                        return None
                     raise
                 if (
                     metadata.plan_branch != ""
                     and metadata.pre_handoff_base_head != ""
                 ):
-                    return
+                    return None
                 if not is_handoff_pristine_for_base_refresh(
                     metadata,
                     parsed_plan.sections,
                 ):
-                    return
+                    return None
             repo_state = probe_repo_state(self._config.repo_root)
             needs_bootstrap = _lifecycle_is_bootstrap_eligible(workflow, repo_state)
             _backup_original_plan(
@@ -1439,6 +1495,7 @@ class DaemonService:
                 event="startup_preparation",
             )
             parsed_plan = load_plan(request.plan_path)
+            normalized_revision: list[str] = []
             _prepare_required_git_tracking_before_allocation(
                 repo_root=self._config.repo_root,
                 original_plan_path=request.plan_path,
@@ -1454,7 +1511,9 @@ class DaemonService:
                 is_resume=request.resume_requested,
                 startup_retry=None,
                 expected_plan_bytes=source_bytes,
+                normalized_revision=normalized_revision,
             )
+            return normalized_revision[0] if expected_plan_revision is not None and normalized_revision else None
         except PlanAdmissionError as exc:
             _logger.warning(
                 "startup plan admission rejected before run reservation",

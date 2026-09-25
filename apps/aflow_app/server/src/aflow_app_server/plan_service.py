@@ -377,15 +377,23 @@ def resume_requeued_plan(
 class PlanService:
     """Manage only direct regular Markdown files in canonical plan directories."""
 
-    def __init__(self, registry: ProjectRegistry, *, max_plan_bytes: int = _MAX_PLAN_BYTES) -> None:
+    def __init__(
+        self, registry: ProjectRegistry, *, max_plan_bytes: int = _MAX_PLAN_BYTES,
+        on_change: Callable[[str], None] | None = None,
+    ) -> None:
         self._registry = registry
         self._max_plan_bytes = max_plan_bytes
+        self._on_change = on_change
         self._locks_guard = RLock()
         self._locks: dict[str, RLock] = {}
 
     def _project_lock(self, project_id: str) -> RLock:
         with self._locks_guard:
             return self._locks.setdefault(project_id, RLock())
+
+    def _notify_change(self, project_id: str) -> None:
+        if self._on_change is not None:
+            self._on_change(project_id)
 
     def list(self, project_id: str, status_filter: PlanStatus | None = None) -> tuple[PlanDocument, ...]:
         with self._project_lock(project_id):
@@ -545,6 +553,8 @@ class PlanService:
             current = self._read_regular(path)
             self._require_revision(current, expected_revision)
             self._atomic_write(path, data, replace=True)
+            if status_value == "in_progress":
+                self._notify_change(project_id)
             return self._document(project_id, status_value, name, data, include_content=True)
 
     def promote(self, project_id: str, status_value: PlanStatus, name: str, expected_revision: str, target_name: str | None = None) -> PlanDocument:
@@ -633,6 +643,7 @@ class PlanService:
                             "plan promotion metadata rollback failed"
                         ) from metadata_rollback_error
                 raise PlanServiceError("plan promotion failed") from exc
+            self._notify_change(project_id)
             return self._document(project_id, target_status, target_name, current, include_content=True)
 
     def classify(

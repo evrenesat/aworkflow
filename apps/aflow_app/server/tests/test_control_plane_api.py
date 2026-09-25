@@ -38,6 +38,7 @@ from aflow.control_plane.persistent_units import PersistentUnitManager
 from aflow.control_plane.units import InMemoryUnitManager, UnitState
 from aflow.daemon import (
     AflowDaemon,
+    DaemonStartupError,
     ExtraInstructionsValidationError,
     _validate_extra_instructions,
 )
@@ -722,6 +723,310 @@ def test_start_same_plan_with_another_key_returns_bounded_conflict(control_clien
     assert len(detail["message"]) <= 256
     assert len(units.start_calls) == 1
     assert ProjectAdmission(root, unit_manager=units).snapshot().occupied_count == 1
+
+
+def test_automatic_start_rechecks_revision_and_opt_out_in_real_service(control_client) -> None:
+    _, root, units, monkeypatch = control_client
+    from aflow_app_server import main
+    import hashlib
+
+    _commit_fixture_repository(root)
+    config_path = root.parent / "global" / "aflow.toml"
+    config_path.write_text(
+        config_path.read_text().replace(
+            '[aflow]\ndefault_workflow = "managed"',
+            '[aflow]\ndefault_workflow = "managed"\n'
+            f'worktree_root = "{root.parent / "worktrees"}"\n'
+            'team_lead = "worker"',
+        ),
+        encoding="utf-8",
+    )
+    workflow_path = config_path.with_name("workflows.toml")
+    workflow_path.write_text(
+        workflow_path.read_text().replace(
+            '[workflow.managed.steps.implement]',
+            '[workflow.managed]\nsetup = ["worktree", "branch"]\n'
+            'teardown = ["merge", "rm_worktree"]\nmain_branch = "main"\n'
+            '[workflow.managed.steps.implement]',
+        ),
+        encoding="utf-8",
+    )
+    source = root / "plans" / "todo" / "test-plan.md"
+    destination = root / "plans" / "in-progress" / source.name
+    destination.parent.mkdir()
+    source.rename(destination)
+    from aflow.plan_backups import ensure_plan_identity
+
+    identity = ensure_plan_identity(root, destination)
+    assert main._control_plane_service is not None
+    service = main._control_plane_service
+    request = dict(
+        plan_path="plans/in-progress/test-plan.md", workflow_name=None,
+        team=None, start_step=None, max_turns=None, automatic=True,
+        expected_plan_identity=identity,
+    )
+    with pytest.raises(DaemonStartupError) as changed:
+        service.start_run(PROJECT_ID, idempotency_key="automatic-revision", **{
+            **request, "expected_plan_revision": "0" * 64,
+        })
+    assert changed.value.code == "project_automatic_plan_changed"
+    with pytest.raises(DaemonStartupError) as identity_changed:
+        service.start_run(PROJECT_ID, idempotency_key="automatic-identity", **{
+            **request,
+            "expected_plan_revision": hashlib.sha256(destination.read_bytes()).hexdigest(),
+            "expected_plan_identity": "0" * 32,
+        })
+    assert identity_changed.value.code == "project_automatic_plan_changed"
+    settings = ProjectSettingsService(root)
+    settings.save(
+        ProjectSettings(auto_consume_plans=False),
+        expected_revision=settings.read().revision,
+    )
+    with pytest.raises(DaemonStartupError) as disabled:
+        service.start_run(PROJECT_ID, idempotency_key="automatic-disabled", **{
+            **request,
+            "expected_plan_revision": hashlib.sha256(destination.read_bytes()).hexdigest(),
+        })
+    assert disabled.value.code == "project_automatic_disabled"
+    assert ProjectAdmission(root, unit_manager=units).snapshot().occupied_count == 0
+    assert units.start_calls == []
+    settings.save(ProjectSettings(), expected_revision=settings.read().revision)
+    monkeypatch.setattr("aflow.daemon.prepare_startup", _prepared)
+    started = service.start_run(PROJECT_ID, idempotency_key="automatic-valid", **{
+        **request,
+        "expected_plan_revision": hashlib.sha256(destination.read_bytes()).hexdigest(),
+    })
+    assert isinstance(started, StartRunResult)
+    assert started.created
+    assert len(units.start_calls) == 1
+    replayed = service.start_run(PROJECT_ID, idempotency_key="automatic-valid", **{
+        **request,
+        "expected_plan_revision": hashlib.sha256(destination.read_bytes()).hexdigest(),
+    })
+    assert isinstance(replayed, StartRunResult)
+    assert replayed.run_id == started.run_id
+    assert not replayed.created
+    assert len(units.start_calls) == 1
+
+
+def _automatic_review_plan_setup(root: Path) -> tuple[Path, Path]:
+    config_path = root.parent / "global" / "aflow.toml"
+    config_path.write_text(
+        config_path.read_text().replace(
+            '[aflow]\ndefault_workflow = "managed"',
+            '[aflow]\ndefault_workflow = "managed"\n'
+            f'worktree_root = "{root.parent / "worktrees"}"\n'
+            'team_lead = "worker"',
+        ).replace('p = "Work."', 'p = "Use aflow-review-checkpoint."'),
+        encoding="utf-8",
+    )
+    workflow_path = config_path.with_name("workflows.toml")
+    workflow_path.write_text(
+        workflow_path.read_text().replace(
+            '[workflow.managed.steps.implement]',
+            '[workflow.managed]\nsetup = ["worktree", "branch"]\n'
+            'teardown = ["merge", "rm_worktree"]\nmain_branch = "main"\n'
+            '[workflow.managed.steps.implement]',
+        ),
+        encoding="utf-8",
+    )
+    source = root / "plans" / "todo" / "test-plan.md"
+    destination = root / "plans" / "in-progress" / source.name
+    destination.parent.mkdir()
+    source.rename(destination)
+    return config_path, destination
+
+
+def test_consumer_starts_pristine_review_plan_once_after_tracking_preparation(control_client) -> None:
+    from aflow.plan import parse_git_tracking_metadata
+    from aflow.plan_backups import plan_identity_for_path
+    from aflow.plan_consumer import PlanConsumer
+    from aflow_app_server import main
+
+    _, root, units, monkeypatch = control_client
+    _commit_fixture_repository(root)
+    config_path, plan = _automatic_review_plan_setup(root)
+    assert parse_git_tracking_metadata(plan.read_text(encoding="utf-8")) is None
+    monkeypatch.setattr("aflow.daemon.prepare_startup", _prepared)
+    service = main._control_plane_service
+    assert service is not None
+    requests: list[tuple[str, str]] = []
+
+    def launch(project, path, key, revision, _workflow, _team, identity):
+        requests.append((key, revision))
+        return service.start_run(
+            project, plan_path=path, workflow_name=None, team=None,
+            start_step=None, max_turns=None, idempotency_key=key,
+            expected_plan_revision=revision, expected_plan_identity=identity,
+            automatic=True,
+        )
+
+    consumer = PlanConsumer(
+        projects=lambda: ((PROJECT_ID, root),), launch=launch,
+        classify_invalid=lambda *_: None, config_path=config_path,
+    )
+    try:
+        consumer.scan_once()
+        assert requests == []
+        consumer.scan_once()
+        assert len(requests) == 1
+        assert len(units.start_calls) == 1
+        metadata = parse_git_tracking_metadata(plan.read_text(encoding="utf-8"))
+        assert metadata is not None
+        assert metadata.pre_handoff_base_head
+        assert metadata.plan_branch is not None
+        key, scanned_revision = requests[0]
+        replayed = service.start_run(
+            PROJECT_ID, plan_path="plans/in-progress/test-plan.md",
+            workflow_name=None, team=None, start_step=None, max_turns=None,
+            idempotency_key=key, expected_plan_revision=scanned_revision,
+            expected_plan_identity=plan_identity_for_path(root, plan),
+            automatic=True,
+        )
+        assert isinstance(replayed, StartRunResult)
+        assert not replayed.created
+        consumer.scan_once()
+        assert len(requests) == 1
+        assert len(units.start_calls) == 1
+    finally:
+        consumer.stop()
+
+
+def test_consumer_rejects_external_edit_before_tracking_preparation(control_client) -> None:
+    from aflow.plan_consumer import PlanConsumer
+    from aflow_app_server import main
+
+    _, root, units, _ = control_client
+    _commit_fixture_repository(root)
+    config_path, plan = _automatic_review_plan_setup(root)
+    service = main._control_plane_service
+    assert service is not None
+    errors: list[str] = []
+
+    def launch(project, path, key, revision, _workflow, _team, identity):
+        plan.write_text(plan.read_text(encoding="utf-8") + "\nExternal edit.\n", encoding="utf-8")
+        try:
+            service.start_run(
+                project, plan_path=path, workflow_name=None, team=None,
+                start_step=None, max_turns=None, idempotency_key=key,
+                expected_plan_revision=revision, expected_plan_identity=identity,
+                automatic=True,
+            )
+        except DaemonStartupError as exc:
+            errors.append(exc.code)
+            raise
+        pytest.fail("changed source was admitted")
+
+    consumer = PlanConsumer(
+        projects=lambda: ((PROJECT_ID, root),), launch=launch,
+        classify_invalid=lambda *_: None, config_path=config_path,
+    )
+    try:
+        consumer.scan_once()
+        consumer.scan_once()
+        assert errors == ["project_automatic_plan_changed"]
+        assert units.start_calls == []
+        assert ProjectAdmission(root, unit_manager=units).snapshot().occupied_count == 0
+    finally:
+        consumer.stop()
+
+
+def test_automatic_admission_rejects_edit_after_tracking_preparation(control_client) -> None:
+    from hashlib import sha256
+    from aflow.daemon import DaemonService
+    from aflow.plan_backups import ensure_plan_identity
+    from aflow_app_server import main
+
+    _, root, units, monkeypatch = control_client
+    _commit_fixture_repository(root)
+    _, plan = _automatic_review_plan_setup(root)
+    identity = ensure_plan_identity(root, plan)
+    scanned_revision = sha256(plan.read_bytes()).hexdigest()
+    prepare = DaemonService._prepare_required_git_tracking_before_reservation
+
+    def edit_after_preparation(self, request, *, expected_plan_revision=None):
+        revision = prepare(
+            self, request, expected_plan_revision=expected_plan_revision,
+        )
+        assert revision is not None
+        plan.write_text(
+            plan.read_text(encoding="utf-8") + "\nExternal edit.\n",
+            encoding="utf-8",
+        )
+        return revision
+
+    monkeypatch.setattr(
+        DaemonService, "_prepare_required_git_tracking_before_reservation",
+        edit_after_preparation,
+    )
+    service = main._control_plane_service
+    assert service is not None
+    with pytest.raises(DaemonStartupError) as changed:
+        service.start_run(
+            PROJECT_ID, plan_path="plans/in-progress/test-plan.md",
+            workflow_name=None, team=None, start_step=None, max_turns=None,
+            idempotency_key="after-preparation", automatic=True,
+            expected_plan_revision=scanned_revision,
+            expected_plan_identity=identity,
+        )
+    assert changed.value.code == "project_automatic_plan_changed"
+    assert units.start_calls == []
+    assert ProjectAdmission(root, unit_manager=units).snapshot().occupied_count == 0
+
+
+def test_server_lifespan_owns_and_stops_plan_scanner(control_client, monkeypatch) -> None:
+    client, root, _, _ = control_client
+    from aflow_app_server import main
+
+    config = main._config
+    assert config is not None
+    config_path = root.parent / "global" / "aflow.toml"
+    config_path.write_text(
+        config_path.read_text().replace(
+            '[aflow]\ndefault_workflow = "managed"',
+            '[aflow]\ndefault_workflow = "managed"\n'
+            f'worktree_root = "{root.parent / "worktrees"}"\n'
+            'team_lead = "worker"',
+        ),
+        encoding="utf-8",
+    )
+    workflow_path = config_path.with_name("workflows.toml")
+    workflow_path.write_text(
+        '[workflow.managed]\nsetup = ["worktree", "branch"]\n'
+        'teardown = ["merge", "rm_worktree"]\nmain_branch = "main"\n'
+        '[workflow.managed.steps.implement]\nrole = "worker"\n'
+        'prompts = ["p"]\ngo = [{ to = "END", when = "DONE" }]\n',
+        encoding="utf-8",
+    )
+    calls: list[tuple[str, str]] = []
+
+    class FakeService:
+        workflow_config_path = config_path
+
+        def __init__(self, _config) -> None:
+            pass
+
+        def start(self) -> None:
+            pass
+
+        def projects(self):
+            return (SimpleNamespace(project_id=PROJECT_ID, root=str(root)),)
+
+        def start_run(self, project_id, **kwargs):
+            calls.append((project_id, kwargs["plan_path"]))
+            return StartRunResult(run_id="automatic-lifespan", created=True, status="starting")
+
+    monkeypatch.setattr(main, "_configured_config", config)
+    monkeypatch.setattr(main, "ControlPlaneService", FakeService)
+    with client:
+        plan = root / "plans" / "in-progress" / "automatic.md"
+        plan.parent.mkdir()
+        plan.write_text("# Work\n\n### [ ] Checkpoint 1: Work\n\n- [ ] Do work\n")
+        assert main._plan_consumer is not None
+        main._plan_consumer.scan_once()
+        main._plan_consumer.scan_once()
+        assert calls == [(PROJECT_ID, "plans/in-progress/automatic.md")]
+    assert main._plan_consumer is None
 
 
 def test_extra_instructions_validation_boundaries() -> None:

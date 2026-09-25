@@ -45,6 +45,7 @@ from aflow.daemon import (
     DurableRecoveryRejection,
     ExtraInstructionsValidationError,
 )
+from aflow.plan_consumer import PlanConsumer
 
 from .browser_session import (
     SESSION_COOKIE_NAME,
@@ -153,6 +154,7 @@ _global_config_service: Any = None
 _project_registry: ProjectRegistry | None = None
 _plan_service: PlanService | None = None
 _control_plane_service: ControlPlaneService | None = None
+_plan_consumer: PlanConsumer | None = None
 _seen_plugin_probe_fingerprints: set[str] = set()
 
 _EVENT_STREAM_POLL_INTERVAL_SECONDS = 0.1
@@ -546,7 +548,7 @@ class _MCPMount(Mount):
 async def lifespan(app: FastAPI):
     """Initialize canonical project, plan, config, and run services."""
     global _config, _project_registry, _plan_service, _control_plane_service
-    global _global_config_service
+    global _global_config_service, _plan_consumer
 
     if _configured_config is not None:
         _config = _configured_config
@@ -560,7 +562,6 @@ async def lifespan(app: FastAPI):
         _config.project_registry_path,
     )
     _project_registry = project_registry
-    _plan_service = PlanService(project_registry)
     service_config = ControlPlaneServiceConfig(
         registry=project_registry,
         aflow_executable=_config.aflow_executable,
@@ -584,6 +585,38 @@ async def lifespan(app: FastAPI):
         )
     _control_plane_service = ControlPlaneService(service_config)
     _control_plane_service.start()
+    control_plane = _control_plane_service
+
+    def _launch_automatic(
+        project_id: str, plan_path: str, key: str, revision: str,
+        _workflow_name: str, _team: str | None, identity: str,
+    ) -> object:
+        return control_plane.start_run(
+            project_id, plan_path=plan_path, workflow_name=None,
+            team=None, start_step=None, max_turns=None,
+            idempotency_key=key, expected_plan_revision=revision,
+            expected_plan_identity=identity,
+            automatic=True,
+        )
+
+    def _classify_invalid(project_id: str, name: str, revision: str) -> None:
+        assert _plan_service is not None
+        _plan_service.classify(
+            project_id, name, revision, target="needs_plan_change",
+            reason_code="plan_validation_failed",
+            reason="Plan content needs correction before automatic start.",
+        )
+
+    _plan_consumer = PlanConsumer(
+        projects=lambda: (
+            (project.project_id, Path(project.root))
+            for project in control_plane.projects()
+        ),
+        launch=_launch_automatic,
+        classify_invalid=_classify_invalid,
+        config_path=control_plane.workflow_config_path,
+    )
+    _plan_service = PlanService(project_registry, on_change=_plan_consumer.wake)
     from .config import global_config_dir
 
     _global_config_service = GlobalConfigService(
@@ -591,9 +624,13 @@ async def lifespan(app: FastAPI):
         audit_path=_config.config_audit_path,
     )
     try:
+        _plan_consumer.start()
         async with mcp_http_app.lifespan(app):
             yield
     finally:
+        if _plan_consumer is not None:
+            _plan_consumer.stop()
+        _plan_consumer = None
         _config = None
         _project_registry = None
         _plan_service = None

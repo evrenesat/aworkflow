@@ -5405,6 +5405,7 @@ def _prepare_required_git_tracking_before_allocation(
     terminal_completion_resume: bool = False,
     planned_execution_branch: str | None = None,
     expected_plan_bytes: bytes | None = None,
+    normalized_revision: list[str] | None = None,
 ) -> tuple[ParsedPlan, bool]:
     """Normalize required Git Tracking metadata before durable run allocation."""
     if terminal_completion_resume:
@@ -5533,6 +5534,8 @@ def _prepare_required_git_tracking_before_allocation(
         if reloaded_plan.snapshot != parsed_plan.snapshot:
             raise WorkflowError("Git Tracking normalization changed the checkpoint snapshot")
 
+        if normalized_revision is not None:
+            normalized_revision.append(hashlib.sha256(updated_text.encode("utf-8")).hexdigest())
         return reloaded_plan, deferred_base_head
 
     if is_resume or startup_retry is not None:
@@ -5593,6 +5596,8 @@ def _prepare_required_git_tracking_before_allocation(
     if reloaded_plan.snapshot != parsed_plan.snapshot:
         raise WorkflowError("Git Tracking normalization changed the checkpoint snapshot")
 
+    if normalized_revision is not None:
+        normalized_revision.append(hashlib.sha256(updated_text.encode("utf-8")).hexdigest())
     return reloaded_plan, deferred_base_head
 
 

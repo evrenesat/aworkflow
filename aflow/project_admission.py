@@ -39,6 +39,7 @@ from aflow.control_plane.repository import (
 )
 from aflow.control_plane.worker_diagnostics import confirmed_inactive
 from aflow.process_identity import process_birth_identity, process_liveness
+from aflow.plan_backups import plan_identity_for_path
 from aflow.plan_dependencies import PlanDependencies, PlanDependencyBlocked, PlanDependencyError
 from aflow.project_settings import (
     ProjectSettingsError,
@@ -102,6 +103,18 @@ class ProjectPlanDependencyBlocked(ProjectAdmissionConflict):
     """A known series predecessor has not completed delivery."""
 
     code = "project_plan_dependency_blocked"
+
+
+class ProjectAutomaticDisabled(ProjectAdmissionConflict):
+    """Project scheduling was disabled before automatic reservation."""
+
+    code = "project_automatic_disabled"
+
+
+class ProjectAutomaticPlanChanged(ProjectAdmissionConflict):
+    """The stable scan no longer matches the admission-time plan bytes."""
+
+    code = "project_automatic_plan_changed"
 
 
 class ProjectCapacityReached(ProjectAdmissionError):
@@ -504,6 +517,8 @@ class ProjectAdmission:
         # while the shared admission lock is held.
         predecessor_inactive_proven: bool = False,
         automatic: bool = False,
+        expected_plan_revision: str | None = None,
+        expected_plan_identity: str | None = None,
         _direct_resume_proof: object | None = None,
     ) -> AdmissionReservation:
         """Atomically reserve one slot, or replay its existing reservation."""
@@ -554,6 +569,26 @@ class ProjectAdmission:
                 )
                 if current.state in _LIVE_RESERVATION_STATES:
                     return current
+
+            if expected_plan_revision is not None:
+                self._require_plan_revision_locked(plan_path, expected_plan_revision)
+            if expected_plan_identity is not None:
+                if (
+                    plan_path is None
+                    or re.fullmatch(r"[0-9a-f]{32}", expected_plan_identity) is None
+                    or plan_identity_for_path(self._checkout_root, plan_path)
+                    != expected_plan_identity
+                ):
+                    raise ProjectAutomaticPlanChanged(
+                        "automatic plan identity changed during admission"
+                    )
+            if automatic:
+                try:
+                    enabled = self._settings.read().auto_consume_plans
+                except ProjectSettingsError as exc:
+                    raise ProjectAdmissionSafetyError(_ADMISSION_SETTINGS_SAFE_MESSAGE) from exc
+                if not enabled:
+                    raise ProjectAutomaticDisabled("automatic plan consumption is disabled")
 
             self._require_unique_successor_locked(
                 source_run_id,
@@ -653,6 +688,8 @@ class ProjectAdmission:
         # decides whether a resume predecessor is safe to replace.
         predecessor_inactive_proven: bool = False,
         automatic: bool = False,
+        expected_plan_revision: str | None = None,
+        expected_plan_identity: str | None = None,
     ) -> AdmissionReservation:
         """Return a live reservation, reacquiring a released plan claim."""
         valid_run_id = validate_run_id(run_id)
@@ -680,7 +717,36 @@ class ProjectAdmission:
             idempotency_key=idempotency_key,
             source_run_id=source_run_id,
             automatic=automatic,
+            expected_plan_revision=expected_plan_revision,
+            expected_plan_identity=expected_plan_identity,
         )
+
+    @staticmethod
+    def _require_plan_revision_locked(plan_path: Path | None, revision: str) -> None:
+        """Recheck an automatic scan's exact bytes at the reservation boundary."""
+        if plan_path is None or re.fullmatch(r"[0-9a-f]{64}", revision) is None:
+            raise ProjectAutomaticPlanChanged("automatic plan revision is invalid")
+        try:
+            descriptor = os.open(plan_path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+            with os.fdopen(descriptor, "rb") as stream:
+                before = os.fstat(stream.fileno())
+                if not stat.S_ISREG(before.st_mode) or before.st_nlink != 1 or before.st_size > 256 * 1024:
+                    raise ProjectAutomaticPlanChanged("automatic plan entry is unsafe")
+                content = stream.read(256 * 1024 + 1)
+                after = os.fstat(stream.fileno())
+            current_path = plan_path.lstat()
+            if (
+                (before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns, before.st_ctime_ns)
+                != (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns, after.st_ctime_ns)
+                or (before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns, before.st_ctime_ns)
+                != (current_path.st_dev, current_path.st_ino, current_path.st_size, current_path.st_mtime_ns, current_path.st_ctime_ns)
+                or len(content) > 256 * 1024
+            ):
+                raise ProjectAutomaticPlanChanged("automatic plan changed during admission")
+        except (OSError, ValueError) as exc:
+            raise ProjectAutomaticPlanChanged("automatic plan is unavailable") from exc
+        if hashlib.sha256(content).hexdigest() != revision:
+            raise ProjectAutomaticPlanChanged("automatic plan changed during admission")
 
     def _require_unique_successor_locked(
         self,
