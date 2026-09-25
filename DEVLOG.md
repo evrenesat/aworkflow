@@ -1,5 +1,26 @@
 # DEVLOG
 
+## 2026-09-25 — Commit native Runs filter choices in the browser test (Checkpoint 1)
+
+- Published `aeafd165` failed only the Dashboard macOS Python 3.12/3.13 jobs in
+  run `36087876569`: after `ArrowDown`, Chromium still exposed the native
+  select's `visible` value. That is an uncommitted picker state, so the browser
+  journey now presses Enter before asserting `Archived` and `All history`, their
+  selected option text, and the corresponding 1/40 recorded counts. The
+  existing select-option, row identity, geometry, screenshot, resize, touch,
+  focus, and More-menu checks remain.
+- The focused journey passed in Chromium and WebKit with local Python 3.12 and
+  3.13. The web suite passed 648/648 and the production build passed. Inspected
+  320px light/dark screenshots from both engines: the selected value and count
+  are visible without clipping. Full dashboard/server suites passed 508/508
+  under each of Python 3.12 and 3.13, with only existing dependency deprecation
+  warnings. `git diff --check` passed. Local Linux emulation cannot prove macOS
+  native picker behavior or a physical mobile keyboard.
+- After review and publication, the coordinator must verify the exact commit's
+  Dashboard macOS Python 3.12/3.13 jobs and Linux dashboard jobs, then report
+  CI and live activation separately. Local approval alone does not establish
+  that remote gate.
+
 ## 2026-09-24 — Keep the Runs history filter readable at 320px (Checkpoint 1)
 
 - Reproduced the populated 320×568 defect before the edit: the native select

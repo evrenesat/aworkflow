@@ -1442,11 +1442,23 @@ def test_runs_header_filter_legibility(control_client, monkeypatch, tmp_path):
 
             page.set_viewport_size({"width": 320, "height": 568})
             select.select_option("visible")
+            expect(page.locator(".section-heading").filter(has_text="Project runs")).to_contain_text(
+                "39 recorded"
+            )
             select.focus()
-            select.press("ArrowDown")
-            expect(select).to_have_value("archived")
-            select.press("ArrowDown")
-            expect(select).to_have_value("all")
+            for value, label, count in (
+                ("archived", "Archived", 1),
+                ("all", "All history", 40),
+            ):
+                # macOS can leave a native picker highlighted without changing its value
+                # until Enter commits the choice.
+                select.press("ArrowDown")
+                select.press("Enter")
+                expect(select).to_have_value(value)
+                expect(select.locator("option:checked")).to_have_text(label)
+                expect(page.locator(".section-heading").filter(has_text="Project runs")).to_contain_text(
+                    f"{count} recorded"
+                )
             assert select.evaluate("node => document.activeElement === node")
             page.set_viewport_size({"width": 390, "height": 844})
             expect(select).to_have_value("all")
