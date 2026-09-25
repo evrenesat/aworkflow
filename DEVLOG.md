@@ -4281,3 +4281,44 @@ HISTORY: Published clipboard history `c14f1f2`/`cd78d53` remains separate and mu
 - Deployed throughput remains unproven: the 90-second live baseline was not
   re-timed here, so no speed or activation claim is made. If the deployed list is
   still slow, the remaining cost needs its own focused profile.
+
+## 2026-09-25 — Separate completed review turns from delivery failure (Checkpoint 1)
+
+- For terminal `controller_failed` runs, the Runs overview now recognizes only
+  a matching, ordered `final_review` start/finish pair with `outcome=completed`
+  and a controller-stage worker exit. It says the review invocation finished,
+  delivery is blocked, and publication is unconfirmed. The known dirty primary
+  checkout merge reason becomes a short cause; other controller reasons stay
+  generic. Neither the event outcome nor reviewer text is treated as approval.
+  A controller failure without the completed event remains a generic failure;
+  reviewer-harness failures retain their earlier warning. Exact reasons remain
+  in Diagnostics, and action admission is unchanged.
+- Inspected read-only evidence for run `20260925t092319z-acdc180d`: ordered
+  final-review start/finish events, a completed invocation, failed canonical
+  status, and a merge-handoff dirty-checkout controller error. The receipt's
+  exit time is rounded to the same second as the finished event, so the UI
+  relies on event order and terminal controller stage rather than a strict
+  timestamp comparison.
+- Populated Chromium and WebKit captures at 320×568 and 1280×720 in light and
+  dark were inspected. The issue cause, coordinator step, failed status, and
+  unconfirmed publication read clearly without raw paths or horizontal
+  overflow; Diagnostics reveals the exact cause and reads cause no writes.
+  The existing browser fixture varies in when detailed checkpoint history
+  finishes loading, so those screenshots are evidence for the overview, not
+  for complete history. Physical mobile keyboard and live deployment remain
+  unverified coordinator checks.
+- Verification: `npm --prefix apps/aflow_app/web test -- --run` passed 667;
+  `npm --prefix apps/aflow_app/web run build` passed;
+  `uv run --directory apps/aflow_app/server pytest -q tests/test_ui_followup_fidelity_browser.py`
+  passed 37; `AFLOW_TEST_BROWSER=webkit uv run --directory apps/aflow_app/server pytest -q tests/test_ui_followup_fidelity_browser.py`
+  passed 37; `env -u AFLOW_ADMISSION_RESERVATION_NONCE uv run --directory apps/aflow_app/server pytest -q`
+  passed 559; and `git diff --check` passed. The AFlow worker inherited
+  `AFLOW_ADMISSION_RESERVATION_NONCE`, which made two unrelated in-process
+  worker browser tests fail with a nonce mismatch. Running the full server
+  command with only that inherited variable removed passed; both failures
+  also passed in isolation with the same environment correction. The checked
+  out `origin/main` SHA `6cecbdce` had a successful exact-SHA CI run before
+  this checkpoint's local verification. Publication and live activation of
+  this checkpoint are still coordinator gates. `origin/main` advanced to
+  `4ce0d0d1` during the work; reviewer integration must account for its
+  separate history-list projection and DEVLOG changes.

@@ -13,6 +13,33 @@ import { groupTeamFamilies, type TeamFamilyGroup } from './teamFamilies'
 
 export const terminalStatuses = new Set(['completed', 'done', 'failed', 'owner_stopped', 'interrupted'])
 
+export interface PostReviewDeliveryFailure {
+  cause: string
+}
+
+/** A finished invocation is evidence of timing, never an approval decision. */
+export function postReviewDeliveryFailure(run: RunStatus, events: RunEvent[]): PostReviewDeliveryFailure | null {
+  if (run.status !== 'failed' || run.status_reason_code !== 'controller_failed'
+    || run.worker_exit?.stage !== 'controller' || run.current_step !== 'final_review') return null
+  if (!Number.isSafeInteger(run.turns_completed)) return null
+  const ordered = [...events].sort((a, b) => a.sequence - b.sequence)
+  const lastStarted = [...ordered].reverse().find(event => event.event_type === 'turn_started')
+  const finished = ordered.find(event => event.event_type === 'turn_finished'
+    && event.data?.step_name === 'final_review'
+    && event.data?.turn_number === run.turns_completed
+    && event.data?.outcome === 'completed'
+    && event.sequence > (lastStarted?.sequence ?? Infinity))
+  if (!lastStarted || lastStarted.data?.step_name !== 'final_review'
+    || lastStarted.data?.turn_number !== run.turns_completed || !finished) return null
+  // Receipt timestamps can be rounded to seconds; event ordering plus the
+  // terminal controller stage is the recorded post-turn boundary.
+  const reason = run.worker_exit.reason ?? ''
+  const cause = /^lifecycle teardown: merge handoff requires clean git state, but\s+primary checkout at\s+/i.test(reason)
+    ? 'Merge handoff needs a clean primary checkout.'
+    : 'Controller delivery stopped after the review turn.'
+  return { cause }
+}
+
 export interface RunPlanPresentation {
   label: string
   date: string | null

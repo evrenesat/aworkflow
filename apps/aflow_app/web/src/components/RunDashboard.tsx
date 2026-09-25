@@ -45,6 +45,7 @@ import {
   isTerminalInactiveRun,
   latestRunResultEvent,
   presentRunEvent,
+  postReviewDeliveryFailure,
   deliveryIssueText,
   runCurrentWorkText,
   runExecutorFacts,
@@ -689,10 +690,15 @@ function recoveryProvenanceFromEvents(events: RunEvent[]): RecoveryProvenance | 
   return null
 }
 
-function runIssue(run: RunStatus): RunIssue | null {
+function runIssue(run: RunStatus, postReviewFailure: ReturnType<typeof postReviewDeliveryFailure> = null): RunIssue | null {
   const category = runDisplayProjection(run).category
   const failure = category === 'failure'
   if (!failure && category !== 'actionable-attention') return null
+
+  if (postReviewFailure) return { kind: 'failure', cause: postReviewFailure.cause }
+  if (run.status === 'failed' && run.worker_exit?.stage === 'controller') {
+    return { kind: 'failure', cause: 'Controller failed. Review completion is not confirmed.' }
+  }
 
   const startupFailure = contextObject(run.evidence.startup_failure)
   const cause = conciseRunText(run.reason)
@@ -3038,7 +3044,9 @@ export function RunDashboard({ visible = true, page, onNewRun, onCancelNewRun, o
     && savedOverrides.owner_stop === true,
   )
   const lastExecuted = lastExecutedEvidence(events, context)
-  const selectedRunIssue = selectedRun ? runIssue(selectedRun) : null
+  const postReviewFailure = selectedRun ? postReviewDeliveryFailure(selectedRun, events) : null
+  const controllerFailure = selectedRun?.status === 'failed' && selectedRun.worker_exit?.stage === 'controller'
+  const selectedRunIssue = selectedRun ? runIssue(selectedRun, postReviewFailure) : null
   const canCreateFollowup = Boolean(
     selectedRun && ['failed', 'needs_attention'].includes(selectedRun.status),
   )
@@ -3077,6 +3085,7 @@ export function RunDashboard({ visible = true, page, onNewRun, onCancelNewRun, o
       : null
   const deliveryWarning = canonicalDetail ? deliveryIssueText(canonicalDetail.delivery) : null
   const failedReview = selectedRun?.status === 'failed'
+    && selectedRun.worker_exit?.stage !== 'controller'
     && /review/i.test(selectedRun.current_step ?? lastExecuted?.stepName ?? '')
   const recordedOrdinal = canonicalProgress?.current_checkpoint_ordinal ?? compatibilitySummary?.index
   const recordedTitle = canonicalProgress?.current_checkpoint_title ?? compatibilitySummary?.name
@@ -3094,7 +3103,9 @@ export function RunDashboard({ visible = true, page, onNewRun, onCancelNewRun, o
     ? runDisplayProjection(selectedRun).category === 'outcome-unrecorded'
       ? null
       : (() => {
-      const currentWork = failedReview
+      const currentWork = postReviewFailure
+        ? `Review turn finished; delivery blocked${lastReviewStep ? ` · ${lastReviewStep}` : ''}.`
+        : failedReview
         ? `Review stopped${lastReviewStep ? ` · ${lastReviewStep}` : ''}.`
         : isTerminalInactiveRun(selectedRun)
         ? `No current work — ${statusLabel(selectedRun)}.`
@@ -3110,7 +3121,7 @@ export function RunDashboard({ visible = true, page, onNewRun, onCancelNewRun, o
             : selectedRun.activity === 'active'
                 ? 'Active work is in progress.'
                 : `${statusLabel(selectedRun)} — current work is not reported.`
-      const executorFacts = failedReview
+      const executorFacts = failedReview || postReviewFailure
         ? [lastExecuted?.selector, lastExecuted?.model].filter((value): value is string => Boolean(value))
         : [
         selectedRun.current_step && !isTerminalInactiveRun(selectedRun) ? formatMachineLabel(selectedRun.current_step) : null,
@@ -3135,6 +3146,14 @@ export function RunDashboard({ visible = true, page, onNewRun, onCancelNewRun, o
     : null
   const overviewLatestResult = selectedRun
     ? (() => {
+      if (postReviewFailure) return <>
+        <p>The final review invocation finished. Publication is not confirmed.</p>
+        <p className="text-sm text-dim"><a href={`#${technicalId}`} onClick={() => setTechnicalDisclosure(true)}>Open Diagnostics</a> for the recorded technical cause and full activity.</p>
+      </>
+      if (controllerFailure) return <>
+        <p>Controller failure was recorded. Review completion is not confirmed.</p>
+        <p className="text-sm text-dim"><a href={`#${technicalId}`} onClick={() => setTechnicalDisclosure(true)}>Open Diagnostics</a> for the recorded technical cause and full activity.</p>
+      </>
       if (failedReview) return <>
         <p>{readableFailure ?? (reviewerHarnessFailed
           ? 'The reviewer harness failed before a decision.'
@@ -3795,8 +3814,9 @@ export function RunDashboard({ visible = true, page, onNewRun, onCancelNewRun, o
                       {canResume && (!confirmResume
                         ? <button className="btn btn-primary" disabled={restartInProgress} onClick={() => setConfirmResume(true)}>Resume as new run…</button>
                         : <div className="confirmation"><span>Confirm explicit resume. Source {selectedRun.run_id} remains visible; the server creates a distinct continuation run with the same workflow and current configuration source.</span><button className="btn btn-primary" disabled={busyAction === 'resume'} onClick={() => void handleResume()}>Confirm resume</button><button className="btn btn-secondary" onClick={() => setConfirmResume(false)}>Cancel</button></div>)}
-                      {canRestart && <span className="text-sm text-dim">Configure a restart from Actions after reviewing the recorded issue.</span>}
-                      {!canResume && !canRestart && <span className="text-sm text-dim">Open Diagnostics for the recorded details.</span>}
+                      {postReviewFailure && <span className="text-sm text-dim">Ask the coordinator to complete integration.</span>}
+                      {!postReviewFailure && canRestart && <span className="text-sm text-dim">Configure a restart from Actions after reviewing the recorded issue.</span>}
+                      {!postReviewFailure && !canResume && !canRestart && <span className="text-sm text-dim">Open Diagnostics for the recorded details.</span>}
                     </div>
                   </section>}
                   {!selectedRunIssue && selectedRun.reason && runDisplayProjection(selectedRun).category !== 'outcome-unrecorded' && <div className="notice">{conciseRunText(selectedRun.reason) ?? 'A run reason was recorded.'}</div>}

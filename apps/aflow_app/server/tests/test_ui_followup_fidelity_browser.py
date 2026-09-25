@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import os
 import re
+from dataclasses import replace
 from pathlib import Path
 from urllib.parse import urlsplit
 
@@ -302,6 +303,46 @@ def _rewrite_run_metadata(path: Path, **updates: object) -> None:
 
 
 FAILED_REVIEW_ID = "20260923t140751z-c60d53d7"
+POST_REVIEW_ID = "20260925t092319z-acdc180d"
+
+
+def _seed_post_review_delivery_failure(root: Path, running: dict[str, object]) -> str:
+    """Record the final-review event and controller receipt shape of the historical run."""
+    source_plan = Path(str(running["plan"]))
+    plan = source_plan.with_name("post-review-delivery-evidence-20260925.md")
+    plan.write_bytes(source_plan.read_bytes())
+    run_id = POST_REVIEW_ID
+    create_launch_manifest(root, LaunchManifest(
+        run_id=run_id, project_root=str(root.resolve()), plan_path=str(plan.resolve()),
+        workflow_name="checkpoint_delivery", max_turns=40, team="base", start_step="implement",
+        idempotency_key="ui-post-review-delivery", caller_scope=f"bearer:{PROJECT_ID}",
+        created_at="2026-09-25T09:23:19Z",
+    ))
+    write_launch_phase(root, run_id, "failed")
+    source_metadata = json.loads((root / ".aflow" / "runs" / str(running["run_id"]) / "run.json").read_text(encoding="utf-8"))
+    source_metadata.update({
+        "run_id": run_id, "status": "failed", "activity": "inactive", "phase": "failed",
+        "failure_reason": None, "original_plan_path": str(plan),
+        "active_plan_path": str(plan), "plan_path": str(plan),
+        "current_step_name": "final_review", "turns_completed": 3,
+        "run_started_at": "2026-09-25T09:23:20Z",
+        "implementation_attempts": {},
+    })
+    run_dir = root / ".aflow" / "runs" / run_id
+    run_dir.mkdir(parents=True, exist_ok=True)
+    (run_dir / "run.json").write_text(json.dumps(source_metadata, indent=2) + "\n", encoding="utf-8")
+    append_run_event(run_dir, "turn_started", {"turn_number": 3, "step_name": "final_review"})
+    append_run_event(run_dir, "turn_finished", {
+        "turn_number": 3, "step_name": "final_review", "outcome": "completed", "returncode": 0,
+    })
+    journal = run_dir / "events.jsonl"
+    records = [json.loads(line) for line in journal.read_text(encoding="utf-8").splitlines()]
+    for record, timestamp in zip(records, (
+        "2026-09-25T09:36:48Z", "2026-09-25T09:39:08Z",
+    ), strict=True):
+        record["timestamp"] = timestamp
+    journal.write_text("".join(json.dumps(record) + "\n" for record in records), encoding="utf-8")
+    return run_id
 
 
 def _seed_failed_reviewer_run(root: Path, running: dict[str, object]) -> str:
@@ -487,6 +528,91 @@ def test_ui_followup_failed_review_history(
                 assert enlarged_layout["label"]["height"] > control_layout["label"]["height"]
                 _assert_no_horizontal_overflow(page)
                 page.screenshot(path=str(artifact_dir / f"{stem}-enlarged.png"), full_page=True)
+        finally:
+            browser.close()
+
+
+@pytest.mark.parametrize("width,height", ((320, 568), (1280, 720)))
+@pytest.mark.parametrize("theme", ("light", "dark"))
+def test_ui_post_review_delivery_failure(
+    control_client, monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+    width: int, height: int, theme: str,
+) -> None:
+    """The recorded final review and later controller failure stay distinct in Runs."""
+    from aflow_app_server import main
+
+    client, root, _, _ = control_client
+    running = seed_demo_fidelity_fixture(root)["running"]
+    assert isinstance(running, dict)
+    run_id = _seed_post_review_delivery_failure(root, running)
+    reason = (
+        "lifecycle teardown: merge handoff requires clean git state, but "
+        "primary checkout at '/private/hidden/agent_flow' is dirty: DEVLOG.md"
+    )
+    service = main._control_plane_service
+    assert service is not None
+    repository = service._project(PROJECT_ID).daemon.application.repository
+    original_status = repository.get_run_status
+
+    def status_with_controller_receipt(selected_id: str, *, include_progress: bool = True):
+        status = original_status(selected_id, include_progress=include_progress)
+        if selected_id != run_id:
+            return status
+        return replace(
+            status, status="failed", activity="inactive", status_reason_code="controller_failed",
+            worker_exit={"stage": "controller", "reason": reason, "exit_code": 1,
+                         "exited_at": "2026-09-25T09:39:08Z", "diagnostic_unavailable": False},
+        )
+
+    monkeypatch.setattr(repository, "get_run_status", status_with_controller_receipt)
+    response = client.get(f"/api/control-plane/projects/{PROJECT_ID}/runs/{run_id}")
+    assert response.status_code == 200, response.text
+    assert response.json()["status_reason_code"] == "controller_failed"
+    assert response.json()["worker_exit"]["stage"] == "controller"
+    _prepare_disposable_fidelity_config(root, monkeypatch)
+    dist = Path(__file__).resolve().parents[2] / "web" / "dist"
+    assert (dist / "index.html").is_file(), "Build the real web app before browser fidelity checks."
+    monkeypatch.setenv("AFLOW_APP_WEB_DIST", str(dist))
+    artifact_dir = _fidelity_artifact_dir(tmp_path)
+    artifact_dir.mkdir(parents=True, exist_ok=True)
+    browser_name = os.environ.get("AFLOW_TEST_BROWSER", "chromium").strip().lower()
+    stem = f"post-review-delivery-{browser_name}-{theme}-{width}x{height}"
+    requests: list[tuple[str, str]] = []
+    page_errors: list[str] = []
+    with live_server() as url, sync_playwright() as playwright:
+        browser = _browser(playwright)
+        page = browser.new_page(viewport={"width": width, "height": height}, has_touch=width <= 390)
+        page.on("request", lambda request: requests.append((request.method, request.url)))
+        page.on("pageerror", lambda error: page_errors.append(str(error)))
+        try:
+            _login(page, url)
+            _set_theme_preference(page, theme)
+            page.goto(f"{url}/?project={PROJECT_ID}&view=runs&run={run_id}", wait_until="load")
+            _wait_for_fidelity_readiness(page)
+            detail = page.locator(".run-detail:visible").first
+            detail.wait_for()
+            page_errors.clear()
+            _assert_theme(page, theme)
+            overview = detail.locator(".run-overview")
+            expect(overview).to_contain_text("Review turn finished; delivery blocked")
+            expect(overview).to_contain_text("Merge handoff needs a clean primary checkout.")
+            expect(overview).to_contain_text("Publication is not confirmed.")
+            expect(overview).to_contain_text("Ask the coordinator to complete integration.")
+            assert "Review stopped before a decision" not in overview.inner_text()
+            assert "Configure a restart" not in overview.inner_text()
+            assert "/private/hidden" not in overview.inner_text()
+            assert "approved" not in overview.inner_text().lower()
+            expect(detail.locator(".run-progress-header")).to_contain_text("Failed")
+            _assert_no_horizontal_overflow(page)
+            page.screenshot(path=str(artifact_dir / f"{stem}.png"), full_page=True)
+            overview.get_by_role("link", name="Open Diagnostics").click()
+            expect(detail.get_by_role("button", name="Diagnostics")).to_have_attribute("aria-expanded", "true")
+            expect(detail.get_by_text(re.compile(r"primary checkout at '/private/hidden/agent_flow'"))).to_be_visible()
+            assert page_errors == []
+            writes = [(method, path) for method, path in requests
+                      if method not in {"GET", "HEAD", "OPTIONS"}
+                      and not path.endswith(("/api/session", "/api/config/form"))]
+            assert writes == []
         finally:
             browser.close()
 

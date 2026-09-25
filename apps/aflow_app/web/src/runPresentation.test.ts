@@ -14,6 +14,7 @@ import {
   latestRunResultEvent,
   meaningfulRunEvents,
   presentRunEvent,
+  postReviewDeliveryFailure,
   progressHistoryNotice,
   runCurrentWorkText,
   runEventFacts,
@@ -32,6 +33,32 @@ import {
 } from './runPresentation'
 
 const run = { status: 'manifest_only', ownership: 'control_plane', evidence: { manifest_created_at: '2026-09-08T10:00:00Z' } } as RunStatus
+
+describe('post-review delivery evidence', () => {
+  const failed = {
+    ...run, status: 'failed', status_reason_code: 'controller_failed', current_step: 'final_review', turns_completed: 3,
+    worker_exit: { stage: 'controller', reason: "lifecycle teardown: merge handoff requires clean git state, but primary checkout at '/private/work' is dirty: DEVLOG.md", exit_code: 1, exited_at: '2026-09-25T09:39:09Z', diagnostic_unavailable: false },
+  }
+  const events: RunEvent[] = [
+    { sequence: 10, event_type: 'turn_started', data: { step_name: 'final_review', turn_number: 3 }, schema_version: 1, timestamp: '2026-09-25T09:36:48Z' },
+    { sequence: 12, event_type: 'turn_finished', data: { step_name: 'final_review', turn_number: 3, outcome: 'completed' }, schema_version: 1, timestamp: '2026-09-25T09:39:08Z' },
+  ]
+
+  it('recognizes only a completed final-review invocation followed by controller exit', () => {
+    expect(postReviewDeliveryFailure(failed, [...events].reverse())).toEqual({ cause: 'Merge handoff needs a clean primary checkout.' })
+    expect(postReviewDeliveryFailure({ ...failed, worker_exit: { ...failed.worker_exit, reason: 'another controller error' } }, events))
+      .toEqual({ cause: 'Controller delivery stopped after the review turn.' })
+    for (const candidate of [
+      { ...failed, status_reason_code: 'worker_failed' },
+      { ...failed, worker_exit: { ...failed.worker_exit, stage: 'worker' } },
+      { ...failed, current_step: 'review_checkpoint' },
+      { ...failed, turns_completed: 2 },
+    ]) expect(postReviewDeliveryFailure(candidate, events)).toBeNull()
+    expect(postReviewDeliveryFailure(failed, events.slice(1))).toBeNull()
+    expect(postReviewDeliveryFailure(failed, [{ ...events[0] }, { ...events[1], data: { ...events[1].data, outcome: 'harness-failed' } }])).toBeNull()
+    expect(postReviewDeliveryFailure(failed, [...events, { ...events[0], sequence: 13, data: { step_name: 'review_checkpoint', turn_number: 4 } }])).toBeNull()
+  })
+})
 describe('honest run timing', () => {
   it('never uses submission time as execution time', () => {
     for (const status of ['manifest_only', 'awaiting_startup_answer', 'needs_attention', 'running', 'completed']) {

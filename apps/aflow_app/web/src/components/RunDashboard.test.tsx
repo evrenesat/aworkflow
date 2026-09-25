@@ -901,6 +901,49 @@ describe('RunDashboard', () => {
     expect(screen.getByRole('button', { name: 'Diagnostics' }).getAttribute('aria-expanded')).toBe('true')
   })
 
+  it('separates a finished final-review turn from failed controller delivery', async () => {
+    const reason = "lifecycle teardown: merge handoff requires clean git state, but primary checkout at '/private/work' is dirty: DEVLOG.md"
+    const failed = { ...ownedRun, status: 'failed', activity: 'inactive' as const,
+      status_reason_code: 'controller_failed', current_step: 'final_review', turns_completed: 3,
+      worker_exit: { stage: 'controller', reason, exit_code: 1, exited_at: '2026-09-25T09:39:08Z', diagnostic_unavailable: false } }
+    vi.mocked(api.listControlPlaneRuns).mockResolvedValue({ runs: [failed], next_cursor: null, schema_version: 1 })
+    vi.mocked(api.getControlPlaneRun).mockResolvedValue(failed)
+    vi.mocked(api.listRunEvents).mockResolvedValue([
+      { sequence: 10, event_type: 'turn_started', data: { turn_number: 3, step_name: 'final_review' }, schema_version: 1, timestamp: '2026-09-25T09:36:48Z' },
+      { sequence: 12, event_type: 'turn_finished', data: { turn_number: 3, step_name: 'final_review', outcome: 'completed' }, schema_version: 1, timestamp: '2026-09-25T09:39:08Z' },
+    ])
+    renderDashboard()
+    expect(await screen.findByText(/Review turn finished; delivery blocked/)).toBeDefined()
+    const overview = document.querySelector('.run-overview')
+    expect(overview?.textContent).toContain('Merge handoff needs a clean primary checkout.')
+    expect(overview?.textContent).toContain('Publication is not confirmed.')
+    expect(overview?.textContent).toContain('Ask the coordinator to complete integration.')
+    expect(overview?.textContent).not.toMatch(/Review stopped before a decision|\/private\/work|approved|deployed/i)
+    expect(overview?.textContent).not.toContain('Configure a restart')
+    fireEvent.click(screen.getByRole('link', { name: 'Open Diagnostics' }))
+    expect(screen.getByRole('button', { name: 'Diagnostics' }).getAttribute('aria-expanded')).toBe('true')
+    expect(screen.getByText(/primary checkout at '\/private\/work'/)).toBeDefined()
+  })
+
+  it('keeps a controller failure without completed review evidence generic and path-free', async () => {
+    const reason = "lifecycle teardown: merge handoff requires clean git state, but primary checkout at '/private/work' is dirty"
+    const failed = { ...ownedRun, status: 'failed', activity: 'inactive' as const,
+      status_reason_code: 'controller_failed', current_step: 'final_review', turns_completed: 3,
+      worker_exit: { stage: 'controller', reason, exit_code: 1, exited_at: '2026-09-25T09:39:08Z', diagnostic_unavailable: false } }
+    vi.mocked(api.listControlPlaneRuns).mockResolvedValue({ runs: [failed], next_cursor: null, schema_version: 1 })
+    vi.mocked(api.getControlPlaneRun).mockResolvedValue(failed)
+    vi.mocked(api.listRunEvents).mockResolvedValue([
+      { sequence: 10, event_type: 'turn_started', data: { turn_number: 3, step_name: 'final_review' }, schema_version: 1, timestamp: '2026-09-25T09:36:48Z' },
+    ])
+    renderDashboard()
+    expect(await screen.findByText('Controller failed. Review completion is not confirmed.')).toBeDefined()
+    const overview = document.querySelector('.run-overview')
+    expect(overview?.textContent).not.toMatch(/Review turn finished|Review stopped before a decision|\/private\/work|approved/i)
+    expect(overview?.textContent).toContain('Open Diagnostics')
+    fireEvent.click(screen.getByRole('link', { name: 'Open Diagnostics' }))
+    expect(screen.getByText(/primary checkout at '\/private\/work'/)).toBeDefined()
+  })
+
   it('keeps a meaningful short failed-review reason ahead of the harness fallback', async () => {
     const failed = { ...ownedRun, status: 'failed', activity: 'inactive' as const, launch_phase: 'failed',
       current_step: 'review_checkpoint', turns_completed: 4, reason: 'Reviewer process lost its connection.' }
