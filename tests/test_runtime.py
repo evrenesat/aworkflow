@@ -8037,6 +8037,7 @@ class WorkflowLifecycleRuntimeTests(unittest.TestCase):
                 encoding='utf-8',
             )
             _run_git_in_test(['add', '.'], cwd=first_repo)
+            _run_git_in_test(['add', '-f', 'plans/in-progress/first.md'], cwd=first_repo)
             rc, _, err = _run_git_in_test(
                 ['commit', '-m', 'seed first plan'], cwd=first_repo
             )
@@ -8056,7 +8057,7 @@ class WorkflowLifecycleRuntimeTests(unittest.TestCase):
                 plan = cwd / 'plans' / 'in-progress' / 'first.md'
                 _write_plan(plan, _COMPLETE_PLAN)
                 rc, _, err = _run_git_in_test(
-                    ['add', 'plans/in-progress/first.md'], cwd=cwd
+                    ['add', '-f', 'plans/in-progress/first.md'], cwd=cwd
                 )
                 assert rc == 0, err
                 rc, _, err = _run_git_in_test(
@@ -8111,7 +8112,7 @@ class WorkflowLifecycleRuntimeTests(unittest.TestCase):
             second_plan = second_repo / 'plans' / 'in-progress' / 'second.md'
             second_plan.parent.mkdir(parents=True)
             _write_plan(second_plan, _VALID_PLAN)
-            _run_git_in_test(['add', 'plans/in-progress/second.md'], cwd=second_repo)
+            _run_git_in_test(['add', '-f', 'plans/in-progress/second.md'], cwd=second_repo)
             rc, _, err = _run_git_in_test(
                 ['commit', '-m', 'seed second plan'], cwd=second_repo
             )
@@ -8122,7 +8123,7 @@ class WorkflowLifecycleRuntimeTests(unittest.TestCase):
                 plan = cwd / 'plans' / 'in-progress' / 'second.md'
                 _write_plan(plan, _COMPLETE_PLAN)
                 rc, _, err = _run_git_in_test(
-                    ['add', 'plans/in-progress/second.md'], cwd=cwd
+                    ['add', '-f', 'plans/in-progress/second.md'], cwd=cwd
                 )
                 assert rc == 0, err
                 rc, _, err = _run_git_in_test(
@@ -8193,6 +8194,7 @@ class WorkflowLifecycleRuntimeTests(unittest.TestCase):
                 encoding='utf-8',
             )
             _run_git_in_test(['add', '.'], cwd=repo_root)
+            _run_git_in_test(['add', '-f', 'plans/in-progress/resume.md'], cwd=repo_root)
             rc, _, err = _run_git_in_test(
                 ['commit', '-m', 'seed resumable plan'], cwd=repo_root
             )
@@ -8226,7 +8228,7 @@ class WorkflowLifecycleRuntimeTests(unittest.TestCase):
                 cwd = Path(kwargs['cwd'])
                 _write_plan(cwd / 'plans' / 'in-progress' / 'resume.md', _COMPLETE_PLAN)
                 rc, _, err = _run_git_in_test(
-                    ['add', 'plans/in-progress/resume.md'], cwd=cwd
+                    ['add', '-f', 'plans/in-progress/resume.md'], cwd=cwd
                 )
                 assert rc == 0, err
                 rc, _, err = _run_git_in_test(

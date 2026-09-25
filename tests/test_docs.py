@@ -194,10 +194,11 @@ class SkillDocsTests(unittest.TestCase):
         text = (repo_root / 'aflow' / 'bundled_skills' / 'aflow-manager' / 'SKILL.md').read_text(encoding='utf-8')
         normalized = ' '.join(text.split())
 
-        assert 'first reviewer rejection' in normalized
+        assert 'evaluate the rejection cause' in normalized
         assert 'decide by cause' in normalized
-        assert 'available edge never mandates an upgrade' in normalized
-        assert 'second rejection in that same open scope invokes Full directly' in normalized
+        assert 'Before the threshold is due, decide by cause' in normalized
+        assert 'When the threshold is due, `continue` cannot keep the old worker' in normalized
+        assert 'the controller applies the exposed one-edge upgrade' in normalized
         assert 'repartition_current_checkpoint' in normalized
         assert 'A real `AFLOW_STOP` remains terminal' in normalized
         assert 'controller validates all routing and decides the concrete target' in normalized
