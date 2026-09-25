@@ -199,7 +199,7 @@ def test_completed_plan_final_review_attribution(
 ) -> None:
     plan_path = tmp_path / "plan.md"
     plan_path.write_text(_CUMULATIVE_PLAN, encoding="utf-8")
-    config = _workflow_config(manager_enabled=False, threshold=0)
+    config = _workflow_config(manager_enabled=False, threshold=1)
     base_team = config.teams["base"]
     config = replace(config, teams={
         **config.teams,
@@ -351,6 +351,456 @@ def test_completed_plan_final_review_attribution(
     else:
         assert review["review_rejection"] is None
         assert run["review_rejection_history"] == []
+
+
+def _cumulative_route_config(*, manager_enabled: bool, threshold: int) -> WorkflowUserConfig:
+    config = _workflow_config(manager_enabled=manager_enabled, threshold=threshold)
+    roles = {
+        "worker": "codex.sol-6-high",
+        "reviewer": "codex.sol-6-medium",
+        "architect": "codex.astra-medium",
+        "manager": "codex.sol-6-medium",
+    }
+    steps = {
+        "implement": WorkflowStepConfig(
+            role="worker", prompts=("p",), go=(GoTransition(to="review"),),
+        ),
+        "review": WorkflowStepConfig(
+            role="reviewer", prompts=("p",), go=(
+                GoTransition(to="final_review", when="DONE"),
+                GoTransition(to="implement"),
+            ),
+        ),
+        "final_review": WorkflowStepConfig(
+            role="architect", prompts=("p",), go=(
+                GoTransition(to="followup", when="NEW_PLAN_EXISTS"),
+                GoTransition(to="END"),
+            ),
+        ),
+        "followup": WorkflowStepConfig(
+            role="worker", prompts=("p",), go=(
+                GoTransition(to="final_review", when="DONE"),
+                GoTransition(to="followup"),
+            ),
+        ),
+    }
+    return replace(
+        config,
+        teams={
+            "sol-6-high": TeamConfig(roles=roles, upgrade_to="ds4.1-flash"),
+            "ds4.1-flash": TeamConfig(
+                roles={"worker": "codex.ds4.1-flash"}, extends="sol-6-high",
+            ),
+        },
+        harnesses={"codex": WorkflowHarnessConfig(profiles={
+            "sol-6-high": HarnessProfileConfig(model="sol-6-high"),
+            "sol-6-medium": HarnessProfileConfig(model="sol-6-medium"),
+            "astra-medium": HarnessProfileConfig(model="astra-medium"),
+            "ds4.1-flash": HarnessProfileConfig(model="ds4.1-flash"),
+        })},
+        workflows={"repair": replace(
+            config.workflows["repair"], team="sol-6-high", steps=steps,
+        )},
+    )
+
+
+@pytest.mark.parametrize("manager_enabled", [False, True])
+@pytest.mark.parametrize("threshold", [0, 1])
+def test_cumulative_final_review_routes_by_failed_repair_count(
+    tmp_path: Path, manager_enabled: bool, threshold: int,
+) -> None:
+    plan_path = tmp_path / "plan.md"
+    plan_path.write_text(_CUMULATIVE_PLAN, encoding="utf-8")
+    config = _cumulative_route_config(
+        manager_enabled=manager_enabled, threshold=threshold,
+    )
+    calls: list[str] = []
+    worker_count = 0
+    final_reviews = 0
+
+    def runner(argv: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+        nonlocal worker_count, final_reviews
+        model = argv[argv.index("--model") + 1]
+        prompt = str(kwargs.get("input", ""))
+        if model == "sol-6-medium" and "schema_version" in prompt:
+            calls.append("manager")
+            return subprocess.CompletedProcess(argv, 0, json.dumps({
+                "schema_version": 1, "action": "continue",
+                "reason": "synthetic continue", "next_step_notes": [],
+                "stop_report": None,
+            }), "")
+        calls.append(model)
+        if model in {"sol-6-high", "ds4.1-flash"}:
+            worker_count += 1
+            if worker_count <= 3:
+                name = ("first", "second", "third")[worker_count - 1]
+                plan_path.write_text(
+                    plan_path.read_text(encoding="utf-8").replace(
+                        f"### [ ] Checkpoint {worker_count}: ",
+                        f"### [x] Checkpoint {worker_count}: ",
+                    ).replace(f"- [ ] {name}", f"- [x] {name}"),
+                    encoding="utf-8",
+                )
+            else:
+                latest = sorted(tmp_path.glob("plan-cp01-v*.md"))[-1]
+                latest.write_text(
+                    _REPAIR_PLAN.replace("[ ]", "[x]"), encoding="utf-8",
+                )
+        elif model == "astra-medium":
+            final_reviews += 1
+            if final_reviews <= threshold + 1:
+                (tmp_path / f"plan-cp01-v{final_reviews:02d}.md").write_text(
+                    _REPAIR_PLAN, encoding="utf-8",
+                )
+        return subprocess.CompletedProcess(argv, 0, "synthetic output", "")
+
+    result = run_workflow(
+        ControllerConfig(repo_root=tmp_path, plan_path=plan_path,
+                         max_turns=12, team="sol-6-high"),
+        config, "repair", config_dir=tmp_path, snapshot_config=False,
+        adapter=CodexAdapter(), runner=runner,
+    )
+    run = json.loads((result.run_dir / "run.json").read_text())
+    turns = result.run_dir / "turns"
+    assert [
+        json.loads((turns / f"turn-{number:03d}" / "result.json").read_text())["selector"]
+        for number in (1, 3, 5)
+    ] == ["codex.sol-6-high"] * 3
+    expected_repairs = (
+        ["codex.ds4.1-flash"] if threshold == 0
+        else ["codex.sol-6-high", "codex.ds4.1-flash"]
+    )
+    assert [
+        json.loads((turns / f"turn-{number:03d}" / "result.json").read_text())["selector"]
+        for number in (8, 10)[:len(expected_repairs)]
+    ] == expected_repairs
+    assert all(
+        json.loads((turns / f"turn-{number:03d}" / "result.json").read_text())["selector"]
+        == "codex.astra-medium"
+        for number in (7, 9, 11)[:threshold + 2]
+    )
+    assert len(run["review_rejection_history"]) == threshold + 1
+    assert [
+        row["reviewed_attempt_ordinal"] for row in run["review_rejection_history"]
+    ] == list(range(1, threshold + 2))
+    assert run["active_implementation_scope"] is None
+    assert resolve_team_config(config, "ds4.1-flash").effective_roles == {
+        **resolve_team_config(config, "sol-6-high").effective_roles,
+        "worker": "codex.ds4.1-flash",
+    }
+    if manager_enabled:
+        assert "manager" in calls
+    inherited = resolve_team_config(config, "ds4.1-flash").effective_roles
+    assert inherited["reviewer"] == "codex.sol-6-medium"
+    assert inherited["manager"] == "codex.sol-6-medium"
+    assert inherited["architect"] == "codex.astra-medium"
+    if threshold == 0 and not manager_enabled:
+        independent = tmp_path / "independent.md"
+        independent.write_text(_PLAN, encoding="utf-8")
+
+        class IndependentStop(BaseException):
+            pass
+
+        def stop_before_independent_worker(
+            argv: list[str], **_kwargs: object,
+        ) -> subprocess.CompletedProcess[str]:
+            assert argv[argv.index("--model") + 1] == "sol-6-high"
+            raise IndependentStop
+
+        with pytest.raises(IndependentStop):
+            run_workflow(
+                ControllerConfig(repo_root=tmp_path, plan_path=independent,
+                                 max_turns=3, team="sol-6-high"),
+                config, "repair", config_dir=tmp_path, snapshot_config=False,
+                adapter=CodexAdapter(), runner=stop_before_independent_worker,
+            )
+
+
+@pytest.mark.parametrize("manager_enabled", [False, True])
+@pytest.mark.parametrize("mode", ["clean", "unmatched"])
+def test_cumulative_final_review_false_overlay_has_no_route(
+    tmp_path: Path, manager_enabled: bool, mode: str,
+) -> None:
+    plan = tmp_path / "plan.md"
+    plan.write_text(_CUMULATIVE_PLAN, encoding="utf-8")
+    config = _cumulative_route_config(manager_enabled=manager_enabled, threshold=0)
+    workers = 0
+    calls: list[str] = []
+
+    def runner(argv: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+        nonlocal workers
+        model = argv[argv.index("--model") + 1]
+        if model == "sol-6-medium" and "schema_version" in str(kwargs.get("input", "")):
+            return subprocess.CompletedProcess(argv, 0, json.dumps({
+                "schema_version": 1, "action": "continue", "reason": "continue",
+                "next_step_notes": [], "stop_report": None,
+            }), "")
+        calls.append(model)
+        if model == "sol-6-high":
+            workers += 1
+            name = ("first", "second", "third")[workers - 1]
+            plan.write_text(
+                plan.read_text(encoding="utf-8").replace(
+                    f"### [ ] Checkpoint {workers}: ",
+                    f"### [x] Checkpoint {workers}: ",
+                ).replace(f"- [ ] {name}", f"- [x] {name}"),
+                encoding="utf-8",
+            )
+        elif model == "astra-medium" and mode == "unmatched":
+            (tmp_path / "unrelated.md").write_text(_REPAIR_PLAN, encoding="utf-8")
+        return subprocess.CompletedProcess(argv, 0, "synthetic output", "")
+
+    result = run_workflow(
+        ControllerConfig(repo_root=tmp_path, plan_path=plan,
+                         max_turns=8, team="sol-6-high"),
+        config, "repair", config_dir=tmp_path, snapshot_config=False,
+        adapter=CodexAdapter(), runner=runner,
+    )
+    run = json.loads((result.run_dir / "run.json").read_text())
+    assert calls == [
+        "sol-6-high", "sol-6-medium",
+        "sol-6-high", "sol-6-medium",
+        "sol-6-high", "sol-6-medium", "astra-medium",
+    ]
+    assert run["review_rejection_history"] == []
+    assert f"{plan}::cumulative-review" not in run["implementation_attempts"]
+
+
+@pytest.mark.parametrize("target_fails", [False, True])
+def test_cumulative_final_review_cross_harness_handover(
+    tmp_path: Path, target_fails: bool,
+) -> None:
+    plan = tmp_path / "plan.md"
+    plan.write_text(_CUMULATIVE_PLAN, encoding="utf-8")
+    (tmp_path / ".gitignore").write_text(".aflow/\n", encoding="utf-8")
+    for args in (
+        ("git", "init", "-q"),
+        ("git", "add", "plan.md", ".gitignore"),
+        ("git", "-c", "user.name=Test", "-c", "user.email=test@example.com", "commit", "-qm", "initial"),
+    ):
+        subprocess.run(args, cwd=tmp_path, check=True, capture_output=True)
+    config = _cumulative_route_config(manager_enabled=False, threshold=0)
+    config = replace(
+        config,
+        teams={
+            **config.teams,
+            "sol-6-high": replace(config.teams["sol-6-high"], upgrade_to="ds4-1-flash"),
+            "ds4-1-flash": TeamConfig(
+                roles={"worker": "reasonix.ds4-1-flash"}, extends="sol-6-high",
+            ),
+        },
+        harnesses={
+            **config.harnesses,
+            "reasonix": WorkflowHarnessConfig(profiles={
+                "ds4-1-flash": HarnessProfileConfig(model="ds4.1-flash"),
+            }),
+        },
+    )
+
+    class SourceDriver:
+        capabilities = SessionCapabilities(session_identity=True, followup_turn=True)
+
+        def handover(self, *args: object) -> None:
+            raise AssertionError("Codex cannot provide read-only handover")
+
+        def build_full_context(self, *args: object) -> None:
+            raise AssertionError("controller evidence must supply the handover")
+
+    class Driver:
+        capabilities = SessionCapabilities(session_identity=True, idempotent_turn_start=True)
+
+        def __init__(self) -> None:
+            self.requests: list[object] = []
+
+        def build_invocation(self, request: object) -> HarnessInvocation:
+            self.requests.append(request)
+            return HarnessInvocation(
+                label=request.selector, argv=("fake-session", request.selector), env={},
+                prompt_mode="synthetic", system_prompt=request.system_prompt,
+                user_prompt=request.user_prompt, effective_prompt=request.user_prompt,
+            )
+
+        def parse_result(
+            self, request: object, stdout: str, *, returncode: int = 0,
+        ) -> SessionResult:
+            del stdout, returncode
+            if target_fails and request.selector == "reasonix.ds4-1-flash":
+                raise RuntimeError("target start failed")
+            return SessionResult(
+                session_id=f"session-{request.selector}", selector=request.selector,
+                model=request.model, effort=request.effort, final_output="DONE",
+                capabilities=self.capabilities,
+            )
+
+    calls: list[str] = []
+    workers = 0
+    final_reviews = 0
+
+    def runner(argv: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+        nonlocal workers, final_reviews
+        selector = (
+            argv[1] if argv[0] == "fake-session"
+            else "codex." + argv[argv.index("--model") + 1]
+        )
+        calls.append(selector)
+        if selector in {"codex.sol-6-high", "reasonix.ds4-1-flash"}:
+            workers += 1
+            if workers <= 3:
+                name = ("first", "second", "third")[workers - 1]
+                plan.write_text(
+                    plan.read_text(encoding="utf-8").replace(
+                        f"### [ ] Checkpoint {workers}: ",
+                        f"### [x] Checkpoint {workers}: ",
+                    ).replace(f"- [ ] {name}", f"- [x] {name}"),
+                    encoding="utf-8",
+                )
+            else:
+                (tmp_path / "plan-cp01-v01.md").write_text(
+                    _REPAIR_PLAN.replace("[ ]", "[x]"), encoding="utf-8",
+                )
+        elif selector == "codex.astra-medium":
+            final_reviews += 1
+            if final_reviews == 1:
+                (tmp_path / "plan-cp01-v01.md").write_text(
+                    _REPAIR_PLAN, encoding="utf-8",
+                )
+        return subprocess.CompletedProcess(argv, 0, "synthetic output", "")
+
+    driver = Driver()
+    try:
+        result = run_workflow(
+            ControllerConfig(repo_root=tmp_path, plan_path=plan,
+                             max_turns=10, team="sol-6-high"),
+            config, "repair", config_dir=tmp_path, snapshot_config=False,
+            adapter=CodexAdapter(), runner=runner, session_driver=driver,
+            source_session_driver=SourceDriver(),
+            preflight_probe=NoOpHarnessPreflightProbe(),
+        )
+    except WorkflowError as exc:
+        if not target_fails:
+            raise
+        result = exc
+    run = json.loads((result.run_dir / "run.json").read_text())
+    repair = json.loads(
+        (result.run_dir / "turns" / "turn-008" / "result.json").read_text()
+    )
+    assert repair["selector"] == "reasonix.ds4-1-flash"
+    assert calls[:8] == [
+        "codex.sol-6-high", "codex.sol-6-medium",
+        "codex.sol-6-high", "codex.sol-6-medium",
+        "codex.sol-6-high", "codex.sol-6-medium",
+        "codex.astra-medium", "reasonix.ds4-1-flash",
+    ]
+    assert len(list((tmp_path / ".aflow" / "runs").iterdir())) == 1
+    assert plan.read_text(encoding="utf-8") == _CUMULATIVE_PLAN.replace("[ ]", "[x]")
+    assert run["hotplug_history"][-1]["stage"] == ("failed" if target_fails else "applied")
+    target = next(
+        request for request in driver.requests
+        if request.selector == "reasonix.ds4-1-flash"
+        and "Controller-authored handover:" in request.user_prompt
+    )
+    assert target.session_id is None
+    assert "Recorded rejection summary" in target.user_prompt
+    assert len(run["hotplug_history"][-1]["artifact_paths"]) == 3
+    assert [row["reviewed_attempt_ordinal"] for row in run["review_rejection_history"]] == [1]
+    if target_fails:
+        assert run["status"] == "failed"
+        assert "codex.sol-6-high" not in calls[8:]
+    else:
+        assert calls[8] == "codex.astra-medium"
+        assert run["status"] == "completed"
+
+
+def test_cumulative_repair_selected_worker_survives_prelaunch_resume(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    plan = tmp_path / "plan.md"
+    plan.write_text(_CUMULATIVE_PLAN, encoding="utf-8")
+    config = _cumulative_route_config(manager_enabled=False, threshold=0)
+    workers = 0
+    calls: list[str] = []
+
+    def runner(argv: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+        nonlocal workers
+        model = argv[argv.index("--model") + 1]
+        calls.append(model)
+        if model == "sol-6-high":
+            workers += 1
+            name = ("first", "second", "third")[workers - 1]
+            plan.write_text(
+                plan.read_text(encoding="utf-8").replace(
+                    f"### [ ] Checkpoint {workers}: ",
+                    f"### [x] Checkpoint {workers}: ",
+                ).replace(f"- [ ] {name}", f"- [x] {name}"),
+                encoding="utf-8",
+            )
+        elif model == "astra-medium" and "ds4.1-flash" not in calls:
+            (tmp_path / "plan-cp01-v01.md").write_text(
+                _REPAIR_PLAN, encoding="utf-8",
+            )
+        elif model == "ds4.1-flash":
+            (tmp_path / "plan-cp01-v01.md").write_text(
+                _REPAIR_PLAN.replace("[ ]", "[x]"), encoding="utf-8",
+            )
+        return subprocess.CompletedProcess(argv, 0, "synthetic output", "")
+
+    class PrelaunchStop(BaseException):
+        pass
+
+    original_write = RunMetadataWriter.write
+
+    def write_and_stop(writer: RunMetadataWriter, **kwargs: object) -> None:
+        original_write(writer, **kwargs)
+        payload = json.loads(writer.paths.run_json.read_text())
+        pending = payload.get("pending_step_team_override")
+        if (
+            isinstance(pending, dict)
+            and pending.get("selector") == "codex.ds4.1-flash"
+            and payload.get("active_turn") == 8
+            and payload.get("turns_completed") == 7
+        ):
+            raise PrelaunchStop
+
+    monkeypatch.setattr(RunMetadataWriter, "write", write_and_stop)
+    with pytest.raises(PrelaunchStop):
+        run_workflow(
+            ControllerConfig(repo_root=tmp_path, plan_path=plan,
+                             max_turns=10, team="sol-6-high"),
+            config, "repair", config_dir=tmp_path, snapshot_config=False,
+            adapter=CodexAdapter(), runner=runner,
+        )
+    monkeypatch.setattr(RunMetadataWriter, "write", original_write)
+    source = next((tmp_path / ".aflow" / "runs").iterdir())
+    saved = json.loads((source / "run.json").read_text())
+    assert saved["pending_step_team_override"]["selector"] == "codex.ds4.1-flash"
+    assert saved["review_rejection_history"][0]["reviewed_attempt_ordinal"] == 1
+    (source / "run.json").write_text(
+        json.dumps({**saved, "status": "interrupted"}) + "\n", encoding="utf-8",
+    )
+    fields = manager_resume_fields(saved)
+    resume = _mark_validated_resume_context(ResumeContext(
+        resumed_from_run_id=source.name,
+        feature_branch=None, worktree_path=None, main_branch=None,
+        setup=(), teardown=(),
+        active_plan_path=tmp_path / "plan-cp01-v01.md",
+        interrupted_step_name="followup", effective_max_turns=10,
+        **fields,
+    ))
+    result = run_workflow(
+        ControllerConfig(repo_root=tmp_path, plan_path=plan,
+                         max_turns=10, team="sol-6-high"),
+        config, "repair", config_dir=tmp_path, snapshot_config=False,
+        adapter=CodexAdapter(), runner=runner, resume=resume,
+    )
+    resumed = json.loads((result.run_dir / "run.json").read_text())
+    repair = json.loads(
+        (result.run_dir / "turns" / "turn-001" / "result.json").read_text()
+    )
+    assert repair["selector"] == "codex.ds4.1-flash"
+    assert repair["step_name"] == "followup"
+    assert calls.count("ds4.1-flash") == 1
+    assert resumed["review_rejection_history"] == saved["review_rejection_history"]
+    assert len(list((tmp_path / ".aflow" / "runs").iterdir())) == 2
 
 
 def _policy(

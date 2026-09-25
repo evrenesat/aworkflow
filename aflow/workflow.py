@@ -1871,9 +1871,17 @@ class _ManagerGateCoordinator:
         )
         target_plan_identity = _target_plan_identity(proposed_target_plan)
         scope = self.state.active_implementation_scope
+        routing_scope_id = scope.scope_id if scope is not None else None
+        if routing_scope_id is None and candidate_step is not None and candidate_step.role == "worker":
+            routing_scope_id = _cumulative_repair_scope_id(
+                self.state,
+                repo_root=run_paths.repo_root,
+                original_plan_path=original_plan_path,
+                target_plan_path=proposed_target_plan,
+            )
         attempts = (
-            self.state.implementation_attempts.get(scope.scope_id, [])
-            if scope is not None else []
+            self.state.implementation_attempts.get(routing_scope_id, [])
+            if routing_scope_id is not None else []
         )
         recent_team = attempts[-1].team if attempts else None
         repair_policy = determine_repair_upgrade_policy(
@@ -1881,10 +1889,25 @@ class _ManagerGateCoordinator:
             threshold=self.workflow.upgrade_after_repairs,
             role=(candidate_step.role if candidate_step is not None else current_role),
             baseline_team=baseline_team_name,
-            scope_id=scope.scope_id if scope is not None else None,
+            scope_id=routing_scope_id,
             attempts=attempts,
             rejections=self.state.review_rejection_history,
         )
+        if (
+            scope is None
+            and routing_scope_id is not None
+            and repair_policy.active
+            and repair_policy.due
+            and not repair_policy.eligible_upgrade.available
+            and repair_policy.current_team is not None
+            and self.workflow_config.teams.get(repair_policy.current_team) is not None
+            and self.workflow_config.teams[repair_policy.current_team].upgrade_to is not None
+        ):
+            raise WorkflowError(
+                "required cumulative repair upgrade has no distinct launchable selector: "
+                f"{repair_policy.eligible_upgrade.reason}",
+                run_dir=run_paths.run_dir,
+            )
         if scope_pressure_reason is not None:
             self.state.scope_pressure_reason = scope_pressure_reason
             _require_valid_pressure_scope(
@@ -1897,15 +1920,16 @@ class _ManagerGateCoordinator:
             # manager decision route. A due edge is mandatory when available;
             # an exhausted edge retains the strongest reviewed team.
             if (
-                repair_policy.active
+                (repair_policy.active or (scope is None and routing_scope_id is not None and recent_team is not None))
                 and candidate_step is not None
                 and candidate_step.role == "worker"
-                and repair_policy.current_team is not None
             ):
+                current_team = repair_policy.current_team or recent_team
+                assert current_team is not None
                 target_team = (
                     repair_policy.eligible_upgrade.target_team
                     if repair_policy.forced
-                    else repair_policy.current_team
+                    else current_team
                 )
                 target_selector = (
                     repair_policy.eligible_upgrade.target_selector
@@ -1922,15 +1946,24 @@ class _ManagerGateCoordinator:
                 self.state.pending_step_team_override = PendingTeamOverride(
                     target_step=str(next_step),
                     role=candidate_step.role,
-                    source_team=repair_policy.current_team,
+                    source_team=current_team,
                     target_team=str(target_team),
                     selector=target_selector,
                     checkpoint_identity=target_plan_identity,
                     decision_number=self.state.manager_decision_number,
                     scope_id=scope.scope_id if scope is not None else None,
                     target_plan_identity=target_plan_identity,
-                    repair_ordinal=repair_policy.repair_ordinal,
-                    team_repairs_completed=repair_policy.team_repairs_completed,
+                    repair_ordinal=(
+                        repair_policy.repair_ordinal
+                        if repair_policy.active else max(
+                            item.rejection_number for item in self.state.review_rejection_history
+                            if item.scope_id == routing_scope_id
+                        )
+                    ),
+                    team_repairs_completed=(
+                        repair_policy.team_repairs_completed
+                        if repair_policy.active else attempts[-1].team_repairs_completed
+                    ),
                 )
                 self.run_metadata.write(
                     status="running",
@@ -1967,7 +2000,7 @@ class _ManagerGateCoordinator:
                 "repair_threshold": repair_policy.threshold,
             }
         retrying_scoped_implementation = (
-            scope is not None
+            routing_scope_id is not None
             and bool(attempts)
             and candidate_step is not None
             and candidate_step.role == "worker"
@@ -3113,36 +3146,79 @@ def _has_resumable_cumulative_repair(
     evidence_state.implementation_attempts = _mutable_implementation_attempts(
         resume.implementation_attempts
     )
-    cumulative = _cumulative_review_attempt(
-        evidence_state,
-        original_plan_path=original_plan_path,
-        completed_snapshot=completed_snapshot,
-    )
-    if cumulative is None:
+    evidence_state.review_rejection_history = list(resume.review_rejection_history)
+    try:
+        return _cumulative_repair_scope_id(
+            evidence_state,
+            repo_root=repo_root,
+            original_plan_path=original_plan_path,
+            target_plan_path=active_path,
+        ) is not None
+    except WorkflowError:
         return False
-    scope_id, attempt = cumulative
-    scope_rejections = [
-        record for record in resume.review_rejection_history
+
+
+def _cumulative_repair_scope_id(
+    state: ControllerState,
+    *,
+    repo_root: Path,
+    original_plan_path: Path,
+    target_plan_path: Path,
+) -> str | None:
+    """Bind a focused worker target to the latest verified final-review rejection."""
+    scope_id = f"{original_plan_path}::cumulative-review"
+    rejections = [
+        record for record in state.review_rejection_history
         if record.scope_id == scope_id
     ]
-    if not scope_rejections:
-        return False
-    latest_number = max(record.rejection_number for record in scope_rejections)
-    matching = [
-        record for record in scope_rejections
+    if not rejections:
+        return None
+    latest_number = max(record.rejection_number for record in rejections)
+    latest = [
+        record for record in rejections
         if record.rejection_number == latest_number
-        and record.checkpoint_index is None
-        and record.reviewed_implementation_turn_number == attempt.turn_number
-        and record.reviewed_attempt_ordinal == attempt.attempt_ordinal
-        and record.reviewed_worker_team == attempt.team
-        and record.reviewed_worker_selector == attempt.selector
-        and record.repair_plan_path is not None
-        and (
-            (repo_root / record.repair_plan_path).resolve()
-            == active_path.resolve()
-        )
     ]
-    return len(matching) == 1
+    if len(latest) != 1 or latest[0].repair_plan_path is None:
+        raise WorkflowError("ambiguous cumulative repair rejection evidence")
+    repair_path = (repo_root / latest[0].repair_plan_path).resolve()
+    if repair_path != target_plan_path.resolve():
+        return None
+    if (
+        latest[0].review_step_name != "final_review"
+        or latest[0].checkpoint_index is not None
+        or not latest[0].reviewer_selector
+    ):
+        raise WorkflowError("invalid cumulative final-review boundary evidence")
+    try:
+        original_snapshot = load_plan(original_plan_path).snapshot
+    except (OSError, PlanParseError) as exc:
+        raise WorkflowError("cannot validate cumulative repair original plan") from exc
+    if not original_snapshot.is_complete or not target_plan_path.is_file():
+        raise WorkflowError("cumulative repair target is missing or original plan changed")
+    rejection = latest[0]
+    attempts = state.implementation_attempts.get(scope_id, [])
+    ordinals = [attempt.attempt_ordinal for attempt in attempts]
+    if (
+        not attempts
+        or any(
+            not isinstance(value, int) or isinstance(value, bool) or value < 1
+            for value in ordinals
+        )
+        or ordinals != sorted(set(ordinals))
+        or any(attempt.role != "worker" for attempt in attempts)
+    ):
+        raise WorkflowError("ambiguous cumulative repair worker attribution")
+    reviewed = [
+        attempt for attempt in attempts
+        if attempt.attempt_ordinal == rejection.reviewed_attempt_ordinal
+        and attempt.turn_number == rejection.reviewed_implementation_turn_number
+        and attempt.team == rejection.reviewed_worker_team
+        and attempt.selector == rejection.reviewed_worker_selector
+        and attempt.outcome == "accepted"
+    ]
+    if len(reviewed) != 1 or original_snapshot.total_checkpoint_count < 1:
+        raise WorkflowError("ambiguous cumulative repair worker attribution")
+    return scope_id
 
 
 def _pending_matches_scope_and_plan(
@@ -9275,11 +9351,12 @@ def _run_workflow_unchecked(
         state.active_turn = turn_number
         state.current_turn_started_at = started_at
         scope = state.active_implementation_scope
+        scope_id = scope.scope_id if scope is not None else cumulative_route_scope_id
         triggering_rejection_number = None
-        if step_role == "worker" and scope is not None:
+        if step_role == "worker" and scope_id is not None:
             matching_rejections = [
                 item for item in state.review_rejection_history
-                if item.scope_id == scope.scope_id
+                if item.scope_id == scope_id
             ]
             if matching_rejections:
                 triggering_rejection_number = max(
@@ -12614,6 +12691,7 @@ def _run_workflow_unchecked(
         attempt_repair_ordinal: int | None = None
         attempt_team_repairs_completed: int | None = None
         attempt_ordinal: int | None = None
+        cumulative_route_scope_id: str | None = None
         turn_session_request: SessionRequest | None = None
         owned_session_result = None
         cross_handover_prompt = ""
@@ -12643,6 +12721,12 @@ def _run_workflow_unchecked(
             )
             step = wf.steps[current_step_name]
             step_path = f"workflow.{workflow_name}.steps.{current_step_name}"
+            if step.role == "worker" and state.active_implementation_scope is None:
+                cumulative_route_scope_id = _cumulative_repair_scope_id(
+                    state, repo_root=run_paths.repo_root,
+                    original_plan_path=original_plan_path,
+                    target_plan_path=active_plan_path,
+                )
             if step.role == "worker" and not done:
                 try:
                     _scope, scope_was_opened = _open_implementation_scope(
@@ -12699,16 +12783,21 @@ def _run_workflow_unchecked(
                 consume_team_override = True
                 attempt_repair_ordinal = pending_override.repair_ordinal
                 attempt_team_repairs_completed = pending_override.team_repairs_completed
-            if step.role == "worker" and state.active_implementation_scope is not None:
+            routing_scope_id = (
+                state.active_implementation_scope.scope_id
+                if state.active_implementation_scope is not None
+                else cumulative_route_scope_id
+            )
+            if step.role == "worker" and routing_scope_id is not None:
                 if attempt_repair_ordinal is None:
                     prelaunch_policy = determine_repair_upgrade_policy(
                         workflow_config,
                         threshold=wf.upgrade_after_repairs,
                         role="worker",
                         baseline_team=baseline_team_name,
-                        scope_id=state.active_implementation_scope.scope_id,
+                        scope_id=routing_scope_id,
                         attempts=state.implementation_attempts.get(
-                            state.active_implementation_scope.scope_id, []
+                            routing_scope_id, []
                         ),
                         rejections=state.review_rejection_history,
                     )
@@ -13009,6 +13098,12 @@ def _run_workflow_unchecked(
 
             step = wf.steps[current_step_name]
             step_path = f"workflow.{workflow_name}.steps.{current_step_name}"
+            if step.role == "worker" and state.active_implementation_scope is None:
+                cumulative_route_scope_id = _cumulative_repair_scope_id(
+                    state, repo_root=run_paths.repo_root,
+                    original_plan_path=original_plan_path,
+                    target_plan_path=active_plan_path,
+                )
             if step.role == "worker" and not current_plan.snapshot.is_complete:
                 try:
                     _scope, scope_was_opened = _open_implementation_scope(
@@ -13065,16 +13160,21 @@ def _run_workflow_unchecked(
                 consume_team_override = True
                 attempt_repair_ordinal = pending_override.repair_ordinal
                 attempt_team_repairs_completed = pending_override.team_repairs_completed
-            if step.role == "worker" and state.active_implementation_scope is not None:
+            routing_scope_id = (
+                state.active_implementation_scope.scope_id
+                if state.active_implementation_scope is not None
+                else cumulative_route_scope_id
+            )
+            if step.role == "worker" and routing_scope_id is not None:
                 if attempt_repair_ordinal is None:
                     prelaunch_policy = determine_repair_upgrade_policy(
                         workflow_config,
                         threshold=wf.upgrade_after_repairs,
                         role="worker",
                         baseline_team=baseline_team_name,
-                        scope_id=state.active_implementation_scope.scope_id,
+                        scope_id=routing_scope_id,
                         attempts=state.implementation_attempts.get(
-                            state.active_implementation_scope.scope_id, []
+                            routing_scope_id, []
                         ),
                         rejections=state.review_rejection_history,
                     )
@@ -13337,10 +13437,10 @@ def _run_workflow_unchecked(
                     new_path=new_plan_path,
                 )
 
-        if step.role == "worker" and state.active_implementation_scope is not None:
+        if step.role == "worker" and routing_scope_id is not None:
             attempt_ordinal = _next_implementation_attempt_ordinal(
                 state.implementation_attempts.get(
-                    state.active_implementation_scope.scope_id,
+                    routing_scope_id,
                     [],
                 )
             )
@@ -14135,9 +14235,8 @@ def _run_workflow_unchecked(
         if review_rejection is not None:
             state.review_rejection_history.append(review_rejection)
 
-        if step.role == "worker" and state.active_implementation_scope is not None:
-            scope = state.active_implementation_scope
-            state.implementation_attempts.setdefault(scope.scope_id, []).append(ImplementationAttempt(
+        if step.role == "worker" and routing_scope_id is not None:
+            state.implementation_attempts.setdefault(routing_scope_id, []).append(ImplementationAttempt(
                 turn_number=turn_number, step_name=current_step_name, role=step.role,
                 team=active_team_name, selector=selector,
                 outcome="accepted" if done else "progress",
@@ -14147,16 +14246,17 @@ def _run_workflow_unchecked(
                 team_repairs_completed=attempt_team_repairs_completed,
                 attempt_ordinal=attempt_ordinal,
             ))
-            next_config = (
-                wf.steps.get(transition_target)
-                if transition_target != "END" else None
-            )
-            state.active_implementation_scope = replace(
-                scope,
-                awaiting_review=(
-                    next_config is not None and next_config.role != "worker"
-                ),
-            )
+            if state.active_implementation_scope is not None:
+                next_config = (
+                    wf.steps.get(transition_target)
+                    if transition_target != "END" else None
+                )
+                state.active_implementation_scope = replace(
+                    state.active_implementation_scope,
+                    awaiting_review=(
+                        next_config is not None and next_config.role != "worker"
+                    ),
+                )
             if consume_team_override:
                 state.pending_step_team_override = None
 

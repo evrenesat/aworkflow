@@ -704,8 +704,14 @@ attempt must have exact team, selector and ordinal evidence. The controller
 stores that attempt under a stable completed-plan scope and records the final
 review rejection there. An unmatched overlay, clean approval or missing worker
 evidence earns no credit. Resume retains the record and focused overlay; a
-repeated review of the same worker attempt cannot count twice. This evidence
-does not itself select the follow-up worker.
+repeated review of the same worker attempt cannot count twice. At the next
+worker boundary, the controller applies the configured repair threshold and
+one-hop team edge to this cumulative lineage. A due edge stores the target
+selector before launch and survives restart; an exhausted edge retains the
+current team. Follow-up attempts remain in the cumulative lineage so a higher
+threshold counts only workers that actually ran and were rejected. The normal
+cross-harness transaction supplies controller-authored handover evidence and
+fails without launching the baseline worker if the target cannot start.
 For newly finalized reviewer turns, the controller stores an explicit
 `review_rejection` object (or JSON `null`) in `result.json` and retains the
 scope history in `run.json`. It records bounded plain-text reviewer and repair

@@ -4522,3 +4522,21 @@ HISTORY: Published clipboard history `c14f1f2`/`cd78d53` remains separate and mu
   checkpoint state and missing worker evidence create no rejection.
 - Focused verification: 88 tests passed across repair upgrades and both resume
   suites. Worker routing remains the next checkpoint's work.
+
+## 2026-09-25 — Final-review repair routing, checkpoint 2
+
+- Historical run `20260925t171339z-3b11d2a6` was inspected read-only: turn 7
+  was an Astra `final_review` with a valid focused overlay, while turn 8 used
+  baseline Sol High. The completed checkpoint scope had already closed.
+- The verified cumulative rejection now feeds the configured repair policy at
+  the post-review boundary. Threshold 0 selects the one-hop repair team for
+  the immediate follow-up; higher thresholds count distinct failed workers.
+  The selected selector is persisted before launch, follow-up attempts extend
+  the cumulative lineage, and normal hotplug handles cross-harness handover.
+- Focused routing, handover and resume verification passed 191 tests. The
+  first full Python run had 2479 passed and one unrelated admission-test
+  failure from inherited `AFLOW_ADMISSION_RESERVATION_NONCE`; that test passed
+  alone with the variable removed. The full rerun with only that variable
+  removed passed 2480 tests and 241 subtests. `git diff --check` and scoped
+  Ruff passed. Publication, exact-SHA CI and live activation remain separate
+  coordinator gates.

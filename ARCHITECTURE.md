@@ -681,8 +681,15 @@ the retained accepted worker from the final checkpoint, then persists one
 separate `::cumulative-review` rejection lineage. The exact worker attempt,
 team and selector remain in the existing attempt and rejection ledgers. Resume
 admits the focused overlay only when those records agree; review retries of the
-same attempt do not create another rejection. Worker selection from this
-cumulative evidence is a separate routing boundary.
+same attempt do not create another rejection. At the post-review boundary,
+the controller evaluates that cumulative lineage with the normal threshold
+and one-hop team graph. It persists the selected worker as a one-turn pending
+override bound to the focused overlay before launch. Completed follow-up
+attempts extend the cumulative lineage without reopening a checkpoint scope;
+manager-disabled and manager-enabled paths retain the latest worker team until
+a later verified rejection is due for another edge. The existing hotplug
+transaction handles a cross-harness target and fails explicitly if it cannot
+start. A separate checkpoint starts from its baseline team.
 
 ## Module Breakdown
 
