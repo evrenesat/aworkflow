@@ -350,7 +350,8 @@ def install_mutation_observer(page: Page, root_selector: str = "body") -> None:
     """Install a bounded observer for later unchanged-refresh assertions."""
     page.evaluate(
         """selector => {
-          const root = document.querySelector(selector) || document.body;
+          const root = document.querySelector(selector);
+          if (!root) throw new Error(`Required mutation root missing: ${selector}`);
           window.__aflowFidelityMutations = [];
           window.__aflowFidelityMutationObserver?.disconnect();
           const observer = new MutationObserver(records => {
@@ -397,7 +398,7 @@ def capture_dom_identity(page: Page, selector: str) -> dict[str, Any]:
           return {
             present: true,
             nodeName: element.nodeName,
-            identity: element.id || element.getAttribute('data-testid') || nodeToken,
+            identity: nodeToken,
             text: element.textContent || '',
             x: rect.x,
             y: rect.y,
@@ -408,4 +409,123 @@ def capture_dom_identity(page: Page, selector: str) -> dict[str, Any]:
           };
         }""",
         selector,
+    )
+
+
+def install_refresh_probe(page: Page, roots: dict[str, str]) -> None:
+    """Observe exact visible roots without changing DOM, styles, or layout.
+
+    The WeakMap token is assigned to an actual Element, never an HTML id.
+    MutationObserver callbacks only append bounded records in JS memory. A
+    parent observer detects root replacement, which a subtree observer alone
+    cannot see. Snapshot reads only geometry and state, so instrumentation
+    itself cannot cause a repaint.
+    """
+    page.evaluate(
+        """selectors => {
+          window.__aflowRefreshProbe?.observers.forEach(observer => observer.disconnect());
+          const tokens = new WeakMap();
+          let nextToken = 0;
+          const token = node => {
+            if (!node) return null;
+            if (!tokens.has(node)) tokens.set(node, ++nextToken);
+            return tokens.get(node);
+          };
+          const locate = (name, selector) => {
+            const matches = [...document.querySelectorAll(selector)].filter(node => {
+              const box = node.getBoundingClientRect();
+              const style = getComputedStyle(node);
+              return node.isConnected && box.width > 0 && box.height > 0
+                && style.display !== 'none' && style.visibility !== 'hidden';
+            });
+            if (matches.length !== 1) throw new Error(`Expected one visible ${name} root (${selector}), got ${matches.length}`);
+            return matches[0];
+          };
+          const records = [];
+          const observers = [];
+          const nodes = Object.fromEntries(Object.entries(selectors).map(([name, selector]) =>
+            [name, locate(name, selector)]));
+          for (const [name, root] of Object.entries(nodes)) {
+            const observer = new MutationObserver(changes => {
+              for (const change of changes) {
+                const target = change.target.nodeType === Node.ELEMENT_NODE ? change.target : change.target.parentElement;
+                const addedElements = [...change.addedNodes].filter(node => node.nodeType === Node.ELEMENT_NODE);
+                const removedElements = [...change.removedNodes].filter(node => node.nodeType === Node.ELEMENT_NODE);
+                const clockLabel = target?.closest?.('dd')?.previousElementSibling?.textContent ?? '';
+                const classification = addedElements.length || removedElements.length ? 'subtree'
+                  : change.type === 'characterData' && /elapsed|duration|running for/i.test(clockLabel + ' ' + (target?.textContent ?? '')) ? 'clock'
+                  : change.type === 'characterData' ? 'value'
+                  : change.attributeName === 'hidden' || change.attributeName === 'aria-hidden' ? 'visibility'
+                  : 'attribute';
+                records.push({root: name, type: change.type, target: target?.tagName ?? '#text',
+                  targetToken: token(target), attribute: change.attributeName,
+                  classification, added: addedElements.length, removed: removedElements.length,
+                  addedElements: addedElements.map(node => ({tag: node.tagName,
+                    className: String(node.className).slice(0, 100),
+                    text: (node.textContent ?? '').slice(0, 120)})),
+                  removedElements: removedElements
+                    .map(node => ({tag: node.tagName, className: String(node.className).slice(0, 100),
+                      text: (node.textContent ?? '').slice(0, 120)}))});
+              }
+              if (records.length > 500) {
+                window.__aflowRefreshProbe.overflow = true;
+                records.splice(0, records.length - 500);
+              }
+            });
+            observer.observe(root, {subtree: true, childList: true, attributes: true, characterData: true});
+            observers.push(observer);
+            if (root.parentElement) {
+              const parent = new MutationObserver(changes => {
+                if (changes.some(change => [...change.removedNodes].some(node => node === root || node.contains?.(root)))) {
+                  records.push({root: name, type: 'root-removed', classification: 'root-replacement'});
+                }
+              });
+              parent.observe(root.parentElement, {childList: true});
+              observers.push(parent);
+            }
+          }
+          window.__aflowRefreshProbe = {selectors, nodes, token, locate, records, observers, overflow: false};
+        }""",
+        roots,
+    )
+
+
+def capture_refresh_probe(page: Page) -> dict[str, Any]:
+    """Read mounted-node, geometry, scroll, focus and disclosure continuity."""
+    return page.evaluate(
+        """() => {
+          const probe = window.__aflowRefreshProbe;
+          if (!probe) throw new Error('Refresh probe was not installed');
+          const active = document.activeElement;
+          const focused = active instanceof Element ? probe.token(active) : null;
+          const roots = Object.fromEntries(Object.entries(probe.selectors).map(([name, selector]) => {
+            const node = probe.locate(name, selector);
+            const box = node.getBoundingClientRect();
+            return [name, {token: probe.token(node), sameNode: node === probe.nodes[name],
+              connected: node.isConnected, text: node.textContent ?? '',
+              open: node instanceof HTMLDetailsElement ? node.open : null,
+              box: {x: box.x, y: box.y, width: box.width, height: box.height},
+              scrollTop: node.scrollTop,
+              disclosures: [...node.querySelectorAll('details')].map(detail =>
+                ({token: probe.token(detail), open: detail.open})),
+            }];
+          }));
+          return {roots, focused, scrollX: window.scrollX, scrollY: window.scrollY,
+            documentScrollTop: document.scrollingElement?.scrollTop ?? 0};
+        }"""
+    )
+
+
+def read_refresh_probe_mutations(page: Page) -> list[dict[str, Any]]:
+    """Drain mutations after queued observer callbacks have run."""
+    return page.evaluate(
+        """async () => {
+          await Promise.resolve();
+          const probe = window.__aflowRefreshProbe;
+          if (!probe) throw new Error('Refresh probe was not installed');
+          if (probe.overflow) throw new Error('Refresh probe overflowed its mutation log');
+          const records = [...probe.records];
+          probe.records.length = 0;
+          return records;
+        }"""
     )

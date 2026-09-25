@@ -7,6 +7,7 @@ import json
 import os
 from pathlib import Path
 import re
+import subprocess
 from urllib.parse import urlsplit
 
 import pytest
@@ -21,11 +22,14 @@ from ui_demo_fidelity import (
     PRODUCTION_ANCHORS,
     PRODUCTION_PROGRESS_SURFACE,
     capture_dom_identity,
+    capture_refresh_probe,
     capture_reference_surface,
     install_mutation_observer,
+    install_refresh_probe,
     load_reference_manifest,
     measure_named_anchors,
     read_mutation_records,
+    read_refresh_probe_mutations,
     seed_demo_fidelity_fixture,
 )
 
@@ -1792,3 +1796,411 @@ def test_ui_demo_equal_refresh_retains_detail_and_changed_rows_update(
                     pass
             browser.close()
     _write_artifact_manifest(tmp_path / f"refresh-comparison-{theme}-{width}x{height}.json", captures)
+
+
+@pytest.mark.parametrize("variant", ("running", "paused"))
+@pytest.mark.parametrize(
+    ("width", "height", "theme"),
+    ((1280, 720, "light"), (390, 844, "dark")),
+)
+def test_ui_demo_selected_run_background_refresh_probe(
+    control_client,  # noqa: F811
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    variant: str,
+    width: int,
+    height: int,
+    theme: str,
+) -> None:
+    """The real event refresh holds list, status, events and context in place."""
+    _, root, units, _ = control_client
+    selected = seed_demo_fidelity_fixture(root)[variant]
+    assert isinstance(selected, dict)
+    if variant == "running":
+        assert isinstance(units, InMemoryUnitManager)
+        unit_name = f"aflow-run-{selected['run_id']}.service"
+        units.units[unit_name] = UnitState(name=unit_name, active_state="active", sub_state="running")
+    dist = Path(__file__).resolve().parents[2] / "web" / "dist"
+    monkeypatch.setenv("AFLOW_APP_WEB_DIST", str(dist))
+    base = f"/api/control-plane/projects/{PROJECT_ID}/runs"
+    selected_path = f"{base}/{selected['run_id']}"
+    phase = {"value": "initial"}
+    held: list[tuple[object, bytes, int, dict[str, str]]] = []
+    requested: list[str] = []
+    writes: list[str] = []
+    page_errors: list[str] = []
+
+    def intercept(route) -> None:
+        request = route.request
+        path = urlsplit(request.url).path
+        if request.method != "GET" or not (path == base or path in {
+            selected_path, f"{selected_path}/events", f"{selected_path}/context"
+        }):
+            route.continue_()
+            return
+        if phase["value"] == "initial":
+            route.continue_()
+            return
+        requested.append(path)
+        if phase["value"] == "failure" and path == selected_path:
+            route.fulfill(status=503, content_type="application/json", body='{"detail":"read unavailable"}')
+            return
+        response = route.fetch()
+        if phase["value"] == "equal":
+            held.append((route, response.body(), response.status, response.headers))
+        elif phase["value"] == "changed" and path == f"{selected_path}/events":
+            payload = json.loads(response.body())
+            payload["events"].append({
+                "sequence": max((event["sequence"] for event in payload["events"]), default=0) + 1,
+                "event_type": "checkpoint_progress_recorded",
+                "schema_version": 1,
+                "timestamp": "2026-09-25T17:00:00Z",
+                "data": {"summary": "Refresh probe changed event"},
+            })
+            route.fulfill(status=200, content_type="application/json", body=json.dumps(payload))
+        else:
+            route.fulfill(status=response.status, headers=response.headers, body=response.body())
+
+    with live_server() as url, sync_playwright() as playwright:
+        browser = _browser(playwright)
+        page = browser.new_page(viewport={"width": width, "height": height})
+        page.on("pageerror", lambda error: page_errors.append(str(error)))
+        # The dashboard uses POST /config/form for a read-only projection.
+        page.on("request", lambda request: writes.append(request.url) if phase["value"] != "initial" and request.method not in {"GET", "OPTIONS"} and "/api/" in request.url and not urlsplit(request.url).path.endswith("/config/form") else None)
+        page.route("**/api/control-plane/projects/*/runs**", intercept)
+        try:
+            _login(page, url)
+            page.emulate_media(color_scheme=theme)  # type: ignore[arg-type]
+            _set_theme_preference(page, theme)
+            page.goto(f"{url}/?project={PROJECT_ID}&view=runs&run={selected['run_id']}")
+            detail = page.locator(".run-detail:visible").first
+            detail.wait_for()
+            if variant == "running":
+                expect(detail).to_contain_text("Running")
+            disclosure = detail.locator("details[data-ui-fidelity-anchor='first-disclosure']")
+            disclosure.locator(":scope > summary").click()
+            expect(disclosure).to_have_attribute("open", "")
+            actions = detail.get_by_role("button", name="Actions", exact=True)
+            actions.focus()
+            page.evaluate("window.scrollTo(0, Math.min(document.body.scrollHeight - innerHeight, 180))")
+            # Progress, context and diagnostics settle on independent reads.
+            # Do not attribute their initial paint to a later refresh.
+            page.wait_for_timeout(2_500)
+            install_refresh_probe(page, {
+                "detail": ".run-detail",
+                "disclosure": "details[data-ui-fidelity-anchor='first-disclosure']",
+            })
+            before = capture_refresh_probe(page)
+            assert before["roots"]["disclosure"]["open"] is True
+            # A viewport screenshot does not resize a long page, which would
+            # itself toggle the compact Back control during observation.
+            page.screenshot(path=str(tmp_path / f"selected-{variant}-before-{theme}-{width}x{height}.png"))
+            phase["value"] = "equal"
+            page.evaluate("window.dispatchEvent(new Event('aflow-history-changed'))")
+            for _ in range(100):
+                if any(urlsplit(route.request.url).path == base for route, *_ in held):
+                    break
+                page.wait_for_timeout(25)
+            assert held, "background run list read was not held"
+            held_snapshot = capture_refresh_probe(page)
+            assert held_snapshot["roots"]["detail"]["sameNode"] is True
+            assert held_snapshot["roots"]["disclosure"]["sameNode"] is True
+            assert held_snapshot["roots"]["disclosure"]["open"] is True
+            assert held_snapshot["roots"]["disclosure"]["box"] == before["roots"]["disclosure"]["box"]
+            assert held_snapshot["roots"]["disclosure"]["disclosures"] == before["roots"]["disclosure"]["disclosures"]
+            assert held_snapshot["focused"] == before["focused"]
+            assert held_snapshot["scrollY"] == before["scrollY"]
+            held_mutations = read_refresh_probe_mutations(page)
+            assert not [item for item in held_mutations if item.get("classification") in {"subtree", "root-replacement"}], held_mutations
+            while held:
+                route, body, status, headers = held.pop(0)
+                route.fulfill(status=status, headers=headers, body=body)
+                page.wait_for_timeout(40)
+                if selected_path in requested and f"{selected_path}/events" in requested and f"{selected_path}/context" in requested:
+                    break
+            for _ in range(100):
+                if selected_path in requested and f"{selected_path}/events" in requested and f"{selected_path}/context" in requested:
+                    break
+                page.wait_for_timeout(25)
+            assert {base, selected_path, f"{selected_path}/events", f"{selected_path}/context"}.issubset(requested)
+            phase["value"] = "released"
+            while held:
+                route, body, status, headers = held.pop(0)
+                route.fulfill(status=status, headers=headers, body=body)
+            page.wait_for_timeout(250)
+            after_equal = capture_refresh_probe(page)
+            assert all(root["sameNode"] for root in after_equal["roots"].values())
+            assert after_equal["roots"]["disclosure"]["open"] is True
+            assert after_equal["roots"]["disclosure"]["box"] == before["roots"]["disclosure"]["box"]
+            assert after_equal["roots"]["disclosure"]["text"] == before["roots"]["disclosure"]["text"]
+            assert after_equal["focused"] == before["focused"]
+            assert after_equal["scrollY"] == before["scrollY"]
+            equal_mutations = read_refresh_probe_mutations(page)
+            assert not [item for item in equal_mutations if item.get("classification") in {"subtree", "root-replacement"}], equal_mutations
+            page.screenshot(path=str(tmp_path / f"selected-{variant}-equal-{theme}-{width}x{height}.png"))
+
+            phase["value"] = "changed"
+            requested.clear()
+            for _ in range(5):
+                page.evaluate("window.dispatchEvent(new Event('aflow-history-changed'))")
+                for _ in range(30):
+                    if f"{selected_path}/events" in requested:
+                        break
+                    page.wait_for_timeout(50)
+                if f"{selected_path}/events" in requested:
+                    break
+            assert f"{selected_path}/events" in requested, requested
+            expect(detail).to_contain_text("Refresh probe changed event")
+            after_changed = capture_refresh_probe(page)
+            assert all(root["sameNode"] for root in after_changed["roots"].values())
+            assert after_changed["roots"]["detail"]["text"] != after_equal["roots"]["detail"]["text"]
+            assert after_changed["roots"]["disclosure"]["open"] is True
+            assert after_changed["focused"] == before["focused"]
+            assert after_changed["scrollY"] == before["scrollY"]
+            page.wait_for_timeout(300)
+
+            phase["value"] = "failure"
+            requested.clear()
+            for _ in range(5):
+                page.evaluate("window.dispatchEvent(new Event('aflow-history-changed'))")
+                for _ in range(30):
+                    if selected_path in requested:
+                        break
+                    page.wait_for_timeout(50)
+                if selected_path in requested:
+                    break
+            assert selected_path in requested, requested
+            expect(page.get_by_role("alert").filter(has_text="read unavailable")).to_be_visible()
+            after_failure = capture_refresh_probe(page)
+            assert all(root["sameNode"] for root in after_failure["roots"].values())
+            assert after_failure["roots"]["disclosure"]["text"] == after_changed["roots"]["disclosure"]["text"]
+            assert disclosure.get_attribute("open") == ""
+            assert actions.is_visible()
+            assert after_failure["focused"] == before["focused"]
+            assert after_failure["scrollY"] == before["scrollY"]
+            assert page_errors == []
+            assert writes == []
+            _write_artifact_manifest(tmp_path / f"selected-{variant}-{theme}-{width}x{height}.json", {
+                "before": before, "held": held_snapshot, "equal": after_equal,
+                "changed": after_changed,
+                "failure": after_failure, "held_mutations": held_mutations,
+                "equal_mutations": equal_mutations,
+                "requested": requested, "page_errors": page_errors, "writes": writes,
+            })
+        finally:
+            for route, body, status, headers in held:
+                try:
+                    route.fulfill(status=status, headers=headers, body=body)
+                except Exception:
+                    pass
+            page.unroute_all(behavior="ignoreErrors")
+            browser.close()
+
+
+@pytest.mark.parametrize(
+    ("width", "height", "theme"),
+    ((1280, 720, "dark"), (390, 844, "light")),
+)
+def test_ui_demo_all_runs_background_refresh_probe(
+    control_client,  # noqa: F811
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    width: int,
+    height: int,
+    theme: str,
+) -> None:
+    """Visibility/event refresh traverses cursors and retains partial rows."""
+    _, root, _, _ = control_client
+    first = seed_demo_fidelity_fixture(root)
+    second_id = "refresh-second"
+    changed_run_id = "refresh-history-054"
+    second_root = tmp_path / second_id
+    second_root.mkdir()
+    subprocess.run(("git", "init", "-q", str(second_root)), check=True)
+    second = seed_demo_fidelity_fixture(second_root)
+    # The real history API must issue a second page. These are disposable
+    # records; the approved reference and any live run artifacts stay intact.
+    for index in range(101):
+        run_dir = second_root / ".aflow" / "runs" / f"refresh-history-{index:03}"
+        run_dir.mkdir(parents=True)
+        (run_dir / "run.json").write_text(json.dumps({
+            "status": "completed", "activity": "inactive",
+            "plan_path": second["completed"]["plan"],
+            "run_started_at": f"2026-09-20T10:{index % 60:02}:00Z",
+        }))
+    from aflow_app_server import main
+    assert main._project_registry is not None
+    main._project_registry.register(second_id, "Second project", second_id)
+    dist = Path(__file__).resolve().parents[2] / "web" / "dist"
+    monkeypatch.setenv("AFLOW_APP_WEB_DIST", str(dist))
+    base = "/api/control-plane/projects/"
+    phase = {"value": "initial"}
+    held: list[tuple[object, bytes, int, dict[str, str]]] = []
+    requests: list[str] = []
+    writes: list[str] = []
+    page_errors: list[str] = []
+
+    def row_selector(project_id: str, run_id: str) -> str:
+        key = json.dumps([project_id, run_id], separators=(",", ":"))
+        return f".global-run-row[data-run-key={json.dumps(key)}]"
+
+    def intercept(route) -> None:
+        request = route.request
+        parsed = urlsplit(request.url)
+        if request.method != "GET" or not re.fullmatch(rf"{base}[^/]+/runs", parsed.path):
+            route.continue_()
+            return
+        requests.append(request.url)
+        project_id = parsed.path.split("/")[-2]
+        if phase["value"] == "failed" and project_id == second_id:
+            route.fulfill(status=503, content_type="application/json", body='{"detail":"project unavailable"}')
+            return
+        response = route.fetch()
+        body = response.body()
+        if phase["value"] == "held" and project_id == second_id and "cursor=" not in parsed.query:
+            held.append((route, body, response.status, response.headers))
+            return
+        if phase["value"] == "changed" and project_id == second_id:
+            payload = json.loads(body)
+            for run in payload["runs"]:
+                if run["run_id"] == changed_run_id:
+                    run.update(status="failed", activity="inactive", status_reason_code="worker_failure")
+            body = json.dumps(payload).encode()
+        route.fulfill(status=response.status, headers=response.headers, body=body)
+
+    with live_server() as url, sync_playwright() as playwright:
+        browser = _browser(playwright)
+        page = browser.new_page(viewport={"width": width, "height": height})
+        page.on("pageerror", lambda error: page_errors.append(str(error)))
+        # Treat the read-only form projection separately from actual writes.
+        page.on("request", lambda request: writes.append(request.url) if phase["value"] != "initial" and request.method not in {"GET", "OPTIONS"} and "/api/" in request.url and not urlsplit(request.url).path.endswith("/config/form") else None)
+        page.route("**/api/control-plane/projects/*/runs?*", intercept)
+        try:
+            _login(page, url)
+            page.emulate_media(color_scheme=theme)  # type: ignore[arg-type]
+            _set_theme_preference(page, theme)
+            page.goto(f"{url}/?view=all-runs")
+            page.get_by_role("heading", name="All runs", exact=True).wait_for()
+            first_selector = row_selector(PROJECT_ID, first["paused"]["run_id"])
+            second_selector = row_selector(second_id, changed_run_id)
+            first_row = page.locator(first_selector)
+            second_row = page.locator(second_selector)
+            expect(first_row).to_be_visible()
+            expect(second_row).to_be_visible()
+            expect(page.locator(".global-run-row[data-enrichment-state='loading']:visible")).to_have_count(0, timeout=15_000)
+            assert any("cursor=" in url for url in requests), "second project never traversed its next cursor"
+            toggle = first_row.locator(".run-row-preview-toggle")
+            toggle.click()
+            expect(first_row.get_by_role("dialog")).to_be_visible()
+            toggle.focus()
+            page.evaluate("window.scrollTo(0, Math.min(document.body.scrollHeight - innerHeight, 180))")
+            page.mouse.move(1, 1)
+            page.wait_for_timeout(350)
+            install_refresh_probe(page, {
+                "results": ".global-run-results",
+                "selected_row": first_selector,
+                "preview": f"{first_selector} .run-row-preview",
+                "changed_row": second_selector,
+            })
+            before = capture_refresh_probe(page)
+            row_order = page.locator(".global-run-row").evaluate_all("rows => rows.map(row => row.getAttribute('data-run-key'))")
+            page.screenshot(path=str(tmp_path / f"all-runs-before-{theme}-{width}x{height}.png"))
+            requests.clear()
+            phase["value"] = "held"
+            page.evaluate("document.dispatchEvent(new Event('visibilitychange'))")
+            for _ in range(100):
+                if held:
+                    break
+                page.wait_for_timeout(25)
+            assert held, "visibility refresh did not reach the second project"
+            during = capture_refresh_probe(page)
+            assert all(root["sameNode"] for root in during["roots"].values())
+            assert page.locator(".global-run-row").evaluate_all("rows => rows.map(row => row.getAttribute('data-run-key'))") == row_order
+            assert during["roots"]["selected_row"]["box"] == before["roots"]["selected_row"]["box"]
+            assert during["roots"]["preview"]["box"] == before["roots"]["preview"]["box"]
+            assert during["focused"] == before["focused"]
+            assert during["scrollY"] == before["scrollY"]
+            held_mutations = read_refresh_probe_mutations(page)
+            assert not [item for item in held_mutations if item.get("classification") in {"subtree", "root-replacement"}], held_mutations
+            route, body, status, headers = held.pop()
+            route.fulfill(status=status, headers=headers, body=body)
+            page.wait_for_timeout(250)
+            equal = capture_refresh_probe(page)
+            assert all(root["sameNode"] for root in equal["roots"].values())
+            assert page.locator(".global-run-row").evaluate_all("rows => rows.map(row => row.getAttribute('data-run-key'))") == row_order
+            assert equal["roots"]["selected_row"]["box"] == before["roots"]["selected_row"]["box"]
+            assert equal["roots"]["preview"]["box"] == before["roots"]["preview"]["box"]
+            assert equal["roots"]["selected_row"]["text"] == before["roots"]["selected_row"]["text"]
+            assert equal["roots"]["preview"]["text"] == before["roots"]["preview"]["text"]
+            assert equal["focused"] == before["focused"]
+            assert equal["scrollY"] == before["scrollY"]
+            equal_mutations = read_refresh_probe_mutations(page)
+            assert not [item for item in equal_mutations if item.get("classification") in {"subtree", "root-replacement"}], equal_mutations
+            page.screenshot(path=str(tmp_path / f"all-runs-equal-{theme}-{width}x{height}.png"))
+
+            phase["value"] = "changed"
+            requests.clear()
+            page.evaluate("window.dispatchEvent(new Event('aflow-history-changed'))")
+            expect(second_row).to_contain_text("Failed")
+            changed = capture_refresh_probe(page)
+            assert all(root["sameNode"] for root in changed["roots"].values())
+            assert changed["roots"]["selected_row"]["text"] == before["roots"]["selected_row"]["text"]
+            assert changed["roots"]["changed_row"]["text"] != before["roots"]["changed_row"]["text"]
+            assert changed["roots"]["preview"]["text"] == before["roots"]["preview"]["text"]
+
+            for _ in range(100):
+                if any("cursor=" in request and f"/{second_id}/runs" in request for request in requests):
+                    break
+                page.wait_for_timeout(25)
+            assert any("cursor=" in request and f"/{second_id}/runs" in request for request in requests)
+            requests.clear()
+            for _ in range(240):
+                if any(f"/{second_id}/runs" in request for request in requests):
+                    break
+                page.wait_for_timeout(50)
+            assert any(f"/{second_id}/runs" in request for request in requests), "10-second background timer did not refresh All runs"
+            after_timer = capture_refresh_probe(page)
+            assert all(root["sameNode"] for root in after_timer["roots"].values())
+            assert after_timer["roots"]["selected_row"]["text"] == before["roots"]["selected_row"]["text"]
+            assert after_timer["focused"] == before["focused"]
+            for _ in range(100):
+                if any("cursor=" in request and f"/{second_id}/runs" in request for request in requests):
+                    break
+                page.wait_for_timeout(25)
+            assert any("cursor=" in request and f"/{second_id}/runs" in request for request in requests)
+            page.wait_for_timeout(250)
+
+            phase["value"] = "failed"
+            page.evaluate("window.dispatchEvent(new Event('aflow-history-changed'))")
+            expect(page.get_by_role("alert").filter(has_text="Partial or stale results")).to_be_visible()
+            failed = capture_refresh_probe(page)
+            assert all(root["sameNode"] for root in failed["roots"].values())
+            assert failed["focused"] == before["focused"]
+            assert failed["scrollY"] == before["scrollY"]
+            expect(second_row).to_contain_text("Failed")
+            assert first_row.get_by_role("dialog").is_visible()
+            assert page_errors == []
+            assert writes == []
+            page.keyboard.press("Escape")
+            expect(first_row.get_by_role("dialog")).to_have_count(0)
+            first_row.locator(".run-list-select").click()
+            expect(page.locator(".run-detail:visible").first).to_contain_text(first["paused"]["title"])
+            assert f"run={first['paused']['run_id']}" in page.url
+            assert page_errors == []
+            assert writes == []
+            _write_artifact_manifest(tmp_path / f"all-runs-{theme}-{width}x{height}.json", {
+                "before": before, "held": during, "equal": equal,
+                "changed": changed, "timer": after_timer, "failed": failed,
+                "held_mutations": held_mutations, "equal_mutations": equal_mutations,
+                "row_order": row_order,
+                "navigated_run_id": first["paused"]["run_id"],
+                "requests": requests, "page_errors": page_errors, "writes": writes,
+            })
+        finally:
+            for route, body, status, headers in held:
+                try:
+                    route.fulfill(status=status, headers=headers, body=body)
+                except Exception:
+                    pass
+            page.unroute_all(behavior="ignoreErrors")
+            browser.close()

@@ -74,7 +74,11 @@ function overlayRuns(projectId: string, previousRows: RunStatus[], freshRows: Ru
     const previous = rows.get(identity)
     rows.set(identity, previous && sameRunStatus(previous, run) ? previous : run)
   }
-  return [...rows.values()]
+  const overlaid = [...rows.values()]
+  return overlaid.length === previousRows.length
+    && overlaid.every((run, index) => run === previousRows[index])
+    ? previousRows
+    : overlaid
 }
 
 interface EnrichmentTarget {
@@ -161,8 +165,8 @@ export function GlobalRunOverview({ projects, onOpen, registryLoading = false, r
       }))
       updateLoadState(() => ({
         identity,
-        // `generation` is the rendered-data generation, not the request
-        // generation. Equal polls therefore keep enrichment and row identity.
+        // Only an explicit Refresh invalidates every enrichment. A changed
+        // background row has its own object identity and re-enriches alone.
         generation: sameIdentity
           ? previous.generation + (explicitRefresh ? 1 : 0)
           : generation,
@@ -193,7 +197,6 @@ export function GlobalRunOverview({ projects, onOpen, registryLoading = false, r
           const displayedRows = update.state === 'complete'
             ? reconcileRunRows(update.projectId, project.displayedRows, freshRows)
             : overlayRuns(update.projectId, project.previousRows, freshRows)
-          const dataChanged = displayedRows !== project.displayedRows
           const projectsState = {
             ...previous.projects,
             [update.projectId]: {
@@ -205,7 +208,7 @@ export function GlobalRunOverview({ projects, onOpen, registryLoading = false, r
           }
           return {
             ...previous,
-            generation: dataChanged ? previous.generation + 1 : previous.generation,
+            generation: previous.generation,
             settled: requestedProjectIds.every(projectId => projectsState[projectId]?.coverage !== 'loading'),
             projects: projectsState,
           }
@@ -234,12 +237,9 @@ export function GlobalRunOverview({ projects, onOpen, registryLoading = false, r
             if (!project) continue
             projectsState[projectId] = { ...project, coverage: 'failed' }
           }
-          const dataChanged = Object.keys(projectsState).some(projectId => (
-            projectsState[projectId]?.displayedRows !== previous.projects[projectId]?.displayedRows
-          ))
           return {
             ...previous,
-            generation: dataChanged ? previous.generation + 1 : previous.generation,
+            generation: previous.generation,
             mode: 'initial',
             settled: true,
             projects: projectsState,
