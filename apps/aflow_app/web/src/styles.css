@@ -3489,6 +3489,15 @@ input::placeholder, textarea::placeholder {
   }
 }
 
+@media (max-width: 359px) {
+  .header-filter-select > span { display: none; }
+  .header-filter-select select {
+    flex: 0 0 128px;
+    width: 128px;
+    min-width: 128px;
+  }
+}
+
 @media (max-height: 599px) {
   /* The shared header's second row is static on short viewports. */
   .app-header-row-two { position: static; }
