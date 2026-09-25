@@ -684,6 +684,12 @@ outcome or from its creation of a new focused follow-up plan. The latter also
 counts when the reviewer reopens the original checkpoint, so the first
 rejection exposes cause-based Lite choices and the second rejection selects
 Full before another worker starts.
+It also counts when the worker already checked the original checkpoint before
+review: a checkpoint reviewer must create a new focused repair overlay while
+an active scope awaits review, with a prior worker attempt, an unchanged
+original snapshot, and a selected worker transition. A checked original box
+does not mean the reviewer accepted the implementation. A clean approval or a
+final architect follow-up does not create a checkpoint rejection.
 For newly finalized reviewer turns, the controller stores an explicit
 `review_rejection` object (or JSON `null`) in `result.json` and retains the
 scope history in `run.json`. It records bounded plain-text reviewer and repair

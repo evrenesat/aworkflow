@@ -1,5 +1,15 @@
 # DEVLOG
 
+## 2026-09-25 — Count reviewer overlays after a checked original checkpoint
+
+- A checkpoint reviewer who creates a focused repair overlay after the worker
+  checked the original checkpoint now records the same scoped rejection as an
+  unchecked-original review. The record uses the awaiting scope and latest
+  worker attempt, and can trigger the configured first-repair upgrade. Clean
+  approvals, final architect follow-ups, changed original snapshots, and
+  unrelated overlays remain excluded. Existing cross-harness handover guards
+  still apply after the repair team is selected.
+
 ## 2026-09-25 — Guided first-repair threshold (Checkpoint 2)
 
 - Guided actions and REST/MCP config writes now accept strict integer zero.

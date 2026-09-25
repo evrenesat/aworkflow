@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import asdict
+from dataclasses import asdict, replace
 import json
 from pathlib import Path
 import subprocess
@@ -34,6 +34,7 @@ from aflow.run_state import (
 )
 from aflow.runlog import RunMetadataWriter
 from aflow.workflow import (
+    WorkflowError,
     _append_replayed_review_rejection,
     load_scope_evidence_for_resume,
     run_workflow,
@@ -57,7 +58,10 @@ _REPAIR_PLAN = """# Repair
 """
 
 
-def _workflow_config(*, manager_enabled: bool, threshold: int) -> WorkflowUserConfig:
+def _workflow_config(
+    *, manager_enabled: bool, threshold: int,
+    review_checked_original: bool = False,
+) -> WorkflowUserConfig:
     workflow = WorkflowConfig(
         manager_enabled=manager_enabled,
         upgrade_after_repairs=threshold,
@@ -68,16 +72,25 @@ def _workflow_config(*, manager_enabled: bool, threshold: int) -> WorkflowUserCo
                 role="worker",
                 prompts=("p",),
                 go=(
-                    GoTransition(to="END", when="DONE"),
-                    GoTransition(to="review"),
+                    (GoTransition(to="review"),)
+                    if review_checked_original else (
+                        GoTransition(to="END", when="DONE"),
+                        GoTransition(to="review"),
+                    )
                 ),
             ),
             "review": WorkflowStepConfig(
                 role="reviewer",
                 prompts=("p",),
                 go=(
-                    GoTransition(to="END", when="DONE"),
-                    GoTransition(to="implement"),
+                    (
+                        GoTransition(to="implement", when="NEW_PLAN_EXISTS"),
+                        GoTransition(to="END"),
+                    )
+                    if review_checked_original else (
+                        GoTransition(to="END", when="DONE"),
+                        GoTransition(to="implement"),
+                    )
                 ),
             ),
         },
@@ -604,7 +617,10 @@ def test_replayed_rejection_is_idempotent() -> None:
     assert state.review_rejection_history == [rejection]
 
 
-def test_pending_finalized_turn_decodes_authoritative_rejection(tmp_path: Path) -> None:
+@pytest.mark.parametrize("complete_original", [False, True])
+def test_pending_finalized_turn_decodes_authoritative_rejection(
+    tmp_path: Path, complete_original: bool,
+) -> None:
     run_dir = tmp_path / "run"
     turn_dir = run_dir / "turns" / "turn-002"
     turn_dir.mkdir(parents=True)
@@ -614,9 +630,11 @@ def test_pending_finalized_turn_decodes_authoritative_rejection(tmp_path: Path) 
         review_turn=2,
         attempt_ordinal=1,
     ))
-    snapshot = PlanSnapshot(
-        "First", 1, 1, False, 1, current_checkpoint_index=1
-    ).to_dict()
+    snapshot = (
+        PlanSnapshot(None, 0, 1, True).to_dict()
+        if complete_original else
+        PlanSnapshot("First", 1, 1, False, 1, current_checkpoint_index=1).to_dict()
+    )
     (turn_dir / "result.json").write_text(
         json.dumps({
             "turn_number": 2,
@@ -630,7 +648,7 @@ def test_pending_finalized_turn_decodes_authoritative_rejection(tmp_path: Path) 
             "snapshot_before": snapshot,
             "snapshot_after": snapshot,
             "conditions": {
-                "DONE": False,
+                "DONE": complete_original,
                 "NEW_PLAN_EXISTS": True,
                 "MAX_TURNS_REACHED": False,
             },
@@ -653,6 +671,11 @@ def test_pending_finalized_turn_decodes_authoritative_rejection(tmp_path: Path) 
     assert pending.review_rejection is not None
     assert pending.review_rejection.rejection_number == 1
     assert pending.review_rejection.reviewed_attempt_ordinal == 1
+    assert pending.snapshot_before == pending.snapshot_after
+    state = ControllerState(last_snapshot=PlanSnapshot(None, 0, 0, False))
+    assert _append_replayed_review_rejection(state, pending.review_rejection)
+    assert not _append_replayed_review_rejection(state, pending.review_rejection)
+    assert state.review_rejection_history == [pending.review_rejection]
 
 
 def _run_fake_sequence(
@@ -719,6 +742,259 @@ def _run_fake_sequence(
         runner=runner,
     )
     return calls, manager_contexts, result.run_dir
+
+
+@pytest.mark.parametrize("manager_enabled", [False, True])
+@pytest.mark.parametrize("threshold, expected_worker", [
+    (0, "ds4.1-flash"),
+    (1, "sol-6-high"),
+])
+def test_checked_original_reviewer_overlay_records_repair(
+    tmp_path: Path,
+    manager_enabled: bool,
+    threshold: int,
+    expected_worker: str,
+) -> None:
+    plan_path = tmp_path / "plan.md"
+    plan_path.write_text(_PLAN, encoding="utf-8")
+    config = _workflow_config(
+        manager_enabled=manager_enabled,
+        threshold=threshold,
+        review_checked_original=True,
+    )
+    config = replace(
+        config,
+        teams={
+            "sol-6-high": TeamConfig(
+                roles={
+                    **config.teams["base"].roles,
+                    "worker": "codex.sol-6-high",
+                },
+                upgrade_to="ds4.1-flash",
+            ),
+            "ds4.1-flash": TeamConfig(
+                roles={"worker": "codex.ds4.1-flash"}, extends="sol-6-high",
+            ),
+        },
+        harnesses={"codex": WorkflowHarnessConfig(profiles={
+            **config.harnesses["codex"].profiles,
+            "sol-6-high": HarnessProfileConfig(model="sol-6-high"),
+            "ds4.1-flash": HarnessProfileConfig(model="ds4.1-flash"),
+        })},
+        workflows={"repair": replace(config.workflows["repair"], team="sol-6-high")},
+    )
+    calls: list[str] = []
+    review_count = 0
+
+    def runner(argv: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+        nonlocal review_count
+        model = argv[argv.index("--model") + 1]
+        calls.append(model)
+        cwd = Path(str(kwargs["cwd"]))
+        if model == "manager":
+            return subprocess.CompletedProcess(argv, 0, json.dumps({
+                "schema_version": 1,
+                "action": "continue",
+                "reason": "synthetic continue",
+                "next_step_notes": [],
+                "stop_report": None,
+            }), "")
+        if model in {"sol-6-high", "ds4.1-flash"}:
+            if model == "sol-6-high" and "reviewer" not in calls:
+                plan_path.write_text(_COMPLETE_PLAN, encoding="utf-8")
+            else:
+                for candidate in cwd.glob("plan-cp*.md"):
+                    candidate.write_text(_COMPLETE_PLAN, encoding="utf-8")
+        elif model == "reviewer":
+            review_count += 1
+            if review_count == 1:
+                (cwd / "plan-cp01-v01.md").write_text(
+                    _REPAIR_PLAN, encoding="utf-8"
+                )
+        return subprocess.CompletedProcess(argv, 0, "synthetic output", "")
+
+    result = run_workflow(
+        config=ControllerConfig(
+            repo_root=tmp_path, plan_path=plan_path, max_turns=5, team="sol-6-high",
+        ),
+        workflow_config=config,
+        workflow_name="repair",
+        config_dir=tmp_path,
+        snapshot_config=False,
+        adapter=CodexAdapter(),
+        runner=runner,
+    )
+    turns = result.run_dir / "turns"
+    review = json.loads((turns / "turn-002" / "result.json").read_text())
+    repair = json.loads((turns / "turn-003" / "result.json").read_text())
+    run = json.loads((result.run_dir / "run.json").read_text())
+    assert review["snapshot_before"] == review["snapshot_after"]
+    assert review["conditions"] == {
+        "DONE": True, "NEW_PLAN_EXISTS": True, "MAX_TURNS_REACHED": False,
+    }
+    assert review["chosen_transition"] == "implement"
+    assert review["review_rejection"]["reviewed_attempt_ordinal"] == 1
+    assert review["review_rejection"]["reviewed_worker_team"] == "sol-6-high"
+    assert review["review_rejection"]["reviewed_worker_selector"] == "codex.sol-6-high"
+    assert len(run["review_rejection_history"]) == 1
+    assert run["review_rejection_history"][0] == review["review_rejection"]
+    assert repair["selector"] == f"codex.{expected_worker}"
+    assert plan_path.read_text(encoding="utf-8") == _COMPLETE_PLAN
+    assert calls.count("reviewer") == 2
+    if manager_enabled:
+        assert calls.count("manager") >= 2
+
+
+@pytest.mark.parametrize("scenario", [
+    "clean_approval",
+    "worker_overlay",
+    "final_architect_overlay",
+    "changed_original",
+    "non_worker_transition",
+    "unrelated_overlay",
+    "mismatched_overlay",
+    "no_scope",
+    "not_awaiting_review",
+])
+def test_checked_original_overlay_requires_scoped_reviewer_evidence(
+    tmp_path: Path, scenario: str, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    plan_path = tmp_path / "plan.md"
+    plan_path.write_text(_PLAN)
+    config = _workflow_config(
+        manager_enabled=False, threshold=0, review_checked_original=True,
+    )
+    workflow = config.workflows["repair"]
+    steps = dict(workflow.steps)
+    if scenario == "final_architect_overlay":
+        steps["implement"] = replace(
+            steps["implement"], go=(GoTransition(to="final_review"),)
+        )
+        steps["final_review"] = WorkflowStepConfig(
+            role="final_reviewer", prompts=("p",),
+            go=(GoTransition(to="implement", when="NEW_PLAN_EXISTS"), GoTransition(to="END")),
+        )
+    if scenario == "non_worker_transition":
+        steps["review"] = replace(steps["review"], go=(GoTransition(to="END"),))
+    config = replace(config, workflows={
+        "repair": replace(
+            workflow,
+            first_step="review" if scenario == "no_scope" else "implement",
+            steps=steps,
+        ),
+    })
+    if scenario == "not_awaiting_review":
+        original_write = RunMetadataWriter.write
+
+        def clear_awaiting_review(
+            writer: RunMetadataWriter, **kwargs: object,
+        ) -> None:
+            if kwargs.get("current_step_name") == "review" and writer.state is not None:
+                scope = writer.state.active_implementation_scope
+                if scope is not None:
+                    writer.state.active_implementation_scope = replace(
+                        scope, awaiting_review=False,
+                    )
+            original_write(writer, **kwargs)
+
+        monkeypatch.setattr(RunMetadataWriter, "write", clear_awaiting_review)
+
+    class StopBeforeRepair(BaseException):
+        pass
+
+    worker_calls = 0
+
+    def runner(argv: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+        nonlocal worker_calls
+        model = argv[argv.index("--model") + 1]
+        cwd = Path(str(kwargs["cwd"]))
+        if model.startswith("worker-"):
+            worker_calls += 1
+            if worker_calls > 1:
+                raise StopBeforeRepair
+            plan_path.write_text(_COMPLETE_PLAN, encoding="utf-8")
+            if scenario == "worker_overlay":
+                (cwd / "plan-cp01-v01.md").write_text(_REPAIR_PLAN)
+        elif model in {"reviewer", "final-reviewer"}:
+            if scenario == "changed_original":
+                plan_path.write_text(_PLAN, encoding="utf-8")
+            if scenario in {
+                "final_architect_overlay", "changed_original",
+                "non_worker_transition", "no_scope", "not_awaiting_review",
+            }:
+                (cwd / "plan-cp01-v01.md").write_text(_REPAIR_PLAN)
+            if scenario == "unrelated_overlay":
+                (cwd / "unrelated.md").write_text(_REPAIR_PLAN)
+            if scenario == "mismatched_overlay":
+                (cwd / "plan-unrelated.md").write_text(_REPAIR_PLAN)
+        return subprocess.CompletedProcess(argv, 0, "synthetic output", "")
+
+    try:
+        result = run_workflow(
+            config=ControllerConfig(
+                repo_root=tmp_path, plan_path=plan_path, max_turns=4,
+                team="base",
+            ),
+            workflow_config=config,
+            workflow_name="repair",
+            config_dir=tmp_path,
+            snapshot_config=False,
+            adapter=CodexAdapter(),
+            runner=runner,
+        )
+        run_dir = result.run_dir
+    except StopBeforeRepair:
+        run_dir = next((tmp_path / ".aflow" / "runs").iterdir())
+    review_turn = 1 if scenario == "no_scope" else 2
+    review = json.loads(
+        (run_dir / "turns" / f"turn-{review_turn:03d}" / "result.json").read_text()
+    )
+    assert review["review_rejection"] is None
+    run = json.loads((run_dir / "run.json").read_text())
+    assert run["review_rejection_history"] == []
+
+
+def test_checked_original_rejection_without_prior_attempt_fails_closed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    plan_path = tmp_path / "plan.md"
+    plan_path.write_text(_PLAN, encoding="utf-8")
+    config = _workflow_config(
+        manager_enabled=False, threshold=0, review_checked_original=True,
+    )
+    original_write = RunMetadataWriter.write
+
+    def remove_attempt_before_review(
+        writer: RunMetadataWriter, **kwargs: object,
+    ) -> None:
+        if kwargs.get("current_step_name") == "review" and writer.state is not None:
+            writer.state.implementation_attempts.clear()
+        original_write(writer, **kwargs)
+
+    monkeypatch.setattr(RunMetadataWriter, "write", remove_attempt_before_review)
+
+    def runner(argv: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+        model = argv[argv.index("--model") + 1]
+        if model == "worker-base":
+            plan_path.write_text(_COMPLETE_PLAN, encoding="utf-8")
+        elif model == "reviewer":
+            (Path(str(kwargs["cwd"])) / "plan-cp01-v01.md").write_text(_REPAIR_PLAN)
+        return subprocess.CompletedProcess(argv, 0, "synthetic output", "")
+
+    with pytest.raises(WorkflowError, match="review rejection has no implementation attempt"):
+        run_workflow(
+            config=ControllerConfig(
+                repo_root=tmp_path, plan_path=plan_path, max_turns=4,
+                team="base",
+            ),
+            workflow_config=config,
+            workflow_name="repair",
+            config_dir=tmp_path,
+            snapshot_config=False,
+            adapter=CodexAdapter(),
+            runner=runner,
+        )
+
 
 
 @pytest.mark.parametrize("manager_enabled", [False, True])

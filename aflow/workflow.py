@@ -13281,6 +13281,7 @@ def _run_workflow_unchecked(
                     new_plan_path=new_plan_path,
                 )
 
+            review_overlay_at_expected_path = False
             try:
                 exec_original = _exec_plan_path(original_plan_path, exec_ctx)
                 resolved_exec_plan_path = _resolve_post_turn_original_plan_path(
@@ -13306,12 +13307,17 @@ def _run_workflow_unchecked(
                         original_plan_path = resolved_exec_plan_path
                     if active_plan_path == config.plan_path:
                         active_plan_path = original_plan_path
+                expected_review_overlay_path = new_plan_path
                 resolved_exec_new_plan_path = _resolve_post_turn_new_plan_path(
                     original_plan_path=resolved_exec_plan_path,
                     expected_new_plan_path=_exec_plan_path(new_plan_path, exec_ctx),
                     candidates_before=followup_candidates_before,
                 )
                 if resolved_exec_new_plan_path is not None:
+                    review_overlay_at_expected_path = (
+                        resolved_exec_new_plan_path
+                        == _exec_plan_path(expected_review_overlay_path, exec_ctx)
+                    )
                     new_plan_path = _primary_plan_path(resolved_exec_new_plan_path, exec_ctx)
                 post_snapshot = parsed_after.snapshot
             except (PlanParseError, FileNotFoundError) as exc:
@@ -13623,9 +13629,10 @@ def _run_workflow_unchecked(
             is_scoped_rejection = (
                 scope_before_finalize is not None
                 and scope_before_finalize.awaiting_review
-                and step.role != "worker"
+                and step.role == "reviewer"
                 and (
                     not done
+                    or review_overlay_at_expected_path
                     or (
                         resume is not None
                         and resume.pending_cumulative_review is not None
