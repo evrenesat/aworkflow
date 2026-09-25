@@ -3,6 +3,10 @@
 - Global configuration PATCH accepts ordered typed actions or edited documents,
   never both. Transform under the shared pair lock and validate the final pair;
   preserve PUT/MCP compatibility. Prompt text belongs only to the existing schema.
+- Project scheduling GET/PATCH and MCP tools delegate to the shared
+  `ProjectSettingsService` revisioned document. Queue projections read
+  admission claims and capacity plus plan lifecycle/dependency evidence;
+  transport code must not reserve slots or invent plan ownership.
 - Restart options is read-only and delegates admission to the daemon. Never
   fabricate owner-stop evidence for failures or reset plan progress in transport.
 

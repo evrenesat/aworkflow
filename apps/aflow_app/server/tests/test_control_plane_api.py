@@ -974,6 +974,130 @@ def test_automatic_admission_rejects_edit_after_tracking_preparation(control_cli
     assert ProjectAdmission(root, unit_manager=units).snapshot().occupied_count == 0
 
 
+def test_project_scheduling_rest_auth_cas_queue_and_pure_defaults(control_client) -> None:
+    from aflow.project_settings import ProjectSettingsService
+    from aflow_app_server import main
+
+    client, root, units, _ = control_client
+    endpoint = f"/api/projects/{PROJECT_ID}/scheduling"
+    assert TestClient(app).get(endpoint).status_code == 401
+    assert TestClient(app).get(f"/api/projects/{PROJECT_ID}/queue").status_code == 401
+    settings_path = ProjectSettingsService(root).settings_path
+    initial = client.get(endpoint)
+    assert initial.status_code == 200
+    assert initial.json()["source"] == "defaults"
+    assert initial.json()["auto_consume_plans"] is True
+    assert initial.json()["max_concurrent_implementations"] == 2
+    assert not settings_path.exists()
+    missing = client.get("/api/projects/missing/scheduling")
+    assert missing.status_code == 404
+
+    saved = client.patch(endpoint, json={
+        "expected_revision": initial.json()["revision"],
+        "max_concurrent_implementations": 1,
+    })
+    assert saved.status_code == 200, saved.text
+    assert saved.json()["max_concurrent_implementations"] == 1
+    assert saved.json()["auto_consume_plans"] is True
+    assert settings_path.is_file()
+    stale = client.patch(endpoint, json={
+        "expected_revision": initial.json()["revision"],
+        "auto_consume_plans": False,
+    })
+    assert stale.status_code == 409
+    assert stale.json()["detail"]["current_revision"] == saved.json()["revision"]
+    assert client.patch(endpoint, json={
+        "expected_revision": saved.json()["revision"],
+        "auto_consume_plans": None,
+    }).status_code == 422
+
+    assert main._plan_service is not None
+    source = main._plan_service.read(PROJECT_ID, "todo", "test-plan.md")
+    promoted = main._plan_service.promote(
+        PROJECT_ID, "todo", source.name, source.revision,
+    )
+    queued = client.get(f"/api/projects/{PROJECT_ID}/queue")
+    assert queued.status_code == 200, queued.text
+    assert queued.json()["capacity"]["limit"] == 1
+    item = next(plan for plan in queued.json()["plans"] if plan["name"] == promoted.name)
+    assert item["identity"]
+    assert item["outcome"] == "queued"
+    assert item["run_id"] is None
+    ProjectAdmission(root, unit_manager=units).acquire(
+        "queue-running", plan_path=root / promoted.path,
+        idempotency_key="queue-running-key",
+    )
+    running = client.get(f"/api/projects/{PROJECT_ID}/queue").json()
+    item = next(plan for plan in running["plans"] if plan["name"] == promoted.name)
+    assert item["outcome"] == "running"
+    assert item["run_id"] == "queue-running"
+    assert running["capacity"]["available_slots"] == 0
+    first = main._plan_service.create(
+        PROJECT_ID, "feature_P01_first.md",
+        "# First\n\n### [ ] Checkpoint 1: Work\n- [ ] Work\n",
+    )
+    later = main._plan_service.create(
+        PROJECT_ID, "feature_P03_later.md",
+        "# Later\n\n### [ ] Checkpoint 1: Work\n- [ ] Work\n",
+    )
+    assert first.status == "todo"
+    main._plan_service.promote(PROJECT_ID, "todo", later.name, later.revision)
+    blocked = client.get(f"/api/projects/{PROJECT_ID}/queue").json()
+    later_item = next(plan for plan in blocked["plans"] if plan["name"] == later.name)
+    assert later_item["outcome"] == "blocked"
+    assert later_item["reason"] == "dependency"
+    assert later_item["dependency"] == first.name
+
+
+def test_upgrade_threshold_actions_preserve_inheritance_and_pair_cas(control_client) -> None:
+    client, _, _, _ = control_client
+    before = client.get("/api/config").json()
+    first = client.patch("/api/config", json={
+        "expected_revision": before["revision"],
+        "actions": [
+            {"type": "set_default_upgrade_after_repairs", "value": 3},
+            {"type": "set_workflow_upgrade_after_repairs", "workflow": "managed", "value": 2},
+        ],
+    })
+    assert first.status_code == 200, first.text
+    assert "upgrade_after_repairs = 3" in first.json()["workflows_toml"]
+    assert "upgrade_after_repairs = 2" in first.json()["workflows_toml"]
+    stale = client.patch("/api/config", json={
+        "expected_revision": before["revision"],
+        "actions": [{"type": "set_default_upgrade_after_repairs", "value": 4}],
+    })
+    assert stale.status_code == 409
+    assert client.patch("/api/config", json={
+        "expected_revision": first.json()["revision"],
+        "actions": [{"type": "set_default_upgrade_after_repairs", "value": 0}],
+    }).status_code == 422
+    removed = client.patch("/api/config", json={
+        "expected_revision": first.json()["revision"],
+        "actions": [{"type": "set_workflow_upgrade_after_repairs", "workflow": "managed", "value": None}],
+    })
+    assert removed.status_code == 200, removed.text
+    assert removed.json()["workflows_toml"].count("upgrade_after_repairs") == 1
+    form = client.post("/api/config/form", json={
+        "aflow_toml": removed.json()["aflow_toml"],
+        "workflows_toml": removed.json()["workflows_toml"],
+    })
+    assert form.status_code == 200, form.text
+    assert form.json()["form"]["default_upgrade_after_repairs"] == 3
+    workflow = form.json()["form"]["workflows"]["managed"]
+    assert workflow["upgrade_after_repairs"] is None
+    assert workflow["effective_upgrade_after_repairs"] == 3
+    assert workflow["upgrade_after_repairs_source"] == "defaults"
+    alias = client.post("/api/config/form", json={
+        "aflow_toml": removed.json()["aflow_toml"],
+        "workflows_toml": removed.json()["workflows_toml"]
+        + '\n[workflow.alias]\nextends = "managed"\n',
+    })
+    assert alias.status_code == 200, alias.text
+    alias_workflow = alias.json()["form"]["workflows"]["alias"]
+    assert alias_workflow["effective_upgrade_after_repairs"] == 3
+    assert alias_workflow["upgrade_after_repairs_source"] == "base:managed"
+
+
 def test_server_lifespan_owns_and_stops_plan_scanner(control_client, monkeypatch) -> None:
     client, root, _, _ = control_client
     from aflow_app_server import main

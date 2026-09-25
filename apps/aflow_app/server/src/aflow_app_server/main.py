@@ -46,6 +46,11 @@ from aflow.daemon import (
     ExtraInstructionsValidationError,
 )
 from aflow.plan_consumer import PlanConsumer
+from aflow.project_admission import ProjectAdmissionError
+from aflow.project_settings import (
+    ProjectSettingsError, ProjectSettingsRevisionConflict,
+    ProjectSettingsValidationError,
+)
 
 from .browser_session import (
     SESSION_COOKIE_NAME,
@@ -61,7 +66,7 @@ from .control_plane_service import (
     ProjectNotAllowedError,
 )
 from .global_config_service import GlobalConfigService
-from .models import GlobalConfigPatchPayload, CanonicalTransportModel
+from .models import GlobalConfigPatchPayload, ProjectSchedulingPatchPayload, CanonicalTransportModel
 from .config_response import config_response, config_validation_response
 from .guided_config import GuidedConfigError, guided_form_response
 from .mcp_adapter import create_control_plane_mcp
@@ -113,6 +118,7 @@ from .project_config_service import (
     ProjectConfigRevisionConflict,
 )
 from .project_discovery import ProjectDiscoveryUnavailable, discover_projects
+from .scheduling_service import SchedulingService
 from .project_registry import (
     ProjectReadProjection,
     ProjectRegistry,
@@ -327,6 +333,16 @@ def get_plan_service() -> PlanService:
     return _plan_service
 
 
+def get_scheduling_service() -> SchedulingService:
+    if _project_registry is None or _plan_service is None:
+        raise RuntimeError("Server not initialized")
+    return SchedulingService(
+        _project_registry, _plan_service,
+        reason=_plan_consumer.reason if _plan_consumer is not None else None,
+        wake=_plan_consumer.wake if _plan_consumer is not None else None,
+    )
+
+
 def get_control_plane_service() -> ControlPlaneService:
     """Return the daemon-backed service after lifespan reconciliation."""
     if _control_plane_service is None:
@@ -524,6 +540,7 @@ mcp_server = create_control_plane_mcp(
     get_control_plane_service,
     get_plan_service=get_plan_service,
     get_global_config_service=get_global_config_service,
+    get_scheduling_service=get_scheduling_service,
 )
 mcp_http_app = mcp_server.http_app(path="/", json_response=True, stateless_http=True)
 
@@ -826,6 +843,29 @@ async def config_revision_conflict_handler(
         "revision_conflict",
         current_revision=exc.current_revision,
     )
+
+
+@app.exception_handler(ProjectSettingsRevisionConflict)
+async def project_settings_revision_conflict_handler(
+    _: Request, exc: ProjectSettingsRevisionConflict,
+) -> JSONResponse:
+    return _error_response(
+        status.HTTP_409_CONFLICT, "revision_conflict",
+        current_revision=exc.current_revision,
+    )
+
+
+@app.exception_handler(ProjectSettingsValidationError)
+async def project_settings_validation_handler(
+    _: Request, __: ProjectSettingsValidationError,
+) -> JSONResponse:
+    return _error_response(status.HTTP_422_UNPROCESSABLE_CONTENT, "invalid_scheduling")
+
+
+@app.exception_handler(ProjectSettingsError)
+@app.exception_handler(ProjectAdmissionError)
+async def project_scheduling_unavailable_handler(_: Request, __: Exception) -> JSONResponse:
+    return _error_response(status.HTTP_503_SERVICE_UNAVAILABLE, "scheduling_unavailable")
 
 
 @app.exception_handler(SkillNotFound)
@@ -1552,6 +1592,38 @@ def get_project(
     if project is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Project not found")
     return project
+
+
+@app.get("/api/projects/{project_id}/scheduling", tags=["settings"])
+def get_project_scheduling(
+    project_id: str,
+    _: str = Depends(verify_token),
+    service: SchedulingService = Depends(get_scheduling_service),
+) -> dict[str, object]:
+    return service.read(project_id)
+
+
+@app.patch("/api/projects/{project_id}/scheduling", tags=["settings"])
+def patch_project_scheduling(
+    project_id: str,
+    payload: ProjectSchedulingPatchPayload,
+    _: str = Depends(verify_token),
+    service: SchedulingService = Depends(get_scheduling_service),
+) -> dict[str, object]:
+    saved = service.update(
+        project_id, expected_revision=payload.expected_revision,
+        changes=payload.changes(),
+    )
+    return saved
+
+
+@app.get("/api/projects/{project_id}/queue", tags=["plans"])
+def get_project_queue(
+    project_id: str,
+    _: str = Depends(verify_token),
+    service: SchedulingService = Depends(get_scheduling_service),
+) -> dict[str, object]:
+    return service.queue(project_id)
 
 
 @app.patch("/api/projects/{project_id}")

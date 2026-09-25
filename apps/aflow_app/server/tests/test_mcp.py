@@ -74,6 +74,9 @@ AUTHORING_TOOL_NAMES = {
     "list_plan_documents",
     "get_global_config",
     "patch_global_config",
+    "get_project_scheduling",
+    "patch_project_scheduling",
+    "get_project_queue",
 }
 EXPECTED_TOOL_NAMES = CORE_TOOL_NAMES | AUTHORING_TOOL_NAMES
 
@@ -88,6 +91,7 @@ def test_shared_and_fastapi_mcp_registries_have_identical_public_contract() -> N
         lambda: None,
         get_plan_service=lambda: None,
         get_global_config_service=lambda: None,
+        get_scheduling_service=lambda: None,
     )
     shared_tools = asyncio.run(shared.list_tools())
     fastapi_tools = asyncio.run(fastapi.list_tools())
@@ -892,6 +896,193 @@ def test_mcp_global_config_discovery_and_snapshot_match_rest(mcp_client) -> None
     assert "server.toml" not in json.dumps(snapshot)
 
 
+def test_queue_requires_receipt_for_observed_done_predecessor(mcp_client) -> None:
+    from aflow.plan_backups import ensure_plan_identity, move_plan_identity
+    from aflow.project_admission import ProjectAdmission, ProjectPlanDependencyBlocked
+    from aflow_app_server import main
+
+    client, root, units, _ = mcp_client
+    assert main._plan_consumer is not None
+    main._plan_consumer.stop()
+    first_name = "feature_P01_first.md"
+    later_name = "feature_P03_later.md"
+    first = root / "plans" / "in-progress" / first_name
+    first.parent.mkdir(parents=True, exist_ok=True)
+    first.write_text("# First\n", encoding="utf-8")
+    ensure_plan_identity(root, first)
+    done = root / "plans" / "done" / first_name
+    done.parent.mkdir(parents=True, exist_ok=True)
+    first.rename(done)
+    assert move_plan_identity(root, source_plan_path=first, destination_plan_path=done)
+    later = root / "plans" / "in-progress" / later_name
+    later.write_text("# Later\n", encoding="utf-8")
+    inventory = root / ".aflow" / "plan-dependencies.json"
+    assert not inventory.exists()
+
+    def queue_item() -> dict[str, object]:
+        rest = client.get(f"/api/projects/{PROJECT_ID}/queue")
+        assert rest.status_code == 200, rest.text
+        assert _mcp_tool(client, "get_project_queue", {"project_id": PROJECT_ID}) == rest.json()
+        assert not inventory.exists()
+        return next(plan for plan in rest.json()["plans"] if plan["name"] == later_name)
+
+    blocked = queue_item()
+    assert blocked["outcome"] == "blocked"
+    assert blocked["reason"] == "dependency"
+    assert blocked["dependency"] == first_name
+
+    run_dir = root / ".aflow" / "runs" / "delivered-run"
+    run_dir.mkdir(parents=True, exist_ok=True)
+    receipt = run_dir / "publication.json"
+    receipt.write_text(json.dumps({
+        "status": "published", "commit": "a" * 40, "source_commit": "b" * 40,
+        "remote": "origin", "branch": "main",
+        "plan_lifecycle": {
+            "phase": "committed", "complete": True,
+            "source": f"plans/in-progress/{first_name}",
+            "destination": f"plans/done/{first_name}",
+        },
+    }), encoding="utf-8")
+    ready = queue_item()
+    assert ready["outcome"] == "queued"
+    assert ready["reason"] is None
+    assert ready["dependency"] is None
+    assert ProjectAdmission(root, unit_manager=units).snapshot().reserved_count == 0
+
+    receipt.unlink()
+    assert queue_item()["dependency"] == first_name
+    with pytest.raises(ProjectPlanDependencyBlocked, match="predecessor"):
+        ProjectAdmission(root, unit_manager=units).acquire(
+            "undelivered-later", plan_path=later, idempotency_key="undelivered-later",
+        )
+
+
+@pytest.mark.parametrize(("conflict_status", "conflict_name"), [
+    ("needs-plan-change", "feature_P1_invalid.md"),
+    ("todo", "feature_P03_other.md"),
+])
+def test_queue_projects_observed_sequence_conflicts_like_admission(
+    mcp_client, conflict_status: str, conflict_name: str,
+) -> None:
+    from aflow.project_admission import ProjectAdmission, ProjectPlanDependencyBlocked
+    from aflow_app_server import main
+
+    client, root, units, _ = mcp_client
+    assert main._plan_consumer is not None
+    main._plan_consumer.stop()
+    later = root / "plans" / "in-progress" / "feature_P03_later.md"
+    later.parent.mkdir(parents=True, exist_ok=True)
+    later.write_text("# Later\n", encoding="utf-8")
+    other = root / "plans" / "in-progress" / "other_P02_work.md"
+    other.write_text("# Other\n", encoding="utf-8")
+    conflict = root / "plans" / conflict_status / conflict_name
+    conflict.parent.mkdir(parents=True, exist_ok=True)
+    conflict.write_text("# Conflict\n", encoding="utf-8")
+    admission = ProjectAdmission(root, unit_manager=units)
+    inventory = root / ".aflow" / "plan-dependencies.json"
+    assert not inventory.exists()
+    claims_before = admission.plan_claims()
+
+    def check_queue() -> None:
+        rest = client.get(f"/api/projects/{PROJECT_ID}/queue")
+        assert rest.status_code == 200, rest.text
+        queue = rest.json()
+        assert _mcp_tool(client, "get_project_queue", {"project_id": PROJECT_ID}) == queue
+        assert queue["capacity"]["available_slots"] > 0
+        plans = {plan["name"]: plan for plan in queue["plans"]}
+        assert plans[later.name]["outcome"] == "blocked"
+        assert plans[later.name]["reason"] == "dependency"
+        assert plans[later.name]["dependency"] == "sequence_conflict"
+        assert plans[other.name]["outcome"] == "queued"
+        assert admission.plan_claims() == claims_before
+
+    check_queue()
+    assert not inventory.exists()
+    with pytest.raises(ProjectPlanDependencyBlocked, match="correction"):
+        admission.acquire("conflicted-later", plan_path=later, idempotency_key="conflicted-later")
+    inventory_after_admission = inventory.read_bytes()
+    check_queue()
+    assert inventory.read_bytes() == inventory_after_admission
+
+
+def test_mcp_project_scheduling_queue_and_thresholds_match_rest(mcp_client) -> None:
+    from aflow.project_admission import ProjectAdmission, ProjectAutomaticDisabled
+    from aflow_app_server import main
+
+    client, root, units, _ = mcp_client
+    endpoint = f"/api/projects/{PROJECT_ID}/scheduling"
+    before = _mcp_tool(client, "get_project_scheduling", {"project_id": PROJECT_ID})
+    assert before == client.get(endpoint).json()
+    assert before["source"] == "defaults"
+    assert not (root / ".aflow" / "project-settings.json").exists()
+    assert _mcp_tool_error(client, "get_project_scheduling", {
+        "project_id": "missing",
+    }) == "project_not_found"
+    patched = _mcp_tool(client, "patch_project_scheduling", {
+        "project_id": PROJECT_ID,
+        "payload": {
+            "expected_revision": before["revision"],
+            "auto_consume_plans": False,
+            "max_concurrent_implementations": 1,
+        },
+    })
+    assert patched == client.get(endpoint).json()
+    assert patched["auto_consume_plans"] is False
+    assert patched["max_concurrent_implementations"] == 1
+    assert _mcp_tool_error(client, "patch_project_scheduling", {
+        "project_id": PROJECT_ID,
+        "payload": {
+            "expected_revision": before["revision"],
+            "auto_consume_plans": True,
+        },
+    }) == "revision_conflict"
+    queue = _mcp_tool(client, "get_project_queue", {"project_id": PROJECT_ID})
+    assert queue == client.get(f"/api/projects/{PROJECT_ID}/queue").json()
+    assert queue["settings"] == patched
+    assert queue["capacity"]["limit"] == 1
+    assert any(plan["outcome"] == "held" for plan in queue["plans"])
+    with pytest.raises(ProjectAutomaticDisabled):
+        ProjectAdmission(root, unit_manager=units).acquire(
+            "mcp-disabled-run", plan_path=root / "plans/todo/test-plan.md",
+            idempotency_key="mcp-disabled-key", automatic=True,
+        )
+    assert main._plan_consumer is not None
+    main._plan_consumer.stop()
+    enabled = client.patch(endpoint, json={
+        "expected_revision": patched["revision"],
+        "auto_consume_plans": True,
+    })
+    assert enabled.status_code == 200, enabled.text
+    assert _mcp_tool(client, "get_project_scheduling", {"project_id": PROJECT_ID}) == enabled.json()
+    assert main._plan_service is not None
+    draft = main._plan_service.read(PROJECT_ID, "todo", "test-plan.md")
+    promoted = main._plan_service.promote(
+        PROJECT_ID, "todo", draft.name, draft.revision,
+    )
+    ProjectAdmission(root, unit_manager=units).acquire(
+        "mcp-queue-run", plan_path=root / promoted.path,
+        idempotency_key="mcp-queue-run-key", automatic=True,
+    )
+    running = _mcp_tool(client, "get_project_queue", {"project_id": PROJECT_ID})
+    assert running == client.get(f"/api/projects/{PROJECT_ID}/queue").json()
+    item = next(plan for plan in running["plans"] if plan["name"] == promoted.name)
+    assert item["outcome"] == "running"
+    assert item["run_id"] == "mcp-queue-run"
+    assert running["capacity"]["available_slots"] == 0
+
+    config = _mcp_tool(client, "get_global_config")
+    changed = _mcp_tool(client, "patch_global_config", {"payload": {
+        "expected_revision": config["revision"],
+        "actions": [
+            {"type": "set_default_upgrade_after_repairs", "value": 4},
+            {"type": "set_workflow_upgrade_after_repairs", "workflow": "managed", "value": 2},
+        ],
+    }})
+    assert changed == client.get("/api/config").json()
+    assert "upgrade_after_repairs = 4" in changed["workflows_toml"]
+    assert "upgrade_after_repairs = 2" in changed["workflows_toml"]
+
+
 def test_mcp_global_config_uses_atomic_typed_patch_and_cross_transport_cas(
     mcp_client,
 ) -> None:
@@ -1206,6 +1397,14 @@ def test_mcp_two_projects_keep_identical_plan_names_and_run_histories(
     registry = main._project_registry
     assert registry is not None
     peer_root = _register_peer_project(registry, root.parent)
+    from aflow.project_settings import ProjectSettings, ProjectSettingsService
+
+    for project_root in (root, peer_root):
+        settings = ProjectSettingsService(project_root)
+        settings.save(
+            ProjectSettings(auto_consume_plans=False),
+            expected_revision=settings.read().revision,
+        )
     peer_id = "peer-project"
     plan_name = "same-mcp-boundary.md"
     markers = {

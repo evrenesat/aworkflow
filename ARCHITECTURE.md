@@ -6,6 +6,15 @@ AFlow is a plan-driven workflow orchestrator that runs coding tasks through exis
 
 ## Project launch admission
 
+The server's project scheduling REST and MCP contracts read and update the
+same primary-checkout `ProjectSettingsService` document. GET leaves absent
+settings at their defaults; PATCH uses its revisioned compare-and-swap. Queue
+reads combine plan lifecycle records, admission claims/capacity, known
+receipt-backed dependencies, and the consumer's current reason codes without
+creating another scheduler. Global typed repair-threshold actions transform
+the locked `aflow.toml`/`workflows.toml` pair; the form reports declared and
+effective values and their inheritance source.
+
 `aflow/project_admission.py` keeps nonce-bound reservations under one lock in
 the primary project's `.aflow` directory. It reconciles controller, startup,
 unit, receipt, and process-birth evidence before counting reserved, starting,

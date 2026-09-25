@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable
-from typing import Any
+from typing import Any, Literal
 
 from fastmcp import FastMCP
 
@@ -152,7 +152,7 @@ def register_plan_authoring_tools(
     )
     def requeue_plan(
         project_id: str,
-        plan_status: PlanStatus,
+        plan_status: Literal["failed", "needs_plan_change"],
         name: str,
         expected_revision: str,
         source_run_id: str | None = None,

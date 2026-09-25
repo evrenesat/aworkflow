@@ -7,6 +7,7 @@ predecessor from the series.
 
 from __future__ import annotations
 
+from collections.abc import Iterable
 import hashlib
 import json
 import os
@@ -19,6 +20,7 @@ from aflow.plan_backups import (
     BackupProvenanceError,
     _plan_identities,
     ensure_plan_identity,
+    plan_identity_for_path,
 )
 from aflow.publication import _valid_published_receipt
 from aflow.project_settings import resolve_project_identity
@@ -68,6 +70,11 @@ def _member(name: str, identity: str, origin: str) -> dict[str, object] | None:
         return None
     return {"identity": identity, "origin": origin, "name": name, "series": parsed[0],
             "position": parsed[1], "delivered": False}
+
+
+def _sequence_conflict(peers: Iterable[dict[str, object]]) -> bool:
+    positions = [item["position"] for item in peers]
+    return any(position is None for position in positions) or len(positions) != len(set(positions))
 
 
 def _regular_json(path: Path, limit: int) -> object | None:
@@ -128,6 +135,57 @@ class PlanDependencies:
                 raise PlanDependencyError("dependency inventory has duplicate members")
             members[key] = {**item, "origin": origin}
         return members
+
+    def blocking_predecessor(
+        self, plan_key: str, *, evidence_roots: tuple[Path, ...] | None = None,
+    ) -> str | None:
+        """Project a known blocker without updating the admission inventory."""
+        candidate = parse_sequence_name(Path(plan_key).name)
+        if candidate is None:
+            return None
+        roots = evidence_roots or (self.root,)
+        for root in roots:
+            project = resolve_project_identity(root)
+            if project.primary_root != self.root or project.checkout_root != root:
+                raise PlanDependencyError("dependency evidence belongs to another project")
+        peers = [item for item in self._load().values() if item["series"] == candidate[0]]
+        if _sequence_conflict(peers):
+            return "sequence_conflict"
+        for item in sorted(peers, key=lambda member: int(member["position"])):
+            if item["position"] >= candidate[1]:
+                continue
+            name = str(item["name"])
+            if not self._member_delivered(
+                str(item["identity"]), name, str(item["origin"]), roots,
+            ):
+                return name
+        return None
+
+    def observed_sequence_conflict(self, plan_name: str, names: Iterable[str]) -> bool:
+        """Project current-document conflicts using admission's member rules."""
+        candidate = parse_sequence_name(plan_name)
+        if candidate is None:
+            return False
+        peers = (_member(name, "", "") for name in names)
+        return _sequence_conflict(
+            item for item in peers if item is not None and item["series"] == candidate[0]
+        )
+
+    def observed_done_delivered(
+        self, name: str, *, checkout_root: Path, evidence_roots: tuple[Path, ...],
+    ) -> bool:
+        """Check an observed Done plan without adding it to the inventory."""
+        checkout = Path(checkout_root)
+        if checkout not in evidence_roots:
+            raise PlanDependencyError("dependency checkout is absent from verified roots")
+        for root in evidence_roots:
+            project = resolve_project_identity(root)
+            if project.primary_root != self.root or project.checkout_root != root:
+                raise PlanDependencyError("dependency evidence belongs to another project")
+        identity = plan_identity_for_path(checkout, checkout / "plans" / "done" / name)
+        return identity is not None and self._member_delivered(
+            identity, name, _origin(checkout), evidence_roots,
+        )
 
     def _save(self, members: dict[str, dict[str, object]]) -> None:
         directory = self.path.parent
@@ -245,6 +303,13 @@ class PlanDependencies:
                 return True
         return False
 
+    def _member_delivered(
+        self, identity: str, name: str, origin: str, roots: tuple[Path, ...],
+    ) -> bool:
+        return self._identity_has_done_owner(identity, name, origin, roots) and any(
+            self._delivered(name, root) for root in roots
+        )
+
     def _delivered(self, name: str, root: Path) -> bool:
         runs = root / ".aflow" / "runs"
         if runs.is_symlink():
@@ -324,11 +389,8 @@ class PlanDependencies:
             if item["series"] != series:
                 continue
             name = str(item["name"])
-            verified = (
-                self._identity_has_done_owner(
-                    str(item["identity"]), name, str(item["origin"]), tuple(verified_roots),
-                )
-                and any(self._delivered(name, root) for root in verified_roots)
+            verified = self._member_delivered(
+                str(item["identity"]), name, str(item["origin"]), tuple(verified_roots),
             )
             if item["delivered"] != verified:
                 item["delivered"] = verified
@@ -336,8 +398,7 @@ class PlanDependencies:
         if changed:
             self._save(members)
         peers = [item for item in members.values() if item["series"] == series]
-        positions = [item["position"] for item in peers if item["position"] is not None]
-        if any(item["position"] is None for item in peers) or len(positions) != len(set(positions)):
+        if _sequence_conflict(peers):
             raise PlanDependencyBlocked("plan sequence needs correction")
         if any(isinstance(item["position"], int) and item["position"] < position
                and not item["delivered"] for item in peers):

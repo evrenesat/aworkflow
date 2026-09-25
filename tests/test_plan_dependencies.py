@@ -6,7 +6,7 @@ from pathlib import Path
 import pytest
 
 from aflow.plan_backups import ensure_plan_identity, move_plan_identity
-from aflow.plan_dependencies import PlanDependencyError, parse_sequence_name
+from aflow.plan_dependencies import PlanDependencies, PlanDependencyError, parse_sequence_name
 from aflow.project_admission import ProjectAdmission, ProjectPlanDependencyBlocked
 
 
@@ -64,6 +64,8 @@ def test_done_name_without_receipt_does_not_release_successor(tmp_path: Path) ->
     admission = ProjectAdmission(tmp_path)
     with pytest.raises(ProjectPlanDependencyBlocked):
         admission.acquire("later", plan_path=later)
+    dependencies = PlanDependencies(tmp_path)
+    assert dependencies.blocking_predecessor("plans/in-progress/feature_P03_finish.md") == first.name
     done = tmp_path / "plans" / "done" / first.name
     done.parent.mkdir()
     first.rename(done)
@@ -74,10 +76,14 @@ def test_done_name_without_receipt_does_not_release_successor(tmp_path: Path) ->
     with pytest.raises(ProjectPlanDependencyBlocked):
         admission.acquire("later", plan_path=later)
     _published_delivery(tmp_path, first.name)
+    inventory_before = dependencies.path.read_bytes()
+    assert dependencies.blocking_predecessor("plans/in-progress/feature_P03_finish.md") is None
+    assert dependencies.path.read_bytes() == inventory_before
     admitted = admission.acquire("later", plan_path=later, idempotency_key="later")
     assert admitted.run_id == "later"
     admission.release(admitted.run_id, admitted.nonce)
     (tmp_path / ".aflow" / "runs" / "delivered-run" / "publication.json").unlink()
+    assert dependencies.blocking_predecessor("plans/in-progress/feature_P03_finish.md") == first.name
     with pytest.raises(ProjectPlanDependencyBlocked):
         admission.acquire("another-later", plan_path=later, idempotency_key="another")
 

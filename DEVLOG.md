@@ -1,5 +1,17 @@
 # DEVLOG
 
+## 2026-09-25 — Scheduling and repair policy API contracts (Checkpoint 6)
+
+- Added authenticated, revisioned project scheduling REST/MCP endpoints over
+  the shared settings service, plus plan queue projections with identity,
+  claims, reason, dependency, run, and effective capacity. Existing failed
+  plan requeue remains the shared revision-checked REST/MCP operation.
+- Added typed global and per-workflow repair-threshold actions under the
+  existing pair lock. Null removes a workflow override; guided projections
+  show declared and effective values with inheritance provenance.
+- Contract tests cover defaults, auth, stale revisions, read purity, queue
+  parity, and threshold inheritance across REST and MCP.
+
 ## 2026-09-24 — Background automatic plan consumption (Checkpoint 5)
 
 - Added server-owned, per-project scanner election and stable two-scan

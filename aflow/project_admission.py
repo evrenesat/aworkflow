@@ -1213,6 +1213,23 @@ class ProjectAdmission:
         """Return current capacity after one fail-closed evidence pass."""
         return self.reconcile()
 
+    def plan_claims(self) -> tuple[tuple[str, str, str, bool], ...]:
+        """Return bounded public plan ownership without reservation nonces."""
+        with self._locked():
+            reservations = self._reconcile_locked(self._load_locked())
+            return tuple(sorted(
+                (reservation.plan_key, reservation.run_id, reservation.state,
+                 reservation.claim_retained)
+                for reservation in reservations.values()
+                if reservation.plan_key is not None
+                and (reservation.state in _LIVE_RESERVATION_STATES
+                     or reservation.claim_retained)
+            ))
+
+    def project_roots(self) -> tuple[Path, ...]:
+        """Return verified checkouts used for shared project evidence."""
+        return self._repository_roots()
+
     def reservation(self, run_id: str) -> AdmissionReservation | None:
         """Read one reservation after reconciliation, without exposing secrets."""
         valid_run_id = validate_run_id(run_id)
