@@ -555,13 +555,13 @@ class SetWorkflowManagerEnabledAction(GuidedActionBase):
 
 class SetDefaultUpgradeAfterRepairsAction(GuidedActionBase):
     type: Literal["set_default_upgrade_after_repairs"]
-    value: StrictInt = Field(ge=1)
+    value: StrictInt = Field(ge=0)
 
 
 class SetWorkflowUpgradeAfterRepairsAction(GuidedActionBase):
     type: Literal["set_workflow_upgrade_after_repairs"]
     workflow: str = Field(min_length=1, max_length=64)
-    value: StrictInt | None = Field(ge=1)
+    value: StrictInt | None = Field(ge=0)
 
 
 class SetPromptAction(GuidedActionBase):

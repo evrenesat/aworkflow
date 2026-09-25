@@ -1074,13 +1074,20 @@ def test_mcp_project_scheduling_queue_and_thresholds_match_rest(mcp_client) -> N
     changed = _mcp_tool(client, "patch_global_config", {"payload": {
         "expected_revision": config["revision"],
         "actions": [
-            {"type": "set_default_upgrade_after_repairs", "value": 4},
-            {"type": "set_workflow_upgrade_after_repairs", "workflow": "managed", "value": 2},
+            {"type": "set_default_upgrade_after_repairs", "value": 0},
+            {"type": "set_workflow_upgrade_after_repairs", "workflow": "managed", "value": 0},
         ],
     }})
     assert changed == client.get("/api/config").json()
-    assert "upgrade_after_repairs = 4" in changed["workflows_toml"]
-    assert "upgrade_after_repairs = 2" in changed["workflows_toml"]
+    assert changed["workflows_toml"].count("upgrade_after_repairs = 0") == 2
+    projected_response = client.post("/api/config/form", json={
+        "aflow_toml": changed["aflow_toml"],
+        "workflows_toml": changed["workflows_toml"],
+    })
+    assert projected_response.status_code == 200
+    projected = projected_response.json()
+    assert projected["form"]["default_upgrade_after_repairs"] == 0
+    assert projected["form"]["workflows"]["managed"]["upgrade_after_repairs"] == 0
 
 
 def test_mcp_global_config_uses_atomic_typed_patch_and_cross_transport_cas(

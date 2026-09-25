@@ -2306,6 +2306,78 @@ def test_new_run_advanced_pointer_survives_preflight(
             browser.close()
 
 
+def test_mobile_repair_threshold_zero_save_reload_and_inherit(control_client, monkeypatch, tmp_path):
+    """The compact Workflows editor keeps zero distinct from blank inheritance."""
+    _, root, _, _ = control_client
+    _seed_responsive_fixture(root)
+    dist = Path(__file__).resolve().parents[2] / "web" / "dist"
+    monkeypatch.setenv("AFLOW_APP_WEB_DIST", str(dist))
+
+    with live_server() as url, sync_playwright() as playwright:
+        browser = _browser(playwright)
+        try:
+            page = browser.new_page(viewport={"width": 320, "height": 568}, has_touch=True)
+            _login(page, url)
+            _ensure_project(page)
+            _open_destination(page, "Settings")
+            _select_settings_section(page, "Workflows")
+            page.get_by_role("button", name="Defaults", exact=True).click()
+            default = page.get_by_label("Default repair threshold", exact=True)
+            expect(default).to_have_attribute("min", "0")
+            expect(default).to_have_value("1")
+            default.fill("0")
+            expect(default).to_have_value("0")
+            expect(page.get_by_text("0 = switch for first reviewer-requested repair", exact=False)).to_be_visible()
+
+            page.get_by_role("button", name="← Back to Workflows", exact=True).click()
+            page.get_by_role("button", name="Managed", exact=True).click()
+            workflow = page.get_by_label("Repair threshold for Managed", exact=True)
+            expect(workflow).to_have_attribute("min", "0")
+            workflow.fill("0")
+            expect(workflow).to_have_value("0")
+            page.get_by_role("button", name="← Back to Workflows", exact=True).click()
+            page.get_by_role("button", name="Defaults", exact=True).click()
+            expect(default).to_have_value("0")
+            page.get_by_role("button", name="Save all changes", exact=True).click()
+            page.get_by_text("Workflow settings saved; new runs use the saved configuration", exact=False).wait_for()
+
+            page.reload()
+            page.get_by_role("heading", name="Settings", exact=True).wait_for()
+            _select_settings_section(page, "Workflows")
+            page.get_by_role("button", name="Defaults", exact=True).click()
+            expect(page.get_by_label("Default repair threshold", exact=True)).to_have_value("0")
+            page.get_by_role("button", name="← Back to Workflows", exact=True).click()
+            page.get_by_role("button", name="Managed", exact=True).click()
+            workflow = page.get_by_label("Repair threshold for Managed", exact=True)
+            expect(workflow).to_have_value("0")
+            for theme in ("light", "dark"):
+                _set_theme_preference(page, theme)
+                page.reload()
+                page.get_by_role("heading", name="Settings", exact=True).wait_for()
+                _assert_theme(page, theme)
+                _select_settings_section(page, "Workflows")
+                page.get_by_role("button", name="Managed", exact=True).click()
+                workflow = page.get_by_label("Repair threshold for Managed", exact=True)
+                expect(workflow).to_have_value("0")
+                image = tmp_path / f"repair-threshold-zero-{theme}-320x568.png"
+                page.screenshot(path=str(image), full_page=True)
+                print("REPAIR_THRESHOLD_SCREENSHOT", image)
+            workflow.fill("")
+            expect(workflow).to_have_value("")
+            page.get_by_role("button", name="Save all changes", exact=True).click()
+            page.get_by_text("Workflow settings saved; new runs use the saved configuration", exact=False).wait_for()
+
+            page.reload()
+            page.get_by_role("heading", name="Settings", exact=True).wait_for()
+            _select_settings_section(page, "Workflows")
+            page.get_by_role("button", name="Managed", exact=True).click()
+            expect(page.get_by_label("Repair threshold for Managed", exact=True)).to_have_value("")
+            expect(page.get_by_text("Effective: 0 (defaults)", exact=False)).to_be_visible()
+            _assert_no_horizontal_overflow(page)
+        finally:
+            browser.close()
+
+
 @pytest.mark.parametrize(("width", "height"), VIEWPORTS)
 def test_responsive_route_matrix(control_client, monkeypatch, tmp_path, width: int, height: int):
     """Exercise every shell destination at each required CSS viewport."""

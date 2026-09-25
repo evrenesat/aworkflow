@@ -92,6 +92,11 @@ disclosure. Advanced TOML replaces all guided tabs until switching back;
 Connection settings TOML stays in General. Clear effort text to unset it, then
 Save all changes.
 
+In Settings → Workflows, a repair threshold of `0` switches to the configured
+upgrade worker for the first reviewer-requested repair. Positive values count
+failed repairs first. A blank workflow threshold inherits its base or the
+global default; an explicit `0` remains visible after save and reload.
+
 The Skills tab (between Prompts and General) edits bundled `SKILL.md` files
 with per-skill drafts that survive skill, tab, and Advanced TOML navigation.
 Saving writes workflow configuration first, then dirty skills in name order,

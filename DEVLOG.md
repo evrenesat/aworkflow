@@ -1,5 +1,19 @@
 # DEVLOG
 
+## 2026-09-25 — Guided first-repair threshold (Checkpoint 2)
+
+- Guided actions and REST/MCP config writes now accept strict integer zero.
+  Both canonical and invalid-draft projections preserve explicit zero through
+  global, workflow, and base-workflow inheritance; `None` still clears a
+  workflow override. Threshold edits leave team role inheritance untouched.
+- Workflows Settings allows zero, explains its first reviewer-requested repair
+  effect, and keeps an unsaved zero across selection and preview refresh.
+  Save and reload continue to distinguish zero from blank inheritance.
+- Verification: 195 guided/API/MCP tests, 664 web tests, 195 focused core tests
+  plus 7 subtests, web build, scoped Ruff, and `git diff --check` passed.
+  Chromium and WebKit passed the 320×568 save/reload/inherit journey; light
+  and dark screenshots showed readable threshold details without overflow.
+
 ## 2026-09-25 — First repair worker upgrade threshold (Checkpoint 1)
 
 - Core workflow config and repair policy accept explicit nonnegative thresholds.

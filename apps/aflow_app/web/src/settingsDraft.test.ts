@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { changedDocuments, createDraftPreviewCoordinator, reconcileCleanPreview, settingsActions } from './settingsDraft'
+import { changedDocuments, createDraftPreviewCoordinator, reconcileCleanPreview, repairThresholdDisplay, retainServerProjection, settingsActions } from './settingsDraft'
 import type { GuidedFormProjection } from './types'
 
 export const baseline: GuidedFormProjection = {
@@ -79,6 +79,48 @@ describe('changed-only settings', () => {
     inherit.workflows.demo.effective_manager_enabled = true
     inherit.workflows.demo.manager_enabled_source = 'defaults'
     expect(settingsActions(enabled, inherit)).toEqual([{ type: 'set_workflow_manager_enabled', workflow: 'demo', value: null }])
+  })
+  it('keeps explicit zero distinct from inheritance in actions and previews', () => {
+    const base: GuidedFormProjection = {
+      ...baseline,
+      default_upgrade_after_repairs: null,
+      effective_default_upgrade_after_repairs: 1,
+      workflows: {
+        demo: { ...baseline.workflows.demo, upgrade_after_repairs: null, effective_upgrade_after_repairs: 1, upgrade_after_repairs_source: 'defaults' },
+        'demo-alias': { ...baseline.workflows['demo-alias'], upgrade_after_repairs: null, effective_upgrade_after_repairs: 1, upgrade_after_repairs_source: 'base:demo' },
+      },
+    }
+    const zero = structuredClone(base)
+    zero.default_upgrade_after_repairs = 0
+    zero.workflows.demo.upgrade_after_repairs = 0
+    expect(settingsActions(base, zero)).toEqual([
+      { type: 'set_default_upgrade_after_repairs', value: 0 },
+      { type: 'set_workflow_upgrade_after_repairs', workflow: 'demo', value: 0 },
+    ])
+    expect(repairThresholdDisplay(zero)).toEqual({ value: 0, source: 'defaults' })
+    expect(repairThresholdDisplay(zero, 'demo')).toEqual({ value: 0, source: 'workflow' })
+    expect(repairThresholdDisplay(zero, 'demo-alias')).toEqual({ value: 0, source: 'base:demo' })
+
+    const refreshed = retainServerProjection(zero, base)
+    expect(refreshed.default_upgrade_after_repairs).toBe(0)
+    expect(refreshed.workflows.demo.upgrade_after_repairs).toBe(0)
+    expect(repairThresholdDisplay(refreshed, 'demo-alias').value).toBe(0)
+
+    const inherit = structuredClone(zero)
+    inherit.workflows.demo.upgrade_after_repairs = null
+    expect(settingsActions(zero, inherit)).toEqual([
+      { type: 'set_workflow_upgrade_after_repairs', workflow: 'demo', value: null },
+    ])
+    expect(repairThresholdDisplay(inherit, 'demo-alias')).toEqual({ value: 0, source: 'base:demo' })
+    expect(settingsActions(zero, structuredClone(zero))).toEqual([])
+
+    const serverZero = structuredClone(base)
+    serverZero.effective_default_upgrade_after_repairs = 0
+    serverZero.workflows.demo.effective_upgrade_after_repairs = 0
+    const inheritedProjection = retainServerProjection(base, serverZero)
+    expect(inheritedProjection.default_upgrade_after_repairs).toBeNull()
+    expect(inheritedProjection.effective_default_upgrade_after_repairs).toBe(0)
+    expect(repairThresholdDisplay(inheritedProjection, 'demo').value).toBe(0)
   })
   it('keeps the launch-default workflow unrelated to supervision inheritance', () => {
     const draft = structuredClone(baseline)

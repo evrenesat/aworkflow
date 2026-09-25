@@ -816,6 +816,11 @@ def _fallback_effective(
     return False
 
 
+def _effective_upgrade_threshold(*values: int | None) -> int:
+    """Preserve explicit zero while resolving declared threshold precedence."""
+    return next((value for value in values if value is not None), DEFAULT_UPGRADE_AFTER_REPAIRS)
+
+
 def _projection(
     aflow_doc: TOMLDocument, workflows_doc: TOMLDocument, texts: tuple[str, str]
 ) -> dict[str, Any]:
@@ -945,7 +950,7 @@ def _projection(
         if isinstance(raw_default, bool):
             default_manager_enabled = raw_default
         raw_upgrade_default = workflow_table.get("upgrade_after_repairs")
-        if isinstance(raw_upgrade_default, int) and not isinstance(raw_upgrade_default, bool) and raw_upgrade_default > 0:
+        if isinstance(raw_upgrade_default, int) and not isinstance(raw_upgrade_default, bool) and raw_upgrade_default >= 0:
             default_upgrade_after_repairs = raw_upgrade_default
         for wf_name in _workflow_names(workflows_doc):
             wf_table = workflow_table.get(wf_name)
@@ -963,7 +968,7 @@ def _projection(
             )
             raw_upgrade = wf_table.get("upgrade_after_repairs")
             declared_upgrade[wf_name] = (
-                raw_upgrade if isinstance(raw_upgrade, int) and not isinstance(raw_upgrade, bool) and raw_upgrade > 0 else None,
+                raw_upgrade if isinstance(raw_upgrade, int) and not isinstance(raw_upgrade, bool) and raw_upgrade >= 0 else None,
                 raw_extends if isinstance(raw_extends, str) else None,
             )
             declared: list[str] = []
@@ -981,7 +986,7 @@ def _projection(
                 "effective_manager_enabled": False,
                 "manager_enabled_source": "defaults",
                 "upgrade_after_repairs": declared_upgrade[wf_name][0],
-                "effective_upgrade_after_repairs": default_upgrade_after_repairs or DEFAULT_UPGRADE_AFTER_REPAIRS,
+                "effective_upgrade_after_repairs": _effective_upgrade_threshold(default_upgrade_after_repairs),
                 "upgrade_after_repairs_source": "defaults",
             }
     report = validate_candidate_pair(*texts)
@@ -1030,7 +1035,7 @@ def _projection(
                         "effective_manager_enabled": False,
                         "manager_enabled_source": "defaults",
                         "upgrade_after_repairs": None,
-                        "effective_upgrade_after_repairs": default_upgrade_after_repairs or DEFAULT_UPGRADE_AFTER_REPAIRS,
+                        "effective_upgrade_after_repairs": _effective_upgrade_threshold(default_upgrade_after_repairs),
                         "upgrade_after_repairs_source": "defaults",
                     },
                 )
@@ -1080,9 +1085,8 @@ def _projection(
             upgrade_declared, upgrade_extends, set(declared_upgrade)
         )
         base_declared = declared_upgrade.get(upgrade_extends, (None, None))[0]
-        summary["effective_upgrade_after_repairs"] = (
-            upgrade_declared or base_declared or default_upgrade_after_repairs
-            or DEFAULT_UPGRADE_AFTER_REPAIRS
+        summary["effective_upgrade_after_repairs"] = _effective_upgrade_threshold(
+            upgrade_declared, base_declared, default_upgrade_after_repairs
         )
     named_prompts = _text_table(aflow_doc.get("prompts"), path="prompts")
     role_prompts = global_role_prompts
@@ -1112,9 +1116,7 @@ def _projection(
         "workflows": workflows,
         "default_manager_enabled": default_manager_enabled,
         "default_upgrade_after_repairs": default_upgrade_after_repairs,
-        "effective_default_upgrade_after_repairs": (
-            default_upgrade_after_repairs or DEFAULT_UPGRADE_AFTER_REPAIRS
-        ),
+        "effective_default_upgrade_after_repairs": _effective_upgrade_threshold(default_upgrade_after_repairs),
     }
 
 

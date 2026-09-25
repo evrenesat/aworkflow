@@ -1067,12 +1067,14 @@ def test_upgrade_threshold_actions_preserve_inheritance_and_pair_cas(control_cli
         "actions": [{"type": "set_default_upgrade_after_repairs", "value": 4}],
     })
     assert stale.status_code == 409
-    assert client.patch("/api/config", json={
+    zero = client.patch("/api/config", json={
         "expected_revision": first.json()["revision"],
         "actions": [{"type": "set_default_upgrade_after_repairs", "value": 0}],
-    }).status_code == 422
+    })
+    assert zero.status_code == 200, zero.text
+    assert "upgrade_after_repairs = 0" in zero.json()["workflows_toml"]
     removed = client.patch("/api/config", json={
-        "expected_revision": first.json()["revision"],
+        "expected_revision": zero.json()["revision"],
         "actions": [{"type": "set_workflow_upgrade_after_repairs", "workflow": "managed", "value": None}],
     })
     assert removed.status_code == 200, removed.text
@@ -1082,10 +1084,11 @@ def test_upgrade_threshold_actions_preserve_inheritance_and_pair_cas(control_cli
         "workflows_toml": removed.json()["workflows_toml"],
     })
     assert form.status_code == 200, form.text
-    assert form.json()["form"]["default_upgrade_after_repairs"] == 3
+    assert form.json()["form"]["default_upgrade_after_repairs"] == 0
+    assert form.json()["form"]["effective_default_upgrade_after_repairs"] == 0
     workflow = form.json()["form"]["workflows"]["managed"]
     assert workflow["upgrade_after_repairs"] is None
-    assert workflow["effective_upgrade_after_repairs"] == 3
+    assert workflow["effective_upgrade_after_repairs"] == 0
     assert workflow["upgrade_after_repairs_source"] == "defaults"
     alias = client.post("/api/config/form", json={
         "aflow_toml": removed.json()["aflow_toml"],
@@ -1094,8 +1097,23 @@ def test_upgrade_threshold_actions_preserve_inheritance_and_pair_cas(control_cli
     })
     assert alias.status_code == 200, alias.text
     alias_workflow = alias.json()["form"]["workflows"]["alias"]
-    assert alias_workflow["effective_upgrade_after_repairs"] == 3
+    assert alias_workflow["effective_upgrade_after_repairs"] == 0
     assert alias_workflow["upgrade_after_repairs_source"] == "base:managed"
+
+
+@pytest.mark.parametrize("value", [-1, True, 0.5, "0"])
+def test_upgrade_threshold_patch_rejects_noninteger_values(control_client, value) -> None:
+    client, _, _, _ = control_client
+    before = client.get("/api/config").json()
+    for action in (
+        {"type": "set_default_upgrade_after_repairs", "value": value},
+        {"type": "set_workflow_upgrade_after_repairs", "workflow": "managed", "value": value},
+    ):
+        response = client.patch("/api/config", json={
+            "expected_revision": before["revision"], "actions": [action],
+        })
+        assert response.status_code == 422
+    assert client.get("/api/config").json()["revision"] == before["revision"]
 
 
 def test_server_lifespan_owns_and_stops_plan_scanner(control_client, monkeypatch) -> None:

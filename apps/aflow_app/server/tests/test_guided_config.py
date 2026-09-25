@@ -31,6 +31,7 @@ from aflow_app_server.models import (
     RemoveTeamAction,
     RenamePromptAction,
     SetDefaultManagerEnabledAction,
+    SetDefaultUpgradeAfterRepairsAction,
     SetDefaultWorkflowAction,
     SetGlobalRoleAction,
     SetMaxTurnsAction,
@@ -41,6 +42,7 @@ from aflow_app_server.models import (
     SetTeamUpgradeAction,
     SetWorkflowDefaultTeamAction,
     SetWorkflowManagerEnabledAction,
+    SetWorkflowUpgradeAfterRepairsAction,
     UpsertProfileAction,
 )
 
@@ -1202,6 +1204,110 @@ class TestManagerEnabled:
         muted = response.form.workflows["muted"]
         assert muted.effective_manager_enabled is False
         assert muted.manager_enabled_source == "base:quiet"
+
+
+class TestUpgradeAfterRepairs:
+    ALIAS_WORKFLOWS = WORKFLOWS_TEXT + '\n[workflow.alias]\nextends = "deliver"\n'
+
+    def test_zero_default_round_trips_without_becoming_missing(self) -> None:
+        initial = _call(workflows_text=self.ALIAS_WORKFLOWS)
+        assert initial.form is not None
+        assert initial.form.default_upgrade_after_repairs is None
+        assert initial.form.effective_default_upgrade_after_repairs == 1
+
+        changed = _call(
+            workflows_text=self.ALIAS_WORKFLOWS,
+            action=SetDefaultUpgradeAfterRepairsAction(
+                type="set_default_upgrade_after_repairs", value=0
+            ),
+        )
+        assert changed.validation.state == "ready"
+        assert changed.workflows_toml.count("upgrade_after_repairs") == 1
+        reloaded = _call(workflows_text=changed.workflows_toml)
+        assert reloaded.form is not None
+        assert reloaded.form.default_upgrade_after_repairs == 0
+        assert reloaded.form.effective_default_upgrade_after_repairs == 0
+        for workflow in ("deliver", "alias"):
+            summary = reloaded.form.workflows[workflow]
+            assert summary.upgrade_after_repairs is None
+            assert summary.effective_upgrade_after_repairs == 0
+
+    def test_zero_workflow_override_inherits_through_alias_and_clears_to_default(self) -> None:
+        defaulted = _call(
+            workflows_text=self.ALIAS_WORKFLOWS,
+            action=SetDefaultUpgradeAfterRepairsAction(
+                type="set_default_upgrade_after_repairs", value=3
+            ),
+        )
+        zero = _call(
+            workflows_text=defaulted.workflows_toml,
+            action=SetWorkflowUpgradeAfterRepairsAction(
+                type="set_workflow_upgrade_after_repairs", workflow="deliver", value=0
+            ),
+        )
+        reloaded = _call(workflows_text=zero.workflows_toml)
+        assert reloaded.validation.state == "ready"
+        assert reloaded.form is not None
+        deliver = reloaded.form.workflows["deliver"]
+        alias = reloaded.form.workflows["alias"]
+        assert (deliver.upgrade_after_repairs, deliver.effective_upgrade_after_repairs, deliver.upgrade_after_repairs_source) == (0, 0, "workflow")
+        assert (alias.upgrade_after_repairs, alias.effective_upgrade_after_repairs, alias.upgrade_after_repairs_source) == (None, 0, "base:deliver")
+
+        cleared = _call(
+            workflows_text=zero.workflows_toml,
+            action=SetWorkflowUpgradeAfterRepairsAction(
+                type="set_workflow_upgrade_after_repairs", workflow="deliver", value=None
+            ),
+        )
+        assert cleared.form is not None
+        assert (cleared.form.workflows["deliver"].upgrade_after_repairs,
+                cleared.form.workflows["deliver"].effective_upgrade_after_repairs) == (None, 3)
+        assert cleared.form.workflows["alias"].effective_upgrade_after_repairs == 3
+
+    def test_invalid_candidate_projects_explicit_zero_and_preserves_roles(self) -> None:
+        aflow = FAMILY_AFLOW_TEXT.replace(
+            'reviewer = "codex.fast"\n\n[roles.prompts]',
+            'reviewer = "codex.fast"\nfinal_reviewer = "codex.review"\n\n[roles.prompts]',
+            1,
+        )
+        workflows = self.ALIAS_WORKFLOWS.replace(
+            '[workflow]\n', '[workflow]\nupgrade_after_repairs = 0\n', 1
+        ).replace(
+            '[workflow.deliver.steps.implement]',
+            '[workflow.deliver]\nupgrade_after_repairs = 0\n\n[workflow.deliver.steps.implement]',
+            1,
+        )
+        ready = _call(aflow_text=aflow, workflows_text=workflows)
+        assert ready.validation.state == "ready"
+        assert ready.form is not None
+        roles = ready.form.teams["child"].effective_roles
+        assert roles["worker"] == "codex.deep"
+        assert roles["reviewer"] == "codex.review"
+        assert roles["final_reviewer"] == "codex.review"
+
+        invalid = _call(
+            aflow_text=aflow.replace('worker = "codex.fast"', 'worker = "codex.missing"', 1),
+            workflows_text=workflows,
+        )
+        assert invalid.validation.state == "invalid"
+        assert invalid.form is not None
+        assert invalid.form.default_upgrade_after_repairs == 0
+        assert invalid.form.effective_default_upgrade_after_repairs == 0
+        assert invalid.form.workflows["deliver"].effective_upgrade_after_repairs == 0
+        assert invalid.form.workflows["alias"].effective_upgrade_after_repairs == 0
+
+    @pytest.mark.parametrize("value", [-1, True, 0.5, "0"])
+    def test_invalid_action_values_are_rejected(self, value: object) -> None:
+        for action in (
+            {"type": "set_default_upgrade_after_repairs", "value": value},
+            {"type": "set_workflow_upgrade_after_repairs", "workflow": "deliver", "value": value},
+        ):
+            with pytest.raises(ValidationError):
+                ProjectConfigFormPayload(
+                    aflow_toml=AFLOW_TEXT,
+                    workflows_toml=WORKFLOWS_TEXT,
+                    action=action,
+                )
 
 
 class TestZCodeFieldOwnership:

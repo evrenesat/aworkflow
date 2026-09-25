@@ -262,15 +262,93 @@ describe('GlobalSettings', () => {
     render(<GlobalSettings onDirtyChange={() => {}} onSaved={() => {}} />)
     fireEvent.click(await screen.findByRole('tab', { name: 'Workflows' }))
     fireEvent.change(screen.getByLabelText('Default repair threshold'), { target: { value: '3' } })
-    expect(screen.getByText('Effective: 3 failed repairs before changing team.')).toBeDefined()
+    expect(screen.getByText('Effective: 3. 0 = switch for first reviewer-requested repair; positive values count failed repairs.')).toBeDefined()
     fireEvent.click(screen.getByRole('button', { name: 'Demo', exact: true }))
-    expect(screen.getByText('Effective: 3 (defaults). Leave blank to inherit.')).toBeDefined()
+    expect(screen.getByText('Effective: 3 (defaults). Leave blank to inherit. 0 = switch for first reviewer-requested repair; positive values count failed repairs.')).toBeDefined()
     fireEvent.change(screen.getByLabelText('Repair threshold for Demo'), { target: { value: '2' } })
-    expect(screen.getByText('Effective: 2 (this workflow). Leave blank to inherit.')).toBeDefined()
+    expect(screen.getByText('Effective: 2 (this workflow). Leave blank to inherit. 0 = switch for first reviewer-requested repair; positive values count failed repairs.')).toBeDefined()
     fireEvent.click(screen.getByRole('button', { name: 'Demo alias', exact: true }))
-    expect(screen.getByText('Effective: 2 (base Demo). Leave blank to inherit.')).toBeDefined()
+    expect(screen.getByText('Effective: 2 (base Demo). Leave blank to inherit. 0 = switch for first reviewer-requested repair; positive values count failed repairs.')).toBeDefined()
     fireEvent.change(screen.getByLabelText('Repair threshold for Demo alias'), { target: { value: '5' } })
-    expect(screen.getByText('Effective: 5 (this workflow). Leave blank to inherit.')).toBeDefined()
+    expect(screen.getByText('Effective: 5 (this workflow). Leave blank to inherit. 0 = switch for first reviewer-requested repair; positive values count failed repairs.')).toBeDefined()
+    expect(api.patchGlobalConfig).not.toHaveBeenCalled()
+  })
+
+  it('saves explicit zero and keeps blank as workflow inheritance', async () => {
+    const thresholdForm: GuidedFormProjection = {
+      ...form,
+      default_upgrade_after_repairs: null,
+      effective_default_upgrade_after_repairs: 1,
+      workflows: { demo: { declared_steps: ['work'], first_step: 'work', executable_steps: ['work'], first_executable_step: 'work', upgrade_after_repairs: null, effective_upgrade_after_repairs: 1, upgrade_after_repairs_source: 'defaults' } },
+    }
+    vi.mocked(api.postGlobalConfigForm).mockResolvedValue({ ...response, form: thresholdForm })
+    render(<GlobalSettings onDirtyChange={() => {}} onSaved={() => {}} />)
+    fireEvent.click(await screen.findByRole('tab', { name: 'Workflows' }))
+    const defaultInput = screen.getByLabelText('Default repair threshold') as HTMLInputElement
+    expect(defaultInput.min).toBe('0')
+    expect(defaultInput.step).toBe('1')
+    fireEvent.change(defaultInput, { target: { value: '0' } })
+    expect(defaultInput.value).toBe('0')
+    expect(screen.getByText(/Effective: 0\. 0 = switch for first reviewer-requested repair/)).toBeDefined()
+    fireEvent.click(screen.getByRole('button', { name: 'Demo', exact: true }))
+    const workflowInput = screen.getByLabelText('Repair threshold for Demo') as HTMLInputElement
+    expect(workflowInput.min).toBe('0')
+    expect(workflowInput.step).toBe('1')
+    fireEvent.change(workflowInput, { target: { value: '0' } })
+    expect(workflowInput.value).toBe('0')
+    expect(screen.getByText(/Effective: 0 \(this workflow\)/)).toBeDefined()
+    fireEvent.click(screen.getByRole('button', { name: 'Save all changes' }))
+    await waitFor(() => expect(api.patchGlobalConfig).toHaveBeenCalledWith({
+      expected_revision: config.revision,
+      actions: [
+        { type: 'set_default_upgrade_after_repairs', value: 0 },
+        { type: 'set_workflow_upgrade_after_repairs', workflow: 'demo', value: 0 },
+      ],
+    }))
+
+    fireEvent.change(workflowInput, { target: { value: '' } })
+    expect(workflowInput.value).toBe('')
+  })
+
+  it('keeps an unsaved zero visible across workflow selection and preview refresh', async () => {
+    const thresholdForm: GuidedFormProjection = {
+      ...form,
+      default_upgrade_after_repairs: null,
+      effective_default_upgrade_after_repairs: 1,
+      workflows: {
+        demo: { declared_steps: ['work'], first_step: 'work', executable_steps: ['work'], first_executable_step: 'work', upgrade_after_repairs: null, effective_upgrade_after_repairs: 1, upgrade_after_repairs_source: 'defaults' },
+        demo_alias: { declared_steps: ['work'], first_step: 'work', executable_steps: ['work'], first_executable_step: 'work', upgrade_after_repairs: null, effective_upgrade_after_repairs: 1, upgrade_after_repairs_source: 'base:demo' },
+      },
+    }
+    const preview = deferred<ProjectConfigFormResponse>()
+    vi.mocked(api.postGlobalConfigForm).mockResolvedValueOnce({ ...response, form: thresholdForm }).mockImplementation(() => preview.promise)
+    render(<GlobalSettings onDirtyChange={() => {}} onSaved={() => {}} />)
+    fireEvent.click(await screen.findByRole('tab', { name: 'Workflows' }))
+    fireEvent.click(screen.getByRole('button', { name: 'Demo', exact: true }))
+    fireEvent.change(screen.getByLabelText('Repair threshold for Demo'), { target: { value: '0' } })
+    fireEvent.click(screen.getByRole('button', { name: 'Demo alias', exact: true }))
+    expect(screen.getByText(/Effective: 0 \(base Demo\)/)).toBeDefined()
+    fireEvent.click(screen.getByRole('button', { name: 'Demo', exact: true }))
+    expect((screen.getByLabelText('Repair threshold for Demo') as HTMLInputElement).value).toBe('0')
+    await act(async () => {
+      preview.resolve({ ...response, form: thresholdForm })
+      await preview.promise
+    })
+    expect((screen.getByLabelText('Repair threshold for Demo') as HTMLInputElement).value).toBe('0')
+    expect(screen.getByText(/Effective: 0 \(this workflow\)/)).toBeDefined()
+  })
+
+  it.each([
+    ['-1', 'Default repair threshold must be a nonnegative integer'],
+    ['0.5', 'Default repair threshold must be a nonnegative integer'],
+  ])('rejects invalid default threshold %s before saving', async (value, message) => {
+    const thresholdForm: GuidedFormProjection = { ...form, default_upgrade_after_repairs: null, effective_default_upgrade_after_repairs: 1 }
+    vi.mocked(api.postGlobalConfigForm).mockResolvedValue({ ...response, form: thresholdForm })
+    render(<GlobalSettings onDirtyChange={() => {}} onSaved={() => {}} />)
+    fireEvent.click(await screen.findByRole('tab', { name: 'Workflows' }))
+    fireEvent.change(screen.getByLabelText('Default repair threshold'), { target: { value } })
+    fireEvent.click(screen.getByRole('button', { name: 'Save all changes' }))
+    await screen.findByText(new RegExp(message))
     expect(api.patchGlobalConfig).not.toHaveBeenCalled()
   })
 
