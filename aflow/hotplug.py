@@ -315,12 +315,16 @@ def build_handover_context_v1(
 ) -> HandoverContextV1:
     """Project Full evidence without manager authority, prompts, or secrets."""
     canonical = json.dumps(_bounded_context_value(full_context), sort_keys=True, separators=(",", ":"))
+    controller = full_context.get("controller_state", {})
+    controller = controller if isinstance(controller, Mapping) else {}
     plan_state = full_context.get("plan_state", {})
-    scope = full_context.get("active_implementation_scope", {})
+    scope = full_context.get("active_implementation_scope") or controller.get("active_implementation_scope", {})
     attempts = full_context.get("implementation_attempts", ())
-    rejections = full_context.get("latest_full_rejection", {})
-    run_summary = full_context.get("run_summary", {})
-    workspace = full_context.get("workspace_facts", {})
+    if isinstance(attempts, Mapping):
+        attempts = attempts.get("attempts", ())
+    rejections = full_context.get("latest_full_rejection") or controller.get("latest_full_rejection", {})
+    run_summary = full_context.get("run_summary") or full_context.get("history_summary", {})
+    workspace = full_context.get("workspace_facts") or controller.get("workspace_state", {})
     completed = full_context.get("completed_work", ())
     return HandoverContextV1(
         transaction_id=transaction.transaction_id,
@@ -334,8 +338,8 @@ def build_handover_context_v1(
             _bounded_context_value(item) for item in attempts if isinstance(item, Mapping)
         ) if isinstance(attempts, (list, tuple)) else (),
         rejection_summary=(
-            str(rejections.get("summary", ""))[:2048]
-            if isinstance(rejections, Mapping) and rejections.get("summary") else None
+            str(rejections.get("summary") or rejections.get("review_summary"))[:2048]
+            if isinstance(rejections, Mapping) and (rejections.get("summary") or rejections.get("review_summary")) else None
         ),
         run_summary=_bounded_context_value(run_summary) if isinstance(run_summary, Mapping) else {},
         workspace_facts=_bounded_context_value(workspace) if isinstance(workspace, Mapping) else {},
@@ -363,6 +367,65 @@ def validate_handover_output(output: str, *, max_bytes: int = HANDOVER_MAX_BYTES
     if any(marker in normalized.lower() for marker in ("chain of thought", "scratchpad", "hidden reasoning")):
         raise ValueError("handover output requests hidden reasoning")
     return normalized + "\n"
+
+
+def render_controller_handover(context: HandoverContextV1) -> str:
+    """Render only recorded controller facts; never imply a provider handover."""
+    if not isinstance(context, HandoverContextV1):
+        raise ValueError("controller handover requires HandoverContextV1")
+
+    def fact(value: object) -> str:
+        # JSON quotes line breaks and Markdown supplied by evidence. The suffix
+        # makes a shortened value distinguishable from a complete record.
+        try:
+            encoded = json.dumps(value, sort_keys=True, ensure_ascii=True)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("controller handover contains non-JSON evidence") from exc
+        encoded = re.sub(
+            r"chain of thought|scratchpad|hidden reasoning",
+            "[unsafe marker omitted]", encoded, flags=re.IGNORECASE,
+        )
+        limit = 256
+        return encoded if len(encoded) <= limit else encoded[:limit] + "... [truncated; inspect context artifact]"
+
+    def records(values: tuple[object, ...], label: str, missing: str) -> list[str]:
+        if not values:
+            return [missing]
+        lines = [f"- {label}: {fact(value)}" for value in values[:4]]
+        if len(values) > 4:
+            lines.append(f"- {len(values) - 4} further records: inspect context artifact.")
+        return lines
+
+    sections = (
+        [
+            f"- Transaction: {fact(context.transaction_id)}; source: {fact(context.source_selector)}; target: {fact(context.target_selector)}.",
+            f"- Controller objective: {fact(context.objective)}",
+            f"- Recorded checkpoint state: {fact(context.checkpoint)}" if context.checkpoint
+            else "- Checkpoint state was not recorded; inspect the authoritative plan.",
+        ],
+        records(context.completed_work, "Recorded completed-work entry", "- No completed-work entries were recorded; inspect the authoritative plan and worktree."),
+        [f"- Recorded implementation scope: {fact(context.scope)}" if context.scope
+         else "- No changed-file inventory was recorded; inspect the worktree.",
+         "- Inspect the worktree for actual changed files; scope is not a file inventory."],
+        records(context.implementation_attempts, "Recorded implementation attempt", "- No verification result was recorded; inspect the plan and worktree before drawing conclusions."),
+        [f"- Recorded rejection summary: {fact(context.rejection_summary)}" if context.rejection_summary
+         else "- No rejection summary was recorded; inspect the authoritative plan for the next action.",
+         "- Read the original plan and worktree to determine the exact next action."],
+        [f"- Recorded run summary: {fact(context.run_summary)}" if context.run_summary
+         else "- No run summary was recorded; inspect the authoritative run artifacts.",
+         "- No source provider context was transferred. The source session was not prompted for this brief."],
+        [f"- Recorded workspace facts: {fact(context.workspace_facts)}" if context.workspace_facts
+         else "- No workspace facts were recorded; inspect the worktree before editing."],
+        [
+            *records(context.artifact_refs, "Recorded artifact reference", "- No artifact references were recorded in this projection; inspect the controller-provided artifact paths."),
+            f"- full_context_sha256 (bounded canonical evidence): {context.full_context_sha256}. Read the controller-provided full-context artifact for further recorded evidence; the original plan and worktree remain authoritative.",
+        ],
+    )
+    output = "\n\n".join(
+        f"## {heading}\n" + "\n".join(lines)
+        for heading, lines in zip(HANDOVER_HEADINGS, sections)
+    )
+    return validate_handover_output(output)
 
 
 def render_handover_prompt(
