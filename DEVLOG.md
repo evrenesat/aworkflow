@@ -24,6 +24,28 @@
   CI and live activation separately. Local approval alone does not establish
   that remote gate.
 
+## 2026-09-25 — Use one contextual run disclosure button (Checkpoint 1)
+
+- The run history now derives one bulk action from its existing section and
+  recorded-event state plus parent Diagnostics and saved settings when present.
+  Mixed state offers Expand all; fully open state offers Collapse all. The same
+  button node and existing read-only handler serve both actions. Absent delivery
+  and saved-settings sections do not block Collapse all.
+- Web tests passed 648/648 including the equal-refresh assertion, and the
+  production build passed. The failed-review
+  browser case passed 12/12 in Chromium and 12/12 in WebKit across light/dark
+  320×568, 390×844, 768×1024, 844×390, 1280×720, and 1440×900. It verifies
+  one 44px mobile control on the Explore row, no horizontal overflow or write
+  requests, and button identity/focus through label changes. Captures are under
+  `/tmp/aflow-contextual-disclosure-{chromium,webkit}-artifacts/` as
+  `failed-review-{engine}-{theme}-{width}x{height}.png` and `-expanded.png`.
+- Compared 320px and 1280px light captures with the frozen demo and the prior
+  combined WebKit capture. The extra disclosure-control row is gone in both
+  engines. The failed-run fixture still differs from the demo's running-run
+  content and includes extra disclosures and a follow-up draft; those are
+  existing domain differences outside this checkpoint. Demo SHA-256 remains
+  `2465c0ac2bfef90af2b98a537ad5ac3e931b927c23a78379a8c532ce4dcbadf4`.
+
 ## 2026-09-24 — Keep the Runs history filter readable at 320px (Checkpoint 1)
 
 - Reproduced the populated 320×568 defect before the edit: the native select

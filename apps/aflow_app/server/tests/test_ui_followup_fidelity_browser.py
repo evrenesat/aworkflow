@@ -396,9 +396,23 @@ def test_ui_followup_failed_review_history(
             assert detail.locator(".run-overview-event").count() == 2
             expect(detail.locator("#checkpoint-history-delivery-evidence")).to_have_count(0)
             expect(detail.locator("#checkpoint-history-delivery-evidence[open]")).to_have_count(0)
+            controls = detail.locator(".checkpoint-history-disclosure-controls")
+            bulk = controls.locator("button")
+            expect(bulk).to_have_text("Expand all")
+            expect(controls.locator("button")).to_have_count(1)
+            label_box = controls.locator("span").bounding_box()
+            button_box = bulk.bounding_box()
+            assert label_box is not None and button_box is not None
+            assert abs(label_box["y"] + label_box["height"] / 2 - button_box["y"] - button_box["height"] / 2) < 2
+            assert button_box["x"] + button_box["width"] <= width
+            if width <= 390:
+                assert button_box["height"] >= 44
             _assert_no_horizontal_overflow(page)
             page.screenshot(path=str(artifact_dir / f"{stem}.png"), full_page=True)
-            detail.get_by_role("button", name="Expand all", exact=True).click()
+            bulk.evaluate("node => { window.__bulkDisclosure = node; node.focus() }")
+            bulk.click()
+            expect(controls.get_by_role("button", name="Collapse all", exact=True)).to_have_count(1)
+            assert bulk.evaluate("node => window.__bulkDisclosure === node && document.activeElement === node")
             expect(detail.get_by_text("Count definitions & evidence", exact=True)).to_be_visible()
             event_summary = detail.locator(".run-overview-event summary").first
             if width <= 390:
@@ -409,6 +423,13 @@ def test_ui_followup_failed_review_history(
             expect(detail.locator(".run-overview-event pre")).to_contain_text('"outcome": "harness-failed"')
             expect(detail.locator(".run-overview-event pre")).to_contain_text('"returncode": 1')
             page.screenshot(path=str(artifact_dir / f"{stem}-expanded.png"), full_page=True)
+            detail.get_by_text("Time details", exact=True).click()
+            expect(controls.get_by_role("button", name="Expand all", exact=True)).to_have_count(1)
+            bulk.click()
+            expect(controls.get_by_role("button", name="Collapse all", exact=True)).to_have_count(1)
+            bulk.click()
+            expect(controls.get_by_role("button", name="Expand all", exact=True)).to_have_count(1)
+            assert bulk.evaluate("node => window.__bulkDisclosure === node")
             writes = [(method, path) for method, path in requests
                       if method not in {"GET", "HEAD", "OPTIONS"}
                       and not path.endswith(("/api/session", "/api/config/form"))]

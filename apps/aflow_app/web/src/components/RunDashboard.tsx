@@ -3845,6 +3845,7 @@ export function RunDashboard({ visible = true, page, onNewRun, onCancelNewRun, o
                     progress={canonicalProgress}
                     detail={canonicalDetail}
                     recordedProgress={recordedProgressContent}
+                    parentInformationalDisclosuresOpen={technicalOpen && (!savedOverrides || runChangesOpen)}
                     onBulkInformationalDisclosureChange={open => {
                       setTechnicalDisclosure(open)
                       if (savedOverrides) setRunChangesDisclosure(open)
