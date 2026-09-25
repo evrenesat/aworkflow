@@ -55,6 +55,23 @@ def wait_for_restored_document_scroll(page, top: float) -> None:
     )
 
 
+def wait_for_visible_run_detail_focus(page) -> None:
+    """Wait for the compact open effect to focus within the visible detail."""
+    page.wait_for_function(
+        """() => {
+            const detail = document.querySelector(
+                '[data-sidebar-editor-list="Run history"] > .sidebar-editor-detail'
+            )
+            return detail && !detail.hidden && detail.getClientRects().length > 0
+                && detail.contains(document.activeElement)
+        }""",
+        timeout=5000,
+    )
+    detail = _run_history_detail(page)
+    assert detail.is_visible()
+    assert detail.evaluate('(node) => node.contains(document.activeElement)')
+
+
 def test_run_navigation_scroll_selection_and_history(control_client, monkeypatch):
     _, root, _, _ = control_client
     for index in range(130):
@@ -67,6 +84,8 @@ def test_run_navigation_scroll_selection_and_history(control_client, monkeypatch
         browser = _browser(playwright)
         try:
             page = browser.new_page(viewport={'width': 1365, 'height': 900})
+            page_errors = []
+            on_page_error = lambda error: page_errors.append(str(error))
             page.add_init_script("""
                 (() => {
                     const nativeFetch = window.fetch.bind(window)
@@ -102,6 +121,7 @@ def test_run_navigation_scroll_selection_and_history(control_client, monkeypatch
             )
             all_run.wait_for()
             for attempt in range(2):
+                page.on('pageerror', on_page_error)
                 all_run.click()
                 page.wait_for_function("new URL(location.href).searchParams.get('project') === 'test-project' && new URL(location.href).searchParams.get('view') === 'runs'")
                 selected_id = page.evaluate("() => new URL(location.href).searchParams.get('run')")
@@ -109,6 +129,9 @@ def test_run_navigation_scroll_selection_and_history(control_client, monkeypatch
                 detail = _run_history_detail(page)
                 detail.wait_for(state='visible')
                 assert not _run_history_navigation(page).is_visible()
+                wait_for_visible_run_detail_focus(page)
+                page.remove_listener('pageerror', on_page_error)
+                assert not page_errors, page_errors
                 _assert_run_detail(page, 'History 000', 'history-000')
                 page.get_by_role('button', name='← Back to Run history', exact=True).click()
                 _run_history_navigation(page).wait_for(state='visible')
@@ -131,15 +154,13 @@ def test_run_navigation_scroll_selection_and_history(control_client, monkeypatch
             before_list_scroll = page.evaluate('() => document.scrollingElement.scrollTop')
             item_id = row.get_attribute('data-sidebar-editor-item')
             assert item_id == 'history-069'
+            page.on('pageerror', on_page_error)
             row.click()
             detail.wait_for(state='visible')
             assert not nav.is_visible()
-            assert page.evaluate("""() => {
-                const detail = document.querySelector(
-                    '[data-sidebar-editor-list="Run history"] > .sidebar-editor-detail'
-                )
-                return detail?.contains(document.activeElement) === true
-            }""")
+            wait_for_visible_run_detail_focus(page)
+            page.remove_listener('pageerror', on_page_error)
+            assert not page_errors, page_errors
             assert page.evaluate("() => new URL(location.href).searchParams.get('run')") == item_id
             page.get_by_role('button', name='← Back to Run history', exact=True).click()
             nav.wait_for(state='visible')
@@ -164,6 +185,8 @@ def test_run_navigation_scroll_selection_and_history(control_client, monkeypatch
                     before_list_scroll = page.evaluate('() => document.scrollingElement.scrollTop')
                     item_id = row.get_attribute('data-sidebar-editor-item')
                     assert item_id == 'history-069'
+                    if compact:
+                        page.on('pageerror', on_page_error)
                     row.click()
                     _assert_run_detail(page, 'History 069', 'history-069')
                     metrics = document_metrics(page)
@@ -181,12 +204,9 @@ def test_run_navigation_scroll_selection_and_history(control_client, monkeypatch
                         # The history list, rather than the detail surface,
                         # proves ordinary document movement on compact screens.
                         assert before_list_scroll > 0, metrics
-                        assert page.evaluate("""() => {
-                            const detail = document.querySelector(
-                                '[data-sidebar-editor-list="Run history"] > .sidebar-editor-detail'
-                            )
-                            return detail?.contains(document.activeElement) === true
-                        }""")
+                        wait_for_visible_run_detail_focus(page)
+                        page.remove_listener('pageerror', on_page_error)
+                        assert not page_errors, page_errors
                     actions = page.get_by_role('button', name='More run actions', exact=True)
                     actions.scroll_into_view_if_needed()
                     action_box = actions.bounding_box()

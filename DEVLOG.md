@@ -1,5 +1,29 @@
 # DEVLOG
 
+## 2026-09-25 — Wait for compact Run history focus at the browser transition
+
+- Release `ab4e1cb7` failed macOS Python 3.12 CI run `36115732349` at the
+  immediate focus assertion after a deep Run history row became visible.
+  Browser instrumentation at 390×844 recorded row-button focus followed by
+  detail `H3` focus without another action: about 4 ms later in Chromium and
+  46 ms later in WebKit. The layout focus effect remained unchanged.
+- The focused navigation test now waits up to five seconds for focus inside
+  the visible Run history detail, then asserts that state. It covers the
+  repeated All runs entry, the 130-row selection, and light/dark compact
+  cases. Existing exact URL, Back focus/document scroll, wide layout, and
+  refresh assertions remain. Page-error checks on row selection passed in
+  both engines; a broader temporary listener observed WebKit access-control
+  errors from requests interrupted by unrelated navigations/reloads.
+- `npm --prefix apps/aflow_app/web test -- --run`: 649 passed;
+  `npm --prefix apps/aflow_app/web run build`: passed. The focused command
+  `uv run --directory apps/aflow_app/server pytest -q
+  tests/test_run_navigation_browser.py -k
+  test_run_navigation_scroll_selection_and_history` passed in Chromium and
+  with `AFLOW_TEST_BROWSER=webkit`. Replacing `uv run` with
+  `uv run --python 3.12` in both commands also passed on local Linux Python
+  3.12. `git diff --check` passed. macOS CI and exact-SHA deployment remain
+  coordinator gates.
+
 ## 2026-09-25 — Verify Runs filter keyboard focus across native pickers (follow-up v01)
 
 - Published `aeafd165` failed only the Dashboard macOS Python 3.12/3.13 jobs in
