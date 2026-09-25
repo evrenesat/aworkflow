@@ -38,8 +38,8 @@ function worktreeItemDescription(item: WorktreeStatusItem): string {
 }
 
 export function WorktreePreflightPanel({ status, result, error, dirtyWorktreeConfirmed, onDirtyWorktreeConfirmedChange, onRefresh, onLoadMore, dirtyQuestionMessage }: WorktreePreflightPanelProps) {
-  const acknowledgmentRequired = status === 'ready' && Boolean(result?.requires_confirmation || dirtyQuestionMessage)
-  const canShowResult = result !== null && status !== 'idle' && status !== 'error'
+  const acknowledgmentRequired = status !== 'idle' && result !== null && Boolean(result.requires_confirmation || dirtyQuestionMessage)
+  const canShowResult = result !== null && status !== 'idle'
   const returnedPathCount = result ? result.items.length : 0
   const reportedChangeCount = result ? Math.max(result.total_items, returnedPathCount) : 0
   const changeLabel = reportedChangeCount === 1 ? 'change' : 'changes'
@@ -67,7 +67,7 @@ export function WorktreePreflightPanel({ status, result, error, dirtyWorktreeCon
       </div>
       {status === 'idle' && <p className="text-sm text-dim">Choose a Ready plan and valid workflow to inspect the working tree.</p>}
       {status === 'loading' && <p className="text-sm text-dim" role="status">Inspecting the selected checkout…</p>}
-      {status === 'error' && <div className="error-message" role="alert">Working tree inspection failed: {error ?? 'Refresh to retry.'}</div>}
+      {status === 'error' && <div className="error-message" role="alert">Working tree inspection failed: {error ?? 'Refresh to retry.'} Start is blocked until inspection succeeds.</div>}
       {canShowResult && result && (
         <>
           <p className="text-sm text-dim">
@@ -83,11 +83,11 @@ export function WorktreePreflightPanel({ status, result, error, dirtyWorktreeCon
           </details>
           {result.blockers.length > 0 && (
             <div className="error-message" role="alert">
-              <strong>Preflight blocks this start:</strong>
+              <strong>{status === 'error' ? 'Last successful inspection reported blockers:' : 'Preflight blocks this start:'}</strong>
               <ul>{result.blockers.map((blocker) => <li key={blocker}>{blocker}</li>)}</ul>
             </div>
           )}
-          {status === 'ready' && <p className={result.dirty ? 'notice' : 'text-sm'}>{changedFilesSummary}</p>}
+          {(status === 'ready' || status === 'error') && <p className={result.dirty ? 'notice' : 'text-sm'}>{status === 'error' ? 'Last successful inspection: ' : ''}{changedFilesSummary}</p>}
           {result.items.length > 0 && (
             <details className="worktree-changed-files">
               <summary>Show changed files ({returnedPathCount}{returnedPathCount < reportedChangeCount ? ` of ${reportedChangeCount}` : ''})</summary>
@@ -116,6 +116,7 @@ export function WorktreePreflightPanel({ status, result, error, dirtyWorktreeCon
           <input
             type="checkbox"
             checked={dirtyWorktreeConfirmed}
+            disabled={status !== 'ready'}
             onChange={(event) => onDirtyWorktreeConfirmedChange(event.target.checked)}
           />
           Continue despite uncommitted changes

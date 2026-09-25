@@ -27,6 +27,58 @@
   unrelated overlays remain excluded. Existing cross-harness handover guards
   still apply after the repair team is selected.
 
+## 2026-09-25 — Full-app invisible refresh verification (Checkpoint 2)
+
+- Added real-browser held-read journeys for Projects, Plans, and New run using
+  actual Element identity and scoped mutations. Projects keeps the selected
+  row and focused Add project draft through equal, changed, and failed registry
+  reads, then survives a viewport resize. Plans keeps a newer dirty editor,
+  cursor, selection, scroll, and node through real post-save list/queue reads;
+  changed queue cues and failed-read warnings stay visible. Explicit conflict
+  reload discards the draft only after confirmation, and compact Back/reopen
+  plus resize retains the selected document. New run keeps exact Plan,
+  Workflow, Team, turns, stage, start step, instructions, and review across
+  equal/changed/failed background preflight, changed/failed capability reads,
+  and an explicit inspection. Changed blockers disable Start; a final double click
+  sends exactly one reviewed request to a disposable intercepted endpoint.
+- Reproduced one New run failure defect: the last successful worktree result
+  remained in state but was hidden after a failed recheck, collapsing the
+  populated section and document position. `NewRunPage` now retains those
+  checkout facts as labelled stale evidence, keeps the acknowledgement
+  visible but disabled, and labels prior blockers as prior evidence. The
+  current failure remains explicit and Start stays blocked until a successful
+  inspection. Full-page Playwright screenshots temporarily mutate inline input
+  styles and can move a sticky action row; capture-only mutations are drained,
+  and New run capture-induced scroll is restored before the next network read.
+  Demo HTML stays at SHA-256 `2465c0ac2bfef90af2b98a537ad5ac3e931b927c23a78379a8c532ce4dcbadf4`,
+  identical to `b667e47b`. Populated reference and production Projects, Plans,
+  and New run captures were inspected in wide/phone light/dark states. The
+  production Project row emphasizes registry readiness/path where the demo
+  uses run counts; New run has real preflight/review evidence beyond the
+  conceptual demo. These existing presentation differences are for the final
+  combined visual gate, not refresh regressions. Physical mobile keyboard and
+  deployed output were not verified by emulation.
+- Verification: web Vitest 667/667; production build; Chromium relevant
+  browser selection 60/60 and WebKit selection 60/60; exact fidelity module
+  30/30 in each engine after the screenshot isolation fix; final scoped
+  Projects 3/3, Plans 2/2, and New run 3/3 refinements passed in each engine.
+  After the production repair, Chromium/WebKit each passed the affected
+  launch/navigation browser selection 7/7, and the fidelity module 30/30.
+  `git diff --check` passed.
+  The 60-test browser selection used the full
+  `test_ui_demo_fidelity_browser.py`, `test_plan_backup_browser.py`,
+  `test_plan_pagination_browser.py`, `test_plan_startup_browser.py`,
+  `test_launch_confirmation_browser.py`, `test_run_navigation_browser.py`,
+  and `test_responsive_browser.py` modules, with this exact pytest filter:
+  `not responsive_route_matrix and not responsive_focus_resize_and_screenshots and not responsive_team_family_journey and not responsive_live_controls_and_restart and not stop_after_current_turn_delayed_worker_journey and not durable_recovery_ui_journey and not global_run_overview and not runs_header_filter_legibility and not responsive_action_hit_test and not team_family_stage_click and not responsive_focus_resize_and_screenshots`.
+  Re-run with `AFLOW_TEST_BROWSER=webkit` for WebKit. The plan/startup and
+  navigation modules contain a few explicitly Chromium-only cases; the new
+  checkpoint probes use `_browser` in both engines.
+- Persistent artifacts: `/tmp/aflow-cp2-artifacts/chromium/` and
+  `/tmp/aflow-cp2-artifacts/webkit/` contain the `cp2-projects-*`,
+  `cp2-plans-*`, and `cp2-new-run-*` PNG/JSON evidence; the frozen demo route
+  captures are under `/tmp/aflow-cp2-artifacts/reference/`.
+
 ## 2026-09-25 — Guided first-repair threshold (Checkpoint 2)
 
 - Guided actions and REST/MCP config writes now accept strict integer zero.

@@ -2204,3 +2204,579 @@ def test_ui_demo_all_runs_background_refresh_probe(
                     pass
             page.unroute_all(behavior="ignoreErrors")
             browser.close()
+
+
+@pytest.mark.parametrize(
+    ("width", "height", "theme"),
+    ((1280, 720, "light"), (390, 844, "dark"), (390, 420, "light")),
+)
+def test_ui_demo_projects_refresh_preserves_add_draft(
+    control_client,  # noqa: F811
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    width: int,
+    height: int,
+    theme: str,
+) -> None:
+    """A real registry read leaves a focused creation draft and selected row in place."""
+    _, root, units, _ = control_client
+    seed_demo_fidelity_fixture(root)
+    monkeypatch.setenv("AFLOW_APP_WEB_DIST", str(Path(__file__).resolve().parents[2] / "web" / "dist"))
+    artifact_dir = _fidelity_artifact_dir(tmp_path)
+    artifact_dir.mkdir(parents=True, exist_ok=True)
+    stem = f"cp2-projects-{theme}-{width}x{height}"
+    phase = {"value": "initial"}
+    held: list[tuple[object, bytes, int, dict[str, str]]] = []
+    read_phases: list[str] = []
+    writes: list[str] = []
+    page_errors: list[str] = []
+
+    def intercept(route) -> None:
+        request = route.request
+        if request.method != "GET" or urlsplit(request.url).path != "/api/projects":
+            route.continue_()
+            return
+        current = phase["value"]
+        read_phases.append(current)
+        if current == "initial":
+            route.continue_()
+        elif current == "failure":
+            route.fulfill(status=503, content_type="application/json", body='{"detail":"Project read unavailable"}')
+        else:
+            response = route.fetch()
+            body = response.body()
+            if current == "changed":
+                payload = json.loads(body)
+                for project in payload:
+                    if project["id"] == PROJECT_ID:
+                        project["display_name"] = "Refresh changed project"
+                body = json.dumps(payload).encode()
+            if current == "equal":
+                held.append((route, body, response.status, response.headers))
+            else:
+                route.fulfill(status=response.status, headers=response.headers, body=body)
+
+    with live_server() as url, sync_playwright() as playwright:
+        browser = _browser(playwright)
+        page = browser.new_page(viewport={"width": width, "height": height})
+        page.on("pageerror", lambda error: page_errors.append(str(error)))
+        page.on("request", lambda request: writes.append(request.url) if phase["value"] != "initial" and request.method not in {"GET", "OPTIONS"} and "/api/" in request.url else None)
+        page.route("**/api/projects", intercept)
+        try:
+            _login(page, url)
+            page.emulate_media(color_scheme=theme)  # type: ignore[arg-type]
+            _set_theme_preference(page, theme)
+            page.goto(f"{url}/?project={PROJECT_ID}&view=projects")
+            row = page.locator("ul[aria-label='Added projects'] .compact-row-main[aria-pressed='true']").first
+            row.wait_for()
+            page.get_by_role("button", name="Add project", exact=True).click()
+            form = page.get_by_role("form", name="Create or register a project")
+            path = form.get_by_label("Relative project path")
+            path.fill("draft/kept-project")
+            name = form.get_by_label("Display name")
+            name.fill("Unsaved project draft")
+            name.focus()
+            install_refresh_probe(page, {"picker": ".project-picker", "row": "ul[aria-label='Added projects'] .compact-row-main[aria-pressed='true']", "form": ".project-create-form", "draft": ".project-create-form input[aria-label='Display name']"})
+            before = capture_refresh_probe(page)
+            page.screenshot(path=str(artifact_dir / f"{stem}-before.png"), full_page=True)
+            # Full-page capture may set temporary inline styles on inputs.
+            # Drain that instrumentation before observing the network read.
+            read_refresh_probe_mutations(page)
+
+            def refresh() -> None:
+                page.get_by_role("button", name="More", exact=True).click()
+                page.get_by_role("menu", name="More project actions").get_by_role("menuitem", name="Refresh", exact=True).click()
+                # Opening the explicit menu moves focus by design. Return to
+                # the draft before judging what the asynchronous read did.
+                name.focus()
+
+            phase["value"] = "equal"
+            refresh()
+            for _ in range(100):
+                if held:
+                    break
+                page.wait_for_timeout(25)
+            assert held, read_phases
+            during = capture_refresh_probe(page)
+            assert all(root["sameNode"] for root in during["roots"].values()), during
+            assert during["focused"] == before["focused"]
+            held_mutations = read_refresh_probe_mutations(page)
+            assert not [item for item in held_mutations if item["root"] in {"form", "row"} and item["classification"] in {"subtree", "root-replacement", "visibility"}], held_mutations
+            route, body, status, headers = held.pop()
+            route.fulfill(status=status, headers=headers, body=body)
+            page.wait_for_timeout(150)
+            equal = capture_refresh_probe(page)
+            assert all(root["sameNode"] for root in equal["roots"].values()), equal
+            assert equal["roots"]["form"]["text"] == before["roots"]["form"]["text"]
+            assert equal["focused"] == before["focused"]
+            assert name.input_value() == "Unsaved project draft"
+            equal_mutations = read_refresh_probe_mutations(page)
+            assert not [item for item in equal_mutations if item["root"] in {"form", "row"} and item["classification"] in {"subtree", "root-replacement"}], equal_mutations
+            page.screenshot(path=str(artifact_dir / f"{stem}-equal.png"), full_page=True)
+            read_refresh_probe_mutations(page)
+
+            phase["value"] = "changed"
+            refresh()
+            expect(row).to_contain_text("Refresh changed project")
+            changed = capture_refresh_probe(page)
+            assert all(root["sameNode"] for root in changed["roots"].values()), changed
+            assert changed["focused"] == before["focused"]
+            assert name.input_value() == "Unsaved project draft"
+            changed_mutations = read_refresh_probe_mutations(page)
+            assert not [item for item in changed_mutations if item["root"] == "form" and item["classification"] in {"subtree", "root-replacement", "visibility", "value"}], changed_mutations
+            page.screenshot(path=str(artifact_dir / f"{stem}-changed.png"), full_page=True)
+            read_refresh_probe_mutations(page)
+
+            phase["value"] = "failure"
+            refresh()
+            expect(page.get_by_role("alert").filter(has_text="Project read unavailable")).to_be_visible()
+            failed = capture_refresh_probe(page)
+            assert all(root["sameNode"] for root in failed["roots"].values()), failed
+            assert failed["focused"] == before["focused"]
+            expect(row).to_contain_text("Refresh changed project")
+            assert path.input_value() == "draft/kept-project"
+            assert name.input_value() == "Unsaved project draft"
+            page.set_viewport_size({"width": 390 if width >= 960 else 1280, "height": 844 if width >= 960 else 720})
+            assert form.is_visible() and row.is_visible()
+            assert row.get_attribute("aria-pressed") == "true"
+            assert name.input_value() == "Unsaved project draft"
+            assert page_errors == [] and writes == [] and units.start_calls == []
+            page.screenshot(path=str(artifact_dir / f"{stem}-failure-resized.png"), full_page=True)
+            _write_artifact_manifest(artifact_dir / f"{stem}.json", {"before": before, "held": during, "equal": equal, "changed": changed, "failure": failed, "held_mutations": held_mutations, "equal_mutations": equal_mutations, "changed_mutations": changed_mutations, "read_phases": read_phases, "page_errors": page_errors, "writes": writes})
+        finally:
+            for route, body, status, headers in held:
+                try:
+                    route.fulfill(status=status, headers=headers, body=body)
+                except Exception:
+                    pass
+            page.unroute_all(behavior="ignoreErrors")
+            browser.close()
+
+
+@pytest.mark.parametrize(
+    ("width", "height", "theme"),
+    ((1280, 720, "dark"), (390, 844, "light")),
+)
+def test_ui_demo_plan_save_followup_reads_preserve_new_draft(
+    control_client,  # noqa: F811
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    width: int,
+    height: int,
+    theme: str,
+) -> None:
+    """The real post-save plan-list and queue reads cannot replace a newer draft."""
+    _, root, units, _ = control_client
+    plan = root / "plans" / "in-progress" / "refresh-probe.md"
+    plan.parent.mkdir(parents=True, exist_ok=True)
+    initial_content = "# Refresh probe\n\n" + "A long editable line for scroll continuity.\n" * 40
+    plan.write_text(initial_content, encoding="utf-8")
+    monkeypatch.setenv("AFLOW_APP_WEB_DIST", str(Path(__file__).resolve().parents[2] / "web" / "dist"))
+    artifact_dir = _fidelity_artifact_dir(tmp_path)
+    artifact_dir.mkdir(parents=True, exist_ok=True)
+    stem = f"cp2-plans-{theme}-{width}x{height}"
+    list_path = f"/api/projects/{PROJECT_ID}/plans"
+    queue_path = f"/api/projects/{PROJECT_ID}/queue"
+    phase = {"value": "initial"}
+    held: list[tuple[object, str, int, bytes, dict[str, str]]] = []
+    read_phases: list[tuple[str, str]] = []
+    changed_list_sizes: list[int] = []
+    writes: list[str] = []
+    page_errors: list[str] = []
+
+    def intercept(route) -> None:
+        request = route.request
+        path = urlsplit(request.url).path
+        if request.method != "GET" or path not in {list_path, queue_path}:
+            route.continue_()
+            return
+        current = phase["value"]
+        read_phases.append((current, path))
+        if current == "initial":
+            route.continue_()
+            return
+        response = route.fetch()
+        body = response.body()
+        if current == "changed":
+            payload = json.loads(body)
+            if path == queue_path:
+                payload["plans"] = [item for item in payload["plans"] if item["path"] != "plans/in-progress/refresh-probe.md"]
+                payload["plans"].append({
+                    "name": "refresh-probe.md", "path": "plans/in-progress/refresh-probe.md",
+                    "status": "in_progress", "identity": "refresh-probe", "outcome": "blocked",
+                    "reason": "capacity", "dependency": None, "run_id": None,
+                    "revision": "changed-queue-revision",
+                })
+            else:
+                    for item in payload:
+                        if item["name"] == "refresh-probe.md":
+                            item["size_bytes"] += 1
+                            changed_list_sizes.append(item["size_bytes"])
+            body = json.dumps(payload).encode()
+        held.append((route, path, 503 if current == "failure" else response.status,
+                     b'{"detail":"Plan read unavailable"}' if current == "failure" else body,
+                     response.headers))
+
+    with live_server() as url, sync_playwright() as playwright:
+        browser = _browser(playwright)
+        page = browser.new_page(viewport={"width": width, "height": height})
+        page.on("pageerror", lambda error: page_errors.append(str(error)))
+        page.on("request", lambda request: writes.append(urlsplit(request.url).path) if phase["value"] != "initial" and request.method not in {"GET", "OPTIONS"} and "/api/" in request.url else None)
+        page.route(f"**/api/projects/{PROJECT_ID}/plans", intercept)
+        page.route(f"**/api/projects/{PROJECT_ID}/queue", intercept)
+        try:
+            _login(page, url)
+            page.emulate_media(color_scheme=theme)  # type: ignore[arg-type]
+            _set_theme_preference(page, theme)
+            page.goto(f"{url}/?project={PROJECT_ID}&view=plans")
+            page.get_by_role("button", name=re.compile("refresh-probe.md")).click()
+            editor = page.get_by_label("Plan content", exact=True)
+            expect(editor).to_have_value(initial_content)
+            captures: dict[str, object] = {}
+
+            for current in ("equal", "changed", "failure"):
+                phase["value"] = current
+                page.get_by_role("button", name="Save", exact=True).click()
+                for _ in range(100):
+                    if {path for _, path, *_ in held} == {list_path, queue_path}:
+                        break
+                    page.wait_for_timeout(25)
+                assert {path for _, path, *_ in held} == {list_path, queue_path}, read_phases
+                next_draft = editor.input_value() + f"\nUnsaved after {current} read."
+                editor.fill(next_draft)
+                editor.evaluate("node => { node.setSelectionRange(node.value.length - 8, node.value.length - 3); node.scrollTop = node.scrollHeight; node.focus(); }")
+                install_refresh_probe(page, {"editor": ".plan-editor", "textarea": ".plan-editor-textarea"})
+                before = capture_refresh_probe(page)
+                selection = editor.evaluate("node => [node.selectionStart, node.selectionEnd, node.scrollTop]")
+                page.screenshot(path=str(artifact_dir / f"{stem}-{current}-held.png"), full_page=True)
+                read_refresh_probe_mutations(page)
+                while held:
+                    route, _, status, body, headers = held.pop(0)
+                    route.fulfill(status=status, headers=headers, body=body)
+                if current == "changed":
+                    expect(page.get_by_text("Waiting for an implementation slot", exact=True)).to_be_visible()
+                elif current == "failure":
+                    expect(page.get_by_role("alert").filter(has_text="Plan read unavailable")).to_be_visible()
+                    expect(page.get_by_role("alert").filter(has_text="Current queue reasons are unavailable")).to_be_visible()
+                else:
+                    page.wait_for_timeout(150)
+                after = capture_refresh_probe(page)
+                assert all(root["sameNode"] for root in after["roots"].values()), (current, after)
+                assert after["focused"] == before["focused"]
+                assert after["roots"]["textarea"]["scrollTop"] == before["roots"]["textarea"]["scrollTop"]
+                assert editor.evaluate("node => [node.selectionStart, node.selectionEnd, node.scrollTop]") == selection
+                assert editor.input_value() == next_draft
+                mutations = read_refresh_probe_mutations(page)
+                assert not [item for item in mutations if item["root"] == "textarea" and item["classification"] in {"subtree", "root-replacement", "value", "visibility"}], mutations
+                if current == "equal":
+                    assert not [item for item in mutations if item["root"] == "editor" and item["classification"] in {"subtree", "root-replacement", "visibility"}], mutations
+                page.screenshot(path=str(artifact_dir / f"{stem}-{current}-settled.png"), full_page=True)
+                captures[current] = {"held": before, "settled": after, "selection": selection, "mutations": mutations}
+
+            assert writes.count(f"{list_path}/in_progress/refresh-probe.md") == 3
+            # An external revision change is different from a passive read:
+            # only the explicit discard action may replace the local draft.
+            server_copy = "# Server copy after conflict\n"
+            plan.write_text(server_copy, encoding="utf-8")
+            phase["value"] = "initial"
+            preserved_draft = editor.input_value()
+            page.get_by_role("button", name="Save", exact=True).click()
+            expect(page.get_by_role("alert").filter(has_text="The plan changed on the server")).to_be_visible()
+            expect(editor).to_have_value(preserved_draft)
+            reload_button = page.locator(".plan-editor").get_by_role("button", name="Reload from server…")
+            reload_button.click()
+            page.get_by_role("button", name="Keep editing", exact=True).click()
+            expect(editor).to_have_value(preserved_draft)
+            reload_button.click()
+            page.get_by_role("button", name="Discard edits and reload", exact=True).click()
+            expect(editor).to_have_value(server_copy)
+            page.screenshot(path=str(artifact_dir / f"{stem}-explicit-conflict-reload.png"), full_page=True)
+            page.set_viewport_size({"width": 390, "height": 420})
+            page.get_by_role("button", name="← Back to Plans", exact=True).click()
+            expect(page.locator(".plan-list")).to_be_visible()
+            list_row = page.get_by_role("button", name=re.compile("refresh-probe.md"))
+            assert len(changed_list_sizes) == 1
+            expect(list_row).to_contain_text(f"{changed_list_sizes[0]} bytes")
+            list_row.click()
+            expect(editor).to_have_value(server_copy)
+            install_refresh_probe(page, {"editor": ".plan-editor", "textarea": ".plan-editor-textarea"})
+            compact = capture_refresh_probe(page)
+            page.set_viewport_size({"width": 1280, "height": 720})
+            expanded = capture_refresh_probe(page)
+            assert all(root["sameNode"] for root in expanded["roots"].values()), (compact, expanded)
+            expect(editor).to_have_value(server_copy)
+            page.screenshot(path=str(artifact_dir / f"{stem}-back-resized.png"), full_page=True)
+            assert page_errors == [] and units.start_calls == []
+            _write_artifact_manifest(artifact_dir / f"{stem}.json", {"captures": captures, "read_phases": read_phases, "changed_list_sizes": changed_list_sizes, "writes": writes, "page_errors": page_errors})
+        finally:
+            for route, _, status, body, headers in held:
+                try:
+                    route.fulfill(status=status, headers=headers, body=body)
+                except Exception:
+                    pass
+            page.unroute_all(behavior="ignoreErrors")
+            browser.close()
+
+
+@pytest.mark.parametrize(
+    ("width", "height", "theme"),
+    ((1280, 720, "light"), (390, 844, "dark"), (844, 390, "light")),
+)
+def test_ui_demo_new_run_background_preflight_preserves_review(
+    control_client,  # noqa: F811
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    width: int,
+    height: int,
+    theme: str,
+) -> None:
+    """Background revalidation keeps a prepared launch mounted and exact."""
+    _, root, units, _ = control_client
+    _seed_team_family_fixture(root)
+    monkeypatch.setenv("AFLOW_APP_WEB_DIST", str(Path(__file__).resolve().parents[2] / "web" / "dist"))
+    artifact_dir = _fidelity_artifact_dir(tmp_path)
+    artifact_dir.mkdir(parents=True, exist_ok=True)
+    stem = f"cp2-new-run-{theme}-{width}x{height}"
+    preflight_path = f"/api/control-plane/projects/{PROJECT_ID}/runs/preflight"
+    start_path = f"/api/control-plane/projects/{PROJECT_ID}/runs"
+    phase = {"value": "initial"}
+    held: list[tuple[object, int, bytes, dict[str, str]]] = []
+    preflight_requests: list[dict[str, object]] = []
+    start_requests: list[dict[str, object]] = []
+    page_errors: list[str] = []
+
+    def intercept_preflight(route) -> None:
+        request = route.request
+        if request.method != "POST" or urlsplit(request.url).path != preflight_path:
+            route.continue_()
+            return
+        current = phase["value"]
+        preflight_requests.append({"phase": current, "body": request.post_data_json})
+        if current == "initial":
+            route.continue_()
+            return
+        response = route.fetch()
+        body = response.body()
+        if current == "changed":
+            payload = json.loads(body)
+            payload["blockers"] = ["Changed checkout requires review"]
+            body = json.dumps(payload).encode()
+        held.append((route, 503 if current == "failure" else response.status,
+                     b'{"detail":"Inspection read unavailable"}' if current == "failure" else body,
+                     response.headers))
+
+    def intercept_start(route) -> None:
+        request = route.request
+        if request.method == "POST" and urlsplit(request.url).path == start_path:
+            start_requests.append(request.post_data_json)
+            held.append((route, 503, b'{"detail":"Disposable start withheld"}', {}))
+        else:
+            route.continue_()
+
+    with live_server() as url, sync_playwright() as playwright:
+        browser = _browser(playwright)
+        page = browser.new_page(viewport={"width": width, "height": height})
+        page.on("pageerror", lambda error: page_errors.append(str(error)))
+        page.route(f"**{preflight_path}", intercept_preflight)
+        page.route(f"**{start_path}", intercept_start)
+        try:
+            _login(page, url)
+            page.emulate_media(color_scheme=theme)  # type: ignore[arg-type]
+            _set_theme_preference(page, theme)
+            page.goto(f"{url}/?project={PROJECT_ID}&view=new-run")
+            plan = page.get_by_label("Run plan", exact=True)
+            plan.wait_for()
+            plan.click()
+            page.get_by_role("option", name=re.compile("ready-launch-plan.md")).click()
+            workflow = page.get_by_label("Run workflow", exact=True)
+            workflow.click()
+            workflow.fill("managed")
+            workflow.press("ArrowDown")
+            workflow.press("Enter")
+            team = page.get_by_label("Run team", exact=True)
+            team.click()
+            team.fill("Product development")
+            page.get_by_role("listbox", name="Run team suggestions").locator("li[role='option']:not(.combobox-default-option)").filter(has_text="Product development").first.click()
+            turns = page.get_by_label("Run max turns", exact=True)
+            turns.fill("7")
+            advanced = page.get_by_role("button", name="Advanced options", exact=True)
+            advanced.click()
+            stage = page.get_by_label("Run team stage", exact=True)
+            stage.click()
+            stage.fill("Stronger worker")
+            page.get_by_role("listbox", name="Run team stage suggestions").locator("li[role='option']:not(.combobox-default-option)").filter(has_text="Stronger worker").first.click()
+            page.get_by_label("Run start step", exact=True).select_option("review")
+            instructions = page.get_by_label("Run extra instructions", exact=True)
+            instructions.fill("Keep this exact reviewed instruction.")
+            preflight = page.locator(".worktree-preflight")
+            expect(preflight).to_have_attribute("data-preflight-status", "ready", timeout=30_000)
+            checkbox = preflight.get_by_role("checkbox", name="Continue despite uncommitted changes", exact=True)
+            if checkbox.count():
+                checkbox.check()
+            review_button = page.get_by_role("button", name="Review start…", exact=True)
+            expect(review_button).to_be_enabled()
+            review_button.click()
+            review = page.get_by_role("region", name="Review start", exact=True)
+            expect(review).to_be_visible()
+            expect(review).to_contain_text("Ready for the final start action")
+            # The explicit review action scrolls smoothly to its heading.
+            # Establish a settled baseline before any background read.
+            page.evaluate("window.__aflowCp2ScrollSample = {last: null, stable: 0}")
+            page.wait_for_function("""() => {
+                const sample = window.__aflowCp2ScrollSample;
+                const current = window.scrollY;
+                sample.stable = sample.last === current ? sample.stable + 1 : 0;
+                sample.last = current;
+                return sample.stable >= 6;
+            }""", polling=50)
+            install_refresh_probe(page, {"form": "section.card.start-run-form", "review": ".launch-review", "preflight": ".worktree-preflight", "instructions": "textarea[aria-label='Run extra instructions']"})
+            before = capture_refresh_probe(page)
+            choices = {"plan": plan.input_value(), "workflow": workflow.input_value(), "team": team.input_value(), "stage": stage.input_value(), "turns": turns.input_value(), "step": page.get_by_label("Run start step", exact=True).input_value(), "instructions": instructions.input_value()}
+
+            def restore_after_full_page_capture() -> None:
+                # Playwright's full-page capture can move the document while
+                # composing a sticky action row. Reset only that capture side
+                # effect before the next read begins.
+                page.evaluate("target => window.scrollTo(0, target)", before["scrollY"])
+                page.wait_for_function("target => window.scrollY === target", arg=before["scrollY"])
+                read_refresh_probe_mutations(page)
+
+            page.screenshot(path=str(artifact_dir / f"{stem}-before.png"), full_page=True)
+            restore_after_full_page_capture()
+            captures: dict[str, object] = {}
+
+            def assert_choices() -> None:
+                assert choices == {"plan": plan.input_value(), "workflow": workflow.input_value(), "team": team.input_value(), "stage": stage.input_value(), "turns": turns.input_value(), "step": page.get_by_label("Run start step", exact=True).input_value(), "instructions": instructions.input_value()}
+
+            for current in ("equal", "changed", "failure"):
+                phase["value"] = current
+                page.evaluate("window.dispatchEvent(new Event('aflow-history-changed'))")
+                for _ in range(200):
+                    if held:
+                        break
+                    page.wait_for_timeout(25)
+                assert held and preflight_requests[-1]["phase"] == current, preflight_requests
+                during = capture_refresh_probe(page)
+                assert all(root["sameNode"] for root in during["roots"].values()), (current, during)
+                assert during["scrollY"] == before["scrollY"], (current, before, during)
+                assert during["focused"] == before["focused"]
+                assert_choices()
+                if current == "equal":
+                    assert preflight.get_attribute("data-preflight-status") == "ready"
+                    assert review.is_visible()
+                    assert during["roots"]["form"]["text"] == before["roots"]["form"]["text"]
+                route, status, body, headers = held.pop(0)
+                route.fulfill(status=status, headers=headers, body=body)
+                if current == "changed":
+                    expect(preflight.get_by_role("alert").filter(has_text="Changed checkout requires review")).to_be_visible()
+                    expect(page.get_by_role("button", name="Start run", exact=True)).to_be_disabled()
+                elif current == "failure":
+                    expect(preflight.get_by_role("alert").filter(has_text="Inspection read unavailable")).to_be_visible()
+                    expect(preflight.get_by_text("Last successful inspection:", exact=False)).to_be_visible()
+                    expect(preflight.get_by_text("Last successful inspection reported blockers:", exact=True)).to_be_visible()
+                    expect(preflight.locator("details.worktree-checkout-details")).to_be_visible()
+                    if checkbox.count():
+                        expect(checkbox).to_be_disabled()
+                    expect(page.get_by_role("button", name="Start run", exact=True)).to_be_disabled()
+                else:
+                    expect(preflight).to_have_attribute("data-preflight-status", "ready")
+                after = capture_refresh_probe(page)
+                assert all(root["sameNode"] for root in after["roots"].values()), (current, after)
+                if current == "equal":
+                    assert after["scrollY"] == before["scrollY"], (current, before, after)
+                    assert abs(after["roots"]["review"]["box"]["y"] - before["roots"]["review"]["box"]["y"]) <= 2
+                if current == "failure":
+                    # The warning can add height, but the last inspection and
+                    # its space must remain instead of collapsing the page.
+                    assert after["roots"]["preflight"]["box"]["height"] >= before["roots"]["preflight"]["box"]["height"]
+                assert after["focused"] == before["focused"]
+                assert_choices()
+                mutations = read_refresh_probe_mutations(page)
+                assert not [item for item in mutations if item["root"] == "instructions" and item["classification"] in {"subtree", "root-replacement", "value", "visibility"}], mutations
+                if current == "equal":
+                    assert not [item for item in mutations if item["root"] in {"form", "review"} and item["classification"] in {"subtree", "root-replacement", "visibility"}], mutations
+                page.screenshot(path=str(artifact_dir / f"{stem}-{current}.png"), full_page=True)
+                restore_after_full_page_capture()
+                captures[current] = {"held": during, "settled": after, "mutations": mutations}
+
+            # A user-requested inspection may show local pending feedback.
+            phase["value"] = "explicit"
+            preflight.get_by_role("button", name="Refresh worktree inspection").click()
+            for _ in range(100):
+                if held:
+                    break
+                page.wait_for_timeout(25)
+            assert held
+            expect(preflight).to_have_attribute("data-preflight-status", "loading")
+            route, status, body, headers = held.pop(0)
+            route.fulfill(status=status, headers=headers, body=body)
+            expect(preflight).to_have_attribute("data-preflight-status", "ready")
+            assert_choices()
+            # The capability GET is another real read in the same background
+            # refresh. Its failure must report stale data without removing the
+            # prepared review or silently submitting a launch.
+            capabilities_path = f"/api/control-plane/projects/{PROJECT_ID}/capabilities"
+            capability_reads: list[str] = []
+
+            def fail_capabilities(route) -> None:
+                capability_reads.append(urlsplit(route.request.url).path)
+                route.fulfill(status=503, content_type="application/json", body='{"detail":"Capabilities unavailable"}')
+
+            page.route(f"**{capabilities_path}", fail_capabilities)
+            phase["value"] = "initial"
+            page.evaluate("window.dispatchEvent(new Event('aflow-history-changed'))")
+            expect(page.get_by_role("alert").filter(has_text="Capabilities unavailable")).to_be_visible()
+            assert capability_reads == [capabilities_path]
+            assert all(root["sameNode"] for root in capture_refresh_probe(page)["roots"].values())
+            assert_choices()
+            assert review.is_visible() and start_requests == []
+            page.screenshot(path=str(artifact_dir / f"{stem}-capabilities-failure.png"), full_page=True)
+            restore_after_full_page_capture()
+            page.unroute(f"**{capabilities_path}", fail_capabilities)
+            def change_capabilities(route) -> None:
+                payload = route.fetch().json()
+                payload["service_features"].append("refresh-probe-read-only")
+                route.fulfill(status=200, content_type="application/json", body=json.dumps(payload))
+
+            page.route(f"**{capabilities_path}", change_capabilities)
+            with page.expect_response(lambda response: urlsplit(response.url).path == capabilities_path) as changed_capability_response:
+                page.evaluate("window.dispatchEvent(new Event('aflow-history-changed'))")
+            assert changed_capability_response.value.status == 200
+            expect(page.get_by_role("alert").filter(has_text="Capabilities unavailable")).to_have_count(0)
+            assert all(root["sameNode"] for root in capture_refresh_probe(page)["roots"].values())
+            assert_choices()
+            assert review.is_visible() and start_requests == []
+            page.screenshot(path=str(artifact_dir / f"{stem}-capabilities-changed.png"), full_page=True)
+            restore_after_full_page_capture()
+            page.unroute(f"**{capabilities_path}", change_capabilities)
+            # Reopen the review after the changed and failed inspection cues.
+            page.get_by_role("button", name="Cancel review", exact=True).click()
+            expect(review_button).to_be_enabled()
+            review_button.click()
+            expect(review).to_contain_text("Ready for the final start action")
+            phase["value"] = "start"
+            page.get_by_role("button", name="Start run", exact=True).evaluate("node => { node.click(); node.click(); }")
+            for _ in range(200):
+                if start_requests:
+                    break
+                page.wait_for_timeout(25)
+            assert len(start_requests) == 1, start_requests
+            request = start_requests[0]
+            assert request["plan_path"] == choices["plan"]
+            assert request["workflow_name"] == "managed"
+            assert request["team"] == "product_stronger"
+            assert request["max_turns"] == 7
+            assert request["start_step"] == "review"
+            assert request["extra_instructions"] == ["Keep this exact reviewed instruction."]
+            route, status, body, headers = held.pop(0)
+            route.fulfill(status=status, headers=headers, body=body)
+            assert page_errors == [] and units.start_calls == []
+            _write_artifact_manifest(artifact_dir / f"{stem}.json", {"before": before, "choices": choices, "captures": captures, "preflight_requests": preflight_requests, "start_requests": start_requests, "page_errors": page_errors})
+        finally:
+            for route, status, body, headers in held:
+                try:
+                    route.fulfill(status=status, headers=headers, body=body)
+                except Exception:
+                    pass
+            page.unroute_all(behavior="ignoreErrors")
+            browser.close()
