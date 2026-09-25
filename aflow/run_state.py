@@ -525,6 +525,10 @@ class PendingTeamOverride:
     repartition_generation_id: str | None = None
     repartition_candidate_sha256: str | None = None
     repartition_partition_id: str | None = None
+    # Controller-owned repair progress captured before the next worker launch.
+    # These fields are optional so pre-threshold persisted records remain valid.
+    repair_ordinal: int | None = None
+    team_repairs_completed: int | None = None
 
 
 @dataclass(frozen=True)
@@ -542,6 +546,11 @@ class ImplementationAttempt:
     selector: str | None
     outcome: str
     manager_decision_number: int | None = None
+    repair_ordinal: int | None = None
+    team_repairs_completed: int | None = None
+    # Monotonic within one implementation scope. Unlike turn_number, this
+    # identity survives a resumed run resetting its local turn counter.
+    attempt_ordinal: int | None = None
 
 
 @dataclass(frozen=True)
@@ -563,6 +572,9 @@ class ReviewRejectionRecord:
     repair_plan_summary: str | None
     review_stdout_artifact_path: str
     repair_plan_path: str | None
+    # Exact scope-local worker attempt reviewed by this rejection. Legacy
+    # records omit it and may use the diagnostic turn number only when unique.
+    reviewed_attempt_ordinal: int | None = None
 
 
 @dataclass(frozen=True)
@@ -690,6 +702,7 @@ class FinalizedTurnBoundary:
     envelope_artifact_sha256: str | None = None
     envelope_canonical_sha256: str | None = None
     repartition_history: list[dict[str, Any]] = field(default_factory=list)
+    repair_upgrade_policy: dict[str, Any] | None = None
 
 
 @dataclass(frozen=True)
@@ -710,6 +723,9 @@ class PendingFinalizedTurn:
     # Preserve the worker's pre-turn checkpoint across a stopped-run resume.
     # Older result artifacts do not contain a value here and remain readable.
     snapshot_before: PlanSnapshot | None = None
+    # Structured reviewer evidence is authoritative when a crash occurred
+    # after turn finalization but before the controller persisted its ledger.
+    review_rejection: ReviewRejectionRecord | None = None
 
 
 RecoveryOperationState = Literal["pending", "in_flight", "consumed"]
@@ -836,6 +852,31 @@ class ResumeContext:
     resumed_from_team: str | None = None
     resume_team_override: str | None = None
     recovery_context: RecoverySessionContext | None = None
+    # Set only by the validated durable resume reconstruction path.  This is
+    # an in-process capability marker, not persisted resume input.
+    _validated_resume_context_marker: object | None = field(
+        default=None,
+        repr=False,
+        compare=False,
+    )
+
+
+_VALIDATED_RESUME_CONTEXT_MARKER = object()
+
+
+def _mark_validated_resume_context(context: ResumeContext) -> ResumeContext:
+    """Attach the private capability issued by durable resume validation."""
+    return replace(
+        context,
+        _validated_resume_context_marker=_VALIDATED_RESUME_CONTEXT_MARKER,
+    )
+
+
+def _resume_context_validation_marker(context: ResumeContext) -> object | None:
+    """Return the marker only for contexts built by the trusted resume path."""
+    if context._validated_resume_context_marker is _VALIDATED_RESUME_CONTEXT_MARKER:
+        return context._validated_resume_context_marker
+    return None
 
 
 @dataclass
@@ -1147,6 +1188,13 @@ def restore_manager_state(state: ControllerState, payload: Mapping[str, Any]) ->
         for item in rejection_history:
             if not isinstance(item, Mapping) or not required <= set(item):
                 continue
+            reviewed_attempt_ordinal = item.get("reviewed_attempt_ordinal")
+            if reviewed_attempt_ordinal is not None and (
+                not isinstance(reviewed_attempt_ordinal, int)
+                or isinstance(reviewed_attempt_ordinal, bool)
+                or reviewed_attempt_ordinal < 1
+            ):
+                continue
             try:
                 state.review_rejection_history.append(ReviewRejectionRecord(
                     scope_id=str(item["scope_id"]), rejection_number=int(item["rejection_number"]),
@@ -1162,6 +1210,7 @@ def restore_manager_state(state: ControllerState, payload: Mapping[str, Any]) ->
                     repair_plan_summary=str(item["repair_plan_summary"]) if item.get("repair_plan_summary") is not None else None,
                     review_stdout_artifact_path=str(item["review_stdout_artifact_path"]),
                     repair_plan_path=str(item["repair_plan_path"]) if item.get("repair_plan_path") is not None else None,
+                    reviewed_attempt_ordinal=reviewed_attempt_ordinal,
                 ))
             except (TypeError, ValueError):
                 continue
@@ -1178,6 +1227,13 @@ def restore_manager_state(state: ControllerState, payload: Mapping[str, Any]) ->
                 required = {"turn_number", "step_name", "role", "outcome"}
                 if not required <= set(item):
                     continue
+                attempt_ordinal = item.get("attempt_ordinal")
+                if attempt_ordinal is not None and (
+                    not isinstance(attempt_ordinal, int)
+                    or isinstance(attempt_ordinal, bool)
+                    or attempt_ordinal < 1
+                ):
+                    continue
                 restored_attempts.append(ImplementationAttempt(
                     turn_number=int(item["turn_number"]), step_name=str(item["step_name"]),
                     role=str(item["role"]), team=str(item["team"]) if item.get("team") is not None else None,
@@ -1185,6 +1241,11 @@ def restore_manager_state(state: ControllerState, payload: Mapping[str, Any]) ->
                     outcome=str(item["outcome"]),
                     manager_decision_number=(int(item["manager_decision_number"])
                         if item.get("manager_decision_number") is not None else None),
+                    repair_ordinal=(int(item["repair_ordinal"])
+                        if item.get("repair_ordinal") is not None else None),
+                    team_repairs_completed=(int(item["team_repairs_completed"])
+                        if item.get("team_repairs_completed") is not None else None),
+                    attempt_ordinal=attempt_ordinal,
                 ))
             state.implementation_attempts[str(key)] = restored_attempts
     scope = payload.get("active_implementation_scope")
@@ -1280,6 +1341,10 @@ def restore_manager_state(state: ControllerState, payload: Mapping[str, Any]) ->
                 checkpoint_identity=str(override["checkpoint_identity"]) if override.get("checkpoint_identity") is not None else None,
                 decision_number=int(override["decision_number"]),
                 consumed=bool(override.get("consumed", False)),
+                repair_ordinal=(int(override["repair_ordinal"])
+                    if override.get("repair_ordinal") is not None else None),
+                team_repairs_completed=(int(override["team_repairs_completed"])
+                    if override.get("team_repairs_completed") is not None else None),
                 scope_id=str(override["scope_id"]) if override.get("scope_id") is not None else None,
                 target_plan_identity=(
                     str(override["target_plan_identity"])
@@ -1556,13 +1621,19 @@ def manager_resume_fields_strict(
     type-safe before the tolerant projection is allowed to run.
     """
 
-    def record(value: object, record_type: type[Any], label: str) -> Mapping[str, Any]:
+    def record(
+        value: object,
+        record_type: type[Any],
+        label: str,
+        *,
+        optional_fields: frozenset[str] = frozenset(),
+    ) -> Mapping[str, Any]:
         if not isinstance(value, Mapping):
             raise ValueError(f"{label} must be a mapping")
         missing = sorted(
             item.name
             for item in dataclass_fields(record_type)
-            if item.name not in value
+            if item.name not in value and item.name not in optional_fields
         )
         if missing:
             raise ValueError(f"{label} is missing required fields: {', '.join(missing)}")
@@ -1584,9 +1655,14 @@ def manager_resume_fields_strict(
         if minimum is not None and value < minimum:
             raise ValueError(f"{label} must be >= {minimum}")
 
-    def optional_integer(value: object, label: str) -> None:
+    def optional_integer(
+        value: object,
+        label: str,
+        *,
+        minimum: int | None = None,
+    ) -> None:
         if value is not None:
-            integer(value, label)
+            integer(value, label, minimum=minimum)
 
     def boolean(value: object, label: str) -> None:
         if not isinstance(value, bool):
@@ -1629,7 +1705,12 @@ def manager_resume_fields_strict(
         raise ValueError("review_rejection_history must be a list")
     for index, value in enumerate(rejection_history):
         label = f"review_rejection_history[{index}]"
-        item = record(value, ReviewRejectionRecord, label)
+        item = record(
+            value,
+            ReviewRejectionRecord,
+            label,
+            optional_fields={"reviewed_attempt_ordinal"},
+        )
         for field_name in (
             "scope_id",
             "source_run_id",
@@ -1654,6 +1735,11 @@ def manager_resume_fields_strict(
         ):
             integer(item[field_name], f"{label}.{field_name}", minimum=0)
         optional_integer(item["checkpoint_index"], f"{label}.checkpoint_index")
+        optional_integer(
+            item.get("reviewed_attempt_ordinal"),
+            f"{label}.reviewed_attempt_ordinal",
+            minimum=1,
+        )
 
     attempts = payload.get("implementation_attempts")
     if not isinstance(attempts, Mapping):
@@ -1663,9 +1749,19 @@ def manager_resume_fields_strict(
             raise ValueError("implementation_attempts keys must be non-empty strings")
         if not isinstance(values, list):
             raise ValueError(f"implementation_attempts[{scope_id}] must be a list")
+        last_attempt_ordinal = 0
         for index, value in enumerate(values):
             label = f"implementation_attempts[{scope_id}][{index}]"
-            item = record(value, ImplementationAttempt, label)
+            item = record(
+                value,
+                ImplementationAttempt,
+                label,
+                optional_fields={
+                    "repair_ordinal",
+                    "team_repairs_completed",
+                    "attempt_ordinal",
+                },
+            )
             integer(item["turn_number"], f"{label}.turn_number", minimum=1)
             for field_name in ("step_name", "role", "outcome"):
                 string(item[field_name], f"{label}.{field_name}", nonempty=True)
@@ -1675,6 +1771,28 @@ def manager_resume_fields_strict(
                 item["manager_decision_number"],
                 f"{label}.manager_decision_number",
             )
+            optional_integer(
+                item.get("repair_ordinal"),
+                f"{label}.repair_ordinal",
+                minimum=0,
+            )
+            optional_integer(
+                item.get("team_repairs_completed"),
+                f"{label}.team_repairs_completed",
+                minimum=0,
+            )
+            attempt_ordinal = item.get("attempt_ordinal")
+            optional_integer(
+                attempt_ordinal,
+                f"{label}.attempt_ordinal",
+                minimum=1,
+            )
+            if attempt_ordinal is not None:
+                if attempt_ordinal <= last_attempt_ordinal:
+                    raise ValueError(
+                        f"{label}.attempt_ordinal must increase within its scope"
+                    )
+                last_attempt_ordinal = attempt_ordinal
 
     active_scope = payload.get("active_implementation_scope")
     if active_scope is not None:
@@ -1718,13 +1836,28 @@ def manager_resume_fields_strict(
     override = payload.get("pending_step_team_override")
     if override is not None:
         label = "pending_step_team_override"
-        item = record(override, PendingTeamOverride, label)
+        item = record(
+            override,
+            PendingTeamOverride,
+            label,
+            optional_fields={"repair_ordinal", "team_repairs_completed"},
+        )
         for field_name in ("target_step", "role", "target_team", "selector"):
             string(item[field_name], f"{label}.{field_name}", nonempty=True)
         optional_string(item["source_team"], f"{label}.source_team")
         optional_string(item["checkpoint_identity"], f"{label}.checkpoint_identity")
         integer(item["decision_number"], f"{label}.decision_number", minimum=0)
         boolean(item["consumed"], f"{label}.consumed")
+        optional_integer(
+            item.get("repair_ordinal"),
+            f"{label}.repair_ordinal",
+            minimum=0,
+        )
+        optional_integer(
+            item.get("team_repairs_completed"),
+            f"{label}.team_repairs_completed",
+            minimum=0,
+        )
         for field_name in (
             "scope_id",
             "target_plan_identity",

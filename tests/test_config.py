@@ -1,3 +1,5 @@
+from dataclasses import asdict
+
 from tests._support import *  # noqa: F401,F403
 from aflow.workflow import resolve_role_prompt
 from aflow.run_state import load_override_request
@@ -140,6 +142,16 @@ def test_workflow_manager_enabled_defaults_to_disabled_when_omitted() -> None:
         assert config.workflows["plain"].manager_enabled is False
 
 
+def test_packaged_workflows_disable_manager_by_default() -> None:
+    package_root = Path(__file__).resolve().parents[1] / "aflow"
+    config = load_workflow_config(package_root / "aflow.toml")
+    assert config.workflows
+    assert all(not workflow.manager_enabled for workflow in config.workflows.values())
+    assert "manager_enabled = true" not in (
+        package_root / "starter" / "workflows.toml"
+    ).read_text(encoding="utf-8")
+
+
 def test_workflow_manager_enabled_preserves_explicit_true_and_false() -> None:
     with tempfile.TemporaryDirectory() as tmpdir:
         config = load_workflow_config(
@@ -200,6 +212,88 @@ def test_workflow_manager_enabled_alias_inherits_base_and_explicit_wins() -> Non
         assert config.workflows["silenced"].manager_enabled is False
         assert config.workflows["quiet"].manager_enabled is False
         assert config.workflows["loud"].manager_enabled is True
+
+
+def test_workflow_upgrade_after_repairs_defaults_and_precedence() -> None:
+    with tempfile.TemporaryDirectory() as tmpdir:
+        config = load_workflow_config(
+            _managed_config(
+                Path(tmpdir),
+                '[workflow]\nupgrade_after_repairs = 2\n\n'
+                '[workflow.base]\nupgrade_after_repairs = 3\n'
+                + _MANAGER_TEST_STEP.format(name="base")
+                + '[workflow.inheriting]\nextends = "base"\n'
+                + '[workflow.overridden]\nextends = "base"\nupgrade_after_repairs = 4\n'
+                + '[workflow.defaulted]\n'
+                + _MANAGER_TEST_STEP.format(name="defaulted"),
+            )
+        )
+
+    base = config.workflows["base"]
+    inheriting = config.workflows["inheriting"]
+    overridden = config.workflows["overridden"]
+    defaulted = config.workflows["defaulted"]
+
+    assert base.upgrade_after_repairs == 3
+    assert base.effective_upgrade_after_repairs == 3
+    assert base.declared_upgrade_after_repairs == 3
+    assert base.upgrade_after_repairs_source == "workflow"
+
+    assert inheriting.upgrade_after_repairs == 3
+    assert inheriting.declared_upgrade_after_repairs is None
+    assert inheriting.upgrade_after_repairs_source == "base:base"
+
+    assert overridden.upgrade_after_repairs == 4
+    assert overridden.declared_upgrade_after_repairs == 4
+    assert overridden.upgrade_after_repairs_source == "workflow"
+
+    assert defaulted.upgrade_after_repairs == 2
+    assert defaulted.declared_upgrade_after_repairs is None
+    assert defaulted.upgrade_after_repairs_source == "defaults"
+
+    serialized = asdict(inheriting)
+    assert serialized["upgrade_after_repairs"] == 3
+    assert serialized["declared_upgrade_after_repairs"] is None
+    assert serialized["upgrade_after_repairs_source"] == "base:base"
+
+
+def test_workflow_upgrade_after_repairs_omitted_defaults_to_one() -> None:
+    with tempfile.TemporaryDirectory() as tmpdir:
+        config = load_workflow_config(
+            _managed_config(
+                Path(tmpdir),
+                '[workflow.plain]\n'
+                + _MANAGER_TEST_STEP.format(name="plain"),
+            )
+        )
+
+    workflow = config.workflows["plain"]
+    assert workflow.upgrade_after_repairs == 1
+    assert workflow.effective_upgrade_after_repairs == 1
+    assert workflow.declared_upgrade_after_repairs is None
+    assert workflow.upgrade_after_repairs_source == "defaults"
+
+
+@pytest.mark.parametrize("value", ['"two"', "true", "0", "-1", "1.5"])
+@pytest.mark.parametrize("location", ("defaults", "workflow"))
+def test_workflow_upgrade_after_repairs_rejects_invalid_values(
+    value: str, location: str
+) -> None:
+    declaration = (
+        f"[workflow]\nupgrade_after_repairs = {value}\n"
+        if location == "defaults"
+        else f"[workflow.flagged]\nupgrade_after_repairs = {value}\n"
+    )
+    with tempfile.TemporaryDirectory() as tmpdir:
+        with pytest.raises(
+            ConfigError, match=r"upgrade_after_repairs must be a positive integer"
+        ):
+            load_workflow_config(
+                _managed_config(
+                    Path(tmpdir),
+                    declaration + "\n" + _MANAGER_TEST_STEP.format(name="flagged"),
+                )
+            )
 
 
 def test_workflow_manager_enabled_ignores_launch_default_workflow() -> None:

@@ -60,6 +60,13 @@
   integration policy. Keep execution worktrees and test resources isolated;
   serialize shared-main integration and publication. Checkpoint workers retain
   their assigned scope and do not take over queue management.
+- `plan_consumer.py` is a server-owned scheduling caller. Keep workflow unit
+  launch, plan claims, capacity, and publication in the existing daemon,
+  admission, and controller services. Its project lock elects only a scanner.
+  `plans/todo` drafts promote to `plans/in-progress`; invalid originals move
+  to `plans/needs-plan-change`, confirmed inactive failures to `plans/failed`,
+  and only receipt-backed published originals to `plans/done`. Preserve plan
+  identity across explicit revision-checked requeue and linked worktrees.
 - Completed-plan delivery is controller-owned: publish approved code first,
   record the receipt-backed `plans/done` lifecycle move, and publish only a
   resulting bookkeeping commit. A failed delivery follows the validated

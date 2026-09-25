@@ -8,10 +8,10 @@ from fastapi import APIRouter, Depends, Query, status
 from pydantic import BaseModel, ConfigDict
 
 from .control_plane_service import ControlPlaneService
-from .plan_service import PlanService
+from .plan_service import PlanService, resume_requeued_plan
 
 router = APIRouter(prefix="/api/projects/{project_id}/plans", tags=["plans"])
-PlanStatusValue = Literal["todo", "in_progress", "done"]
+PlanStatusValue = Literal["todo", "in_progress", "done", "failed", "needs_plan_change"]
 
 class StrictModel(BaseModel):
     model_config = ConfigDict(extra="forbid")
@@ -33,6 +33,12 @@ class PlanUpdatePayload(StrictModel):
 class PlanPromotePayload(StrictModel):
     expected_revision: str
     target_name: str | None = None
+
+
+class PlanRequeuePayload(StrictModel):
+    expected_revision: str
+    source_run_id: str | None = None
+    idempotency_key: str | None = None
 
 def _get_plan_service() -> PlanService:
     raise RuntimeError("plan service dependency was not configured")
@@ -122,3 +128,27 @@ def promote_plan(
     service: PlanService = Depends(_get_plan_service),
 ) -> dict[str, object]:
     return service.promote(project_id, plan_status, name, payload.expected_revision, payload.target_name).to_dict()
+
+
+@router.post("/{plan_status}/{name}/requeue")
+def requeue_plan(
+    project_id: str,
+    plan_status: Literal["failed", "needs_plan_change"],
+    name: str,
+    payload: PlanRequeuePayload,
+    service: PlanService = Depends(_get_plan_service),
+    control_plane: ControlPlaneService = Depends(_get_control_plane_service),
+) -> dict[str, object]:
+    plan = service.requeue(
+        project_id, plan_status, name, payload.expected_revision,
+        source_run_id=payload.source_run_id,
+        run_status_reader=control_plane.run_status,
+    )
+    response: dict[str, object] = {"plan": plan.to_dict()}
+    resumed = resume_requeued_plan(
+        project_id, plan, control_plane,
+        idempotency_key=payload.idempotency_key,
+    )
+    if resumed is not None:
+        response["run"] = resumed.to_dict()
+    return response

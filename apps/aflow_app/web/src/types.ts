@@ -131,6 +131,9 @@ export interface GuidedWorkflowStepSummaries {
   effective_manager_enabled?: boolean
   /** Where the effective value came from: "workflow", "base:<name>", or "defaults". */
   manager_enabled_source?: string
+  upgrade_after_repairs?: number | null
+  effective_upgrade_after_repairs?: number
+  upgrade_after_repairs_source?: string
 }
 
 /**
@@ -175,6 +178,8 @@ export interface GuidedFormProjection {
   workflows: Record<string, GuidedWorkflowStepSummaries>
   /** Declared `[workflow].manager_enabled` default; null when omitted (disabled). */
   default_manager_enabled?: boolean | null
+  default_upgrade_after_repairs?: number | null
+  effective_default_upgrade_after_repairs?: number
 }
 
 export interface GuidedConfiguredChoices {
@@ -231,6 +236,8 @@ export type GuidedConfigAction =
   | { type: 'set_workflow_default_team'; workflow: string; team: string | null }
   | { type: 'set_default_manager_enabled'; value: boolean | null }
   | { type: 'set_workflow_manager_enabled'; workflow: string; value: boolean | null }
+  | { type: 'set_default_upgrade_after_repairs'; value: number }
+  | { type: 'set_workflow_upgrade_after_repairs'; workflow: string; value: number | null }
 
 export interface ProjectConfigFormRequest {
   aflow_toml: string
@@ -320,7 +327,7 @@ export interface ProjectConfigFormResponse {
   server_default_max_turns?: number
 }
 
-export type PlanStatus = 'todo' | 'in_progress' | 'done'
+export type PlanStatus = 'todo' | 'in_progress' | 'done' | 'failed' | 'needs_plan_change'
 
 export interface PlanDocument {
   project_id: string
@@ -330,6 +337,34 @@ export interface PlanDocument {
   revision: string
   size_bytes: number
   content?: string
+  lifecycle?: { reason_code?: string; reason?: string; source_run_id?: string } | null
+}
+
+export interface ProjectScheduling {
+  auto_consume_plans: boolean
+  max_concurrent_implementations: number
+  revision: string
+  persisted: boolean
+  source: 'defaults' | 'file'
+}
+
+export interface ProjectQueuePlan {
+  name: string
+  path: string
+  status: PlanStatus
+  identity: string | null
+  outcome: 'queued' | 'blocked' | 'running' | 'held'
+  reason: string | null
+  dependency: string | null
+  run_id: string | null
+  revision: string
+}
+
+export interface ProjectQueue {
+  project_id: string
+  settings: ProjectScheduling
+  capacity: { limit: number; available_slots: number; reserved_count: number; starting_count: number; active_count: number; uncertain_count: number }
+  plans: ProjectQueuePlan[]
 }
 
 export type PlanBackupKind = 'snapshot' | 'follow_up'

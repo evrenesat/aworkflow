@@ -65,7 +65,7 @@ def _seed_responsive_fixture(root: Path) -> None:
         run_dir.mkdir(parents=True)
         (run_dir / "run.json").write_text(json.dumps({
             "status": "completed",
-            "plan_path": f"plans/todo/long-plan-{index:02}.md",
+            "plan_path": str((plans / f"long-plan-{index:02}.md").resolve()),
             "workflow_name": "managed",
             "max_turns": 5,
         }))
@@ -3654,6 +3654,22 @@ def test_responsive_live_controls_and_restart(
             browser.close()
 
 
+def _share_in_process_worker_units(monkeypatch, units):
+    """Give a test worker the same mutable unit state as its UI service."""
+    from aflow import daemon
+
+    original_compose = daemon.compose_control_plane
+    test_units = units
+
+    def compose_with_test_units(repo_root, *, config_path, units=None):
+        return original_compose(
+            repo_root, config_path=config_path,
+            units=units if units is not None else test_units,
+        )
+
+    monkeypatch.setattr(daemon, "compose_control_plane", compose_with_test_units)
+
+
 def test_stop_after_current_turn_delayed_worker_journey(control_client, monkeypatch):
     """Exercise a persisted boundary stop through the real controller and UI."""
     from aflow.api.runner import execute_workflow as canonical_execute_workflow
@@ -3731,6 +3747,7 @@ go = [{ to = "END" }]
 
     monkeypatch.setattr("aflow.daemon.prepare_startup", _prepared)
     monkeypatch.setattr("aflow.daemon.execute_workflow", execute_with_fake_provider)
+    _share_in_process_worker_units(monkeypatch, units)
     original_start = units.start
 
     def start_and_run_worker(name, argv, **kwargs):
@@ -4235,6 +4252,7 @@ def test_durable_recovery_ui_journey(control_client, monkeypatch, tmp_path):
     # publication settings contact a remote while the fake worker runs.
     monkeypatch.setattr("aflow.workflow.publish_completed_run", lambda *args, **kwargs: None)
     monkeypatch.setattr("aflow.daemon.execute_workflow", execute_with_fake_providers)
+    _share_in_process_worker_units(monkeypatch, units)
     source_unit_name = f"aflow-run-{source_id}.service"
     units.units[source_unit_name] = UnitState(
         name=source_unit_name,

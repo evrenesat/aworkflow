@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import Annotated, Any, Literal, Mapping
 
-from pydantic import BaseModel, ConfigDict, Field, StrictBool, model_validator
+from pydantic import BaseModel, ConfigDict, Field, StrictBool, StrictInt, model_validator
 from pydantic_core import core_schema
 
 from aflow.config import DEFAULT_MAX_TURNS
@@ -553,6 +553,17 @@ class SetWorkflowManagerEnabledAction(GuidedActionBase):
     value: StrictBool | None
 
 
+class SetDefaultUpgradeAfterRepairsAction(GuidedActionBase):
+    type: Literal["set_default_upgrade_after_repairs"]
+    value: StrictInt = Field(ge=1)
+
+
+class SetWorkflowUpgradeAfterRepairsAction(GuidedActionBase):
+    type: Literal["set_workflow_upgrade_after_repairs"]
+    workflow: str = Field(min_length=1, max_length=64)
+    value: StrictInt | None = Field(ge=1)
+
+
 class SetPromptAction(GuidedActionBase):
     type: Literal["set_prompt"]
     name: str = Field(min_length=1, max_length=128)
@@ -595,6 +606,8 @@ GuidedConfigAction = Annotated[
     | SetWorkflowDefaultTeamAction
     | SetDefaultManagerEnabledAction
     | SetWorkflowManagerEnabledAction
+    | SetDefaultUpgradeAfterRepairsAction
+    | SetWorkflowUpgradeAfterRepairsAction
     | SetPromptAction
     | RenamePromptAction
     | SetRolePromptAction
@@ -613,6 +626,25 @@ class GlobalConfigPatchPayload(CanonicalTransportModel):
         if (self.actions is None) == (self.documents is None) or self.documents == {}:
             raise ValueError("provide actions or a nonempty documents map, exclusively")
         return self
+
+
+class ProjectSchedulingPatchPayload(CanonicalTransportModel):
+    expected_revision: str = Field(pattern=r"^[0-9a-f]{64}$")
+    auto_consume_plans: StrictBool | None = None
+    max_concurrent_implementations: StrictInt | None = Field(default=None, ge=1, le=1000)
+
+    @model_validator(mode="after")
+    def require_change(self):
+        fields = self.model_fields_set - {"expected_revision"}
+        if not fields or any(getattr(self, field) is None for field in fields):
+            raise ValueError("provide at least one non-null scheduling setting")
+        return self
+
+    def changes(self) -> dict[str, object]:
+        return {
+            field: getattr(self, field)
+            for field in self.model_fields_set - {"expected_revision"}
+        }
 
 
 class ProjectConfigFormPayload(CanonicalTransportModel):
@@ -648,6 +680,9 @@ class GuidedWorkflowStepSummaries(CanonicalTransportModel):
     # Where the effective value came from: "workflow" (explicit override),
     # "base:<name>" (alias inherits its concrete base), or "defaults".
     manager_enabled_source: str = "defaults"
+    upgrade_after_repairs: int | None = None
+    effective_upgrade_after_repairs: int = 1
+    upgrade_after_repairs_source: str = "defaults"
 
 
 class GuidedTeamSummary(CanonicalTransportModel):
@@ -690,6 +725,8 @@ class GuidedFormProjection(CanonicalTransportModel):
     workflows: Mapping[str, GuidedWorkflowStepSummaries]
     # Declared `[workflow].manager_enabled` default (None when omitted).
     default_manager_enabled: bool | None = None
+    default_upgrade_after_repairs: int | None = None
+    effective_default_upgrade_after_repairs: int = 1
 
 
 class GuidedConfiguredChoices(CanonicalTransportModel):

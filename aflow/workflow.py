@@ -15,7 +15,8 @@ from datetime import datetime, timezone
 from dataclasses import asdict, dataclass, replace
 from enum import Enum
 from pathlib import Path
-from typing import TYPE_CHECKING, Callable, Literal, Mapping, NoReturn
+from typing import TYPE_CHECKING, Callable, Literal, Mapping, NoReturn, Sequence
+from uuid import uuid4
 
 if TYPE_CHECKING:
     from aflow.api.events import ExecutionEvent, ExecutionObserver
@@ -40,6 +41,7 @@ from .manager import (
     build_manager_note_correction_result,
     build_manager_prompts,
     build_repartition_prompts,
+    determine_repair_upgrade_policy,
     eligible_implementation_upgrade,
     manager_prompt_metrics,
     parse_manager_decision,
@@ -88,6 +90,7 @@ from .harnesses.base import (
     adapter_manager_workspace_read,
 )
 from .plan import (
+    GitTrackingMetadataError,
     ParsedPlan,
     PlanParseError,
     PlanSnapshot,
@@ -122,7 +125,7 @@ from .recovery import (
     TeamLeadRecoveryDecision,
     TeamLeadRecoveryDecisionError,
 )
-from .run_state import ActiveImplementationScope, CheckpointRepartitionRecord, ControllerConfig, ControllerRunResult, ControllerState, ExecutionContext, FinalizedTurnBoundary, FrozenRunIdentity, HarnessRecoveryAction, HarnessRecoveryContext, ImplementationAttempt, IssueRecord, ManagerDecisionSummary, OverrideResult, PendingBoundaryDecision, PendingFinalizedTurn, PendingManagerNotes, PendingRepartitionV1, PendingTeamOverride, RecoverySessionContext, RetryContext, ResumeContext, ReviewRejectionRecord, TurnRecord, WorkflowEndReason, format_harness_model_display, load_override_request, merge_accepted_override_choices
+from .run_state import ActiveImplementationScope, CheckpointRepartitionRecord, ControllerConfig, ControllerRunResult, ControllerState, ExecutionContext, FinalizedTurnBoundary, FrozenRunIdentity, HarnessRecoveryAction, HarnessRecoveryContext, ImplementationAttempt, IssueRecord, ManagerDecisionSummary, OverrideResult, PendingBoundaryDecision, PendingFinalizedTurn, PendingManagerNotes, PendingRepartitionV1, PendingTeamOverride, RecoverySessionContext, RetryContext, ResumeContext, ReviewRejectionRecord, TurnRecord, WorkflowEndReason, _resume_context_validation_marker, format_harness_model_display, load_override_request, merge_accepted_override_choices
 from .control_plane.validation import ControlValidationError, validate_override_targets
 from .hotplug import (
     HarnessSessionRefV1, HotplugTransactionV1, bounded_hotplug_history,
@@ -142,6 +145,7 @@ from .stop_marker import (
 )
 from .scope_pressure import parse_scope_pressure
 from .status import BannerRenderer, WorkflowGraphSource
+from .control_plane.persistence import validate_run_id
 from aflow.api.events import (
     CheckpointRepartitionedEvent,
     ManagerDecidedEvent,
@@ -1857,14 +1861,6 @@ class _ManagerGateCoordinator:
                 f"scope-pressure rerouting requires an enabled manager",
                 run_dir=run_paths.run_dir,
             )
-        if not self.workflow.manager_enabled:
-            return proposed_transition
-        if scope_pressure_reason is not None:
-            self.state.scope_pressure_reason = scope_pressure_reason
-            _require_valid_pressure_scope(
-                run_paths.run_dir,
-                self.state.active_implementation_scope,
-            )
         next_step = None if proposed_transition == "END" else proposed_transition
         candidate_step = self.workflow.steps.get(next_step) if next_step is not None else None
         proposed_target_plan = (
@@ -1879,6 +1875,71 @@ class _ManagerGateCoordinator:
             if scope is not None else []
         )
         recent_team = attempts[-1].team if attempts else None
+        repair_policy = determine_repair_upgrade_policy(
+            self.workflow_config,
+            threshold=self.workflow.upgrade_after_repairs,
+            role=(candidate_step.role if candidate_step is not None else current_role),
+            baseline_team=baseline_team_name,
+            scope_id=scope.scope_id if scope is not None else None,
+            attempts=attempts,
+            rejections=self.state.review_rejection_history,
+        )
+        if scope_pressure_reason is not None:
+            self.state.scope_pressure_reason = scope_pressure_reason
+            _require_valid_pressure_scope(
+                run_paths.run_dir,
+                self.state.active_implementation_scope,
+            )
+        if not self.workflow.manager_enabled:
+            # Manager-independent routing is still durable: the selected team
+            # is recorded before the next worker invocation, exactly like a
+            # manager decision route. A due edge is mandatory when available;
+            # an exhausted edge retains the strongest reviewed team.
+            if (
+                repair_policy.active
+                and candidate_step is not None
+                and candidate_step.role == "worker"
+                and repair_policy.current_team is not None
+            ):
+                target_team = (
+                    repair_policy.eligible_upgrade.target_team
+                    if repair_policy.forced
+                    else repair_policy.current_team
+                )
+                target_selector = (
+                    repair_policy.eligible_upgrade.target_selector
+                    if repair_policy.forced
+                    else None
+                )
+                if target_selector is None:
+                    target_selector, _ = _resolve_step_runtime(
+                        candidate_step,
+                        self.workflow_config,
+                        team_name=target_team,
+                        step_path=f"workflow.{self.workflow_name}.steps.{next_step}",
+                    )
+                self.state.pending_step_team_override = PendingTeamOverride(
+                    target_step=str(next_step),
+                    role=candidate_step.role,
+                    source_team=repair_policy.current_team,
+                    target_team=str(target_team),
+                    selector=target_selector,
+                    checkpoint_identity=target_plan_identity,
+                    decision_number=self.state.manager_decision_number,
+                    scope_id=scope.scope_id if scope is not None else None,
+                    target_plan_identity=target_plan_identity,
+                    repair_ordinal=repair_policy.repair_ordinal,
+                    team_repairs_completed=repair_policy.team_repairs_completed,
+                )
+                self.run_metadata.write(
+                    status="running",
+                    last_snapshot=self.state.last_snapshot,
+                    original_plan_path=original_plan_path,
+                    current_step_name=runtime_current_step_name,
+                    active_plan_path=active_plan_path,
+                    new_plan_path=new_plan_path,
+                )
+            return proposed_transition
         scope_context = None
         if scope is not None:
             upgrade_depth = _implementation_upgrade_depth(
@@ -1900,6 +1961,9 @@ class _ManagerGateCoordinator:
                 "attempt_selectors": [attempt.selector for attempt in attempts],
                 "most_recent_team": recent_team,
                 "upgrade_depth": upgrade_depth,
+                "repair_ordinal": repair_policy.repair_ordinal,
+                "team_repairs_completed": repair_policy.team_repairs_completed,
+                "repair_threshold": repair_policy.threshold,
             }
         retrying_scoped_implementation = (
             scope is not None
@@ -2011,6 +2075,7 @@ class _ManagerGateCoordinator:
             operational_failure=operational_failure, backup_team=backup_team,
             backup_selector=backup_selector, implementation_upgrade=upgrade.__dict__,
             active_implementation_scope=scope_context,
+            repair_upgrade_policy=repair_policy.to_dict(),
             eligible_actions=sorted(lite_eligible),
             scope_pressure_reason=scope_pressure_reason,
             # Immutable controller-owned copies for deterministic v2 reconstruction.
@@ -2176,14 +2241,29 @@ class _ManagerGateCoordinator:
             and retrying_scoped_implementation
             and recent_team is not None
         )
+        forced_worker_upgrade = (
+            decision.action == "continue"
+            and repair_policy.forced
+            and target_config is not None
+            and target_config.role == "worker"
+        )
+        selected_upgrade = (
+            repair_policy.eligible_upgrade
+            if forced_worker_upgrade
+            else upgrade
+        )
         target_team = (
-            upgrade.target_team
-            if decision.action == "upgrade_next_implementation"
+            selected_upgrade.target_team
+            if decision.action == "upgrade_next_implementation" or forced_worker_upgrade
             else recent_team
             if retain_scoped_team
             else None
         )
-        target_selector = upgrade.target_selector if decision.action == "upgrade_next_implementation" else None
+        target_selector = (
+            selected_upgrade.target_selector
+            if decision.action == "upgrade_next_implementation" or forced_worker_upgrade
+            else None
+        )
         if target_config is not None and target_selector is None:
             resolution_team = (
                 backup_team
@@ -2245,18 +2325,30 @@ class _ManagerGateCoordinator:
                 raise WorkflowError("manager selected unavailable backup-team retry", run_dir=run_paths.run_dir)
             self.state.current_team_override = backup_team
             return current_step
-        if decision.action == "upgrade_next_implementation":
+        if decision.action == "upgrade_next_implementation" or forced_worker_upgrade:
             assert next_step is not None
-            if not upgrade.available or upgrade.target_team is None or upgrade.target_selector is None:
+            if (
+                not selected_upgrade.available
+                or selected_upgrade.target_team is None
+                or selected_upgrade.target_selector is None
+            ):
                 raise WorkflowError("manager selected unavailable implementation upgrade", run_dir=run_paths.run_dir)
             self.state.pending_step_team_override = PendingTeamOverride(
-                target_step=next_step, role=self.workflow.steps[next_step].role, source_team=upgrade.source_team,
-                target_team=upgrade.target_team, selector=upgrade.target_selector,
+                target_step=next_step, role=self.workflow.steps[next_step].role,
+                source_team=selected_upgrade.source_team,
+                target_team=selected_upgrade.target_team, selector=selected_upgrade.target_selector,
                 checkpoint_identity=target_identity, decision_number=self.state.manager_decision_number,
                 scope_id=scope_id, target_plan_identity=target_identity,
                 repartition_generation_id=active_partition_identity[0],
                 repartition_candidate_sha256=active_partition_identity[1],
                 repartition_partition_id=active_partition_identity[2],
+                repair_ordinal=(
+                    repair_policy.repair_ordinal if repair_policy.active else None
+                ),
+                team_repairs_completed=(
+                    repair_policy.team_repairs_completed
+                    if repair_policy.active else None
+                ),
             )
         elif (
             retain_scoped_team
@@ -2281,6 +2373,13 @@ class _ManagerGateCoordinator:
                 repartition_generation_id=active_partition_identity[0],
                 repartition_candidate_sha256=active_partition_identity[1],
                 repartition_partition_id=active_partition_identity[2],
+                repair_ordinal=(
+                    repair_policy.repair_ordinal if repair_policy.active else None
+                ),
+                team_repairs_completed=(
+                    repair_policy.team_repairs_completed
+                    if repair_policy.active else None
+                ),
             )
         return proposed_transition
 
@@ -2917,6 +3016,25 @@ def _close_implementation_scope(state: ControllerState) -> None:
     state.reviewer_rejection_count = 0
 
 
+def _append_replayed_review_rejection(
+    state: ControllerState,
+    rejection: ReviewRejectionRecord,
+) -> bool:
+    """Append one finalized rejection exactly once during resume replay."""
+    if any(
+        item.scope_id == rejection.scope_id
+        and item.rejection_number == rejection.rejection_number
+        and item.reviewed_attempt_ordinal == rejection.reviewed_attempt_ordinal
+        and item.review_turn_number == rejection.review_turn_number
+        and item.reviewed_implementation_turn_number
+        == rejection.reviewed_implementation_turn_number
+        for item in state.review_rejection_history
+    ):
+        return False
+    state.review_rejection_history.append(rejection)
+    return True
+
+
 def _pending_matches_scope_and_plan(
     pending: object,
     state: ControllerState,
@@ -2965,6 +3083,20 @@ def _mutable_implementation_attempts(
 ) -> dict[str, list[ImplementationAttempt]]:
     """Normalize durable resume histories before any live append."""
     return {key: list(history) for key, history in attempts.items()}
+
+
+def _next_implementation_attempt_ordinal(
+    attempts: Sequence[ImplementationAttempt],
+) -> int:
+    """Allocate a scope-local identity after all durable retained attempts."""
+    durable_ordinals = [
+        attempt.attempt_ordinal
+        for attempt in attempts
+        if isinstance(attempt.attempt_ordinal, int)
+        and not isinstance(attempt.attempt_ordinal, bool)
+        and attempt.attempt_ordinal > 0
+    ]
+    return max([len(attempts), *durable_ordinals], default=0) + 1
 
 
 def _implementation_upgrade_depth(
@@ -4404,6 +4536,110 @@ def _done_plan_path(repo_root: Path, plan_path: Path) -> Path | None:
     return plans_root / "done" / relative_plan_path
 
 
+def _classify_failed_original_plan(
+    config: ControllerConfig,
+    error: WorkflowError,
+    admission: object,
+) -> None:
+    """Move only an exact original plan after terminal failure evidence."""
+    from .control_plane import RunRepository
+    from .plan_lifecycle import PlanLifecycle, PlanLifecycleError, canonical_direct_child
+    from .project_admission import ProjectAdmissionConflict
+
+    root = config.repo_root.resolve()
+    if Path(config.plan_path).suffix != ".md":
+        return
+    try:
+        source = canonical_direct_child(
+            config.plan_path, root / "plans" / "in-progress"
+        )
+    except PlanLifecycleError:
+        return
+    try:
+        data = source.read_bytes()
+    except OSError:
+        return
+    revision = hashlib.sha256(data).hexdigest()
+    lifecycle = PlanLifecycle(root)
+
+    invalid_plan = error.failure_kind == "missing_git_tracking"
+    if not invalid_plan:
+        try:
+            load_plan(source)
+            tracking = parse_git_tracking_metadata(data.decode("utf-8"))
+            if tracking is not None and (
+                tracking.plan_branch is None
+                or tracking.pre_handoff_base_head is None
+            ):
+                invalid_plan = True
+        except (PlanParseError, GitTrackingMetadataError, UnicodeError):
+            invalid_plan = True
+
+    if error.run_dir is None:
+        if invalid_plan:
+            try:
+                with admission.plan_lifecycle_guard(source):
+                    lifecycle.move(
+                        source, "needs_plan_change", expected_revision=revision,
+                        reason_code="invalid_plan", reason="Plan structure requires correction",
+                    )
+            except ProjectAdmissionConflict:
+                return
+        return
+
+    if error.failure_kind in {"environment_preflight", "completion_publication"}:
+        return
+    try:
+        run_dir = canonical_direct_child(error.run_dir, root / ".aflow" / "runs")
+    except PlanLifecycleError:
+        return
+    run_id = run_dir.name
+    metadata_path = run_dir / "run.json"
+    if metadata_path.is_symlink() or not metadata_path.is_file():
+        return
+    try:
+        metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+        status = RunRepository(root).get_run_status(run_id, include_progress=False)
+    except (OSError, ValueError):
+        return
+    recorded_source = metadata.get("original_plan_path") if isinstance(metadata, Mapping) else None
+    try:
+        same_original = (
+            isinstance(recorded_source, str)
+            and canonical_direct_child(
+                Path(recorded_source), root / "plans" / "in-progress"
+            ) == source
+        )
+    except PlanLifecycleError:
+        same_original = False
+    if (
+        not isinstance(metadata, Mapping)
+        or not same_original
+        or status.status not in {"failed", "interrupted"}
+        or not admission.predecessor_inactive_for_preview(run_id)
+    ):
+        return
+    try:
+        with admission.plan_lifecycle_guard(source, source_run_id=run_id):
+            lifecycle.move(
+                source, "needs_plan_change" if invalid_plan else "failed",
+                expected_revision=revision,
+                reason_code="invalid_plan" if invalid_plan else "terminal_execution_failure",
+                reason=(
+                    "Plan structure requires correction" if invalid_plan
+                    else "Confirmed terminal execution failure"
+                ),
+                source_run_id=run_id,
+            )
+    except ProjectAdmissionConflict:
+        return
+    except PlanLifecycleError as exc:
+        raise WorkflowError(
+            "terminal plan classification could not be completed",
+            run_dir=run_dir,
+        ) from exc
+
+
 def _prepare_controller_plan_provenance(
     repo_root: Path,
     source_plan_path: Path,
@@ -5185,6 +5421,7 @@ def _prepare_required_git_tracking_before_allocation(
     terminal_completion_resume: bool = False,
     planned_execution_branch: str | None = None,
     expected_plan_bytes: bytes | None = None,
+    normalized_revision: list[str] | None = None,
 ) -> tuple[ParsedPlan, bool]:
     """Normalize required Git Tracking metadata before durable run allocation."""
     if terminal_completion_resume:
@@ -5313,6 +5550,8 @@ def _prepare_required_git_tracking_before_allocation(
         if reloaded_plan.snapshot != parsed_plan.snapshot:
             raise WorkflowError("Git Tracking normalization changed the checkpoint snapshot")
 
+        if normalized_revision is not None:
+            normalized_revision.append(hashlib.sha256(updated_text.encode("utf-8")).hexdigest())
         return reloaded_plan, deferred_base_head
 
     if is_resume or startup_retry is not None:
@@ -5373,6 +5612,8 @@ def _prepare_required_git_tracking_before_allocation(
     if reloaded_plan.snapshot != parsed_plan.snapshot:
         raise WorkflowError("Git Tracking normalization changed the checkpoint snapshot")
 
+    if normalized_revision is not None:
+        normalized_revision.append(hashlib.sha256(updated_text.encode("utf-8")).hexdigest())
     return reloaded_plan, deferred_base_head
 
 
@@ -6922,6 +7163,56 @@ def _validate_terminal_completion_resume_context(
         )
 
 
+def _validated_resume_execution_context(
+    primary_root: Path,
+    resume_ctx: ResumeContext,
+    *,
+    terminal_completion_resume: bool,
+) -> ExecutionContext | None:
+    """Validate and materialize a resumed lifecycle boundary exactly once."""
+    if terminal_completion_resume:
+        _validate_terminal_completion_resume_context(primary_root, resume_ctx)
+        if resume_ctx.main_branch is not None and resume_ctx.feature_branch is not None:
+            return ExecutionContext(
+                primary_repo_root=primary_root,
+                execution_repo_root=primary_root,
+                main_branch=resume_ctx.main_branch,
+                feature_branch=resume_ctx.feature_branch,
+                worktree_path=None,
+                setup=resume_ctx.setup,
+                teardown=resume_ctx.teardown,
+            )
+        return None
+    if "worktree" in resume_ctx.setup:
+        _validate_worktree_resume_context(primary_root, resume_ctx)
+        assert resume_ctx.worktree_path is not None
+        assert resume_ctx.main_branch is not None
+        assert resume_ctx.feature_branch is not None
+        return ExecutionContext(
+            primary_repo_root=primary_root,
+            execution_repo_root=resume_ctx.worktree_path,
+            main_branch=resume_ctx.main_branch,
+            feature_branch=resume_ctx.feature_branch,
+            worktree_path=resume_ctx.worktree_path,
+            setup=resume_ctx.setup,
+            teardown=resume_ctx.teardown,
+        )
+    if "branch" in resume_ctx.setup:
+        _validate_branch_resume_context(primary_root, resume_ctx)
+        assert resume_ctx.main_branch is not None
+        assert resume_ctx.feature_branch is not None
+        return ExecutionContext(
+            primary_repo_root=primary_root,
+            execution_repo_root=primary_root,
+            main_branch=resume_ctx.main_branch,
+            feature_branch=resume_ctx.feature_branch,
+            worktree_path=None,
+            setup=resume_ctx.setup,
+            teardown=resume_ctx.teardown,
+        )
+    return None
+
+
 def _execute_merge_handoff(
     exec_ctx: ExecutionContext,
     wf: WorkflowConfig,
@@ -7168,7 +7459,7 @@ def _discover_session_driver(adapter: HarnessAdapter, *, repo_root: Path | None 
         return None
 
 
-def run_workflow(
+def _run_workflow_unchecked(
     config: ControllerConfig,
     workflow_config: WorkflowUserConfig,
     workflow_name: str,
@@ -7190,6 +7481,8 @@ def run_workflow(
     source_session_driver: SessionDriver | None = None,
     allow_existing_launch_manifest: bool = False,
     snapshot_config: bool = True,
+    _admission: object | None = None,
+    _admission_reservation_nonce: str | None = None,
 ) -> ControllerRunResult:
     config_dir = Path(config_dir)
     live_config_source_path: Path | None = None
@@ -7382,6 +7675,113 @@ def run_workflow(
         write_launch_phase,
     )
 
+    resumed_execution_context: ExecutionContext | None = None
+    resume_lifecycle_validated = False
+    direct_resume_admission_proof: object | None = None
+    validated_resume_marker = (
+        _resume_context_validation_marker(resume)
+        if resume is not None
+        else None
+    )
+    if (
+        _admission is not None
+        and _admission_reservation_nonce is None
+        and resume is not None
+        and config.restarted_from_run_id is None
+    ):
+        # Direct callers have already crossed the ResumeContext/lifecycle
+        # boundary. Materialize that validation as an opaque capability for
+        # shared admission; daemon-owned requests never receive this proof.
+        resumed_execution_context = _validated_resume_execution_context(
+            config.repo_root,
+            resume,
+            terminal_completion_resume=terminal_completion_resume,
+        )
+        resume_lifecycle_validated = True
+        if validated_resume_marker is not None:
+            # Admission authority comes only from the private marker attached
+            # by durable resume reconstruction.  Public lifecycle fields may
+            # still materialize an execution context, but they must fall
+            # through to canonical predecessor evidence for admission.
+            from .project_admission import _make_direct_resume_admission_proof
+
+            direct_resume_admission_proof = _make_direct_resume_admission_proof(
+                resume.resumed_from_run_id
+            )
+
+    admission_run_id: str | None = None
+    admission_nonce: str | None = None
+    admission_claimed = False
+    admission_bound = False
+
+    def release_unbound_admission(reason: str) -> None:
+        """Release only a claim that never reached launch identity binding."""
+        if (
+            _admission is None
+            or not admission_claimed
+            or admission_bound
+            or admission_run_id is None
+            or admission_nonce is None
+        ):
+            return
+        try:
+            _admission.release(
+                admission_run_id,
+                admission_nonce,
+                reason=reason,
+            )
+        except Exception:
+            # A partially published or otherwise ambiguous launch must remain
+            # fail-closed. Preserve the original pre-bind failure and let the
+            # admission journal be reconciled from canonical evidence.
+            pass
+
+    if _admission is not None:
+        # Startup/preflight above is deliberately side-effect free.  Admit
+        # only after it has passed, immediately before the existing immutable
+        # launch-manifest boundary and before lifecycle worktree/provider work.
+        requested_run_id = config.reserved_run_id
+        if requested_run_id is None:
+            requested_run_id = validate_run_id(
+                datetime.now(timezone.utc).strftime("%Y%m%dt%H%M%Sz").lower()
+                + "-"
+                + uuid4().hex[:8]
+            )
+            config = replace(config, reserved_run_id=requested_run_id)
+        admission_run_id = requested_run_id
+        source_run_id = config.restarted_from_run_id or (
+            resume.resumed_from_run_id if resume is not None else None
+        )
+        if source_run_id is not None and direct_resume_admission_proof is None:
+            if (
+                resume is not None
+                and config.restarted_from_run_id is None
+                and _admission_reservation_nonce is None
+            ):
+                from .project_admission import _validate_source_provenance_id
+
+                source_run_id = _validate_source_provenance_id(source_run_id)
+            else:
+                source_run_id = validate_run_id(source_run_id)
+        if _admission_reservation_nonce is not None:
+            _admission.consume(requested_run_id, _admission_reservation_nonce)
+            admission_nonce = _admission_reservation_nonce
+            admission_claimed = True
+            # A worker nonce is issued by the daemon after its launch intent
+            # exists, so consuming it is already a bound admission transition.
+            admission_bound = True
+        else:
+            reservation = _admission.acquire(
+                requested_run_id,
+                plan_path=config.plan_path.resolve(),
+                idempotency_key=config.idempotency_key or f"run-{requested_run_id}",
+                source_run_id=source_run_id,
+                _direct_resume_proof=direct_resume_admission_proof,
+            )
+            admission_nonce = reservation.nonce
+            admission_claimed = True
+            admission_bound = bool(getattr(reservation, "bound", False))
+
     try:
         reserved_run_id = reserve_run_id(config.repo_root, config.reserved_run_id)
         launch_manifest = LaunchManifest(
@@ -7420,7 +7820,19 @@ def run_workflow(
         else:
             launch_result = create_launch_manifest(config.repo_root, launch_manifest)
     except (ValueError, RunIdentityConflict) as exc:
+        release_unbound_admission(reason="launch_identity_rejected")
         raise WorkflowError(f"cannot reserve run identity: {exc}") from exc
+    except Exception:
+        release_unbound_admission(reason="launch_identity_failed")
+        raise
+
+    if _admission is not None and admission_claimed and not admission_bound:
+        # The immutable manifest is the logical-run boundary. Set the local
+        # guard before the journal transition so a transition failure cannot
+        # free a claim whose canonical identity is already published.
+        admission_bound = True
+        _admission.bind(reserved_run_id, admission_nonce)
+
     if not launch_result.created and not allow_existing_launch_manifest:
         # The daemon/service layer consumes this proven replay result directly.
         # A controller process must never attach itself as a second child.
@@ -8303,49 +8715,14 @@ def run_workflow(
 
             _validate_scope_envelope_bytes(scope, envelope_path.read_bytes())
         try:
-            if terminal_completion_resume:
-                _validate_terminal_completion_resume_context(config.repo_root, resume)
-                if resume.main_branch is not None and resume.feature_branch is not None:
-                    exec_ctx = ExecutionContext(
-                        primary_repo_root=config.repo_root,
-                        execution_repo_root=config.repo_root,
-                        main_branch=resume.main_branch,
-                        feature_branch=resume.feature_branch,
-                        worktree_path=None,
-                        setup=resume.setup,
-                        teardown=resume.teardown,
-                    )
-                else:
-                    exec_ctx = None
-            elif "worktree" in resume.setup:
-                _validate_worktree_resume_context(config.repo_root, resume)
-                assert resume.worktree_path is not None
-                assert resume.main_branch is not None
-                assert resume.feature_branch is not None
-                exec_ctx = ExecutionContext(
-                    primary_repo_root=config.repo_root,
-                    execution_repo_root=resume.worktree_path,
-                    main_branch=resume.main_branch,
-                    feature_branch=resume.feature_branch,
-                    worktree_path=resume.worktree_path,
-                    setup=resume.setup,
-                    teardown=resume.teardown,
-                )
-            elif "branch" in resume.setup:
-                _validate_branch_resume_context(config.repo_root, resume)
-                assert resume.main_branch is not None
-                assert resume.feature_branch is not None
-                exec_ctx = ExecutionContext(
-                    primary_repo_root=config.repo_root,
-                    execution_repo_root=config.repo_root,
-                    main_branch=resume.main_branch,
-                    feature_branch=resume.feature_branch,
-                    worktree_path=None,
-                    setup=resume.setup,
-                    teardown=resume.teardown,
-                )
+            if resume_lifecycle_validated:
+                exec_ctx = resumed_execution_context
             else:
-                exec_ctx = None
+                exec_ctx = _validated_resume_execution_context(
+                    config.repo_root,
+                    resume,
+                    terminal_completion_resume=terminal_completion_resume,
+                )
             if not terminal_completion_resume:
                 _sync_startup_plan_metadata_for_execution(
                     original_plan_path,
@@ -10643,6 +11020,27 @@ def run_workflow(
                     source_scope.carried_reviewer_rejection_count
                 ),
             )
+        replayed_rejection = replayed_boundary.review_rejection
+        replay_scope = state.active_implementation_scope
+        if (
+            replayed_rejection is not None
+            and replay_scope is not None
+            and replayed_rejection.scope_id == replay_scope.scope_id
+            and not any(
+                item.scope_id == replayed_rejection.scope_id
+                and item.rejection_number == replayed_rejection.rejection_number
+                and item.reviewed_attempt_ordinal
+                == replayed_rejection.reviewed_attempt_ordinal
+                and item.review_turn_number == replayed_rejection.review_turn_number
+                and item.reviewed_implementation_turn_number
+                == replayed_rejection.reviewed_implementation_turn_number
+                for item in state.review_rejection_history
+            )
+        ):
+            # The result artifact is the only accepted source for a rejection
+            # that was finalized before the controller ledger write. Matching
+            # its scope makes replay idempotent and prevents cross-scope credit.
+            _append_replayed_review_rejection(state, replayed_rejection)
         post_transition_active_path = _select_next_active_plan_path(
             original_plan_path=original_plan_path,
             active_plan_path=active_plan_path,
@@ -11878,6 +12276,9 @@ def run_workflow(
         followup_candidates_before: set[Path] = set()
         consume_manager_notes = False
         consume_team_override = False
+        attempt_repair_ordinal: int | None = None
+        attempt_team_repairs_completed: int | None = None
+        attempt_ordinal: int | None = None
         turn_session_request: SessionRequest | None = None
         owned_session_result = None
         cross_handover_prompt = ""
@@ -11961,6 +12362,31 @@ def run_workflow(
             ):
                 active_team_name = pending_override.target_team
                 consume_team_override = True
+                attempt_repair_ordinal = pending_override.repair_ordinal
+                attempt_team_repairs_completed = pending_override.team_repairs_completed
+            if step.role == "worker" and state.active_implementation_scope is not None:
+                if attempt_repair_ordinal is None:
+                    prelaunch_policy = determine_repair_upgrade_policy(
+                        workflow_config,
+                        threshold=wf.upgrade_after_repairs,
+                        role="worker",
+                        baseline_team=baseline_team_name,
+                        scope_id=state.active_implementation_scope.scope_id,
+                        attempts=state.implementation_attempts.get(
+                            state.active_implementation_scope.scope_id, []
+                        ),
+                        rejections=state.review_rejection_history,
+                    )
+                    attempt_repair_ordinal = (
+                        prelaunch_policy.repair_ordinal
+                        if prelaunch_policy.active
+                        else 0
+                    )
+                    attempt_team_repairs_completed = (
+                        prelaunch_policy.team_repairs_completed
+                        if prelaunch_policy.active
+                        else 0
+                    )
             selector, resolved = _resolve_step_runtime(
                 step,
                 workflow_config,
@@ -12302,6 +12728,31 @@ def run_workflow(
             ):
                 active_team_name = pending_override.target_team
                 consume_team_override = True
+                attempt_repair_ordinal = pending_override.repair_ordinal
+                attempt_team_repairs_completed = pending_override.team_repairs_completed
+            if step.role == "worker" and state.active_implementation_scope is not None:
+                if attempt_repair_ordinal is None:
+                    prelaunch_policy = determine_repair_upgrade_policy(
+                        workflow_config,
+                        threshold=wf.upgrade_after_repairs,
+                        role="worker",
+                        baseline_team=baseline_team_name,
+                        scope_id=state.active_implementation_scope.scope_id,
+                        attempts=state.implementation_attempts.get(
+                            state.active_implementation_scope.scope_id, []
+                        ),
+                        rejections=state.review_rejection_history,
+                    )
+                    attempt_repair_ordinal = (
+                        prelaunch_policy.repair_ordinal
+                        if prelaunch_policy.active
+                        else 0
+                    )
+                    attempt_team_repairs_completed = (
+                        prelaunch_policy.team_repairs_completed
+                        if prelaunch_policy.active
+                        else 0
+                    )
             selector, resolved = _resolve_step_runtime(
                 step,
                 workflow_config,
@@ -12551,6 +13002,14 @@ def run_workflow(
                     new_path=new_plan_path,
                 )
 
+        if step.role == "worker" and state.active_implementation_scope is not None:
+            attempt_ordinal = _next_implementation_attempt_ordinal(
+                state.implementation_attempts.get(
+                    state.active_implementation_scope.scope_id,
+                    [],
+                )
+            )
+
         turn_dir, turn_started_at = _start_turn(
             turn_number=turn_number,
             step_name=current_step_name,
@@ -12588,8 +13047,12 @@ def run_workflow(
                 )
             if consume_manager_notes:
                 state.pending_manager_notes = None
-            if consume_team_override:
-                state.pending_step_team_override = None
+            # Keep the selected worker route durable through the provider
+            # launch boundary.  Clearing it here leaves a prelaunch resume
+            # with only the baseline team, even though the override was
+            # already selected and persisted in the turn metadata.  The
+            # finalized-turn path below clears it after the provider result
+            # has been recorded.
             boundary_target_started = (
                 state.pending_boundary_decision is not None
                 and not state.pending_boundary_decision.consumed
@@ -13202,6 +13665,7 @@ def run_workflow(
                     reviewed_implementation_turn_number=reviewed_attempt.turn_number,
                     reviewed_worker_team=reviewed_attempt.team,
                     reviewed_worker_selector=reviewed_attempt.selector,
+                    reviewed_attempt_ordinal=reviewed_attempt.attempt_ordinal,
                     review_summary=summarize_review_rejection(completed.stdout),
                     repair_plan_summary=summarize_repair_plan(repair_path),
                     review_stdout_artifact_path=_turn_artifact_display_path(
@@ -13288,6 +13752,9 @@ def run_workflow(
                 outcome="accepted" if done else "progress",
                 manager_decision_number=(state.pending_boundary_decision.decision_number
                     if state.pending_boundary_decision is not None else None),
+                repair_ordinal=attempt_repair_ordinal,
+                team_repairs_completed=attempt_team_repairs_completed,
+                attempt_ordinal=attempt_ordinal,
             ))
             next_config = (
                 wf.steps.get(transition_target)
@@ -13299,6 +13766,8 @@ def run_workflow(
                     next_config is not None and next_config.role != "worker"
                 ),
             )
+            if consume_team_override:
+                state.pending_step_team_override = None
 
         post_transition_active_path = _select_next_active_plan_path(
             original_plan_path=original_plan_path,
@@ -13577,3 +14046,86 @@ def run_workflow(
     )
     banner.stop(state)
     raise WorkflowError(summary, run_dir=run_paths.run_dir)
+
+
+def run_workflow(
+    config: ControllerConfig,
+    workflow_config: WorkflowUserConfig,
+    workflow_name: str,
+    *,
+    parsed_plan: ParsedPlan | None = None,
+    startup_retry: RetryContext | None = None,
+    startup_base_head_refresh_sha: str | None = None,
+    dirty_worktree_confirmed: bool | None = None,
+    config_dir: Path,
+    working_dir: Path | None = None,
+    adapter: HarnessAdapter | None = None,
+    runner: Callable[..., subprocess.CompletedProcess[str]] | None = None,
+    preflight_probe: HarnessPreflightProbe | None = None,
+    banner: BannerRenderer | None = None,
+    resume: ResumeContext | None = None,
+    observer: ExecutionObserver | None = None,
+    control_source: Callable[[], object] | None = None,
+    session_driver: SessionDriver | None = None,
+    source_session_driver: SessionDriver | None = None,
+    allow_existing_launch_manifest: bool = False,
+    snapshot_config: bool = True,
+    admission_reservation_nonce: str | None = None,
+) -> ControllerRunResult:
+    """Admit one logical run after preflight and before execution work.
+
+    The legacy controller body remains deliberately unaware of the scheduling
+    journal.  This wrapper is the public boundary used by the CLI, API runner,
+    and daemon worker, so all of them make one project-scoped capacity decision
+    after side-effect-free startup validation and before lifecycle/provider work.
+    A worker receives the parent's nonce and consumes that reservation instead
+    of creating a second one.
+    """
+    from .project_admission import ProjectAdmission
+    from .plan_lifecycle import PlanLifecycle, PlanLifecycleError
+
+    admission = ProjectAdmission(config.repo_root)
+    try:
+        PlanLifecycle(config.repo_root).recover_for_path(config.plan_path)
+    except PlanLifecycleError as exc:
+        raise WorkflowError("plan lifecycle recovery needs attention") from exc
+    try:
+        return _run_workflow_unchecked(
+            config,
+            workflow_config,
+            workflow_name,
+            parsed_plan=parsed_plan,
+            startup_retry=startup_retry,
+            startup_base_head_refresh_sha=startup_base_head_refresh_sha,
+            dirty_worktree_confirmed=dirty_worktree_confirmed,
+            config_dir=config_dir,
+            working_dir=working_dir,
+            adapter=adapter,
+            runner=runner,
+            preflight_probe=preflight_probe,
+            banner=banner,
+            resume=resume,
+            observer=observer,
+            control_source=control_source,
+            session_driver=session_driver,
+            source_session_driver=source_session_driver,
+            allow_existing_launch_manifest=allow_existing_launch_manifest,
+            snapshot_config=snapshot_config,
+            _admission=admission,
+            _admission_reservation_nonce=admission_reservation_nonce,
+        )
+    except WorkflowError as exc:
+        _classify_failed_original_plan(config, exc, admission)
+        raise
+    finally:
+        # The journal only frees terminal or explicitly inactive claims.  It
+        # intentionally leaves an ambiguous launch occupied across crashes or
+        # missing-PID observations for a later reconciliation pass.
+        if admission.state_path.exists():
+            try:
+                admission.reconcile()
+            except Exception:
+                # The controller's own durable outcome remains authoritative.
+                # A transient observer failure must not replace it with a
+                # provider error or accidentally free capacity.
+                pass

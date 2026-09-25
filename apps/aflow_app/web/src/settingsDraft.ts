@@ -162,10 +162,18 @@ export function settingsActions(base: GuidedFormProjection, draft: GuidedFormPro
   if ((draft.default_manager_enabled ?? null) !== (base.default_manager_enabled ?? null)) {
     declarations.push({ type: 'set_default_manager_enabled', value: draft.default_manager_enabled ?? null })
   }
+  if ((draft.default_upgrade_after_repairs ?? null) !== (base.default_upgrade_after_repairs ?? null)
+      && draft.default_upgrade_after_repairs !== null && draft.default_upgrade_after_repairs !== undefined) {
+    declarations.push({ type: 'set_default_upgrade_after_repairs', value: draft.default_upgrade_after_repairs })
+  }
   for (const workflow of sortedKeys(base.workflows, draft.workflows)) {
     const declared = draft.workflows[workflow]?.manager_enabled ?? null
     if ((base.workflows[workflow]?.manager_enabled ?? null) !== declared) {
       declarations.push({ type: 'set_workflow_manager_enabled', workflow, value: declared })
+    }
+    const upgrade = draft.workflows[workflow]?.upgrade_after_repairs ?? null
+    if ((base.workflows[workflow]?.upgrade_after_repairs ?? null) !== upgrade) {
+      declarations.push({ type: 'set_workflow_upgrade_after_repairs', workflow, value: upgrade })
     }
   }
 
@@ -266,9 +274,34 @@ export function retainServerProjection(declarations: GuidedFormProjection, proje
       ...current,
       effective_manager_enabled: serverWorkflow.effective_manager_enabled ?? current.effective_manager_enabled,
       manager_enabled_source: serverWorkflow.manager_enabled_source ?? current.manager_enabled_source,
+      effective_upgrade_after_repairs: serverWorkflow.effective_upgrade_after_repairs ?? current.effective_upgrade_after_repairs,
+      upgrade_after_repairs_source: serverWorkflow.upgrade_after_repairs_source ?? current.upgrade_after_repairs_source,
     }
   }
+  next.effective_default_upgrade_after_repairs = projected.effective_default_upgrade_after_repairs ?? next.effective_default_upgrade_after_repairs
   return next
+}
+
+/** Show repair policy from live declarations while the canonical preview runs. */
+export function repairThresholdDisplay(
+  draft: GuidedFormProjection, workflow?: string,
+): { value: number | null; source: string } {
+  const defaultValue = draft.default_upgrade_after_repairs ?? draft.effective_default_upgrade_after_repairs ?? 1
+  if (!workflow) return { value: defaultValue, source: 'defaults' }
+  const current = draft.workflows[workflow]
+  if (!current) return { value: defaultValue, source: 'defaults' }
+  if (current.upgrade_after_repairs != null) {
+    return { value: current.upgrade_after_repairs, source: 'workflow' }
+  }
+  const priorSource = current.upgrade_after_repairs_source
+  if (priorSource?.startsWith('base:')) {
+    const base = draft.workflows[priorSource.slice('base:'.length)]
+    return { value: base?.upgrade_after_repairs ?? defaultValue, source: priorSource }
+  }
+  // An override was just cleared. Its alias relationship is only known to
+  // the server, so avoid displaying the old source while that preview resolves.
+  if (priorSource === 'workflow') return { value: null, source: 'updating' }
+  return { value: defaultValue, source: 'defaults' }
 }
 
 function previewValidationError(response: ProjectConfigFormResponse, message: string): TeamFamilyError | null {

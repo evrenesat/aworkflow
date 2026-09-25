@@ -50,6 +50,19 @@ def _owned_run(root: Path, run_id: str = "owned-run", *, status: str = "running"
     return run_dir
 
 
+def test_repository_exposes_shared_project_settings_without_migration(
+    tmp_path: Path,
+) -> None:
+    repository = RunRepository(tmp_path)
+
+    snapshot = repository.project_settings.read()
+
+    assert snapshot.settings.auto_consume_plans is True
+    assert snapshot.settings.max_concurrent_implementations == 2
+    assert snapshot.persisted is False
+    assert not (tmp_path / ".aflow").exists()
+
+
 def test_repository_lists_stable_plan_and_run_metadata(tmp_path: Path) -> None:
     (tmp_path / "plans" / "todo").mkdir(parents=True)
     (tmp_path / "plans" / "todo" / "zeta.md").write_text("# Zeta\n")

@@ -1,8 +1,11 @@
 import json
 from pathlib import Path
 import subprocess
+from concurrent.futures import ThreadPoolExecutor
+from threading import Event, Lock
 
 import pytest
+import aflow.publication as publication_module
 
 from aflow.publication import (
     PlanLifecycleError,
@@ -118,8 +121,9 @@ def test_opt_out_is_noop(tmp_path):
     assert not (tmp_path / "run").exists()
 
 
-def test_completed_commit_reaches_main_and_repeat_is_idempotent(repos):
+def test_completed_commit_reaches_main_and_repeat_is_idempotent(repos, monkeypatch):
     source, remote, _, run = repos
+    monkeypatch.setenv("GIT_CONFIG_GLOBAL", "/dev/null")
     head = commit(source, "feature", "approved")
     run.mkdir()
     lifecycle = {"phase": "moved", "source": "plans/in-progress/plan.md"}
@@ -130,11 +134,59 @@ def test_completed_commit_reaches_main_and_repeat_is_idempotent(repos):
     assert publish_completed_run(source, run) == head
     assert git(remote, "rev-parse", "main") == head
     assert git(source, "branch", "--show-current") == "feature"
+    assert git(source, "status", "--porcelain") == ""
+    assert (source / ".git" / "publication.lock").is_file()
+    assert not (source / ".aflow").exists()
     assert publish_completed_run(source, run) == head
     receipt = json.loads((run / "publication.json").read_text())
     assert receipt["status"] == "published"
     assert receipt["plan_lifecycle"] == lifecycle
     assert receipt["future_field"] == "retain"
+
+
+def test_parallel_publication_enters_shared_main_boundary_one_at_a_time(repos, monkeypatch):
+    source, _, _, run = repos
+    linked = source.parent / "linked"
+    git(source, "worktree", "add", "--detach", str(linked), "HEAD")
+    entered = Event()
+    release = Event()
+    guard = Lock()
+    active = 0
+    maximum = 0
+
+    def publish_locked(*_args):
+        nonlocal active, maximum
+        with guard:
+            active += 1
+            maximum = max(maximum, active)
+            entered.set()
+        release.wait(2)
+        with guard:
+            active -= 1
+        return "a" * 40
+
+    monkeypatch.setattr(publication_module, "_publish_completed_run_locked", publish_locked)
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        first = executor.submit(publish_completed_run, source, run)
+        assert entered.wait(2)
+        second = executor.submit(publish_completed_run, linked, run)
+        try:
+            assert not second.done()
+        finally:
+            release.set()
+        assert first.result(timeout=3) == "a" * 40
+        assert second.result(timeout=3) == "a" * 40
+    assert maximum == 1
+    assert (source / ".git" / "publication.lock").is_file()
+    assert not (source / ".aflow").exists()
+    assert not (linked / ".aflow").exists()
+
+
+def test_publication_lock_requires_git_identity(tmp_path):
+    with pytest.raises(PublicationError, match="Git common directory is unavailable"):
+        with publication_module._publication_lock(tmp_path):
+            pass
+    assert not (tmp_path / ".aflow").exists()
 
 
 def test_dirty_execution_is_not_published(repos):

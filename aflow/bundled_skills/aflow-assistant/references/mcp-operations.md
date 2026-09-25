@@ -29,10 +29,11 @@ or supply arbitrary filesystem roots. Missing projects need registration via
 the existing browser flow, not a fabricated MCP registration call. Skill
 installation also remains a separate operation.
 
-The full UI registry currently has 14 lifecycle tools, eight authoring tools,
-and three read-only resource templates. A lifecycle-only registry does not
-promise authoring support. The live schemas and capabilities decide what is
-available; an installed reference is not evidence that a tool is connected.
+The UI registry includes lifecycle, authoring, and scheduling tools plus
+read-only resource templates. A lifecycle-only registry does not promise
+authoring or scheduling support. The live schemas and capabilities decide
+what is available; an installed reference is not evidence that a tool is
+connected.
 
 ## Read tools
 
@@ -57,10 +58,16 @@ available; an installed reference is not evidence that a tool is connected.
 - `get_global_config()` reads the revisioned `aflow.toml`/`workflows.toml`
   pair and its configuration view. These settings are shared across registered
   projects; read them to select existing workflows and teams.
+- `get_project_scheduling(project_id)` reads the revisioned automatic-consumption
+  toggle and concurrent-implementation limit (defaults: enabled and two).
+  `get_project_queue(project_id)` reads ready, held, claimed, and capacity
+  evidence. Consult it after promotion and before a manual start.
 - `list_plan_documents(project_id, plan_status=None)` lists editable document
   identities and revisions. `read_plan(project_id, plan_status, name)` reads
-  the Markdown. Status values are `todo`, `in_progress`, and `done`; the disk
-  directory for `in_progress` is `plans/in-progress`.
+  the Markdown. Status values are `todo`, `in_progress`, `done`, `failed`, and
+  `needs_plan_change`, stored under the matching five `plans/` directories
+  (`in_progress` uses `in-progress`; `needs_plan_change` uses
+  `needs-plan-change`).
 
 Resource templates provide equivalent read-only views:
 
@@ -96,11 +103,16 @@ available. Reads never authorize a subsequent mutation.
 6. Use `promote_plan(project_id, plan_status, name, expected_revision,
    target_name=None)` to move to the next lifecycle stage. It has no arbitrary
    destination-status argument. Promotion from todo makes the plan ready in
-   `in_progress`; promotion is not proof of review or delivery. Do not move an
+   `in_progress`; the default-on consumer may start it immediately. Inspect the
+   queue's claim/run before a manual start. Promotion is not proof of review or
+   delivery. Do not move an
    active controller's source plan to done manually.
 7. Resolve the resulting path from returned document/lifecycle metadata using
    `list_plan_documents` and `list_plans`; retain the returned name after any
-   rename. Preflight the exact ready plan before starting it.
+   rename. Inspect `get_project_queue` and existing runs first; preflight the
+   exact ready plan before starting it if no claim exists. Corrected inactive
+   failed or `needs_plan_change` plans use `requeue_plan` with their latest
+   revision and a retained idempotency key; they are never retried implicitly.
 
 Only change global settings when the requested work requires that change and
 authorization covers its shared effect. Prefer per-run workflow/team/max-turn

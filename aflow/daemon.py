@@ -81,6 +81,12 @@ from aflow.control_plane.persistence import (
     _contained_directory,
     normalized_request_digest,
 )
+from aflow.project_admission import (
+    ProjectAdmission,
+    ProjectAdmissionError,
+    ProjectCapacityReached,
+    ProjectAutomaticPlanChanged,
+)
 from aflow.control_plane.units import UnitManager, UnitState
 from aflow.git_status import WorktreePreflight
 from aflow.harnesses import ADAPTERS
@@ -394,6 +400,10 @@ class DaemonService:
         self._workflow_config = workflow_config
         self._lock = RLock()
         self._transient_extra_instructions: dict[str, tuple[str, ...]] = {}
+        self._admission = ProjectAdmission(
+            config.repo_root,
+            unit_manager=application.units,
+        )
 
     def _refresh_workflow_config(self) -> None:
         """Reload the workflow pair so global edits apply to new runs immediately.
@@ -409,17 +419,186 @@ class DaemonService:
         except ConfigError as exc:
             raise DaemonError(f"workflow configuration is invalid: {exc}") from exc
 
+    def _ensure_admission(
+        self,
+        run_id: str,
+        *,
+        plan_path: Path,
+        idempotency_key: str | None,
+        source_run_id: str | None = None,
+        expected_plan_revision: str | None = None,
+        expected_plan_identity: str | None = None,
+        automatic: bool = False,
+    ):
+        """Ensure one daemon request owns a shared project reservation."""
+        try:
+            return self._admission.ensure(
+                run_id,
+                plan_path=plan_path,
+                idempotency_key=idempotency_key,
+                source_run_id=source_run_id,
+                expected_plan_revision=expected_plan_revision,
+                expected_plan_identity=expected_plan_identity,
+                automatic=automatic,
+            )
+        except ProjectCapacityReached as exc:
+            raise DaemonStartupError(
+                validate_run_id(run_id),
+                exc.safe_message,
+                code=ProjectCapacityReached.code,
+            ) from exc
+        except ProjectAdmissionError as exc:
+            raise DaemonStartupError(
+                validate_run_id(run_id),
+                exc.safe_message,
+                code=exc.code,
+            ) from exc
+
+    def _release_unbound_admission(
+        self,
+        run_id: str,
+        nonce: str,
+        *,
+        reason: str,
+        claim_retained: bool = False,
+    ) -> None:
+        """Release a reservation only for a failed pre-manifest operation."""
+        try:
+            self._admission.release(
+                run_id,
+                nonce,
+                reason=reason,
+                claim_retained=claim_retained,
+            )
+        except ProjectAdmissionError:
+            # A published manifest or another process may already own the
+            # identity.  Reconciliation must keep that claim fail-closed.
+            _logger.warning("could not release prelaunch admission for %s", run_id)
+
+    @staticmethod
+    def _path_exists(path: Path | None) -> bool:
+        """Treat broken symlinks as existing artifacts during cleanup."""
+        if path is None:
+            return False
+        return path.exists() or path.is_symlink()
+
+    @staticmethod
+    def _regular_file_bytes(path: Path) -> bytes | None:
+        """Read one owned-artifact candidate without following symlinks."""
+        if path.is_symlink() or not path.is_file():
+            return None
+        try:
+            return path.read_bytes()
+        except OSError:
+            return None
+
+    @classmethod
+    def _remove_owned_file(
+        cls,
+        path: Path | None,
+        *,
+        owned: bool,
+        expected: bytes | None,
+    ) -> bool:
+        """Remove only an artifact whose pre-publication ownership is proven."""
+        if not owned or path is None:
+            return True
+        if not cls._path_exists(path):
+            return True
+        if expected is None or path.is_symlink() or not path.is_file():
+            return False
+        if cls._regular_file_bytes(path) != expected:
+            return False
+        try:
+            path.unlink()
+        except OSError:
+            return False
+        return True
+
+    @classmethod
+    def _remove_owned_empty_directory(
+        cls,
+        path: Path | None,
+        *,
+        created: bool,
+    ) -> bool:
+        """Remove only a directory created by this publication if still empty."""
+        if not created or path is None:
+            return True
+        if not cls._path_exists(path):
+            return True
+        if path.is_symlink() or not path.is_dir():
+            return False
+        try:
+            if any(path.iterdir()):
+                return False
+            path.rmdir()
+        except OSError:
+            return False
+        return True
+
+    def _cleanup_unbound_resume_publication(
+        self,
+        *,
+        manifest_path: Path,
+        manifest_owned: bool,
+        manifest_bytes: bytes | None,
+        phase_path: Path,
+        phase_owned: bool,
+        phase_bytes: bytes | None,
+        successor_dir: Path | None,
+        successor_dir_created: bool,
+        record_path: Path | None,
+        record_owned: bool,
+        record_bytes: bytes | None,
+    ) -> bool:
+        """Undo only the artifacts proven to belong to a failed resume publish."""
+        return all(
+            (
+                self._remove_owned_file(
+                    record_path,
+                    owned=record_owned,
+                    expected=record_bytes,
+                ),
+                self._remove_owned_empty_directory(
+                    successor_dir,
+                    created=successor_dir_created,
+                ),
+                self._remove_owned_file(
+                    phase_path,
+                    owned=phase_owned,
+                    expected=phase_bytes,
+                ),
+                self._remove_owned_file(
+                    manifest_path,
+                    owned=manifest_owned,
+                    expected=manifest_bytes,
+                ),
+            )
+        )
+
     def start(
         self,
         request: StartupRequest,
         *,
         caller_scope: str = "local",
         idempotency_key: str | None = None,
+        expected_plan_revision: str | None = None,
+        expected_plan_identity: str | None = None,
+        automatic: bool = False,
     ) -> StartRunResult | StartupQuestionRecord:
         """Reserve durable intent before evaluating the interactive startup gate."""
         lineage_lock = self._durable_lock(".restart-locks", validate_run_id(request.restarted_from_run_id)) if request.restarted_from_run_id else nullcontext()
         with self._lock, lineage_lock, self._idempotency_lock("start", caller_scope, idempotency_key):
-            self._refresh_workflow_config()
+            try:
+                self._refresh_workflow_config()
+            except DaemonError as exc:
+                if not automatic:
+                    raise
+                raise DaemonStartupError(
+                    None, "automatic default workflow configuration is unavailable",
+                    code="automatic_default_unavailable",
+                ) from exc
             normalized = self._normalize_request(
                 request,
                 caller_scope=caller_scope,
@@ -455,26 +634,75 @@ class DaemonService:
                 self._transient_extra_instructions[existing.run_id] = normalized.extra_instructions
                 return self._recover_start_manifest(existing, normalized, request_digest)
 
-            self._prepare_required_git_tracking_before_reservation(normalized)
-            run_id = reserve_run_id(self._config.repo_root)
-            self._transient_extra_instructions[run_id] = normalized.extra_instructions
-            effective_key = idempotency_key or f"daemon-{run_id}"
-            manifest = self._initial_manifest_for(
-                run_id=run_id,
-                request=normalized,
-                caller_scope=caller_scope,
-                idempotency_key=effective_key,
-            )
+            if automatic:
+                name = self._workflow_config.aflow.default_workflow
+                workflow = self._workflow_config.workflows.get(name) if name else None
+                if (
+                    request.workflow_name is not None or request.team is not None
+                    or workflow is None
+                    or tuple(workflow.setup or ()) != ("worktree", "branch")
+                    or tuple(workflow.teardown or ()) != ("merge", "rm_worktree")
+                    or workflow.main_branch is None
+                    or not self._workflow_config.aflow.worktree_root
+                    or (workflow.team is not None and workflow.team not in self._workflow_config.teams)
+                ):
+                    raise DaemonStartupError(
+                        None, "automatic default workflow is unavailable or not isolated",
+                        code="automatic_default_unavailable",
+                    )
             try:
+                if expected_plan_revision is not None:
+                    # Reject an external edit before daemon-owned preparation.
+                    self._admission._require_plan_revision_locked(
+                        normalized.plan_path, expected_plan_revision,
+                    )
+                prepared_revision = self._prepare_required_git_tracking_before_reservation(
+                    normalized, expected_plan_revision=expected_plan_revision,
+                )
+            except ProjectAdmissionError as exc:
+                raise DaemonStartupError(None, exc.safe_message, code=exc.code) from exc
+            run_id = reserve_run_id(self._config.repo_root)
+            effective_key = idempotency_key or f"daemon-{run_id}"
+            reservation = self._ensure_admission(
+                run_id,
+                plan_path=normalized.plan_path,
+                idempotency_key=effective_key,
+                source_run_id=normalized.restarted_from_run_id,
+                expected_plan_revision=prepared_revision or expected_plan_revision,
+                expected_plan_identity=expected_plan_identity,
+                automatic=automatic,
+            )
+            self._transient_extra_instructions[run_id] = normalized.extra_instructions
+            try:
+                manifest = self._initial_manifest_for(
+                    run_id=run_id,
+                    request=normalized,
+                    caller_scope=caller_scope,
+                    idempotency_key=effective_key,
+                )
                 manifest_result = create_launch_manifest(
                     self._config.repo_root, manifest
                 )
-            except (ValueError, RunIdentityConflict) as exc:
+            except (OSError, ValueError, RunIdentityConflict) as exc:
+                self._release_unbound_admission(
+                    run_id,
+                    reservation.nonce,
+                    reason="launch_manifest_rejected",
+                )
                 raise DaemonError(f"cannot reserve launch intent: {exc}") from exc
+            except DaemonError:
+                self._release_unbound_admission(
+                    run_id,
+                    reservation.nonce,
+                    reason="launch_manifest_rejected",
+                )
+                raise
             if not manifest_result.created:
+                self._admission.bind(run_id, reservation.nonce)
                 return self._recover_start_manifest(
                     manifest, normalized, request_digest
                 )
+            self._admission.bind(run_id, reservation.nonce)
             try:
                 create_run_config_snapshot(
                     repo_root=self._config.repo_root,
@@ -589,6 +817,12 @@ class DaemonService:
                 raise DaemonError("startup question is no longer awaiting an answer")
             question = _question_from_record(record)
             request = self._request_from_record(record)
+            reservation = self._ensure_admission(
+                run_id,
+                plan_path=request.plan_path,
+                idempotency_key=str(record["effective_idempotency_key"]),
+                source_run_id=request.restarted_from_run_id,
+            )
             try:
                 prepared_or_question = prepare_startup_with_answer(
                     question, request, answer
@@ -601,6 +835,7 @@ class DaemonService:
                 )
                 updated = dict(record)
                 updated["state"] = "needs_attention"
+                updated.pop("preparation_owner", None)
                 updated["startup_failure"] = startup_failure(
                     "preparation",
                     exc.safe_message,
@@ -608,6 +843,11 @@ class DaemonService:
                     kind=exc.kind,
                 )
                 self._write_record(updated)
+                self._release_unbound_admission(
+                    run_id,
+                    reservation.nonce,
+                    reason="startup_preparation_rejected",
+                )
                 raise DaemonStartupError(
                     run_id,
                     exc.safe_message,
@@ -616,8 +856,14 @@ class DaemonService:
             except StartupError as exc:
                 updated = dict(record)
                 updated["state"] = "needs_attention"
+                updated.pop("preparation_owner", None)
                 updated["startup_failure"] = startup_failure("preparation", str(exc))
                 self._write_record(updated)
+                self._release_unbound_admission(
+                    run_id,
+                    reservation.nonce,
+                    reason="startup_preparation_failed",
+                )
                 raise DaemonStartupError(run_id, updated["startup_failure"]["message"]) from exc
             if isinstance(prepared_or_question, StartupQuestion):
                 updated = dict(record)
@@ -629,7 +875,14 @@ class DaemonService:
                     prepared_or_question.continuation_request or request
                 )
                 updated["question_generation"] = question_generation + 1
+                updated.pop("preparation_owner", None)
                 self._write_record(updated)
+                self._release_unbound_admission(
+                    run_id,
+                    reservation.nonce,
+                    reason="startup_question_waiting",
+                    claim_retained=True,
+                )
                 return _question_record(
                     run_id, prepared_or_question, question_generation + 1
                 )
@@ -845,90 +1098,167 @@ class DaemonService:
             self._assert_manifest_caller(normalized_source_run_id, caller_scope)
 
             run_id = reserve_run_id(self._config.repo_root)
-            self._transient_extra_instructions[run_id] = bootstrap.extra_instructions
-            prepared = PreparedRun(
-                workflow_name=bootstrap.workflow_name,
-                repo_root=self._config.repo_root,
+            effective_key = idempotency_key or f"daemon-{run_id}"
+            reservation = self._ensure_admission(
+                run_id,
                 plan_path=bootstrap.plan_path,
-                config_path=_bootstrap_config_path(bootstrap, self._config),
-                max_turns=bootstrap.max_turns,
-                team=bootstrap.team,
-                extra_instructions=bootstrap.extra_instructions,
-                start_step=(
-                    bootstrap.start_step
-                    or _bootstrap_workflow_config(bootstrap, self).workflows[
-                        bootstrap.workflow_name
-                    ].first_step
-                    or bootstrap.workflow_name
-                ),
-                reserved_run_id=run_id,
-                idempotency_key=idempotency_key or f"daemon-{run_id}",
-                caller_scope=caller_scope,
-                team_explicit=getattr(bootstrap, "team_explicit", None),
-                max_turns_explicit=getattr(bootstrap, "max_turns_explicit", None),
-                start_step_explicit=True,
+                idempotency_key=effective_key,
+                source_run_id=normalized_source_run_id,
             )
-            manifest = self._manifest_for(
-                run_id=run_id,
-                prepared=prepared,
-                caller_scope=caller_scope,
-                idempotency_key=prepared.idempotency_key or f"daemon-{run_id}",
-                workflow_config=_bootstrap_workflow_config(bootstrap, self),
-            )
-            request_digest = normalized_request_digest(manifest)
-
-            recovery_intent = (
-                self._build_recovery_intent(
-                    source_run_id=normalized_source_run_id,
-                    target_run_id=run_id,
-                    source=source,
-                    source_manifest=source_manifest,
-                    bootstrap=bootstrap,
-                    target_request=normalized_recovery,
+            self._transient_extra_instructions[run_id] = bootstrap.extra_instructions
+            bound = False
+            launches_root = self._config.repo_root / ".aflow" / "launches"
+            manifest_path = launches_root / f"{run_id}.json"
+            phase_path = launches_root / f"{run_id}.state.json"
+            manifest_preexisting = self._path_exists(manifest_path)
+            phase_preexisting = self._path_exists(phase_path)
+            publication_cleanup_safe = not manifest_preexisting
+            manifest_owned = False
+            manifest_bytes: bytes | None = None
+            phase_owned = False
+            phase_bytes: bytes | None = None
+            successor_dir: Path | None = None
+            successor_dir_created = False
+            record_path: Path | None = None
+            record_preexisting = False
+            record_owned = False
+            record_bytes: bytes | None = None
+            try:
+                prepared = PreparedRun(
+                    workflow_name=bootstrap.workflow_name,
+                    repo_root=self._config.repo_root,
+                    plan_path=bootstrap.plan_path,
+                    config_path=_bootstrap_config_path(bootstrap, self._config),
+                    max_turns=bootstrap.max_turns,
+                    team=bootstrap.team,
+                    extra_instructions=bootstrap.extra_instructions,
+                    start_step=(
+                        bootstrap.start_step
+                        or _bootstrap_workflow_config(bootstrap, self).workflows[
+                            bootstrap.workflow_name
+                        ].first_step
+                        or bootstrap.workflow_name
+                    ),
+                    reserved_run_id=run_id,
+                    idempotency_key=effective_key,
+                    caller_scope=caller_scope,
+                    team_explicit=getattr(bootstrap, "team_explicit", None),
+                    max_turns_explicit=getattr(bootstrap, "max_turns_explicit", None),
+                    start_step_explicit=True,
                 )
-                if normalized_recovery is not None
-                else None
-            )
+                manifest = self._manifest_for(
+                    run_id=run_id,
+                    prepared=prepared,
+                    caller_scope=caller_scope,
+                    idempotency_key=prepared.idempotency_key or f"daemon-{run_id}",
+                    workflow_config=_bootstrap_workflow_config(bootstrap, self),
+                )
+                request_digest = normalized_request_digest(manifest)
 
-            record = self._new_start_record(
-                run_id=run_id,
-                request=None,
-                request_digest=request_digest,
-                caller_scope=caller_scope,
-                idempotency_key=idempotency_key,
-                state="prepared",
-                prepared=prepared,
-                operation="resume",
-                mode="resume",
-                resumed_from_run_id=normalized_source_run_id,
-                source_invocation_digest=source_manifest.request_digest,
-                resume_extra_instructions_provided=extra_instructions is not None,
-                resume_extra_instructions_digest=_extra_instructions_digest(
-                    bootstrap.extra_instructions
-                ),
-                recovery=normalized_recovery,
-            )
-            record["manifest_request_digest"] = normalized_request_digest(manifest)
-            if recovery_intent is not None:
-                record["recovery_intent_digest"] = recovery_intent_digest(
-                    recovery_intent
+                recovery_intent = (
+                    self._build_recovery_intent(
+                        source_run_id=normalized_source_run_id,
+                        target_run_id=run_id,
+                        source=source,
+                        source_manifest=source_manifest,
+                        bootstrap=bootstrap,
+                        target_request=normalized_recovery,
+                    )
+                    if normalized_recovery is not None
+                    else None
                 )
 
-                # The launch manifest is immutable and must exist before the
-                # successor directory is created.  The intent itself is
-                # published by the replay-safe recovery path below, after the
-                # startup record has an identity that can be retried.
+                record = self._new_start_record(
+                    run_id=run_id,
+                    request=None,
+                    request_digest=request_digest,
+                    caller_scope=caller_scope,
+                    idempotency_key=idempotency_key,
+                    state="prepared",
+                    prepared=prepared,
+                    operation="resume",
+                    mode="resume",
+                    resumed_from_run_id=normalized_source_run_id,
+                    source_invocation_digest=source_manifest.request_digest,
+                    resume_extra_instructions_provided=extra_instructions is not None,
+                    resume_extra_instructions_digest=_extra_instructions_digest(
+                        bootstrap.extra_instructions
+                    ),
+                    recovery=normalized_recovery,
+                )
+                record["manifest_request_digest"] = normalized_request_digest(manifest)
+                if recovery_intent is not None:
+                    record["recovery_intent_digest"] = recovery_intent_digest(
+                        recovery_intent
+                    )
+
+                # Publish the immutable successor intent before creating its
+                # directory and replay record.  Nothing has a bound logical
+                # identity until the complete pre-launch publication succeeds.
                 try:
-                    create_launch_manifest(self._config.repo_root, manifest)
+                    manifest_result = create_launch_manifest(
+                        self._config.repo_root, manifest
+                    )
                 except (ValueError, RunIdentityConflict) as exc:
                     raise DaemonError(
-                        f"cannot reserve recovery launch intent: {exc}"
+                        f"cannot reserve continuation launch intent: {exc}"
                     ) from exc
+                if manifest_result.created and not manifest_preexisting:
+                    manifest_owned = True
+                    manifest_bytes = self._regular_file_bytes(manifest_path)
+                    if not phase_preexisting:
+                        phase_owned = True
+                        phase_bytes = self._regular_file_bytes(phase_path)
+                else:
+                    # An existing/replayed manifest is not an artifact this
+                    # failed publication may remove.
+                    publication_cleanup_safe = False
+                    manifest_owned = False
                 successor_dir = self._application.repository.run_directory(run_id)
                 if successor_dir.exists() and not successor_dir.is_dir():
-                    raise DaemonError("recovery successor run directory is unsafe")
+                    raise DaemonError("continuation successor run directory is unsafe")
                 successor_dir.mkdir(parents=True, exist_ok=False)
-            self._create_record(record)
+                successor_dir_created = True
+                record_path = self._record_path(run_id)
+                record_preexisting = self._path_exists(record_path)
+                record_owned = not record_preexisting
+                record_bytes = _record_bytes(record)
+                self._create_record(record)
+                # The manifest, successor directory, and startup record now
+                # establish the logical identity.  Preserve the claim even if
+                # the admission transition itself fails.
+                bound = True
+                self._admission.bind(run_id, reservation.nonce)
+            except Exception:
+                if not bound:
+                    cleanup_safe = publication_cleanup_safe
+                    for path, preexisting, owned in (
+                        (manifest_path, manifest_preexisting, manifest_owned),
+                        (phase_path, phase_preexisting, phase_owned),
+                        (record_path, record_preexisting, record_owned),
+                    ):
+                        if not preexisting and not owned and self._path_exists(path):
+                            cleanup_safe = False
+                            break
+                    if cleanup_safe and self._cleanup_unbound_resume_publication(
+                        manifest_path=manifest_path,
+                        manifest_owned=manifest_owned,
+                        manifest_bytes=manifest_bytes,
+                        phase_path=phase_path,
+                        phase_owned=phase_owned,
+                        phase_bytes=phase_bytes,
+                        successor_dir=successor_dir,
+                        successor_dir_created=successor_dir_created,
+                        record_path=record_path,
+                        record_owned=record_owned,
+                        record_bytes=record_bytes,
+                    ):
+                        self._release_unbound_admission(
+                            run_id,
+                            reservation.nonce,
+                            reason="resume_publication_failed",
+                        )
+                raise
             return self._recover_resume_record(
                 record,
                 prepared=prepared,
@@ -1027,6 +1357,8 @@ class DaemonService:
             observed = self._application.units.get(_unit_name(status.run_id))
             if observed is not None and (observed.name != _unit_name(status.run_id) or observed.is_active):
                 return False
+            if not self._admission.predecessor_inactive_for_preview(status.run_id):
+                return False
             self._resume_bootstrap(status.run_id)
         except Exception:
             return False
@@ -1092,7 +1424,9 @@ class DaemonService:
     def _prepare_required_git_tracking_before_reservation(
         self,
         request: StartupRequest,
-    ) -> None:
+        *,
+        expected_plan_revision: str | None = None,
+    ) -> str | None:
         """Normalize required plan metadata before daemon run allocation."""
         workflow_name = (
             request.workflow_name or self._workflow_config.aflow.default_workflow
@@ -1122,9 +1456,16 @@ class DaemonService:
         )
 
         if not _workflow_requires_git_tracking(workflow, self._workflow_config):
-            return
+            return None
         try:
             source_bytes = request.plan_path.read_bytes()
+            if (
+                expected_plan_revision is not None
+                and hashlib.sha256(source_bytes).hexdigest() != expected_plan_revision
+            ):
+                raise ProjectAutomaticPlanChanged(
+                    "automatic plan changed before Git Tracking preparation"
+                )
             plan_text = source_bytes.decode("utf-8")
             metadata = parse_git_tracking_metadata(plan_text)
             if metadata is not None:
@@ -1134,18 +1475,18 @@ class DaemonService:
                     parsed_plan = load_plan(request.plan_path)
                 except PlanParseError as exc:
                     if exc.error_kind == "inconsistent_checkpoint_state":
-                        return
+                        return None
                     raise
                 if (
                     metadata.plan_branch != ""
                     and metadata.pre_handoff_base_head != ""
                 ):
-                    return
+                    return None
                 if not is_handoff_pristine_for_base_refresh(
                     metadata,
                     parsed_plan.sections,
                 ):
-                    return
+                    return None
             repo_state = probe_repo_state(self._config.repo_root)
             needs_bootstrap = _lifecycle_is_bootstrap_eligible(workflow, repo_state)
             _backup_original_plan(
@@ -1154,6 +1495,7 @@ class DaemonService:
                 event="startup_preparation",
             )
             parsed_plan = load_plan(request.plan_path)
+            normalized_revision: list[str] = []
             _prepare_required_git_tracking_before_allocation(
                 repo_root=self._config.repo_root,
                 original_plan_path=request.plan_path,
@@ -1169,7 +1511,9 @@ class DaemonService:
                 is_resume=request.resume_requested,
                 startup_retry=None,
                 expected_plan_bytes=source_bytes,
+                normalized_revision=normalized_revision,
             )
+            return normalized_revision[0] if expected_plan_revision is not None and normalized_revision else None
         except PlanAdmissionError as exc:
             _logger.warning(
                 "startup plan admission rejected before run reservation",
@@ -1319,10 +1663,20 @@ class DaemonService:
         """Advance one already-reserved request without changing its identity."""
         if record.get("state") != "preparing":
             return self._pending_response_locked(record)
+        request = self._request_from_record(record)
+        reservation = self._ensure_admission(
+            str(record["run_id"]),
+            plan_path=request.plan_path,
+            idempotency_key=str(record["effective_idempotency_key"]),
+            source_run_id=(
+                str(record["resumed_from_run_id"])
+                if record.get("resumed_from_run_id") is not None
+                else request.restarted_from_run_id
+            ),
+        )
         from .control_plane.run_activity import preparation_owner
         record = {**record, "preparation_owner": preparation_owner()}
         self._write_record(record)
-        request = self._request_from_record(record)
         try:
             prepared_or_question = prepare_startup(request)
         except PlanAdmissionError as exc:
@@ -1333,6 +1687,7 @@ class DaemonService:
             )
             updated = dict(record)
             updated["state"] = "needs_attention"
+            updated.pop("preparation_owner", None)
             updated["startup_failure"] = startup_failure(
                 "preparation",
                 exc.safe_message,
@@ -1340,6 +1695,11 @@ class DaemonService:
                 kind=exc.kind,
             )
             self._write_record(updated)
+            self._release_unbound_admission(
+                str(record["run_id"]),
+                reservation.nonce,
+                reason="startup_preparation_rejected",
+            )
             raise DaemonStartupError(
                 str(record["run_id"]),
                 exc.safe_message,
@@ -1348,8 +1708,14 @@ class DaemonService:
         except StartupError as exc:
             updated = dict(record)
             updated["state"] = "needs_attention"
+            updated.pop("preparation_owner", None)
             updated["startup_failure"] = startup_failure("preparation", str(exc))
             self._write_record(updated)
+            self._release_unbound_admission(
+                str(record["run_id"]),
+                reservation.nonce,
+                reason="startup_preparation_failed",
+            )
             raise DaemonStartupError(str(record["run_id"]), updated["startup_failure"]["message"]) from exc
         if isinstance(prepared_or_question, StartupQuestion):
             updated = dict(record)
@@ -1359,7 +1725,14 @@ class DaemonService:
                 prepared_or_question.continuation_request or request
             )
             updated["question_generation"] = _next_question_generation(record)
+            updated.pop("preparation_owner", None)
             self._write_record(updated)
+            self._release_unbound_admission(
+                str(record["run_id"]),
+                reservation.nonce,
+                reason="startup_question_waiting",
+                claim_retained=True,
+            )
             return _question_record(
                 validate_run_id(str(record["run_id"])),
                 prepared_or_question,
@@ -1379,6 +1752,7 @@ class DaemonService:
         )
         updated = dict(record)
         updated["state"] = "prepared"
+        updated.pop("preparation_owner", None)
         updated["prepared"] = _prepared_payload(prepared)
         self._write_record(updated)
         return self._launch_prepared_locked(updated, prepared, created=created)
@@ -1401,6 +1775,16 @@ class DaemonService:
         if persisted_manifest is None:
             raise DaemonError("launch manifest disappeared before unit creation")
         self._assert_manifest_accepts_prepared(persisted_manifest, record, prepared)
+        reservation = self._ensure_admission(
+            run_id,
+            plan_path=prepared.plan_path,
+            idempotency_key=str(record["effective_idempotency_key"]),
+            source_run_id=(
+                str(record["resumed_from_run_id"])
+                if record.get("resumed_from_run_id") is not None
+                else prepared.restarted_from_run_id
+            ),
+        )
         status = self._application.repository.get_run_status(run_id)
         observed = self._application.units.get(_unit_name(run_id))
         if observed is not None and observed.name != _unit_name(run_id):
@@ -1411,6 +1795,7 @@ class DaemonService:
                 reason="unit identity is ambiguous",
             )
         if observed is not None and observed.is_active:
+            self._admission.consume(run_id, reservation.nonce)
             return StartRunResult(
                 run_id=run_id,
                 created=False,
@@ -1434,6 +1819,7 @@ class DaemonService:
             )
         argv = self._worker_argv(run_id, extra_instructions)
         public_argv = self._worker_argv(run_id, ())
+        self._admission.mark_starting(run_id, reservation.nonce)
         environment_identity = _file_identity(self._config.environment_file)
         mutable = dict(record)
         mutable["state"] = "launch_requested"
@@ -1465,7 +1851,10 @@ class DaemonService:
                 argv,
                 cwd=self._config.repo_root,
                 environment_file=self._config.environment_file,
-                environment=self._config.environment,
+                environment={
+                    **self._config.environment,
+                    "AFLOW_ADMISSION_RESERVATION_NONCE": reservation.nonce,
+                },
             )
             if started_unit.name != _unit_name(run_id) or not started_unit.is_active:
                 raise DaemonError(
@@ -2881,12 +3270,33 @@ def worker_main(
         service._config = daemon_config
         service._workflow_config = workflow_config
         service._lock = RLock()
+        service._admission = ProjectAdmission(root, unit_manager=application.units)
         record = service._read_record(selected_run_id)
         manifest = application.repository.get_launch_manifest(selected_run_id)
         if manifest is None:
             raise DaemonError("daemon worker has no immutable launch manifest")
         if manifest.intended_unit != _unit_name(selected_run_id):
             raise DaemonError("daemon worker manifest unit identity is invalid")
+        admission_nonce = os.environ.get("AFLOW_ADMISSION_RESERVATION_NONCE")
+        if admission_nonce:
+            service._admission.consume(selected_run_id, admission_nonce)
+        else:
+            # Compatibility for an explicitly invoked worker in older durable
+            # records and deterministic fake-unit tests.  A normal daemon
+            # launch always supplies the parent nonce through the unit env.
+            resumed_from_run_id = record.get("resumed_from_run_id")
+            if resumed_from_run_id is not None:
+                resumed_from_run_id = validate_run_id(resumed_from_run_id)
+            admission_nonce = service._admission.ensure(
+                selected_run_id,
+                plan_path=Path(manifest.plan_path),
+                idempotency_key=(
+                    str(manifest.idempotency_key)
+                    if manifest.idempotency_key is not None
+                    else None
+                ),
+                source_run_id=resumed_from_run_id,
+            ).nonce
         stage = "prepared_request"
         prepared, resume = _worker_prepared(
             record,
@@ -2902,6 +3312,7 @@ def worker_main(
             prepared,
             resume=resume,
             allow_existing_launch_manifest=True,
+            admission_reservation_nonce=admission_nonce,
         )
     except Exception as exc:
         from aflow.control_plane.models import startup_failure

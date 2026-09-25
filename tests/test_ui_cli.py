@@ -312,7 +312,11 @@ class TestBackgroundLifecycle:
             "create_plan_from_run",
             "update_plan",
             "promote_plan",
+            "requeue_plan",
             "list_plan_documents",
+            "get_project_scheduling",
+            "patch_project_scheduling",
+            "get_project_queue",
             "get_global_config",
             "patch_global_config",
         }

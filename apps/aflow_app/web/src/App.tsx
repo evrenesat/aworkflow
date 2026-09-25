@@ -699,6 +699,7 @@ export function App() {
             <GlobalSettings
               onDirtyChange={handleConfigDirty}
               onSaved={handleConfigSaved}
+              project={selectedProject}
             />
         )}
         {selectedProject && readinessGuidance[selectedProject.readiness] && view === 'settings' && (
@@ -766,6 +767,7 @@ export function App() {
               project={selectedProject}
               onDirtyChange={handlePlanDirty}
               onOpenRunDashboard={handleOpenRunDashboard}
+              onOpenRun={runId => openExplicitRun(selectedProject.id, runId)}
               initialPlanPath={planPanelPath}
               onInitialPlanHandled={() => setPlanPanelPath(null)}
             />

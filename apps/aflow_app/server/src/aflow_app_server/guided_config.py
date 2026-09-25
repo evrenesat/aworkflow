@@ -28,6 +28,7 @@ def _is_table(value: object) -> bool:
 
 from aflow.config import (
     ConfigError,
+    DEFAULT_UPGRADE_AFTER_REPAIRS,
     TEAM_DISPLAY_NAME_MAX_LENGTH,
     load_workflow_config,
     render_starter_documents,
@@ -41,6 +42,7 @@ from .models import (
     BuildStarterAction,
     GuidedConfigAction,
     SetDefaultManagerEnabledAction,
+    SetDefaultUpgradeAfterRepairsAction,
     SetDefaultWorkflowAction,
     SetGlobalRoleAction,
     SetMaxTurnsAction,
@@ -51,6 +53,7 @@ from .models import (
     SetTeamUpgradeAction,
     SetWorkflowDefaultTeamAction,
     SetWorkflowManagerEnabledAction,
+    SetWorkflowUpgradeAfterRepairsAction,
     UpsertProfileAction,
 )
 from .project_config_service import (
@@ -671,6 +674,21 @@ def _apply_action(
         # Explicit false is a real declaration: never use truthiness here.
         wf_table["manager_enabled"] = action.value
         return
+    if isinstance(action, SetDefaultUpgradeAfterRepairsAction):
+        defaults_table = _table(workflows_doc, "workflow", path="workflow")
+        defaults_table["upgrade_after_repairs"] = action.value
+        return
+    if isinstance(action, SetWorkflowUpgradeAfterRepairsAction):
+        _require_workflow(workflows_doc, action.workflow)
+        root = workflows_doc.get("workflow")
+        assert _is_table(root)
+        wf_table = root.get(action.workflow)
+        assert _is_table(wf_table)
+        if action.value is None:
+            _delete_key(wf_table, "upgrade_after_repairs")
+        else:
+            wf_table["upgrade_after_repairs"] = action.value
+        return
     raise GuidedConfigError(
         "unknown_action", f"unsupported guided action '{action.type}'"
     )
@@ -761,7 +779,7 @@ def _apply_upsert_profile(action: UpsertProfileAction, aflow_doc: TOMLDocument) 
 
 
 def _manager_source(
-    declared: bool | None, extends: str | None, known: set[str]
+    declared: object | None, extends: str | None, known: set[str]
 ) -> str:
     """Label where one workflow's effective supervision comes from.
 
@@ -915,15 +933,20 @@ def _projection(
     workflows: dict[str, dict[str, Any]] = {}
     # Declared `[workflow].manager_enabled` default; None when omitted.
     default_manager_enabled: bool | None = None
+    default_upgrade_after_repairs: int | None = None
     # Per-workflow declared override plus the raw extends target, so the
     # source label can distinguish an explicit flag from base/default
     # inheritance without reimplementing canonical resolution.
     declared_manager: dict[str, tuple[bool | None, str | None]] = {}
+    declared_upgrade: dict[str, tuple[int | None, str | None]] = {}
     workflow_table = workflows_doc.get("workflow")
     if _is_table(workflow_table):
         raw_default = workflow_table.get("manager_enabled")
         if isinstance(raw_default, bool):
             default_manager_enabled = raw_default
+        raw_upgrade_default = workflow_table.get("upgrade_after_repairs")
+        if isinstance(raw_upgrade_default, int) and not isinstance(raw_upgrade_default, bool) and raw_upgrade_default > 0:
+            default_upgrade_after_repairs = raw_upgrade_default
         for wf_name in _workflow_names(workflows_doc):
             wf_table = workflow_table.get(wf_name)
             if not _is_table(wf_table):
@@ -936,6 +959,11 @@ def _projection(
             raw_extends = wf_table.get("extends")
             declared_manager[wf_name] = (
                 raw_manager if isinstance(raw_manager, bool) else None,
+                raw_extends if isinstance(raw_extends, str) else None,
+            )
+            raw_upgrade = wf_table.get("upgrade_after_repairs")
+            declared_upgrade[wf_name] = (
+                raw_upgrade if isinstance(raw_upgrade, int) and not isinstance(raw_upgrade, bool) and raw_upgrade > 0 else None,
                 raw_extends if isinstance(raw_extends, str) else None,
             )
             declared: list[str] = []
@@ -952,6 +980,9 @@ def _projection(
                 "manager_enabled": declared_manager[wf_name][0],
                 "effective_manager_enabled": False,
                 "manager_enabled_source": "defaults",
+                "upgrade_after_repairs": declared_upgrade[wf_name][0],
+                "effective_upgrade_after_repairs": default_upgrade_after_repairs or DEFAULT_UPGRADE_AFTER_REPAIRS,
+                "upgrade_after_repairs_source": "defaults",
             }
     report = validate_candidate_pair(*texts)
     config = None
@@ -998,6 +1029,9 @@ def _projection(
                         "manager_enabled": None,
                         "effective_manager_enabled": False,
                         "manager_enabled_source": "defaults",
+                        "upgrade_after_repairs": None,
+                        "effective_upgrade_after_repairs": default_upgrade_after_repairs or DEFAULT_UPGRADE_AFTER_REPAIRS,
+                        "upgrade_after_repairs_source": "defaults",
                     },
                 )
                 # The materialized config resolves aliases ('extends') and
@@ -1020,6 +1054,10 @@ def _projection(
                 summary["manager_enabled_source"] = _manager_source(
                     declared, extends, set(declared_manager)
                 )
+                upgrade_declared, upgrade_extends = declared_upgrade.get(wf_name, (None, None))
+                summary["upgrade_after_repairs"] = upgrade_declared
+                summary["effective_upgrade_after_repairs"] = wf_config.upgrade_after_repairs
+                summary["upgrade_after_repairs_source"] = wf_config.upgrade_after_repairs_source
     for wf_name, summary in workflows.items():
         if wf_name in materialized:
             continue
@@ -1035,6 +1073,16 @@ def _projection(
         )
         summary["effective_manager_enabled"] = _fallback_effective(
             declared, extends, declared_manager, default_manager_enabled
+        )
+        upgrade_declared, upgrade_extends = declared_upgrade.get(wf_name, (None, None))
+        summary["upgrade_after_repairs"] = upgrade_declared
+        summary["upgrade_after_repairs_source"] = _manager_source(
+            upgrade_declared, upgrade_extends, set(declared_upgrade)
+        )
+        base_declared = declared_upgrade.get(upgrade_extends, (None, None))[0]
+        summary["effective_upgrade_after_repairs"] = (
+            upgrade_declared or base_declared or default_upgrade_after_repairs
+            or DEFAULT_UPGRADE_AFTER_REPAIRS
         )
     named_prompts = _text_table(aflow_doc.get("prompts"), path="prompts")
     role_prompts = global_role_prompts
@@ -1063,6 +1111,10 @@ def _projection(
         "workflow_default_teams": workflow_default_teams,
         "workflows": workflows,
         "default_manager_enabled": default_manager_enabled,
+        "default_upgrade_after_repairs": default_upgrade_after_repairs,
+        "effective_default_upgrade_after_repairs": (
+            default_upgrade_after_repairs or DEFAULT_UPGRADE_AFTER_REPAIRS
+        ),
     }
 
 

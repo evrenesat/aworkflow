@@ -71,10 +71,12 @@ repository files.
    checkpoint tasks, verification commands, and observable acceptance. If
    available, use `aflow-plan` for its full checkpoint handoff contract.
 3. Read and revise the draft, then promote it to `in_progress`. Resolve its
-   returned lifecycle path. Inspect existing runs and preflight the exact launch.
-4. Start once with a retained idempotency key. Handle the returned startup
-   question, if any, using `answer_startup`; a reserved run is not yet proof
-   that a worker started.
+   returned lifecycle path. Promotion may already trigger the server's default-on
+   plan consumer: inspect current queue claims and runs before any manual start,
+   then preflight the exact plan only if it remains unclaimed.
+4. If a manual start is still needed, start once with a retained idempotency
+   key. Handle the returned startup question, if any, using `answer_startup`;
+   a reserved run is not yet proof that a worker started.
 5. Follow the returned run ID with state, incremental events, and lite context.
    Resolve failures using evidence. Apply authorized control or resume through
    the managed interface and track a successor's new ID.

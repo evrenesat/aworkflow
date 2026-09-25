@@ -5,11 +5,12 @@ from contextlib import contextmanager
 from dataclasses import replace
 import hashlib
 import importlib.util
+import multiprocessing
 from pathlib import Path
 import json
 import subprocess
 import sys
-from threading import Event
+from threading import Barrier, Event
 
 import pytest
 
@@ -33,11 +34,14 @@ from aflow.control_plane import (
     read_events,
     write_launch_phase,
 )
+from aflow.project_admission import ProjectAdmission, ProjectCapacityReached
+from aflow.project_settings import ProjectSettings, ProjectSettingsService
 from aflow.daemon import (
     AflowDaemon,
     DaemonConfig,
     DaemonError,
     DaemonIdempotencyConflict,
+    DaemonStartupError,
     _startup_request_digest,
 )
 
@@ -918,6 +922,157 @@ def test_unclassified_reserved_startup_value_error_remains_generic(
     assert units.start_calls == []
 
 
+def test_daemon_raw_manifest_io_failure_releases_unbound_admission(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    units = InMemoryUnitManager()
+    daemon, request = _daemon(tmp_path, monkeypatch, units)
+    run_id = "raw-manifest-io-failure"
+    monkeypatch.setattr("aflow.daemon.reserve_run_id", lambda _root: run_id)
+
+    def fail_manifest(*_args: object, **_kwargs: object) -> None:
+        raise OSError("synthetic launch-manifest I/O failure")
+
+    monkeypatch.setattr("aflow.daemon.create_launch_manifest", fail_manifest)
+
+    with pytest.raises(DaemonError, match="cannot reserve launch intent"):
+        daemon.service.start(
+            request,
+            caller_scope="project:admission",
+            idempotency_key="raw-manifest-io-failure",
+        )
+
+    reservation = daemon.service._admission.reservation(run_id)
+    assert reservation is not None
+    assert reservation.state == "released"
+    assert reservation.bound is False
+    assert daemon.service._admission.snapshot().occupied_count == 0
+    assert units.start_calls == []
+
+
+def test_capacity_rejections_do_not_retain_transient_start_instructions(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from aflow.daemon import DaemonStartupError
+
+    units = InMemoryUnitManager()
+    daemon, request = _daemon(tmp_path, monkeypatch, units)
+    request = replace(request, extra_instructions=("private-start-guidance",))
+    settings = ProjectSettingsService(request.repo_root)
+    settings.update(
+        ProjectSettings(max_concurrent_implementations=1),
+        expected_revision=settings.read().revision,
+    )
+    admission = ProjectAdmission(request.repo_root, unit_manager=units)
+    occupied = admission.acquire("occupied-start", idempotency_key="occupied-start")
+    attempted = iter(("rejected-start-one", "rejected-start-two", "admitted-start"))
+    monkeypatch.setattr("aflow.daemon.reserve_run_id", lambda _root: next(attempted))
+
+    for key, run_id in (("one", "rejected-start-one"), ("two", "rejected-start-two")):
+        with pytest.raises(DaemonStartupError) as raised:
+            daemon.service.start(request, caller_scope="project:one", idempotency_key=key)
+        assert raised.value.code == "project_capacity_reached"
+        assert run_id not in daemon.service._transient_extra_instructions
+        assert admission.reservation(run_id) is None
+        assert admission.snapshot().occupied_count == 1
+
+    admission.release(occupied.run_id, occupied.nonce)
+    monkeypatch.setattr("aflow.daemon.prepare_startup", _prepared_for_request)
+    admitted = daemon.service.start(
+        request, caller_scope="project:one", idempotency_key="admitted"
+    )
+    assert admitted.status == "running"
+    assert "--extra-instruction=private-start-guidance" in units.start_calls[0][1]
+    assert admitted.run_id not in daemon.service._transient_extra_instructions
+
+
+def test_distinct_start_keys_cannot_launch_the_same_plan_concurrently(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    units = InMemoryUnitManager()
+    daemon, request = _daemon(tmp_path, monkeypatch, units)
+    peer = AflowDaemon(daemon._config, units=units)
+    peer.start()
+    request = replace(request, extra_instructions=("private-guidance",))
+    monkeypatch.setattr("aflow.daemon.prepare_startup", _prepared_for_request)
+    barrier = Barrier(2)
+
+    def start(service, key: str):
+        barrier.wait(timeout=5)
+        try:
+            return ("started", service.start(request, idempotency_key=key))
+        except DaemonStartupError as exc:
+            return ("rejected", exc)
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        first = pool.submit(start, daemon.service, "first-key")
+        second = pool.submit(start, peer.service, "second-key")
+        outcomes = (first.result(timeout=10), second.result(timeout=10))
+
+    assert sorted(kind for kind, _ in outcomes) == ["rejected", "started"]
+    rejected = next(value for kind, value in outcomes if kind == "rejected")
+    started = next(value for kind, value in outcomes if kind == "started")
+    assert rejected.code == "project_plan_claim_conflict"
+    assert rejected.run_id != started.run_id
+    assert len(units.start_calls) == 1
+    assert ProjectAdmission(request.repo_root, unit_manager=units).snapshot().occupied_count == 1
+    assert ProjectAdmission(request.repo_root).reservation(rejected.run_id) is None
+    assert rejected.run_id not in daemon.service._transient_extra_instructions
+    assert rejected.run_id not in peer.service._transient_extra_instructions
+    assert not (request.repo_root / ".aflow" / "launches" / f"{rejected.run_id}.json").exists()
+    assert not (request.repo_root / ".aflow" / "start-requests" / f"{rejected.run_id}.json").exists()
+
+    other_plan = request.plan_path.with_name("other-plan.md")
+    other_plan.write_bytes(request.plan_path.read_bytes())
+    other = daemon.service.start(
+        replace(request, plan_path=other_plan), idempotency_key="other-plan-key"
+    )
+    assert other.status == "running"
+    assert ProjectAdmission(request.repo_root, unit_manager=units).snapshot().occupied_count == 2
+
+
+def test_distinct_processes_starting_one_plan_publish_one_launch(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    units = InMemoryUnitManager()
+    daemon, request = _daemon(tmp_path, monkeypatch, units)
+    monkeypatch.setattr("aflow.daemon.prepare_startup", _prepared_for_request)
+    context = multiprocessing.get_context("fork")
+    barrier = context.Barrier(2)
+    release = context.Event()
+    results = context.Queue()
+
+    def start(key: str) -> None:
+        barrier.wait(timeout=10)
+        try:
+            result = daemon.service.start(request, idempotency_key=key)
+            results.put(("started", result.run_id))
+        except DaemonStartupError as exc:
+            results.put((exc.code, exc.run_id))
+        finally:
+            release.wait(timeout=10)
+
+    processes = [context.Process(target=start, args=(key,)) for key in ("one", "two")]
+    for process in processes:
+        process.start()
+    try:
+        observed = [results.get(timeout=10) for _ in processes]
+        assert sorted(kind for kind, _ in observed) == [
+            "project_plan_claim_conflict", "started"
+        ]
+        started_id = next(run_id for kind, run_id in observed if kind == "started")
+        rejected_id = next(run_id for kind, run_id in observed if kind != "started")
+        assert (request.repo_root / ".aflow" / "launches" / f"{started_id}.json").exists()
+        assert not (request.repo_root / ".aflow" / "launches" / f"{rejected_id}.json").exists()
+        assert ProjectAdmission(request.repo_root).snapshot().occupied_count == 1
+    finally:
+        release.set()
+        for process in processes:
+            process.join(timeout=10)
+            assert process.exitcode == 0
+
+
 def test_daemon_persists_startup_question_then_launches_once_when_answered(
     tmp_path: Path, monkeypatch
 ) -> None:
@@ -1568,7 +1723,7 @@ def test_daemon_restart_successor_requires_owner_stopped_inactive_source_and_kee
         raise RuntimeError("synthetic unit failure")
 
     monkeypatch.setattr(units, "start", fail_start)
-    with pytest.raises(DaemonError, match="workflow unit failed to start"):
+    with pytest.raises(DaemonStartupError, match="workflow unit failed to start") as failed:
         daemon.service.start(
             successor_request,
             caller_scope="project:one",
@@ -1576,6 +1731,20 @@ def test_daemon_restart_successor_requires_owner_stopped_inactive_source_and_kee
         )
     assert daemon.service.run_status(source.run_id).status == "owner_stopped"
     monkeypatch.setattr(units, "start", original_start)
+
+    with pytest.raises(DaemonError, match="unresolved successor"):
+        daemon.service.start(
+            successor_request,
+            caller_scope="project:one",
+            idempotency_key="blocked-successor",
+        )
+    assert failed.value.run_id is not None
+    daemon.service.owner_stop(
+        failed.value.run_id,
+        expected_revision=0,
+        caller_scope="project:one",
+        idempotency_key="failed-successor-stop",
+    )
 
     successor = daemon.service.start(
         successor_request,
@@ -1906,3 +2075,78 @@ def test_startup_failure_survives_fresh_daemon_redacted_and_bounded(tmp_path, mo
     assert status.plan_path == str(request.plan_path)
     assert status.started_at is None
     assert status.evidence["no_agent_started"] == (stage == "preparation")
+
+
+def test_ambiguous_unit_launch_failure_keeps_startup_claim_and_capacity(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from aflow.daemon import DaemonStartupError
+
+    units = InMemoryUnitManager()
+    daemon, request = _daemon(tmp_path, monkeypatch, units)
+    settings = ProjectSettingsService(request.repo_root)
+    initial = settings.read()
+    settings.update(
+        ProjectSettings(max_concurrent_implementations=1),
+        expected_revision=initial.revision,
+    )
+    monkeypatch.setattr("aflow.daemon.prepare_startup", _prepared)
+
+    def dispatch_timeout(*_args, **_kwargs):
+        raise TimeoutError("fake unit dispatch timed out")
+
+    monkeypatch.setattr(units, "start", dispatch_timeout)
+    with pytest.raises(DaemonStartupError) as raised:
+        daemon.service.start(
+            request,
+            caller_scope="project:one",
+            idempotency_key="ambiguous-unit-launch",
+        )
+
+    run_id = raised.value.run_id
+    assert run_id is not None
+    record_path = request.repo_root / ".aflow" / "start-requests" / f"{run_id}.json"
+    record = json.loads(record_path.read_text(encoding="utf-8"))
+    assert record["state"] == "needs_attention"
+    assert record["startup_failure"]["stage"] == "unit_launch"
+
+    admission = ProjectAdmission(request.repo_root, unit_manager=units)
+    reservation = admission.reservation(run_id)
+    assert reservation is not None
+    assert reservation.state in {"starting", "uncertain"}
+    assert admission.snapshot().occupied_count == 1
+    with pytest.raises(ProjectCapacityReached):
+        admission.acquire("second-admission", idempotency_key="second-admission-key")
+
+
+@pytest.mark.parametrize("artifact", ["malformed", "unsafe"])
+def test_daemon_settings_failures_keep_a_safe_typed_code(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, artifact: str
+) -> None:
+    units = InMemoryUnitManager()
+    daemon, request = _daemon(tmp_path, monkeypatch, units)
+    settings_path = request.repo_root / ".aflow" / "project-settings.json"
+    settings_path.parent.mkdir(parents=True, exist_ok=True)
+    if artifact == "malformed":
+        settings_path.write_text(
+            '{"provider":"raw-provider-detail",', encoding="utf-8"
+        )
+    else:
+        outside = request.repo_root / "outside-settings.json"
+        outside.write_text('{"provider":"raw-provider-detail"}\n', encoding="utf-8")
+        settings_path.symlink_to(outside)
+
+    from aflow.daemon import DaemonStartupError
+
+    with pytest.raises(DaemonStartupError) as raised:
+        daemon.service.start(
+            request,
+            caller_scope="project:one",
+            idempotency_key=f"settings-{artifact}",
+        )
+
+    assert raised.value.code == "project_admission_error"
+    assert str(raised.value) == "project admission settings are unavailable or invalid"
+    assert str(request.repo_root) not in str(raised.value)
+    assert "raw-provider-detail" not in str(raised.value)
+    assert daemon.service._transient_extra_instructions == {}

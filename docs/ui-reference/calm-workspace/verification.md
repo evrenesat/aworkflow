@@ -130,3 +130,15 @@ count repair passed Chromium/WebKit checks and the full web suite with one
 Vitest worker (653 tests); the default parallel suite timed out on one
 130-row refresh test, which passed alone. Publication and live comparison
 remain pending.
+
+Final cumulative review integrated both checkpoint commits with `46224dfa`,
+preserving concurrent scheduling and plan-consumer behavior. Combined checks
+passed: 26 repository/history, 73 API, 659 web tests (one worker), production
+build, 40 Chromium and 39 WebKit browser cases, and diff checks. The browser
+sets include navigation, row fidelity and equal/changed refresh; Chromium also
+rerendered the frozen reference. Populated light/dark desktop/phone captures
+were inspected; no material sidebar gap was found. The first WebKit attempt
+ended with SIGTERM after one passing case; the complete rerun passed.
+These are local integrated-code results. New exact-SHA CI and live activation
+remain separate delivery gates; the running UI still served `46224dfa` during
+review. The frozen demo remains unchanged.

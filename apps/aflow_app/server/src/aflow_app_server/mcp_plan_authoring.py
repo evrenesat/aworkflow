@@ -3,13 +3,13 @@
 from __future__ import annotations
 
 from collections.abc import Callable
-from typing import Any
+from typing import Any, Literal
 
 from fastmcp import FastMCP
 
 from aflow.mcp_control_plane import MCPToolResult
 
-from .plan_service import PlanService, PlanServiceError, PlanStatus
+from .plan_service import PlanService, PlanServiceError, PlanStatus, resume_requeued_plan
 
 
 _READ_ANNOTATIONS = {
@@ -144,6 +144,44 @@ def register_plan_authoring_tools(
                 "target_name": target_name,
             },
         )
+
+    @mcp.tool(
+        title="Requeue a corrected AFlow plan",
+        annotations=_NON_IDEMPOTENT_WRITE_ANNOTATIONS,
+        tags={"write", "plans", "approval-required"},
+    )
+    def requeue_plan(
+        project_id: str,
+        plan_status: Literal["failed", "needs_plan_change"],
+        name: str,
+        expected_revision: str,
+        source_run_id: str | None = None,
+        idempotency_key: str | None = None,
+    ) -> dict[str, object]:
+        """Requeue an edited plan and resume its recoverable source run."""
+        def requeue() -> dict[str, object]:
+            if get_control_plane_service is None:
+                raise PlanServiceError("control-plane service is unavailable")
+            control_plane = get_control_plane_service()
+            plan = get_plan_service().requeue(
+                project_id, plan_status, name, expected_revision,
+                source_run_id=source_run_id,
+                run_status_reader=control_plane.run_status,
+            )
+            result: dict[str, object] = {"plan": plan.to_dict()}
+            resumed = resume_requeued_plan(
+                project_id, plan, control_plane,
+                idempotency_key=idempotency_key,
+            )
+            if resumed is not None:
+                result["run"] = resumed.to_dict()
+            return result
+
+        return tool_result(requeue, {
+            "project_id": project_id, "plan_status": plan_status,
+            "name": name, "expected_revision": expected_revision,
+            "source_run_id": source_run_id, "idempotency_key": idempotency_key,
+        })
 
     @mcp.tool(
         title="List AFlow plan documents",
