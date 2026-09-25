@@ -154,6 +154,15 @@ def _source_session() -> HarnessSessionRefV1:
     )
 
 
+def _record_inactive_source(root: Path, run_id: str = "source-run") -> None:
+    """Model a stopped legacy controller before a successor is admitted."""
+    run_dir = root / ".aflow" / "runs" / run_id
+    run_dir.mkdir(parents=True, exist_ok=True)
+    (run_dir / "run.json").write_text(
+        json.dumps({"status": "interrupted"}), encoding="utf-8"
+    )
+
+
 def _runtime_marker(
     target_run_id: str,
     *,
@@ -293,6 +302,7 @@ def test_recovery_starts_fresh_target_and_then_uses_only_target_session(
         "# Plan\n\n### [ ] Checkpoint 1: First\n- [ ] step\n",
         encoding="utf-8",
     )
+    _record_inactive_source(tmp_path)
     driver = _FakeTargetDriver(target_harness, ["continue", "DONE"])
     source_driver = _UnavailableSourceDriver()
     resume = ResumeContext(
@@ -365,6 +375,7 @@ def test_recovery_target_failure_does_not_trigger_legacy_automatic_failover(
         "# Plan\n\n### [ ] Checkpoint 1: First\n- [ ] step\n",
         encoding="utf-8",
     )
+    _record_inactive_source(tmp_path)
     driver = _FakeTargetDriver("muse", ["provider failure"])
     resume = ResumeContext(
         resumed_from_run_id="source-run",
@@ -433,6 +444,7 @@ def test_recovery_pending_review_keeps_review_context_and_does_not_consume(
         "# Plan\n\n### [ ] Checkpoint 1: First\n- [ ] step\n",
         encoding="utf-8",
     )
+    _record_inactive_source(tmp_path)
     reviewer = HarnessSessionRefV1(
         session_id="review-session",
         role="reviewer",
@@ -503,6 +515,7 @@ def test_recovery_consumption_and_session_identity_share_one_durable_snapshot(
 
     def setup_root(root: Path) -> tuple[Path, ResumeContext]:
         root.mkdir()
+        _record_inactive_source(root)
         plan = root / "plan.md"
         plan.write_text(
             "# Plan\n\n### [ ] Checkpoint 1: First\n- [ ] step\n",
@@ -654,6 +667,12 @@ def test_recovery_consumption_and_session_identity_share_one_durable_snapshot(
         "muse-target-1"
     ]
 
+    # The simulated controller has exited; record that terminal observation
+    # before asking admission to start its continuation.
+    (after_run_dir / "run.json").write_text(
+        json.dumps({**after_payload, "status": "interrupted"}), encoding="utf-8"
+    )
+
     continuation_driver = _FakeTargetDriver("muse", ["DONE"])
 
     def finish_continuation(argv, **kwargs):
@@ -696,6 +715,7 @@ def test_recovery_unknown_inflight_operation_rejects_before_provider_launch(
         "# Plan\n\n### [ ] Checkpoint 1: First\n- [ ] step\n",
         encoding="utf-8",
     )
+    _record_inactive_source(tmp_path)
     calls: list[object] = []
 
     def runner(*args, **kwargs):

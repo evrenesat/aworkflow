@@ -32,7 +32,11 @@ from aflow.run_state import (
     manager_resume_fields_strict,
 )
 from aflow.runlog import RunMetadataWriter
-from aflow.workflow import _append_replayed_review_rejection, run_workflow
+from aflow.workflow import (
+    _append_replayed_review_rejection,
+    load_scope_evidence_for_resume,
+    run_workflow,
+)
 
 
 _PLAN = """# Plan
@@ -753,6 +757,9 @@ def test_selected_worker_route_survives_prelaunch_process_stop(
         interrupted_step_name="implement",
         effective_max_turns=10,
         scope_envelope_bytes=envelope_path.read_bytes(),
+        scope_evidence_artifact_bytes=load_scope_evidence_for_resume(
+            source_run, scope, envelope_path.read_bytes()
+        ),
         **fields,
     ))
 
@@ -867,6 +874,9 @@ def test_repair_threshold_survives_resume_with_reset_turn_numbers(
         interrupted_step_name="review",
         effective_max_turns=10,
         scope_envelope_bytes=envelope_path.read_bytes(),
+        scope_evidence_artifact_bytes=load_scope_evidence_for_resume(
+            source_run, scope, envelope_path.read_bytes()
+        ),
         **fields,
     ))
     review_count = 0
