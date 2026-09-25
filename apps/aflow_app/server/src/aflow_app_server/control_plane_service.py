@@ -259,6 +259,7 @@ class ControlPlaneService:
         limit: int,
         cursor: str | None,
         history: str = "visible",
+        order: str = "oldest",
         include_progress: bool = True,
     ) -> RunPage:
         item = self._project(project_id)
@@ -266,6 +267,7 @@ class ControlPlaneService:
             limit=limit,
             cursor=cursor,
             history=history,
+            order=order,
         )
 
         def status_for(identity) -> RunStatus:

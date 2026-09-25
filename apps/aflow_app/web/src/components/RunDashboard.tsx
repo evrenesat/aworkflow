@@ -214,24 +214,6 @@ function selectorModelEffortText(
     .join(' · ')
 }
 
-/** Prefer canonical launch time, then the UTC timestamp in legacy run ids. */
-function runCreatedAt(run: RunStatus): number {
-  const created = run.evidence.manifest_created_at
-  if (typeof created === 'string') {
-    const timestamp = Date.parse(created)
-    if (Number.isFinite(timestamp)) return timestamp
-  }
-  const match = /^(\d{4})(\d{2})(\d{2})t(\d{2})(\d{2})(\d{2})z(?:-|$)/i.exec(run.run_id)
-  if (!match) return 0
-  const [, year, month, day, hour, minute, second] = match
-  const timestamp = Date.parse(`${year}-${month}-${day}T${hour}:${minute}:${second}Z`)
-  return Number.isFinite(timestamp) ? timestamp : 0
-}
-
-function newestRunsFirst(runs: RunStatus[]): RunStatus[] {
-  return [...runs].sort((left, right) => runCreatedAt(right) - runCreatedAt(left))
-}
-
 function requestKey(prefix: string): string {
   const identifier = globalThis.crypto?.randomUUID?.()
     ?? `${Date.now()}-${Math.random().toString(36).slice(2)}`
@@ -1521,7 +1503,7 @@ export function RunDashboard({ visible = true, page, onNewRun, onCancelNewRun, o
       const seen = new Set<string>()
       try {
         for (let index = 0; index < pageCount; index++) {
-          const page = await api.listControlPlaneRuns(nextProjectId, { limit: 100, history: requestedHistory, ...(cursor ? { cursor } : {}) })
+          const page = await api.listControlPlaneRuns(nextProjectId, { limit: 100, history: requestedHistory, order: 'recent', ...(cursor ? { cursor } : {}) })
           runs.push(...page.runs)
           cursor = page.next_cursor ?? undefined
           if (!cursor || !isActive()) break
@@ -1561,7 +1543,7 @@ export function RunDashboard({ visible = true, page, onNewRun, onCancelNewRun, o
       setPlans(current => reconcilePlans(current, nextPlans))
       setNextRunCursor(page.next_cursor)
       setExposedShellProjectId(nextProjectId)
-      const orderedRuns = newestRunsFirst(page.runs.filter(run => !deletedRef.current.has(run.run_id)))
+      const orderedRuns = page.runs.filter(run => !deletedRef.current.has(run.run_id))
       setRuns((current) => {
         // Refreshed pages never silently displace a run that was fetched
         // directly (a requested link target or the current selection): it is

@@ -667,8 +667,8 @@ describe('RunDashboard', () => {
     const later = { ...ownedRun, run_id: '20240103t000000z-33333333', evidence: source === 'manifest' ? { manifest_created_at: '2024-01-03T00:00:00Z' } : {} }
     const byId = new Map([oldest, newest, later].map((run) => [run.run_id, run]))
     vi.mocked(api.listControlPlaneRuns)
-      .mockResolvedValueOnce({ runs: [oldest, newest], next_cursor: null, schema_version: 1 })
-      .mockResolvedValueOnce({ runs: [oldest, newest, later], next_cursor: null, schema_version: 1 })
+      .mockResolvedValueOnce({ runs: [newest, oldest], next_cursor: null, schema_version: 1 })
+      .mockResolvedValueOnce({ runs: [later, newest, oldest], next_cursor: null, schema_version: 1 })
     vi.mocked(api.getControlPlaneRun).mockImplementation(async (_projectId, runId) => byId.get(runId)!)
     vi.mocked(api.getRunContext).mockImplementation(async (_projectId, runId) => ({
       run_id: runId, level: 'lite', data: { status: 'running' }, schema_version: 1,
@@ -715,6 +715,7 @@ describe('RunDashboard', () => {
     await waitFor(() => expect((screen.getByRole('button', { name: 'Refresh', exact: true }) as HTMLButtonElement).disabled).toBe(false))
     fireEvent.click(screen.getByRole('button', { name: 'Refresh', exact: true }))
     await waitFor(() => expect(api.listControlPlaneRuns).toHaveBeenCalledTimes(5))
+    expect(vi.mocked(api.listControlPlaneRuns).mock.calls.every(([, request]) => request?.order === 'recent')).toBe(true)
     expect(count()).toBe(130)
     records = records.filter(run => run.run_id !== 'history-125')
     await waitFor(() => expect((screen.getByRole('button', { name: 'Refresh', exact: true }) as HTMLButtonElement).disabled).toBe(false))

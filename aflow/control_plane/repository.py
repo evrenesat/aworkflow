@@ -440,7 +440,7 @@ class RunRepository:
         )
 
     def list_history_page(
-        self, *, limit=100, cursor=None, history="visible"
+        self, *, limit=100, cursor=None, history="visible", order="oldest"
     ) -> RunHistoryIdentityPage:
         """Filter all readable history identities before applying pagination."""
         from .run_history import RunHistory
@@ -448,12 +448,22 @@ class RunRepository:
         _bounded_limit(limit)
         if history not in {"visible", "archived", "all"}:
             raise RepositoryError("invalid history filter")
+        if order not in {"oldest", "recent"}:
+            raise RepositoryError("invalid history order")
         if cursor is not None:
             self._readable_run_id(cursor)
         records = RunHistory(self)
-        ids = [run_id for run_id in self._run_ids() if cursor is None or run_id > cursor]
+        ids = self._run_ids()
+        if order == "oldest":
+            ids = [run_id for run_id in ids if cursor is None or run_id > cursor]
         snapshots = {run_id: records.read(run_id) for run_id in ids}
         ids = [run_id for run_id in ids if snapshots[run_id]["state"] in ({"visible", "archived"} if history == "all" else {history})]
+        if order == "recent":
+            ids.reverse()
+            if cursor is not None:
+                if cursor not in ids:
+                    raise RepositoryNotFoundError("history cursor does not exist")
+                ids = ids[ids.index(cursor) + 1:]
         selected = ids[:limit]
         return RunHistoryIdentityPage(
             runs=tuple(
@@ -467,9 +477,9 @@ class RunRepository:
             next_cursor=selected[-1] if len(ids) > limit else None,
         )
 
-    def list_history(self, *, limit=100, cursor=None, history="visible") -> RunPage:
+    def list_history(self, *, limit=100, cursor=None, history="visible", order="oldest") -> RunPage:
         """Return the compatible status-bearing form of a history page."""
-        page = self.list_history_page(limit=limit, cursor=cursor, history=history)
+        page = self.list_history_page(limit=limit, cursor=cursor, history=history, order=order)
         return RunPage(
             runs=tuple(
                 replace(

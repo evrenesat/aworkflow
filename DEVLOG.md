@@ -1,5 +1,25 @@
 # DEVLOG
 
+## 2026-09-25 — Recent-first project Runs history (Checkpoint 1)
+
+- Added opt-in `order=recent` to repository, service, and REST history pages. The
+  default remains oldest-first for existing clients and All runs. Recent pages
+  filter before reversal and limit, continue after the exact last identity, and
+  reject a cursor outside the selected history. Runs requests recent order on
+  initial load, refresh, and Load more; it preserves server page order.
+- Repository coverage exercises 125 mixed visible/archived/deleted identities,
+  a legacy timestamp ID, a new insertion ahead of the cursor, and complete
+  duplicate-free traversal. Browser coverage uses 120 older runs with no
+  recorded outcome plus recent active, failed, and completed runs. Chromium
+  and WebKit show the newest three in the first rows after one Runs history
+  request; All runs continues to request the default order.
+- Verification: repository/history pytest 25 passed; API and Chromium run
+  navigation pytest 67 passed; WebKit run navigation pytest 4 passed; web
+  Vitest 649 passed; web production build and `git diff --check` passed.
+  The exact-SHA CI gate for base `be28adc` was still in progress at handoff.
+  This checkpoint is uncommitted for review; publication and live activation
+  remain coordinator gates.
+
 ## 2026-09-25 — Wait for compact Run history focus at the browser transition
 
 - Release `ab4e1cb7` failed macOS Python 3.12 CI run `36115732349` at the

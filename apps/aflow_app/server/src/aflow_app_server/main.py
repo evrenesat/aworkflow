@@ -1036,6 +1036,7 @@ def control_plane_plans(
 def control_plane_runs(
     project_id: str,
     history: Literal["visible", "archived", "all"] = Query(default="visible"),
+    order: Literal["oldest", "recent"] = Query(default="oldest"),
     limit: int = Query(default=100, ge=1, le=1_000),
     cursor: str | None = Query(default=None, max_length=64),
     include_progress: bool = Query(default=True),
@@ -1047,6 +1048,7 @@ def control_plane_runs(
         limit=limit,
         cursor=cursor,
         history=history,
+        order=order,
         include_progress=include_progress,
     )
     return RunListResponse(

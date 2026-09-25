@@ -46,6 +46,14 @@ history mutations require authentication, revision and idempotency checks;
 external deleted reads return 410. No history action signals a process or removes
 workflow artifacts.
 
+Project run history defaults to oldest-first identity order for repository,
+REST, and MCP callers. The REST `GET /api/control-plane/projects/{project_id}/runs`
+query accepts `order=recent` to reverse the filtered identity order before
+pagination. Its cursor is the exact last returned run ID; recent continuation
+starts strictly after that identity and rejects a cursor absent from the
+selected history filter. Runs opts in on initial, refresh, and Load more reads;
+All runs retains the default traversal.
+
 Status-bearing history pages use an internal identity-only page after the full
 history scan and before pagination. The daemon reads each selected status
 without the optional progress projection, reconciles unit/startup evidence, and

@@ -285,6 +285,50 @@ def test_history_identity_page_preserves_filters_and_cursor(tmp_path: Path) -> N
     assert before == {path: path.read_bytes() for path in tmp_path.rglob("*") if path.is_file()}
 
 
+def test_recent_history_pages_filter_before_limit_and_continue_after_exact_identity(tmp_path: Path) -> None:
+    from aflow.control_plane.repository import RepositoryNotFoundError
+
+    run_root = tmp_path / ".aflow" / "runs"
+    for index in range(125):
+        run_dir = run_root / f"history-{index:03}"
+        run_dir.mkdir(parents=True)
+        (run_dir / "run.json").write_text('{"status":"completed"}')
+    legacy = "20260809T172123Z-abc12345"
+    legacy_dir = run_root / legacy
+    legacy_dir.mkdir()
+    (legacy_dir / "run.json").write_text('{"status":"completed"}')
+    repository = RunRepository(tmp_path)
+    history = RunHistory(repository)
+    for index in range(0, 125, 11):
+        history.mutate(f"history-{index:03}", state="archived", expected_revision=0, idempotency_key=f"archive-{index}")
+    history.mutate("history-001", state="deleted", expected_revision=0, idempotency_key="delete-1")
+
+    inclusive = [run.run_id for run in repository.list_runs(limit=1000).runs]
+    assert inclusive == sorted([legacy, *(f"history-{index:03}" for index in range(125))])
+    expected = [run_id for run_id in inclusive if run_id != "history-001" and not (run_id.startswith("history-") and int(run_id[-3:]) % 11 == 0)]
+    assert [run.run_id for run in repository.list_history_page(limit=100).runs] == expected[:100]
+
+    first = repository.list_history_page(limit=100, order="recent")
+    assert [run.run_id for run in first.runs] == list(reversed(expected))[:100]
+    assert first.next_cursor == first.runs[-1].run_id
+    newest_dir = run_root / "history-999"
+    newest_dir.mkdir()
+    (newest_dir / "run.json").write_text('{"status":"running"}')
+    second = repository.list_history_page(limit=100, cursor=first.next_cursor, order="recent")
+    combined = [run.run_id for run in (*first.runs, *second.runs)]
+    assert combined == list(reversed(expected))
+    assert len(combined) == len(set(combined))
+    assert second.next_cursor is None
+    assert repository.list_history_page(limit=2, order="recent", history="archived").runs[0].run_id == "history-121"
+    assert repository.list_history(limit=1, order="recent").runs[0].run_id == "history-999"
+    with pytest.raises(RepositoryNotFoundError):
+        repository.list_history_page(cursor="history-missing", order="recent")
+    with pytest.raises(RepositoryNotFoundError):
+        repository.list_history_page(cursor="history-000", order="recent")
+    with pytest.raises(RepositoryError):
+        repository.list_history_page(order="unknown")
+
+
 def test_progress_cache_is_separated_by_project_and_refreshes_new_turn_evidence(
     tmp_path: Path,
 ) -> None:

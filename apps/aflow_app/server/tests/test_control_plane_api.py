@@ -1405,6 +1405,29 @@ def test_openapi_documents_control_plane_operations_and_models() -> None:
     assert "durable-evidence" in resume_schema["properties"]["recovery"]["description"]
 
 
+def test_run_list_recent_order_is_opt_in_and_cursor_is_validated(control_client):
+    client, root, _, _ = control_client
+    for run_id in ("history-001", "history-002", "history-003"):
+        run_dir = root / ".aflow" / "runs" / run_id
+        run_dir.mkdir(parents=True)
+        (run_dir / "run.json").write_text('{"status":"completed"}')
+    endpoint = f"/api/control-plane/projects/{PROJECT_ID}/runs"
+    oldest = client.get(endpoint, params={"limit": 2, "include_progress": "false"})
+    assert oldest.status_code == 200, oldest.text
+    assert [run["run_id"] for run in oldest.json()["runs"]] == ["history-001", "history-002"]
+    assert oldest.json()["next_cursor"] == "history-002"
+
+    recent = client.get(endpoint, params={"limit": 2, "order": "recent", "include_progress": "false"})
+    assert recent.status_code == 200, recent.text
+    assert [run["run_id"] for run in recent.json()["runs"]] == ["history-003", "history-002"]
+    assert recent.json()["next_cursor"] == "history-002"
+    next_page = client.get(endpoint, params={"order": "recent", "cursor": recent.json()["next_cursor"]})
+    assert [run["run_id"] for run in next_page.json()["runs"]] == ["history-001"]
+    assert next_page.json()["next_cursor"] is None
+    assert client.get(endpoint, params={"order": "recent", "cursor": "history-missing"}).status_code == 404
+    assert client.get(endpoint, params={"order": "newest"}).status_code == 422
+
+
 def test_run_list_uses_summary_only_without_context_requests(control_client, monkeypatch):
     from aflow_app_server import main
 

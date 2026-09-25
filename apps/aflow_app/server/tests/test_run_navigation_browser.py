@@ -2,6 +2,8 @@
 import json
 from pathlib import Path
 import re
+from aflow.control_plane import LaunchManifest, create_launch_manifest
+from aflow.control_plane.units import UnitState
 from playwright.sync_api import expect, sync_playwright
 from test_control_plane_api import control_client, live_server, TOKEN, PROJECT_ID  # noqa: F401
 from test_responsive_browser import (
@@ -70,6 +72,54 @@ def wait_for_visible_run_detail_focus(page) -> None:
     detail = _run_history_detail(page)
     assert detail.is_visible()
     assert detail.evaluate('(node) => node.contains(document.activeElement)')
+
+
+def test_recent_runs_are_on_first_history_page_without_extra_fetch(control_client, monkeypatch):
+    client, root, units, _ = control_client
+    for index in range(120):
+        run_id = f'history-{index:03}'
+        create_launch_manifest(root, LaunchManifest(run_id=run_id, project_root=str(root), plan_path='plans/todo/test-plan.md', workflow_name='managed', max_turns=5))
+    for name, status in (('zz-recent-active', 'running'), ('zz-recent-failed', 'failed'), ('zz-recent-completed', 'completed')):
+        create_launch_manifest(root, LaunchManifest(run_id=name, project_root=str(root), plan_path='plans/todo/test-plan.md', workflow_name='managed', max_turns=5))
+        path = root / '.aflow' / 'runs' / name / 'run.json'
+        path.parent.mkdir(parents=True)
+        path.write_text(json.dumps({'status': status, 'plan_path': 'plans/todo/test-plan.md'}))
+    units.units['aflow-run-zz-recent-active.service'] = UnitState(name='aflow-run-zz-recent-active.service', active_state='active', sub_state='running')
+    old = client.get(f'/api/control-plane/projects/{PROJECT_ID}/runs/history-000').json()
+    assert old['status'] == 'needs_attention' and old['status_reason_code'] == 'unit_missing'
+    assert old['evidence']['has_run_metadata'] is False
+    assert {
+        name: client.get(f'/api/control-plane/projects/{PROJECT_ID}/runs/{name}').json()['status']
+        for name in ('zz-recent-active', 'zz-recent-failed', 'zz-recent-completed')
+    } == {'zz-recent-active': 'running', 'zz-recent-failed': 'failed', 'zz-recent-completed': 'completed'}
+    dist = Path(__file__).resolve().parents[2] / 'web' / 'dist'
+    monkeypatch.setenv('AFLOW_APP_WEB_DIST', str(dist))
+    with live_server() as url, sync_playwright() as playwright:
+        browser = _browser(playwright)
+        try:
+            page = browser.new_page(viewport={'width': 1280, 'height': 720})
+            history_requests = []
+            _login(page, url)
+            page.on('request', lambda request: history_requests.append(request.url) if f'/projects/{PROJECT_ID}/runs?' in request.url else None)
+            page.goto(f'{url}/?project={PROJECT_ID}&view=runs')
+            nav = _run_history_navigation(page)
+            first_rows = nav.locator('.run-list-item')
+            expect(first_rows).to_have_count(100)
+            assert [first_rows.nth(index).locator('[data-sidebar-editor-item]').get_attribute('data-sidebar-editor-item') for index in range(3)] == [
+                'zz-recent-failed', 'zz-recent-completed', 'zz-recent-active',
+            ]
+            recent_requests = [request for request in history_requests if 'order=recent' in request]
+            assert len(recent_requests) == 1, history_requests
+            assert 'cursor=' not in recent_requests[0]
+            assert all('order=' not in request for request in history_requests if 'include_progress=false' in request)
+            assert page.evaluate("() => new URL(location.href).searchParams.get('run')") == 'zz-recent-failed'
+            page.get_by_role('button', name='Load more runs', exact=True).click()
+            expect(first_rows).to_have_count(123)
+            recent_requests = [request for request in history_requests if 'order=recent' in request]
+            assert len(recent_requests) == 3, history_requests
+            assert len({row.locator('[data-sidebar-editor-item]').get_attribute('data-sidebar-editor-item') for row in first_rows.all()}) == 123
+        finally:
+            browser.close()
 
 
 def test_run_navigation_scroll_selection_and_history(control_client, monkeypatch):
