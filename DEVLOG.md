@@ -1,5 +1,32 @@
 # DEVLOG
 
+## 2026-09-24 — Keep the Runs history filter readable at 320px (Checkpoint 1)
+
+- Reproduced the populated 320×568 defect before the edit: the native select
+  measured 69.05px in Chromium and 54.05px in WebKit, with `Visible` clipped
+  while New run and More were 44px high and the page had no horizontal overflow.
+  At widths through 359px, hide only the on-screen `Run history` label and keep
+  the accessible native select at a non-shrinking 128px. Wider layouts retain
+  their visible label and existing spacing.
+- The disposable browser fixture archives one of 40 runs. At 320px, both engines
+  show all of `Visible`, `Archived`, and `All history` with the expected 39/1/40
+  results. The select is 128×44px, New run is 84.14×44px in Chromium and
+  90.5×44px in WebKit, More is 48×44px, and the header row is 54px high.
+  `All history` has 40.65px of measured arrow room in Chromium and 30.05px in
+  WebKit after text, padding, and borders. No horizontal overflow appeared at
+  320×568, 390×844, 844×390, 1280×720, or 1440×900, light or dark. Keyboard
+  selection, touch access, focus/selection after resize, an open More menu
+  after resize, and selection/trigger focus after an equal Refresh passed.
+  Screenshots were inspected in both engines; artifacts are
+  under `/tmp/aflow-mobile-runs-filter-cp1-20260924/` as
+  `runs-filter-{chromium|webkit}-{light|dark}-{visible|archived|all}-320x568.png`,
+  plus `all` captures for the four wider viewports.
+- The focused responsive case passed in Chromium and WebKit. The existing
+  populated Runs follow-up fidelity journeys passed 5/5, web tests passed
+  633/633, the production build passed, and `git diff --check` was clean.
+  Reviewed integration with the sidebar, exact-SHA CI, and live activation
+  remain coordinator gates.
+
 ## 2026-09-24 — Prove CP8 held-request termination before Review (follow-up v01)
 
 - The held-refresh fixture now matches Playwright requests by object identity

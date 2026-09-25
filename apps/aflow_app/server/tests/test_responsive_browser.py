@@ -1344,6 +1344,137 @@ def _create_live_control_fixture(control_client, root: Path, monkeypatch) -> tup
     return run_id, state
 
 
+def test_runs_header_filter_legibility(control_client, monkeypatch, tmp_path):
+    """A populated Runs header keeps every native filter value readable on phones."""
+    client, root, _, _ = control_client
+    _seed_responsive_fixture(root)
+    archived_id = RESPONSIVE_GLOBAL_RUN_ID
+    archived = client.post(
+        f"/api/control-plane/projects/{PROJECT_ID}/runs/{archived_id}/archive",
+        json={"expected_revision": 0},
+        headers={"Idempotency-Key": "responsive-header-archive"},
+    )
+    assert archived.status_code == 200, archived.text
+    dist = Path(__file__).resolve().parents[2] / "web" / "dist"
+    monkeypatch.setenv("AFLOW_APP_WEB_DIST", str(dist))
+    artifacts = Path(os.environ.get("AFLOW_BROWSER_ARTIFACT_DIR", str(tmp_path)))
+    artifacts.mkdir(parents=True, exist_ok=True)
+    browser_name = os.environ.get("AFLOW_TEST_BROWSER", "chromium").strip().lower()
+
+    with live_server() as url, sync_playwright() as playwright:
+        browser = _browser(playwright)
+        try:
+            page = browser.new_page(viewport={"width": 320, "height": 568}, has_touch=True)
+            _login(page, url)
+            for theme in ("light", "dark"):
+                _set_theme_preference(page, theme)
+                for width, height in (
+                    (320, 568), (390, 844), (844, 390), (1280, 720), (1440, 900)
+                ):
+                    page.set_viewport_size({"width": width, "height": height})
+                    page.goto(f"{url}/?project={PROJECT_ID}&view=runs")
+                    select = page.get_by_role("combobox", name="Run history", exact=True)
+                    expect(select).to_be_visible()
+                    assert select.get_attribute("aria-label") == "Run history"
+                    for value, label, count in (
+                        ("visible", "Visible", 39),
+                        ("archived", "Archived", 1),
+                        ("all", "All history", 40),
+                    ):
+                        select.select_option(value)
+                        expect(select).to_have_value(value)
+                        expect(page.locator(".section-heading").filter(has_text="Project runs")).to_contain_text(
+                            f"{count} recorded"
+                        )
+                        archived_row = page.locator(
+                            f".run-list-item[data-run-key='{archived_id}']"
+                        )
+                        expect(archived_row).to_have_count(0 if value == "visible" else 1)
+                        visible_row = page.locator(
+                            ".run-list-item[data-run-key='responsive-run-01']"
+                        )
+                        expect(visible_row).to_have_count(0 if value == "archived" else 1)
+                        _assert_no_horizontal_overflow(page)
+                        metrics = page.evaluate("""() => {
+                            const row = document.querySelector('.app-header-row-two');
+                            const label = row.querySelector('.header-filter-select');
+                            const select = label.querySelector('select');
+                            const text = label.querySelector('span');
+                            const primary = row.querySelector('.header-slot-primary button');
+                            const more = row.querySelector('.header-slot-more button');
+                            const box = node => {
+                                const r = node.getBoundingClientRect();
+                                return {left:r.left, right:r.right, width:r.width, height:r.height};
+                            };
+                            const style = getComputedStyle(select);
+                            const canvas = document.createElement('canvas');
+                            const context = canvas.getContext('2d');
+                            context.font = style.font;
+                            const selected = select.selectedOptions[0].textContent;
+                            const textWidth = context.measureText(selected).width;
+                            const chrome = parseFloat(style.paddingLeft) + parseFloat(style.paddingRight)
+                                + parseFloat(style.borderLeftWidth) + parseFloat(style.borderRightWidth);
+                            return {
+                                row:box(row), label:box(label), select:box(select),
+                                primary:box(primary), more:box(more),
+                                labelDisplay:getComputedStyle(text).display,
+                                selected, textWidth, chrome,
+                                arrowRoom:select.getBoundingClientRect().width - chrome - textWidth,
+                                scrollWidth:document.documentElement.scrollWidth,
+                            };
+                        }""")
+                        assert metrics["selected"] == label, metrics
+                        assert metrics["select"]["height"] >= 44, metrics
+                        assert metrics["primary"]["height"] >= 44, metrics
+                        assert metrics["more"]["height"] >= 44, metrics
+                        assert metrics["select"]["right"] + 4 <= metrics["primary"]["left"], metrics
+                        assert metrics["primary"]["right"] + 4 <= metrics["more"]["left"], metrics
+                        assert metrics["more"]["right"] <= width, metrics
+                        assert metrics["row"]["height"] <= 56, metrics
+                        assert metrics["arrowRoom"] >= 24, metrics
+                        assert metrics["labelDisplay"] == ("none" if width == 320 else "block"), metrics
+                        if width == 320 or value == "all":
+                            print("RUNS_FILTER_GEOMETRY", browser_name, theme, width, value, metrics)
+                        if width == 320 or value == "all":
+                            image = artifacts / f"runs-filter-{browser_name}-{theme}-{value}-{width}x{height}.png"
+                            page.screenshot(path=str(image))
+                            print("RUNS_FILTER_SCREENSHOT", image)
+
+            page.set_viewport_size({"width": 320, "height": 568})
+            select.select_option("visible")
+            select.focus()
+            select.press("End")
+            expect(select).to_have_value("all")
+            assert select.evaluate("node => document.activeElement === node")
+            page.set_viewport_size({"width": 390, "height": 844})
+            expect(select).to_have_value("all")
+            assert select.evaluate("node => document.activeElement === node")
+            page.set_viewport_size({"width": 320, "height": 568})
+            expect(select).to_have_value("all")
+            assert select.evaluate("node => document.activeElement === node")
+            select.tap()
+            expect(select).to_have_value("all")
+            expect(page.get_by_role("button", name="New run", exact=True)).to_be_visible()
+            more = page.get_by_role("button", name="More", exact=True)
+            more.tap()
+            menu = page.get_by_role("menu", name="More run page actions")
+            expect(menu).to_be_visible()
+            page.set_viewport_size({"width": 390, "height": 844})
+            expect(menu).to_be_visible()
+            page.keyboard.press("Escape")
+            assert more.evaluate("node => document.activeElement === node")
+            expect(select).to_have_value("all")
+            more.tap()
+            page.get_by_role("menuitem", name="Refresh", exact=True).click()
+            expect(page.locator(".section-heading").filter(has_text="Project runs")).to_contain_text(
+                "40 recorded"
+            )
+            expect(select).to_have_value("all")
+            assert more.evaluate("node => document.activeElement === node")
+        finally:
+            browser.close()
+
+
 @pytest.mark.parametrize(("width", "height"), VIEWPORTS)
 def test_project_worktree_presentation(control_client, monkeypatch, width: int, height: int):
     """Exercise one-level disclosure, direct child links, history and context."""
