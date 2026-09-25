@@ -31,6 +31,7 @@ interface CheckpointHistoryProps {
   progress: RunProgressSummary | null
   detail: RunProgressDetail | null
   recordedProgress?: ReactNode
+  parentInformationalDisclosuresOpen?: boolean
   onBulkInformationalDisclosureChange?: (open: boolean) => void
 }
 
@@ -985,7 +986,7 @@ function EvidenceDisclosure({
   </details>
 }
 
-export function CheckpointHistory({ projectId, run, progress, detail, recordedProgress, onBulkInformationalDisclosureChange }: CheckpointHistoryProps): JSX.Element {
+export function CheckpointHistory({ projectId, run, progress, detail, recordedProgress, parentInformationalDisclosuresOpen = true, onBulkInformationalDisclosureChange }: CheckpointHistoryProps): JSX.Element {
   const summary = progress ?? detail
   const runKey = `${projectId}/${run.run_id}`
   const detailEvents = useMemo(() => uniqueEvents(detail?.events ?? []), [detail?.events])
@@ -1066,6 +1067,13 @@ export function CheckpointHistory({ projectId, run, progress, detail, recordedPr
     recordedDelivery.length > 0
     || summary?.availability === 'partial'
   )
+  const allInformationalDisclosuresOpen = parentInformationalDisclosuresOpen
+    && disclosureState.open.checkpoints
+    && disclosureState.open.changes
+    && disclosureState.open.time
+    && disclosureState.open.evidence
+    && (!deliveryRelevant || disclosureState.open.delivery)
+    && detailEvents.every(event => disclosureState.openEventIds.has(event.event_id))
 
   function updateDisclosure(key: HistoryDisclosureKey, open: boolean): void {
     setDisclosureStates(current => {
@@ -1137,8 +1145,7 @@ export function CheckpointHistory({ projectId, run, progress, detail, recordedPr
     {detailAvailable && <>
       <div className="checkpoint-history-disclosure-controls" aria-label="Informational disclosure controls">
         <span className="text-xs text-dim">Explore this run</span>
-        <button type="button" className="btn btn-secondary btn-sm" onClick={() => setAllInformationalDisclosure(true)}>Expand all</button>
-        <button type="button" className="btn btn-secondary btn-sm" onClick={() => setAllInformationalDisclosure(false)}>Collapse all</button>
+        <button type="button" className="btn btn-secondary btn-sm" onClick={() => setAllInformationalDisclosure(!allInformationalDisclosuresOpen)}>{allInformationalDisclosuresOpen ? 'Collapse all' : 'Expand all'}</button>
       </div>
       <details
         className="checkpoint-history-disclosure checkpoint-history-checkpoints"

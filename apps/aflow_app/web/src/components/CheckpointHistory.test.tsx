@@ -194,7 +194,8 @@ describe('CheckpointHistory', () => {
     const view = render(<CheckpointHistory projectId="project-current" run={run} progress={initial} detail={initial} />)
     const checkpoints = document.querySelector('details.checkpoint-history-checkpoints') as HTMLDetailsElement
     expect(checkpoints.hasAttribute('open')).toBe(false)
-    expect(screen.getByRole('button', { name: 'Expand all' })).toBeDefined()
+    const bulkButton = screen.getByRole('button', { name: 'Expand all' })
+    expect(document.querySelectorAll('.checkpoint-history-disclosure-controls button')).toHaveLength(1)
 
     openCheckpointDisclosure()
     fireEvent.click(screen.getByRole('button', { name: /Checkpoint 1: Build/ }))
@@ -208,6 +209,7 @@ describe('CheckpointHistory', () => {
     expect((document.querySelector('details.checkpoint-history-checkpoints') as HTMLDetailsElement).hasAttribute('open')).toBe(true)
     expect((screen.getByText('Run settings & changes', { selector: 'summary' }).closest('details') as HTMLDetailsElement).hasAttribute('open')).toBe(true)
     expect(document.querySelector('.checkpoint-history-detail-heading h5')?.textContent).toBe('Checkpoint 1: Build')
+    expect(screen.getByRole('button', { name: 'Expand all' })).toBe(bulkButton)
 
     const successor = { ...run, run_id: 'run-successor' }
     view.rerender(<CheckpointHistory projectId="project-current" run={successor} progress={initial} detail={initial} />)
@@ -215,12 +217,33 @@ describe('CheckpointHistory', () => {
     view.rerender(<CheckpointHistory projectId="project-current" run={run} progress={initial} detail={initial} />)
     expect((document.querySelector('details.checkpoint-history-checkpoints') as HTMLDetailsElement).hasAttribute('open')).toBe(true)
 
-    fireEvent.click(screen.getByRole('button', { name: 'Expand all' }))
+    bulkButton.focus()
+    fireEvent.click(bulkButton)
     expect((screen.getByText('Count definitions & evidence', { selector: 'summary' }).closest('details') as HTMLDetailsElement).hasAttribute('open')).toBe(true)
     expect((document.querySelector('.checkpoint-history-event-disclosure') as HTMLDetailsElement).hasAttribute('open')).toBe(true)
-    fireEvent.click(screen.getByRole('button', { name: 'Collapse all' }))
+    expect(screen.getByRole('button', { name: 'Collapse all' })).toBe(bulkButton)
+    expect(document.activeElement).toBe(bulkButton)
+    const firstEvent = document.querySelector('.checkpoint-history-event-disclosure') as HTMLDetailsElement
+    firstEvent.open = false
+    fireEvent(firstEvent, new Event('toggle'))
+    expect(screen.getByRole('button', { name: 'Expand all' })).toBe(bulkButton)
+    fireEvent.click(bulkButton)
+    expect(screen.getByRole('button', { name: 'Collapse all' })).toBe(bulkButton)
+    fireEvent.click(bulkButton)
     expect((document.querySelector('details.checkpoint-history-checkpoints') as HTMLDetailsElement).hasAttribute('open')).toBe(false)
     expect((screen.getByText('Time details', { selector: 'summary' }).closest('details') as HTMLDetailsElement).hasAttribute('open')).toBe(false)
+    expect(screen.getByRole('button', { name: 'Expand all' })).toBe(bulkButton)
+  })
+
+  it('ignores absent delivery and event sections while following parent disclosure state', () => {
+    const withoutDelivery = detail({ delivery: [], events: [] })
+    const view = render(<CheckpointHistory projectId="project-current" run={run} progress={withoutDelivery} detail={withoutDelivery} parentInformationalDisclosuresOpen={false} />)
+    const button = screen.getByRole('button', { name: 'Expand all' })
+    expect(document.querySelector('#checkpoint-history-delivery-evidence')).toBeNull()
+    fireEvent.click(button)
+    expect(screen.getByRole('button', { name: 'Expand all' })).toBe(button)
+    view.rerender(<CheckpointHistory projectId="project-current" run={run} progress={withoutDelivery} detail={withoutDelivery} parentInformationalDisclosuresOpen />)
+    expect(screen.getByRole('button', { name: 'Collapse all' })).toBe(button)
   })
 
   it('links canonical retry completions only to the matching source run, turn, and role', () => {

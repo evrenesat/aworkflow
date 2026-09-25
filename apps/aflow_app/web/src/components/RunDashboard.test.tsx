@@ -4306,18 +4306,27 @@ describe('RunDashboard', () => {
     const diagnostics = screen.getByRole('button', { name: 'Diagnostics' })
     expect(details.hasAttribute('open')).toBe(false)
     expect(diagnostics.getAttribute('aria-expanded')).toBe('false')
+    expect(document.querySelector('details.run-settings-changes-disclosure')).toBeNull()
 
-    fireEvent.click(screen.getByRole('button', { name: 'Expand all' }))
+    const bulkButton = screen.getByRole('button', { name: 'Expand all' })
+    bulkButton.focus()
+    fireEvent.click(bulkButton)
     await waitFor(() => {
       expect(details.hasAttribute('open')).toBe(true)
       expect(diagnostics.getAttribute('aria-expanded')).toBe('true')
+      expect(screen.getByRole('button', { name: 'Collapse all' })).toBe(bulkButton)
     })
+    expect(document.activeElement).toBe(bulkButton)
     expect(vi.mocked(api.getRunContext).mock.calls.length).toBe(contextCallsBeforeBulk)
     expect(api.controlControlPlaneRun).not.toHaveBeenCalled()
     expect(api.ownerStopControlPlaneRun).not.toHaveBeenCalled()
     expect(api.startControlPlaneRun).not.toHaveBeenCalled()
 
-    fireEvent.click(screen.getByRole('button', { name: 'Collapse all' }))
+    fireEvent.click(diagnostics)
+    expect(screen.getByRole('button', { name: 'Expand all' })).toBe(bulkButton)
+    fireEvent.click(bulkButton)
+    expect(screen.getByRole('button', { name: 'Collapse all' })).toBe(bulkButton)
+    fireEvent.click(bulkButton)
     await waitFor(() => {
       expect(details.hasAttribute('open')).toBe(false)
       expect(diagnostics.getAttribute('aria-expanded')).toBe('false')
@@ -4351,17 +4360,24 @@ describe('RunDashboard', () => {
     expect(savedSettings).not.toBeNull()
     expect(savedSettings.hasAttribute('open')).toBe(false)
 
-    fireEvent.click(screen.getByRole('button', { name: 'Expand all' }))
+    const bulkButton = screen.getByRole('button', { name: 'Expand all' })
+    fireEvent.click(bulkButton)
     await waitFor(() => {
       expect(savedSettings.hasAttribute('open')).toBe(true)
       expect(diagnostics.getAttribute('aria-expanded')).toBe('true')
+      expect(screen.getByRole('button', { name: 'Collapse all' })).toBe(bulkButton)
     })
     expect(vi.mocked(api.getRunContext).mock.calls.length).toBe(contextCallsBeforeBulk)
     expect(api.controlControlPlaneRun).not.toHaveBeenCalled()
     expect(api.ownerStopControlPlaneRun).not.toHaveBeenCalled()
     expect(api.startControlPlaneRun).not.toHaveBeenCalled()
 
-    fireEvent.click(screen.getByRole('button', { name: 'Collapse all' }))
+    savedSettings.open = false
+    fireEvent(savedSettings, new Event('toggle'))
+    expect(screen.getByRole('button', { name: 'Expand all' })).toBe(bulkButton)
+    fireEvent.click(bulkButton)
+    expect(screen.getByRole('button', { name: 'Collapse all' })).toBe(bulkButton)
+    fireEvent.click(bulkButton)
     await waitFor(() => {
       expect(savedSettings.hasAttribute('open')).toBe(false)
       expect(diagnostics.getAttribute('aria-expanded')).toBe('false')
@@ -4390,12 +4406,16 @@ describe('RunDashboard', () => {
     openTechnicalDetails()
     fireEvent.click(screen.getByText('Raw details'))
     await screen.findByText(/full-marker/)
+    const bulkButton = screen.getByRole('button', { name: 'Expand all' })
+    fireEvent.click(bulkButton)
+    expect(screen.getByRole('button', { name: 'Collapse all' })).toBe(bulkButton)
     const fullCallsBeforeRefresh = vi.mocked(api.getRunContext).mock.calls.filter(call => call[2] === 'full').length
 
     fireEvent.click(screen.getByRole('button', { name: 'Refresh' }))
     await waitFor(() => expect(vi.mocked(api.getRunContext).mock.calls.filter(call => call[2] === 'full').length).toBeGreaterThan(fullCallsBeforeRefresh))
     expect(screen.getByText(/full-marker/)).toBeDefined()
     expect(screen.getAllByRole('heading', { name: 'Checkpoint 4: Reviewed' }).length).toBeGreaterThan(0)
+    expect(screen.getByRole('button', { name: 'Collapse all' })).toBe(bulkButton)
     await openRunActions()
     expect(screen.getByRole('menuitem', { name: 'Review stop options…', exact: true })).toBeDefined()
     expect(screen.getByRole('menuitem', { name: 'Configure restart…', exact: true })).toBeDefined()
