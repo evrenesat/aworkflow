@@ -47,6 +47,21 @@ class PlanLifecycleConflict(PlanLifecycleError):
     """The source revision or destination is no longer the requested one."""
 
 
+def canonical_direct_child(path: Path, parent: Path) -> Path:
+    """Accept a parent alias without following the final plan or run entry."""
+    path = Path(path)
+    if not path.is_absolute() or path.name in {"", ".", ".."}:
+        raise PlanLifecycleError("lifecycle path is invalid")
+    try:
+        if path.parent.resolve(strict=True) != parent:
+            raise PlanLifecycleError("lifecycle parent is outside the repository directory")
+    except (OSError, RuntimeError, ValueError) as exc:
+        raise PlanLifecycleError("lifecycle parent is unavailable") from exc
+    if path.is_symlink():
+        raise PlanLifecycleError("lifecycle entry must not be a symlink")
+    return parent / path.name
+
+
 def _fsync_dir(path: Path) -> None:
     descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
     try:
@@ -110,6 +125,19 @@ class PlanLifecycle:
         if not isinstance(name, str) or _NAME_RE.fullmatch(name) is None:
             raise PlanLifecycleError("plan filename is invalid")
         return self._directory(location, create=create) / name
+
+    def _location_for(self, path: Path) -> PlanLocation | None:
+        if not path.is_absolute():
+            raise PlanLifecycleError("lifecycle path is invalid")
+        try:
+            parent = path.parent.resolve(strict=True)
+        except (OSError, RuntimeError, ValueError) as exc:
+            raise PlanLifecycleError("lifecycle parent is unavailable") from exc
+        return next(
+            (key for key, dirname in _DIRECTORIES.items()
+             if parent == self.root / "plans" / dirname),
+            None,
+        )
 
     @contextmanager
     def _locked(self) -> Iterator[Path]:
@@ -273,16 +301,14 @@ class PlanLifecycle:
         ):
             raise PlanLifecycleError("source run identity is invalid")
         source = Path(source)
-        if not source.is_absolute() or source.name != source.name.strip():
+        if source.name != source.name.strip():
             raise PlanLifecycleError("source plan path is invalid")
-        source_location = next(
-            (
-                location for location, dirname in _DIRECTORIES.items()
-                if source == self.root / "plans" / dirname / source.name
-            ), None
-        )
+        source_location = self._location_for(source)
         if source_location is None or source_location == destination:
             raise PlanLifecycleError("source plan location is invalid")
+        source = canonical_direct_child(
+            source, self._directory(source_location, create=False)
+        )
         with self._locked() as journal:
             data = _regular_bytes(source)
             if data is None:
@@ -342,14 +368,10 @@ class PlanLifecycle:
     def recover_for_path(self, plan_path: Path) -> tuple[Path, ...]:
         """Recover prepared moves touching one direct lifecycle plan path."""
         path = Path(plan_path)
-        location = next(
-            (
-                key for key, directory in _DIRECTORIES.items()
-                if path == self.root / "plans" / directory / path.name
-            ), None
-        )
+        location = self._location_for(path)
         if location is None or _NAME_RE.fullmatch(path.name) is None:
             return ()
+        path = canonical_direct_child(path, self._directory(location, create=False))
         completed: list[Path] = []
         with self._locked() as journal:
             for entry in sorted(journal.glob("*.json")):
@@ -365,7 +387,13 @@ class PlanLifecycle:
 
     def record_for(self, plan_path: Path) -> dict[str, object] | None:
         """Read current lifecycle state for one stable plan owner."""
-        identity = plan_identity_for_path(self.root, plan_path)
+        path = Path(plan_path)
+        location = self._location_for(path)
+        if location is None or _NAME_RE.fullmatch(path.name) is None:
+            return None
+        identity = plan_identity_for_path(
+            self.root, canonical_direct_child(path, self._directory(location, create=False))
+        )
         if identity is None:
             return None
         with self._locked() as journal:

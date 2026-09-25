@@ -4543,12 +4543,17 @@ def _classify_failed_original_plan(
 ) -> None:
     """Move only an exact original plan after terminal failure evidence."""
     from .control_plane import RunRepository
-    from .plan_lifecycle import PlanLifecycle, PlanLifecycleError
+    from .plan_lifecycle import PlanLifecycle, PlanLifecycleError, canonical_direct_child
     from .project_admission import ProjectAdmissionConflict
 
     root = config.repo_root.resolve()
-    source = Path(config.plan_path)
-    if source.parent != root / "plans" / "in-progress" or source.suffix != ".md":
+    if Path(config.plan_path).suffix != ".md":
+        return
+    try:
+        source = canonical_direct_child(
+            config.plan_path, root / "plans" / "in-progress"
+        )
+    except PlanLifecycleError:
         return
     try:
         data = source.read_bytes()
@@ -4584,8 +4589,9 @@ def _classify_failed_original_plan(
 
     if error.failure_kind in {"environment_preflight", "completion_publication"}:
         return
-    run_dir = Path(error.run_dir)
-    if run_dir.parent != root / ".aflow" / "runs" or run_dir.is_symlink():
+    try:
+        run_dir = canonical_direct_child(error.run_dir, root / ".aflow" / "runs")
+    except PlanLifecycleError:
         return
     run_id = run_dir.name
     metadata_path = run_dir / "run.json"
@@ -4596,9 +4602,19 @@ def _classify_failed_original_plan(
         status = RunRepository(root).get_run_status(run_id, include_progress=False)
     except (OSError, ValueError):
         return
+    recorded_source = metadata.get("original_plan_path") if isinstance(metadata, Mapping) else None
+    try:
+        same_original = (
+            isinstance(recorded_source, str)
+            and canonical_direct_child(
+                Path(recorded_source), root / "plans" / "in-progress"
+            ) == source
+        )
+    except PlanLifecycleError:
+        same_original = False
     if (
         not isinstance(metadata, Mapping)
-        or metadata.get("original_plan_path") != str(source)
+        or not same_original
         or status.status not in {"failed", "interrupted"}
         or not admission.predecessor_inactive_for_preview(run_id)
     ):

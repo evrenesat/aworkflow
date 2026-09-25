@@ -1421,10 +1421,15 @@ to move the original plan into distinct correction states. A per-identity
 journal records the source revision, file identity, reason, source run, and
 original/current paths before a no-clobber move; replay completes interrupted
 moves. Plan service access and direct controller entry recover prepared moves
-before using affected paths. Admission guards classification and explicit
-requeue against unresolved run claims. Requeue validates the edited revision,
-returns its checked source run with a stable resume replay key, and resumes a
-recorded recoverable run through control-plane admission. Successful delivery retains
+before using affected paths. Failure classification and lifecycle move/recovery
+compare the resolved parent directory of each plan, run, and recorded
+original-plan path to the registered repository directory. They retain the
+final entry name without resolving it, so a parent alias is accepted while
+symlinked final entries remain rejected. Admission guards classification and
+explicit requeue against unresolved run claims. Requeue validates the edited
+revision, returns its checked source run with a stable resume replay key, and
+resumes a recorded recoverable run through control-plane admission. Successful
+delivery retains
 its receipt-backed done transition; a failed receipt retains its run claim and
 gates unrelated later publication until a descendant in the recorded run
 lineage has a valid published receipt for the same configured target. Historical

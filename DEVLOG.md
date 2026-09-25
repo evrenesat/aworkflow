@@ -1,5 +1,19 @@
 # DEVLOG
 
+## 2026-09-25 — Repair failed-plan moves through parent path aliases
+
+- Terminal failure classification now compares verified canonical parent
+  directories for the source plan, run, and recorded original plan. Lifecycle
+  moves, prepared recovery, and record lookup use the same parent identity while
+  retaining final-entry symlink rejection, revision checks, and admission gates.
+- Reproduced both macOS runtime failures with a symlinked Linux temporary root;
+  the two runtime cases pass after the repair. Added prepared-recovery and
+  symlinked-final-entry regression coverage. Focused tests: 18 passed; the
+  two alias-root runtime tests: 2 passed; Python 3.12 runtime/lifecycle suite:
+  325 passed and 45 subtests passed. Ruff passes for the changed code and
+  lifecycle tests; its full planned command still reports seven unchanged
+  findings in `tests/test_runtime.py` at the base commit.
+
 ## 2026-09-25 — Keep publication locking outside execution checkouts
 
 - Moved the repository-wide publication lock to the verified Git common

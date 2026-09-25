@@ -234,6 +234,37 @@ def test_prepared_journal_recovers_same_bytes_after_interruption(
     assert lifecycle.recover() == ()
 
 
+def test_prepared_move_recovers_through_parent_alias(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = _source(tmp_path)
+    alias = tmp_path.with_name(f"{tmp_path.name}-alias")
+    alias.symlink_to(tmp_path, target_is_directory=True)
+    lifecycle = PlanLifecycle(tmp_path)
+    alias_source = alias / "plans" / "in-progress" / source.name
+    original_complete = lifecycle._complete
+    monkeypatch.setattr(
+        lifecycle, "_complete",
+        lambda record, path: (_ for _ in ()).throw(RuntimeError("crash")),
+    )
+    try:
+        with pytest.raises(RuntimeError, match="crash"):
+            lifecycle.move(
+                alias_source, "failed", expected_revision=hashlib.sha256(_PLAN).hexdigest(),
+                reason_code="terminal_execution_failure", reason="Failed",
+            )
+        monkeypatch.setattr(lifecycle, "_complete", original_complete)
+        assert lifecycle.recover_for_path(alias_source) == (
+            tmp_path / "plans" / "failed" / source.name,
+        )
+        alias_destination = alias / "plans" / "failed" / source.name
+        assert alias_destination.read_bytes() == _PLAN
+        assert lifecycle.record_for(alias_destination)["current_location"] == "failed"
+        assert lifecycle.recover_for_path(alias_source) == ()
+    finally:
+        alias.unlink()
+
+
 def test_replay_finishes_move_after_file_link_but_before_identity_update(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -275,6 +306,50 @@ def test_rejects_symlinked_plan_and_destination(tmp_path: Path) -> None:
             reason_code="terminal_execution_failure", reason="Failed",
         )
     assert outside.read_bytes() == _PLAN
+
+
+def test_parent_alias_does_not_admit_symlinked_final_plan(tmp_path: Path) -> None:
+    outside = tmp_path / "outside.md"
+    outside.write_bytes(_PLAN)
+    source = _source(tmp_path)
+    source.unlink()
+    source.symlink_to(outside)
+    alias = tmp_path.with_name(f"{tmp_path.name}-alias")
+    alias.symlink_to(tmp_path, target_is_directory=True)
+    lifecycle = PlanLifecycle(tmp_path)
+    try:
+        alias_source = alias / "plans" / "in-progress" / source.name
+        with pytest.raises(PlanLifecycleError, match="symlink"):
+            lifecycle.move(
+                alias_source, "failed", expected_revision=hashlib.sha256(_PLAN).hexdigest(),
+                reason_code="terminal_execution_failure", reason="Failed",
+            )
+        with pytest.raises(PlanLifecycleError, match="symlink"):
+            lifecycle.recover_for_path(alias_source)
+        with pytest.raises(PlanLifecycleError, match="symlink"):
+            lifecycle.record_for(alias_source)
+        assert outside.read_bytes() == _PLAN
+        assert not (tmp_path / "plans" / "failed" / source.name).exists()
+    finally:
+        alias.unlink()
+
+
+def test_lifecycle_rejects_outside_and_missing_parent(tmp_path: Path) -> None:
+    source = _source(tmp_path)
+    lifecycle = PlanLifecycle(tmp_path)
+    outside = tmp_path.parent / "other-repository" / "plans" / "in-progress" / source.name
+    missing = tmp_path / "plans" / "missing" / source.name
+    for path in (outside, missing):
+        with pytest.raises(PlanLifecycleError):
+            lifecycle.move(
+                path, "failed", expected_revision=hashlib.sha256(_PLAN).hexdigest(),
+                reason_code="terminal_execution_failure", reason="Failed",
+            )
+        with pytest.raises(PlanLifecycleError):
+            lifecycle.recover_for_path(path)
+        with pytest.raises(PlanLifecycleError):
+            lifecycle.record_for(path)
+    assert source.read_bytes() == _PLAN
 
 
 def test_journal_reason_is_bounded_and_safe(tmp_path: Path) -> None:
