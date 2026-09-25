@@ -775,6 +775,69 @@ describe('GlobalRunOverview project context', () => {
     expect(staleRow.getAttribute('data-enrichment-state')).toBe('stale')
   })
 
+  it('re-enriches only a changed background row and leaves an equal row mounted', async () => {
+    const changed = makeRun('changed-background', { status: 'running', activity: 'active', turns_completed: 1 })
+    const next = { ...changed, turns_completed: 2, revision: 2 }
+    const equal = makeRun('equal-background', { status: 'running', activity: 'active' })
+    const nextDetail = deferred<RunStatus>()
+    let listCalls = 0
+    vi.mocked(api.listControlPlaneRuns).mockImplementation(async () => page(listCalls++ === 0 ? [changed, equal] : [next, { ...equal }]))
+    vi.mocked(api.getControlPlaneRun).mockImplementation(async (_project, runId) => {
+      if (runId === equal.run_id) return canonicalDetail(equal)
+      return listCalls === 1 ? canonicalDetail(changed, { approved_checkpoints: { value: 1, coverage: 'complete' } }) : nextDetail.promise
+    })
+    const view = render(<GlobalRunOverview projects={[primary]} onOpen={vi.fn()} />)
+    const changedRow = await screen.findByRole('button', { name: /changed-background/ })
+    const equalRow = await screen.findByRole('button', { name: /equal-background/ })
+    await waitFor(() => expect(changedRow.textContent).toContain('1/11 approved'))
+    await waitFor(() => expect(equalRow.getAttribute('data-enrichment-state')).toBe('settled'))
+    const equalText = equalRow.textContent
+    const states: string[] = []
+    const observer = new MutationObserver(() => states.push(changedRow.getAttribute('data-enrichment-state') ?? 'missing'))
+    observer.observe(changedRow, { attributes: true, attributeFilter: ['data-enrichment-state'] })
+
+    fireEvent(window, new Event('aflow-history-changed'))
+    await waitFor(() => expect(listCalls).toBe(2))
+    await waitFor(() => expect(vi.mocked(api.getControlPlaneRun).mock.calls.filter(([, id]) => id === changed.run_id)).toHaveLength(2))
+    expect(view.container.querySelectorAll('.global-run-row')[0]).toBe(changedRow.closest('.global-run-row'))
+    expect(view.container.querySelectorAll('.global-run-row')[1]).toBe(equalRow.closest('.global-run-row'))
+    expect(changedRow.textContent).toContain('1/11 approved')
+    expect(states).not.toContain('loading')
+    expect(equalRow.textContent).toBe(equalText)
+    observer.disconnect()
+    expect(vi.mocked(api.getControlPlaneRun).mock.calls.filter(([, id]) => id === equal.run_id)).toHaveLength(1)
+
+    nextDetail.resolve(canonicalDetail(next, { approved_checkpoints: { value: 2, coverage: 'complete' } }))
+    await waitFor(() => expect(changedRow.textContent).toContain('2/11 approved'))
+    expect(changedRow.getAttribute('data-enrichment-state')).toBe('settled')
+    expect(equalRow.textContent).toBe(equalText)
+  })
+
+  it.each(['stale', 'failed'] as const)('rejects a delayed old detail after a changed background row %s read', async outcome => {
+    const initial = makeRun('changed-late', { status: 'running', activity: 'active', turns_completed: 1 })
+    const next = { ...initial, turns_completed: 2, revision: 2 }
+    const oldDetail = deferred<RunStatus>()
+    const newDetail = deferred<RunStatus>()
+    let listCalls = 0
+    let detailCalls = 0
+    vi.mocked(api.listControlPlaneRuns).mockImplementation(async () => page([listCalls++ === 0 ? initial : next]))
+    vi.mocked(api.getControlPlaneRun).mockImplementation(async () => ++detailCalls === 1 ? oldDetail.promise : newDetail.promise)
+    render(<GlobalRunOverview projects={[primary]} onOpen={vi.fn()} />)
+    const row = await screen.findByRole('button', { name: /changed-late/ })
+    await waitFor(() => expect(detailCalls).toBe(1))
+
+    fireEvent(window, new Event('aflow-history-changed'))
+    await waitFor(() => expect(detailCalls).toBe(2))
+    oldDetail.resolve(canonicalDetail(initial, { approved_checkpoints: { value: 3, coverage: 'complete' } }))
+    await act(async () => { await oldDetail.promise })
+    expect(row.textContent).not.toContain('3/11 approved')
+    if (outcome === 'stale') newDetail.resolve(canonicalDetail(initial))
+    else newDetail.reject(new Error('detail unavailable'))
+    await waitFor(() => expect(row.getAttribute('data-enrichment-state')).toBe(outcome))
+    expect(row.textContent).not.toContain('3/11 approved')
+    expect(detailCalls).toBe(2)
+  })
+
   it('retries a terminal stale mismatch after an ordinary Refresh', async () => {
     const run = makeRun('refresh-stale', {
       original_plan_display_name: 'Refresh stale', original_plan_path: 'plans/refresh-stale.md',

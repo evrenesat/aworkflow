@@ -115,7 +115,7 @@ export function GlobalRunOverview({ projects, onOpen, registryLoading = false, r
   const activeEnrichmentRef = useRef(new Map<string, EnrichmentRequest>())
   const visibleEnrichmentRef = useRef(new Map<string, EnrichmentTarget>())
   const enrichmentEpochRef = useRef(0)
-  const rowTokenRef = useRef(new Map<string, number>())
+  const rowTokenRef = useRef(new WeakMap<RunStatus, number>())
   const nextRowTokenRef = useRef(0)
   const pumpEnrichmentRef = useRef<(() => void) | null>(null)
   const [, setEnrichmentVersion] = useState(0)
@@ -294,10 +294,10 @@ export function GlobalRunOverview({ projects, onOpen, registryLoading = false, r
   const currentGeneration = currentLoad?.generation ?? 0
   const renderedSnapshot = renderedRows.map(({ projectId, run }) => {
     const identity = runIdentity(projectId, run.run_id)
-    let token = rowTokenRef.current.get(identity)
+    let token = rowTokenRef.current.get(run)
     if (token === undefined) {
       token = ++nextRowTokenRef.current
-      rowTokenRef.current.set(identity, token)
+      rowTokenRef.current.set(run, token)
     }
     return `${identity}:${token}`
   }).join('\u0000')
@@ -498,8 +498,18 @@ export function GlobalRunOverview({ projects, onOpen, registryLoading = false, r
       && enrichment.run === run
       ? enrichment
       : null
-    const progressRun = currentEnrichment ? { ...run, progress: currentEnrichment.progress } : run
-    const progressState: RunProgressLoadState = currentEnrichment?.state ?? (run.progress ? 'ready' : 'loading')
+    const previousProgress = !currentEnrichment
+      && !run.progress
+      && enrichment?.generation === currentGeneration
+      && enrichment.resultsIdentity === resultsIdentity
+      && enrichment.progress
+      ? enrichment.progress
+      : null
+    const progressRun = currentEnrichment
+      ? { ...run, progress: currentEnrichment.progress }
+      : previousProgress ? { ...run, progress: previousProgress } : run
+    const progressState: RunProgressLoadState = currentEnrichment?.state
+      ?? (previousProgress ? 'stale' : run.progress ? 'ready' : 'loading')
     return <li key={JSON.stringify([projectId, run.run_id])}>
       <RunListItem
         run={progressRun}
@@ -508,7 +518,7 @@ export function GlobalRunOverview({ projects, onOpen, registryLoading = false, r
         rowClassName="global-run-row"
         dataEnrichmentState={progressState === 'ready' ? 'settled' : progressState}
         loadState={progressState}
-        loadMessage={currentEnrichment?.message}
+        loadMessage={currentEnrichment?.message ?? (previousProgress ? STALE_PROGRESS_MESSAGE : null)}
         onSelect={() => onOpen(projectId, run.run_id)}
       />
     </li>

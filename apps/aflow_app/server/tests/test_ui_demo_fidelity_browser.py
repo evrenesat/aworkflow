@@ -2160,11 +2160,11 @@ def test_ui_demo_all_runs_background_refresh_probe(
     _, root, _, _ = control_client
     first = seed_demo_fidelity_fixture(root)
     second_id = "refresh-second"
-    changed_run_id = "refresh-history-054"
     second_root = tmp_path / second_id
     second_root.mkdir()
     subprocess.run(("git", "init", "-q", str(second_root)), check=True)
     second = seed_demo_fidelity_fixture(second_root)
+    changed_run_id = second["running"]["run_id"]
     # The real history API must issue a second page. These are disposable
     # records; the approved reference and any live run artifacts stay intact.
     for index in range(101):
@@ -2184,6 +2184,8 @@ def test_ui_demo_all_runs_background_refresh_probe(
     phase = {"value": "initial"}
     held: list[tuple[object, bytes, int, dict[str, str]]] = []
     requests: list[str] = []
+    detail_requests: list[str] = []
+    changed_snapshot: dict[str, object] = {}
     writes: list[str] = []
     page_errors: list[str] = []
 
@@ -2194,6 +2196,16 @@ def test_ui_demo_all_runs_background_refresh_probe(
     def intercept(route) -> None:
         request = route.request
         parsed = urlsplit(request.url)
+        if request.method == "GET" and parsed.path == f"{base}{second_id}/runs/{changed_run_id}":
+            response = route.fetch()
+            payload = json.loads(response.body())
+            if phase["value"] == "changed":
+                payload.update({key: value for key, value in changed_snapshot.items() if key != "progress"})
+                progress = payload.get("progress")
+                if progress and progress.get("approved_checkpoints", {}).get("value") is not None:
+                    progress["approved_checkpoints"]["value"] += 1
+            route.fulfill(status=response.status, headers=response.headers, body=json.dumps(payload).encode())
+            return
         if request.method != "GET" or not re.fullmatch(rf"{base}[^/]+/runs", parsed.path):
             route.continue_()
             return
@@ -2211,7 +2223,9 @@ def test_ui_demo_all_runs_background_refresh_probe(
             payload = json.loads(body)
             for run in payload["runs"]:
                 if run["run_id"] == changed_run_id:
-                    run.update(status="failed", activity="inactive", status_reason_code="worker_failure")
+                    run.update(turns_completed=(run.get("turns_completed") or 0) + 1)
+                    changed_snapshot.clear()
+                    changed_snapshot.update(run)
             body = json.dumps(payload).encode()
         route.fulfill(status=response.status, headers=response.headers, body=body)
 
@@ -2219,9 +2233,11 @@ def test_ui_demo_all_runs_background_refresh_probe(
         browser = _browser(playwright)
         page = browser.new_page(viewport={"width": width, "height": height})
         page.on("pageerror", lambda error: page_errors.append(str(error)))
+        page.on("request", lambda request: detail_requests.append(request.url) if request.method == "GET" and re.fullmatch(rf"{base}[^/]+/runs/[^/]+", urlsplit(request.url).path) else None)
         # Treat the read-only form projection separately from actual writes.
         page.on("request", lambda request: writes.append(request.url) if phase["value"] != "initial" and request.method not in {"GET", "OPTIONS"} and "/api/" in request.url and not urlsplit(request.url).path.endswith("/config/form") else None)
         page.route("**/api/control-plane/projects/*/runs?*", intercept)
+        page.route(f"**/api/control-plane/projects/{second_id}/runs/{changed_run_id}", intercept)
         try:
             _login(page, url)
             page.emulate_media(color_scheme=theme)  # type: ignore[arg-type]
@@ -2253,6 +2269,7 @@ def test_ui_demo_all_runs_background_refresh_probe(
             row_order = page.locator(".global-run-row").evaluate_all("rows => rows.map(row => row.getAttribute('data-run-key'))")
             page.screenshot(path=str(tmp_path / f"all-runs-before-{theme}-{width}x{height}.png"))
             requests.clear()
+            detail_requests.clear()
             phase["value"] = "held"
             page.evaluate("document.dispatchEvent(new Event('visibilitychange'))")
             for _ in range(100):
@@ -2281,6 +2298,7 @@ def test_ui_demo_all_runs_background_refresh_probe(
             assert equal["roots"]["preview"]["text"] == before["roots"]["preview"]["text"]
             assert equal["focused"] == before["focused"]
             assert equal["scrollY"] == before["scrollY"]
+            assert detail_requests == [], detail_requests
             equal_mutations = read_refresh_probe_mutations(page)
             assert not [item for item in equal_mutations if item.get("classification") in {"subtree", "root-replacement"}], equal_mutations
             page.screenshot(path=str(tmp_path / f"all-runs-equal-{theme}-{width}x{height}.png"))
@@ -2288,12 +2306,24 @@ def test_ui_demo_all_runs_background_refresh_probe(
             phase["value"] = "changed"
             requests.clear()
             page.evaluate("window.dispatchEvent(new Event('aflow-history-changed'))")
-            expect(second_row).to_contain_text("Failed")
+            for _ in range(100):
+                if detail_requests:
+                    break
+                page.wait_for_timeout(50)
+            expect(second_row).to_have_attribute("data-enrichment-state", "settled", timeout=15_000)
+            assert len(detail_requests) == 1 and detail_requests[0].endswith(f"/{changed_run_id}"), detail_requests
             changed = capture_refresh_probe(page)
-            assert all(root["sameNode"] for root in changed["roots"].values())
+            assert all(root["sameNode"] for root in changed["roots"].values()), [name for name, root in changed["roots"].items() if not root["sameNode"]]
             assert changed["roots"]["selected_row"]["text"] == before["roots"]["selected_row"]["text"]
             assert changed["roots"]["changed_row"]["text"] != before["roots"]["changed_row"]["text"]
+            assert "2/10 approved" in changed["roots"]["changed_row"]["text"]
             assert changed["roots"]["preview"]["text"] == before["roots"]["preview"]["text"]
+            assert changed["focused"] == before["focused"]
+            assert changed["scrollY"] == before["scrollY"]
+            changed_mutations = read_refresh_probe_mutations(page)
+            assert not [item for item in changed_mutations if item.get("classification") == "root-replacement"], changed_mutations
+            assert not [item for item in changed_mutations if item.get("root") in {"selected_row", "preview"}], changed_mutations
+            page.screenshot(path=str(tmp_path / f"all-runs-changed-{theme}-{width}x{height}.png"))
 
             for _ in range(100):
                 if any("cursor=" in request and f"/{second_id}/runs" in request for request in requests):
@@ -2310,6 +2340,8 @@ def test_ui_demo_all_runs_background_refresh_probe(
             assert all(root["sameNode"] for root in after_timer["roots"].values())
             assert after_timer["roots"]["selected_row"]["text"] == before["roots"]["selected_row"]["text"]
             assert after_timer["focused"] == before["focused"]
+            assert len(detail_requests) == 1, detail_requests
+            refresh_detail_requests = detail_requests.copy()
             for _ in range(100):
                 if any("cursor=" in request and f"/{second_id}/runs" in request for request in requests):
                     break
@@ -2324,7 +2356,7 @@ def test_ui_demo_all_runs_background_refresh_probe(
             assert all(root["sameNode"] for root in failed["roots"].values())
             assert failed["focused"] == before["focused"]
             assert failed["scrollY"] == before["scrollY"]
-            expect(second_row).to_contain_text("Failed")
+            expect(second_row).to_have_attribute("data-enrichment-state", "settled")
             assert first_row.get_by_role("dialog").is_visible()
             assert page_errors == []
             assert writes == []
@@ -2339,9 +2371,12 @@ def test_ui_demo_all_runs_background_refresh_probe(
                 "before": before, "held": during, "equal": equal,
                 "changed": changed, "timer": after_timer, "failed": failed,
                 "held_mutations": held_mutations, "equal_mutations": equal_mutations,
+                "changed_mutations": changed_mutations,
                 "row_order": row_order,
                 "navigated_run_id": first["paused"]["run_id"],
-                "requests": requests, "page_errors": page_errors, "writes": writes,
+                "requests": requests, "refresh_detail_requests": refresh_detail_requests,
+                "detail_requests": detail_requests,
+                "page_errors": page_errors, "writes": writes,
             })
         finally:
             for route, body, status, headers in held:

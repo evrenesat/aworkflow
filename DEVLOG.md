@@ -1,5 +1,24 @@
 # DEVLOG
 
+## 2026-09-25 — Keep changed All runs progress moving (Checkpoint 1)
+
+- The integrated invisible-refresh change kept the overview generation stable,
+  but its effect snapshot keyed tokens only by project/run ID. A changed raw
+  row could therefore depend on an incidental admission transition to restart
+  detail enrichment. Tokens now follow reconciled run objects: equal rows retain
+  their token; changed rows enqueue one matching detail read. Existing generation,
+  result identity, four-request cap, and stale-response checks remain in force.
+- A changed row keeps its last matching projection visibly marked stale until
+  detail settles. Focused tests cover equal siblings, one replacement read,
+  delayed old detail, canonical mismatch, and failure. The populated All runs
+  browser probe uses a changed raw turn without changing the row's group;
+  Chromium/WebKit desktop 1280×720 and mobile 390×844 kept equal-row nodes,
+  preview, focus, and scroll, made no writes or extra equal-row reads, and
+  settled the changed row to 2/10 approved after one detail read. Before/equal/
+  changed screenshots and DOM identity evidence were inspected. Physical mobile
+  keyboard and browser chrome, CI, publication, and live activation are outside
+  this checkpoint's local verification.
+
 ## 2026-09-25 — Automatic durable cross-harness repair handover
 
 - Run `20260925t152928z-45800a35` failed at the first Sol High → DS4.1 repair
