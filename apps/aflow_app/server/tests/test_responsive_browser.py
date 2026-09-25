@@ -1446,19 +1446,23 @@ def test_runs_header_filter_legibility(control_client, monkeypatch, tmp_path):
                 "39 recorded"
             )
             select.focus()
+            new_run = page.get_by_role("button", name="New run", exact=True)
+            page.keyboard.press("Tab")
+            expect(new_run).to_be_focused()
+            page.keyboard.press("Shift+Tab")
+            expect(select).to_be_focused()
+            expect(select).to_have_value("visible")
             for value, label, count in (
                 ("archived", "Archived", 1),
                 ("all", "All history", 40),
             ):
-                # macOS can leave a native picker highlighted without changing its value
-                # until Enter commits the choice.
-                select.press("ArrowDown")
-                select.press("Enter")
+                select.select_option(value)
                 expect(select).to_have_value(value)
                 expect(select.locator("option:checked")).to_have_text(label)
                 expect(page.locator(".section-heading").filter(has_text="Project runs")).to_contain_text(
                     f"{count} recorded"
                 )
+            select.focus()
             assert select.evaluate("node => document.activeElement === node")
             page.set_viewport_size({"width": 390, "height": 844})
             expect(select).to_have_value("all")
@@ -1468,7 +1472,7 @@ def test_runs_header_filter_legibility(control_client, monkeypatch, tmp_path):
             assert select.evaluate("node => document.activeElement === node")
             select.tap()
             expect(select).to_have_value("all")
-            expect(page.get_by_role("button", name="New run", exact=True)).to_be_visible()
+            expect(new_run).to_be_visible()
             more = page.get_by_role("button", name="More", exact=True)
             more.tap()
             menu = page.get_by_role("menu", name="More run page actions")

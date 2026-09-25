@@ -1,21 +1,24 @@
 # DEVLOG
 
-## 2026-09-25 — Commit native Runs filter choices in the browser test (Checkpoint 1)
+## 2026-09-25 — Verify Runs filter keyboard focus across native pickers (follow-up v01)
 
 - Published `aeafd165` failed only the Dashboard macOS Python 3.12/3.13 jobs in
   run `36087876569`: after `ArrowDown`, Chromium still exposed the native
-  select's `visible` value. That is an uncommitted picker state, so the browser
-  journey now presses Enter before asserting `Archived` and `All history`, their
-  selected option text, and the corresponding 1/40 recorded counts. The
-  existing select-option, row identity, geometry, screenshot, resize, touch,
-  focus, and More-menu checks remain.
-- The focused journey passed in Chromium and WebKit with local Python 3.12 and
-  3.13. The web suite passed 648/648 and the production build passed. Inspected
-  320px light/dark screenshots from both engines: the selected value and count
-  are visible without clipping. Full dashboard/server suites passed 508/508
-  under each of Python 3.12 and 3.13, with only existing dependency deprecation
-  warnings. `git diff --check` passed. Local Linux emulation cannot prove macOS
-  native picker behavior or a physical mobile keyboard.
+  select's `visible` value. The subsequent ArrowDown/Enter test also assumed
+  ArrowDown advanced the macOS native menu, which is not guaranteed. The
+  corrected journey uses real Tab and Shift+Tab keys to verify focus moves from
+  the history select to New run and back without changing its value. Playwright
+  `select_option` verifies `Archived` and `All history`, their selected option
+  text, and the corresponding 1/40 recorded counts; it does not prove direct
+  keyboard selection. Existing row identity, geometry, screenshots, resize,
+  touch, focus, and More-menu checks remain.
+- Follow-up verification: focused Chromium and WebKit journeys passed on local
+  Python 3.12 and 3.13; the web suite passed 648/648, the production build
+  passed, and the full Python 3.13 dashboard/server suite passed 508/508 with
+  existing dependency deprecation warnings. Inspected all twelve 320px
+  light/dark screenshots across both engines and three filter values: labels
+  and 39/1/40 counts remain readable without clipping. Physical keyboard
+  behavior and native macOS picker selection remain unverified locally.
 - After review and publication, the coordinator must verify the exact commit's
   Dashboard macOS Python 3.12/3.13 jobs and Linux dashboard jobs, then report
   CI and live activation separately. Local approval alone does not establish
@@ -35,9 +38,11 @@
   90.5×44px in WebKit, More is 48×44px, and the header row is 54px high.
   `All history` has 40.65px of measured arrow room in Chromium and 30.05px in
   WebKit after text, padding, and borders. No horizontal overflow appeared at
-  320×568, 390×844, 844×390, 1280×720, or 1440×900, light or dark. Keyboard
-  selection, touch access, focus/selection after resize, an open More menu
-  after resize, and selection/trigger focus after an equal Refresh passed.
+  320×568, 390×844, 844×390, 1280×720, or 1440×900, light or dark. The original
+  local Linux keyboard selection check passed, but the portable follow-up above
+  now verifies keyboard focus/navigation separately. Touch access, focus and
+  selection after resize, an open More menu after resize, and selection/trigger
+  focus after an equal Refresh passed.
   Screenshots were inspected in both engines; artifacts are
   under `/tmp/aflow-mobile-runs-filter-cp1-20260924/` as
   `runs-filter-{chromium|webkit}-{light|dark}-{visible|archived|all}-320x568.png`,
