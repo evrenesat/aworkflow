@@ -3927,3 +3927,32 @@ HISTORY: Published clipboard history `c14f1f2`/`cd78d53` remains separate and mu
   passed 49; `git diff --check` passed. Existing dependency deprecation
   warnings remain. Exact-SHA CI, publication, and live activation are
   coordinator gates; checkpoint changes remain uncommitted for review.
+
+## 2026-09-25 — Measure disclosure controls in one browser frame (Checkpoint 1)
+
+- Fast-forwarded the clean managed worktree to published `6d44263d`. CI run
+  `36122613852` read label y=662.656 h=18 and button y=686.656 h=44 in
+  separate calls, implying a 37px center gap. Its later atomic JSON instead
+  read label y=699.656 and button y=686.656: both centers were 708.656.
+  The focused test also had separate enlarged-text box reads.
+- The focused browser test now reads the disclosure row, label, button, font
+  state and clipping in one scoped DOM evaluation per layout state. The strict
+  `<2px` center check, loaded-font check, one-button interaction, phone target,
+  overflow, no-write and page-error assertions remain. A temporary one-column
+  grid at light 390px creates a real second row; the same predicate rejects its
+  39px center gap, and the inline style is removed before normal screenshots.
+- Populated light/dark Chromium and WebKit JSON captures at 320, 375, 390,
+  768, 844, 1280 and 1440px all show 0px center gaps. At enlarged 390×420,
+  the label wraps to 54px, the button remains 44px high, and centers still
+  agree in both engines. Inspected normal 390px and 768px light screenshots
+  from both engines plus enlarged 390px screenshots; the disclosure control
+  remains readable and aligned. Artifacts are in
+  `/tmp/aflow-ui-disclosure-cp1-artifacts/` for this local run.
+- Verification: `npm --prefix apps/aflow_app/web test -- --run` passed 649;
+  `npm --prefix apps/aflow_app/web run build` passed; the focused
+  `uv run --directory apps/aflow_app/server pytest -q tests/test_ui_followup_fidelity_browser.py -k failed_review_history`
+  passed 14 in Chromium and 14 with `AFLOW_TEST_BROWSER=webkit`; the combined
+  `uv run --directory apps/aflow_app/server pytest -q tests/test_ui_followup_fidelity_browser.py tests/test_ui_demo_fidelity_browser.py`
+  passed 49; `git diff --check` passed. Browser commands used
+  `AFLOW_BROWSER_ARTIFACT_DIR=/tmp/aflow-ui-disclosure-cp1-artifacts`. Local
+  verification does not establish hosted CI, publication or live activation.

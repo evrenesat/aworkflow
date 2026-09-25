@@ -53,6 +53,35 @@ def _box(capture: dict[str, object], name: str) -> dict[str, float]:
     return box
 
 
+def _disclosure_control_layout(controls) -> dict:
+    """Read the disclosure row and both children in one browser layout frame."""
+    return controls.evaluate(
+        """row => {
+          const label = row.querySelector('span');
+          const button = row.querySelector('button');
+          const box = node => {
+            const {x, y, width, height} = node.getBoundingClientRect();
+            return {x, y, width, height, scrollWidth: node.scrollWidth};
+          };
+          return {fonts: document.fonts.status, display: getComputedStyle(row).display,
+            row: box(row), label: box(label), button: box(button)};
+        }"""
+    )
+
+
+def _assert_disclosure_control_layout(layout: dict, viewport_width: int) -> None:
+    assert layout["fonts"] == "loaded"
+    assert layout["display"] == "grid"
+    label, button, row = layout["label"], layout["button"], layout["row"]
+    center_delta = abs(label["y"] + label["height"] / 2 - button["y"] - button["height"] / 2)
+    assert center_delta < 2, f"disclosure centers differ by {center_delta:.2f}px: {layout}"
+    assert label["scrollWidth"] <= label["width"] + 1
+    assert button["x"] + button["width"] <= row["x"] + row["width"] + 1
+    assert button["x"] + button["width"] <= viewport_width
+    if viewport_width <= 390:
+        assert button["height"] >= 44
+
+
 def _assert_anchor_order(capture: dict[str, object]) -> None:
     anchors = capture["anchors"]
     assert isinstance(anchors, dict)
@@ -400,31 +429,24 @@ def test_ui_followup_failed_review_history(
             bulk = controls.locator("button")
             expect(bulk).to_have_text("Expand all")
             expect(controls.locator("button")).to_have_count(1)
-            label_box = controls.locator("span").bounding_box()
-            button_box = bulk.bounding_box()
-            assert label_box is not None and button_box is not None
-            control_layout = page.evaluate(
-                """() => {
-                  const row = document.querySelector('.run-detail:has(.checkpoint-history-disclosure-controls) .checkpoint-history-disclosure-controls');
-                  const label = row.querySelector('span');
-                  const button = row.querySelector('button');
-                  const box = node => {
-                    const {x, y, width, height} = node.getBoundingClientRect();
-                    return {x, y, width, height, scrollWidth: node.scrollWidth};
-                  };
-                  return {fonts: document.fonts.status, display: getComputedStyle(row).display,
-                    row: box(row), label: box(label), button: box(button)};
-                }"""
-            )
+            control_layout = _disclosure_control_layout(controls)
             (artifact_dir / f"{stem}-controls.json").write_text(
                 json.dumps(control_layout, indent=2) + "\n", encoding="utf-8",
             )
-            assert control_layout["fonts"] == "loaded"
-            assert abs(label_box["y"] + label_box["height"] / 2 - button_box["y"] - button_box["height"] / 2) < 2
-            assert control_layout["label"]["scrollWidth"] <= label_box["width"] + 1
-            assert button_box["x"] + button_box["width"] <= width
-            if width <= 390:
-                assert button_box["height"] >= 44
+            _assert_disclosure_control_layout(control_layout, width)
+            if (width, theme) == (390, "light"):
+                try:
+                    controls.evaluate("row => { row.style.gridTemplateColumns = '1fr' }")
+                    wrapped_layout = _disclosure_control_layout(controls)
+                    (artifact_dir / f"{stem}-controls-forced-wrap.json").write_text(
+                        json.dumps(wrapped_layout, indent=2) + "\n", encoding="utf-8",
+                    )
+                    assert wrapped_layout["label"]["y"] + wrapped_layout["label"]["height"] <= wrapped_layout["button"]["y"]
+                    with pytest.raises(AssertionError, match="disclosure centers differ"):
+                        _assert_disclosure_control_layout(wrapped_layout, width)
+                finally:
+                    controls.evaluate("row => { row.style.removeProperty('grid-template-columns') }")
+                _assert_disclosure_control_layout(_disclosure_control_layout(controls), width)
             _assert_no_horizontal_overflow(page)
             page.screenshot(path=str(artifact_dir / f"{stem}.png"), full_page=True)
             bulk.evaluate("node => { window.__bulkDisclosure = node; node.focus() }")
@@ -457,12 +479,12 @@ def test_ui_followup_failed_review_history(
                 page.set_viewport_size({"width": 390, "height": 420})
                 page.evaluate("document.documentElement.style.fontSize = '24px'")
                 _wait_for_fidelity_readiness(page)
-                enlarged_label = controls.locator("span").bounding_box()
-                enlarged_button = bulk.bounding_box()
-                assert enlarged_label is not None and enlarged_button is not None
-                assert enlarged_label["height"] > label_box["height"]
-                assert enlarged_button["height"] >= 44
-                assert enlarged_button["x"] + enlarged_button["width"] <= 390
+                enlarged_layout = _disclosure_control_layout(controls)
+                (artifact_dir / f"{stem}-controls-enlarged.json").write_text(
+                    json.dumps(enlarged_layout, indent=2) + "\n", encoding="utf-8",
+                )
+                _assert_disclosure_control_layout(enlarged_layout, 390)
+                assert enlarged_layout["label"]["height"] > control_layout["label"]["height"]
                 _assert_no_horizontal_overflow(page)
                 page.screenshot(path=str(artifact_dir / f"{stem}-enlarged.png"), full_page=True)
         finally:
