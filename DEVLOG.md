@@ -1,5 +1,23 @@
 # DEVLOG
 
+## 2026-09-25 — Stabilize grouped Run history Back focus check
+
+- Exact-SHA `10e5bdfb` CI run `36141982543` failed the same immediate
+  `activeElement` read in macOS Dashboard Python 3.12 and 3.13 after the
+  document scroll had already matched. `SidebarEditorLayout` focuses the
+  captured row in the next animation frame. The unchanged populated case
+  confirmed `history-119` focus and scroll in local Chromium and WebKit.
+- The browser case now waits up to five seconds for the visible grouped row
+  itself to receive focus, then checks restored document scroll. No UI focus
+  behavior, fixture, pagination, or grouped disclosure changed. macOS CI and
+  live activation remain delivery gates after review and publication.
+- Verification: the focused case passed three Chromium and two WebKit runs;
+  the complete navigation module passed 4/4; the web suite passed 659/659
+  when run alone; the production build and `git diff --check` passed. A web
+  refresh test timed out once while browser suites ran concurrently, then
+  passed alone and in the isolated full-suite rerun. Inspected 390×844 light
+  and dark captures for recent rows, `100 loaded`, and one older-run group.
+
 ## 2026-09-25 — Recent-first project Runs history (Checkpoint 1)
 
 - Added opt-in `order=recent` to repository, service, and REST history pages. The

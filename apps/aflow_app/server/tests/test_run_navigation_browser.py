@@ -182,8 +182,9 @@ def test_recent_runs_are_on_first_history_page_without_extra_fetch(control_clien
             assert page.evaluate("() => new URL(location.href).searchParams.get('run')") == 'history-119'
             page.get_by_role('button', name='← Back to Run history', exact=True).click()
             nav.wait_for(state='visible')
+            expect(old_row).to_be_visible()
+            expect(old_row).to_be_focused(timeout=5000)
             wait_for_restored_document_scroll(page, before_back_scroll)
-            assert page.evaluate('() => document.activeElement?.dataset.sidebarEditorItem') == 'history-119'
             page.get_by_role('button', name='Load more runs', exact=True).click()
             expect(first_rows).to_have_count(123)
             expect(history_count).to_have_text('123 recorded')
