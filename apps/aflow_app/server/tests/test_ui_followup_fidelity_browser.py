@@ -877,6 +877,8 @@ def test_ui_followup_run_rows(
         pytest.param(390, 844, "dark", True, id="phone-dark-dirty"),
         pytest.param(844, 390, "light", True, id="landscape-light-dirty"),
         pytest.param(844, 390, "dark", True, id="landscape-dark-dirty"),
+        pytest.param(320, 568, "light", False, id="small-phone-light-clean"),
+        pytest.param(320, 568, "dark", True, id="small-phone-dark-dirty"),
     ),
 )
 def test_ui_followup_launch_review(
@@ -952,15 +954,36 @@ def test_ui_followup_launch_review(
                 and response.request.post_data_json.get("plan_path") == running_plan.relative_to(root).as_posix()
                 and response.request.post_data_json.get("workflow_name") == "managed",
                 timeout=30_000,
-            ):
+            ) as selected_preflight:
                 plan_input.click()
                 plan_input.fill(running_plan.name)
                 page.get_by_role("option", name=running_plan.name, exact=False).click()
             expect(plan_input).to_have_value(running_plan.relative_to(root).as_posix())
+            assert selected_preflight.value.status == 200
 
             visible_dashboard = page.locator('.dashboard-host:not([hidden])').first
             preflight = visible_dashboard.locator('section[aria-label="Working tree preflight"]')
             preflight.wait_for(state="visible")
+            # The matching HTTP response can precede a later render for the
+            # current launch identity. Assert the complete visible state in
+            # one browser poll so a momentary older `ready` cannot satisfy it.
+            page.wait_for_function(
+                """({ dirty, count }) => {
+                    const dashboard = document.querySelector('.dashboard-host:not([hidden])');
+                    const panel = dashboard?.querySelector('[aria-label="Working tree preflight"]');
+                    const review = [...document.querySelectorAll('button')].find(
+                        button => button.textContent?.trim() === 'Review start…' && !button.closest('[hidden]')
+                    );
+                    if (panel?.getAttribute('data-preflight-status') !== 'ready') return false;
+                    const text = panel.textContent || '';
+                    if (!text.includes('Execution mode: existing checkout')) return false;
+                    if (!text.includes(dirty ? `${count} uncommitted changes detected.` : 'No uncommitted changes detected.')) return false;
+                    const checkbox = panel.querySelector('input[type="checkbox"]');
+                    return dirty ? !!checkbox && !!review?.disabled : !checkbox && !!review && !review.disabled;
+                }""",
+                arg={"dirty": dirty, "count": len(dirty_paths)},
+                timeout=30_000,
+            )
             expect(preflight).to_have_attribute("data-preflight-status", "ready", timeout=30_000)
             expect(preflight).to_contain_text(
                 "Execution mode: existing checkout — uses the current checkout; "
@@ -978,6 +1001,7 @@ def test_ui_followup_launch_review(
                 )
                 expect(confirmation).to_be_visible()
                 confirmation.check()
+                expect(page.get_by_role("button", name="Review start…", exact=True)).to_be_enabled(timeout=30_000)
                 changed_files.locator(":scope > summary").click()
                 expect(changed_files).to_have_attribute("open", "")
                 expect(first_path).to_be_visible()
@@ -1016,6 +1040,8 @@ def test_ui_followup_launch_review(
             expect(review_region).to_contain_text("No run is allocated until you choose Start run.")
             expect(review_region).to_contain_text("Execution mode")
             expect(review_region).to_contain_text("Turn limit")
+            expect(review_region).to_contain_text("no team — global role assignments apply")
+            expect(review_region).to_contain_text("15 · server default")
             full_details = review_region.locator("details.launch-review-details")
             assert full_details.get_attribute("open") is None
             assert units.start_calls == []

@@ -3748,3 +3748,35 @@ HISTORY: Published clipboard history `c14f1f2`/`cd78d53` remains separate and mu
 - Added a disposable owned-run failed review beside active, paused and completed history, with real API reads and Chromium/WebKit light/dark viewport captures at 320×568, 390×844, 768×1024, 844×390, 1280×720 and 1440×900. The existing row journey checks 56–72px desktop rows where possible, viewport-contained previews, focus restoration, stable refresh and read-only navigation.
 - Visual review against the frozen demo shows the same overview reading order. The real authenticated shell, failure actions, follow-up draft, and fuller evidence add height, especially at 320px; the frozen demo is a simpler representative surface. The owner's defect screenshots were described in the plan but were not present as files in this worktree, so comparison to them is limited to those recorded symptoms. Browser emulation does not verify a physical mobile keyboard or browser toolbar. Live deployment remains outside this checkpoint worker's scope.
 - Verification on the final code: web 644 tests across 29 files; production build passed with its existing large-chunk warning; populated Chromium and WebKit browser files passed 29 tests each at the requested light/dark viewport matrix; full server suite passed 504 tests with three dependency deprecation warnings. Older browser assertions were updated to expect `-` in recorded delivery slots with unknown status. Disposable captures showed no horizontal overflow, clipped preview, unwanted write or page error; WebKit wraps the compact 320px heading and recent-activity labels more than Chromium while preserving readable text.
+
+## 2026-09-24 — Settle residual launch and follow-up CI races (Checkpoint 1)
+
+- Fast-forwarded the clean managed worktree to reviewed base `ca89865e` and
+  confirmed its ancestry. CI run `36066404378` showed launch assertions seeing
+  `ready` before a later `Inspecting…` render; the recorded `36058346101`
+  follow-up test also asserted its deferred detail request before that call was
+  observed. The launch guard remains tied to the current preflight identity;
+  no persistent product state failure was reproduced locally.
+- The launch browser journey now waits for the matching plan/workflow preflight
+  response and the complete visible ready state, correct dirty count, and
+  Review button state together. It checks the effective no-team and 15-turn
+  defaults in the focused read-only review. Added clean and dirty 320×568
+  cases. The follow-up component test waits for the exact project/run/signal
+  detail call before resolving its deferred response; its one-draft and exact
+  returned-path assertions remain.
+- Web suite: 633 passed across 29 files. Production build passed with the
+  existing chunk-size warning. Chromium and WebKit follow-up browser modules
+  each passed 19 tests; Chromium's 14-case launch matrix passed separately.
+  Inspected light clean and dark dirty 320×568 review captures in both engines:
+  focus, effective choices, and read-only consequence were visible; no new
+  mismatch with the approved demo was identified.
+- Full server suite: Python 3.12 passed 495; Python 3.13 passed 495 on rerun.
+  The first 3.13 full pass had one intermittent focus-restoration failure in
+  the existing run-row browser journey (494 passed, 1 failed); the complete
+  follow-up browser module and subsequent full suite both passed without a
+  product or test edit for that row case. All runs used separate temporary
+  configuration and pytest/browser artifact directories. Hosted CI and live
+  deployment remain coordinator gates. After the effective-choice assertions,
+  the full WebKit follow-up module passed again (19), and focused Python 3.12
+  clean desktop/dirty 320×568 launch cases passed (2). `git diff --check`
+  passed.
