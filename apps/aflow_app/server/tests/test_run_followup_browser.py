@@ -39,7 +39,14 @@ def test_failed_run_creates_edits_promotes_and_explicitly_launches_followup(
     monkeypatch,
     tmp_path: Path,
 ) -> None:
+    from aflow.project_settings import ProjectSettings, ProjectSettingsService
+
     _, root, units, _ = control_client
+    settings = ProjectSettingsService(root)
+    settings.save(
+        ProjectSettings(auto_consume_plans=False),
+        expected_revision=settings.read().revision,
+    )
     source_run_id = "followup-browser-failed"
     source_plan = root / "plans" / "in-progress" / "source.md"
     source_plan.parent.mkdir(parents=True, exist_ok=True)
@@ -51,7 +58,7 @@ def test_failed_run_creates_edits_promotes_and_explicitly_launches_followup(
     source_dir.mkdir(parents=True, exist_ok=True)
     source_run = {
         "status": "failed",
-        "plan_path": "plans/in-progress/source.md",
+        "plan_path": str(source_plan.resolve()),
         "workflow_name": "managed",
         "current_step_name": "implement",
         "turns_completed": 2,
@@ -149,7 +156,12 @@ def test_failed_run_creates_edits_promotes_and_explicitly_launches_followup(
             page.get_by_role("region", name="Review start", exact=True).wait_for()
             start = page.get_by_role("button", name="Start run", exact=True)
             expect(start).to_be_enabled()
-            start.click()
+            with page.expect_response(
+                lambda response: response.request.method == "POST"
+                and response.url.endswith(f"/api/control-plane/projects/{PROJECT_ID}/runs")
+            ) as start_response:
+                start.click()
+            assert start_response.value.status == 201, start_response.value.text()
             page.locator(".run-detail").wait_for()
             assert len(units.start_calls) == 1
             assert source_json.read_bytes() == source_bytes

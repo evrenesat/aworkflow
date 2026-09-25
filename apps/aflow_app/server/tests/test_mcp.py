@@ -1562,7 +1562,14 @@ def test_mcp_default_requeue_resumes_recorded_source_on_replay(mcp_client) -> No
 
 
 def test_mcp_plan_authoring_matches_rest_and_preserves_stale_bytes(mcp_client) -> None:
+    from aflow.project_settings import ProjectSettings, ProjectSettingsService
+
     client, root, _, _ = mcp_client
+    settings = ProjectSettingsService(root)
+    settings.save(
+        ProjectSettings(auto_consume_plans=False),
+        expected_revision=settings.read().revision,
+    )
     headers = {"Authorization": f"Bearer {TOKEN}"}
     plans_path = f"/api/projects/{PROJECT_ID}/plans"
     name = "mcp-authoring.md"
