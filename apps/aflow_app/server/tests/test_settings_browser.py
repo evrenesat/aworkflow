@@ -112,7 +112,7 @@ def test_profile_combobox_enter_preserves_raw_identity(control_client, tmp_path,
     monkeypatch.setattr(config_module, 'global_config_dir', lambda: config_dir)
     dist = Path(__file__).resolve().parents[2] / 'web' / 'dist'
     monkeypatch.setenv('AFLOW_APP_WEB_DIST', str(dist))
-    evidence_root = Path('.aflow/review-clear-run-settings/r1')
+    evidence_root = tmp_path / 'profile-evidence'
     evidence_root.mkdir(parents=True, exist_ok=True)
 
     def add_raw_profile_suggestion(route):

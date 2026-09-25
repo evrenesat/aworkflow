@@ -15,7 +15,7 @@ from playwright.sync_api import Error as PlaywrightError, expect, sync_playwrigh
 
 from aflow.control_plane.units import InMemoryUnitManager, UnitState
 from test_control_plane_api import PROJECT_ID, control_client, live_server  # noqa: F401
-from test_responsive_browser import _assert_header_and_flow, _assert_theme, _browser, _login, _seed_team_family_fixture, _select_settings_section, _set_theme_preference
+from test_responsive_browser import _assert_header_and_flow, _assert_theme, _browser, _login, _open_destination, _seed_team_family_fixture, _select_settings_section, _set_theme_preference
 from ui_demo_fidelity import (
     CAPTURE_THEMES,
     CAPTURE_VIEWPORTS,
@@ -1473,12 +1473,17 @@ def test_ui_demo_cp8_plan_editor_and_review_captures(
 
 
 @pytest.mark.parametrize(
-    ("width", "height", "theme"),
+    ("width", "height", "theme", "text_scale"),
     (
-        pytest.param(1280, 720, "light", id="desktop-light"),
-        pytest.param(1280, 720, "dark", id="desktop-dark"),
-        pytest.param(390, 844, "light", id="mobile-light"),
-        pytest.param(390, 844, "dark", id="mobile-dark"),
+        pytest.param(1280, 720, "light", 1, id="desktop-light"),
+        pytest.param(1280, 720, "dark", 1, id="desktop-dark"),
+        pytest.param(390, 844, "light", 1, id="mobile-light"),
+        pytest.param(390, 844, "dark", 1, id="mobile-dark"),
+        pytest.param(320, 568, "light", 1, id="small-mobile-light"),
+        pytest.param(844, 390, "dark", 1, id="mobile-landscape-dark"),
+        pytest.param(1440, 900, "light", 1, id="wide-desktop-light"),
+        pytest.param(390, 420, "dark", 1, id="short-mobile-dark"),
+        pytest.param(390, 844, "light", 1.25, id="mobile-enlarged-text-light"),
     ),
 )
 def test_ui_demo_cp9_settings_effective_values_and_disclosures(
@@ -1488,6 +1493,7 @@ def test_ui_demo_cp9_settings_effective_values_and_disclosures(
     width: int,
     height: int,
     theme: str,
+    text_scale: float,
 ) -> None:
     """Capture each populated Settings section against the frozen surface."""
     _, root, _, _ = control_client
@@ -1502,6 +1508,7 @@ def test_ui_demo_cp9_settings_effective_values_and_disclosures(
         "reference_sha256": manifest["demo_sha256"],
         "viewport": {"width": width, "height": height},
         "theme": theme,
+        "text_scale": text_scale,
         "sections": {},
     }
     sections = ("Teams", "Agents & Roles", "Workflows", "Prompts", "Skills", "General")
@@ -1523,6 +1530,10 @@ def test_ui_demo_cp9_settings_effective_values_and_disclosures(
     with live_server() as url, sync_playwright() as playwright:
         browser = _browser(playwright)
         page = browser.new_page(viewport={"width": width, "height": height})
+        page_errors: list[str] = []
+        writes: list[str] = []
+        page.on("pageerror", lambda error: page_errors.append(str(error)))
+        page.on("request", lambda request: writes.append(f"{request.method} {request.url}") if request.method in {"PATCH", "PUT", "DELETE"} else None)
         try:
             _login(page, url)
             page.emulate_media(color_scheme=theme)  # type: ignore[arg-type]
@@ -1537,9 +1548,22 @@ def test_ui_demo_cp9_settings_effective_values_and_disclosures(
             )
             _assert_reference_capture(reference)
             captures["reference"] = {"screenshot": reference_path.name, "anchors": reference["anchors"]}
+            # The frozen file has a separate Settings screen. Capture its
+            # matching section before navigating to the authenticated app.
+            page.locator('[data-view="settings"]').evaluate("element => element.click()")
+            page.locator("#af-frame .af-footer").evaluate("element => { element.style.display = 'none' }")
+            reference_sections = {}
+            for section in sections:
+                page.locator(f'[data-setting="{section}"]').evaluate("element => element.click()")
+                reference_section_path = tmp_path / f"cp9-reference-settings-{section.lower().replace(' & ', '-')}-{theme}-{width}x{height}.png"
+                page.locator("#af-frame").screenshot(path=str(reference_section_path))
+                reference_sections[section] = reference_section_path.name
+            captures["reference_sections"] = reference_sections
 
             page.goto(f"{url}/?project={PROJECT_ID}&view=settings", wait_until="load")
             page.get_by_role("heading", name="Settings", exact=True).wait_for()
+            if text_scale != 1:
+                page.evaluate("scale => { document.documentElement.style.fontSize = `${scale * 100}%` }", text_scale)
             for section in sections:
                 _select_settings_section(page, section)
                 panel = page.locator("#settings-domain-panel")
@@ -1555,6 +1579,8 @@ def test_ui_demo_cp9_settings_effective_values_and_disclosures(
                     page.locator(".sidebar-editor-navigation:visible [data-sidebar-editor-item]").first.wait_for()
                 _assert_theme(page, theme)
                 _assert_header_and_flow(page)
+                install_refresh_probe(page, {"panel": "#settings-domain-panel"})
+                assert capture_refresh_probe(page)["roots"]["panel"]["sameNode"]
                 save = page.get_by_role("button", name="Save all changes", exact=True)
                 expect(save).to_be_visible()
                 first_disclosure = panel.locator("details:visible").first
@@ -1597,9 +1623,130 @@ def test_ui_demo_cp9_settings_effective_values_and_disclosures(
                     "first_disclosure": first_summary,
                     "settings_tab": panel.get_attribute("data-settings-tab"),
                 }
+                navigation_control = page.get_by_role("combobox", name="Settings section", exact=True) if width < 1200 else page.get_by_role("tab", name=section, exact=True)
+                navigation_control.focus()
+                expect(navigation_control).to_be_focused()
+            assert not page_errors, page_errors
+            assert not writes, writes
         finally:
             browser.close()
     _write_artifact_manifest(tmp_path / f"cp9-settings-{theme}-{width}x{height}.json", captures)
+
+
+@pytest.mark.parametrize(
+    ("width", "height", "theme", "text_scale"),
+    (
+        pytest.param(1280, 720, "light", 1, id="desktop-light"),
+        pytest.param(1280, 720, "dark", 1, id="desktop-dark"),
+        pytest.param(390, 844, "light", 1, id="mobile-light"),
+        pytest.param(390, 844, "dark", 1, id="mobile-dark"),
+        pytest.param(320, 568, "light", 1, id="small-mobile-light"),
+        pytest.param(844, 390, "dark", 1, id="mobile-landscape-dark"),
+        pytest.param(1440, 900, "light", 1, id="wide-desktop-light"),
+        pytest.param(390, 420, "dark", 1, id="short-mobile-dark"),
+        pytest.param(390, 844, "light", 1.25, id="mobile-enlarged-text-light"),
+    ),
+)
+def test_ui_demo_cp9_combined_six_screen_matrix(
+    control_client, monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+    width: int, height: int, theme: str, text_scale: float,
+) -> None:
+    """Compare six populated app screens to their frozen-demo counterparts."""
+    _, root, units, _ = control_client
+    fixtures = seed_demo_fidelity_fixture(root)
+    _prepare_disposable_fidelity_config(root, monkeypatch)
+    running = fixtures["running"]
+    assert isinstance(running, dict)
+    units.units[f"aflow-run-{running['run_id']}.service"] = UnitState(
+        name=f"aflow-run-{running['run_id']}.service", active_state="active", sub_state="running",
+    )
+    monkeypatch.setenv("AFLOW_APP_WEB_DIST", str(Path(__file__).resolve().parents[2] / "web" / "dist"))
+    plan_name = Path(running["plan"]).name
+    snapshots: dict[str, object] = {"viewport": [width, height], "theme": theme,
+                                    "text_scale": text_scale, "demo_sha256": load_reference_manifest()["demo_sha256"],
+                                    "screens": {}}
+    screens = (("Runs", "runs", ".run-detail"),
+               ("All runs", "all", ".global-run-results"),
+               ("Projects", "projects", ".project-picker"),
+               ("Settings", "settings", "#settings-domain-panel"),
+               ("Plans", "plans", ".plan-editor"),
+               ("New run", "new", "section.card.start-run-form"))
+
+    with live_server() as url, sync_playwright() as playwright:
+        browser = _browser(playwright)
+        page = browser.new_page(viewport={"width": width, "height": height})
+        page_errors: list[str] = []
+        writes: list[str] = []
+        page.on("pageerror", lambda error: page_errors.append(str(error)))
+        page.on("request", lambda request: writes.append(f"{request.method} {urlsplit(request.url).path}")
+                if request.method in {"PATCH", "PUT", "DELETE"}
+                or (request.method == "POST" and urlsplit(request.url).path.endswith("/runs")) else None)
+        try:
+            _login(page, url)
+            page.emulate_media(color_scheme=theme)  # type: ignore[arg-type]
+            _set_theme_preference(page, theme)
+            capture_reference_surface(page, width=width, height=height, theme=theme,
+                                      screenshot_path=tmp_path / f"cp9-six-demo-runs-{theme}-{width}x{height}.png")
+            page.locator("#af-frame .af-footer").evaluate("element => { element.style.display = 'none' }")
+            for name, demo_view, _ in screens:
+                demo_button = (page.locator('[data-page="plans"] button[data-view="new"]').first
+                               if demo_view == "new" else page.locator(f'#af-nav [data-view="{demo_view}"]'))
+                demo_button.evaluate("element => element.click()")
+                reference_image = tmp_path / f"cp9-six-demo-{demo_view}-{theme}-{width}x{height}.png"
+                page.locator("#af-frame").screenshot(path=str(reference_image))
+                snapshots["screens"][name] = {"demo": reference_image.name}
+
+            page.goto(f"{url}/?project={PROJECT_ID}&view=runs&run={running['run_id']}", wait_until="load")
+            if text_scale != 1:
+                page.evaluate("scale => { document.documentElement.style.fontSize = `${scale * 100}%` }", text_scale)
+            for name, _, selector in screens:
+                if name == "All runs":
+                    _open_destination(page, "All runs")
+                    expect(page.locator(".global-run-row")).to_have_count(3)
+                elif name in {"Projects", "Settings", "Plans"}:
+                    _open_destination(page, name)
+                if name == "Plans":
+                    ready = page.locator(".plan-list > section").nth(1).locator("button.content-button").filter(has_text=plan_name).first
+                    ready.click()
+                    page.get_by_label("Plan content", exact=True).wait_for()
+                elif name == "New run":
+                    page.get_by_role("button", name="More", exact=True).click()
+                    page.get_by_role("menuitem", name="Configure run…", exact=True).click()
+                    page.get_by_label("Run plan", exact=True).wait_for()
+                if name == "Settings":
+                    _select_settings_section(page, "Agents & Roles")
+                page.locator(selector).wait_for(state="visible")
+                _assert_theme(page, theme)
+                _assert_header_and_flow(page)
+                install_refresh_probe(page, {"screen": selector})
+                probe = capture_refresh_probe(page)
+                assert probe["roots"]["screen"]["sameNode"]
+                assert probe["roots"]["screen"]["text"].strip()
+                if name == "Runs":
+                    expect(page.locator(".run-detail:visible").first).to_contain_text(plan_name)
+                elif name == "Projects":
+                    expect(page.locator("ul[aria-label='Added projects'] > li")).not_to_have_count(0)
+                elif name == "Plans":
+                    expect(page.get_by_label("Plan content", exact=True)).to_be_visible()
+                elif name == "New run":
+                    expect(page.get_by_label("Run plan", exact=True)).not_to_have_value("")
+                image = tmp_path / f"cp9-six-app-{name.lower().replace(' ', '-')}-{theme}-{width}x{height}.png"
+                page.screenshot(path=str(image), full_page=True)
+                snapshots["screens"][name]["app"] = image.name
+                snapshots["screens"][name]["probe"] = {"token": probe["roots"]["screen"]["token"],
+                                                          "box": probe["roots"]["screen"]["box"]}
+                focus_target = page.get_by_role("button", name="Menu", exact=True) if width < 960 or height < 600 else page.get_by_role("button", name="More", exact=True)
+                if focus_target.count() and focus_target.is_visible() and focus_target.is_enabled():
+                    focus_target.focus()
+                    expect(focus_target).to_be_focused()
+                if name == "Projects":
+                    page.locator("ul[aria-label='Added projects'] .compact-row-main").first.click()
+                    page.wait_for_function("() => document.querySelector('.app-header')?.textContent?.includes('Test project')")
+            assert not page_errors, page_errors
+            assert not writes, writes
+        finally:
+            browser.close()
+    _write_artifact_manifest(tmp_path / f"cp9-six-screens-{theme}-{width}x{height}.json", snapshots)
 
 
 @pytest.mark.parametrize(

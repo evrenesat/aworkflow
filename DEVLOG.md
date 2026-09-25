@@ -4427,3 +4427,59 @@ HISTORY: Published clipboard history `c14f1f2`/`cd78d53` remains separate and mu
   value explanation were visible. The journey asserted no page errors and no
   horizontal overflow. Published exact-SHA CI and deployment remain delivery
   gates.
+
+## 2026-09-25 — Full-app invisible refresh verification, Checkpoint 3
+
+- Started clean at reviewed `ea27758f` (merged base `b667e47b`); this checkpoint
+  remains uncommitted for review. Held real Settings reads while users edited
+  Teams' family wizard, Agents & Roles, Workflows, Prompts, Skills and General.
+  The strict WeakMap probe verified visible editor identity and focus across
+  equal, changed and failed responses. Skills coverage retained two drafts by
+  exact name and the original revision; a changed skill still reports the
+  expected conflict. A concurrent workflow edit now keeps its prior revision,
+  and Save all surfaces the real 409 instead of silently losing the draft.
+- Reproduced and fixed two read-boundary defects: a reload disabled the entire
+  editor fieldset, and a changed configuration response replaced an edit made
+  while the read was pending. Read-only reloads now leave the editor enabled;
+  save remains guarded. Changed reads preserve dirty domain state and show a
+  conflict warning. A changed/failed warning now anchors the focused editor
+  in view when inserted above it. The existing single save coordinator, Undo,
+  prompt deletion recovery and per-skill acknowledgement paths remain in place.
+- The combined six-section Settings capture ran in Chromium and WebKit at
+  320×568, 390×844, 844×390, 1280×720, 1440×900 and 390×420, plus 390×844
+  with 125% root text. It checked strict visible roots, document ownership,
+  horizontal overflow, compact touch target height, keyboard focus, page
+  errors and mutation requests. Paired frozen-demo and real populated Settings
+  frames are under `/tmp/aflow-cp3-full-final/` and
+  `/tmp/aflow-cp3-webkit-final-matrix/` (the `test_ui_demo_cp9_settings_effe*` folders).
+  Representative pairs: `...effe0/cp9-reference-settings-teams-light-1280x720.png`
+  with `...effe0/cp9-settings-teams-light-1280x720.png`, and
+  `...effe3/cp9-reference-settings-skills-dark-390x844.png` with
+  `...effe3/cp9-settings-skills-dark-390x844.png` in the WebKit root. A
+  separate combined six-screen journey covers Runs, All runs, Projects, an
+  open Plan editor, New run and Settings at the same matrix points. It uses
+  ordinary UI navigation, strict probes, populated fixtures and paired demo
+  captures under the `test_ui_demo_cp9_combined_six_*` folders; for example,
+  `...six_7/cp9-six-app-plans-dark-390x420.png` and its
+  `cp9-six-demo-plans-dark-390x420.png` counterpart in the WebKit root.
+- Visual follow-up: the frozen demo's Settings surface uses a single header
+  and a simple left tab rail with placeholder fields. The populated app uses
+  the later approved two-row header, top tabs or compact selector, family
+  list/detail and full domain editors. Those topology/content differences are
+  material, so this checkpoint does not claim pixel parity. A focused owner
+  follow-up should approve a current Settings reference for all six sections
+  or explicitly accept the recorded divergence; preserve the frozen demo bytes
+  until that decision. Its SHA-256 remains
+  `2465c0ac2bfef90af2b98a537ad5ac3e931b927c23a78379a8c532ce4dcbadf4`.
+- Verification: web test 667/667 and build passed. The first full server run
+  had 594 passed and 3 failed: two in-process worker journeys inherited
+  `AFLOW_ADMISSION_RESERVATION_NONCE`, as previously documented in this log;
+  one paused-run refresh probe missed its event read but passed alone. With
+  only the inherited nonce removed, both worker tests passed alone and the
+  full server suite then passed 597/597. After adding the combined six-screen
+  matrix, the final full server suite passed 606/606 in 819.14 s. The specified
+  final WebKit fidelity/Settings selection passed 71/71 in 294.48 s, using
+  separate `/tmp/aflow-cp3-webkit-final-matrix/` artifacts. `git diff --check`
+  passed.
+  Physical mobile keyboard/browser chrome and exact-SHA CI/deployed comparison
+  remain coordinator or owner checks; no live activation is claimed.

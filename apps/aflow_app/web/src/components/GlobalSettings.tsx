@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from 'react'
+import { useEffect, useLayoutEffect, useRef, useState } from 'react'
 import * as api from '../api'
 import type { GuidedConfigAction, GuidedFormProjection, ProjectConfig, ProjectConfigFormResponse, ProjectInfo, ProjectScheduling, SettingsResponse, SettingsSaveRequest } from '../types'
 import { changedDocuments, createDraftPreviewCoordinator, previewLegacyConversion, previewSettingsActions, reconcileCleanPreview, repairThresholdDisplay, retainServerProjection, settingsActions, type DraftPreviewState } from '../settingsDraft'
@@ -83,6 +83,7 @@ export function GlobalSettings({ onDirtyChange, onSaved, project = null }: { onD
   const [error, setError] = useState<string | null>(null)
   const [notice, setNotice] = useState<string | null>(null)
   const [busy, setBusy] = useState(false)
+  const [reading, setReading] = useState(false)
   const [newProfile, setNewProfile] = useState({ harness: '', profile: '', model: '', effort: '' })
   const [newProfileError, setNewProfileError] = useState<string | null>(null)
   const [newRole, setNewRole] = useState({ role: '', selector: '' })
@@ -118,12 +119,28 @@ export function GlobalSettings({ onDirtyChange, onSaved, project = null }: { onD
   const schedulingProjectIdRef = useRef<string | null>(null)
   const draftRef = useRef<GuidedFormProjection | null>(null)
   const skillReadSequenceRef = useRef(0)
+  const readWarningAnchorRef = useRef<{ element: Element; top: number } | null>(null)
+
+  function setReadWarning(message: string | null) {
+    const active = document.activeElement
+    const panel = document.getElementById('settings-domain-panel')
+    readWarningAnchorRef.current = active instanceof Element && panel?.contains(active)
+      ? { element: active, top: active.getBoundingClientRect().top } : null
+    setError(message)
+  }
+  useLayoutEffect(() => {
+    const anchor = readWarningAnchorRef.current
+    readWarningAnchorRef.current = null
+    if (!anchor?.element.isConnected) return
+    const shift = anchor.element.getBoundingClientRect().top - anchor.top
+    if (Math.abs(shift) > 1) window.scrollBy(0, shift)
+  }, [error])
 
   useEffect(() => {
     draftRef.current = draft
   }, [draft])
 
-  async function acceptConfig(saved: ProjectConfig, epoch: number, preserveLoaded = false) {
+  async function acceptConfig(saved: ProjectConfig, epoch: number, preserveLoaded = false, preservePendingEdits = true) {
     if (epochRef.current !== epoch) return
     const previousSnapshot = snapshot
     const previousProjection = projection
@@ -163,6 +180,13 @@ export function GlobalSettings({ onDirtyChange, onSaved, project = null }: { onD
       && previousSnapshot.aflow_toml === saved.aflow_toml
       && previousSnapshot.workflows_toml === saved.workflows_toml)
     const projectionEqual = Boolean(previousProjection && sameValue(previousProjection, form))
+    if (preserveLoaded && preservePendingEdits && configDraftDirtyRef.current) {
+      // A user may start editing after Reload has begun. Keep the exact draft
+      // and its revision, so a subsequent save can still detect a conflict.
+      if (!documentsEqual) setReadWarning('Workflow settings changed on the server while you were editing. Your draft is retained; Save all may report a conflict. Reload explicitly to discard it.')
+      setProjectionError(null)
+      return
+    }
     if (preserveLoaded && documentsEqual && projectionEqual && !previousRawEdited) {
       // Revisions and validation metadata can advance without changing what is
       // rendered. Update the authoritative snapshot, but leave projections,
@@ -186,8 +210,12 @@ export function GlobalSettings({ onDirtyChange, onSaved, project = null }: { onD
     if (!(selectedTeam in draft.teams)) setSelectedTeam(Object.keys(draft.teams).sort()[0] ?? '')
     if (selectedWorkflow !== 'Defaults' && !(selectedWorkflow in draft.workflows)) setSelectedWorkflow('Defaults')
   }, [draft, selectedTeam, selectedWorkflow])
-  function acceptServer(saved: SettingsResponse, epoch: number) {
+  function acceptServer(saved: SettingsResponse, epoch: number, preservePendingEdits = false) {
     if (epochRef.current !== epoch) return
+    if (preservePendingEdits && serverDraftDirtyRef.current) {
+      if (server?.revision !== saved.revision) setReadWarning('Server settings changed while you were editing. Your draft is retained; Save all may report a conflict.')
+      return
+    }
     setServer(current => sameValue(current, saved) ? current : saved)
     if (serverText !== saved.advanced_toml) setServerText(saved.advanced_toml)
     const nextDraft = { bind_host: saved.bind_host, bind_port: String(saved.bind_port), managed_projects_root: saved.managed_projects_root }
@@ -274,7 +302,7 @@ export function GlobalSettings({ onDirtyChange, onSaved, project = null }: { onD
       void ensureSkillContent(selectedSkill, epochRef.current)
     }
   }, [selectedSkill, skills, skillContents, skillRevisions]) // eslint-disable-line react-hooks/exhaustive-deps
-  async function load(skillOverride: string | null = null) {
+  async function load(skillOverride: string | null = null, preservePendingEdits = true) {
     const epoch = ++epochRef.current
     const schedulingProjectId = project?.id ?? null
     if (schedulingProjectIdRef.current !== schedulingProjectId) {
@@ -285,13 +313,17 @@ export function GlobalSettings({ onDirtyChange, onSaved, project = null }: { onD
     // Superseded skill reads remain harmless through the epoch check, while a
     // new read for the selected skill must not be blocked by their old marker.
     skillInflight.current.clear()
-    setBusy(true); setError(null); setSkillContentLoading(false); setSkillContentError(null)
+    setBusy(true); setReading(Boolean(snapshot)); setReadWarning(null); setSkillContentLoading(false); setSkillContentError(null)
     const results = await Promise.allSettled([
-      api.getGlobalConfig().then(saved => acceptConfig(saved, epoch, true)), api.getSettings().then(saved => acceptServer(saved, epoch)),
+      api.getGlobalConfig().then(saved => acceptConfig(saved, epoch, true, preservePendingEdits)), api.getSettings().then(saved => acceptServer(saved, epoch, preservePendingEdits)),
       api.listSkills().then(list => { acceptSkills(list, epoch); return list }),
       schedulingProjectId
         ? api.getProjectScheduling(schedulingProjectId).then(saved => {
           if (epochRef.current !== epoch) return
+          if (preservePendingEdits && projectSchedulingDirtyRef.current) {
+            if (projectScheduling?.revision !== saved.revision) setReadWarning('Project scheduling changed while you were editing. Your draft is retained; Save all may report a conflict.')
+            return
+          }
           setProjectScheduling(saved)
           setProjectSchedulingDraft({ auto_consume_plans: saved.auto_consume_plans, max_concurrent_implementations: saved.max_concurrent_implementations })
         })
@@ -304,9 +336,9 @@ export function GlobalSettings({ onDirtyChange, onSaved, project = null }: { onD
         const reason = (results[2] as PromiseRejectedResult).reason
         setSkillsError(reason instanceof Error ? reason.message : 'Could not load the skill list.')
       }
-      setError('Some settings could not be loaded. Reload to retry.')
+      setReadWarning('Some settings could not be loaded. Reload to retry.')
     }
-    setBusy(false)
+    setBusy(false); setReading(false)
     const loaded = results[2]?.status === 'fulfilled' ? ((results[2] as unknown as PromiseFulfilledResult<SkillSummary[]>).value ?? []) : []
     const requestedSkill = skillOverride ?? selectedSkill
     const current = results[2]?.status === 'fulfilled'
@@ -341,7 +373,7 @@ export function GlobalSettings({ onDirtyChange, onSaved, project = null }: { onD
     setSkillDrafts({})
     setSelectedSkill('')
     setSkillContentError(null)
-    void load('')
+    void load('', false)
   }
   async function retryProjection() {
     if (!snapshot) return
@@ -372,6 +404,12 @@ export function GlobalSettings({ onDirtyChange, onSaved, project = null }: { onD
   const skillsDirty = dirtySkillNames.length > 0
   const saveableDirty = configDirty || pendingCreation || serverDirty || skillsDirty || projectSchedulingDirty
   const dirty = saveableDirty || teamWizardDirty
+  const configDraftDirtyRef = useRef(false)
+  const serverDraftDirtyRef = useRef(false)
+  const projectSchedulingDirtyRef = useRef(false)
+  configDraftDirtyRef.current = configDirty || pendingCreation || teamWizardDirty
+  serverDraftDirtyRef.current = serverDirty
+  projectSchedulingDirtyRef.current = projectSchedulingDirty
   function reloadSettings() {
     if (dirty) {
       if (!window.confirm('Discard unsaved settings and reload?')) return
@@ -937,7 +975,7 @@ export function GlobalSettings({ onDirtyChange, onSaved, project = null }: { onD
     {notice && <p className="success-message" role="status">{notice}</p>}
     {projectionError && <div className="error-message" role="alert">The guided settings view is unavailable: {projectionError} <button className="btn btn-secondary btn-sm" onClick={() => void retryProjection()} disabled={busy || !snapshot}>Retry</button> The saved documents stay editable under Advanced TOML.</div>}
     {draftPreviewState.error && <p className="error-message" role="alert">The current settings preview is unavailable: {draftPreviewState.error.message} Your edits remain in the draft; edit again or save to retry.</p>}
-    <fieldset disabled={busy} data-settings-tab={advanced ? 'Advanced TOML' : tab} className="settings-body" id="settings-domain-panel" role={advanced ? 'region' : 'tabpanel'} aria-label={advanced ? 'Advanced TOML editor' : undefined} aria-labelledby={advanced ? undefined : `settings-tab-${tabs.indexOf(tab)}`}>
+    <fieldset disabled={busy && !reading} data-settings-tab={advanced ? 'Advanced TOML' : tab} className="settings-body" id="settings-domain-panel" role={advanced ? 'region' : 'tabpanel'} aria-label={advanced ? 'Advanced TOML editor' : undefined} aria-labelledby={advanced ? undefined : `settings-tab-${tabs.indexOf(tab)}`}>
     {advanced ? <div className="settings-fields">{texts.map((text, index) => <div className="text-editor-field" key={index}><span className="text-editor-label">{index ? 'workflows.toml' : 'aflow.toml'}</span><TextEditor className="mono config-textarea" aria-label={index ? 'workflows.toml contents' : 'aflow.toml contents'} value={text} onChange={e => { draftPreviewCoordinator.invalidate(); setDraftPreviewState(draftPreviewCoordinator.state()); const next: [string, string] = [...texts]; next[index] = e.target.value; setTexts(next); if (!rawEdited) { const form = candidate().form; setBaseline(form); setDraft(form); if (form) draftPreviewCoordinator.updateDraft(form); setPendingNames({}); setNewProfile({ harness: '', profile: '', model: '', effort: '' }); setNewProfileError(null); setNewRole({ role: '', selector: '' }); setNewRoleError(null); setNewTeamName(''); setNewTeamError(null); setPendingFocusTeam(null) } setRawEdited(true) }} /></div>)}</div> : <><div className="settings-retained-skills" hidden={tab !== 'Skills'} aria-hidden={tab !== 'Skills' || undefined}><SkillsSettings
       skills={skills}
       loadError={skillsLoadError}
