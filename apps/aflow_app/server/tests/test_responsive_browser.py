@@ -1443,7 +1443,9 @@ def test_runs_header_filter_legibility(control_client, monkeypatch, tmp_path):
             page.set_viewport_size({"width": 320, "height": 568})
             select.select_option("visible")
             select.focus()
-            select.press("End")
+            select.press("ArrowDown")
+            expect(select).to_have_value("archived")
+            select.press("ArrowDown")
             expect(select).to_have_value("all")
             assert select.evaluate("node => document.activeElement === node")
             page.set_viewport_size({"width": 390, "height": 844})
@@ -1954,6 +1956,7 @@ def test_history_completion_preserves_live_controls_pointer_target(
     dist = Path(__file__).resolve().parents[2] / "web" / "dist"
     monkeypatch.setenv("AFLOW_APP_WEB_DIST", str(dist))
     held_history = []
+    completed_requests = []
     base_path = f"/api/control-plane/projects/{PROJECT_ID}/runs"
     run_path = f"{base_path}/{run_id}"
 
@@ -1969,6 +1972,9 @@ def test_history_completion_preserves_live_controls_pointer_target(
     with live_server() as url, sync_playwright() as playwright:
         browser = _browser(playwright)
         page = browser.new_page(viewport={"width": width, "height": height})
+        page.on("response", lambda response: completed_requests.append(
+            (urlsplit(response.url).path, response.status)
+        ) if urlsplit(response.url).path.startswith(run_path) else None)
         history_pattern = f"**/api/control-plane/projects/{PROJECT_ID}/runs**"
         try:
             _login(page, url)
@@ -1987,6 +1993,18 @@ def test_history_completion_preserves_live_controls_pointer_target(
             if _compact(page):
                 expect(detail_heading).to_be_focused()
             dashboard = _open_live_controls(page)
+            checkpoint_disclosure = dashboard.locator(
+                "details.checkpoint-history-checkpoints"
+            ).first
+            # The direct run and its context load independently. Begin the
+            # held refresh only after its detail has reached a stable state.
+            expect(checkpoint_disclosure).to_have_count(1)
+            expected_detail_heading = "Unassigned history"
+            expect(checkpoint_disclosure.locator(
+                ".checkpoint-history-detail-heading h5"
+            )).to_have_text(expected_detail_heading)
+            disclosure_element = checkpoint_disclosure.element_handle()
+            assert disclosure_element is not None
             page.route(history_pattern, hold_refresh_history)
             page.locator('select[aria-label="Run history"]').first.select_option("all")
             pending = dashboard.get_by_role("status").filter(
@@ -2028,6 +2046,13 @@ def test_history_completion_preserves_live_controls_pointer_target(
             held_history.clear()
             page.unroute(history_pattern, hold_refresh_history)
             pending.wait_for(state="hidden")
+            assert identity.get_attribute("aria-label") == run_id
+            assert disclosure_element.evaluate("element => element.isConnected"), {
+                "run": run_id,
+                "url": page.url,
+                "completed_requests": completed_requests,
+            }
+            expect(checkpoint_disclosure).to_have_count(1)
             after = summary.bounding_box()
             assert after, "Adjust run summary detached after history completion"
             after_flow = page.evaluate(
@@ -2071,15 +2096,11 @@ def test_history_completion_preserves_live_controls_pointer_target(
             expect(details).to_have_count(0)
             expect(dashboard.get_by_label("Control max turns", exact=True)).to_have_count(0)
 
-            checkpoint_disclosure = dashboard.locator(
-                "details.checkpoint-history-checkpoints"
-            ).first
             if checkpoint_disclosure.get_attribute("open") is None:
                 checkpoint_disclosure.locator(":scope > summary").click()
             expect(checkpoint_disclosure).to_have_attribute("open", "")
             checkpoint_layout = dashboard.locator(".checkpoint-history-layout")
             checkpoint_layout.wait_for(state="visible")
-            expected_detail_heading = "Unassigned history"
             current_checkpoint = checkpoint_layout.locator(
                 '.checkpoint-history-entry[aria-current="true"]'
             )

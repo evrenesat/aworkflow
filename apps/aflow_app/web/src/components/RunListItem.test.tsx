@@ -42,6 +42,21 @@ describe('RunListItem', () => {
     expect(screen.getByRole('button', { name: /Preview Automatic/ })).toBeTruthy()
   })
 
+  it('keeps a finished date in the accessible name and preview, outside the collapsed row', () => {
+    const finished: RunStatus = {
+      ...run,
+      status: 'completed',
+      activity: 'inactive',
+      ended_at: '2026-09-25T10:00:00Z',
+    }
+    const { container } = render(<RunListItem run={finished} stableKey="finished" onSelect={vi.fn()} />)
+    const selection = container.querySelector<HTMLButtonElement>('.run-list-select')!
+    expect(selection.textContent).not.toContain('2026')
+    expect(selection.getAttribute('aria-label')).toContain('2026')
+    fireEvent.click(screen.getByRole('button', { name: /Preview Automatic/ }))
+    expect(screen.getByRole('dialog').textContent).toContain('2026')
+  })
+
   it('keeps preview activation independent from the exact selection control', () => {
     const onSelect = vi.fn()
     const { container } = render(<RunListItem run={run} stableKey="run-controls" onSelect={onSelect} />)

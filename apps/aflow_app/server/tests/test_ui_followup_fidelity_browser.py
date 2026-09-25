@@ -546,7 +546,11 @@ def test_ui_followup_run_rows(
         if len(parts) == 6 and parts[4] == "runs" and project_id == worktree_id:
             run_id = parts[5]
             if run_id == paused_id:
-                route.abort(error_code="failed")
+                route.fulfill(
+                    status=503,
+                    content_type="application/json",
+                    body=json.dumps({"detail": {"code": "run_unavailable"}}),
+                )
                 return
             if run_id == running_id and loading_mode["enabled"]:
                 held_loading_routes.append(route)
@@ -641,7 +645,7 @@ def test_ui_followup_run_rows(
                     dated_row.scroll_into_view_if_needed()
                     dated_name = dated_row.get_attribute("aria-label") or ""
                     assert "2026" in dated_name, dated_name
-                    assert "2026" not in dated_row.inner_text()
+                    assert "2026" not in dated_row.locator(".run-list-context").inner_text()
                     dated_box = dated_row.bounding_box()
                     assert dated_box and dated_box["height"] >= 44, dated_box
                     if width >= 1280 and height >= 600:
@@ -684,11 +688,14 @@ def test_ui_followup_run_rows(
                     # selection opener rather than the sibling preview toggle,
                     # without the restored focus scheduling a delayed reopen.
                     page.mouse.move(1, 1)
+                    expect(page.locator(".run-row-preview:visible")).to_have_count(0)
                     long_row.focus()
-                    expect(page.locator(".run-row-preview:visible")).to_have_count(1)
+                    expect(long_row).to_be_focused()
+                    expect(row_item.locator(".run-row-preview")).to_be_visible()
                     preview_toggle.focus()
                     page.keyboard.press("Escape")
                     expect(page.locator(".run-row-preview:visible")).to_have_count(0)
+                    expect(long_row).to_be_focused()
                     restored_focus = page.evaluate(
                         """() => ({
                           tag: document.activeElement?.tagName,

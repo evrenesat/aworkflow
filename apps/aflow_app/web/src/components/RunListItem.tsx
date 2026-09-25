@@ -2,6 +2,7 @@ import { useEffect, useId, useRef, useState } from 'react'
 import type { CSSProperties, FocusEvent, PointerEvent } from 'react'
 import type { RunStatus } from '../types'
 import {
+  isTerminalInactiveRun,
   runActivityText,
   runDurationText,
   runPlanPresentationForRun,
@@ -85,7 +86,7 @@ export function RunListItem({
   const duration = knownFact(runDurationText(run))
   const activity = knownFact(runActivityText(run))
   const compactProgressFact = run.progress ? compactRunProgressText(run.progress, run) : null
-  const rowActivityFact = compactProgressFact ? null : activity
+  const rowActivityFact = compactProgressFact || isTerminalInactiveRun(run) ? null : activity
   const accessibleFacts = [plan.label, plan.date, progressLabel, progressLoadLabel, duration, activity].filter((value): value is string => Boolean(value))
   const accessibleName = projectLabel
     ? [projectLabel, status, ...accessibleFacts, run.run_id].join(' · ')
