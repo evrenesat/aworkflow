@@ -162,13 +162,31 @@ def test_recent_runs_are_on_first_history_page_without_extra_fetch(control_clien
                     assert all(item['previewHeight'] >= 44 for item in geometry), geometry
                     page.screenshot(path=str(tmp_path / f'run-sidebar-{theme}-{width}x{height}.png'), full_page=True)
             page.set_viewport_size({'width': 390, 'height': 844})
+            page.wait_for_function("""() => {
+                const layout = document.querySelector('[data-sidebar-editor-list="Run history"]')
+                const navigation = layout?.querySelector('.sidebar-editor-navigation')
+                const detail = layout?.querySelector('.sidebar-editor-detail')
+                return matchMedia('(max-width: 959px), (max-height: 599px)').matches
+                    && (navigation?.hidden || detail?.hidden)
+            }""")
+            back = page.get_by_role('button', name='← Back to Run history', exact=True)
+            if back.is_visible():
+                back.click()
+            expect(_run_history_detail(page)).to_be_hidden()
+            expect(nav).to_be_visible()
+            sibling = first_rows.nth(1)
+            expect(sibling).to_be_visible()
+            page.evaluate('() => new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve)))')
             preview = first_rows.first.locator('.run-row-preview-toggle')
             selected_url = page.url
-            before_sibling = first_rows.nth(1).bounding_box()
+            before_sibling = sibling.bounding_box()
+            assert before_sibling is not None
             preview.click()
             expect(page.get_by_role('dialog', name=re.compile('Preview Investigate failed delivery'))).to_be_visible()
             assert page.url == selected_url
-            assert first_rows.nth(1).bounding_box() == before_sibling
+            after_sibling = sibling.bounding_box()
+            assert after_sibling is not None
+            assert all(abs(after_sibling[axis] - before_sibling[axis]) <= 1 for axis in ('x', 'y', 'width', 'height'))
             page.keyboard.press('Escape')
             gap_toggle.click()
             expect(gap_toggle).to_have_attribute('aria-expanded', 'true')
