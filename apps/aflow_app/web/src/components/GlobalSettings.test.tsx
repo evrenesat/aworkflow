@@ -31,10 +31,12 @@ vi.mock('react', async () => {
   }
 })
 
-vi.mock('../api', () => ({ getGlobalConfig: vi.fn(), postGlobalConfigForm: vi.fn(), getSettings: vi.fn(), patchGlobalConfig: vi.fn(), saveSettings: vi.fn(), validateGlobalConfig: vi.fn(), projectSettingsText: vi.fn(), listSkills: vi.fn(), readSkill: vi.fn(), saveSkill: vi.fn(), validateSkills: vi.fn(), installSkills: vi.fn() }))
+vi.mock('../api', () => ({ getGlobalConfig: vi.fn(), postGlobalConfigForm: vi.fn(), getSettings: vi.fn(), patchGlobalConfig: vi.fn(), saveSettings: vi.fn(), validateGlobalConfig: vi.fn(), projectSettingsText: vi.fn(), listSkills: vi.fn(), readSkill: vi.fn(), saveSkill: vi.fn(), validateSkills: vi.fn(), installSkills: vi.fn(), getProjectScheduling: vi.fn(), patchProjectScheduling: vi.fn() }))
 const validation = { state: 'ready' as const, issues: [], placeholders: [], workflows: ['demo'], teams: [], roles: ['worker'] }
 const config = { project_id: 'global', revision: 'a'.repeat(64), aflow_toml: 'config', workflows_toml: 'workflows', documents: ['aflow.toml', 'workflows.toml'], validation }
 const server = { revision: 'b'.repeat(64), bind_host: 'localhost', bind_port: 8766, managed_projects_root: '/code', password_set: true, advanced_toml: 'server', restart: { bind_host: false, bind_port: false, managed_projects_root: false } }
+const selectedProject = { id: 'alpha', display_name: 'Alpha', current_path: '/code/alpha', is_git_root: true, registered_at: '2026-01-01T00:00:00Z', readiness: 'ready' as const }
+const scheduling = { auto_consume_plans: true, max_concurrent_implementations: 2, revision: 'c'.repeat(64), persisted: false, source: 'defaults' as const }
 const form: GuidedFormProjection = { default_workflow: 'demo', max_turns: 5, harnesses: { codex: { worker: { model: 'model', effort: 'high' } } }, roles: { worker: 'codex.worker' }, teams: {}, workflows: {}, workflow_default_teams: {}, prompts: { work: 'Original' }, role_prompts: {} }
 const response: ProjectConfigFormResponse = { ...config, changed: false, syntax_issues: [], form, choices: { harnesses: ['codex'], profiles: { codex: ['worker'] }, selectors: ['codex.worker'], roles: ['worker'], teams: [], workflows: ['demo'] }, suggestions: { label: 'suggestion', note: '', harnesses: [{ name: 'codex', supports_effort: true, custom_model_supported: true }], profiles: [{ harness: 'codex', profile: 'worker', model: 'model', effort: 'high' }] } }
 const familyForm: GuidedFormProjection = {
@@ -207,11 +209,91 @@ describe('GlobalSettings', () => {
     vi.mocked(api.validateGlobalConfig).mockResolvedValue(validation)
     vi.mocked(api.patchGlobalConfig).mockResolvedValue(config)
     vi.mocked(api.saveSettings).mockResolvedValue(server)
+    vi.mocked(api.getProjectScheduling).mockResolvedValue(scheduling)
+    vi.mocked(api.patchProjectScheduling).mockResolvedValue({ ...scheduling, persisted: true, source: 'file' })
     vi.mocked(api.listSkills).mockResolvedValue(skillSummaries)
     vi.mocked(api.readSkill).mockImplementation(async (name: string) => skillDetail(name, skillSummaries.find(skill => skill.name === name)!.revision))
     vi.mocked(api.validateSkills).mockImplementation(async (entries: { name: string }[]) => entries.map(entry => ({ name: entry.name, ok: true, current_revision: 'c'.repeat(64), error_code: null, error: null })))
     vi.mocked(api.saveSkill).mockImplementation(async (name: string, request: { content: string }) => ({ ...skillSummaries.find(skill => skill.name === name)!, source: 'saved' as const, edited: true, revision: 'e'.repeat(64), content: request.content }))
     vi.mocked(api.installSkills).mockResolvedValue({ mode: 'auto', succeeded: true, cancelled: false, refresh: [], operations: [] })
+  })
+  it('keeps one default workflow selector in General and links to it from Workflows', async () => {
+    render(<GlobalSettings onDirtyChange={() => {}} onSaved={() => {}} />)
+    fireEvent.click(await screen.findByRole('tab', { name: 'Workflows' }))
+    expect(screen.queryByLabelText('Default workflow')).toBeNull()
+    fireEvent.click(screen.getByRole('button', { name: 'Set default workflow in General…' }))
+    expect(screen.getByLabelText('Default workflow')).toBeDefined()
+  })
+
+  it('saves default and workflow repair thresholds through the shared draft', async () => {
+    const thresholdForm: GuidedFormProjection = {
+      ...form,
+      default_upgrade_after_repairs: null,
+      effective_default_upgrade_after_repairs: 1,
+      workflows: { demo: { declared_steps: ['work'], first_step: 'work', executable_steps: ['work'], first_executable_step: 'work', upgrade_after_repairs: null, effective_upgrade_after_repairs: 1, upgrade_after_repairs_source: 'defaults' } },
+    }
+    vi.mocked(api.postGlobalConfigForm).mockResolvedValue({ ...response, form: thresholdForm })
+    render(<GlobalSettings onDirtyChange={() => {}} onSaved={() => {}} />)
+    fireEvent.click(await screen.findByRole('tab', { name: 'Workflows' }))
+    fireEvent.change(screen.getByLabelText('Default repair threshold'), { target: { value: '3' } })
+    fireEvent.click(screen.getByRole('button', { name: 'Demo', exact: true }))
+    fireEvent.change(screen.getByLabelText('Repair threshold for Demo'), { target: { value: '2' } })
+    fireEvent.click(screen.getByRole('button', { name: 'Save all changes' }))
+    await waitFor(() => expect(api.patchGlobalConfig).toHaveBeenCalledWith({
+      expected_revision: config.revision,
+      actions: [
+        { type: 'set_default_upgrade_after_repairs', value: 3 },
+        { type: 'set_workflow_upgrade_after_repairs', workflow: 'demo', value: 2 },
+      ],
+    }))
+  })
+
+  it('previews unsaved repair thresholds and inheritance sources from the current draft', async () => {
+    const thresholdForm: GuidedFormProjection = {
+      ...form,
+      default_upgrade_after_repairs: null,
+      effective_default_upgrade_after_repairs: 1,
+      workflows: {
+        demo: { declared_steps: ['work'], first_step: 'work', executable_steps: ['work'], first_executable_step: 'work', upgrade_after_repairs: null, effective_upgrade_after_repairs: 1, upgrade_after_repairs_source: 'defaults' },
+        demo_alias: { declared_steps: ['work'], first_step: 'work', executable_steps: ['work'], first_executable_step: 'work', upgrade_after_repairs: null, effective_upgrade_after_repairs: 1, upgrade_after_repairs_source: 'base:demo' },
+      },
+    }
+    vi.mocked(api.postGlobalConfigForm).mockResolvedValue({ ...response, form: thresholdForm })
+    render(<GlobalSettings onDirtyChange={() => {}} onSaved={() => {}} />)
+    fireEvent.click(await screen.findByRole('tab', { name: 'Workflows' }))
+    fireEvent.change(screen.getByLabelText('Default repair threshold'), { target: { value: '3' } })
+    expect(screen.getByText('Effective: 3 failed repairs before changing team.')).toBeDefined()
+    fireEvent.click(screen.getByRole('button', { name: 'Demo', exact: true }))
+    expect(screen.getByText('Effective: 3 (defaults). Leave blank to inherit.')).toBeDefined()
+    fireEvent.change(screen.getByLabelText('Repair threshold for Demo'), { target: { value: '2' } })
+    expect(screen.getByText('Effective: 2 (this workflow). Leave blank to inherit.')).toBeDefined()
+    fireEvent.click(screen.getByRole('button', { name: 'Demo alias', exact: true }))
+    expect(screen.getByText('Effective: 2 (base Demo). Leave blank to inherit.')).toBeDefined()
+    fireEvent.change(screen.getByLabelText('Repair threshold for Demo alias'), { target: { value: '5' } })
+    expect(screen.getByText('Effective: 5 (this workflow). Leave blank to inherit.')).toBeDefined()
+    expect(api.patchGlobalConfig).not.toHaveBeenCalled()
+  })
+
+  it('saves project scheduling with its own revision and retains a rejected draft', async () => {
+    vi.mocked(api.patchProjectScheduling).mockRejectedValueOnce(Object.assign(new Error('revision conflict'), { code: 'revision_conflict' }))
+    render(<GlobalSettings project={selectedProject} onDirtyChange={() => {}} onSaved={() => {}} />)
+    fireEvent.click(await screen.findByRole('tab', { name: 'General' }))
+    const toggle = await screen.findByLabelText('Automatic plan consumption') as HTMLInputElement
+    expect(toggle.checked).toBe(true)
+    expect((screen.getByLabelText('Concurrent implementations') as HTMLInputElement).value).toBe('2')
+    fireEvent.click(toggle)
+    fireEvent.change(screen.getByLabelText('Concurrent implementations'), { target: { value: '3' } })
+    fireEvent.click(screen.getByRole('button', { name: 'Save all changes' }))
+    await screen.findByText(/settings changed on the server/i)
+    expect(toggle.checked).toBe(false)
+    expect((screen.getByLabelText('Concurrent implementations') as HTMLInputElement).value).toBe('3')
+    fireEvent.click(screen.getByRole('button', { name: 'Save all changes' }))
+    await waitFor(() => expect(api.patchProjectScheduling).toHaveBeenCalledTimes(2))
+    expect(api.patchProjectScheduling).toHaveBeenCalledWith('alpha', {
+      expected_revision: scheduling.revision,
+      auto_consume_plans: false,
+      max_concurrent_implementations: 3,
+    })
   })
   it.each(['save', 'blur', 'Enter'])('clears custom effort with %s and has no redundant unset button', async mode => {
     const view = render(<GlobalSettings onDirtyChange={() => {}} onSaved={() => {}} />)

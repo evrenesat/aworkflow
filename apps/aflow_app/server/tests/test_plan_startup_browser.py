@@ -197,6 +197,103 @@ def _assert_tracked_modification(root: Path, path: Path) -> None:
     assert _git(root, "diff", "--name-only", "HEAD", "--", relative_path) == relative_path
 
 
+def test_failed_plan_review_and_queue_evidence_in_browser(
+    _control_client_fixture, monkeypatch, tmp_path,  # noqa: F811
+) -> None:
+    _, root, _, _ = _control_client_fixture
+    dist = Path(__file__).resolve().parents[2] / "web" / "dist"
+    monkeypatch.setenv("AFLOW_APP_WEB_DIST", str(dist))
+    failed = {
+        "project_id": PROJECT_ID, "name": "failed-cycle.md",
+        "path": "plans/failed/failed-cycle.md", "status": "failed",
+        "revision": "f" * 64, "size_bytes": 18,
+        "lifecycle": {"reason_code": "execution_failed", "source_run_id": "source-run"},
+    }
+    needs = {
+        "project_id": PROJECT_ID, "name": "needs-fix.md",
+        "path": "plans/needs-plan-change/needs-fix.md", "status": "needs_plan_change",
+        "revision": "e" * 64, "size_bytes": 12,
+        "lifecycle": {"reason_code": "invalid_plan"},
+    }
+    ready = {**failed, "path": "plans/in-progress/failed-cycle.md", "status": "in_progress"}
+    state = {"requeued": False, "requests": []}
+
+    def fulfill(route, payload):
+        route.fulfill(status=200, content_type="application/json", body=json.dumps(payload))
+
+    def plan_route(route):
+        path = route.request.url.split("?", 1)[0]
+        if path.endswith("/plans"):
+            fulfill(route, [ready if state["requeued"] else failed, needs])
+        elif path.endswith("/failed/failed-cycle.md/requeue"):
+            state["requests"].append(route.request.post_data_json)
+            state["requeued"] = True
+            fulfill(route, {"plan": {**ready, "content": "# Corrected plan\n"}})
+        elif path.endswith("/failed/failed-cycle.md"):
+            fulfill(route, {**failed, "content": "# Corrected plan\n"})
+        else:
+            route.continue_()
+
+    def queue_route(route):
+        current = ready if state["requeued"] else failed
+        fulfill(route, {
+            "project_id": PROJECT_ID,
+            "settings": {"auto_consume_plans": True, "max_concurrent_implementations": 2,
+                         "revision": "q" * 64, "persisted": False, "source": "defaults"},
+            "capacity": {"limit": 2, "available_slots": 1, "reserved_count": 1,
+                         "starting_count": 0, "active_count": 0, "uncertain_count": 0},
+            "plans": [{"name": current["name"], "path": current["path"],
+                       "status": current["status"], "identity": "plan-identity",
+                       "outcome": "queued" if state["requeued"] else "held",
+                       "reason": None if state["requeued"] else "execution_failed",
+                       "dependency": None, "run_id": "source-run", "revision": current["revision"]}],
+        })
+
+    with live_server() as url, sync_playwright() as playwright:
+        browser = playwright.chromium.launch(headless=True, args=["--no-sandbox"])
+        try:
+            page = browser.new_page(viewport={"width": 1280, "height": 720})
+            _login(page, url)
+            page.route(f"**/api/projects/{PROJECT_ID}/plans**", plan_route)
+            page.route(f"**/api/projects/{PROJECT_ID}/queue", queue_route)
+            page.goto(f"{url}/?project={PROJECT_ID}&view=plans")
+            expect(page.get_by_role("heading", name="Failed", exact=True)).to_be_visible()
+            expect(page.get_by_role("heading", name="Needs plan change", exact=True)).to_be_visible()
+            expect(page.get_by_text("Implementation slots: 1 of 2 available", exact=True)).to_be_visible()
+            for theme in ("light", "dark"):
+                page.evaluate("""theme => {
+                    localStorage.setItem('aflow.appearance', theme)
+                    window.dispatchEvent(new StorageEvent('storage', {key: 'aflow.appearance', newValue: theme}))
+                }""", theme)
+                for width, height in ((1280, 720), (390, 844)):
+                    page.set_viewport_size({"width": width, "height": height})
+                    assert not page.evaluate("document.documentElement.scrollWidth > innerWidth")
+                    image = tmp_path / f"cp7-plans-{theme}-{width}x{height}.png"
+                    page.screenshot(path=str(image), full_page=True)
+                    print("CP7_PLANS_SCREENSHOT", image)
+            page.set_viewport_size({"width": 390, "height": 844})
+            _open_plan(page, "failed-cycle.md")
+            page.get_by_role("button", name="More", exact=True).click()
+            page.get_by_role("menuitem", name="Review requeue…", exact=True).click()
+            expect(page.get_by_role("alertdialog", name="Review plan requeue")).to_be_visible()
+            assert state["requests"] == []
+            page.get_by_role("button", name="Cancel", exact=True).click()
+            editor = page.get_by_label("Plan content", exact=True)
+            editor.fill("# Unsaved correction\n")
+            page.get_by_role("button", name="← Back to Plans", exact=True).click()
+            expect(page.get_by_role("alertdialog", name="Unsaved plan edits")).to_be_visible()
+            page.get_by_role("button", name="Keep editing", exact=True).click()
+            expect(editor).to_have_value("# Unsaved correction\n")
+            editor.fill("# Corrected plan\n")
+            page.get_by_role("button", name="More", exact=True).click()
+            page.get_by_role("menuitem", name="Review requeue…", exact=True).click()
+            page.get_by_role("button", name="Confirm requeue and resume", exact=True).click()
+            expect(page.get_by_text("The corrected plan was requeued to Ready.", exact=True)).to_be_visible()
+            assert state["requests"] == [{"expected_revision": failed["revision"], "source_run_id": "source-run"}]
+        finally:
+            browser.close()
+
+
 @pytest.mark.parametrize("ignore_plan_files", [False, True], ids=("normal", "ignored-plans"))
 def test_chromium_preserves_ready_state_and_retries_a_corrected_plan(
     _control_client_fixture,  # noqa: F811

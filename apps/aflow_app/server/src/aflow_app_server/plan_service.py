@@ -985,9 +985,23 @@ class PlanService:
     def _document(self, project_id: str, status_value: PlanStatus, name: str, data: bytes, *, include_content: bool = False) -> PlanDocument:
         relative = f"plans/{_STATUS_DIRS[status_value]}/{name}"
         lifecycle = None
-        if status_value in {"failed", "needs_plan_change"}:
+        if status_value in {"failed", "needs_plan_change", "in_progress"}:
             try:
                 record = PlanLifecycle(self._root(project_id)).record_for(self._root(project_id) / relative)
+                if status_value == "in_progress" and record is not None:
+                    # Only the moved, identity-bound requeue journal can
+                    # expose a predecessor after its run claim is absent.
+                    if not (
+                        record.get("phase") == "moved"
+                        and record.get("current_location") == "in_progress"
+                        and record.get("destination") == "in_progress"
+                        and record.get("source") in {"failed", "needs_plan_change"}
+                        and record.get("reason_code") == "explicit_requeue"
+                        and record.get("name") == name
+                        and isinstance(record.get("source_run_id"), str)
+                        and re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]{0,63}", record["source_run_id"])
+                    ):
+                        record = None
                 if record is not None:
                     lifecycle = {
                         key: record.get(key) for key in (

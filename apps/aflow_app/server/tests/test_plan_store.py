@@ -1764,6 +1764,39 @@ def test_http_requeue_rejects_mismatched_source_and_reports_resume_conflict(
     assert rejected.json()["detail"]["code"] == "plan_requeue_resume_conflict"
     assert rejected.json()["detail"]["plan_path"] == "plans/in-progress/conflict-requeue.md"
     assert not failed.exists()
+    ready_path = "/api/projects/project/plans/in_progress/conflict-requeue.md"
+    ready = plan_client.get(ready_path, headers=headers)
+    assert ready.status_code == 200
+    assert ready.json()["lifecycle"]["source_run_id"] == run_id
+    listed = plan_client.get("/api/projects/project/plans", headers=headers)
+    assert next(plan for plan in listed.json() if plan["path"] == rejected.json()["detail"]["plan_path"])["lifecycle"]["source_run_id"] == run_id
+
+
+def test_only_verified_requeued_ready_plan_projects_recorded_run(plan_fixture) -> None:
+    service, root, _ = plan_fixture
+    ordinary = service.create("project", "ordinary.md", "# Ordinary plan\n")
+    promoted = service.promote("project", "todo", ordinary.name, ordinary.revision)
+    assert service.read("project", "in_progress", promoted.name).lifecycle is None
+
+    failed_manual, manual_revision, manual_run_id = _managed_failed_requeue_fixture(
+        service, root, project_id="project", name="manual.md", run_id="20260924t230001z-abcdef12",
+    )
+    PlanLifecycle(root).move(
+        failed_manual, "in_progress", expected_revision=manual_revision,
+        reason_code="manual_move", reason="Manual move", source_run_id=manual_run_id,
+    )
+    assert service.read("project", "in_progress", "manual.md").lifecycle is None
+
+    _, revision, run_id = _managed_failed_requeue_fixture(
+        service, root, project_id="project", name="verified-requeue.md",
+    )
+    requeued = service.requeue(
+        "project", "failed", "verified-requeue.md", revision,
+        run_status_reader=lambda *_: RunStatus(run_id=run_id, status="failed"),
+    )
+    assert requeued.lifecycle is not None
+    assert requeued.lifecycle["source_run_id"] == run_id
+    assert service.read("project", "in_progress", requeued.name).lifecycle == requeued.lifecycle
 
 
 @pytest.mark.parametrize("crash_phase", ["prepared", "linked", "post_unlink"])

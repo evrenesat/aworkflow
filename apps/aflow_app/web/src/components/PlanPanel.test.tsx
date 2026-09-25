@@ -15,6 +15,8 @@ vi.mock('../api', async () => {
     updateProjectPlan: vi.fn(),
     promoteProjectPlan: vi.fn(),
     listProjectPlanBackups: vi.fn(),
+    getProjectQueue: vi.fn(),
+    requeueProjectPlan: vi.fn(),
   }
 })
 
@@ -74,13 +76,99 @@ describe('PlanPanel', () => {
   beforeEach(() => {
     vi.clearAllMocks()
     mockList()
+    vi.mocked(api.getProjectQueue).mockResolvedValue({
+      project_id: 'alpha',
+      settings: { auto_consume_plans: true, max_concurrent_implementations: 2, revision: 'q'.repeat(64), persisted: false, source: 'defaults' },
+      capacity: { limit: 2, available_slots: 2, reserved_count: 0, starting_count: 0, active_count: 0, uncertain_count: 0 },
+      plans: [],
+    })
+  })
+
+  it('shows failed and needs-change plans with queue evidence and reviews requeue before acting', async () => {
+    const failed: PlanDocument = {
+      project_id: 'alpha', name: 'failed.md', path: 'plans/failed/failed.md',
+      status: 'failed', revision: 'f'.repeat(64), size_bytes: 20,
+      lifecycle: { reason_code: 'execution_failed', source_run_id: 'source-run' },
+    }
+    const needs: PlanDocument = {
+      project_id: 'alpha', name: 'needs.md', path: 'plans/needs-plan-change/needs.md',
+      status: 'needs_plan_change', revision: 'n'.repeat(64), size_bytes: 20,
+    }
+    vi.mocked(api.listProjectPlans).mockResolvedValue([failed, needs])
+    vi.mocked(api.getProjectQueue).mockResolvedValue({
+      project_id: 'alpha',
+      settings: { auto_consume_plans: true, max_concurrent_implementations: 2, revision: 'q'.repeat(64), persisted: false, source: 'defaults' },
+      capacity: { limit: 2, available_slots: 1, reserved_count: 1, starting_count: 0, active_count: 0, uncertain_count: 0 },
+      plans: [{ name: failed.name, path: failed.path, status: 'failed', identity: 'identity-1', outcome: 'held', reason: 'execution_failed', dependency: null, run_id: 'source-run', revision: failed.revision }],
+    })
+    const onOpenRun = vi.fn()
+    render(<PlanPanel project={project} onDirtyChange={vi.fn()} onOpenRunDashboard={vi.fn()} onOpenRun={onOpenRun} />)
+    await screen.findByRole('heading', { name: 'Failed' })
+    expect(screen.getByRole('heading', { name: 'Needs plan change' })).toBeDefined()
+    expect(screen.queryByRole('heading', { name: 'Draft' })).toBeNull()
+    expect(screen.queryByRole('heading', { name: 'Done' })).toBeNull()
+    expect(screen.getByText(/Implementation slots: 1 of 2 available/)).toBeDefined()
+    expect(screen.getByText('Execution failed')).toBeDefined()
+    await openPlan(failed, '# Corrected plan\n')
+    fireEvent.click(screen.getByRole('button', { name: 'View recorded run' }))
+    expect(onOpenRun).toHaveBeenCalledWith('source-run')
+    fireEvent.click(screen.getByRole('button', { name: 'Review requeue…' }))
+    expect(screen.getByRole('alertdialog', { name: 'Review plan requeue' })).toBeDefined()
+    expect(api.requeueProjectPlan).not.toHaveBeenCalled()
+    vi.mocked(api.requeueProjectPlan).mockResolvedValue({ plan: { ...failed, status: 'in_progress', path: 'plans/in-progress/failed.md', content: '# Corrected plan\n' } })
+    fireEvent.click(screen.getByRole('button', { name: 'Confirm requeue and resume' }))
+    await waitFor(() => expect(api.requeueProjectPlan).toHaveBeenCalledWith('alpha', 'failed', 'failed.md', {
+      expected_revision: failed.revision, source_run_id: 'source-run',
+    }))
+    await screen.findByText('The corrected plan was requeued to Ready.')
+  })
+
+  it('keeps the verified recorded-run action after a partial requeue and revisit without a queue claim', async () => {
+    const failed: PlanDocument = {
+      project_id: 'alpha', name: 'failed.md', path: 'plans/failed/failed.md',
+      status: 'failed', revision: 'f'.repeat(64), size_bytes: 20,
+      lifecycle: { reason_code: 'execution_failed', source_run_id: 'source-run' },
+    }
+    const ready: PlanDocument = {
+      ...failed, path: 'plans/in-progress/failed.md', status: 'in_progress',
+      lifecycle: { reason_code: 'explicit_requeue', source_run_id: 'source-run' },
+    }
+    let moved = false
+    vi.mocked(api.listProjectPlans).mockImplementation(async () => [moved ? ready : failed])
+    vi.mocked(api.readProjectPlan).mockImplementation(async (_project, status) => ({
+      ...(status === 'in_progress' ? ready : failed), content: '# Corrected plan\n',
+    }))
+    vi.mocked(api.requeueProjectPlan).mockImplementation(async () => {
+      moved = true
+      throw new ApiError(409, 'Recorded run could not resume', 'plan_requeue_resume_conflict', {
+        plan_path: ready.path,
+      })
+    })
+    const onOpenRun = vi.fn()
+    render(<PlanPanel project={project} onDirtyChange={vi.fn()} onOpenRunDashboard={vi.fn()} onOpenRun={onOpenRun} />)
+    fireEvent.click(await screen.findByRole('button', { name: /failed\.md/ }))
+    await screen.findByLabelText('Plan content')
+    fireEvent.click(screen.getByRole('button', { name: 'Review requeue…' }))
+    fireEvent.click(screen.getByRole('button', { name: 'Confirm requeue and resume' }))
+    await screen.findByText(/Use View recorded run to resolve its attention state/)
+    await waitFor(() => expect(api.listProjectPlans).toHaveBeenCalledTimes(2))
+    fireEvent.click(screen.getByRole('button', { name: 'View recorded run' }))
+    expect(onOpenRun).toHaveBeenCalledWith('source-run')
+
+    fireEvent.click(screen.getByRole('button', { name: '← Back to Plans' }))
+    await screen.findByRole('heading', { name: 'Ready' })
+    fireEvent.click(screen.getByRole('button', { name: /failed\.md/ }))
+    await screen.findByLabelText('Plan content')
+    fireEvent.click(screen.getByRole('button', { name: 'View recorded run' }))
+    expect(onOpenRun).toHaveBeenCalledTimes(2)
+    expect(api.getProjectQueue).toHaveBeenCalled()
   })
 
   it('groups contained plans by lifecycle status and reads the selected plan', async () => {
     render(<PlanPanel project={project} onDirtyChange={vi.fn()} onOpenRunDashboard={vi.fn()} />)
     await screen.findByRole('heading', { name: 'Draft', exact: true })
     expect(screen.getByRole('heading', { name: 'Ready', exact: true })).toBeDefined()
-    expect(screen.getByText('Done')).toBeDefined()
+    expect(screen.queryByRole('heading', { name: 'Done' })).toBeNull()
     await openPlan(todoPlan, '# Plan A\n')
     expect(api.readProjectPlan).toHaveBeenCalledWith('alpha', 'todo', 'plan-a.md')
     expect((screen.getByLabelText('Plan content') as HTMLTextAreaElement).value).toBe('# Plan A\n')
