@@ -681,7 +681,11 @@ the retained accepted worker from the final checkpoint, then persists one
 separate `::cumulative-review` rejection lineage. The exact worker attempt,
 team and selector remain in the existing attempt and rejection ledgers. Resume
 admits the focused overlay only when those records agree; review retries of the
-same attempt do not create another rejection. At the post-review boundary,
+same attempt do not create another rejection. Focused overlay existence is
+checked in the owned execution checkout, including on resume, while rejection
+and pending-route identities remain primary-root paths.
+An overlay found only in the primary checkout cannot authorize a repair.
+At the post-review boundary,
 the controller evaluates that cumulative lineage with the normal threshold
 and one-hop team graph. It persists the selected worker as a one-turn pending
 override bound to the focused overlay before launch. Completed follow-up

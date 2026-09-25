@@ -404,6 +404,232 @@ def _cumulative_route_config(*, manager_enabled: bool, threshold: int) -> Workfl
     )
 
 
+def _cumulative_worktree_case(
+    tmp_path: Path, *, manager_enabled: bool,
+) -> tuple[Path, Path, WorkflowUserConfig]:
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    plan = repo / "plan.md"
+    plan.write_text(_CUMULATIVE_PLAN, encoding="utf-8")
+    (repo / ".gitignore").write_text(".aflow/\n", encoding="utf-8")
+    for args in (
+        ("git", "init", "-qb", "main"),
+        ("git", "add", "plan.md", ".gitignore"),
+        ("git", "-c", "user.name=Test", "-c", "user.email=test@example.com",
+         "commit", "-qm", "initial"),
+    ):
+        subprocess.run(args, cwd=repo, check=True, capture_output=True)
+    config = _cumulative_route_config(manager_enabled=manager_enabled, threshold=0)
+    config = replace(
+        config,
+        aflow=replace(config.aflow, worktree_root=str(tmp_path / "worktrees")),
+        workflows={"repair": replace(
+            config.workflows["repair"],
+            setup=("worktree", "branch"),
+            teardown=("merge", "rm_worktree"),
+            main_branch="main",
+        )},
+    )
+    return repo, plan, config
+
+
+@pytest.mark.parametrize("manager_enabled", [False, True])
+def test_cumulative_final_repair_routes_in_managed_worktree(
+    tmp_path: Path, manager_enabled: bool,
+) -> None:
+    repo, plan, config = _cumulative_worktree_case(
+        tmp_path, manager_enabled=manager_enabled,
+    )
+    calls: list[str] = []
+    workers = 0
+    reviews = 0
+
+    class FinalReviewObserved(BaseException):
+        pass
+
+    def runner(argv: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+        nonlocal workers, reviews
+        model = argv[argv.index("--model") + 1]
+        if model == "sol-6-medium" and "schema_version" in str(kwargs.get("input", "")):
+            return subprocess.CompletedProcess(argv, 0, json.dumps({
+                "schema_version": 1, "action": "continue", "reason": "continue",
+                "next_step_notes": [], "stop_report": None,
+            }), "")
+        calls.append(model)
+        execution = Path(str(kwargs["cwd"]))
+        execution_plan = execution / "plan.md"
+        overlay = execution / "plan-cp01-v01.md"
+        if model == "sol-6-high":
+            workers += 1
+            name = ("first", "second", "third")[workers - 1]
+            execution_plan.write_text(
+                execution_plan.read_text(encoding="utf-8").replace(
+                    f"### [ ] Checkpoint {workers}: ",
+                    f"### [x] Checkpoint {workers}: ",
+                ).replace(f"- [ ] {name}", f"- [x] {name}"),
+                encoding="utf-8",
+            )
+        elif model == "astra-medium":
+            reviews += 1
+            if reviews == 1:
+                overlay.write_text(_REPAIR_PLAN, encoding="utf-8")
+                assert not (repo / overlay.name).exists()
+            else:
+                raise FinalReviewObserved
+        elif model == "ds4.1-flash":
+            assert overlay.is_file()
+            overlay.write_text(_REPAIR_PLAN.replace("[ ]", "[x]"), encoding="utf-8")
+        return subprocess.CompletedProcess(argv, 0, "synthetic output", "")
+
+    with pytest.raises(FinalReviewObserved):
+        run_workflow(
+            ControllerConfig(repo_root=repo, plan_path=plan,
+                             max_turns=10, team="sol-6-high"),
+            config, "repair", config_dir=repo, snapshot_config=False,
+            adapter=CodexAdapter(), runner=runner,
+        )
+    assert calls == [
+        "sol-6-high", "sol-6-medium",
+        "sol-6-high", "sol-6-medium",
+        "sol-6-high", "sol-6-medium",
+        "astra-medium", "ds4.1-flash", "astra-medium",
+    ]
+    source = next((repo / ".aflow" / "runs").iterdir())
+    saved = json.loads((source / "run.json").read_text(encoding="utf-8"))
+    assert Path(saved["worktree_path"]).joinpath("plan-cp01-v01.md").is_file()
+    assert not (repo / "plan-cp01-v01.md").exists()
+    assert saved["review_rejection_history"][0]["reviewed_attempt_ordinal"] == 1
+
+
+@pytest.mark.parametrize("manager_enabled", [False, True])
+@pytest.mark.parametrize("missing_overlay", [False, True])
+def test_cumulative_worktree_repair_resume_uses_owned_overlay(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    manager_enabled: bool, missing_overlay: bool,
+) -> None:
+    repo, plan, config = _cumulative_worktree_case(
+        tmp_path, manager_enabled=manager_enabled,
+    )
+    calls: list[str] = []
+    workers = 0
+    reviews = 0
+
+    class PrelaunchStop(BaseException):
+        pass
+
+    class FinalReviewObserved(BaseException):
+        pass
+
+    def runner(argv: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+        nonlocal workers, reviews
+        model = argv[argv.index("--model") + 1]
+        if model == "sol-6-medium" and "schema_version" in str(kwargs.get("input", "")):
+            return subprocess.CompletedProcess(argv, 0, json.dumps({
+                "schema_version": 1, "action": "continue", "reason": "continue",
+                "next_step_notes": [], "stop_report": None,
+            }), "")
+        calls.append(model)
+        execution = Path(str(kwargs["cwd"]))
+        execution_plan = execution / "plan.md"
+        overlay = execution / "plan-cp01-v01.md"
+        if model == "sol-6-high":
+            workers += 1
+            name = ("first", "second", "third")[workers - 1]
+            execution_plan.write_text(
+                execution_plan.read_text(encoding="utf-8").replace(
+                    f"### [ ] Checkpoint {workers}: ",
+                    f"### [x] Checkpoint {workers}: ",
+                ).replace(f"- [ ] {name}", f"- [x] {name}"),
+                encoding="utf-8",
+            )
+        elif model == "astra-medium":
+            reviews += 1
+            if reviews == 1:
+                overlay.write_text(_REPAIR_PLAN, encoding="utf-8")
+            else:
+                raise FinalReviewObserved
+        elif model == "ds4.1-flash":
+            assert overlay.is_file()
+            overlay.write_text(_REPAIR_PLAN.replace("[ ]", "[x]"), encoding="utf-8")
+        return subprocess.CompletedProcess(argv, 0, "synthetic output", "")
+
+    original_write = RunMetadataWriter.write
+
+    def write_and_stop(writer: RunMetadataWriter, **kwargs: object) -> None:
+        original_write(writer, **kwargs)
+        payload = json.loads(writer.paths.run_json.read_text(encoding="utf-8"))
+        pending = payload.get("pending_step_team_override")
+        if (
+            isinstance(pending, dict)
+            and pending.get("selector") == "codex.ds4.1-flash"
+            and payload.get("active_turn") == 8
+            and payload.get("turns_completed") == 7
+        ):
+            raise PrelaunchStop
+
+    monkeypatch.setattr(RunMetadataWriter, "write", write_and_stop)
+    with pytest.raises(PrelaunchStop):
+        run_workflow(
+            ControllerConfig(repo_root=repo, plan_path=plan,
+                             max_turns=10, team="sol-6-high"),
+            config, "repair", config_dir=repo, snapshot_config=False,
+            adapter=CodexAdapter(), runner=runner,
+        )
+    monkeypatch.setattr(RunMetadataWriter, "write", original_write)
+    source = next((repo / ".aflow" / "runs").iterdir())
+    saved = json.loads((source / "run.json").read_text(encoding="utf-8"))
+    execution = Path(saved["worktree_path"])
+    overlay = execution / "plan-cp01-v01.md"
+    assert overlay.is_file()
+    assert not (repo / overlay.name).exists()
+    assert saved["pending_step_team_override"]["selector"] == "codex.ds4.1-flash"
+    assert saved["review_rejection_history"][0]["reviewed_attempt_ordinal"] == 1
+    (source / "run.json").write_text(
+        json.dumps({**saved, "status": "interrupted"}) + "\n", encoding="utf-8",
+    )
+    if missing_overlay:
+        overlay.unlink()
+        (repo / overlay.name).write_text(_REPAIR_PLAN, encoding="utf-8")
+    resume = _mark_validated_resume_context(ResumeContext(
+        resumed_from_run_id=source.name,
+        feature_branch=saved["feature_branch"],
+        worktree_path=execution, main_branch="main",
+        setup=("worktree", "branch"), teardown=("merge", "rm_worktree"),
+        active_plan_path=repo / overlay.name,
+        interrupted_step_name="followup", effective_max_turns=10,
+        **manager_resume_fields(saved),
+    ))
+    if missing_overlay:
+        with pytest.raises(WorkflowError, match="ambiguous worker or overlay evidence"):
+            run_workflow(
+                ControllerConfig(repo_root=repo, plan_path=plan,
+                                 max_turns=10, team="sol-6-high"),
+                config, "repair", config_dir=repo, snapshot_config=False,
+                adapter=CodexAdapter(), runner=runner, resume=resume,
+            )
+        assert "ds4.1-flash" not in calls
+        return
+
+    with pytest.raises(FinalReviewObserved):
+        run_workflow(
+            ControllerConfig(repo_root=repo, plan_path=plan,
+                             max_turns=10, team="sol-6-high"),
+            config, "repair", config_dir=repo, snapshot_config=False,
+            adapter=CodexAdapter(), runner=runner, resume=resume,
+        )
+    successor = next(path for path in (repo / ".aflow" / "runs").iterdir() if path != source)
+    resumed = json.loads((successor / "run.json").read_text(encoding="utf-8"))
+    repair = json.loads(
+        (successor / "turns" / "turn-001" / "result.json").read_text(encoding="utf-8")
+    )
+    assert repair["selector"] == "codex.ds4.1-flash"
+    assert Path(resumed["worktree_path"]) == execution
+    assert calls.count("ds4.1-flash") == 1
+    assert calls[-1] == "astra-medium"
+    assert resumed["review_rejection_history"] == saved["review_rejection_history"]
+    assert not (repo / overlay.name).exists()
+
+
 @pytest.mark.parametrize("manager_enabled", [False, True])
 @pytest.mark.parametrize("threshold", [0, 1])
 def test_cumulative_final_review_routes_by_failed_repair_count(

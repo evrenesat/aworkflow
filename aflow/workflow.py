@@ -1878,6 +1878,7 @@ class _ManagerGateCoordinator:
                 repo_root=run_paths.repo_root,
                 original_plan_path=original_plan_path,
                 target_plan_path=proposed_target_plan,
+                exec_ctx=self.execution_context,
             )
         attempts = (
             self.state.implementation_attempts.get(routing_scope_id, [])
@@ -3135,12 +3136,13 @@ def _has_resumable_cumulative_repair(
     repo_root: Path,
     original_plan_path: Path,
     completed_snapshot: PlanSnapshot,
+    exec_ctx: ExecutionContext | None,
 ) -> bool:
     """Admit a saved focused repair after the original plan became complete."""
     if resume is None or resume.active_plan_path is None:
         return False
     active_path = resume.active_plan_path
-    if active_path == original_plan_path or not active_path.is_file():
+    if active_path == original_plan_path or not _exec_plan_path(active_path, exec_ctx).is_file():
         return False
     evidence_state = ControllerState(last_snapshot=completed_snapshot)
     evidence_state.implementation_attempts = _mutable_implementation_attempts(
@@ -3153,6 +3155,7 @@ def _has_resumable_cumulative_repair(
             repo_root=repo_root,
             original_plan_path=original_plan_path,
             target_plan_path=active_path,
+            exec_ctx=exec_ctx,
         ) is not None
     except WorkflowError:
         return False
@@ -3164,6 +3167,7 @@ def _cumulative_repair_scope_id(
     repo_root: Path,
     original_plan_path: Path,
     target_plan_path: Path,
+    exec_ctx: ExecutionContext | None,
 ) -> str | None:
     """Bind a focused worker target to the latest verified final-review rejection."""
     scope_id = f"{original_plan_path}::cumulative-review"
@@ -3193,7 +3197,7 @@ def _cumulative_repair_scope_id(
         original_snapshot = load_plan(original_plan_path).snapshot
     except (OSError, PlanParseError) as exc:
         raise WorkflowError("cannot validate cumulative repair original plan") from exc
-    if not original_snapshot.is_complete or not target_plan_path.is_file():
+    if not original_snapshot.is_complete or not _exec_plan_path(target_plan_path, exec_ctx).is_file():
         raise WorkflowError("cumulative repair target is missing or original plan changed")
     rejection = latest[0]
     attempts = state.implementation_attempts.get(scope_id, [])
@@ -8679,6 +8683,25 @@ def _run_workflow_unchecked(
     if (
         done
         and resume is not None
+        and not resume_lifecycle_validated
+        and resume.active_plan_path is not None
+        and resume.active_plan_path != original_plan_path
+        and any(
+            record.scope_id == f"{original_plan_path}::cumulative-review"
+            for record in resume.review_rejection_history
+        )
+    ):
+        # Cumulative admission precedes normal resume setup. Validate and
+        # reuse the recorded execution context before reading its overlay.
+        resumed_execution_context = _validated_resume_execution_context(
+            config.repo_root,
+            resume,
+            terminal_completion_resume=terminal_completion_resume,
+        )
+        resume_lifecycle_validated = True
+    if (
+        done
+        and resume is not None
         and not terminal_integration_only
         and not terminal_completion_resume
         and not pending_review_resume
@@ -8694,6 +8717,7 @@ def _run_workflow_unchecked(
             repo_root=config.repo_root,
             original_plan_path=original_plan_path,
             completed_snapshot=original_snapshot,
+            exec_ctx=resumed_execution_context,
         )
     ):
         raise WorkflowError(
@@ -8710,6 +8734,7 @@ def _run_workflow_unchecked(
                 repo_root=config.repo_root,
                 original_plan_path=original_plan_path,
                 completed_snapshot=original_snapshot,
+                exec_ctx=resumed_execution_context,
             )
         )
     ):
@@ -12726,6 +12751,7 @@ def _run_workflow_unchecked(
                     state, repo_root=run_paths.repo_root,
                     original_plan_path=original_plan_path,
                     target_plan_path=active_plan_path,
+                    exec_ctx=exec_ctx,
                 )
             if step.role == "worker" and not done:
                 try:
@@ -13103,6 +13129,7 @@ def _run_workflow_unchecked(
                     state, repo_root=run_paths.repo_root,
                     original_plan_path=original_plan_path,
                     target_plan_path=active_plan_path,
+                    exec_ctx=exec_ctx,
                 )
             if step.role == "worker" and not current_plan.snapshot.is_complete:
                 try:

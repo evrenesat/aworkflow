@@ -4540,3 +4540,12 @@ HISTORY: Published clipboard history `c14f1f2`/`cd78d53` remains separate and mu
   removed passed 2480 tests and 241 subtests. `git diff --check` and scoped
   Ruff passed. Publication, exact-SHA CI and live activation remain separate
   coordinator gates.
+
+## 2026-09-25 — Managed-worktree final-review repair follow-up
+
+- Cumulative repair validation now checks the focused overlay in its execution
+  worktree while retaining primary-root ledger identities. Resume admission
+  reuses the validated lifecycle context before the ordinary worker boundary.
+- Temporary Git-worktree regressions cover both manager modes, a stopped-run
+  resume using the selected DS4.1 worker, and rejection of a missing execution
+  overlay even when a primary-checkout copy exists.
