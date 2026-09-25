@@ -56,7 +56,12 @@ using reservation and persisted lineage evidence. Exact retries reuse their
 claim; another successor waits until the first is authoritatively inactive.
 The daemon's read-only `can_resume` hint uses the same predecessor inactivity
 check as locked admission; a stopped or missing unit with running controller
-metadata remains uncertain and cannot be offered for resume.
+metadata remains uncertain and cannot be offered for resume. The hint is an
+observer preview, not a permission: history list pages skip it
+(`include_resume_preview=False` in `DaemonService.run_status`) because it costs
+one project-wide admission scan per row, so list rows omit the field instead of
+reporting a fabricated `false`. Selected-run detail and every mutation keep the
+full preview and recheck admission.
 The same lock also admits only one unresolved run claim for a validated plan
 path across daemon and direct controllers, including linked worktrees. A
 released pending startup question retains its claim; confirmed inactive runs

@@ -543,15 +543,23 @@ export interface RunDisplayProjection {
   tone: 'neutral' | 'attention' | 'danger' | 'muted'
 }
 
-/** Match only the fully evidenced historical gap; unknown cases stay visible as attention. */
+/**
+ * Match only the fully evidenced historical gap; unknown cases stay visible as attention.
+ * `evidence.can_resume` is an optional list preview: history list rows omit it because
+ * computing it costs one project-wide admission scan per row. An omitted preview is
+ * unknown, not a denial, so the missing-outcome shape stands on its own evidence while an
+ * explicit `can_resume === true` keeps the row actionable. This projection never
+ * authorizes a resume action; detail and action admission recheck eligibility.
+ */
 function isUnrecordedOutcome(run: RunStatus): boolean {
   const activityIsInactiveOrUnknown = run.activity === 'inactive' || run.activity === 'unknown'
+  const resumePreviewIsNotActionable = run.evidence.can_resume !== true
   return run.status === 'needs_attention'
     && activityIsInactiveOrUnknown
     && run.evidence.unit_observation === 'missing'
     && run.evidence.unit_active !== true
     && run.evidence.has_run_metadata === false
-    && run.evidence.can_resume === false
+    && resumePreviewIsNotActionable
     && run.status_reason_code === 'unit_missing'
 }
 

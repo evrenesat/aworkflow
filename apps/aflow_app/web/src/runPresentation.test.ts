@@ -88,18 +88,27 @@ describe('honest run timing', () => {
       },
     }
 
-    expect(runDisplayProjection(historicalGap)).toEqual({
-      category: 'outcome-unrecorded',
-      label: 'Outcome not recorded',
-      tone: 'muted',
-    })
-    expect(statusLabel(historicalGap)).toBe('Outcome not recorded')
+    // List rows omit the resume preview entirely: the same evidence still groups as a gap.
+    const omittedPreview: RunStatus = {
+      ...historicalGap,
+      evidence: { unit_observation: 'missing', has_run_metadata: false },
+    }
+    for (const candidate of [historicalGap, omittedPreview]) {
+      expect(runDisplayProjection(candidate)).toEqual({
+        category: 'outcome-unrecorded',
+        label: 'Outcome not recorded',
+        tone: 'muted',
+      })
+      expect(statusLabel(candidate)).toBe('Outcome not recorded')
+    }
+    expect(omittedPreview.evidence.can_resume).toBeUndefined()
     expect(historicalGap.status).toBe('needs_attention')
     expect(historicalGap.status_reason_code).toBe('unit_missing')
     expect(historicalGap.reason).toContain('no normal outcome was recorded')
     expect(historicalGap.unit_name).toBe('aflow-run-20260911t140026z-d06cc7d7.service')
     expect(historicalGap.evidence.unit_observation).toBe('missing')
     expect(runDisplayProjection({ ...historicalGap, activity: 'inactive', evidence: { ...historicalGap.evidence, unit_active: false } }).category).toBe('outcome-unrecorded')
+    expect(runDisplayProjection({ ...omittedPreview, activity: 'inactive', evidence: { ...omittedPreview.evidence, unit_active: false } }).category).toBe('outcome-unrecorded')
 
     const ambiguousVariants = [
       { ...historicalGap, status_reason_code: 'worker_attention' },
@@ -112,6 +121,16 @@ describe('honest run timing', () => {
       { ...historicalGap, evidence: { ...historicalGap.evidence, can_resume: true } },
       { ...historicalGap, evidence: { ...historicalGap.evidence, has_run_metadata: true } },
       { ...historicalGap, activity: undefined },
+      // The omitted-preview shape must not widen the gap: only explicit `true` stays actionable.
+      { ...omittedPreview, status_reason_code: 'worker_attention' },
+      { ...omittedPreview, activity: 'active' },
+      { ...omittedPreview, evidence: { ...omittedPreview.evidence, unit_observation: 'observed' } },
+      { ...omittedPreview, evidence: { ...omittedPreview.evidence, unit_observation: 'unavailable' } },
+      { ...omittedPreview, evidence: { ...omittedPreview.evidence, unit_observation: undefined } },
+      { ...omittedPreview, evidence: { ...omittedPreview.evidence, unit_active: true } },
+      { ...omittedPreview, evidence: { ...omittedPreview.evidence, can_resume: true } },
+      { ...omittedPreview, evidence: { ...omittedPreview.evidence, has_run_metadata: true } },
+      { ...omittedPreview, activity: undefined },
     ] as RunStatus[]
     for (const variant of ambiguousVariants) {
       expect(runDisplayProjection(variant).category).toBe('actionable-attention')

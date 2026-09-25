@@ -245,9 +245,15 @@ class ControlPlaneService:
         return self._project(project_id).daemon.application.capabilities.get()
 
     @staticmethod
-    def _status(item, run_id: str, *, include_progress: bool = True) -> RunStatus:
+    def _status(
+        item, run_id: str, *, include_progress: bool = True, include_resume_preview: bool = True
+    ) -> RunStatus:
         """Return the daemon's finalized status for one run."""
-        return item.daemon.service.run_status(run_id, include_progress=include_progress)
+        return item.daemon.service.run_status(
+            run_id,
+            include_progress=include_progress,
+            include_resume_preview=include_resume_preview,
+        )
 
     def list_plans(
         self, project_id: str, *, limit: int, cursor: str | None
@@ -279,6 +285,7 @@ class ControlPlaneService:
                 item,
                 identity.run_id,
                 include_progress=include_progress,
+                include_resume_preview=False,
             )
             if not include_progress:
                 status = item.daemon.application.repository.with_original_plan_identity(status)

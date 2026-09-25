@@ -1924,6 +1924,81 @@ def test_run_list_recent_order_is_opt_in_and_cursor_is_validated(control_client)
     assert client.get(endpoint, params={"order": "newest"}).status_code == 422
 
 
+def test_history_pages_skip_resume_preview_but_detail_keeps_it(control_client, monkeypatch):
+    from aflow_app_server import main
+
+    client, root, _, _ = control_client
+    for index in range(123):
+        run_id = f"history-{index:03}"
+        create_launch_manifest(
+            root,
+            LaunchManifest(
+                run_id=run_id,
+                project_root=str(root),
+                plan_path="plans/todo/test-plan.md",
+                workflow_name="managed",
+                max_turns=5,
+            ),
+        )
+        write_launch_phase(root, run_id, "unit_started")
+
+    service = main._control_plane_service
+    assert service is not None
+    daemon = service._project(PROJECT_ID).daemon.service
+    preview_calls: list[str] = []
+    admission_calls: list[str] = []
+    original_preview = daemon._can_resume
+
+    def counted_preview(status):
+        preview_calls.append(status.run_id)
+        return original_preview(status)
+
+    def counted_admission(run_id):
+        admission_calls.append(run_id)
+        return False
+
+    monkeypatch.setattr(daemon, "_can_resume", counted_preview)
+    monkeypatch.setattr(daemon._admission, "predecessor_inactive_for_preview", counted_admission)
+
+    endpoint = f"/api/control-plane/projects/{PROJECT_ID}/runs"
+    for include_progress in (False, True):
+        for order in ("oldest", "recent"):
+            first = client.get(endpoint, params={
+                "limit": 100, "order": order, "include_progress": include_progress,
+            })
+            assert first.status_code == 200, first.text
+            first_page = first.json()
+            expected = [f"history-{index:03}" for index in range(123)]
+            if order == "recent":
+                expected.reverse()
+            assert [run["run_id"] for run in first_page["runs"]] == expected[:100]
+            assert first_page["next_cursor"] == expected[99]
+
+            second = client.get(endpoint, params={
+                "limit": 100,
+                "cursor": first_page["next_cursor"],
+                "order": order,
+                "include_progress": include_progress,
+            })
+            assert second.status_code == 200, second.text
+            second_page = second.json()
+            assert [run["run_id"] for run in second_page["runs"]] == expected[100:]
+            assert second_page["next_cursor"] is None
+            for run in first_page["runs"] + second_page["runs"]:
+                assert run["status"] == "needs_attention"
+                assert run["evidence"]["has_run_metadata"] is False
+                assert "can_resume" not in run["evidence"]
+                assert (run["progress"] is not None) is include_progress
+
+    assert preview_calls == []
+    assert admission_calls == []
+    detail = client.get(f"{endpoint}/history-122")
+    assert detail.status_code == 200, detail.text
+    assert detail.json()["evidence"]["can_resume"] is False
+    assert preview_calls == ["history-122"]
+    assert admission_calls == ["history-122"]
+
+
 def test_run_list_uses_summary_only_without_context_requests(control_client, monkeypatch):
     from aflow_app_server import main
 

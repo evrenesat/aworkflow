@@ -4244,3 +4244,40 @@ HISTORY: Published clipboard history `c14f1f2`/`cd78d53` remains separate and mu
   reader also rejects permission frames buffered before the prompt. The
   separate failed history repair run remains available for supported recovery
   after delivery.
+
+## 2026-09-25 — History list resume preview performance (fresh DS4.1 repair, Checkpoint 1)
+
+- Pre-change live baseline, recorded in the original plan: the p100 100-row
+  visible history request timed out at 90 seconds both with and without progress
+  enrichment. This pass did not repeat an authenticated live timing.
+- Scope was ported from the held successor's uncommitted diff as read-only
+  evidence and re-verified here, rather than copied wholesale. The held worktree
+  was inspected with `git status`/`git diff` only and remains byte-for-byte
+  unchanged; the failed lineage's `in_flight` state was not touched.
+- `DaemonService.run_status` gained `include_resume_preview` (default `True`, so
+  every existing caller including selected-run detail and mutations keeps full
+  status). `ControlPlaneService.list_runs` passes `False` per row and omits
+  `evidence.can_resume` instead of forging `false`; `include_progress` stays
+  independent.
+- `apps/aflow_app/server/tests/test_control_plane_api.py::test_history_pages_skip_resume_preview_but_detail_keeps_it`
+  seeds 123 `needs_attention` history records and counts both `_can_resume` and
+  `predecessor_inactive_for_preview` calls: zero across the first and next pages,
+  both `oldest` and `recent` cursor orders, and both progress modes, while a
+  direct detail read makes exactly one preview and returns `can_resume: false`.
+- `runPresentation.ts::isUnrecordedOutcome` now treats an omitted list preview as
+  unknown rather than a denial (`evidence.can_resume !== true`) while keeping the
+  same fully evidenced missing-outcome shape; explicit `can_resume === true` and
+  ambiguous activity/unit/metadata/reason shapes stay “Needs attention.” The
+  projection is display-only — the resume action gate in `RunDashboard.tsx` still
+  requires an explicit `true` and detail rechecks admission.
+- Verification actually run: core `tests/test_aflowd.py tests/test_control_plane_repository.py`
+  63 passed; server `tests/test_control_plane_api.py tests/test_mcp.py` 118
+  passed; the populated 123-record Chromium and WebKit
+  `test_recent_runs_are_on_first_history_page_without_extra_fetch` cases both
+  passed with `Older runs without a recorded outcome · 97 loaded` collapsed and
+  the recent rows actionable at 320/390/1280/1440 widths without overflow; web
+  unit suite 664 passed (29 files, including 23 focused `runPresentation` cases);
+  `npm run build` succeeded; Ruff and `git diff --check` clean.
+- Deployed throughput remains unproven: the 90-second live baseline was not
+  re-timed here, so no speed or activation claim is made. If the deployed list is
+  still slow, the remaining cost needs its own focused profile.

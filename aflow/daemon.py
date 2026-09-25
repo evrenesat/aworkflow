@@ -1266,8 +1266,20 @@ class DaemonService:
                 recovery_intent=recovery_intent,
             )
 
-    def run_status(self, run_id: str, *, include_progress: bool = True) -> RunStatus:
-        """Project a persisted startup question into canonical run status."""
+    def run_status(
+        self,
+        run_id: str,
+        *,
+        include_progress: bool = True,
+        include_resume_preview: bool = True,
+    ) -> RunStatus:
+        """Project a persisted startup question into canonical run status.
+
+        ``include_resume_preview`` gates the read-only admission preview that
+        populates ``evidence.can_resume``. Defaults to the full status; history
+        list rows skip it because it performs a project-wide admission scan per
+        row, and the field is omitted rather than forged when skipped.
+        """
         from .control_plane.run_activity import project_activity
         repository = self._application.repository
 
@@ -1276,19 +1288,29 @@ class DaemonService:
             return repository.with_progress(projected) if include_progress else projected
 
         status = repository.get_run_status(run_id, include_progress=False)
+        if not include_resume_preview and "can_resume" in status.evidence:
+            status = replace(
+                status,
+                evidence={
+                    key: value for key, value in status.evidence.items() if key != "can_resume"
+                },
+            )
         if status.status == "owner_stopped":
-            return finalize(
-                replace(
+            if include_resume_preview:
+                status = replace(
                     status,
                     evidence={
                         **status.evidence,
                         "can_resume": self._can_resume(status),
                     },
                 )
-            )
+            return finalize(status)
         if status.ownership != "control_plane":
             return finalize(status)
-        status = replace(status, evidence={**status.evidence, "can_resume": self._can_resume(status)})
+        if include_resume_preview:
+            status = replace(
+                status, evidence={**status.evidence, "can_resume": self._can_resume(status)}
+            )
         try:
             observed = self._application.units.get(_unit_name(run_id))
             if observed is not None and observed.name == _unit_name(run_id) and status.evidence.get("worker") is None:
