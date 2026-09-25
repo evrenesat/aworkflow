@@ -1,5 +1,11 @@
 # DEVLOG
 
+## 2026-09-25 — Keep publication locking outside execution checkouts
+
+- Moved the repository-wide publication lock to the verified Git common
+  directory. Acquiring it now leaves clean checkouts clean even when `.aflow/`
+  is not ignored, while linked worktrees still share the exclusive lock.
+
 ## 2026-09-25 — Wait for compact Run history focus at the browser transition
 
 - Release `ab4e1cb7` failed macOS Python 3.12 CI run `36115732349` at the

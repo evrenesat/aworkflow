@@ -1076,18 +1076,11 @@ def finalize_completed_plan(
 def _publication_lock(root: Path) -> Iterator[None]:
     """Serialize shared-main publication across independent worktree workers."""
     try:
-        primary = resolve_project_identity(root).primary_root
+        directory = resolve_project_identity(root).common_git_dir
     except ProjectSettingsError as exc:
         raise PublicationError("publication project identity is unavailable") from exc
-    directory = primary / ".aflow"
-    if directory.is_symlink():
-        raise PublicationError("publication state directory is unsafe")
-    try:
-        directory.mkdir(mode=0o700, exist_ok=True)
-    except OSError as exc:
-        raise PublicationError("publication state directory is unavailable") from exc
-    if not directory.is_dir() or directory.is_symlink():
-        raise PublicationError("publication state directory is unsafe")
+    if directory is None or not directory.is_dir():
+        raise PublicationError("publication Git common directory is unavailable")
     try:
         descriptor = os.open(
             directory / "publication.lock",

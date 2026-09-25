@@ -1455,9 +1455,10 @@ before dispatch; the daemon resolves that
 default and its team again for admission. Only isolated worktree delivery
 workflows are eligible. The consumer holds no publication or provider lock;
 capacity and plan claims remain with project admission, and the controller
-continues to own publication. Publication itself holds a separate primary-root
-file lock across fetch, reconciliation, push, and receipt so concurrent
-worktree runs serialize shared-main delivery. Plan and run-artifact watches wake
+continues to own publication. Publication itself holds a separate lock in the
+verified shared Git common directory across fetch, reconciliation, push, and
+receipt so concurrent worktree runs serialize shared-main delivery. Plan and
+run-artifact watches wake
 the relevant project scanner between bounded periodic passes. Server shutdown releases scanner ownership
 without stopping already launched workflow units.
 
@@ -1671,8 +1672,10 @@ If that move creates a bookkeeping commit, it publishes that commit through the
 same receipt; no redundant push is issued for an untracked or ignored-only move.
 Local Git configuration selects an existing remote/branch. Publication preserves
 the execution checkout, merges concurrent accepted history in an isolated
-checkout, never force-pushes, and writes a bounded run-local receipt. A failed
-approved or lifecycle phase records its phase in `run.json`; a terminal resume
+checkout, never force-pushes, and writes a bounded run-local receipt. The
+publication lock lives in shared Git metadata, so acquiring it cannot dirty a
+clean checkout even without an `.aflow/` ignore rule. A failed approved or
+lifecycle phase records its phase in `run.json`; a terminal resume
 validates the recorded branch identities and receipt. Repeated terminal resumes
 follow the validated `resumed_from_run_id` lineage to the exact receipt owner
 and retain every predecessor needed to resolve that lineage through allocation
