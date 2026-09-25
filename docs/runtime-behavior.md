@@ -380,6 +380,14 @@ previous selections after each dependent update so model or effort cannot
 silently reset approval. Missing, malformed, rejected, or unacknowledged state
 closes the owned process and fails before `session/prompt`. The ordinary durable
 turn/run failure boundary records that negotiation failure once without retry.
+During that prompt only, the owned stdio client may answer a bounded ACP
+`session/request_permission` for the exact opened session. It requires a valid
+request id, structured tool call, and distinct offered options, and chooses the
+first option whose ACP `kind` is `allow_once`. The response echoes that option's
+id and authorizes only the current tool call; `allow_always` would persist a
+grant beyond the verified prompt. Unknown, malformed, cross-session, and
+pre-approval requests fail closed. Permission payloads are not added to turn
+output, and interleaved requests do not reset the original prompt deadline.
 
 ### Transaction and capability path
 

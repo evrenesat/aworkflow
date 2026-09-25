@@ -4231,3 +4231,16 @@ HISTORY: Published clipboard history `c14f1f2`/`cd78d53` remains separate and mu
   Vitest worker passed; the default parallel suite timed out in that case twice.
   `origin/main` `46224dfa` subsequently passed all 12 CI jobs. Integration,
   publication, and live comparison remain separate delivery steps.
+
+## 2026-09-25 — Answer strict owned Reasonix ACP permission requests
+
+- Verified `tool_approval=yolo` prompts now answer only same-session,
+  well-formed `session/request_permission` with an offered `allow_once` choice.
+  The stdio seam bounds message size and request count, retains prompt
+  correlation and deadline, and omits raw permission payloads from turn output.
+- Added fake stdio coverage for valid interleaving, invalid requests, limits,
+  and existing config-notification settlement. A real-pipe regression covers
+  coalesced notification and permission frames; a persistent bounded byte
+  reader also rejects permission frames buffered before the prompt. The
+  separate failed history repair run remains available for supported recovery
+  after delivery.

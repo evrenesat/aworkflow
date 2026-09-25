@@ -1,4 +1,6 @@
 import json
+import subprocess
+import sys
 from pathlib import Path
 from dataclasses import dataclass, field
 
@@ -461,6 +463,7 @@ class _FakeReasonixAcpProcess:
         self.last_request_id = 0
         self.update_count = 0
         self.closed = False
+        self.agent_handlers = []
 
     def config_options(self) -> list[dict[str, object]]:
         return _reasonix_config_options(
@@ -489,8 +492,10 @@ class _FakeReasonixAcpProcess:
         *,
         timeout_seconds: float = 10.0,
         accept_notification=None,
+        accept_agent_request=None,
     ) -> dict[str, object]:
         self.calls.append((method, dict(params), timeout_seconds))
+        self.agent_handlers.append(accept_agent_request)
         self.last_request_id += 1
         if method in {"session/new", "session/resume"}:
             if self.open_response is not None:
@@ -573,6 +578,18 @@ def test_reasonix_owned_executor_sets_yolo_before_model_effort_and_prompt_for_ne
     ] * 4
     assert fake.calls[4][1]["prompt"][0]["type"] == "text"
     assert fake.calls[4][2] > 60
+    assert fake.agent_handlers[:4] == [None] * 4
+    assert fake.agent_handlers[4] is not None
+    assert fake.agent_handlers[4]({
+        "method": "session/request_permission",
+        "params": {
+            "sessionId": "fresh", "toolCall": {"toolCallId": "tool-1"},
+            "options": [
+                {"optionId": "persistent", "name": "Allow", "kind": "allow_always"},
+                {"optionId": "once", "name": "Allow once", "kind": "allow_once"},
+            ],
+        },
+    }) == {"outcome": {"outcome": "selected", "optionId": "once"}}
     assert control_calls == ["control"]
     assert execution.result.session_id == "fresh"
     assert execution.result.final_output == "DONE"
@@ -721,12 +738,13 @@ def test_reasonix_transport_accepts_long_prompt_timeout_without_fixed_sixty_seco
     class Stream:
         def write(self, value): pass
         def flush(self): pass
-        def readline(self): return '{"jsonrpc":"2.0","id":1,"result":{}}\n'
+        def fileno(self): return 0
     class Proc:
         stdin = Stream()
         stdout = Stream()
     seen = []
     monkeypatch.setattr(reasonix_module.select, "select", lambda r, w, e, timeout: (seen.append(timeout) or ([r[0]], [], [])))
+    monkeypatch.setattr(reasonix_module.os, "read", lambda fd, limit: b'{"jsonrpc":"2.0","id":1,"result":{}}\n')
     ReasonixAcpProcess(Proc()).request("session/prompt", {}, timeout_seconds=3600.0)
     assert seen == [pytest.approx(3600.0, abs=0.01)]
 
@@ -735,18 +753,19 @@ def test_reasonix_transport_uses_one_deadline_across_notifications(monkeypatch):
     class Stream:
         def __init__(self):
             self.lines = iter((
-                '{"jsonrpc":"2.0","method":"session/update","params":{}}\n',
-                '{"jsonrpc":"2.0","id":1,"result":{}}\n',
+                b'{"jsonrpc":"2.0","method":"session/update","params":{}}\n',
+                b'{"jsonrpc":"2.0","id":1,"result":{}}\n',
             ))
         def write(self, value): pass
         def flush(self): pass
-        def readline(self): return next(self.lines)
+        def fileno(self): return 0
     class Proc:
         stdin = Stream()
         stdout = stdin
     seen = []
     clock = iter((100.0, 100.0, 101.0))
     monkeypatch.setattr(reasonix_module.time, "monotonic", lambda: next(clock))
+    monkeypatch.setattr(reasonix_module.os, "read", lambda fd, limit: next(Proc.stdin.lines))
     monkeypatch.setattr(
         reasonix_module.select,
         "select",
@@ -760,12 +779,7 @@ def test_reasonix_transport_accepts_exact_config_update_notification(monkeypatch
     class Stream:
         def write(self, value): pass
         def flush(self): pass
-        def readline(self):
-            return (
-                '{"jsonrpc":"2.0","method":"session/update","params":'
-                '{"sessionId":"rx-1","update":{"sessionUpdate":'
-                '"config_option_update","configOptions":[]}}}\n'
-            )
+        def fileno(self): return 0
     class Proc:
         stdin = Stream()
         stdout = stdin
@@ -774,6 +788,11 @@ def test_reasonix_transport_accepts_exact_config_update_notification(monkeypatch
         "select",
         lambda r, w, e, timeout: ([r[0]], [], []),
     )
+    monkeypatch.setattr(reasonix_module.os, "read", lambda fd, limit: (
+        b'{"jsonrpc":"2.0","method":"session/update","params":'
+        b'{"sessionId":"rx-1","update":{"sessionUpdate":'
+        b'"config_option_update","configOptions":[]}}}\n'
+    ))
     process = ReasonixAcpProcess(Proc())
     response = process.request(
         "session/set_config_option",
@@ -789,17 +808,9 @@ def test_reasonix_transport_accepts_exact_config_update_notification(monkeypatch
 
 def test_reasonix_transport_discards_one_late_notification_settled_response(monkeypatch):
     class Stream:
-        def __init__(self):
-            self.lines = iter((
-                '{"jsonrpc":"2.0","method":"session/update","params":'
-                '{"sessionId":"rx-1","update":{"sessionUpdate":'
-                '"config_option_update","configOptions":[]}}}\n',
-                '{"jsonrpc":"2.0","id":1,"result":{"late":true}}\n',
-                '{"jsonrpc":"2.0","id":2,"result":{"current":true}}\n',
-            ))
         def write(self, value): pass
         def flush(self): pass
-        def readline(self): return next(self.lines)
+        def fileno(self): return 0
     class Proc:
         stdin = Stream()
         stdout = stdin
@@ -808,6 +819,14 @@ def test_reasonix_transport_discards_one_late_notification_settled_response(monk
         "select",
         lambda r, w, e, timeout: ([r[0]], [], []),
     )
+    reads = iter((
+        b'{"jsonrpc":"2.0","method":"session/update","params":'
+        b'{"sessionId":"rx-1","update":{"sessionUpdate":'
+        b'"config_option_update","configOptions":[]}}}\n'
+        b'{"jsonrpc":"2.0","id":1,"result":{"late":true}}\n'
+        b'{"jsonrpc":"2.0","id":2,"result":{"current":true}}\n',
+    ))
+    monkeypatch.setattr(reasonix_module.os, "read", lambda fd, limit: next(reads))
     process = ReasonixAcpProcess(Proc())
     process.request(
         "session/set_config_option",
@@ -820,6 +839,331 @@ def test_reasonix_transport_discards_one_late_notification_settled_response(monk
     )
     response = process.request("session/set_config_option", {"sessionId": "rx-1"})
     assert response["result"] == {"current": True}
+
+
+def test_reasonix_buffered_pre_prompt_permission_cannot_be_approved(monkeypatch):
+    class Stream:
+        def write(self, value): pass
+        def flush(self): pass
+        def fileno(self): return 0
+    class Proc:
+        stdin = Stream()
+        stdout = stdin
+    notification = {
+        "jsonrpc": "2.0", "method": "session/update",
+        "params": {"sessionId": "rx-1", "update": {
+            "sessionUpdate": "config_option_update", "configOptions": [],
+        }},
+    }
+    permission = {
+        "jsonrpc": "2.0", "id": 3, "method": "session/request_permission",
+        "params": {"sessionId": "rx-1", "toolCall": {"toolCallId": "tool-1"},
+                   "options": [{"optionId": "once", "name": "Allow once",
+                                "kind": "allow_once"}]},
+    }
+    coalesced = (json.dumps(notification) + "\n" + json.dumps(permission) + "\n").encode()
+    monkeypatch.setattr(
+        reasonix_module.select, "select",
+        lambda r, w, e, timeout: ([r[0]], [], []),
+    )
+    reads = iter((coalesced,))
+    monkeypatch.setattr(reasonix_module.os, "read", lambda fd, limit: next(reads))
+    process = ReasonixAcpProcess(Proc())
+    process.request(
+        "session/set_config_option", {"sessionId": "rx-1"},
+        accept_notification=lambda event: reasonix_module._config_update_notification_result(
+            event, session_id="rx-1"
+        ),
+    )
+    with pytest.raises(RuntimeError, match="agent request is not permitted"):
+        process.request(
+            "session/prompt", {"sessionId": "rx-1"},
+            accept_agent_request=lambda event: reasonix_module._select_owned_permission(
+                event, session_id="rx-1"
+            ),
+        )
+
+
+def _reasonix_permission_event(
+    request_id=2, *, session_id="rx-1", options=None, method="session/request_permission"
+):
+    return {
+        "jsonrpc": "2.0", "id": request_id, "method": method,
+        "params": {
+            "sessionId": session_id,
+            "toolCall": {"toolCallId": "tool-1", "rawInput": "PRIVATE TOOL INPUT"},
+            "options": options if options is not None else [
+                {"optionId": "always", "name": "Allow", "kind": "allow_always"},
+                {"optionId": "once", "name": "Allow once", "kind": "allow_once"},
+            ],
+        },
+    }
+
+
+def _reasonix_stdio_process(monkeypatch, events):
+    class Stream:
+        def __init__(self):
+            self.lines = iter(
+                event if isinstance(event, bytes) else (
+                    event if isinstance(event, str) else json.dumps(event) + "\n"
+                ).encode()
+                for event in events
+            )
+            self.writes = []
+
+        def fileno(self):
+            return 0
+
+        def write(self, value):
+            self.writes.append(value)
+
+        def flush(self):
+            pass
+
+    class Proc:
+        stdin = Stream()
+        stdout = stdin
+
+    monkeypatch.setattr(
+        reasonix_module.select, "select",
+        lambda r, w, e, timeout: ([r[0]], [], []),
+    )
+    monkeypatch.setattr(
+        reasonix_module.os, "read",
+        lambda fd, limit: next(Proc.stdout.lines, b"")[:limit],
+    )
+    return ReasonixAcpProcess(Proc()), Proc.stdin.writes
+
+
+def test_reasonix_raw_reader_preserves_split_utf8_and_rejects_incomplete_frames(monkeypatch):
+    frame = json.dumps(
+        {"jsonrpc": "2.0", "id": 1,
+         "result": {"sessionId": "rx-1", "finalOutput": "café"}},
+        ensure_ascii=False,
+    ).encode() + b"\n"
+    split = frame.index("é".encode()) + 1
+    process, _writes = _reasonix_stdio_process(monkeypatch, [
+        frame[:split], frame[split:]
+    ])
+    assert process.request("session/prompt", {})["result"]["finalOutput"] == "café"
+
+    process, _writes = _reasonix_stdio_process(monkeypatch, [b'{"jsonrpc":"2.0"'])
+    with pytest.raises(ValueError, match="line is incomplete"):
+        process.request("session/prompt", {})
+
+    process, _writes = _reasonix_stdio_process(monkeypatch, [
+        b'{"jsonrpc":"2.0","id":1,"result":{"text":"\xff"}}\n'
+    ])
+    with pytest.raises(ValueError, match="invalid UTF-8"):
+        process.request("session/prompt", {})
+
+
+def test_reasonix_real_pipe_answers_permission_coalesced_with_notification():
+    child = r'''
+import json
+import os
+import sys
+
+prompt = json.loads(sys.stdin.readline())
+notification = {"jsonrpc": "2.0", "method": "session/update",
+                "params": {"sessionId": "rx-1", "update": {"text": "café"}}}
+permission = {"jsonrpc": "2.0", "id": "permission-1",
+              "method": "session/request_permission",
+              "params": {"sessionId": "rx-1",
+                         "toolCall": {"toolCallId": "tool-1"},
+                         "options": [{"optionId": "once", "name": "Allow once",
+                                     "kind": "allow_once"}]}}
+os.write(sys.stdout.fileno(),
+         (json.dumps(notification, ensure_ascii=False) + "\n"
+          + json.dumps(permission) + "\n").encode())
+answer = json.loads(sys.stdin.readline())
+if answer != {"jsonrpc": "2.0", "id": "permission-1",
+              "result": {"outcome": {"outcome": "selected", "optionId": "once"}}}:
+    sys.exit(2)
+result = {"jsonrpc": "2.0", "id": prompt["id"],
+          "result": {"sessionId": "rx-1", "finalOutput": "DONE"}}
+os.write(sys.stdout.fileno(), (json.dumps(result) + "\n").encode())
+'''
+    child_process = subprocess.Popen(
+        [sys.executable, "-u", "-c", child],
+        stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        text=True, encoding="utf-8",
+    )
+    process = ReasonixAcpProcess(child_process)
+    try:
+        response = process.request(
+            "session/prompt", {"sessionId": "rx-1"}, timeout_seconds=5.0,
+            accept_agent_request=lambda event: reasonix_module._select_owned_permission(
+                event, session_id="rx-1"
+            ),
+        )
+        assert response["result"]["finalOutput"] == "DONE"
+        assert process.notifications[0]["params"]["update"]["text"] == "café"
+        assert child_process.wait(timeout=2) == 0
+    finally:
+        process.close()
+        if child_process.poll() is None:
+            child_process.kill()
+            child_process.wait(timeout=2)
+
+
+def test_reasonix_owned_permission_interleaves_with_prompt_without_leaking_tool_call(monkeypatch):
+    process, writes = _reasonix_stdio_process(monkeypatch, [
+        {"jsonrpc": "2.0", "method": "session/update", "params": {"sessionId": "rx-1"}},
+        _reasonix_permission_event(2),
+        _reasonix_permission_event("1", options=[
+            {"optionId": "second", "name": "Allow once", "kind": "allow_once"},
+        ]),
+        {"jsonrpc": "2.0", "id": 1, "result": {"sessionId": "rx-1", "finalOutput": "DONE"}},
+    ])
+    response = process.request(
+        "session/prompt", {"sessionId": "rx-1"},
+        accept_agent_request=lambda event: reasonix_module._select_owned_permission(
+            event, session_id="rx-1"
+        ),
+    )
+    assert response["result"]["finalOutput"] == "DONE"
+    assert [json.loads(line) for line in writes[1:]] == [
+        {"jsonrpc": "2.0", "id": 2,
+         "result": {"outcome": {"outcome": "selected", "optionId": "once"}}},
+        {"jsonrpc": "2.0", "id": "1",
+         "result": {"outcome": {"outcome": "selected", "optionId": "second"}}},
+    ]
+    assert len(process.notifications) == 1
+    assert "PRIVATE TOOL INPUT" not in "".join(writes)
+
+
+@pytest.mark.parametrize("change", [
+    {"sessionId": "other"},
+    {"sessionId": ""},
+    {"toolCall": {}},
+    {"toolCall": {"toolCallId": 4}},
+    {"options": []},
+    {"options": [{}]},
+    {"options": [{"optionId": "once", "name": "once", "kind": "allow_once"},
+                 {"optionId": "once", "name": "again", "kind": "allow_once"}]},
+    {"options": [{"optionId": "always", "name": "Allow", "kind": "allow_always"}]},
+    {"options": [{"optionId": "once", "name": "once", "kind": "unknown"}]},
+    {"options": [{"optionId": str(i), "name": "Allow once", "kind": "allow_once"}
+                 for i in range(129)]},
+])
+def test_reasonix_permission_rejects_invalid_params_without_approval(monkeypatch, change):
+    event = _reasonix_permission_event()
+    event["params"].update(change)
+    process, writes = _reasonix_stdio_process(monkeypatch, [event])
+    with pytest.raises((RuntimeError, ValueError)) as exc_info:
+        process.request(
+            "session/prompt", {"sessionId": "rx-1"},
+            accept_agent_request=lambda item: reasonix_module._select_owned_permission(
+                item, session_id="rx-1"
+            ),
+        )
+    assert len(writes) == 1
+    assert "PRIVATE TOOL INPUT" not in str(exc_info.value)
+    assert "other" not in str(exc_info.value)
+
+
+@pytest.mark.parametrize("request_id", [None, True, 1, 1.5, ""])
+def test_reasonix_permission_rejects_invalid_or_colliding_id(monkeypatch, request_id):
+    process, writes = _reasonix_stdio_process(monkeypatch, [
+        _reasonix_permission_event(request_id)
+    ])
+    with pytest.raises(RuntimeError, match="agent request is not permitted"):
+        process.request(
+            "session/prompt", {"sessionId": "rx-1"},
+            accept_agent_request=lambda item: reasonix_module._select_owned_permission(
+                item, session_id="rx-1"
+            ),
+        )
+    assert len(writes) == 1
+
+
+def test_reasonix_permission_rejects_duplicate_id_and_request_limit(monkeypatch):
+    process, writes = _reasonix_stdio_process(monkeypatch, [
+        _reasonix_permission_event(2), _reasonix_permission_event(2)
+    ])
+    with pytest.raises(RuntimeError, match="agent request is not permitted"):
+        process.request(
+            "session/prompt", {"sessionId": "rx-1"},
+            accept_agent_request=lambda item: reasonix_module._select_owned_permission(
+                item, session_id="rx-1"
+            ),
+        )
+    assert len(writes) == 2
+
+    monkeypatch.setattr(reasonix_module, "REASONIX_ACP_MAX_PERMISSION_REQUESTS", 1)
+    process, writes = _reasonix_stdio_process(monkeypatch, [
+        _reasonix_permission_event(2), _reasonix_permission_event(3)
+    ])
+    with pytest.raises(RuntimeError, match="agent request is not permitted"):
+        process.request(
+            "session/prompt", {"sessionId": "rx-1"},
+            accept_agent_request=lambda item: reasonix_module._select_owned_permission(
+                item, session_id="rx-1"
+            ),
+        )
+    assert len(writes) == 2
+
+
+def test_reasonix_permission_rejects_unknown_preapproval_and_oversize(monkeypatch):
+    for events, handler in [
+        ([_reasonix_permission_event(method="session/unknown")], True),
+        ([_reasonix_permission_event()], False),
+    ]:
+        process, writes = _reasonix_stdio_process(monkeypatch, events)
+        with pytest.raises(RuntimeError):
+            process.request(
+                "session/prompt", {"sessionId": "rx-1"},
+                accept_agent_request=(
+                    (lambda item: reasonix_module._select_owned_permission(
+                        item, session_id="rx-1"
+                    )) if handler else None
+                ),
+            )
+        assert len(writes) == 1
+    monkeypatch.setattr(reasonix_module, "REASONIX_ACP_MAX_LINE_BYTES", 128)
+    process, writes = _reasonix_stdio_process(monkeypatch, [
+        _reasonix_permission_event()
+    ])
+    with pytest.raises(ValueError, match="size limit") as exc_info:
+        process.request(
+            "session/prompt", {"sessionId": "rx-1"},
+            accept_agent_request=lambda item: reasonix_module._select_owned_permission(
+                item, session_id="rx-1"
+            ),
+        )
+    assert len(writes) == 1
+    assert "PRIVATE TOOL INPUT" not in str(exc_info.value)
+
+
+def test_reasonix_permission_notification_without_id_fails_closed(monkeypatch):
+    event = _reasonix_permission_event()
+    event.pop("id")
+    process, writes = _reasonix_stdio_process(monkeypatch, [event])
+    with pytest.raises(ValueError, match="permission request has no id"):
+        process.request(
+            "session/prompt", {"sessionId": "rx-1"},
+            accept_agent_request=lambda item: reasonix_module._select_owned_permission(
+                item, session_id="rx-1"
+            ),
+        )
+    assert len(writes) == 1
+
+
+def test_reasonix_permission_keeps_original_prompt_deadline(monkeypatch):
+    process, writes = _reasonix_stdio_process(monkeypatch, [
+        _reasonix_permission_event()
+    ])
+    clock = iter((100.0, 100.0, 111.0))
+    monkeypatch.setattr(reasonix_module.time, "monotonic", lambda: next(clock))
+    with pytest.raises(TimeoutError, match="response timed out"):
+        process.request(
+            "session/prompt", {"sessionId": "rx-1"}, timeout_seconds=10.0,
+            accept_agent_request=lambda item: reasonix_module._select_owned_permission(
+                item, session_id="rx-1"
+            ),
+        )
+    assert len(writes) == 1
 
 
 def test_reasonix_discovery_is_initialize_only_and_does_not_mutate_model(monkeypatch, tmp_path: Path):

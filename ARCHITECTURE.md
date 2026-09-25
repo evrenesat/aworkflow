@@ -955,6 +955,15 @@ prompt, and close. Before prompting it must negotiate the exact
 values. Any missing, malformed, rejected, or reset state closes the process and
 terminalizes the run before the prompt. A permissive global Reasonix permissions
 file is not AFlow's proof that an owned ACP session is noninteractive.
+Only the active prompt after those exact acknowledgements installs an ACP
+permission handler. The owned stdio seam validates same-session request shape,
+ids, bounded options and messages, then replies with an offered `allow_once`
+option while retaining prompt correlation and its original deadline. It does
+not expose permission requests in the stored transport output. Other agent
+requests close the owned process through the normal failure boundary.
+The stdout reader keeps a bounded UTF-8 byte buffer across requests and consumes
+complete frames before polling the fd; frames buffered during configuration
+cannot gain prompt-only permission authority later.
 
 Strands uses the published `@strands-agents/cli` 0.1.2 ACP server. Discovery
 negotiates `initialize` without opening a session. Each worker turn starts a

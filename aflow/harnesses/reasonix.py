@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 import select
 import time
@@ -20,6 +21,68 @@ from ..stop_marker import STRUCTURED_TRANSPORT_OUTPUT_SOURCE
 
 
 REASONIX_SESSION_CONTROL_TIMEOUT_SECONDS = 60.0
+REASONIX_ACP_MAX_LINE_BYTES = 1_048_576
+REASONIX_ACP_MAX_PERMISSION_REQUESTS = 128
+REASONIX_ACP_MAX_PERMISSION_OPTIONS = 128
+
+
+def _jsonrpc_id(value: object) -> bool:
+    return (type(value) is int or type(value) is str) and value != ""
+
+
+def _same_jsonrpc_id(left: object, right: object) -> bool:
+    return type(left) is type(right) and left == right
+
+
+def _select_owned_permission(
+    event: Mapping[str, Any], *, session_id: str
+) -> Mapping[str, Any]:
+    """Select a single-use option for the exact verified owned session."""
+    if event.get("method") != "session/request_permission":
+        raise RuntimeError("Reasonix ACP unsupported agent request")
+    params = event.get("params")
+    if (
+        not isinstance(params, Mapping)
+        or not isinstance(params.get("sessionId"), str)
+        or not params["sessionId"]
+        or params["sessionId"] != session_id
+    ):
+        raise ValueError("Reasonix ACP permission request has invalid session id")
+    tool_call = params.get("toolCall")
+    if (
+        not isinstance(tool_call, Mapping)
+        or not isinstance(tool_call.get("toolCallId"), str)
+        or not tool_call["toolCallId"]
+    ):
+        raise ValueError("Reasonix ACP permission request has invalid toolCall")
+    options = params.get("options")
+    if (
+        not isinstance(options, list)
+        or not 0 < len(options) <= REASONIX_ACP_MAX_PERMISSION_OPTIONS
+    ):
+        raise ValueError("Reasonix ACP permission request has invalid options")
+    seen: set[str] = set()
+    selected: str | None = None
+    for option in options:
+        if not isinstance(option, Mapping):
+            raise ValueError("Reasonix ACP permission request has invalid options")
+        option_id = option.get("optionId")
+        if (
+            not isinstance(option_id, str)
+            or not option_id
+            or option_id in seen
+            or not isinstance(option.get("name"), str)
+            or option.get("kind") not in {
+                "allow_once", "allow_always", "reject_once", "reject_always"
+            }
+        ):
+            raise ValueError("Reasonix ACP permission request has invalid options")
+        seen.add(option_id)
+        if option["kind"] == "allow_once" and selected is None:
+            selected = option_id
+    if selected is None:
+        raise ValueError("Reasonix ACP permission request has no allow_once option")
+    return {"outcome": {"outcome": "selected", "optionId": selected}}
 
 
 def _collect_acp_session_ids(value: object, found: set[str]) -> None:
@@ -297,6 +360,7 @@ class ReasonixAcpProcess:
         self.last_request_id: int | None = None
         self.notifications: list[Mapping[str, Any]] = []
         self._settled_request_ids: set[int] = set()
+        self._stdout_pending = bytearray()
 
     @classmethod
     def start(cls, *, repo_root: Path, executable: str = "reasonix") -> "ReasonixAcpProcess":
@@ -307,6 +371,47 @@ class ReasonixAcpProcess:
         )
         return cls(process)
 
+    def _read_line(self, *, deadline: float) -> tuple[str, int]:
+        """Read one bounded UTF-8 frame without hiding later frames from select."""
+        stdout = self.process.stdout
+        if stdout is None:
+            raise RuntimeError("Reasonix ACP stdio transport is unavailable")
+        while True:
+            end = self._stdout_pending.find(b"\n")
+            if end >= 0:
+                if end + 1 > REASONIX_ACP_MAX_LINE_BYTES:
+                    raise ValueError("Reasonix ACP line exceeds size limit")
+                frame = bytes(self._stdout_pending[:end + 1])
+                del self._stdout_pending[:end + 1]
+                try:
+                    return frame.decode("utf-8"), len(frame)
+                except UnicodeDecodeError:
+                    raise ValueError("Reasonix ACP emitted invalid UTF-8") from None
+            if len(self._stdout_pending) >= REASONIX_ACP_MAX_LINE_BYTES:
+                # One more byte distinguishes a legal final LF from an oversized frame.
+                read_limit = 1
+            else:
+                read_limit = min(
+                    65_536, REASONIX_ACP_MAX_LINE_BYTES + 1 - len(self._stdout_pending)
+                )
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError("Reasonix ACP response timed out")
+            ready, _, _ = select.select([stdout], [], [], remaining)
+            if not ready:
+                raise TimeoutError("Reasonix ACP response timed out")
+            chunk = os.read(stdout.fileno(), read_limit)
+            if not chunk:
+                if self._stdout_pending:
+                    raise ValueError("Reasonix ACP line is incomplete")
+                raise RuntimeError("Reasonix ACP exited before correlated response")
+            self._stdout_pending.extend(chunk)
+            if (
+                len(self._stdout_pending) > REASONIX_ACP_MAX_LINE_BYTES
+                and not 0 <= self._stdout_pending.find(b"\n") < REASONIX_ACP_MAX_LINE_BYTES
+            ):
+                raise ValueError("Reasonix ACP line exceeds size limit")
+
     def request(
         self,
         method: str,
@@ -314,6 +419,8 @@ class ReasonixAcpProcess:
         *,
         timeout_seconds: float = 10.0,
         accept_notification: Callable[[Mapping[str, Any]], Mapping[str, Any] | None]
+        | None = None,
+        accept_agent_request: Callable[[Mapping[str, Any]], Mapping[str, Any]]
         | None = None,
     ) -> Mapping[str, Any]:
         if self.process.stdin is None or self.process.stdout is None:
@@ -327,25 +434,44 @@ class ReasonixAcpProcess:
         }) + "\n")
         self.process.stdin.flush()
         deadline = time.monotonic() + timeout_seconds
+        seen_agent_ids: set[tuple[type, int | str]] = set()
+        prior_request_bytes = len(self._stdout_pending)
         while True:
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                raise TimeoutError("Reasonix ACP response timed out")
-            ready, _, _ = select.select([self.process.stdout], [], [], remaining)
-            if not ready:
-                raise TimeoutError("Reasonix ACP response timed out")
-            line = self.process.stdout.readline()
-            if not line:
-                raise RuntimeError("Reasonix ACP exited before correlated response")
-            event = json.loads(line)
+            line, frame_bytes = self._read_line(deadline=deadline)
+            from_prior_request = prior_request_bytes > 0
+            prior_request_bytes = max(0, prior_request_bytes - frame_bytes)
+            try:
+                event = json.loads(line)
+            except json.JSONDecodeError as exc:
+                raise ValueError("Reasonix ACP emitted invalid JSON") from exc
             if not isinstance(event, Mapping) or event.get("jsonrpc") != "2.0":
                 raise ValueError("Reasonix ACP emitted a non-JSON-RPC event")
             if "method" in event and "id" in event:
-                raise RuntimeError(
-                    "Reasonix ACP agent request requires an owned client handler: "
-                    f"{event.get('method')}"
-                )
+                agent_id = event["id"]
+                if (
+                    from_prior_request
+                    or accept_agent_request is None
+                    or not _jsonrpc_id(agent_id)
+                    or _same_jsonrpc_id(agent_id, request_id)
+                    or any(_same_jsonrpc_id(agent_id, old) for old in self._settled_request_ids)
+                    or (type(agent_id), agent_id) in seen_agent_ids
+                    or len(seen_agent_ids) >= REASONIX_ACP_MAX_PERMISSION_REQUESTS
+                    or "result" in event
+                    or "error" in event
+                ):
+                    raise RuntimeError("Reasonix ACP agent request is not permitted")
+                result = accept_agent_request(event)
+                if time.monotonic() >= deadline:
+                    raise TimeoutError("Reasonix ACP response timed out")
+                seen_agent_ids.add((type(agent_id), agent_id))
+                self.process.stdin.write(json.dumps({
+                    "jsonrpc": "2.0", "id": agent_id, "result": dict(result),
+                }) + "\n")
+                self.process.stdin.flush()
+                continue
             if "method" in event and "id" not in event:
+                if event.get("method") == "session/request_permission":
+                    raise ValueError("Reasonix ACP permission request has no id")
                 self.notifications.append(event)
                 notification_result = (
                     accept_notification(event)
@@ -361,10 +487,10 @@ class ReasonixAcpProcess:
                     }
                 continue
             response_id = event.get("id")
-            if response_id in self._settled_request_ids:
+            if type(response_id) is int and response_id in self._settled_request_ids:
                 self._settled_request_ids.remove(response_id)
                 continue
-            if response_id != request_id:
+            if not _same_jsonrpc_id(response_id, request_id):
                 raise ValueError("Reasonix ACP response id mismatch")
             if "error" in event:
                 raise RuntimeError(f"Reasonix ACP error: {event['error']}")
@@ -530,7 +656,11 @@ class ReasonixAcpDriver:
             prompt = process.request("session/prompt", {
                 "sessionId": session_id,
                 "prompt": [{"type": "text", "text": "\n\n".join((request.system_prompt, request.user_prompt))}],
-            }, timeout_seconds=3600.0)
+            }, timeout_seconds=3600.0,
+                accept_agent_request=lambda event: _select_owned_permission(
+                    event, session_id=session_id
+                ),
+            )
             wire.extend(process.notifications)
             wire.append(prompt)
             raw = "\n".join(json.dumps(item) for item in wire) + "\n"
