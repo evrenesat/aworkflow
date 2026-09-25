@@ -717,7 +717,7 @@ def test_ui_demo_fixture_captures_authenticated_built_app(
     ),
 )
 def test_ui_demo_project_and_global_overview_captures(
-    control_client,
+    control_client,  # noqa: F811
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
     width: int,
@@ -726,7 +726,7 @@ def test_ui_demo_project_and_global_overview_captures(
 ) -> None:
     """Capture populated project and All runs surfaces at reference breakpoints."""
     _, root, _, _ = control_client
-    fixtures = seed_demo_fidelity_fixture(root)
+    seed_demo_fidelity_fixture(root)
     dist = Path(__file__).resolve().parents[2] / "web" / "dist"
     if not (dist / "index.html").exists():
         pytest.fail("The CP7 capture requires the real built web app; run the web build first.")
@@ -811,7 +811,7 @@ def test_ui_demo_project_and_global_overview_captures(
     ),
 )
 def test_ui_demo_cp8_plan_editor_and_review_captures(
-    control_client,
+    control_client,  # noqa: F811
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
     width: int,
@@ -1093,7 +1093,13 @@ def test_ui_demo_cp8_plan_editor_and_review_captures(
     with live_server() as url, sync_playwright() as playwright:
         browser = _browser(playwright)
         page = browser.new_page(viewport={"width": width, "height": height})
-        page.expose_function("__aflowCp8TerminalCount", lambda: len(routed_terminals))
+        page.expose_function(
+            "__aflowCp8NamedRoutesSettled",
+            lambda indexes: all(
+                any(event["route_index"] == index for event in routed_terminals)
+                for index in indexes
+            ),
+        )
         page.on("request", trace_request)
         page.on("response", trace_response)
         page.on("requestfinished", lambda request: trace_terminal(request, "requestfinished"))
@@ -1114,6 +1120,11 @@ def test_ui_demo_cp8_plan_editor_and_review_captures(
             page.goto(f"{url}/?project={PROJECT_ID}&view=plans", wait_until="load")
             plan_list = page.locator(".plan-list")
             plan_list.wait_for()
+            sections = plan_list.locator(":scope > section")
+            expect(sections.locator("h3")).to_have_text(["Draft", "Ready", "Done"])
+            expect(sections.nth(0).locator("button.content-button")).to_have_count(2)
+            expect(sections.nth(1).locator("button.content-button")).to_have_count(2)
+            expect(sections.nth(2).locator("button.content-button")).to_have_count(1)
             _assert_theme(page, theme)
             _assert_header_and_flow(page)
             lifecycle_headings = page.locator(".plan-list > section h3").all_text_contents()
@@ -1300,13 +1311,16 @@ def test_ui_demo_cp8_plan_editor_and_review_captures(
                     held_route_released = True
                     page.unroute("**/runs/preflight", hold_preflight)
                     route_registered = False
+                    named_route_indexes = [0, changed_route_index, restored_route_index]
                     page.wait_for_function(
-                        "expected => window.__aflowCp8TerminalCount().then(count => count >= expected)",
-                        arg=len(routed_requests),
+                        "indexes => window.__aflowCp8NamedRoutesSettled(indexes)",
+                        arg=named_route_indexes,
                     )
                     outcomes = routed_outcome_records()
                     assert len(outcomes) == len(routed_preflights), outcomes
-                    assert all(record["terminal_outcome"] in ("requestfinished", "requestfailed") for record in outcomes), outcomes
+                    assert outcomes[0]["identity"] == held_identity, outcomes
+                    assert outcomes[changed_route_index]["identity"] == preflight_identity(changed_response.request), outcomes
+                    assert outcomes[restored_route_index]["identity"] == held_identity, outcomes
                     assert outcomes[changed_route_index]["terminal_outcome"] == "requestfinished", outcomes
                     assert outcomes[restored_route_index]["terminal_outcome"] == "requestfinished", outcomes
                     held_outcome = outcomes[0]["terminal_outcome"]
@@ -1464,7 +1478,7 @@ def test_ui_demo_cp8_plan_editor_and_review_captures(
     ),
 )
 def test_ui_demo_cp9_settings_effective_values_and_disclosures(
-    control_client,
+    control_client,  # noqa: F811
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
     width: int,
@@ -1592,7 +1606,7 @@ def test_ui_demo_cp9_settings_effective_values_and_disclosures(
     ),
 )
 def test_ui_demo_equal_refresh_retains_detail_and_changed_rows_update(
-    control_client,
+    control_client,  # noqa: F811
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
     width: int,
