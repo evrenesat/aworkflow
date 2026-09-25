@@ -202,12 +202,14 @@ release dependent plans.
 
 Packaged workflows start with manager supervision disabled; a workflow can
 explicitly opt in. `upgrade_after_repairs` defaults to one and may be
-overridden per workflow. An initial review rejection starts the repair
-sequence; after N failed repairs in the same checkpoint scope, the next worker
-uses the next configured team. This works without manager supervision.
-Operational retries and reviewer turns do not count, and an exhausted chain
-keeps its strongest team under ordinary run limits. Checkpoint and final
-reviews still run with clean context.
+overridden per workflow. An explicit zero routes the first repair after an
+authoritative initial reviewer rejection through one `upgrade_to` edge. A
+positive N waits for N failed repairs in the same checkpoint scope before
+changing the worker team. This works without manager supervision. Operational
+retries and reviewer turns do not count, and an exhausted chain keeps its
+strongest team under ordinary run limits. Changes to the setting affect newly
+resolved repair boundaries; they do not rewrite prior attempts or change
+inherited checkpoint and final reviewer roles.
 
 ## Run progress in the web view
 

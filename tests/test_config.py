@@ -274,7 +274,42 @@ def test_workflow_upgrade_after_repairs_omitted_defaults_to_one() -> None:
     assert workflow.upgrade_after_repairs_source == "defaults"
 
 
-@pytest.mark.parametrize("value", ['"two"', "true", "0", "-1", "1.5"])
+@pytest.mark.parametrize("location", ("defaults", "workflow"))
+def test_workflow_upgrade_after_repairs_accepts_explicit_zero(location: str) -> None:
+    declaration = (
+        '[workflow]\nupgrade_after_repairs = 0\n'
+        if location == "defaults"
+        else '[workflow.flagged]\nupgrade_after_repairs = 0\n'
+    )
+    with tempfile.TemporaryDirectory() as tmpdir:
+        config = load_workflow_config(
+            _managed_config(
+                Path(tmpdir),
+                declaration + "\n" + _MANAGER_TEST_STEP.format(name="flagged"),
+            )
+        )
+    workflow = config.workflows["flagged"]
+    assert workflow.upgrade_after_repairs == 0
+    assert workflow.declared_upgrade_after_repairs == (0 if location == "workflow" else None)
+    assert workflow.upgrade_after_repairs_source == ("workflow" if location == "workflow" else "defaults")
+
+
+@pytest.mark.parametrize("value", [0, -1, True, 0.5])
+@pytest.mark.parametrize("field", ["effective", "declared"])
+def test_resolved_upgrade_threshold_validates_nonnegative_integer(value: object, field: str) -> None:
+    workflow = WorkflowConfig(
+        upgrade_after_repairs=value if field == "effective" else 1,
+        declared_upgrade_after_repairs=value if field == "declared" else None,
+    )
+    errors = validate_workflow_config(WorkflowUserConfig(workflows={"flagged": workflow}))
+    field_name = "upgrade_after_repairs" if field == "effective" else "declared_upgrade_after_repairs"
+    matching = [error for error in errors if f"workflow.flagged.{field_name} must be" in error]
+    assert matching == ([] if value == 0 else [
+        f"workflow.flagged.{field_name} must be a nonnegative integer"
+    ])
+
+
+@pytest.mark.parametrize("value", ['"two"', "true", "-1", "1.5"])
 @pytest.mark.parametrize("location", ("defaults", "workflow"))
 def test_workflow_upgrade_after_repairs_rejects_invalid_values(
     value: str, location: str
@@ -286,7 +321,7 @@ def test_workflow_upgrade_after_repairs_rejects_invalid_values(
     )
     with tempfile.TemporaryDirectory() as tmpdir:
         with pytest.raises(
-            ConfigError, match=r"upgrade_after_repairs must be a positive integer"
+            ConfigError, match=r"upgrade_after_repairs must be a nonnegative integer"
         ):
             load_workflow_config(
                 _managed_config(

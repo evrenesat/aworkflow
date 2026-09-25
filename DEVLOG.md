@@ -1,5 +1,18 @@
 # DEVLOG
 
+## 2026-09-25 — First repair worker upgrade threshold (Checkpoint 1)
+
+- Core workflow config and repair policy accept explicit nonnegative thresholds.
+  The default stays at one; zero takes one `upgrade_to` edge for the first
+  reviewer-requested repair after an authoritative initial rejection. Positive
+  thresholds still count failed repairs on the current team. Missing or
+  ambiguous rejection evidence, operational retries, and reviewer invocations
+  do not trigger an upgrade.
+- The route remains worker-only and preserves inherited checkpoint and final
+  reviewer roles. Live config changes apply at newly resolved boundaries and
+  do not rewrite prior attempts. Guided Settings and p100 workflow opt-in are
+  separate work after this checkpoint.
+
 ## 2026-09-25 — Stabilize grouped Run history Back focus check
 
 - Exact-SHA `10e5bdfb` CI run `36141982543` failed the same immediate

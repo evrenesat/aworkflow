@@ -439,7 +439,7 @@ def test_live_reloaded_upgrade_threshold_is_exposed_at_loop_boundary(
         calls += 1
         if calls == 1:
             workflows_path.write_text(
-                _live_workflows(upgrade_after_repairs=4),
+                _live_workflows(upgrade_after_repairs=0),
                 encoding="utf-8",
             )
         else:
@@ -463,7 +463,7 @@ def test_live_reloaded_upgrade_threshold_is_exposed_at_loop_boundary(
         )
 
     assert result.final_snapshot.is_complete
-    assert observed_thresholds == [2, 4]
+    assert observed_thresholds == [2, 0]
 
 
 def test_live_profile_edit_updates_model_effort_prompt_and_reuses_session(

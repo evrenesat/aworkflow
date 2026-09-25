@@ -17,6 +17,7 @@ from aflow.config import (
     WorkflowHarnessConfig,
     WorkflowStepConfig,
     WorkflowUserConfig,
+    resolve_team_config,
 )
 from aflow.harnesses.codex import CodexAdapter
 from aflow.manager import determine_repair_upgrade_policy
@@ -83,11 +84,12 @@ def _workflow_config(*, manager_enabled: bool, threshold: int) -> WorkflowUserCo
     )
     profiles = {
         name: HarnessProfileConfig(model=name)
-        for name in ("worker-base", "worker-high", "reviewer", "manager")
+        for name in ("worker-base", "worker-high", "reviewer", "final-reviewer", "manager")
     }
     base_roles = {
         "worker": "codex.worker-base",
         "reviewer": "codex.reviewer",
+        "final_reviewer": "codex.final-reviewer",
     }
     if manager_enabled:
         base_roles["manager"] = "codex.manager"
@@ -193,6 +195,12 @@ def _policy(
     ("threshold", "attempts", "rejections", "expected"),
     [
         (
+            0,
+            [_attempt(1)],
+            [_rejection(number=1, reviewed_turn=1, review_turn=2)],
+            (1, 0, True, True, "high"),
+        ),
+        (
             1,
             [_attempt(1)],
             [_rejection(number=1, reviewed_turn=1, review_turn=2)],
@@ -257,6 +265,86 @@ def test_repair_policy_rejects_unlinked_or_wrong_selector_evidence() -> None:
     assert policy.repair_ordinal == 1
     assert policy.team_repairs_completed == 0
     assert policy.due is False
+
+
+@pytest.mark.parametrize("threshold", [-1, True, 0.5])
+def test_repair_policy_rejects_invalid_threshold(threshold: object) -> None:
+    with pytest.raises(ValueError, match="nonnegative integer"):
+        _policy(threshold=threshold, attempts=[], rejections=[])
+
+
+def test_zero_threshold_needs_latest_authoritative_rejection() -> None:
+    initial = _policy(threshold=0, attempts=[_attempt(1)], rejections=[])
+    assert initial.active is False
+    assert initial.due is False
+    assert initial.forced is False
+
+    retry = _policy(
+        threshold=0,
+        attempts=[_attempt(1), _attempt(2, outcome="retry-scheduled")],
+        rejections=[],
+    )
+    assert retry.active is False
+    assert retry.forced is False
+
+    wrong_selector = _policy(
+        threshold=0,
+        attempts=[_attempt(1)],
+        rejections=[_rejection(number=1, reviewed_turn=1, review_turn=2, selector="codex.other")],
+    )
+    assert wrong_selector.active is False
+    assert wrong_selector.forced is False
+
+    stale = _policy(
+        threshold=0,
+        attempts=[_attempt(1), _attempt(3)],
+        rejections=[_rejection(number=1, reviewed_turn=1, review_turn=2)],
+    )
+    assert stale.active is False
+    assert stale.forced is False
+
+    ambiguous = _policy(
+        threshold=0,
+        attempts=[_attempt(1), _attempt(1)],
+        rejections=[_rejection(number=1, reviewed_turn=1, review_turn=2)],
+    )
+    assert ambiguous.active is False
+    assert ambiguous.forced is False
+
+    duplicate = _policy(
+        threshold=0,
+        attempts=[_attempt(1)],
+        rejections=[
+            _rejection(number=1, reviewed_turn=1, review_turn=2),
+            _rejection(number=2, reviewed_turn=1, review_turn=3),
+        ],
+    )
+    assert duplicate.active is True
+    assert duplicate.repair_ordinal == 1
+    assert duplicate.team_repairs_completed == 0
+    assert duplicate.forced is True
+
+
+def test_zero_threshold_without_upgrade_edge_keeps_baseline() -> None:
+    policy = _policy(
+        threshold=0,
+        attempts=[_attempt(1)],
+        rejections=[_rejection(number=1, reviewed_turn=1, review_turn=2)],
+        teams={"base": TeamConfig(roles={"worker": "codex.worker-base"})},
+    )
+    assert policy.active is True
+    assert policy.due is True
+    assert policy.forced is False
+    assert policy.current_team == "base"
+
+
+@pytest.mark.parametrize("manager_enabled", [False, True])
+def test_worker_upgrade_preserves_inherited_review_roles(manager_enabled: bool) -> None:
+    config = _workflow_config(manager_enabled=manager_enabled, threshold=0)
+    roles = resolve_team_config(config, "high").effective_roles
+    assert roles["worker"] == "codex.worker-high"
+    assert roles["reviewer"] == "codex.reviewer"
+    assert roles["final_reviewer"] == "codex.final-reviewer"
 
 
 def test_initial_rejection_after_early_upgrade_does_not_force_next_edge() -> None:
@@ -634,14 +722,16 @@ def _run_fake_sequence(
 
 
 @pytest.mark.parametrize("manager_enabled", [False, True])
+@pytest.mark.parametrize("threshold", [0, 1])
 def test_selected_worker_route_survives_prelaunch_process_stop(
     tmp_path: Path,
     manager_enabled: bool,
+    threshold: int,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     plan_path = tmp_path / "plan.md"
     plan_path.write_text(_PLAN, encoding="utf-8")
-    config = _workflow_config(manager_enabled=manager_enabled, threshold=1)
+    config = _workflow_config(manager_enabled=manager_enabled, threshold=threshold)
     calls: list[str] = []
     review_count = 0
     crashed = False
@@ -785,7 +875,7 @@ def test_selected_worker_route_survives_prelaunch_process_stop(
     assert worker_calls.count("worker-high") == 1
 
 
-@pytest.mark.parametrize("threshold", [1, 2])
+@pytest.mark.parametrize("threshold", [0, 1, 2])
 @pytest.mark.parametrize("manager_enabled", [False, True])
 def test_repair_threshold_survives_resume_with_reset_turn_numbers(
     tmp_path: Path,
@@ -918,7 +1008,9 @@ def test_repair_threshold_survives_resume_with_reset_turn_numbers(
     )
 
     expected = (
-        ["worker-base", "reviewer", "worker-base", "reviewer", "worker-high"]
+        ["worker-base", "reviewer", "worker-high"]
+        if threshold == 0
+        else ["worker-base", "reviewer", "worker-base", "reviewer", "worker-high"]
         if threshold == 1
         else [
             "worker-base",
@@ -950,6 +1042,7 @@ def test_repair_threshold_survives_resume_with_reset_turn_numbers(
 
 
 @pytest.mark.parametrize("threshold, expected_workers", [
+    (0, ["worker-base", "reviewer", "worker-high"]),
     (1, ["worker-base", "reviewer", "worker-base", "reviewer", "worker-high"]),
     (2, ["worker-base", "reviewer", "worker-base", "reviewer", "worker-base", "reviewer", "worker-high"]),
 ])
@@ -983,7 +1076,9 @@ def test_fake_provider_sequences_apply_threshold_in_both_manager_modes(
     run_json = json.loads((run_dir / "run.json").read_text(encoding="utf-8"))
     attempt_rows = next(iter(run_json["implementation_attempts"].values()))
     expected_progress = (
-        [(0, 0), (1, 0), (2, 1)]
+        [(0, 0), (1, 0)]
+        if threshold == 0
+        else [(0, 0), (1, 0), (2, 1)]
         if threshold == 1
         else [(0, 0), (1, 0), (2, 1), (3, 2)]
     )

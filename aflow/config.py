@@ -772,10 +772,10 @@ def _parse_workflow_definition(
         if (
             not isinstance(upgrade_value, int)
             or isinstance(upgrade_value, bool)
-            or upgrade_value < 1
+            or upgrade_value < 0
         ):
             raise ConfigError(
-                f"{path}.upgrade_after_repairs must be a positive integer"
+                f"{path}.upgrade_after_repairs must be a nonnegative integer"
             )
         wf_upgrade_after_repairs = upgrade_value
     steps: dict[str, WorkflowStepConfig] = {}
@@ -846,10 +846,10 @@ def _parse_workflow_lifecycle_defaults(
         if (
             not isinstance(upgrade_value, int)
             or isinstance(upgrade_value, bool)
-            or upgrade_value < 1
+            or upgrade_value < 0
         ):
             raise ConfigError(
-                f"{path}.upgrade_after_repairs must be a positive integer"
+                f"{path}.upgrade_after_repairs must be a nonnegative integer"
             )
         upgrade_after_repairs = upgrade_value
         declared_upgrade_after_repairs = upgrade_value
@@ -1647,21 +1647,21 @@ def validate_workflow_config(
         if (
             not isinstance(wf_config.upgrade_after_repairs, int)
             or isinstance(wf_config.upgrade_after_repairs, bool)
-            or wf_config.upgrade_after_repairs < 1
+            or wf_config.upgrade_after_repairs < 0
         ):
             errors.append(
-                f"workflow.{wf_name}.upgrade_after_repairs must be a positive integer"
+                f"workflow.{wf_name}.upgrade_after_repairs must be a nonnegative integer"
             )
         if (
             wf_config.declared_upgrade_after_repairs is not None
             and (
                 not isinstance(wf_config.declared_upgrade_after_repairs, int)
                 or isinstance(wf_config.declared_upgrade_after_repairs, bool)
-                or wf_config.declared_upgrade_after_repairs < 1
+                or wf_config.declared_upgrade_after_repairs < 0
             )
         ):
             errors.append(
-                f"workflow.{wf_name}.declared_upgrade_after_repairs must be a positive integer"
+                f"workflow.{wf_name}.declared_upgrade_after_repairs must be a nonnegative integer"
             )
         if wf_config.extends is not None:
             errors.append(

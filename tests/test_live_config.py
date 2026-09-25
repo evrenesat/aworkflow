@@ -72,6 +72,15 @@ def test_live_loader_reloads_upgrade_threshold_from_selected_pair(tmp_path: Path
         == "defaults"
     )
 
+    workflows_path.write_text(
+        '[workflow]\nupgrade_after_repairs = 0\n\n' + VALID_WORKFLOWS,
+        encoding="utf-8",
+    )
+    zero = load_live_config(config_path).workflow_config.workflows["simple"]
+    assert zero.upgrade_after_repairs == 0
+    assert zero.declared_upgrade_after_repairs is None
+    assert zero.upgrade_after_repairs_source == "defaults"
+
 
 def test_relative_filesystem_settings_use_the_selected_file_directory(
     tmp_path: Path,

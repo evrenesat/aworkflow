@@ -217,8 +217,8 @@ def determine_repair_upgrade_policy(
     turn numbers, which can restart after resume.  Legacy turn-only evidence is
     accepted only when it is unambiguous within the retained scope history.
     """
-    if not isinstance(threshold, int) or isinstance(threshold, bool) or threshold < 1:
-        raise ValueError("repair upgrade threshold must be a positive integer")
+    if not isinstance(threshold, int) or isinstance(threshold, bool) or threshold < 0:
+        raise ValueError("repair upgrade threshold must be a nonnegative integer")
 
     unavailable = EligibleImplementationUpgrade(
         available=False,
