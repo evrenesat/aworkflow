@@ -1,5 +1,20 @@
 # DEVLOG
 
+## 2026-09-25 — Document the managed plan lifecycle and disable packaged managers
+
+- Packaged workflows now inherit `manager_enabled = false`; starter workflows
+  remain disabled by omission. Explicit per-workflow opt-in and checkpoint/final
+  review remain available.
+- Documented the default-on plan consumer, five lifecycle directories,
+  receipt-backed sequence dependencies, shared capacity and claims, explicit
+  requeue, and manager-independent repair upgrades in operator and bundled
+  assistant guidance. Preserved the accepted UI description rather than
+  carrying the failed source worktree's stale layout claim.
+- Ported the isolated queue, delivery, failure, and restart scenario from the
+  failed run's uncommitted Checkpoint 8 work. The focused config, docs, consumer,
+  and repair suite passed 209/209, and all packaged workflows resolved with
+  managers disabled. Full integrated and browser gates remain Checkpoint 6.
+
 ## 2026-09-24 — Keep the Runs history filter readable at 320px (Checkpoint 1)
 
 - Reproduced the populated 320×568 defect before the edit: the native select

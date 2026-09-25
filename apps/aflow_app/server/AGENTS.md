@@ -16,6 +16,8 @@
 - The app lifespan owns `PlanConsumer`: it scans registered primary projects,
   calls `ControlPlaneService.start_run` for eligible stable plans, and releases
   only scanner ownership on shutdown. Plan mutations may wake the scanner.
+  Promotion can claim a ready plan before the promote response is inspected;
+  direct manual starts must recheck the shared plan claim and capacity lock.
 - The versioned project registry is the explicit allowlist beneath one configured managed root. Resolve exact registry records only; reject URL tokens, arbitrary roots, traversal, and unsafe plan paths.
 - `plan_service.py` edits only direct regular Markdown files in the five lifecycle directories (`todo`, `in-progress`, `done`, `failed`, `needs-plan-change`). Preserve expected-revision checks and source bytes on rejected writes or moves. Failed/invalid classification and requeue use the shared lifecycle journal and admission guard; transport resumes recorded eligible lineage through the control plane.
 - `skill_service.py` is a thin facade over the shared `aflow.skill_store` and

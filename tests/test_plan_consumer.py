@@ -5,13 +5,16 @@ from __future__ import annotations
 from multiprocessing import get_context
 from pathlib import Path
 from threading import Event
+import hashlib
+import json
 import time
 from types import SimpleNamespace
 
 import pytest
 
 from aflow.plan_consumer import PlanConsumer
-from aflow.plan_backups import create_plan_identity
+from aflow.plan_backups import create_plan_identity, move_plan_identity
+from aflow.plan_lifecycle import PlanLifecycle
 from aflow.project_admission import (
     ProjectAdmission, ProjectAdmissionConflict, ProjectAutomaticDisabled,
     ProjectPlanDependencyBlocked,
@@ -110,6 +113,108 @@ def test_stable_plans_fill_two_slots_and_third_waits(tmp_path: Path) -> None:
     consumer.scan_once()
     assert len(calls) == 2
     consumer.stop()
+
+
+def test_managed_queue_delivery_failure_and_restart_scenario(tmp_path: Path) -> None:
+    root = _project(tmp_path)
+    config = _config(tmp_path)
+    first = _plan(root, "feature_P01_first.md")
+    successor = _plan(root, "feature_P03_next.md")
+    _plan(root, "other.md")
+    _plan(root, "third.md")
+    invalid = _plan(root, "invalid.md", "not a checkpoint plan")
+    admission = ProjectAdmission(root)
+    lifecycle = PlanLifecycle(root)
+    launched: dict[str, object] = {}
+    rejected: list[str] = []
+    attempts = 0
+
+    def classify(_project, name, revision):
+        rejected.append(name)
+        lifecycle.move(root / "plans" / "in-progress" / name,
+                       "needs_plan_change", expected_revision=revision,
+                       reason_code="invalid_plan", reason="Invalid plan")
+
+    def launch(_project, name, key, revision, _workflow, _team, identity):
+        nonlocal attempts
+        attempts += 1
+        run_id = f"run-{attempts}"
+        reservation = admission.acquire(
+            run_id, plan_path=root / name, idempotency_key=key,
+            expected_plan_revision=revision, expected_plan_identity=identity,
+        )
+        launched[name] = reservation
+        return SimpleNamespace(run_id=run_id)
+
+    consumer = _consumer(root, config, launch, classify)
+    consumer.scan_once()
+    consumer.scan_once()
+    assert rejected == ["invalid.md"]
+    assert (root / "plans" / "needs-plan-change" / invalid.name).exists()
+    assert set(launched) == {
+        "plans/in-progress/feature_P01_first.md", "plans/in-progress/other.md",
+    }
+    assert consumer.reason(root, successor.name) == "dependency"
+    assert consumer.reason(root, "third.md") == "capacity"
+    assert admission.snapshot().occupied_count == 2
+
+    # The consumer can restart without changing active worker reservations.
+    consumer.stop()
+    restarted = _consumer(root, config, launch, classify)
+    restarted.scan_once()
+    restarted.scan_once()
+    assert admission.snapshot().occupied_count == 2
+    assert len(launched) == 2
+
+    first_reservation = launched["plans/in-progress/feature_P01_first.md"]
+    admission.release(first_reservation.run_id, first_reservation.nonce)
+    done = root / "plans" / "done" / first.name
+    done.parent.mkdir()
+    first.rename(done)
+    assert move_plan_identity(root, source_plan_path=first, destination_plan_path=done)
+    assert done.exists()
+    receipt = root / ".aflow" / "runs" / "delivered-run" / "publication.json"
+    receipt.parent.mkdir(parents=True, exist_ok=True)
+    (receipt.parent / "run.json").write_text(
+        json.dumps({"status": "completed"}), encoding="utf-8",
+    )
+    receipt.write_text(json.dumps({
+        "status": "published", "commit": "a" * 40, "source_commit": "b" * 40,
+        "remote": "origin", "branch": "main",
+        "plan_lifecycle": {"phase": "committed", "complete": True,
+                           "source": f"plans/in-progress/{first.name}",
+                           "destination": f"plans/done/{first.name}"},
+    }), encoding="utf-8")
+    restarted.scan_once()
+    restarted.scan_once()
+    assert "plans/in-progress/feature_P03_next.md" in launched, (
+        restarted.reason(root, successor.name), admission.snapshot().occupied_count,
+    )
+    assert restarted.reason(root, "third.md") == "capacity"
+
+    next_reservation = launched["plans/in-progress/feature_P03_next.md"]
+    admission.release(next_reservation.run_id, next_reservation.nonce)
+    failed = lifecycle.move(
+        successor, "failed", expected_revision=hashlib.sha256(successor.read_bytes()).hexdigest(),
+        reason_code="terminal_execution_failure", reason="Worker failed",
+        source_run_id=next_reservation.run_id,
+    )
+    other_reservation = launched["plans/in-progress/other.md"]
+    admission.release(other_reservation.run_id, other_reservation.nonce)
+    later = _plan(root, "feature_P05_later.md")
+    with pytest.raises(ProjectPlanDependencyBlocked):
+        admission.acquire("later", plan_path=later, idempotency_key="later")
+    restarted.scan_once()
+    restarted.scan_once()
+    assert "plans/in-progress/third.md" in launched
+    failed.write_text(PLAN + "\nCorrected.\n", encoding="utf-8")
+    corrected = lifecycle.move(
+        failed, "in_progress", expected_revision=hashlib.sha256(failed.read_bytes()).hexdigest(),
+        reason_code="requeued", reason="Corrected by operator",
+    )
+    assert corrected.read_text(encoding="utf-8").endswith("Corrected.\n")
+    assert lifecycle.record_for(corrected)["source_run_id"] == next_reservation.run_id
+    restarted.stop()
 
 
 def test_opt_out_and_file_edit_require_new_stable_observation(tmp_path: Path) -> None:

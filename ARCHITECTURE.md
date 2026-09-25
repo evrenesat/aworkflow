@@ -6,6 +6,32 @@ AFlow is a plan-driven workflow orchestrator that runs coding tasks through exis
 
 ## Project launch admission
 
+The UI server owns one `PlanConsumer` scanner per registered primary project,
+elected with a cross-process scanner lock. It examines direct regular Markdown
+files in `plans/in-progress` after two stable observations, on a bounded
+five-second pass or a plan/completion wakeup. Drafts stay in `plans/todo`;
+invalid content and confirmed inactive run failures move through the journal
+to `plans/needs-plan-change` and `plans/failed`. A revision-checked requeue
+returns a corrected original to Ready and resumes eligible recorded lineage.
+Only receipt-backed publication moves an original to `plans/done`. These five
+directories share plan identity and lifecycle provenance. Scanner shutdown
+does not stop workflow units.
+
+The consumer resolves the current global default workflow and team for each
+admission, requires isolated worktree delivery, and passes a durable request
+key to the managed control plane. It does not own worker launch, claims,
+capacity, or publication. Default project settings enable consumption with two
+implementation slots; manual, CLI, and automatic launches use the same
+admission lock. A startup question retains the plan claim but releases its
+capacity slot. The controller serializes shared-main publication under its
+separate publication lock, without holding admission through fetch/merge/push.
+
+`PlanDependencies` records numbered series across the five directories and
+linked checkouts. It accepts positive `series_P01_title.md` positions with
+gaps, rejects malformed or duplicate members, and requires matching
+receipt-backed delivery for every known lower member. A failed member blocks
+its series while unrelated series remain eligible.
+
 The server's project scheduling REST and MCP contracts read and update the
 same primary-checkout `ProjectSettingsService` document. GET leaves absent
 settings at their defaults; PATCH uses its revisioned compare-and-swap. Queue

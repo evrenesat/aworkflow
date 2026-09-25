@@ -100,12 +100,20 @@ cycles, manager role resolution, lifecycle combinations).
 | `roles` | table | Overrides a subset of global roles; missing roles fall back to `[roles]`. |
 | `prompts` | table | Team-level role prompt overrides (same shape as `[roles.prompts]`). |
 | `backup_team` | string | Next team for deterministic harness-recovery retries (operational fallback). |
-| `upgrade_to` | string | Quality/capability escalation edge selectable by manager `upgrade_next_implementation` (one hop per decision). |
+| `upgrade_to` | string | Quality escalation edge used after the configured failed-repair threshold, with or without manager supervision; manager may also request one edge when enabled. |
 
 Legacy inline role keys (`worker = "codex.sol-high"` directly under
 `[teams.<name>]`) are accepted only when no `roles` table is present.
 Backup/upgrade chains are validated at load: targets must exist, cannot be
 self-references, and cannot form cycles.
+`upgrade_after_repairs` defaults to one globally and may be overridden per
+workflow. The initial review rejection does not count as a failed repair.
+After N rejected repair attempts in the same original checkpoint scope, the
+next worker takes one `upgrade_to` edge. Operational retries and reviewer
+turns do not count; an exhausted chain retains its strongest team within
+normal run limits. Settings General shows the global default workflow;
+Workflows Defaults shows the global repair threshold, per-workflow overrides,
+and their effective inheritance source.
 
 ### `[manager]`
 

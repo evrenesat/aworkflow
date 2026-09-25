@@ -142,6 +142,16 @@ def test_workflow_manager_enabled_defaults_to_disabled_when_omitted() -> None:
         assert config.workflows["plain"].manager_enabled is False
 
 
+def test_packaged_workflows_disable_manager_by_default() -> None:
+    package_root = Path(__file__).resolve().parents[1] / "aflow"
+    config = load_workflow_config(package_root / "aflow.toml")
+    assert config.workflows
+    assert all(not workflow.manager_enabled for workflow in config.workflows.values())
+    assert "manager_enabled = true" not in (
+        package_root / "starter" / "workflows.toml"
+    ).read_text(encoding="utf-8")
+
+
 def test_workflow_manager_enabled_preserves_explicit_true_and_false() -> None:
     with tempfile.TemporaryDirectory() as tmpdir:
         config = load_workflow_config(

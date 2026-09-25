@@ -5,7 +5,7 @@
 setup = ["worktree", "branch"]
 teardown = ["merge", "rm_worktree"]
 main_branch = "main"
-manager_enabled = true
+manager_enabled = false
 # Number of reviewed repairs before the next eligible worker team is used.
 upgrade_after_repairs = 1
 
