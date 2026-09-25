@@ -4483,3 +4483,30 @@ HISTORY: Published clipboard history `c14f1f2`/`cd78d53` remains separate and mu
   passed.
   Physical mobile keyboard/browser chrome and exact-SHA CI/deployed comparison
   remain coordinator or owner checks; no live activation is claimed.
+
+## 2026-09-25 — Confirmed Settings discard follow-up
+
+- Fixed a confirmed Reload server settings read discarding an edit entered after
+  confirmation. The confirmation now clears the old dirty guards immediately;
+  the subsequent workflow-config, server-settings and project-scheduling reads
+  protect new edits, while a clean changed response still updates its domain.
+  The existing revision remains attached to a retained draft, so a concurrent
+  workflow change produces the normal save conflict instead of a silent rebase.
+- Added disposable real-browser cases for equal, changed and failed held reads
+  in all three domains after confirmation, plus clean changed-read acceptance.
+  They check that the old edit is discarded, the new editor node, focus and
+  Save all remain usable, failed reads retain content, and no incidental writes
+  occur. The real workflow conflict path retains the new value.
+- Verification: web 667/667 and build; Settings browser 39/39 in Chromium and
+  WebKit; populated demo-fidelity browser 44/44 in both engines; full server
+  618/618 with only the inherited `AFLOW_ADMISSION_RESERVATION_NONCE` removed
+  from that test process; `git diff --check` passed. One WebKit fidelity attempt
+  had two navigation/paused-run timing failures outside Settings; both passed
+  alone and the complete suite passed on rerun. A preceding WebKit attempt was
+  terminated externally (143) before completion.
+- Inspected representative populated Workflow Settings captures at desktop and
+  mobile sizes in light and dark against the frozen reference. The previously
+  recorded layout/content divergence remains; this repair adds no new layout
+  change. The approved demo SHA-256 is unchanged at
+  `2465c0ac2bfef90af2b98a537ad5ac3e931b927c23a78379a8c532ce4dcbadf4`.
+  Deployment and physical-device checks remain separate gates.

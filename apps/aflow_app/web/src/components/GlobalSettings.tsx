@@ -140,7 +140,7 @@ export function GlobalSettings({ onDirtyChange, onSaved, project = null }: { onD
     draftRef.current = draft
   }, [draft])
 
-  async function acceptConfig(saved: ProjectConfig, epoch: number, preserveLoaded = false, preservePendingEdits = true) {
+  async function acceptConfig(saved: ProjectConfig, epoch: number, preserveLoaded = false) {
     if (epochRef.current !== epoch) return
     const previousSnapshot = snapshot
     const previousProjection = projection
@@ -180,7 +180,7 @@ export function GlobalSettings({ onDirtyChange, onSaved, project = null }: { onD
       && previousSnapshot.aflow_toml === saved.aflow_toml
       && previousSnapshot.workflows_toml === saved.workflows_toml)
     const projectionEqual = Boolean(previousProjection && sameValue(previousProjection, form))
-    if (preserveLoaded && preservePendingEdits && configDraftDirtyRef.current) {
+    if (preserveLoaded && configDraftDirtyRef.current) {
       // A user may start editing after Reload has begun. Keep the exact draft
       // and its revision, so a subsequent save can still detect a conflict.
       if (!documentsEqual) setReadWarning('Workflow settings changed on the server while you were editing. Your draft is retained; Save all may report a conflict. Reload explicitly to discard it.')
@@ -302,7 +302,7 @@ export function GlobalSettings({ onDirtyChange, onSaved, project = null }: { onD
       void ensureSkillContent(selectedSkill, epochRef.current)
     }
   }, [selectedSkill, skills, skillContents, skillRevisions]) // eslint-disable-line react-hooks/exhaustive-deps
-  async function load(skillOverride: string | null = null, preservePendingEdits = true) {
+  async function load(skillOverride: string | null = null) {
     const epoch = ++epochRef.current
     const schedulingProjectId = project?.id ?? null
     if (schedulingProjectIdRef.current !== schedulingProjectId) {
@@ -315,12 +315,12 @@ export function GlobalSettings({ onDirtyChange, onSaved, project = null }: { onD
     skillInflight.current.clear()
     setBusy(true); setReading(Boolean(snapshot)); setReadWarning(null); setSkillContentLoading(false); setSkillContentError(null)
     const results = await Promise.allSettled([
-      api.getGlobalConfig().then(saved => acceptConfig(saved, epoch, true, preservePendingEdits)), api.getSettings().then(saved => acceptServer(saved, epoch, preservePendingEdits)),
+      api.getGlobalConfig().then(saved => acceptConfig(saved, epoch, true)), api.getSettings().then(saved => acceptServer(saved, epoch, true)),
       api.listSkills().then(list => { acceptSkills(list, epoch); return list }),
       schedulingProjectId
         ? api.getProjectScheduling(schedulingProjectId).then(saved => {
           if (epochRef.current !== epoch) return
-          if (preservePendingEdits && projectSchedulingDirtyRef.current) {
+          if (projectSchedulingDirtyRef.current) {
             if (projectScheduling?.revision !== saved.revision) setReadWarning('Project scheduling changed while you were editing. Your draft is retained; Save all may report a conflict.')
             return
           }
@@ -353,6 +353,11 @@ export function GlobalSettings({ onDirtyChange, onSaved, project = null }: { onD
   }
   /** Explicit confirmed discard: pending edits return to the loaded baselines. */
   function discardAndReload() {
+    // Clear the pre-confirmation guards synchronously. The next read protects
+    // any new edits made while it is pending, even before React commits reset state.
+    configDraftDirtyRef.current = false
+    serverDraftDirtyRef.current = false
+    projectSchedulingDirtyRef.current = false
     setDeletedPrompts([])
     draftPreviewCoordinator.invalidate()
     setPassword(''); setNewProfile({ harness: '', profile: '', model: '', effort: '' }); setNewProfileError(null); setNewRole({ role: '', selector: '' }); setNewRoleError(null); setNewTeamName(''); setNewTeamError(null); setPendingFocusTeam(null); setTeamWizardDirty(false); setTeamWizardResetVersion(value => value + 1)
@@ -373,7 +378,7 @@ export function GlobalSettings({ onDirtyChange, onSaved, project = null }: { onD
     setSkillDrafts({})
     setSelectedSkill('')
     setSkillContentError(null)
-    void load('', false)
+    void load('')
   }
   async function retryProjection() {
     if (!snapshot) return

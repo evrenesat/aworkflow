@@ -10,7 +10,7 @@ import pytest
 
 from playwright.sync_api import sync_playwright
 
-from test_control_plane_api import TOKEN, control_client, live_server  # noqa: F401
+from test_control_plane_api import PROJECT_ID, TOKEN, control_client, live_server  # noqa: F401
 from test_responsive_browser import _browser, _login, _seed_team_family_fixture, _select_settings_section
 from ui_demo_fidelity import capture_refresh_probe, install_refresh_probe, read_refresh_probe_mutations
 
@@ -100,6 +100,170 @@ def test_guided_workflow_edit_survives_pending_equal_reload(control_client, monk
                 page.get_by_role("button", name="Save all changes", exact=True).click()
                 page.get_by_text("Your remaining edits are retained", exact=False).wait_for()
                 assert field.input_value() == "17"
+        finally:
+            for route in held:
+                route.abort()
+            browser.close()
+
+
+@pytest.mark.parametrize("domain", ["workflow", "server", "scheduling"])
+@pytest.mark.parametrize("mode", ["equal", "changed", "failed"])
+def test_confirmed_discard_protects_new_edits_during_read(control_client, monkeypatch, tmp_path, domain, mode):
+    """A discard applies to the old draft, not edits entered during its pending GET."""
+    from aflow_app_server import config as config_module, main
+
+    _, root, _, _ = control_client
+    config_dir = root.parent / "global"
+    config_path = config_dir / "aflow.toml"
+    monkeypatch.setattr(main, "global_config_dir", lambda: config_dir)
+    monkeypatch.setattr(config_module, "global_config_dir", lambda: config_dir)
+    monkeypatch.setenv("AFLOW_APP_WEB_DIST", str(Path(__file__).resolve().parents[2] / "web" / "dist"))
+    paths = {
+        "workflow": "/api/config",
+        "server": "/api/settings",
+        "scheduling": f"/api/projects/{PROJECT_ID}/scheduling",
+    }
+    held = []
+    writes = []
+
+    def intercept(route):
+        if route.request.method == "GET":
+            held.append(route)
+        else:
+            writes.append(route.request.method)
+            route.continue_()
+
+    with live_server() as url, sync_playwright() as playwright:
+        browser = _browser(playwright)
+        try:
+            page = browser.new_page(viewport={"width": 1280, "height": 720})
+            errors = []
+            _login(page, url)
+            if domain == "scheduling":
+                page.goto(f"{url}/?project={PROJECT_ID}&view=settings")
+            else:
+                page.get_by_role("button", name="Settings", exact=True).click()
+            _select_settings_section(page, "Workflows" if domain == "workflow" else "General")
+            field = page.get_by_label({"workflow": "Max turns", "server": "Bind host", "scheduling": "Concurrent implementations"}[domain], exact=True)
+            field.wait_for(state="visible")
+            page.on("pageerror", lambda error: errors.append(str(error)))
+            original = field.input_value()
+            old = "13" if domain != "server" else "discard-old.invalid"
+            fresh = "17" if domain != "server" else "pending-new.invalid"
+            assert original != old and original != fresh
+            field.fill(old)
+            page.route(f"**{paths[domain]}", intercept)
+            page.once("dialog", lambda dialog: dialog.accept())
+            _reload_from_more(page)
+            _wait_for_held_route(page, held)
+            assert field.input_value() == original, "the pre-confirmation draft was not discarded"
+            assert field.is_enabled()
+            field.evaluate("element => element.setAttribute('data-refresh-test-editor', '')")
+            install_refresh_probe(page, {"panel": "#settings-domain-panel", "editor": "#settings-domain-panel [data-refresh-test-editor]"})
+            field.fill(fresh)
+            field.focus()
+            during = capture_refresh_probe(page)
+            read_refresh_probe_mutations(page)
+            if mode == "changed" and domain == "workflow":
+                config_path.write_text(config_path.read_text(encoding="utf-8") + "\n# concurrent edit\n", encoding="utf-8")
+            for route in held:
+                if mode == "failed":
+                    route.fulfill(status=503, content_type="application/json", body=json.dumps({"detail": "reload failed"}))
+                elif mode == "changed" and domain != "workflow":
+                    response = route.fetch()
+                    payload = response.json()
+                    payload["revision"] = "f" * 64
+                    if domain == "server":
+                        payload["bind_host"] = "changed-on-server.invalid"
+                    else:
+                        payload["max_concurrent_implementations"] = 4
+                    route.fulfill(response=response, json=payload)
+                else:
+                    route.continue_()
+            held.clear()
+            page.wait_for_function("() => ![...document.querySelectorAll('.app-header-row-two button')].some(button => button.textContent?.trim() === 'Working…')")
+            after = capture_refresh_probe(page)
+            assert all(root["sameNode"] for root in after["roots"].values())
+            assert after["roots"]["editor"]["token"] == during["roots"]["editor"]["token"]
+            assert after["focused"] == during["focused"]
+            assert field.input_value() == fresh
+            assert page.get_by_role("button", name="Save all changes", exact=True).is_enabled()
+            if mode == "changed":
+                page.get_by_text("Your draft is retained", exact=False).wait_for()
+            if mode == "failed":
+                page.get_by_text("Some settings could not be loaded. Reload to retry.", exact=True).wait_for()
+            if domain == "workflow" and mode == "changed":
+                page.get_by_role("button", name="Save all changes", exact=True).click()
+                page.get_by_text("Your remaining edits are retained", exact=False).wait_for()
+                assert field.input_value() == fresh
+            else:
+                assert not writes
+            assert not errors
+            if domain == "workflow" and mode == "changed":
+                page.screenshot(path=str(tmp_path / "confirmed-discard-changed.png"), full_page=True)
+        finally:
+            for route in held:
+                route.abort()
+            browser.close()
+
+
+@pytest.mark.parametrize("domain", ["workflow", "server", "scheduling"])
+def test_confirmed_discard_without_new_edit_accepts_changed_read(control_client, monkeypatch, domain):
+    """A clean confirmed reload still takes changed server values and revisions."""
+    from aflow_app_server import config as config_module, main
+
+    _, root, _, _ = control_client
+    config_dir = root.parent / "global"
+    monkeypatch.setattr(main, "global_config_dir", lambda: config_dir)
+    monkeypatch.setattr(config_module, "global_config_dir", lambda: config_dir)
+    monkeypatch.setenv("AFLOW_APP_WEB_DIST", str(Path(__file__).resolve().parents[2] / "web" / "dist"))
+    paths = {"workflow": "/api/config", "server": "/api/settings", "scheduling": f"/api/projects/{PROJECT_ID}/scheduling"}
+    held = []
+
+    def intercept(route):
+        if route.request.method == "GET":
+            held.append(route)
+        else:
+            route.continue_()
+
+    with live_server() as url, sync_playwright() as playwright:
+        browser = _browser(playwright)
+        try:
+            page = browser.new_page(viewport={"width": 1280, "height": 720})
+            _login(page, url)
+            if domain == "scheduling":
+                page.goto(f"{url}/?project={PROJECT_ID}&view=settings")
+            else:
+                page.get_by_role("button", name="Settings", exact=True).click()
+            _select_settings_section(page, "Workflows" if domain == "workflow" else "General")
+            field = page.get_by_label({"workflow": "Max turns", "server": "Bind host", "scheduling": "Concurrent implementations"}[domain], exact=True)
+            field.wait_for(state="visible")
+            old = "13" if domain != "server" else "discard-old.invalid"
+            field.fill(old)
+            page.route(f"**{paths[domain]}", intercept)
+            page.once("dialog", lambda dialog: dialog.accept())
+            _reload_from_more(page)
+            _wait_for_held_route(page, held)
+            assert field.input_value() != old
+            for route in held:
+                response = route.fetch()
+                payload = response.json()
+                payload["revision"] = "f" * 64
+                if domain == "workflow":
+                    payload["aflow_toml"] += "\n# clean changed reload\n"
+                elif domain == "server":
+                    payload["bind_host"] = "changed-on-server.invalid"
+                else:
+                    payload["max_concurrent_implementations"] = 4
+                route.fulfill(response=response, json=payload)
+            held.clear()
+            page.wait_for_function("() => ![...document.querySelectorAll('.app-header-row-two button')].some(button => button.textContent?.trim() === 'Working…')")
+            if domain == "workflow":
+                _toggle_advanced(page)
+                assert "# clean changed reload" in page.get_by_label("aflow.toml contents", exact=True).input_value()
+            else:
+                assert field.input_value() == ("changed-on-server.invalid" if domain == "server" else "4")
+            assert page.get_by_role("button", name="Save all changes", exact=True).is_disabled()
         finally:
             for route in held:
                 route.abort()
