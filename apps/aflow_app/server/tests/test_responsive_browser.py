@@ -468,11 +468,21 @@ def _open_destination(page: Page, label: str) -> None:
 
 
 def _select_settings_section(page: Page, name: str) -> None:
-    selector = page.get_by_role("combobox", name="Settings section", exact=True)
-    if selector.count():
+    page.get_by_role("heading", name="Settings", exact=True).wait_for(state="visible")
+    width = page.viewport_size["width"]
+    # Settings uses its own 1200px header breakpoint, independent of the app shell.
+    if width < 1200:
+        selector = page.get_by_role("combobox", name="Settings section", exact=True)
+        expect(
+            selector, f"Expected the compact Settings section selector at {width}px"
+        ).to_be_visible(timeout=30_000)
         selector.select_option(label=name)
     else:
-        page.get_by_role("tab", name=name, exact=True).click()
+        tab = page.get_by_role("tab", name=name, exact=True)
+        expect(
+            tab, f"Expected the desktop {name} Settings tab at {width}px"
+        ).to_be_visible(timeout=30_000)
+        tab.click()
 
 
 def _team_family_primary_role_row(detail, role: str):
@@ -2317,6 +2327,8 @@ def test_mobile_repair_threshold_zero_save_reload_and_inherit(control_client, mo
         browser = _browser(playwright)
         try:
             page = browser.new_page(viewport={"width": 320, "height": 568}, has_touch=True)
+            page_errors: list[str] = []
+            page.on("pageerror", lambda error: page_errors.append(str(error)))
             _login(page, url)
             _ensure_project(page)
             _open_destination(page, "Settings")
@@ -2374,6 +2386,7 @@ def test_mobile_repair_threshold_zero_save_reload_and_inherit(control_client, mo
             expect(page.get_by_label("Repair threshold for Managed", exact=True)).to_have_value("")
             expect(page.get_by_text("Effective: 0 (defaults)", exact=False)).to_be_visible()
             _assert_no_horizontal_overflow(page)
+            assert page_errors == [], page_errors
         finally:
             browser.close()
 

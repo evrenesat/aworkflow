@@ -4332,3 +4332,29 @@ HISTORY: Published clipboard history `c14f1f2`/`cd78d53` remains separate and mu
   this checkpoint are still coordinator gates. `origin/main` advanced to
   `4ce0d0d1` during the work; reviewer integration must account for its
   separate history-list projection and DEVLOG changes.
+
+## 2026-09-25 — Wait for the Settings section control in browser checks (Checkpoint 1)
+
+- [CI run 36164919770](https://github.com/evrenesat/aworkflow/actions/runs/36164919770)
+  failed at the first Workflows selection after opening Settings at 320×568:
+  Ubuntu Python 3.13 Chromium had 1 failure among 560 server tests, and Ubuntu
+  Python 3.12 WebKit had 1 failure among 44 responsive checks. Both timed out
+  after 30 seconds waiting for the desktop `Workflows` tab. The failed journey
+  produced no threshold screenshot because selection failed before its captures.
+- The helper's immediate `Settings section` combobox `count()` could run before
+  the Settings header slot mounted, returning zero and committing to a desktop
+  tab that cannot appear at 320px. `GlobalSettings` uses a width breakpoint
+  below 1200px for its section selector. The helper now waits for the Settings
+  heading and the expected visible labelled selector or named desktop tab; a
+  missing control reports the expected viewport-specific control. No product
+  code changed.
+- Exact checkpoint checks passed: the focused zero/save/reload/light/dark/
+  inherit test passed once each in Chromium and WebKit; the required
+  `-k 'settings or repair_threshold'` command passed once per engine (1 selected,
+  43 deselected each); and `git diff --check` passed. Additional route-matrix
+  checks at 320×568 and 1280×720 passed in both engines (2 each), covering
+  selector and tab navigation. Chromium and WebKit light/dark threshold
+  screenshots were inspected: the section selector, zero value, and effective
+  value explanation were visible. The journey asserted no page errors and no
+  horizontal overflow. Published exact-SHA CI and deployment remain delivery
+  gates.
