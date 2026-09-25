@@ -1,5 +1,22 @@
 # DEVLOG
 
+## 2026-09-25 — Automatic durable cross-harness repair handover
+
+- Run `20260925t152928z-45800a35` failed at the first Sol High → DS4.1 repair
+  boundary because Codex has no provider-enforced read-only teardown. Its
+  predecessor worker session and recorded reviewer rejection remain untouched.
+- At a completed worker boundary, an exact active source session and successful
+  target preflight now allow a controller-authored brief from bounded Full
+  manager and durable controller facts. No source-session method runs. The
+  existing provider-enforced read-only path remains available. Both paths keep
+  three hash-bound artifacts and fail closed on missing evidence or workspace
+  drift; controller fingerprints include already-dirty file contents.
+- Verified `uv run pytest -q tests/test_hotplug.py tests/test_repair_upgrades.py
+  tests/test_live_config_runtime.py tests/test_harness_sessions.py` (269 passed),
+  `uv run pytest -q tests/test_aflowd.py tests/test_config.py` (200 passed,
+  7 subtests), scoped Ruff, and `git diff --check`. Publication, CI, and live
+  activation remain separate coordinator gates.
+
 ## 2026-09-25 — Count reviewer overlays after a checked original checkpoint
 
 - A checkpoint reviewer who creates a focused repair overlay after the worker

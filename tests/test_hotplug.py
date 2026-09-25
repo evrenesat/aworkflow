@@ -28,7 +28,7 @@ from aflow.hotplug import (
     write_hotplug_artifact,
 )
 from aflow.plan import PlanSnapshot
-from aflow.run_state import ControllerState, RetryContext, ResumeContext, hotplug_resume_fields, hotplug_state_payload, load_override_request
+from aflow.run_state import ControllerState, ImplementationAttempt, RetryContext, ResumeContext, hotplug_resume_fields, hotplug_state_payload, load_override_request
 from aflow.config import GoTransition, HarnessProfileConfig, TeamConfig, WorkflowConfig, WorkflowHarnessConfig, WorkflowStepConfig, WorkflowUserConfig
 from aflow.harnesses.codex import CodexAdapter
 from aflow.harnesses.base import HarnessInvocation
@@ -1088,9 +1088,213 @@ def test_cross_harness_run_handles_success_and_hotplug_observer_failure(
     ]
 
 
+def _run_controller_handover(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    source_selector: str = "codex.sol-6-high",
+    missing_session: bool = False,
+    mismatched_transaction_session: bool = False,
+    with_attempt: bool = True,
+    mutate_plan_during_context: bool = False,
+    mutate_dirty_file_during_context: bool = False,
+    missing_context: bool = False,
+    target_fails: bool = False,
+    preflight_fails: bool = False,
+) -> tuple[Path, object, object, object]:
+    transaction = replace(
+        make_transaction("accepted"),
+        source_selector="codex.sol-6-high", target_selector="reasonix.ds4-1-flash",
+        source_harness="codex", target_harness="reasonix",
+        source_profile="sol-6-high", target_profile="ds4-1-flash",
+        source_model_display="codex / sol-6-high",
+        target_model_display="reasonix / ds4-1-flash",
+    )
+    source = HarnessSessionRefV1(
+        session_id="codex-source", role="worker", selector=source_selector,
+        harness="codex", profile="sol-6-high", model_display="codex / sol-6-high",
+    )
+    if mismatched_transaction_session:
+        transaction = replace(
+            transaction, source_session=replace(source, session_id="other-source"),
+        )
+    plan = tmp_path / "plan.md"
+    plan.write_text("# Plan\n\n### [ ] Checkpoint 1: First\n- [ ] step\n", encoding="utf-8")
+    dirty_file = tmp_path / "source.txt"
+    if mutate_dirty_file_during_context:
+        dirty_file.write_text("original\n", encoding="utf-8")
+    (tmp_path / ".gitignore").write_text(".aflow/\n", encoding="utf-8")
+    for args in (
+        ("git", "init", "-q"),
+        ("git", "add", "-A"),
+        ("git", "-c", "user.name=Test", "-c", "user.email=test@example.com", "commit", "-qm", "initial"),
+    ):
+        subprocess.run(args, cwd=tmp_path, check=True, capture_output=True)
+    if mutate_dirty_file_during_context:
+        dirty_file.write_text("dirty before\n", encoding="utf-8")
+    _record_inactive_source(tmp_path, "codex-source-run")
+    attempts = (ImplementationAttempt(
+        turn_number=1, step_name="implement", role="worker", team="sol-6-high",
+        selector="codex.sol-6-high", outcome="progress", attempt_ordinal=1,
+    ),) if with_attempt else ()
+    resume = ResumeContext(
+        resumed_from_run_id="codex-source-run", feature_branch=None,
+        worktree_path=None, main_branch=None, setup=(), teardown=(),
+        interrupted_step_name="implement", role_selectors={"worker": transaction.target_selector},
+        current_hotplug_transaction=transaction, pending_hotplug_transaction=transaction,
+        active_role_sessions=() if missing_session else (source,), hotplug_transaction_number=1,
+        implementation_attempts={"scope-1": attempts},
+    )
+    config = _controller_config()
+    config = replace(config, harnesses={
+        **config.harnesses,
+        "reasonix": WorkflowHarnessConfig(profiles={
+            "ds4-1-flash": HarnessProfileConfig(model="ds4-1-flash"),
+        }),
+    })
+
+    class SourceDriver:
+        capabilities = SessionCapabilities(session_identity=True, followup_turn=True)
+        def build_full_context(self, run_dir):
+            raise AssertionError("controller fallback must not consult source driver")
+        def build_invocation(self, request):
+            raise AssertionError("controller fallback must not start source driver")
+
+    class TargetDriver:
+        capabilities = SessionCapabilities(session_identity=True, idempotent_turn_start=True)
+        prompts: list[str] = []
+        def build_invocation(self, request):
+            self.prompts.append(request.user_prompt)
+            return HarnessInvocation(
+                label="reasonix-target", argv=("reasonix-target",), env={},
+                prompt_mode="synthetic", system_prompt=request.system_prompt,
+                user_prompt=request.user_prompt, effective_prompt=request.user_prompt,
+            )
+        def parse_result(self, request, stdout, *, returncode=0):
+            if target_fails:
+                raise RuntimeError("target start failed")
+            return SessionResult(
+                session_id="reasonix-target", selector=request.selector,
+                model=request.model, effort=request.effort, final_output="DONE",
+                capabilities=self.capabilities,
+            )
+
+    def full_context(run_dir, *, level, trigger):
+        assert level == "full" and trigger == "hotplug_handover"
+        if mutate_plan_during_context:
+            plan.write_text(plan.read_text(encoding="utf-8") + "\nchanged\n", encoding="utf-8")
+        if mutate_dirty_file_during_context:
+            dirty_file.write_text("dirty after\n", encoding="utf-8")
+        if missing_context:
+            return {}
+        return {
+            "plan_state": {"current_checkpoint": "Checkpoint 1"},
+            "implementation_attempts": {"attempts": [{"turn_number": 1, "selector": source.selector}]},
+            "controller_state": {"latest_full_rejection": {"review_summary": "repair required"}},
+        }
+
+    monkeypatch.setattr("aflow.workflow.build_manager_context", full_context)
+    target = TargetDriver()
+
+    class Probe(NoOpHarnessPreflightProbe):
+        calls = 0
+        def resolve_executable(self, command, *, env):
+            self.calls += 1
+            if preflight_fails:
+                return None
+            return super().resolve_executable(command, env=env)
+
+    probe = Probe()
+    def runner(argv, **kwargs):
+        del kwargs
+        plan.write_text("# Plan\n\n### [x] Checkpoint 1: First\n- [x] step\n", encoding="utf-8")
+        return subprocess.CompletedProcess(argv, 0, "wire", "")
+
+    try:
+        result = run_workflow(
+            ControllerConfig(repo_root=tmp_path, plan_path=plan, max_turns=1),
+            config, "live", config_dir=tmp_path, adapter=CodexAdapter(),
+            snapshot_config=False, runner=runner, session_driver=target,
+            source_session_driver=SourceDriver(), resume=resume,
+            preflight_probe=probe,
+        )
+    except WorkflowError as exc:
+        result = exc
+    return plan, result, target, probe
+
+
+def test_controller_handover_starts_fresh_target_with_bound_durable_facts(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    plan, result, target, probe = _run_controller_handover(tmp_path, monkeypatch)
+    assert not isinstance(result, WorkflowError)
+    assert probe.calls >= 1
+    assert len(target.prompts) == 2
+    prompt = target.prompts[-1]
+    assert "Controller-authored handover:" in prompt
+    assert "No source provider context was transferred" in prompt
+    assert "Source worker handover:" not in prompt
+    state = json.loads((result.run_dir / "run.json").read_text(encoding="utf-8"))
+    transaction = state["hotplug_history"][-1]
+    assert transaction["stage"] == "applied"
+    assert transaction["source_session"]["session_id"] == "codex-source"
+    assert transaction["provider_operation_id"] is None
+    assert len(transaction["artifact_paths"]) == 3
+    for ref, digest in zip(transaction["artifact_paths"], transaction["artifact_hashes"]):
+        assert hashlib.sha256((result.run_dir / ref).read_bytes()).hexdigest() == digest
+        assert str((result.run_dir / ref).resolve()) in prompt
+        assert digest in prompt
+    assert len((result.run_dir / transaction["artifact_paths"][0]).read_bytes()) <= 8192
+    bound = replace(
+        HotplugTransactionV1.from_dict(transaction), stage="handover_ready",
+    )
+    assert classify_hotplug_resume_stage(result.run_dir, bound) == bound
+    ambiguous = classify_hotplug_resume_stage(
+        result.run_dir, replace(bound, stage="target_starting"),
+    )
+    assert ambiguous.stage == "waiting_for_hotplug_recovery"
+    (result.run_dir / transaction["artifact_paths"][1]).write_text("tampered", encoding="utf-8")
+    with pytest.raises(ValueError, match="hash mismatch"):
+        classify_hotplug_resume_stage(result.run_dir, bound)
+    assert plan.read_text(encoding="utf-8").find("[x]") >= 0
+
+
+@pytest.mark.parametrize("failure", [
+    "missing_session", "wrong_session", "mismatched_transaction_session",
+    "missing_attempt", "missing_context", "mutated_plan", "mutated_dirty_file",
+    "target_failure", "preflight",
+])
+def test_controller_handover_fails_closed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, failure: str,
+) -> None:
+    _plan, result, target, probe = _run_controller_handover(
+        tmp_path, monkeypatch,
+        missing_session=failure == "missing_session",
+        mismatched_transaction_session=failure == "mismatched_transaction_session",
+        source_selector="codex.wrong" if failure == "wrong_session" else "codex.sol-6-high",
+        with_attempt=failure != "missing_attempt",
+        missing_context=failure == "missing_context",
+        mutate_plan_during_context=failure == "mutated_plan",
+        mutate_dirty_file_during_context=failure == "mutated_dirty_file",
+        target_fails=failure == "target_failure",
+        preflight_fails=failure == "preflight",
+    )
+    assert isinstance(result, WorkflowError)
+    state = json.loads((result.run_dir / "run.json").read_text(encoding="utf-8"))
+    assert state["role_selectors"]["worker"] == "codex.sol-6-high"
+    assert state["hotplug_history"][-1]["stage"] == "failed"
+    if failure != "target_failure":
+        assert state["hotplug_history"][-1]["artifact_paths"] == []
+        assert not any("Controller-authored handover:" in prompt for prompt in target.prompts)
+    if failure in {"missing_session", "wrong_session", "mismatched_transaction_session", "missing_attempt"}:
+        assert probe.calls == 0
+
+
+@pytest.mark.parametrize("controller_authored", [False, True])
 def test_resume_handover_ready_reuses_captured_source_artifact(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    controller_authored: bool,
 ) -> None:
     predecessor = tmp_path / ".aflow" / "runs" / "predecessor"
     predecessor.mkdir(parents=True)
@@ -1105,11 +1309,13 @@ def test_resume_handover_ready_reuses_captured_source_artifact(
         profile=transaction.source_profile,
         model_display=transaction.source_model_display,
     )
+    context = build_handover_context_v1(transaction, {"plan_state": {"checkpoint": 1}})
+    output = render_controller_handover(context) if controller_authored else _valid_handover()
     refs, hashes = write_handover_artifacts(
         predecessor,
         transaction.transaction_number,
-        build_handover_context_v1(transaction, {"plan_state": {"checkpoint": 1}}),
-        _valid_handover(),
+        context,
+        output,
         {"plan_state": {"checkpoint": 1}},
     )
     transaction = replace(
@@ -1198,8 +1404,9 @@ def test_resume_handover_ready_reuses_captured_source_artifact(
 
     assert result.final_snapshot.is_complete
     assert len(target_driver.prompts) == 2  # target preflight plus the turn
-    assert "Source worker handover:" in target_driver.prompts[-1]
-    assert (result.run_dir / refs[0]).read_text(encoding="utf-8").rstrip() == _valid_handover()
+    expected_heading = "Controller-authored handover:" if controller_authored else "Source worker handover:"
+    assert expected_heading in target_driver.prompts[-1]
+    assert (result.run_dir / refs[0]).read_text(encoding="utf-8").rstrip() == output.rstrip()
     state = json.loads((result.run_dir / "run.json").read_text(encoding="utf-8"))
     assert state["hotplug_history"][-1]["stage"] == "applied"
 

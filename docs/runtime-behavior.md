@@ -279,7 +279,7 @@ the run-local role-selector hotplug surface: it overrides the current role
 routing for the next worker turn (validated against the current config) and
 creates a durable hotplug transaction instead of a plain override. Same-harness
 switches resume the exact active source session (`native_resume`); cross-harness
-switches require a bounded read-only handover brief before the target starts
+switches require a bounded handover brief before the target starts
 (`handover_required`). See the Live Role-Selector Hotplug section below.
 
 AFlow reads this file once at the pre-turn boundary, never while a harness is
@@ -401,13 +401,19 @@ accepted:
   with exact resume (`resume_with_model` or an owned executor), otherwise the
   boundary fails closed.
 - `handover_required` — cross-harness switch. The target environment is
-  preflighted first, then the source session produces a bounded read-only
-  handover brief (≤ 8 KiB, eight required Markdown sections, no hidden
-  reasoning, workspace fingerprint unchanged). The brief, its bounded context
-  projection, and a bounded full-context snapshot are written hash-bound under
+  preflighted first. If the source driver supports provider-enforced read-only
+  handover, its source session produces the brief. Otherwise, with an exact
+  active source session and a recorded completed worker attempt, the controller
+  renders a brief from bounded Full manager evidence without calling the source
+  driver. This brief says that no source provider context was transferred.
+  Both briefs have the same bound (≤ 8 KiB), eight required Markdown sections,
+  no hidden reasoning, and unchanged workspace/plan fingerprints. The brief,
+  its bounded context projection, and a bounded full-context snapshot are
+  written hash-bound under
   `.aflow/runs/<run-id>/hotplugs/hotplug-<NNN>/` (`handover.md`,
   `context.json`, `full-context.json`) and appended to the target turn's
-  prompt.
+  prompt. Missing evidence or changed workspace/plan state fails before target
+  launch. The original plan and worktree remain authoritative.
 
 ### Stages
 

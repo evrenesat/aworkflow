@@ -387,8 +387,9 @@ role, selector, harness, profile, model display, `source_turn_number`,
 - `native_resume` — source and target harness are the same; the target turn
   resumes the exact active source session (requires `resume_with_model` or an
   owned executor; otherwise the boundary fails).
-- `handover_required` — cross-harness; a bounded read-only source brief is
-  produced before the target starts (see below).
+- `handover_required` — cross-harness; a bounded provider read-only or
+  controller-authored durable brief is produced before the target starts
+  (see below).
 
 ### Stages
 
@@ -415,8 +416,12 @@ ambiguous = `quiescing`/`handover_starting`/`target_starting`.
 
 ### Cross-harness handover
 
-`handover_required` paths require the source driver to advertise
-`followup_turn` and `read_only_teardown` and an exact active source session.
+`handover_required` paths require distinct harnesses, target preflight, and
+an exact active source session. Provider-authored handover additionally needs
+`followup_turn`, provider-enforced `read_only_teardown`, and a callable
+`handover`. When these are unavailable, the controller uses a recorded
+completed worker attempt and Full manager evidence without invoking the source
+driver. Codex does not advertise provider-enforced read-only teardown.
 Flow:
 
 1. Target preflight must pass before any source-side side effect.
@@ -425,15 +430,18 @@ Flow:
    work, implementation attempts, rejection summary, run summary, workspace
    facts, artifact refs, `full_context_sha256`). No manager authority,
    prompts, or secrets.
-3. The source session produces a handover brief via a read-only prompt with
-   exactly eight required Markdown sections: `Objective And Checkpoint`,
+3. The capable source session produces a handover brief via a provider-enforced
+   read-only prompt. Otherwise the controller renders the bounded projection
+   as a brief and explicitly states no source provider context was transferred.
+   Both use exactly eight required Markdown sections: `Objective And Checkpoint`,
    `Completed Work`, `Changed Files`, `Verification`,
    `Unfinished Work And Exact Next Action`, `Decisions And Assumptions`,
    `Hazards And Dirty State`, `Relevant Paths And Artifacts`. Output must be
    ≤ 8 KiB, contain no placeholder bodies, and must not request hidden
    reasoning.
 4. The workspace/plan fingerprint is compared before/after; any change fails
-   the handover.
+   the handover before target launch. The controller path fingerprints before
+   building Full context and does not use a source-driver context builder.
 5. Three artifacts are written and hash-bound under
    `.aflow/runs/<run-id>/hotplugs/hotplug-<NNN>/`:
    `handover.md`, `context.json`, `full-context.json` (bounded). The

@@ -129,7 +129,8 @@ from .run_state import ActiveImplementationScope, CheckpointRepartitionRecord, C
 from .control_plane.validation import ControlValidationError, validate_override_targets
 from .hotplug import (
     HarnessSessionRefV1, HotplugTransactionV1, bounded_hotplug_history,
-    build_handover_context_v1, render_handover_prompt, validate_handover_output,
+    build_handover_context_v1, render_controller_handover,
+    render_handover_prompt, validate_handover_output,
     workspace_fingerprint, write_handover_artifacts, hotplug_transaction_id,
     classify_hotplug_resume_stage, copy_hotplug_resume_artifacts,
     safe_hotplug_artifact_path, validate_hotplug_resume_artifacts,
@@ -11876,7 +11877,7 @@ def _run_workflow_unchecked(
         user_prompt: str,
         target_preflight: Callable[[], None],
     ) -> str:
-        """Collect one bounded read-only source brief before a cross-harness target."""
+        """Prepare a provider or durable controller brief before a fresh target."""
         def _render_handover_suffix(
             normalized: str,
             artifact_refs: tuple[str, ...],
@@ -11885,9 +11886,14 @@ def _run_workflow_unchecked(
             handover_path = str((run_paths.run_dir / artifact_refs[0]).resolve())
             projection_path = str((run_paths.run_dir / artifact_refs[1]).resolve())
             full_context_path = str((run_paths.run_dir / artifact_refs[2]).resolve())
+            controller_authored = (
+                "No source provider context was transferred. "
+                "The source session was not prompted for this brief."
+            ) in normalized
+            heading = "Controller-authored handover" if controller_authored else "Source worker handover"
             return (
-                "\n\nSource worker handover:\n" + normalized
-                + "\nSource worker handover artifact: " + handover_path
+                "\n\n" + heading + ":\n" + normalized
+                + "\n" + heading + " artifact: " + handover_path
                 + " (sha256=" + artifact_hashes[0] + ")"
                 + "\n\nController continuity context:\n"
                 + "Projection artifact: " + projection_path
@@ -11917,9 +11923,167 @@ def _run_workflow_unchecked(
                 normalized, transaction.artifact_paths, transaction.artifact_hashes
             )
 
+        def _controller_workspace_fingerprint() -> dict[str, object]:
+            """Include dirty file bytes, which porcelain status alone omits."""
+            fingerprint = workspace_fingerprint(
+                execution_repo_root, (original_plan_path, active_plan_path)
+            )
+            if "<missing>" in fingerprint["plans"].values():
+                raise RuntimeError("controller handover requires readable original and active plans")
+            if not fingerprint["head"]:
+                raise RuntimeError("controller handover requires a Git workspace fingerprint")
+            tracked = subprocess.run(
+                ["git", "diff", "--no-ext-diff", "--no-textconv", "--binary", "HEAD", "--"],
+                cwd=execution_repo_root, capture_output=True, check=False,
+            )
+            untracked = subprocess.run(
+                ["git", "ls-files", "--others", "--exclude-standard", "-z"],
+                cwd=execution_repo_root, capture_output=True, check=False,
+            )
+            if tracked.returncode or untracked.returncode:
+                raise RuntimeError("controller handover cannot fingerprint worktree contents")
+            digest = hashlib.sha256()
+            digest.update(str(fingerprint["sha256"]).encode("ascii"))
+            digest.update(tracked.stdout)
+            for raw_path in sorted(filter(None, untracked.stdout.split(b"\0"))):
+                path = execution_repo_root / os.fsdecode(raw_path)
+                digest.update(raw_path + b"\0")
+                if path.is_symlink():
+                    digest.update(os.fsencode(os.readlink(path)))
+                elif path.is_file():
+                    with path.open("rb") as handle:
+                        for block in iter(lambda: handle.read(65536), b""):
+                            digest.update(block)
+                else:
+                    raise RuntimeError("controller handover cannot fingerprint an untracked path")
+            fingerprint["sha256"] = digest.hexdigest()
+            return fingerprint
+
         if source_driver is target_driver:
             raise RuntimeError("cross-harness hotplug requires distinct source and target drivers")
         capabilities = getattr(source_driver, "capabilities", None)
+        handover = getattr(source_driver, "handover", None)
+        provider_handover = (
+            capabilities is not None and capabilities.followup_turn
+            and capabilities.read_only_teardown and callable(handover)
+        )
+        if not provider_handover:
+            if source_driver is None or transaction.source_harness == transaction.target_harness:
+                raise RuntimeError("controller handover requires distinct source and target harnesses")
+            source_sessions = [
+                item for item in state.active_role_sessions
+                if item.role == transaction.source_role
+                and item.selector == transaction.source_selector
+                and item.harness == transaction.source_harness
+                and item.profile == transaction.source_profile
+                and item.model_display == transaction.source_model_display
+                and item.status == "active"
+            ]
+            if (
+                len(source_sessions) != 1
+                or transaction.source_session is not None
+                and transaction.source_session != source_sessions[0]
+            ):
+                raise RuntimeError("controller handover requires an exact active source session")
+            scope = state.active_implementation_scope
+            scoped_attempts = (
+                state.implementation_attempts.get(scope.scope_id)
+                if scope is not None else None
+            )
+            attempt_groups = (
+                (scoped_attempts,) if scoped_attempts else state.implementation_attempts.values()
+            )
+            completed_source = any(
+                attempt.role == "worker"
+                and attempt.selector == transaction.source_selector
+                and attempt.outcome in {"progress", "accepted"}
+                for attempts in attempt_groups
+                for attempt in attempts
+            )
+            if not completed_source:
+                raise RuntimeError("controller handover requires a completed source worker attempt")
+            target_preflight()
+            before = _controller_workspace_fingerprint()
+            manager_context = build_manager_context(
+                run_paths.run_dir, level="full", trigger="hotplug_handover",
+            )
+            if (
+                not isinstance(manager_context, Mapping)
+                or not isinstance(manager_context.get("plan_state"), Mapping)
+                or not manager_context["plan_state"]
+            ):
+                raise RuntimeError("Full handover context is unavailable")
+            # Legacy Full contexts omit the controller's durable attempt and
+            # rejection ledgers. Add only bounded records already persisted by
+            # this controller; never consult the source provider for them.
+            full_context = dict(manager_context)
+            if scope is not None and not full_context.get("active_implementation_scope"):
+                full_context["active_implementation_scope"] = asdict(scope)
+            if not full_context.get("implementation_attempts"):
+                completed_attempts = [
+                    asdict(attempt) for attempts in attempt_groups for attempt in attempts
+                    if attempt.role == "worker"
+                    and attempt.selector == transaction.source_selector
+                    and attempt.outcome in {"progress", "accepted"}
+                ]
+                full_context["implementation_attempts"] = {
+                    "attempts": completed_attempts[-4:],
+                }
+            controller_facts = full_context.get("controller_state")
+            rejection_facts = full_context.get("latest_full_rejection")
+            if not rejection_facts and isinstance(controller_facts, Mapping):
+                rejection_facts = controller_facts.get("latest_full_rejection")
+            has_rejection_summary = (
+                isinstance(rejection_facts, Mapping)
+                and bool(rejection_facts.get("summary") or rejection_facts.get("review_summary"))
+            )
+            if not has_rejection_summary:
+                latest_rejection = next(
+                    (
+                        item for item in reversed(state.review_rejection_history)
+                        if item.reviewed_worker_selector == transaction.source_selector
+                        and (scope is None or item.scope_id == scope.scope_id)
+                    ),
+                    None,
+                )
+                if latest_rejection is not None:
+                    full_context["latest_full_rejection"] = asdict(latest_rejection)
+            if not full_context.get("workspace_facts"):
+                full_context["workspace_facts"] = {
+                    "head": before["head"],
+                    "dirty": bool(before["status"]),
+                    "fingerprint_sha256": before["sha256"],
+                }
+            if not full_context.get("run_summary") and not full_context.get("history_summary"):
+                full_context["run_summary"] = {"turns_completed": state.turns_completed}
+            prefix = f"hotplugs/hotplug-{transaction.transaction_number:03d}"
+            artifact_refs = tuple(
+                f"{prefix}/{name}"
+                for name in ("handover.md", "context.json", "full-context.json")
+            )
+            context = build_handover_context_v1(
+                transaction, full_context, artifact_refs=artifact_refs,
+            )
+            normalized = render_controller_handover(context)
+            after = _controller_workspace_fingerprint()
+            if before["sha256"] != after["sha256"]:
+                raise RuntimeError("controller handover changed the workspace or plan")
+            written_refs, artifact_hashes = write_handover_artifacts(
+                run_paths.run_dir, transaction.transaction_number, context, normalized,
+                full_context,
+            )
+            if written_refs != artifact_refs:
+                raise RuntimeError("controller handover artifact references changed")
+            ready = replace(
+                transaction, stage="handover_ready", source_session=source_sessions[0],
+                artifact_paths=written_refs, artifact_hashes=artifact_hashes,
+            )
+            validate_hotplug_resume_artifacts(run_paths.run_dir, ready)
+            state.current_hotplug_transaction = ready
+            state.pending_hotplug_transaction = ready
+            _emit_hotplug_event(observer, ExecutionEventType.HOTPLUG_STAGE_CHANGED, ready)
+            _write_override_boundary(status="running")
+            return _render_handover_suffix(normalized, written_refs, artifact_hashes)
         if capabilities is None or not capabilities.followup_turn or not capabilities.read_only_teardown:
             raise RuntimeError(
                 "cross-harness hotplug requires followup_turn and enforced read_only_teardown"

@@ -1602,11 +1602,15 @@ quiescing/source-finalized, handover-ready, target-starting, applied, failed,
 or waiting-for-hotplug-recovery. Only applied and failed are terminal.
 
 Same-harness targets use an exact active source session and capability-gated
-native resume. Cross-harness targets first pass target preflight, then use an
-enforced read-only source handover and three hash-bound artifacts (handover,
-projection, and Full context). The target prompt contains bounded operational
-sections and resolvable artifact references, never hidden context or raw
-provider transport.
+native resume. Cross-harness targets first pass target preflight. Drivers with
+provider-enforced read-only teardown retain the provider-authored source
+handover. Otherwise, a recorded completed worker attempt and exact active
+source session allow the controller to render only bounded Full manager facts;
+it never invokes the source provider for this brief. Both paths use the same
+three hash-bound artifacts (handover, projection, and Full context). The target
+prompt distinguishes controller-authored evidence, names the resolvable
+artifacts and hashes, and treats the original plan and worktree as authority.
+Missing evidence or workspace/plan drift fails before target launch.
 
 Resume copies and verifies required artifacts into the successor before
 pruning. `handover_starting`, `target_starting`, and `quiescing` are ambiguous

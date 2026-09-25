@@ -20,7 +20,11 @@ from aflow.config import (
     resolve_team_config,
 )
 from aflow.harnesses.codex import CodexAdapter
+from aflow.harnesses.base import HarnessInvocation
+from aflow.harnesses.preflight import NoOpHarnessPreflightProbe
+from aflow.harnesses.session import SessionCapabilities, SessionResult
 from aflow.manager import determine_repair_upgrade_policy
+from aflow.manager_context import build_manager_context as real_build_manager_context
 from aflow.run_state import (
     ControllerConfig,
     ControllerState,
@@ -843,6 +847,162 @@ def test_checked_original_reviewer_overlay_records_repair(
     assert calls.count("reviewer") == 2
     if manager_enabled:
         assert calls.count("manager") >= 2
+
+
+@pytest.mark.parametrize("target_fails", [False, True])
+@pytest.mark.parametrize("structural_rejection", [False, True])
+def test_first_repair_cross_harness_upgrade_uses_controller_handover(
+    tmp_path: Path, target_fails: bool, structural_rejection: bool,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    plan = tmp_path / "plan.md"
+    plan.write_text(_PLAN, encoding="utf-8")
+    (tmp_path / ".gitignore").write_text(".aflow/\n", encoding="utf-8")
+    for args in (
+        ("git", "init", "-q"),
+        ("git", "add", "plan.md", ".gitignore"),
+        ("git", "-c", "user.name=Test", "-c", "user.email=test@example.com", "commit", "-qm", "initial"),
+    ):
+        subprocess.run(args, cwd=tmp_path, check=True, capture_output=True)
+    config = _workflow_config(
+        manager_enabled=False, threshold=0, review_checked_original=True,
+    )
+    config = replace(
+        config,
+        teams={
+            "sol-6-high": TeamConfig(
+                roles={
+                    "worker": "codex.sol-6-high",
+                    "reviewer": "codex.sol-6-medium",
+                    "final_reviewer": "codex.astra-medium",
+                },
+                upgrade_to="ds4-1-flash",
+            ),
+            "ds4-1-flash": TeamConfig(
+                roles={"worker": "reasonix.ds4-1-flash"}, extends="sol-6-high",
+            ),
+        },
+        harnesses={
+            "codex": WorkflowHarnessConfig(profiles={
+                "sol-6-high": HarnessProfileConfig(model="sol-6-high"),
+                "sol-6-medium": HarnessProfileConfig(model="sol-6-medium"),
+                "astra-medium": HarnessProfileConfig(model="astra-medium"),
+            }),
+            "reasonix": WorkflowHarnessConfig(profiles={
+                "ds4-1-flash": HarnessProfileConfig(model="ds4-1-flash"),
+            }),
+        },
+        workflows={"repair": replace(config.workflows["repair"], team="sol-6-high")},
+    )
+
+    class SourceDriver:
+        capabilities = SessionCapabilities(session_identity=True, followup_turn=True)
+        def handover(self, *args):
+            raise AssertionError("Codex has no provider-enforced read-only handover")
+        def build_full_context(self, *args):
+            raise AssertionError("fallback must use durable controller evidence")
+
+    class Driver:
+        capabilities = SessionCapabilities(session_identity=True, idempotent_turn_start=True)
+        requests = []
+        def build_invocation(self, request):
+            self.requests.append(request)
+            return HarnessInvocation(
+                label=request.selector, argv=("fake-session", request.selector), env={},
+                prompt_mode="synthetic", system_prompt=request.system_prompt,
+                user_prompt=request.user_prompt, effective_prompt=request.user_prompt,
+            )
+        def parse_result(self, request, stdout, *, returncode=0):
+            del stdout, returncode
+            if target_fails and request.selector == "reasonix.ds4-1-flash":
+                raise RuntimeError("target start failed")
+            return SessionResult(
+                session_id=f"session-{request.selector}", selector=request.selector,
+                model=request.model, effort=request.effort,
+                final_output=(
+                    "review rejected"
+                    if request.selector == "codex.sol-6-medium" and reviews == 1
+                    else "DONE"
+                ),
+                capabilities=self.capabilities,
+            )
+
+    calls: list[str] = []
+    reviews = 0
+    if structural_rejection:
+        def structural_full_context(*args, **kwargs):
+            context = real_build_manager_context(*args, **kwargs)
+            if kwargs.get("trigger") == "hotplug_handover":
+                context = dict(context)
+                context["controller_state"] = {
+                    **context.get("controller_state", {}),
+                    "latest_full_rejection": {"rejection_number": 1},
+                }
+            return context
+        monkeypatch.setattr("aflow.workflow.build_manager_context", structural_full_context)
+
+    def runner(argv, **kwargs):
+        nonlocal reviews
+        selector = (
+            argv[1] if argv[0] == "fake-session"
+            else "codex." + argv[argv.index("--model") + 1]
+        )
+        calls.append(selector)
+        if selector == "codex.sol-6-high":
+            plan.write_text(_COMPLETE_PLAN, encoding="utf-8")
+        elif selector == "codex.sol-6-medium":
+            reviews += 1
+            if reviews == 1:
+                (Path(kwargs["cwd"]) / "plan-cp01-v01.md").write_text(
+                    _REPAIR_PLAN, encoding="utf-8",
+                )
+        elif selector == "reasonix.ds4-1-flash":
+            (Path(kwargs["cwd"]) / "plan-cp01-v01.md").write_text(
+                _COMPLETE_PLAN, encoding="utf-8",
+            )
+        return subprocess.CompletedProcess(argv, 0, "review rejected" if reviews == 1 else "wire", "")
+
+    driver = Driver()
+    try:
+        result = run_workflow(
+            ControllerConfig(repo_root=tmp_path, plan_path=plan, max_turns=5, team="sol-6-high"),
+            config, "repair", config_dir=tmp_path, adapter=CodexAdapter(),
+            snapshot_config=False, runner=runner, session_driver=driver,
+            source_session_driver=SourceDriver(),
+            preflight_probe=NoOpHarnessPreflightProbe(),
+        )
+    except WorkflowError as exc:
+        if not target_fails:
+            raise
+        result = exc
+    run = json.loads((result.run_dir / "run.json").read_text(encoding="utf-8"))
+    assert calls[:3] == [
+        "codex.sol-6-high", "codex.sol-6-medium", "reasonix.ds4-1-flash",
+    ]
+    assert reviews == (1 if target_fails else 2)
+    assert run["review_rejection_history"][0]["reviewed_worker_selector"] == "codex.sol-6-high"
+    assert run["hotplug_history"][-1]["stage"] == ("failed" if target_fails else "applied")
+    assert run["hotplug_history"][-1]["source_session"]["session_id"] == "session-codex.sol-6-high"
+    if target_fails:
+        assert run["role_selectors"]["worker"] == "codex.sol-6-high"
+        assert any(
+            item["session_id"] == "session-codex.sol-6-high" and item["status"] == "active"
+            for item in run["active_role_sessions"]
+        )
+    target_request = next(
+        request for request in driver.requests
+        if request.selector == "reasonix.ds4-1-flash" and "Controller-authored handover:" in request.user_prompt
+    )
+    assert target_request.session_id is None
+    assert "No source provider context was transferred" in target_request.user_prompt
+    assert "attempt_ordinal" in target_request.user_prompt
+    assert "Recorded rejection summary" in target_request.user_prompt
+    assert "review rejected" in target_request.user_prompt
+    assert "Recorded workspace facts" in target_request.user_prompt
+    assert len(run["hotplug_history"][-1]["artifact_paths"]) == 3
+    inherited_roles = resolve_team_config(config, "ds4-1-flash").effective_roles
+    assert inherited_roles["reviewer"] == "codex.sol-6-medium"
+    assert inherited_roles["final_reviewer"] == "codex.astra-medium"
 
 
 @pytest.mark.parametrize("scenario", [
