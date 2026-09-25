@@ -171,6 +171,44 @@ aflow run path/to/plan.md -- keep changes limited to the requested scope
 If no workflow is named, AFlow uses `aflow.default_workflow` from the
 configuration.
 
+## Managed plan queue
+
+Draft in `plans/todo`; promoting a valid draft to `plans/in-progress` makes it
+ready. The UI server consumes stable, direct Markdown files there by default.
+Project Settings can turn **Automatic plan consumption** off and set
+**Concurrent implementations** (default two). The scanner observes external
+file writes twice, then uses the managed start path. Manual and automatic runs
+share the same capacity, plan claim, and admission rules. A missing or invalid
+global default workflow, unavailable provider, or startup question leaves a
+plan waiting for an operator. Set the global default in **Settings → General**;
+an explicit launch choice wins. Automatic starts require an isolated worktree
+workflow with merge and worktree removal on delivery.
+
+Numbered plans use `^(?P<series>.+)_P(?P<position>[0-9]{2,})_(?P<title>.+)\.md$`,
+for example `catalog_P01_model.md` and `catalog_P03_api.md`. Positions are
+positive; gaps are allowed. Each filename has exactly one `_P` marker. A
+duplicate position or malformed sequence-looking name holds its series for
+correction. A known lower member blocks later members until its matching
+publication receipt proves delivery, even if it is already in `plans/done`.
+Independent series can use other slots.
+
+Invalid content moves to `plans/needs-plan-change`; a confirmed inactive run
+failure moves its original plan to `plans/failed`. Neither retries itself.
+Correct the plan and use its revision-checked **Requeue** action to return it
+to Ready and resume eligible recorded lineage. Owner-stopped and uncertain
+runs require operator attention. Successful delivery moves the original to
+`plans/done` after publication; a checked box or local exit alone cannot
+release dependent plans.
+
+Packaged workflows start with manager supervision disabled; a workflow can
+explicitly opt in. `upgrade_after_repairs` defaults to one and may be
+overridden per workflow. An initial review rejection starts the repair
+sequence; after N failed repairs in the same checkpoint scope, the next worker
+uses the next configured team. This works without manager supervision.
+Operational retries and reviewer turns do not count, and an exhausted chain
+keeps its strongest team under ordinary run limits. Checkpoint and final
+reviews still run with clean context.
+
 ## Run progress in the web view
 
 The authenticated web application opens All runs, where an owner can select a

@@ -45,6 +45,15 @@ from aflow.api.events import CollectingObserver, ExecutionEventType, HotplugEven
 from aflow.analyzer import _hotplug_summary, summarize_run
 
 
+def _record_inactive_source(root: Path, run_id: str) -> None:
+    """Prove a named predecessor stopped before continuing its session."""
+    run_dir = root / ".aflow" / "runs" / run_id
+    run_dir.mkdir(parents=True, exist_ok=True)
+    metadata = run_dir / "run.json"
+    assert not metadata.exists()
+    metadata.write_text(json.dumps({"status": "interrupted"}), encoding="utf-8")
+
+
 def make_transaction(stage: str = "accepted") -> HotplugTransactionV1:
     digest = "a" * 64
     return HotplugTransactionV1(
@@ -162,6 +171,7 @@ def test_owned_executor_without_exact_resume_starts_fresh_session(tmp_path: Path
         profile="high",
         model_display="codex / high",
     )
+    _record_inactive_source(tmp_path, "previous-run")
     resume = ResumeContext(
         resumed_from_run_id="previous-run",
         feature_branch=None,
@@ -560,6 +570,7 @@ def test_controller_second_changed_digest_while_pending_does_not_mutate_transact
     plan.write_text("# Plan\n\n### [ ] Checkpoint 1: First\n- [ ] step\n", encoding="utf-8")
     override = tmp_path / "overrides.toml"
     override.write_text(second, encoding="utf-8")
+    _record_inactive_source(tmp_path, "pending-source")
     resume = ResumeContext(
         resumed_from_run_id="pending-source", feature_branch=None,
         worktree_path=None, main_branch=None, setup=(), teardown=(),
@@ -608,6 +619,7 @@ def test_retry_preserves_transaction_and_source_session_identity(tmp_path: Path)
     )
     plan = tmp_path / "plan.md"
     plan.write_text("# Plan\n\n### [ ] Checkpoint 1: First\n- [ ] step\n", encoding="utf-8")
+    _record_inactive_source(tmp_path, "retry-source")
     resume = ResumeContext(
         resumed_from_run_id="retry-source", feature_branch=None,
         worktree_path=None, main_branch=None, setup=(), teardown=(),
@@ -645,6 +657,7 @@ def test_retry_preserves_transaction_and_source_session_identity(tmp_path: Path)
 def test_manager_one_turn_override_precedes_run_local_then_returns(tmp_path: Path) -> None:
     config = _controller_config(with_team=True)
     pending = PendingTeamOverride(target_step="implement", role="worker", source_team="base", target_team="strong", selector="codex.high", checkpoint_identity=None, decision_number=1)
+    _record_inactive_source(tmp_path, "manager-source")
     resume = ResumeContext(resumed_from_run_id="manager-source", feature_branch=None, worktree_path=None, main_branch=None, setup=(), teardown=(), pending_step_team_override=pending, role_selectors={"worker": "codex.low"}, interrupted_step_name="implement")
     plan = tmp_path / "plan.md"
     plan.write_text("# Plan\n\n### [ ] Checkpoint 1: First\n- [ ] step\n", encoding="utf-8")
@@ -825,6 +838,7 @@ def test_cross_harness_run_handles_success_and_hotplug_observer_failure(
     )
     plan = tmp_path / "plan.md"
     plan.write_text("# Plan\n\n### [ ] Checkpoint 1: First\n- [ ] step\n", encoding="utf-8")
+    _record_inactive_source(tmp_path, "reasonix-source-run")
     resume = ResumeContext(
         resumed_from_run_id="reasonix-source-run", feature_branch=None,
         worktree_path=None, main_branch=None, setup=(), teardown=(),
@@ -979,6 +993,7 @@ def test_resume_handover_ready_reuses_captured_source_artifact(
         artifact_paths=refs,
         artifact_hashes=hashes,
     )
+    _record_inactive_source(tmp_path, "predecessor")
     resume = ResumeContext(
         resumed_from_run_id="predecessor",
         feature_branch=None,
@@ -1072,6 +1087,7 @@ def test_cross_harness_target_failure_restores_source_session_active(tmp_path: P
     )
     plan = tmp_path / "plan.md"
     plan.write_text("# Plan\n\n### [ ] Checkpoint 1: First\n- [ ] step\n", encoding="utf-8")
+    _record_inactive_source(tmp_path, "reasonix-source-run")
     resume = ResumeContext(
         resumed_from_run_id="reasonix-source-run", feature_branch=None,
         worktree_path=None, main_branch=None, setup=(), teardown=(),
@@ -1099,7 +1115,7 @@ def test_cross_harness_target_failure_restores_source_session_active(tmp_path: P
         def parse_result(self, request, stdout, *, returncode=0):
             raise RuntimeError("target start failed")
 
-    with pytest.raises(WorkflowError):
+    with pytest.raises(WorkflowError) as error:
         run_workflow(
             ControllerConfig(repo_root=tmp_path, plan_path=plan, max_turns=1),
             _controller_config(), "live", config_dir=tmp_path, adapter=CodexAdapter(),
@@ -1107,7 +1123,7 @@ def test_cross_harness_target_failure_restores_source_session_active(tmp_path: P
             runner=lambda argv, **kwargs: subprocess.CompletedProcess(argv, 0, "wire", ""),
             session_driver=TargetDriver(), source_session_driver=SourceDriver(), resume=resume,
         )
-    run_json = next((tmp_path / ".aflow" / "runs").glob("*/run.json"))
+    run_json = error.value.run_dir / "run.json"
     state = json.loads(run_json.read_text(encoding="utf-8"))
     assert state["active_role_sessions"][0]["session_id"] == "reasonix-source"
     assert state["active_role_sessions"][0]["status"] == "active"
@@ -1242,6 +1258,7 @@ def test_run_resume_ambiguous_target_start_never_launches_harness(tmp_path: Path
         model_display=transaction.source_model_display,
     )
     transaction = replace(transaction, source_session=source)
+    _record_inactive_source(tmp_path, "predecessor")
     resume = ResumeContext(
         resumed_from_run_id="predecessor", feature_branch=None,
         worktree_path=None, main_branch=None, setup=(), teardown=(),
@@ -1250,7 +1267,7 @@ def test_run_resume_ambiguous_target_start_never_launches_harness(tmp_path: Path
         active_role_sessions=(source,), hotplug_transaction_number=1,
     )
     calls: list[object] = []
-    with pytest.raises(WorkflowError, match="waiting_for_hotplug_recovery"):
+    with pytest.raises(WorkflowError, match="waiting_for_hotplug_recovery") as error:
         run_workflow(
             ControllerConfig(repo_root=tmp_path, plan_path=plan, max_turns=1),
             _controller_config(), "live", config_dir=tmp_path, adapter=CodexAdapter(),
@@ -1259,7 +1276,7 @@ def test_run_resume_ambiguous_target_start_never_launches_harness(tmp_path: Path
             resume=resume,
         )
     assert calls == []
-    run_json = next((tmp_path / ".aflow" / "runs").glob("*/run.json"))
+    run_json = error.value.run_dir / "run.json"
     persisted = json.loads(run_json.read_text(encoding="utf-8"))
     assert persisted["current_hotplug_transaction"]["stage"] == "waiting_for_hotplug_recovery"
 
@@ -1272,6 +1289,7 @@ def test_run_resume_applied_transaction_is_normalized_into_history(tmp_path: Pat
         session_id="codex-target", role="worker", selector=transaction.target_selector,
         harness="codex", profile="high", model_display="codex / high",
     )
+    _record_inactive_source(tmp_path, "applied-predecessor")
     resume = ResumeContext(
         resumed_from_run_id="applied-predecessor", feature_branch=None,
         worktree_path=None, main_branch=None, setup=(), teardown=(),
@@ -1306,6 +1324,7 @@ def test_run_resume_imports_durable_provider_result_once(tmp_path: Path, evidenc
         model_display=base.source_model_display,
     )
     transaction = replace(base, source_session=source, provider_operation_id="provider-1", idempotency_key=base.transaction_id)
+    _record_inactive_source(tmp_path, "provider-predecessor")
     resume = ResumeContext(
         resumed_from_run_id="provider-predecessor", feature_branch=None,
         worktree_path=None, main_branch=None, setup=(), teardown=(),

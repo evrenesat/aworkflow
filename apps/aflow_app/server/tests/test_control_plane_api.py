@@ -38,9 +38,12 @@ from aflow.control_plane.persistent_units import PersistentUnitManager
 from aflow.control_plane.units import InMemoryUnitManager, UnitState
 from aflow.daemon import (
     AflowDaemon,
+    DaemonStartupError,
     ExtraInstructionsValidationError,
     _validate_extra_instructions,
 )
+from aflow.project_admission import ProjectAdmission
+from aflow.project_settings import ProjectSettings, ProjectSettingsService
 from aflow_app_server.config import ServerConfig
 from aflow_app_server.control_plane_service import ControlPlaneService
 from aflow_app_server.main import app
@@ -673,6 +676,481 @@ def _lifecycle_record_bytes(root: Path) -> dict[str, bytes]:
             }
         )
     return records
+
+
+def test_start_capacity_rejection_is_a_bounded_conflict(control_client) -> None:
+    client, root, units, _ = control_client
+    _commit_fixture_repository(root)
+    settings = ProjectSettingsService(root)
+    settings.update(
+        ProjectSettings(max_concurrent_implementations=1),
+        expected_revision=settings.read().revision,
+    )
+    admission = ProjectAdmission(root, unit_manager=units)
+    admission.acquire("occupied-api", idempotency_key="occupied-api")
+
+    response = client.post(
+        f"/api/control-plane/projects/{PROJECT_ID}/runs",
+        headers={"Idempotency-Key": "capacity-api"},
+        json={
+            "plan_path": "plans/todo/test-plan.md",
+            "workflow_name": "managed",
+        },
+    )
+
+    assert response.status_code == 409, response.text
+    assert response.json()["detail"]["code"] == "project_capacity_reached"
+    assert len(response.json()["detail"]["message"]) <= 256
+    assert admission.snapshot().occupied_count == 1
+    assert units.start_calls == []
+
+
+def test_start_same_plan_with_another_key_returns_bounded_conflict(control_client) -> None:
+    client, root, units, monkeypatch = control_client
+    _commit_fixture_repository(root)
+    monkeypatch.setattr("aflow.daemon.prepare_startup", _prepared)
+    endpoint = f"/api/control-plane/projects/{PROJECT_ID}/runs"
+    payload = {"plan_path": "plans/todo/test-plan.md", "workflow_name": "managed"}
+
+    first = client.post(endpoint, headers={"Idempotency-Key": "first-plan-key"}, json=payload)
+    assert first.status_code == 201, first.text
+    rejected = client.post(
+        endpoint, headers={"Idempotency-Key": "second-plan-key"}, json=payload
+    )
+    assert rejected.status_code == 409, rejected.text
+    detail = rejected.json()["detail"]
+    assert detail["code"] == "project_plan_claim_conflict"
+    assert len(detail["message"]) <= 256
+    assert len(units.start_calls) == 1
+    assert ProjectAdmission(root, unit_manager=units).snapshot().occupied_count == 1
+
+
+def test_automatic_start_rechecks_revision_and_opt_out_in_real_service(control_client) -> None:
+    _, root, units, monkeypatch = control_client
+    from aflow_app_server import main
+    import hashlib
+
+    _commit_fixture_repository(root)
+    config_path = root.parent / "global" / "aflow.toml"
+    config_path.write_text(
+        config_path.read_text().replace(
+            '[aflow]\ndefault_workflow = "managed"',
+            '[aflow]\ndefault_workflow = "managed"\n'
+            f'worktree_root = "{root.parent / "worktrees"}"\n'
+            'team_lead = "worker"',
+        ),
+        encoding="utf-8",
+    )
+    workflow_path = config_path.with_name("workflows.toml")
+    workflow_path.write_text(
+        workflow_path.read_text().replace(
+            '[workflow.managed.steps.implement]',
+            '[workflow.managed]\nsetup = ["worktree", "branch"]\n'
+            'teardown = ["merge", "rm_worktree"]\nmain_branch = "main"\n'
+            '[workflow.managed.steps.implement]',
+        ),
+        encoding="utf-8",
+    )
+    source = root / "plans" / "todo" / "test-plan.md"
+    destination = root / "plans" / "in-progress" / source.name
+    destination.parent.mkdir()
+    source.rename(destination)
+    from aflow.plan_backups import ensure_plan_identity
+
+    identity = ensure_plan_identity(root, destination)
+    assert main._control_plane_service is not None
+    service = main._control_plane_service
+    request = dict(
+        plan_path="plans/in-progress/test-plan.md", workflow_name=None,
+        team=None, start_step=None, max_turns=None, automatic=True,
+        expected_plan_identity=identity,
+    )
+    with pytest.raises(DaemonStartupError) as changed:
+        service.start_run(PROJECT_ID, idempotency_key="automatic-revision", **{
+            **request, "expected_plan_revision": "0" * 64,
+        })
+    assert changed.value.code == "project_automatic_plan_changed"
+    with pytest.raises(DaemonStartupError) as identity_changed:
+        service.start_run(PROJECT_ID, idempotency_key="automatic-identity", **{
+            **request,
+            "expected_plan_revision": hashlib.sha256(destination.read_bytes()).hexdigest(),
+            "expected_plan_identity": "0" * 32,
+        })
+    assert identity_changed.value.code == "project_automatic_plan_changed"
+    settings = ProjectSettingsService(root)
+    settings.save(
+        ProjectSettings(auto_consume_plans=False),
+        expected_revision=settings.read().revision,
+    )
+    with pytest.raises(DaemonStartupError) as disabled:
+        service.start_run(PROJECT_ID, idempotency_key="automatic-disabled", **{
+            **request,
+            "expected_plan_revision": hashlib.sha256(destination.read_bytes()).hexdigest(),
+        })
+    assert disabled.value.code == "project_automatic_disabled"
+    assert ProjectAdmission(root, unit_manager=units).snapshot().occupied_count == 0
+    assert units.start_calls == []
+    settings.save(ProjectSettings(), expected_revision=settings.read().revision)
+    monkeypatch.setattr("aflow.daemon.prepare_startup", _prepared)
+    started = service.start_run(PROJECT_ID, idempotency_key="automatic-valid", **{
+        **request,
+        "expected_plan_revision": hashlib.sha256(destination.read_bytes()).hexdigest(),
+    })
+    assert isinstance(started, StartRunResult)
+    assert started.created
+    assert len(units.start_calls) == 1
+    replayed = service.start_run(PROJECT_ID, idempotency_key="automatic-valid", **{
+        **request,
+        "expected_plan_revision": hashlib.sha256(destination.read_bytes()).hexdigest(),
+    })
+    assert isinstance(replayed, StartRunResult)
+    assert replayed.run_id == started.run_id
+    assert not replayed.created
+    assert len(units.start_calls) == 1
+
+
+def _automatic_review_plan_setup(root: Path) -> tuple[Path, Path]:
+    config_path = root.parent / "global" / "aflow.toml"
+    config_path.write_text(
+        config_path.read_text().replace(
+            '[aflow]\ndefault_workflow = "managed"',
+            '[aflow]\ndefault_workflow = "managed"\n'
+            f'worktree_root = "{root.parent / "worktrees"}"\n'
+            'team_lead = "worker"',
+        ).replace('p = "Work."', 'p = "Use aflow-review-checkpoint."'),
+        encoding="utf-8",
+    )
+    workflow_path = config_path.with_name("workflows.toml")
+    workflow_path.write_text(
+        workflow_path.read_text().replace(
+            '[workflow.managed.steps.implement]',
+            '[workflow.managed]\nsetup = ["worktree", "branch"]\n'
+            'teardown = ["merge", "rm_worktree"]\nmain_branch = "main"\n'
+            '[workflow.managed.steps.implement]',
+        ),
+        encoding="utf-8",
+    )
+    source = root / "plans" / "todo" / "test-plan.md"
+    destination = root / "plans" / "in-progress" / source.name
+    destination.parent.mkdir()
+    source.rename(destination)
+    return config_path, destination
+
+
+def test_consumer_starts_pristine_review_plan_once_after_tracking_preparation(control_client) -> None:
+    from aflow.plan import parse_git_tracking_metadata
+    from aflow.plan_backups import plan_identity_for_path
+    from aflow.plan_consumer import PlanConsumer
+    from aflow_app_server import main
+
+    _, root, units, monkeypatch = control_client
+    _commit_fixture_repository(root)
+    config_path, plan = _automatic_review_plan_setup(root)
+    assert parse_git_tracking_metadata(plan.read_text(encoding="utf-8")) is None
+    monkeypatch.setattr("aflow.daemon.prepare_startup", _prepared)
+    service = main._control_plane_service
+    assert service is not None
+    requests: list[tuple[str, str]] = []
+
+    def launch(project, path, key, revision, _workflow, _team, identity):
+        requests.append((key, revision))
+        return service.start_run(
+            project, plan_path=path, workflow_name=None, team=None,
+            start_step=None, max_turns=None, idempotency_key=key,
+            expected_plan_revision=revision, expected_plan_identity=identity,
+            automatic=True,
+        )
+
+    consumer = PlanConsumer(
+        projects=lambda: ((PROJECT_ID, root),), launch=launch,
+        classify_invalid=lambda *_: None, config_path=config_path,
+    )
+    try:
+        consumer.scan_once()
+        assert requests == []
+        consumer.scan_once()
+        assert len(requests) == 1
+        assert len(units.start_calls) == 1
+        metadata = parse_git_tracking_metadata(plan.read_text(encoding="utf-8"))
+        assert metadata is not None
+        assert metadata.pre_handoff_base_head
+        assert metadata.plan_branch is not None
+        key, scanned_revision = requests[0]
+        replayed = service.start_run(
+            PROJECT_ID, plan_path="plans/in-progress/test-plan.md",
+            workflow_name=None, team=None, start_step=None, max_turns=None,
+            idempotency_key=key, expected_plan_revision=scanned_revision,
+            expected_plan_identity=plan_identity_for_path(root, plan),
+            automatic=True,
+        )
+        assert isinstance(replayed, StartRunResult)
+        assert not replayed.created
+        consumer.scan_once()
+        assert len(requests) == 1
+        assert len(units.start_calls) == 1
+    finally:
+        consumer.stop()
+
+
+def test_consumer_rejects_external_edit_before_tracking_preparation(control_client) -> None:
+    from aflow.plan_consumer import PlanConsumer
+    from aflow_app_server import main
+
+    _, root, units, _ = control_client
+    _commit_fixture_repository(root)
+    config_path, plan = _automatic_review_plan_setup(root)
+    service = main._control_plane_service
+    assert service is not None
+    errors: list[str] = []
+
+    def launch(project, path, key, revision, _workflow, _team, identity):
+        plan.write_text(plan.read_text(encoding="utf-8") + "\nExternal edit.\n", encoding="utf-8")
+        try:
+            service.start_run(
+                project, plan_path=path, workflow_name=None, team=None,
+                start_step=None, max_turns=None, idempotency_key=key,
+                expected_plan_revision=revision, expected_plan_identity=identity,
+                automatic=True,
+            )
+        except DaemonStartupError as exc:
+            errors.append(exc.code)
+            raise
+        pytest.fail("changed source was admitted")
+
+    consumer = PlanConsumer(
+        projects=lambda: ((PROJECT_ID, root),), launch=launch,
+        classify_invalid=lambda *_: None, config_path=config_path,
+    )
+    try:
+        consumer.scan_once()
+        consumer.scan_once()
+        assert errors == ["project_automatic_plan_changed"]
+        assert units.start_calls == []
+        assert ProjectAdmission(root, unit_manager=units).snapshot().occupied_count == 0
+    finally:
+        consumer.stop()
+
+
+def test_automatic_admission_rejects_edit_after_tracking_preparation(control_client) -> None:
+    from hashlib import sha256
+    from aflow.daemon import DaemonService
+    from aflow.plan_backups import ensure_plan_identity
+    from aflow_app_server import main
+
+    _, root, units, monkeypatch = control_client
+    _commit_fixture_repository(root)
+    _, plan = _automatic_review_plan_setup(root)
+    identity = ensure_plan_identity(root, plan)
+    scanned_revision = sha256(plan.read_bytes()).hexdigest()
+    prepare = DaemonService._prepare_required_git_tracking_before_reservation
+
+    def edit_after_preparation(self, request, *, expected_plan_revision=None):
+        revision = prepare(
+            self, request, expected_plan_revision=expected_plan_revision,
+        )
+        assert revision is not None
+        plan.write_text(
+            plan.read_text(encoding="utf-8") + "\nExternal edit.\n",
+            encoding="utf-8",
+        )
+        return revision
+
+    monkeypatch.setattr(
+        DaemonService, "_prepare_required_git_tracking_before_reservation",
+        edit_after_preparation,
+    )
+    service = main._control_plane_service
+    assert service is not None
+    with pytest.raises(DaemonStartupError) as changed:
+        service.start_run(
+            PROJECT_ID, plan_path="plans/in-progress/test-plan.md",
+            workflow_name=None, team=None, start_step=None, max_turns=None,
+            idempotency_key="after-preparation", automatic=True,
+            expected_plan_revision=scanned_revision,
+            expected_plan_identity=identity,
+        )
+    assert changed.value.code == "project_automatic_plan_changed"
+    assert units.start_calls == []
+    assert ProjectAdmission(root, unit_manager=units).snapshot().occupied_count == 0
+
+
+def test_project_scheduling_rest_auth_cas_queue_and_pure_defaults(control_client) -> None:
+    from aflow.project_settings import ProjectSettingsService
+    from aflow_app_server import main
+
+    client, root, units, _ = control_client
+    endpoint = f"/api/projects/{PROJECT_ID}/scheduling"
+    assert TestClient(app).get(endpoint).status_code == 401
+    assert TestClient(app).get(f"/api/projects/{PROJECT_ID}/queue").status_code == 401
+    settings_path = ProjectSettingsService(root).settings_path
+    initial = client.get(endpoint)
+    assert initial.status_code == 200
+    assert initial.json()["source"] == "defaults"
+    assert initial.json()["auto_consume_plans"] is True
+    assert initial.json()["max_concurrent_implementations"] == 2
+    assert not settings_path.exists()
+    missing = client.get("/api/projects/missing/scheduling")
+    assert missing.status_code == 404
+
+    saved = client.patch(endpoint, json={
+        "expected_revision": initial.json()["revision"],
+        "max_concurrent_implementations": 1,
+    })
+    assert saved.status_code == 200, saved.text
+    assert saved.json()["max_concurrent_implementations"] == 1
+    assert saved.json()["auto_consume_plans"] is True
+    assert settings_path.is_file()
+    stale = client.patch(endpoint, json={
+        "expected_revision": initial.json()["revision"],
+        "auto_consume_plans": False,
+    })
+    assert stale.status_code == 409
+    assert stale.json()["detail"]["current_revision"] == saved.json()["revision"]
+    assert client.patch(endpoint, json={
+        "expected_revision": saved.json()["revision"],
+        "auto_consume_plans": None,
+    }).status_code == 422
+
+    assert main._plan_service is not None
+    source = main._plan_service.read(PROJECT_ID, "todo", "test-plan.md")
+    promoted = main._plan_service.promote(
+        PROJECT_ID, "todo", source.name, source.revision,
+    )
+    queued = client.get(f"/api/projects/{PROJECT_ID}/queue")
+    assert queued.status_code == 200, queued.text
+    assert queued.json()["capacity"]["limit"] == 1
+    item = next(plan for plan in queued.json()["plans"] if plan["name"] == promoted.name)
+    assert item["identity"]
+    assert item["outcome"] == "queued"
+    assert item["run_id"] is None
+    ProjectAdmission(root, unit_manager=units).acquire(
+        "queue-running", plan_path=root / promoted.path,
+        idempotency_key="queue-running-key",
+    )
+    running = client.get(f"/api/projects/{PROJECT_ID}/queue").json()
+    item = next(plan for plan in running["plans"] if plan["name"] == promoted.name)
+    assert item["outcome"] == "running"
+    assert item["run_id"] == "queue-running"
+    assert running["capacity"]["available_slots"] == 0
+    first = main._plan_service.create(
+        PROJECT_ID, "feature_P01_first.md",
+        "# First\n\n### [ ] Checkpoint 1: Work\n- [ ] Work\n",
+    )
+    later = main._plan_service.create(
+        PROJECT_ID, "feature_P03_later.md",
+        "# Later\n\n### [ ] Checkpoint 1: Work\n- [ ] Work\n",
+    )
+    assert first.status == "todo"
+    main._plan_service.promote(PROJECT_ID, "todo", later.name, later.revision)
+    blocked = client.get(f"/api/projects/{PROJECT_ID}/queue").json()
+    later_item = next(plan for plan in blocked["plans"] if plan["name"] == later.name)
+    assert later_item["outcome"] == "blocked"
+    assert later_item["reason"] == "dependency"
+    assert later_item["dependency"] == first.name
+
+
+def test_upgrade_threshold_actions_preserve_inheritance_and_pair_cas(control_client) -> None:
+    client, _, _, _ = control_client
+    before = client.get("/api/config").json()
+    first = client.patch("/api/config", json={
+        "expected_revision": before["revision"],
+        "actions": [
+            {"type": "set_default_upgrade_after_repairs", "value": 3},
+            {"type": "set_workflow_upgrade_after_repairs", "workflow": "managed", "value": 2},
+        ],
+    })
+    assert first.status_code == 200, first.text
+    assert "upgrade_after_repairs = 3" in first.json()["workflows_toml"]
+    assert "upgrade_after_repairs = 2" in first.json()["workflows_toml"]
+    stale = client.patch("/api/config", json={
+        "expected_revision": before["revision"],
+        "actions": [{"type": "set_default_upgrade_after_repairs", "value": 4}],
+    })
+    assert stale.status_code == 409
+    assert client.patch("/api/config", json={
+        "expected_revision": first.json()["revision"],
+        "actions": [{"type": "set_default_upgrade_after_repairs", "value": 0}],
+    }).status_code == 422
+    removed = client.patch("/api/config", json={
+        "expected_revision": first.json()["revision"],
+        "actions": [{"type": "set_workflow_upgrade_after_repairs", "workflow": "managed", "value": None}],
+    })
+    assert removed.status_code == 200, removed.text
+    assert removed.json()["workflows_toml"].count("upgrade_after_repairs") == 1
+    form = client.post("/api/config/form", json={
+        "aflow_toml": removed.json()["aflow_toml"],
+        "workflows_toml": removed.json()["workflows_toml"],
+    })
+    assert form.status_code == 200, form.text
+    assert form.json()["form"]["default_upgrade_after_repairs"] == 3
+    workflow = form.json()["form"]["workflows"]["managed"]
+    assert workflow["upgrade_after_repairs"] is None
+    assert workflow["effective_upgrade_after_repairs"] == 3
+    assert workflow["upgrade_after_repairs_source"] == "defaults"
+    alias = client.post("/api/config/form", json={
+        "aflow_toml": removed.json()["aflow_toml"],
+        "workflows_toml": removed.json()["workflows_toml"]
+        + '\n[workflow.alias]\nextends = "managed"\n',
+    })
+    assert alias.status_code == 200, alias.text
+    alias_workflow = alias.json()["form"]["workflows"]["alias"]
+    assert alias_workflow["effective_upgrade_after_repairs"] == 3
+    assert alias_workflow["upgrade_after_repairs_source"] == "base:managed"
+
+
+def test_server_lifespan_owns_and_stops_plan_scanner(control_client, monkeypatch) -> None:
+    client, root, _, _ = control_client
+    from aflow_app_server import main
+
+    config = main._config
+    assert config is not None
+    config_path = root.parent / "global" / "aflow.toml"
+    config_path.write_text(
+        config_path.read_text().replace(
+            '[aflow]\ndefault_workflow = "managed"',
+            '[aflow]\ndefault_workflow = "managed"\n'
+            f'worktree_root = "{root.parent / "worktrees"}"\n'
+            'team_lead = "worker"',
+        ),
+        encoding="utf-8",
+    )
+    workflow_path = config_path.with_name("workflows.toml")
+    workflow_path.write_text(
+        '[workflow.managed]\nsetup = ["worktree", "branch"]\n'
+        'teardown = ["merge", "rm_worktree"]\nmain_branch = "main"\n'
+        '[workflow.managed.steps.implement]\nrole = "worker"\n'
+        'prompts = ["p"]\ngo = [{ to = "END", when = "DONE" }]\n',
+        encoding="utf-8",
+    )
+    calls: list[tuple[str, str]] = []
+
+    class FakeService:
+        workflow_config_path = config_path
+
+        def __init__(self, _config) -> None:
+            pass
+
+        def start(self) -> None:
+            pass
+
+        def projects(self):
+            return (SimpleNamespace(project_id=PROJECT_ID, root=str(root)),)
+
+        def start_run(self, project_id, **kwargs):
+            calls.append((project_id, kwargs["plan_path"]))
+            return StartRunResult(run_id="automatic-lifespan", created=True, status="starting")
+
+    monkeypatch.setattr(main, "_configured_config", config)
+    monkeypatch.setattr(main, "ControlPlaneService", FakeService)
+    with client:
+        plan = root / "plans" / "in-progress" / "automatic.md"
+        plan.parent.mkdir()
+        plan.write_text("# Work\n\n### [ ] Checkpoint 1: Work\n\n- [ ] Do work\n")
+        assert main._plan_consumer is not None
+        main._plan_consumer.scan_once()
+        main._plan_consumer.scan_once()
+        assert calls == [(PROJECT_ID, "plans/in-progress/automatic.md")]
+    assert main._plan_consumer is None
 
 
 def test_extra_instructions_validation_boundaries() -> None:
@@ -1762,7 +2240,7 @@ def test_control_events_context_controls_owner_stop_and_resume(control_client) -
 
     units.stop(f"aflow-run-{run_id}.service")
     (root / ".aflow" / "runs" / run_id / "run.json").write_text(
-        '{"status":"running","workflow_name":"managed","team":null,'
+        '{"status":"failed","workflow_name":"managed","team":null,'
         '"selected_start_step":"implement","max_turns":3,"extra_instructions":[]}'
     )
     monkeypatch.setattr(
@@ -1777,6 +2255,9 @@ def test_control_events_context_controls_owner_stop_and_resume(control_client) -
             resume_context=object(),
         ),
     )
+    available = client.get(f"/api/control-plane/projects/{PROJECT_ID}/runs/{run_id}")
+    assert available.status_code == 200
+    assert available.json()["evidence"]["can_resume"] is True
     resumed = client.post(
         f"/api/control-plane/projects/{PROJECT_ID}/runs/{run_id}/resume",
         headers={"Idempotency-Key": "resume-1"},
@@ -1811,7 +2292,9 @@ def test_control_events_context_controls_owner_stop_and_resume(control_client) -
     assert len(units.stop_calls) == stop_call_count
 
 
-def test_rest_resume_persists_reviewer_start_step_and_replays_once(control_client) -> None:
+def test_stopped_unit_with_running_metadata_is_not_offered_or_admitted(
+    control_client,
+) -> None:
     client, root, units, monkeypatch = control_client
     pending = _start_pending(client, monkeypatch)
     started = _answer_pending(client, pending, monkeypatch)
@@ -1820,6 +2303,46 @@ def test_rest_resume_persists_reviewer_start_step_and_replays_once(control_clien
     source_path = root / ".aflow" / "runs" / run_id / "run.json"
     source_path.write_text(
         '{"status":"running","workflow_name":"managed","team":null,'
+        '"selected_start_step":"implement","max_turns":3,"extra_instructions":[]}'
+    )
+    before = source_path.read_bytes()
+    monkeypatch.setattr(
+        "aflow.cli._bootstrap_resume_invocation",
+        lambda **_kwargs: SimpleNamespace(
+            workflow_name="managed",
+            plan_path=root / "plans" / "todo" / "test-plan.md",
+            max_turns=3,
+            team=None,
+            start_step="implement",
+            extra_instructions=(),
+            resume_context=object(),
+        ),
+    )
+
+    shown = client.get(f"/api/control-plane/projects/{PROJECT_ID}/runs/{run_id}")
+    assert shown.status_code == 200
+    assert shown.json()["evidence"]["can_resume"] is False
+    assert source_path.read_bytes() == before
+
+    rejected = client.post(
+        f"/api/control-plane/projects/{PROJECT_ID}/runs/{run_id}/resume",
+        headers={"Idempotency-Key": "uncertain-resume"},
+    )
+    assert rejected.status_code == 422
+    assert rejected.json()["detail"]["code"] == "project_admission_error"
+    assert len(units.start_calls) == 1
+    assert source_path.read_bytes() == before
+
+
+def test_rest_resume_persists_reviewer_start_step_and_replays_once(control_client) -> None:
+    client, root, units, monkeypatch = control_client
+    pending = _start_pending(client, monkeypatch)
+    started = _answer_pending(client, pending, monkeypatch)
+    run_id = started["result"]["run_id"]
+    units.stop(f"aflow-run-{run_id}.service")
+    source_path = root / ".aflow" / "runs" / run_id / "run.json"
+    source_path.write_text(
+        '{"status":"failed","workflow_name":"managed","team":null,'
         '"selected_start_step":"implement","max_turns":3,'
         '"extra_instructions":[]}'
     )
@@ -1986,7 +2509,7 @@ def test_resume_extra_instructions_are_optional_and_idempotent(
     units.stop(f"aflow-run-{run_id}.service")
     source_path = root / ".aflow" / "runs" / run_id / "run.json"
     source_path.write_text(
-        '{"status":"running","workflow_name":"managed","team":null,'
+        '{"status":"failed","workflow_name":"managed","team":null,'
         '"selected_start_step":"implement","max_turns":3,'
         '"extra_instructions":["saved guidance"]}'
     )
@@ -2623,10 +3146,18 @@ def test_two_registered_projects_keep_exact_plan_and_launch_boundaries(
         assert start_record["selected_environment_file"]["path"] == str(
             (root / "aflowd.env").resolve()
         )
+        reservation_state = json.loads(
+            (project_root / ".aflow" / "project-admission.json").read_text(
+                encoding="utf-8"
+            )
+        )
         assert captured_starts[f"aflow-run-{run_id}.service"] == {
             "cwd": project_root.resolve(),
             "environment_file": (root / "aflowd.env").resolve(),
-            "environment": {"AFLOW_TEST_SECRET": secret},
+            "environment": {
+                "AFLOW_TEST_SECRET": secret,
+                "AFLOW_ADMISSION_RESERVATION_NONCE": reservation_state["reservations"][run_id]["nonce"],
+            },
         }
 
         events = client.get(

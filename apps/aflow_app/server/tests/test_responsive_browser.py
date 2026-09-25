@@ -65,7 +65,7 @@ def _seed_responsive_fixture(root: Path) -> None:
         run_dir.mkdir(parents=True)
         (run_dir / "run.json").write_text(json.dumps({
             "status": "completed",
-            "plan_path": f"plans/todo/long-plan-{index:02}.md",
+            "plan_path": str((plans / f"long-plan-{index:02}.md").resolve()),
             "workflow_name": "managed",
             "max_turns": 5,
         }))

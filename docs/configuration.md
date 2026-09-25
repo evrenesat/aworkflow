@@ -143,7 +143,11 @@ merge_prompt = ["simple_merge"]
   declarations editable. Restoring a legacy inline role removes that actual
   declaration, while other metadata and role entries remain intact.
 - Team tables can set `backup_team`, naming the next team to try when deterministic harness recovery switches away from the active team.
-- Team tables can also set `upgrade_to`, a separate quality/capability edge that the manager may select for exactly one next implementation attempt.
+- Team tables can also set `upgrade_to`, a separate quality/capability edge.
+  After `upgrade_after_repairs` failed repair attempts in the same checkpoint
+  scope, the next worker takes one edge even when manager supervision is
+  disabled. An enabled manager may also select one edge for its next
+  implementation action.
 - `extends`, `backup_team`, and `upgrade_to` are independent links. Backup and
   upgrade targets must exist, cannot point to themselves, and cannot form
   cycles; neither route is inherited, and inheritance does not imply an
@@ -269,11 +273,11 @@ next invocation without changing an in-flight call.
 
 ## Interstep Manager Supervision
 
-Manager supervision is an opt-in control gate per workflow. A freshly
-bootstrapped config enables it through the `[workflow]` defaults, while a
-config with no `manager_enabled` flag anywhere preserves the prior workflow,
-recovery, turn-count, and merge behavior. Add the following roles and sections
-to opt in safely:
+Manager supervision is an opt-in control gate per workflow. The packaged
+workflows set `[workflow].manager_enabled = false`; the provider-neutral starter
+omits the flag and also resolves disabled. A config with no `manager_enabled`
+flag anywhere leaves it disabled. Checkpoint and final reviews still run. Add
+the following roles and sections to opt in safely:
 
 ```toml
 [roles]
@@ -290,12 +294,9 @@ repartition_skill = "aflow-repartition-checkpoint"
 ```
 
 ```toml
-# workflows.toml
-[workflow]
+# workflows.toml, in one workflow that should use manager supervision
+[workflow.review_implement_cp_review]
 manager_enabled = true
-
-[workflow.ralph]
-manager_enabled = false
 ```
 
 Omission is disabled: a workflow without the flag inherits its concrete base
@@ -363,8 +364,8 @@ boundary.
 
 ### Team upgrade routes
 
-Use `upgrade_to` only for a manager-selected quality escalation, not for
-operational recovery:
+Use `upgrade_to` for quality escalation after the failed-repair threshold or
+an enabled manager's upgrade action, not for operational recovery:
 
 ```toml
 [teams.standard]

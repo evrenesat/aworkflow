@@ -421,6 +421,100 @@ def test_manager_report_remains_visible_once_after_real_banner_and_cli(
         assert full_result["status"] == "accepted"
         assert full_result["action"] == "stop"
 
+
+@pytest.mark.parametrize("artifact", [None, "malformed", "unsafe"])
+def test_cli_renders_generic_project_admission_error_without_traceback(
+    tmp_path: Path, artifact: str | None
+) -> None:
+    import aflow.cli as cli_module
+    from aflow.project_admission import ProjectAdmission, ProjectAdmissionSafetyError
+
+    repo_root = tmp_path / "repo"
+    repo_root.mkdir()
+    plan_path = repo_root / "plan.md"
+    plan_path.write_text(_VALID_PLAN, encoding="utf-8")
+    config_path = repo_root / "aflow.toml"
+    config_path.write_text("", encoding="utf-8")
+    workflow = WorkflowConfig(
+        steps={
+            "impl": WorkflowStepConfig(
+                role="worker",
+                prompts=("p",),
+                go=(GoTransition(to="END", when="DONE"),),
+            )
+        },
+        first_step="impl",
+    )
+    workflow_config = WorkflowUserConfig(
+        roles={"worker": "codex.worker"},
+        harnesses={
+            "codex": WorkflowHarnessConfig(
+                profiles={"worker": HarnessProfileConfig(model="worker")}
+            )
+        },
+        workflows={"managed": workflow},
+        prompts={"p": "Work."},
+    )
+    prepared = PreparedRun(
+        workflow_name="managed",
+        repo_root=repo_root,
+        plan_path=plan_path,
+        config_path=config_path,
+        max_turns=2,
+        team=None,
+        extra_instructions=(),
+        start_step="impl",
+    )
+    stderr = io.StringIO()
+
+    if artifact is None:
+        admission_failure = ProjectAdmissionSafetyError("x" * 4096)
+    else:
+        settings_path = repo_root / ".aflow" / "project-settings.json"
+        settings_path.parent.mkdir()
+        if artifact == "malformed":
+            settings_path.write_text(
+                '{"provider":"raw-provider-detail",', encoding="utf-8"
+            )
+        else:
+            outside = repo_root / "outside-settings.json"
+            outside.write_text(
+                '{"provider":"raw-provider-detail"}\n', encoding="utf-8"
+            )
+            settings_path.symlink_to(outside)
+
+        def raise_settings_failure(*args, **kwargs):
+            ProjectAdmission(repo_root).snapshot()
+            raise AssertionError("settings admission should have failed")
+
+        admission_failure = raise_settings_failure
+
+    with redirect_stderr(stderr), \
+         patch.object(cli_module, "_bootstrap_config_files", return_value=(config_path, ())), \
+         patch.object(cli_module, "load_workflow_config", return_value=workflow_config), \
+         patch.object(cli_module, "validate_workflow_config", return_value=[]), \
+         patch.object(cli_module, "_resolve_repo_root", return_value=repo_root), \
+         patch.object(cli_module, "_resolve_run_arguments", return_value=("managed", str(plan_path), ())), \
+         patch.object(cli_module, "_handle_startup_questions", return_value=prepared), \
+         patch.object(cli_module, "_detect_resume_candidate", return_value=None), \
+         patch.object(cli_module, "BannerRenderer", return_value=Mock()), \
+         patch.object(
+             cli_module,
+             "execute_workflow",
+             side_effect=admission_failure,
+         ):
+        result = cli_module.main(["run", str(plan_path)])
+
+    rendered = stderr.getvalue()
+    assert result == 1
+    assert "[project_admission_error]" in rendered
+    assert "Traceback" not in rendered
+    assert len(rendered) < 400
+    if artifact is not None:
+        assert "project admission settings are unavailable or invalid" in rendered
+        assert "raw-provider-detail" not in rendered
+
+
 class WorkflowCliTests(unittest.TestCase):
 
     def _new_temp_path(self) -> Path:
@@ -5468,6 +5562,10 @@ class WorkflowStartupFlowTests(unittest.TestCase):
                 run_dir,
                 plan_path,
             )
+            run_dir.joinpath("run.json").write_text(
+                '{"status":"failed"}\n',
+                encoding="utf-8",
+            )
             candidate_rel = pending["candidate_artifact_path"]
             candidate_bytes = artifacts[candidate_rel]
             prev_run = {
@@ -5537,6 +5635,10 @@ class WorkflowStartupFlowTests(unittest.TestCase):
             pending, artifacts, scope = _bound_pending_repartition_fixture(
                 run_dir,
                 plan_path,
+            )
+            run_dir.joinpath("run.json").write_text(
+                '{"status":"failed"}\n',
+                encoding="utf-8",
             )
             prev_run = {
                 "repo_root": str(repo_root),

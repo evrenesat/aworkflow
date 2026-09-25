@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState } from 'react'
 import * as api from '../api'
-import type { GuidedConfigAction, GuidedFormProjection, ProjectConfig, ProjectConfigFormResponse, SettingsResponse, SettingsSaveRequest } from '../types'
-import { changedDocuments, createDraftPreviewCoordinator, previewLegacyConversion, previewSettingsActions, reconcileCleanPreview, retainServerProjection, settingsActions, type DraftPreviewState } from '../settingsDraft'
+import type { GuidedConfigAction, GuidedFormProjection, ProjectConfig, ProjectConfigFormResponse, ProjectInfo, ProjectScheduling, SettingsResponse, SettingsSaveRequest } from '../types'
+import { changedDocuments, createDraftPreviewCoordinator, previewLegacyConversion, previewSettingsActions, reconcileCleanPreview, repairThresholdDisplay, retainServerProjection, settingsActions, type DraftPreviewState } from '../settingsDraft'
 import { AppearanceSelector } from './AppearanceSelector'
 import { RecentRunsLimit } from './GlobalRunOverview'
 import { Combobox } from './Combobox'
@@ -27,6 +27,10 @@ function sameValue(left: unknown, right: unknown): boolean {
   return left === right || JSON.stringify(left) === JSON.stringify(right)
 }
 
+function positiveInteger(value: number): boolean {
+  return Number.isInteger(value) && value > 0
+}
+
 function useSettingsHeaderCompact(): boolean {
   const [compact, setCompact] = useState(() => (
     typeof window !== 'undefined'
@@ -50,7 +54,7 @@ function useSettingsHeaderCompact(): boolean {
   return compact
 }
 
-export function GlobalSettings({ onDirtyChange, onSaved }: { onDirtyChange: (dirty: boolean) => void; onSaved: (saved: ProjectConfig) => void }) {
+export function GlobalSettings({ onDirtyChange, onSaved, project = null }: { onDirtyChange: (dirty: boolean) => void; onSaved: (saved: ProjectConfig) => void; project?: ProjectInfo | null }) {
   const [tab, setTab] = useState<typeof tabs[number]>('Agents & Roles')
   const [selectedTeam, setSelectedTeam] = useState('')
   const [selectedWorkflow, setSelectedWorkflow] = useState('Defaults')
@@ -67,6 +71,8 @@ export function GlobalSettings({ onDirtyChange, onSaved }: { onDirtyChange: (dir
   const [advanced, setAdvanced] = useState(false)
   const [rawEdited, setRawEdited] = useState(false)
   const [server, setServer] = useState<SettingsResponse | null>(null)
+  const [projectScheduling, setProjectScheduling] = useState<ProjectScheduling | null>(null)
+  const [projectSchedulingDraft, setProjectSchedulingDraft] = useState<{ auto_consume_plans: boolean; max_concurrent_implementations: number } | null>(null)
   const [serverDraft, setServerDraft] = useState({ bind_host: '', bind_port: '', managed_projects_root: '' })
   const [serverText, setServerText] = useState('')
   const [password, setPassword] = useState('')
@@ -105,6 +111,7 @@ export function GlobalSettings({ onDirtyChange, onSaved }: { onDirtyChange: (dir
   // Bumped by every load/discard so a response that resolves after an
   // explicit discard can never restore discarded edits.
   const epochRef = useRef(0)
+  const schedulingProjectIdRef = useRef<string | null>(null)
   const draftRef = useRef<GuidedFormProjection | null>(null)
   const skillReadSequenceRef = useRef(0)
 
@@ -265,6 +272,12 @@ export function GlobalSettings({ onDirtyChange, onSaved }: { onDirtyChange: (dir
   }, [selectedSkill, skills, skillContents, skillRevisions]) // eslint-disable-line react-hooks/exhaustive-deps
   async function load(skillOverride: string | null = null) {
     const epoch = ++epochRef.current
+    const schedulingProjectId = project?.id ?? null
+    if (schedulingProjectIdRef.current !== schedulingProjectId) {
+      schedulingProjectIdRef.current = schedulingProjectId
+      setProjectScheduling(null)
+      setProjectSchedulingDraft(null)
+    }
     // Superseded skill reads remain harmless through the epoch check, while a
     // new read for the selected skill must not be blocked by their old marker.
     skillInflight.current.clear()
@@ -272,6 +285,13 @@ export function GlobalSettings({ onDirtyChange, onSaved }: { onDirtyChange: (dir
     const results = await Promise.allSettled([
       api.getGlobalConfig().then(saved => acceptConfig(saved, epoch, true)), api.getSettings().then(saved => acceptServer(saved, epoch)),
       api.listSkills().then(list => { acceptSkills(list, epoch); return list }),
+      schedulingProjectId
+        ? api.getProjectScheduling(schedulingProjectId).then(saved => {
+          if (epochRef.current !== epoch) return
+          setProjectScheduling(saved)
+          setProjectSchedulingDraft({ auto_consume_plans: saved.auto_consume_plans, max_concurrent_implementations: saved.max_concurrent_implementations })
+        })
+        : Promise.resolve().then(() => { if (epochRef.current === epoch) { setProjectScheduling(null); setProjectSchedulingDraft(null) } }),
     ])
     if (epochRef.current !== epoch) return
     const failures = results.filter(result => result.status === 'rejected')
@@ -310,6 +330,10 @@ export function GlobalSettings({ onDirtyChange, onSaved }: { onDirtyChange: (dir
       setServerText(server.advanced_toml)
       setServerDraft({ bind_host: server.bind_host, bind_port: String(server.bind_port), managed_projects_root: server.managed_projects_root })
     }
+    if (projectScheduling) setProjectSchedulingDraft({
+      auto_consume_plans: projectScheduling.auto_consume_plans,
+      max_concurrent_implementations: projectScheduling.max_concurrent_implementations,
+    })
     setSkillDrafts({})
     setSelectedSkill('')
     setSkillContentError(null)
@@ -329,16 +353,20 @@ export function GlobalSettings({ onDirtyChange, onSaved }: { onDirtyChange: (dir
       setProjectionError(reason instanceof Error ? reason.message : 'Could not build the guided view.')
     } finally { setBusy(false) }
   }
-  useEffect(() => { void load() }, []) // eslint-disable-line react-hooks/exhaustive-deps
+  useEffect(() => { void load() }, [project?.id]) // eslint-disable-line react-hooks/exhaustive-deps
   const actions = baseline && draft ? settingsActions(baseline, draft) : []
   const documents = snapshot ? changedDocuments(snapshot, texts) : {}
   const configDirty = (rawEdited && Object.keys(documents).length > 0) || actions.length > 0 || Object.entries(pendingNames).some(([name, target]) => name !== target && name in (draft?.prompts ?? {}))
   const pendingCreation = Object.values(newProfile).some(Boolean) || Object.values(newRole).some(Boolean)
   const serverDirty = Boolean(server && (password || serverText !== server.advanced_toml || serverDraft.bind_host !== server.bind_host || serverDraft.bind_port !== String(server.bind_port) || serverDraft.managed_projects_root !== server.managed_projects_root))
+  const projectSchedulingDirty = Boolean(projectScheduling && projectSchedulingDraft && (
+    projectScheduling.auto_consume_plans !== projectSchedulingDraft.auto_consume_plans
+    || projectScheduling.max_concurrent_implementations !== projectSchedulingDraft.max_concurrent_implementations
+  ))
   // Skill drafts live outside TOML documents and join the same dirty guard.
   const dirtySkillNames = Object.keys(skillDrafts).sort()
   const skillsDirty = dirtySkillNames.length > 0
-  const saveableDirty = configDirty || pendingCreation || serverDirty || skillsDirty
+  const saveableDirty = configDirty || pendingCreation || serverDirty || skillsDirty || projectSchedulingDirty
   const dirty = saveableDirty || teamWizardDirty
   function reloadSettings() {
     if (dirty) {
@@ -569,6 +597,12 @@ export function GlobalSettings({ onDirtyChange, onSaved }: { onDirtyChange: (dir
     if (source === 'workflow') return 'this workflow'
     return 'defaults'
   }
+  function repairThresholdText(current: GuidedFormProjection, workflow: string): string {
+    const display = repairThresholdDisplay(current, workflow)
+    return display.value === null
+      ? 'Updating effective repair threshold…'
+      : `Effective: ${display.value} (${managerSourceLabel(display.source)}). Leave blank to inherit.`
+  }
   async function toggleAdvanced(): Promise<boolean> {
     const previousPreview = draftPreviewCoordinator.state()
     setBusy(true); setError(null)
@@ -706,8 +740,23 @@ export function GlobalSettings({ onDirtyChange, onSaved }: { onDirtyChange: (dir
     // acknowledgement can replace it through acceptConfig.
     setBusy(true); setError(null); setNotice(null)
     let configSaved = false
+    let projectSaved = false
     const savedSkills: string[] = []
     try {
+      if (draft?.default_upgrade_after_repairs != null && !positiveInteger(draft.default_upgrade_after_repairs)) {
+        throw new Error('Default repair threshold must be a positive integer')
+      }
+      for (const [workflow, value] of Object.entries(draft?.workflows ?? {})) {
+        if (value.upgrade_after_repairs != null && !positiveInteger(value.upgrade_after_repairs)) {
+          throw new Error(`Repair threshold for ${workflow} must be a positive integer`)
+        }
+      }
+      if (projectSchedulingDirty && projectSchedulingDraft && (
+        !positiveInteger(projectSchedulingDraft.max_concurrent_implementations)
+        || projectSchedulingDraft.max_concurrent_implementations > 1000
+      )) {
+        throw new Error('Concurrent implementations must be a whole number from 1 to 1000')
+      }
       // Validate all dirty domains before the first write; password is in the final write.
       // Skills prevalidate read-only; every PUT repeats its checks under the store lock.
       // Freeze each text/revision pair before validation. The read-only check
@@ -753,6 +802,20 @@ export function GlobalSettings({ onDirtyChange, onSaved }: { onDirtyChange: (dir
         await acceptConfig(saved, epochRef.current)
         if (epochRef.current !== epoch) return
       }
+      if (projectSchedulingDirty && projectSchedulingDraft && projectScheduling && project) {
+        const updates = {
+          expected_revision: projectScheduling.revision,
+          ...(projectSchedulingDraft.auto_consume_plans !== projectScheduling.auto_consume_plans
+            ? { auto_consume_plans: projectSchedulingDraft.auto_consume_plans } : {}),
+          ...(projectSchedulingDraft.max_concurrent_implementations !== projectScheduling.max_concurrent_implementations
+            ? { max_concurrent_implementations: projectSchedulingDraft.max_concurrent_implementations } : {}),
+        }
+        const saved = await api.patchProjectScheduling(project.id, updates)
+        if (epochRef.current !== epoch) return
+        setProjectScheduling(saved)
+        setProjectSchedulingDraft({ auto_consume_plans: saved.auto_consume_plans, max_concurrent_implementations: saved.max_concurrent_implementations })
+        projectSaved = true
+      }
       // Dirty skills save in sorted name order; each clears only on its own
       // acknowledgement, so a 409/network/write failure preserves the rest.
       for (const { name, content, expectedRevision } of skillSaveSnapshot) {
@@ -776,16 +839,20 @@ export function GlobalSettings({ onDirtyChange, onSaved }: { onDirtyChange: (dir
       if (epochRef.current !== epoch) return
       const parts: string[] = []
       if (configSaved) parts.push('Workflow settings saved; new runs use the saved configuration, and existing control-plane runs can select updated teams and profiles. Saved run controls apply at the next turn or when the run resumes.')
+      if (projectSaved) parts.push('Project scheduling saved; the new settings apply to future automatic starts.')
       if (savedSkills.length) parts.push(`Skill text saved for ${savedSkills.join(', ')}; the next manager invocation uses it.`)
       setNotice(parts.length ? parts.join(' ') : 'All changes saved.')
     } catch (reason) {
       const message = reason instanceof Error ? reason.message : 'Save failed'
-      const acknowledged = configSaved && savedSkills.length
-        ? `Workflow configuration saved. Skills saved: ${savedSkills.join(', ')}.`
-        : configSaved
-          ? 'Workflow configuration saved. Remaining settings were not saved.'
-          : savedSkills.length ? `Skills saved: ${savedSkills.join(', ')}.` : null
-      setError(`${acknowledged ? `${acknowledged} ` : ''}${message}. Your remaining edits are retained; reload explicitly to reapply after a conflict.`)
+      const acknowledged = [
+        configSaved && savedSkills.length ? `Workflow configuration saved. Skills saved: ${savedSkills.join(', ')}.`
+          : configSaved ? 'Workflow configuration saved. Remaining settings were not saved.'
+            : savedSkills.length ? `Skills saved: ${savedSkills.join(', ')}.` : '',
+        projectSaved ? 'Project scheduling saved.' : '',
+      ].filter(Boolean).join(' ')
+      const conflict = (reason as { code?: unknown })?.code === 'revision_conflict'
+        ? ' The settings changed on the server' : ''
+      setError(`${acknowledged ? `${acknowledged} ` : ''}${message}${conflict}. Your remaining edits are retained; reload explicitly to reapply after a conflict.`)
     } finally { setBusy(false) }
   }
   const effectiveSkill = selectedSkill || skills?.[0]?.name || ''
@@ -924,6 +991,21 @@ export function GlobalSettings({ onDirtyChange, onSaved }: { onDirtyChange: (dir
         onWizardDirtyChange={setTeamWizardDirty}
       />
     </div>}{tab === 'Changelog' ? <ChangelogSettings /> : tab === 'General' ? <div className="settings-fields">
+      {draft && <>
+        <h3>New run defaults</h3>
+        <Combobox label="Default workflow" value={draft.default_workflow ?? ''} options={workflowNames} optionLabel={value => formatMachineChoice(value, workflowNames)} onChange={value => { if (value) change(next => { next.default_workflow = value }) }} />
+        <p className="text-xs text-dim">New runs follow this workflow when no workflow is chosen at launch. An explicit launch choice takes precedence.</p>
+      </>}
+      {project && <>
+        <h3>Project scheduling · {project.display_name}</h3>
+        {projectSchedulingDraft ? <>
+          <label className="settings-checkbox-row"><input type="checkbox" checked={projectSchedulingDraft.auto_consume_plans} onChange={event => setProjectSchedulingDraft(current => current && ({ ...current, auto_consume_plans: event.target.checked }))} />Automatic plan consumption</label>
+          <p className="text-xs text-dim">Starts eligible Ready plans automatically. Turning this off affects future starts only.</p>
+          <label>Concurrent implementations<input className="input" type="number" min="1" max="1000" step="1" value={projectSchedulingDraft.max_concurrent_implementations} onChange={event => setProjectSchedulingDraft(current => current && ({ ...current, max_concurrent_implementations: Number(event.target.value) }))} /></label>
+          {(!positiveInteger(projectSchedulingDraft.max_concurrent_implementations) || projectSchedulingDraft.max_concurrent_implementations > 1000) && <p className="error-message" role="alert">Enter a whole number from 1 to 1000.</p>}
+          <p className="text-xs text-dim">{projectScheduling?.source === 'defaults' ? 'Showing project defaults. ' : ''}Lowering the limit waits for existing work; it does not stop a run.</p>
+        </> : <p className="text-xs text-dim">Loading project scheduling…</p>}
+      </>}
       <AppearanceSelector /><RecentRunsLimit />
       <h3>Server settings</h3>
       {server && Object.values(server.restart).some(Boolean) && <p role="status">Saved server binding or root changes require a server restart.</p>}
@@ -979,7 +1061,7 @@ export function GlobalSettings({ onDirtyChange, onSaved }: { onDirtyChange: (dir
           </div>
         </details>
       </>}
-      {tab === 'Workflows' && <SidebarEditorLayout selection={selectedWorkflow} navigationVersion={navigationVersion} listLabel="Workflows" navigation={<div>{['Defaults', ...workflowNames].map(name => <button data-sidebar-editor-item={name} className={`btn sidebar-entry ${selectedWorkflow === name ? 'btn-primary' : 'btn-secondary'}`} aria-pressed={selectedWorkflow === name} key={name} onClick={() => { setSelectedWorkflow(name); setNavigationVersion(value => value + 1) }}>{name === 'Defaults' ? name : formatMachineChoice(name, workflowNames)}</button>)}</div>}><div className="settings-fields">{selectedWorkflow === 'Defaults' && <><h3>Defaults</h3><Combobox label="Default workflow" value={draft.default_workflow ?? ''} options={workflowNames} optionLabel={value => formatMachineChoice(value, workflowNames)} onChange={value => change(next => { next.default_workflow = value })} /><label>Max turns<input className="input" type="number" min="1" value={draft.max_turns ?? ''} onChange={e => change(next => { next.max_turns = e.target.value === '' ? null : Number(e.target.value) })} /></label><label>Manager supervision<select className="input" aria-label="Default manager supervision" value={draft.default_manager_enabled == null ? 'unset' : draft.default_manager_enabled ? 'enabled' : 'disabled'} onChange={e => change(next => { const raw = e.target.value; next.default_manager_enabled = raw === 'unset' ? null : raw === 'enabled' })}><option value="enabled">Enabled</option><option value="disabled">Disabled</option><option value="unset">Disabled (default)</option></select></label><p className="text-xs text-dim">Applies to new runs in every workflow without its own override. Omitted means disabled.</p></>}{Object.entries(draft.workflows).filter(([name]) => name === selectedWorkflow).map(([workflow, value]) => <div className="card" key={workflow}><h3>{formatMachineChoice(workflow, workflowNames)}</h3><p>{(value.executable_steps ?? value.declared_steps).map(formatMachineLabel).join(' → ')}</p><label>Default team<select className="input" value={draft.workflow_default_teams[workflow] ?? ''} onChange={e => change(next => { next.workflow_default_teams[workflow] = e.target.value || null })}><option value="">Unset</option>{teamNames.map(team => <option key={team} value={team}>{formatMachineChoice(team, teamNames)}</option>)}</select></label><label>Manager supervision<select className="input" aria-label={`Manager supervision for workflow ${formatMachineChoice(workflow, workflowNames)}`} value={value.manager_enabled == null ? 'inherit' : value.manager_enabled ? 'enabled' : 'disabled'} onChange={e => change(next => { const raw = e.target.value; next.workflows[workflow].manager_enabled = raw === 'inherit' ? null : raw === 'enabled' })}><option value="inherit">Inherit</option><option value="enabled">Enabled</option><option value="disabled">Disabled</option></select></label><p className="text-xs text-dim">Effective supervision: {(value.effective_manager_enabled ?? false) ? 'Enabled' : 'Disabled'} ({managerSourceLabel(value.manager_enabled_source)}). Applies to new runs; the launch-default workflow does not affect inheritance.</p></div>)}</div></SidebarEditorLayout>}
+      {tab === 'Workflows' && <SidebarEditorLayout selection={selectedWorkflow} navigationVersion={navigationVersion} listLabel="Workflows" navigation={<div>{['Defaults', ...workflowNames].map(name => <button data-sidebar-editor-item={name} className={`btn sidebar-entry ${selectedWorkflow === name ? 'btn-primary' : 'btn-secondary'}`} aria-pressed={selectedWorkflow === name} key={name} onClick={() => { setSelectedWorkflow(name); setNavigationVersion(value => value + 1) }}>{name === 'Defaults' ? name : formatMachineChoice(name, workflowNames)}</button>)}</div>}><div className="settings-fields">{selectedWorkflow === 'Defaults' && <><h3>Defaults</h3><button type="button" className="btn btn-secondary btn-sm" onClick={() => setTab('General')}>Set default workflow in General…</button><label>Max turns<input className="input" type="number" min="1" value={draft.max_turns ?? ''} onChange={e => change(next => { next.max_turns = e.target.value === '' ? null : Number(e.target.value) })} /></label><label>Manager supervision<select className="input" aria-label="Default manager supervision" value={draft.default_manager_enabled == null ? 'unset' : draft.default_manager_enabled ? 'enabled' : 'disabled'} onChange={e => change(next => { const raw = e.target.value; next.default_manager_enabled = raw === 'unset' ? null : raw === 'enabled' })}><option value="enabled">Enabled</option><option value="disabled">Disabled</option><option value="unset">Disabled (default)</option></select></label><p className="text-xs text-dim">Applies to new runs in every workflow without its own override. Omitted means disabled.</p><label>Default repair threshold<input className="input" type="number" min="1" step="1" value={draft.default_upgrade_after_repairs ?? draft.effective_default_upgrade_after_repairs ?? 1} onChange={e => change(next => { next.default_upgrade_after_repairs = Number(e.target.value) })} /></label><p className="text-xs text-dim">Effective: {repairThresholdDisplay(draft).value} failed repairs before changing team.</p></>}{Object.entries(draft.workflows).filter(([name]) => name === selectedWorkflow).map(([workflow, value]) => <div className="card" key={workflow}><h3>{formatMachineChoice(workflow, workflowNames)}</h3><p>{(value.executable_steps ?? value.declared_steps).map(formatMachineLabel).join(' → ')}</p><label>Default team<select className="input" value={draft.workflow_default_teams[workflow] ?? ''} onChange={e => change(next => { next.workflow_default_teams[workflow] = e.target.value || null })}><option value="">Unset</option>{teamNames.map(team => <option key={team} value={team}>{formatMachineChoice(team, teamNames)}</option>)}</select></label><label>Manager supervision<select className="input" aria-label={`Manager supervision for workflow ${formatMachineChoice(workflow, workflowNames)}`} value={value.manager_enabled == null ? 'inherit' : value.manager_enabled ? 'enabled' : 'disabled'} onChange={e => change(next => { const raw = e.target.value; next.workflows[workflow].manager_enabled = raw === 'inherit' ? null : raw === 'enabled' })}><option value="inherit">Inherit</option><option value="enabled">Enabled</option><option value="disabled">Disabled</option></select></label><p className="text-xs text-dim">Effective supervision: {(value.effective_manager_enabled ?? false) ? 'Enabled' : 'Disabled'} ({managerSourceLabel(value.manager_enabled_source)}). Applies to new runs; the launch-default workflow does not affect inheritance.</p><label>Repair threshold for {formatMachineChoice(workflow, workflowNames)}<input className="input" type="number" min="1" step="1" placeholder="Inherit" value={value.upgrade_after_repairs ?? ''} onChange={e => change(next => { next.workflows[workflow].upgrade_after_repairs = e.target.value === '' ? null : Number(e.target.value) })} /></label><p className="text-xs text-dim">{repairThresholdText(draft, workflow)}</p></div>)}</div></SidebarEditorLayout>}
       {tab === 'Prompts' && <PromptsSettings selected={selectedPrompt} onSelect={setSelectedPrompt} draft={draft} change={change} names={pendingNames} rename={(name, target) => setPendingNames({ ...pendingNames, [name]: target })}
         deleted={deletedPrompts}
         onDelete={(name, text) => {

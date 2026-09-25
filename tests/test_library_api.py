@@ -365,7 +365,7 @@ class LibraryStartupTests(unittest.TestCase):
             encoding="utf-8",
         )
         subprocess.run(
-            ["git", "add", str(request.plan_path)],
+            ["git", "add", "-f", str(request.plan_path)],
             cwd=self.repo_root,
             check=True,
             capture_output=True,
@@ -388,7 +388,11 @@ class LibraryStartupTests(unittest.TestCase):
 
         self.assertIn("HEAD changed after preparation", str(raised.exception))
         self.assertEqual(runner_calls, [])
-        self.assertFalse((self.repo_root / ".aflow").exists())
+        from aflow.project_admission import ProjectAdmission
+
+        runs_dir = self.repo_root / ".aflow" / "runs"
+        self.assertFalse(runs_dir.exists() and any(runs_dir.iterdir()))
+        self.assertEqual(ProjectAdmission(self.repo_root).snapshot().occupied_count, 0)
 
     def test_prepare_startup_current_branch_continuation_rejects_boundaries(self) -> None:
         cases = (

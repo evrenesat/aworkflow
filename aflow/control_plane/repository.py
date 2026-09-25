@@ -11,6 +11,7 @@ from typing import Any, Literal, Mapping
 
 from aflow.run_state import load_override_request
 from aflow.recovery_runtime import RECOVERY_OPERATION_STATES, RECOVERY_RUNTIME_FIELDS
+from aflow.project_settings import ProjectSettingsService
 
 from .models import (
     CONTROL_PLANE_SCHEMA_VERSION,
@@ -154,10 +155,18 @@ class RunRepository:
         if not root.is_dir():
             raise RepositoryError(f"repository root does not exist: {root}")
         self._root = root
+        self._project_settings: ProjectSettingsService | None = None
 
     @property
     def repo_root(self) -> Path:
         return self._root
+
+    @property
+    def project_settings(self) -> ProjectSettingsService:
+        """Return the shared settings service for this checkout's project."""
+        if self._project_settings is None:
+            self._project_settings = ProjectSettingsService(self._root)
+        return self._project_settings
 
     def project(self) -> ProjectRecord:
         return ProjectRecord(project_id=self._root.name, root=str(self._root))

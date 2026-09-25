@@ -47,6 +47,32 @@ def test_loader_reads_the_selected_pair_once_and_reports_provenance(tmp_path: Pa
     assert loaded.workflow_config.workflows["simple"].first_step == "implement"
 
 
+def test_live_loader_reloads_upgrade_threshold_from_selected_pair(tmp_path: Path) -> None:
+    config_path, workflows_path = _write_split_config(
+        tmp_path / "selected", VALID_AFLOW, VALID_WORKFLOWS
+    )
+
+    initial = load_live_config(config_path)
+    assert initial.workflow_config.workflows["simple"].upgrade_after_repairs == 1
+
+    workflows_path.write_text(
+        '[workflow]\nupgrade_after_repairs = 3\n\n' + VALID_WORKFLOWS,
+        encoding="utf-8",
+    )
+    reloaded = load_live_config(config_path)
+
+    assert reloaded.source.kind == "explicit"
+    assert reloaded.workflow_config.workflows["simple"].upgrade_after_repairs == 3
+    assert (
+        reloaded.workflow_config.workflows["simple"].declared_upgrade_after_repairs
+        is None
+    )
+    assert (
+        reloaded.workflow_config.workflows["simple"].upgrade_after_repairs_source
+        == "defaults"
+    )
+
+
 def test_relative_filesystem_settings_use_the_selected_file_directory(
     tmp_path: Path,
 ) -> None:

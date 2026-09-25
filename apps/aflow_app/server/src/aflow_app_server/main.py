@@ -45,6 +45,12 @@ from aflow.daemon import (
     DurableRecoveryRejection,
     ExtraInstructionsValidationError,
 )
+from aflow.plan_consumer import PlanConsumer
+from aflow.project_admission import ProjectAdmissionError
+from aflow.project_settings import (
+    ProjectSettingsError, ProjectSettingsRevisionConflict,
+    ProjectSettingsValidationError,
+)
 
 from .browser_session import (
     SESSION_COOKIE_NAME,
@@ -60,7 +66,7 @@ from .control_plane_service import (
     ProjectNotAllowedError,
 )
 from .global_config_service import GlobalConfigService
-from .models import GlobalConfigPatchPayload, CanonicalTransportModel
+from .models import GlobalConfigPatchPayload, ProjectSchedulingPatchPayload, CanonicalTransportModel
 from .config_response import config_response, config_validation_response
 from .guided_config import GuidedConfigError, guided_form_response
 from .mcp_adapter import create_control_plane_mcp
@@ -102,6 +108,7 @@ from .plan_service import (
     PlanAlreadyExists,
     PlanProjectNotFound,
     PlanRevisionConflict,
+    PlanRequeueResumeConflict,
     PlanService,
     PlanServiceError,
 )
@@ -111,6 +118,7 @@ from .project_config_service import (
     ProjectConfigRevisionConflict,
 )
 from .project_discovery import ProjectDiscoveryUnavailable, discover_projects
+from .scheduling_service import SchedulingService
 from .project_registry import (
     ProjectReadProjection,
     ProjectRegistry,
@@ -152,6 +160,7 @@ _global_config_service: Any = None
 _project_registry: ProjectRegistry | None = None
 _plan_service: PlanService | None = None
 _control_plane_service: ControlPlaneService | None = None
+_plan_consumer: PlanConsumer | None = None
 _seen_plugin_probe_fingerprints: set[str] = set()
 
 _EVENT_STREAM_POLL_INTERVAL_SECONDS = 0.1
@@ -322,6 +331,16 @@ def get_plan_service() -> PlanService:
     if _plan_service is None:
         raise RuntimeError("Server not initialized")
     return _plan_service
+
+
+def get_scheduling_service() -> SchedulingService:
+    if _project_registry is None or _plan_service is None:
+        raise RuntimeError("Server not initialized")
+    return SchedulingService(
+        _project_registry, _plan_service,
+        reason=_plan_consumer.reason if _plan_consumer is not None else None,
+        wake=_plan_consumer.wake if _plan_consumer is not None else None,
+    )
 
 
 def get_control_plane_service() -> ControlPlaneService:
@@ -521,6 +540,7 @@ mcp_server = create_control_plane_mcp(
     get_control_plane_service,
     get_plan_service=get_plan_service,
     get_global_config_service=get_global_config_service,
+    get_scheduling_service=get_scheduling_service,
 )
 mcp_http_app = mcp_server.http_app(path="/", json_response=True, stateless_http=True)
 
@@ -545,7 +565,7 @@ class _MCPMount(Mount):
 async def lifespan(app: FastAPI):
     """Initialize canonical project, plan, config, and run services."""
     global _config, _project_registry, _plan_service, _control_plane_service
-    global _global_config_service
+    global _global_config_service, _plan_consumer
 
     if _configured_config is not None:
         _config = _configured_config
@@ -559,7 +579,6 @@ async def lifespan(app: FastAPI):
         _config.project_registry_path,
     )
     _project_registry = project_registry
-    _plan_service = PlanService(project_registry)
     service_config = ControlPlaneServiceConfig(
         registry=project_registry,
         aflow_executable=_config.aflow_executable,
@@ -583,6 +602,38 @@ async def lifespan(app: FastAPI):
         )
     _control_plane_service = ControlPlaneService(service_config)
     _control_plane_service.start()
+    control_plane = _control_plane_service
+
+    def _launch_automatic(
+        project_id: str, plan_path: str, key: str, revision: str,
+        _workflow_name: str, _team: str | None, identity: str,
+    ) -> object:
+        return control_plane.start_run(
+            project_id, plan_path=plan_path, workflow_name=None,
+            team=None, start_step=None, max_turns=None,
+            idempotency_key=key, expected_plan_revision=revision,
+            expected_plan_identity=identity,
+            automatic=True,
+        )
+
+    def _classify_invalid(project_id: str, name: str, revision: str) -> None:
+        assert _plan_service is not None
+        _plan_service.classify(
+            project_id, name, revision, target="needs_plan_change",
+            reason_code="plan_validation_failed",
+            reason="Plan content needs correction before automatic start.",
+        )
+
+    _plan_consumer = PlanConsumer(
+        projects=lambda: (
+            (project.project_id, Path(project.root))
+            for project in control_plane.projects()
+        ),
+        launch=_launch_automatic,
+        classify_invalid=_classify_invalid,
+        config_path=control_plane.workflow_config_path,
+    )
+    _plan_service = PlanService(project_registry, on_change=_plan_consumer.wake)
     from .config import global_config_dir
 
     _global_config_service = GlobalConfigService(
@@ -590,9 +641,13 @@ async def lifespan(app: FastAPI):
         audit_path=_config.config_audit_path,
     )
     try:
+        _plan_consumer.start()
         async with mcp_http_app.lifespan(app):
             yield
     finally:
+        if _plan_consumer is not None:
+            _plan_consumer.stop()
+        _plan_consumer = None
         _config = None
         _project_registry = None
         _plan_service = None
@@ -710,7 +765,11 @@ async def startup_failure_handler(_: Request, exception: DaemonStartupError) -> 
     if exception.run_id is not None:
         extra["run_id"] = exception.run_id
     return _error_response(
-        status.HTTP_422_UNPROCESSABLE_CONTENT,
+        (
+            status.HTTP_409_CONFLICT
+            if exception.code in {"project_capacity_reached", "project_plan_claim_conflict"}
+            else status.HTTP_422_UNPROCESSABLE_CONTENT
+        ),
         exception.code,
         **extra,
     )
@@ -784,6 +843,29 @@ async def config_revision_conflict_handler(
         "revision_conflict",
         current_revision=exc.current_revision,
     )
+
+
+@app.exception_handler(ProjectSettingsRevisionConflict)
+async def project_settings_revision_conflict_handler(
+    _: Request, exc: ProjectSettingsRevisionConflict,
+) -> JSONResponse:
+    return _error_response(
+        status.HTTP_409_CONFLICT, "revision_conflict",
+        current_revision=exc.current_revision,
+    )
+
+
+@app.exception_handler(ProjectSettingsValidationError)
+async def project_settings_validation_handler(
+    _: Request, __: ProjectSettingsValidationError,
+) -> JSONResponse:
+    return _error_response(status.HTTP_422_UNPROCESSABLE_CONTENT, "invalid_scheduling")
+
+
+@app.exception_handler(ProjectSettingsError)
+@app.exception_handler(ProjectAdmissionError)
+async def project_scheduling_unavailable_handler(_: Request, __: Exception) -> JSONResponse:
+    return _error_response(status.HTTP_503_SERVICE_UNAVAILABLE, "scheduling_unavailable")
 
 
 @app.exception_handler(SkillNotFound)
@@ -865,6 +947,16 @@ async def plan_revision_conflict_handler(
 @app.exception_handler(PlanAlreadyExists)
 async def plan_already_exists_handler(_: Request, __: PlanAlreadyExists) -> JSONResponse:
     return _error_response(status.HTTP_409_CONFLICT, "plan_exists")
+
+
+@app.exception_handler(PlanRequeueResumeConflict)
+async def plan_requeue_resume_conflict_handler(
+    _: Request, exc: PlanRequeueResumeConflict,
+) -> JSONResponse:
+    return _error_response(
+        status.HTTP_409_CONFLICT, "plan_requeue_resume_conflict",
+        plan_path=exc.plan_path,
+    )
 
 
 @app.exception_handler(GuidedConfigError)
@@ -1500,6 +1592,38 @@ def get_project(
     if project is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Project not found")
     return project
+
+
+@app.get("/api/projects/{project_id}/scheduling", tags=["settings"])
+def get_project_scheduling(
+    project_id: str,
+    _: str = Depends(verify_token),
+    service: SchedulingService = Depends(get_scheduling_service),
+) -> dict[str, object]:
+    return service.read(project_id)
+
+
+@app.patch("/api/projects/{project_id}/scheduling", tags=["settings"])
+def patch_project_scheduling(
+    project_id: str,
+    payload: ProjectSchedulingPatchPayload,
+    _: str = Depends(verify_token),
+    service: SchedulingService = Depends(get_scheduling_service),
+) -> dict[str, object]:
+    saved = service.update(
+        project_id, expected_revision=payload.expected_revision,
+        changes=payload.changes(),
+    )
+    return saved
+
+
+@app.get("/api/projects/{project_id}/queue", tags=["plans"])
+def get_project_queue(
+    project_id: str,
+    _: str = Depends(verify_token),
+    service: SchedulingService = Depends(get_scheduling_service),
+) -> dict[str, object]:
+    return service.queue(project_id)
 
 
 @app.patch("/api/projects/{project_id}")

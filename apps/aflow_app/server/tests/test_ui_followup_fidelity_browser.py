@@ -649,6 +649,10 @@ def test_ui_followup_run_rows(
                     loading_mode["enabled"] = exercise_loading
                     page.goto(f"{url}/?view=all-runs", wait_until="load")
                     _wait_for_fidelity_readiness(page)
+                    # WebKit may reject detail fetches from the document just
+                    # replaced by this navigation. Check errors on the settled
+                    # destination surface rather than the discarded document.
+                    page_errors.clear()
                     _assert_theme(page, theme)
                     page.get_by_role("heading", name="All runs", exact=True).wait_for()
                     if exercise_loading:
@@ -829,6 +833,7 @@ def test_ui_followup_run_rows(
                         )
                         page.goto(f"{url}/?view=all-runs", wait_until="load")
                         _wait_for_fidelity_readiness(page)
+                        page_errors.clear()
                         page.get_by_role("heading", name="All runs", exact=True).wait_for()
 
                     # The parent copy has an evidenced zero approval count in
@@ -903,6 +908,7 @@ def test_ui_followup_run_rows(
 
                     screenshot = artifact_dir / f"run-rows-{browser_name}-{theme}-{width}x{height}.png"
                     page.screenshot(path=str(screenshot), full_page=True)
+                    assert page_errors == [], page_errors
             writes = [
                 {"method": method, "url": request_url}
                 for method, request_url in requests
@@ -971,11 +977,23 @@ def test_ui_followup_launch_review(
     dirty: bool,
 ) -> None:
     """Keep launch preparation concise while making the final action deliberate."""
+    from aflow.project_settings import ProjectSettings, ProjectSettingsService
+
     _, root, units, _ = control_client
+    settings = ProjectSettingsService(root)
+    settings.save(
+        ProjectSettings(
+            auto_consume_plans=False,
+            max_concurrent_implementations=3,
+        ),
+        expected_revision=settings.read().revision,
+    )
     fixtures = seed_demo_fidelity_fixture(root)
     running = fixtures["running"]
     assert isinstance(running, dict)
     running_plan = Path(running["plan"])
+    launch_plan = running_plan.with_name("launch-review.md")
+    launch_plan.write_bytes(running_plan.read_bytes())
     _commit_fixture_repository(root)
     dirty_paths = [f"launch-review-dirty-{index:02}.txt" for index in range(12)]
     if dirty:
@@ -1031,14 +1049,14 @@ def test_ui_followup_launch_review(
                 lambda response: response.request.method == "POST"
                 and response.url.endswith("/runs/preflight")
                 and response.status == 200
-                and response.request.post_data_json.get("plan_path") == running_plan.relative_to(root).as_posix()
+                and response.request.post_data_json.get("plan_path") == launch_plan.relative_to(root).as_posix()
                 and response.request.post_data_json.get("workflow_name") == "managed",
                 timeout=30_000,
             ) as selected_preflight:
                 plan_input.click()
-                plan_input.fill(running_plan.name)
-                page.get_by_role("option", name=running_plan.name, exact=False).click()
-            expect(plan_input).to_have_value(running_plan.relative_to(root).as_posix())
+                plan_input.fill(launch_plan.name)
+                page.get_by_role("option", name=launch_plan.name, exact=False).click()
+            expect(plan_input).to_have_value(launch_plan.relative_to(root).as_posix())
             assert selected_preflight.value.status == 200
 
             visible_dashboard = page.locator('.dashboard-host:not([hidden])').first
@@ -1139,7 +1157,7 @@ def test_ui_followup_launch_review(
                     and urlsplit(response.url).path == f"/api/control-plane/projects/{PROJECT_ID}/runs"
                 ) as start_response:
                     page.get_by_role("button", name="Start run", exact=True).click()
-                assert start_response.value.status == 201
+                assert start_response.value.status == 201, start_response.value.text()
                 result = start_response.value.json()["result"]
                 returned_run_id = result["run_id"]
                 page.wait_for_function(

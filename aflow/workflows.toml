@@ -5,7 +5,9 @@
 setup = ["worktree", "branch"]
 teardown = ["merge", "rm_worktree"]
 main_branch = "main"
-manager_enabled = true
+manager_enabled = false
+# Number of reviewed repairs before the next eligible worker team is used.
+upgrade_after_repairs = 1
 
 # Ralph loop, single-step implementation with no review phase.
 [workflow.ralph.steps.implement_plan]

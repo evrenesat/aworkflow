@@ -553,6 +553,17 @@ def test_resume_creates_one_new_continuation_and_audits_the_source(tmp_path: Pat
         assert list(source_dir.parent.iterdir()) == [source_dir]
         assert source_dir.joinpath("run.json").read_bytes() == before
         return
+    if source_status == "running":
+        with pytest.raises(DaemonError, match="predecessor inactivity"):
+            daemon.service.resume(
+                source_id,
+                caller_scope="project:one",
+                idempotency_key="resume-1",
+            )
+        assert units.start_calls == []
+        assert list(source_dir.parent.iterdir()) == [source_dir]
+        assert source_dir.joinpath("run.json").read_bytes() == before
+        return
     assert daemon.service.run_status(source_id).evidence["can_resume"] is True
     assert source_dir.joinpath("run.json").read_bytes() == before
     assert units.start_calls == []
@@ -579,6 +590,226 @@ def test_resume_creates_one_new_continuation_and_audits_the_source(tmp_path: Pat
     source_events = read_events(source_dir)
     assert [event.event_type for event in source_events].count("resume_requested") == 1
     assert source_dir.joinpath("run.json").read_bytes() == before
+
+
+def _resume_publication_fixture(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> tuple[AflowDaemon, StartupRequest, str]:
+    units = InMemoryUnitManager()
+    daemon, request = _daemon_for_config(tmp_path, monkeypatch, units, _workflow_config())
+    source_id = "resume-publication-source"
+    create_launch_manifest(
+        request.repo_root,
+        LaunchManifest(
+            run_id=source_id,
+            project_root=str(request.repo_root),
+            plan_path=str(request.plan_path),
+            workflow_name="managed",
+            max_turns=2,
+            idempotency_key="source-key",
+            caller_scope="project:one",
+        ),
+    )
+    source_dir = request.repo_root / ".aflow" / "runs" / source_id
+    source_dir.mkdir()
+    source_dir.joinpath("run.json").write_text(
+        '{"status":"failed","workflow_name":"managed",'
+        '"team":null,"selected_start_step":null}'
+    )
+    write_launch_phase(request.repo_root, source_id, "failed")
+    bootstrap = SimpleNamespace(
+        workflow_name="managed",
+        plan_path=request.plan_path,
+        max_turns=2,
+        team=None,
+        start_step="implement",
+        extra_instructions=(),
+        workflow_config=_workflow_config(),
+        resume_context=object(),
+    )
+    monkeypatch.setattr(
+        "aflow.cli._bootstrap_resume_invocation",
+        lambda **_kwargs: bootstrap,
+    )
+    return daemon, request, source_id
+
+
+def test_capacity_rejections_do_not_retain_transient_resume_instructions(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from aflow.daemon import DaemonStartupError
+    from aflow.project_admission import ProjectAdmission
+    from aflow.project_settings import ProjectSettings, ProjectSettingsService
+
+    daemon, request, source_id = _resume_publication_fixture(tmp_path, monkeypatch)
+    settings = ProjectSettingsService(request.repo_root)
+    settings.update(
+        ProjectSettings(max_concurrent_implementations=1),
+        expected_revision=settings.read().revision,
+    )
+    admission = ProjectAdmission(request.repo_root)
+    occupied = admission.acquire("occupied-resume", idempotency_key="occupied-resume")
+    attempted = iter(("rejected-resume-one", "rejected-resume-two", "admitted-resume"))
+    monkeypatch.setattr("aflow.daemon.reserve_run_id", lambda _root: next(attempted))
+
+    for key, run_id in (("one", "rejected-resume-one"), ("two", "rejected-resume-two")):
+        with pytest.raises(DaemonStartupError) as raised:
+            daemon.service.resume(
+                source_id,
+                caller_scope="project:one",
+                idempotency_key=key,
+                extra_instructions=("private-resume-guidance",),
+            )
+        assert raised.value.code == "project_capacity_reached"
+        assert run_id not in daemon.service._transient_extra_instructions
+        assert admission.reservation(run_id) is None
+        assert admission.snapshot().occupied_count == 1
+
+    admission.release(occupied.run_id, occupied.nonce)
+    monkeypatch.setattr(
+        "aflow.cli._bootstrap_resume_invocation",
+        lambda **kwargs: SimpleNamespace(
+            workflow_name="managed",
+            plan_path=request.plan_path,
+            max_turns=2,
+            team=None,
+            start_step="implement",
+            extra_instructions=kwargs["extra_instructions_arg"],
+            workflow_config=_workflow_config(),
+            resume_context=object(),
+        ),
+    )
+    admitted = daemon.service.resume(
+        source_id,
+        caller_scope="project:one",
+        idempotency_key="admitted",
+        extra_instructions=("private-resume-guidance",),
+    )
+    assert admitted.status == "running"
+    assert "--extra-instruction=private-resume-guidance" in daemon.application.units.start_calls[0][1]
+    assert admitted.run_id not in daemon.service._transient_extra_instructions
+
+
+def test_distinct_managed_resume_cannot_claim_the_same_source(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from aflow.daemon import DaemonStartupError
+
+    daemon, _request, source_id = _resume_publication_fixture(tmp_path, monkeypatch)
+    attempted = iter(("first-successor", "second-successor"))
+    monkeypatch.setattr("aflow.daemon.reserve_run_id", lambda _root: next(attempted))
+    first = daemon.service.resume(
+        source_id, caller_scope="project:one", idempotency_key="first-key"
+    )
+    assert first.status == "running"
+
+    with pytest.raises(DaemonStartupError, match="unresolved successor") as rejected:
+        daemon.service.resume(
+            source_id,
+            caller_scope="project:one",
+            idempotency_key="second-key",
+            extra_instructions=("private-guidance",),
+        )
+    assert rejected.value.code == "project_admission_error"
+    assert "second-successor" not in daemon.service._transient_extra_instructions
+    assert daemon.service._admission.reservation("second-successor") is None
+    assert daemon.service._admission.snapshot().occupied_count == 1
+    assert len(daemon.application.units.start_calls) == 1
+
+    replay = daemon.service.resume(
+        source_id, caller_scope="project:one", idempotency_key="first-key"
+    )
+    assert replay.run_id == first.run_id
+    assert len(daemon.application.units.start_calls) == 1
+
+
+@pytest.mark.parametrize(
+    "failure_kind", ["manifest", "successor_directory", "startup_record"]
+)
+def test_resume_releases_unbound_admission_on_publication_failures(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    failure_kind: str,
+) -> None:
+    daemon, request, source_id = _resume_publication_fixture(tmp_path, monkeypatch)
+    target_id = "resume-publication-target"
+    monkeypatch.setattr("aflow.daemon.reserve_run_id", lambda _root: target_id)
+    unsafe_path: Path | None = None
+
+    if failure_kind == "manifest":
+        def fail_manifest(*_args: object, **_kwargs: object) -> None:
+            raise ValueError("synthetic manifest failure")
+
+        monkeypatch.setattr("aflow.daemon.create_launch_manifest", fail_manifest)
+    elif failure_kind == "successor_directory":
+        unsafe_path = request.repo_root / "successor-file"
+        unsafe_path.write_text("not a directory", encoding="utf-8")
+        original_run_directory = daemon.application.repository.run_directory
+
+        def run_directory(run_id: str) -> Path:
+            if run_id == target_id:
+                return unsafe_path
+            return original_run_directory(run_id)
+
+        monkeypatch.setattr(daemon.application.repository, "run_directory", run_directory)
+    else:
+        def fail_record(_record: object) -> None:
+            raise DaemonError("synthetic startup record failure")
+
+        monkeypatch.setattr(daemon.service, "_create_record", fail_record)
+
+    with pytest.raises(DaemonError):
+        daemon.service.resume(
+            source_id,
+            caller_scope="project:one",
+            idempotency_key=f"resume-{failure_kind}",
+        )
+
+    reservation = daemon.service._admission.reservation(target_id)
+    assert reservation is not None
+    assert reservation.state == "released"
+    assert reservation.bound is False
+    assert daemon.service._admission.snapshot().occupied_count == 0
+    assert not (
+        request.repo_root / ".aflow" / "launches" / f"{target_id}.json"
+    ).exists()
+    assert not (
+        request.repo_root / ".aflow" / "launches" / f"{target_id}.state.json"
+    ).exists()
+    assert not (
+        request.repo_root / ".aflow" / "runs" / target_id
+    ).exists()
+    if failure_kind == "successor_directory":
+        assert unsafe_path is not None
+        assert unsafe_path.read_text(encoding="utf-8") == "not a directory"
+
+
+def test_resume_keeps_bound_admission_after_replay_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    daemon, request, source_id = _resume_publication_fixture(tmp_path, monkeypatch)
+    target_id = "resume-bound-target"
+    monkeypatch.setattr("aflow.daemon.reserve_run_id", lambda _root: target_id)
+
+    def fail_replay(*_args: object, **_kwargs: object) -> None:
+        raise DaemonError("synthetic post-bind replay failure")
+
+    monkeypatch.setattr(daemon.service, "_recover_resume_record", fail_replay)
+
+    with pytest.raises(DaemonError, match="post-bind replay failure"):
+        daemon.service.resume(
+            source_id,
+            caller_scope="project:one",
+            idempotency_key="resume-bound",
+        )
+
+    reservation = daemon.service._admission.reservation(target_id)
+    assert reservation is not None
+    assert reservation.bound is True
+    assert reservation.state != "released"
+    assert daemon.service._admission.snapshot().occupied_count == 1
+    assert daemon.application.repository.get_launch_manifest(target_id) is not None
+    assert daemon.service._read_record(target_id)["state"] == "prepared"
 
 
 def test_daemon_resume_uses_relocated_live_config_after_legacy_snapshot_damage(
@@ -735,10 +966,10 @@ def test_resume_extra_instructions_inherit_replace_and_clear(
     source_dir = request.repo_root / ".aflow" / "runs" / source_id
     source_dir.mkdir()
     source_dir.joinpath("run.json").write_text(
-        '{"status":"running","workflow_name":"managed","team":null,'
+        '{"status":"failed","workflow_name":"managed","team":null,'
         '"selected_start_step":null,"extra_instructions":["saved guidance"]}'
     )
-    write_launch_phase(request.repo_root, source_id, "unit_started")
+    write_launch_phase(request.repo_root, source_id, "failed")
     before = source_dir.joinpath("run.json").read_bytes()
     bootstrap_calls: list[dict[str, object]] = []
 
@@ -817,10 +1048,10 @@ def test_resume_extra_instructions_reuse_conflicts_without_mutation(
     source_dir = request.repo_root / ".aflow" / "runs" / source_id
     source_dir.mkdir()
     source_dir.joinpath("run.json").write_text(
-        '{"status":"running","workflow_name":"managed","team":null,'
+        '{"status":"failed","workflow_name":"managed","team":null,'
         '"selected_start_step":null,"extra_instructions":[]}'
     )
-    write_launch_phase(request.repo_root, source_id, "unit_started")
+    write_launch_phase(request.repo_root, source_id, "failed")
     monkeypatch.setattr(
         "aflow.cli._bootstrap_resume_invocation",
         lambda **kwargs: SimpleNamespace(

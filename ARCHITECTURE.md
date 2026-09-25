@@ -4,6 +4,70 @@ AFlow is a plan-driven workflow orchestrator that runs coding tasks through exis
 
 `RunMetadataWriter` is the workflow controller's bound schema-v2 persistence boundary, holding stable run identity while each write supplies mutable lifecycle state explicitly.
 
+## Project launch admission
+
+The UI server owns one `PlanConsumer` scanner per registered primary project,
+elected with a cross-process scanner lock. It examines direct regular Markdown
+files in `plans/in-progress` after two stable observations, on a bounded
+five-second pass or a plan/completion wakeup. Drafts stay in `plans/todo`;
+invalid content and confirmed inactive run failures move through the journal
+to `plans/needs-plan-change` and `plans/failed`. A revision-checked requeue
+returns a corrected original to Ready and resumes eligible recorded lineage.
+Only receipt-backed publication moves an original to `plans/done`. These five
+directories share plan identity and lifecycle provenance. Scanner shutdown
+does not stop workflow units.
+
+The consumer resolves the current global default workflow and team for each
+admission, requires isolated worktree delivery, and passes a durable request
+key to the managed control plane. It does not own worker launch, claims,
+capacity, or publication. Default project settings enable consumption with two
+implementation slots; manual, CLI, and automatic launches use the same
+admission lock. A startup question retains the plan claim but releases its
+capacity slot. The controller serializes shared-main publication under its
+separate publication lock, without holding admission through fetch/merge/push.
+
+`PlanDependencies` records numbered series across the five directories and
+linked checkouts. It accepts positive `series_P01_title.md` positions with
+gaps, rejects malformed or duplicate members, and requires matching
+receipt-backed delivery for every known lower member. A failed member blocks
+its series while unrelated series remain eligible.
+
+The server's project scheduling REST and MCP contracts read and update the
+same primary-checkout `ProjectSettingsService` document. GET leaves absent
+settings at their defaults; PATCH uses its revisioned compare-and-swap. Queue
+reads combine plan lifecycle records, admission claims/capacity, known
+receipt-backed dependencies, and the consumer's current reason codes without
+creating another scheduler. Global typed repair-threshold actions transform
+the locked `aflow.toml`/`workflows.toml` pair; the form reports declared and
+effective values and their inheritance source.
+
+`aflow/project_admission.py` keeps nonce-bound reservations under one lock in
+the primary project's `.aflow` directory. It reconciles controller, startup,
+unit, receipt, and process-birth evidence before counting reserved, starting,
+active, and uncertain logical runs against the project scheduling limit. A
+daemon start or resume reserves before launch publication; its worker consumes
+the same reservation. Direct CLI and API controllers enter through
+`run_workflow`. Startup questions retain their plan claim while releasing the
+capacity slot, then reacquire a slot before launch. Ambiguous ownership keeps
+its slot until inactivity is proven. Manual capacity conflicts carry the
+`project_capacity_reached` code; automatic callers can defer on that code.
+The same lock also admits only one unresolved successor per predecessor,
+using reservation and persisted lineage evidence. Exact retries reuse their
+claim; another successor waits until the first is authoritatively inactive.
+The daemon's read-only `can_resume` hint uses the same predecessor inactivity
+check as locked admission; a stopped or missing unit with running controller
+metadata remains uncertain and cannot be offered for resume.
+The same lock also admits only one unresolved run claim for a validated plan
+path across daemon and direct controllers, including linked worktrees. A
+released pending startup question retains its claim; confirmed inactive runs
+can be retried or continued without blocking independent plans. Canonical
+external plan paths have their own bounded identity; plan-claim conflicts
+return HTTP 409 from the server.
+The CLI's validated resume marker permits the source's historical plan claim
+only after admission confirms its current ownership is inactive under that
+lock. Saved running metadata alone does not prove the prior controller stopped;
+terminal direct-controller records or identity-bound worker receipts do.
+
 ## Optional issue-intake boundary
 
 `aflow/issue_intake.py` is a short-lived host command. It loads one strict
@@ -1344,13 +1408,58 @@ its registered parent.
 
 `plan_service.py` resolves each project through that registry and addresses
 only direct regular UTF-8 Markdown files under `plans/todo`,
-`plans/in-progress`, and `plans/done`. It returns SHA-256 revisions, requires an
+`plans/in-progress`, `plans/done`, `plans/failed`, and `plans/needs-plan-change`. It returns SHA-256 revisions, requires an
 expected revision for edits and moves, writes through fsynced temporary files,
 and permits only `todo -> in_progress -> done` promotion. Rejected validation,
 stale edits, and occupied destinations leave the original bytes in place.
 `plan_routes.py` provides the authenticated project-scoped REST adapter. The web
 client uses this same contract for plan creation, editing, promotion, and run
 dashboard launch.
+
+Terminal execution failures and invalid plan content use `plan_lifecycle.py`
+to move the original plan into distinct correction states. A per-identity
+journal records the source revision, file identity, reason, source run, and
+original/current paths before a no-clobber move; replay completes interrupted
+moves. Plan service access and direct controller entry recover prepared moves
+before using affected paths. Admission guards classification and explicit
+requeue against unresolved run claims. Requeue validates the edited revision,
+returns its checked source run with a stable resume replay key, and resumes a
+recorded recoverable run through control-plane admission. Successful delivery retains
+its receipt-backed done transition; a failed receipt retains its run claim and
+gates unrelated later publication until a descendant in the recorded run
+lineage has a valid published receipt for the same configured target. Historical
+failed receipts remain intact.
+
+`plan_dependencies.py` inventories numbered filenames in the five lifecycle
+directories of the primary and verified launching checkout, plus retained plan
+identities, into one additive project journal. Equal filenames in separate Git
+worktrees represent one logical member; different names at one position remain
+duplicates.
+`ProjectAdmission.acquire()` checks the series under the shared admission lock
+before reserving capacity. Known lower positions, malformed sequence members,
+and duplicate positions hold only their series. A lower member clears after
+its identity reaches Done and a matching completed lifecycle has a valid
+published receipt in a verified project checkout; a missing number is not a
+dependency. Delivery checks read verified project worktrees even when the next
+launch uses a different checkout; inventory discovery still touches only the
+primary and launching checkout.
+
+`plan_consumer.py` is owned by the app server lifespan. A nonblocking file lock
+in each registered primary project's `.aflow` directory elects one scanner
+across server processes. Five-second scans require unchanged regular-file
+identity and content in `plans/in-progress` across two observations. The
+consumer rechecks the content revision, plan identity, and project opt-out
+under admission, then calls the existing control-plane start service with a
+stable key derived from plan identity. It checks the saved global default
+before dispatch; the daemon resolves that
+default and its team again for admission. Only isolated worktree delivery
+workflows are eligible. The consumer holds no publication or provider lock;
+capacity and plan claims remain with project admission, and the controller
+continues to own publication. Publication itself holds a separate primary-root
+file lock across fetch, reconciliation, push, and receipt so concurrent
+worktree runs serialize shared-main delivery. Plan and run-artifact watches wake
+the relevant project scanner between bounded periodic passes. Server shutdown releases scanner ownership
+without stopping already launched workflow units.
 
 `project_config_service.py` owns exactly `.aflow/config/aflow.toml` and
 `.aflow/config/workflows.toml` as one validated revisioned pair. Configuration

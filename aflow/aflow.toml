@@ -81,10 +81,10 @@ workflow-specific AFlow review skill for checkpoint and plan bookkeeping,
 lifecycle actions, and conflicting output requirements.
 """
 
-# Interstep supervision is enabled for newly bootstrapped configuration through
-# [workflow].manager_enabled in workflows.toml. Lite is
-# the normal path; Full is selected after the configured semantic-stall limit or
-# when the controller identifies an ambiguous terminal condition.
+# Interstep supervision defaults to disabled in the packaged workflows.toml.
+# Set [workflow.<name>].manager_enabled = true to opt a workflow in; checkpoint
+# and final reviews still run when supervision is disabled. When enabled, Lite
+# is the normal path; Full handles configured stalls or ambiguous boundaries.
 [manager]
 lite_role = 'manager_lite'
 full_role = 'manager_full'
@@ -94,10 +94,11 @@ repartition_skill = 'aflow-repartition-checkpoint'
 
 # Team-specific role overrides live under [teams.<name>.roles]. Missing roles fall back
 # to the global [roles] map. backup_team names the next team to try for harness
-# recovery. upgrade_to is a separate quality escalation route for a
-# manager-selected implementation retry. Each decision advances one edge for
-# one worker invocation; repeated rejection can expose the next edge in the
-# chain. Checkpoint approval resets worker routing to the baseline team. Both
+# recovery. upgrade_to is a separate quality escalation route. After the
+# configured upgrade_after_repairs threshold of failed repairs in one checkpoint
+# scope, the next worker takes one edge even with supervision disabled. An
+# enabled manager may also select one edge for its next implementation action.
+# Checkpoint approval resets worker routing to the baseline team. Both
 # graph targets must be defined teams; self-links and cycles are rejected
 # independently at config validation.
 # [teams.standard]
