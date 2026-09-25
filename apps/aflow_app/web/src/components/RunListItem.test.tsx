@@ -179,6 +179,36 @@ describe('RunListItem', () => {
     expect(selection.textContent).not.toMatch(/approval unknown|total unknown|unavailable/)
   })
 
+  it('shows one known fact in a quiet outcome row while its preview retains full evidence', () => {
+    const gap: RunStatus = {
+      ...run,
+      run_id: '20260911t140026z-d06cc7d7',
+      status: 'needs_attention',
+      status_reason_code: 'unit_missing',
+      activity: 'unknown',
+      started_at: null,
+      progress: null,
+      original_plan_display_name: 'historical-work-20260911.md',
+      original_plan_path: '/plans/historical-work-20260911.md',
+      evidence: { unit_observation: 'missing', has_run_metadata: false, can_resume: false },
+    }
+    const onSelect = vi.fn()
+    const { container } = render(<RunListItem run={gap} stableKey={gap.run_id} quietOutcome contextLabel="Selected · older history" onSelect={onSelect} />)
+    const row = container.querySelector<HTMLElement>('.run-list-item')!
+    const selection = row.querySelector<HTMLButtonElement>('.run-list-select')!
+
+    expect(row.querySelector('.status-pill')).toBeNull()
+    expect(row.querySelector('.run-row-meta')?.textContent).toContain('2026')
+    expect(selection.getAttribute('aria-label')).toContain('Selected · older history')
+    expect(selection.getAttribute('aria-label')).toContain('Outcome not recorded')
+    fireEvent.click(screen.getByRole('button', { name: /Preview Historical work/ }))
+    expect(onSelect).not.toHaveBeenCalled()
+    const preview = screen.getByRole('dialog')
+    expect(preview.textContent).toContain('Outcome not recorded')
+    expect(preview.textContent).toContain(gap.run_id)
+    expect(preview.textContent).toContain('2026')
+  })
+
   it('restores selection focus after a focus-open preview closes with Escape', () => {
     vi.useFakeTimers()
     const { container } = render(<RunListItem run={run} stableKey="run-selection-focus" onSelect={vi.fn()} />)

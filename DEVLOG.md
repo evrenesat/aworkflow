@@ -3976,3 +3976,43 @@ HISTORY: Published clipboard history `c14f1f2`/`cd78d53` remains separate and mu
   passed 49; `git diff --check` passed. Browser commands used
   `AFLOW_BROWSER_ARTIFACT_DIR=/tmp/aflow-ui-disclosure-cp1-artifacts`. Local
   verification does not establish hosted CI, publication or live activation.
+
+## 2026-09-25 — Make large project run history concise (Checkpoint 2)
+
+- Replaced the tall off-page selection notice with one compact pinned run row.
+  When Load more reaches that identity, the row moves into its normal position
+  while preserving selection, focus, and document scroll. Grouped loaded
+  `outcome-unrecorded` rows under a counted disclosure after ordinary runs;
+  selecting a gap opens it, and user disclosure choice survives refresh.
+  Quiet gap rows omit repeated status pills while retaining raw status, full ID,
+  title, and known facts in accessible names and previews.
+- Populated light/dark Chromium and WebKit captures at 320×568, 390×844,
+  1280×720, and 1440×900 were inspected against the frozen calm-workspace
+  reference. Three recent runs remain above the fold; 97 older outcome gaps
+  occupy one disclosure. No material sidebar hierarchy or clipping gap was
+  found. The authenticated header and richer run detail remain existing
+  differences. The browser fixture checks touch preview, 44px targets,
+  overflow, page errors, Back/focus/scroll, and Load more identity uniqueness.
+- Updated two existing browser fixtures exposed by the broader gate: the
+  paged service wrapper now forwards Checkpoint 1's `order`; the late-context
+  hit test accepts a settled layout that stays in place; WebKit's canceled
+  same-origin detail reads during deliberate navigation are excluded from its
+  page-error assertion. The new sidebar fixture still asserts no page errors.
+- Verification: web suite 653 passed; production build passed with the
+  existing chunk-size warning; focused Chromium and WebKit browser suites
+  passed 37 each; full server suite passed 512 with 3 dependency warnings;
+  `git diff --check` passed. The published `be28adcb` base CI gate succeeded.
+  Checkpoint changes remain uncommitted for review; publication and live
+  activation remain separate gates.
+- Review follow-up: the 123-run fixture's first page previously called its
+  100 loaded rows `100 recorded`. The Project runs heading now uses only
+  loaded-page membership and says `100 loaded` while a cursor remains, then
+  `123 recorded` after Load more exhausts it; a pinned direct-link row does
+  not inflate either count. Web tests passed 653, the production build passed,
+  the focused Chromium and WebKit browser cases passed 1 each, and
+  `git diff --check` passed. The current `origin/main` gate is red, so this
+  local correction remains uncommitted and unpublished for review.
+- Checkpoint 2 review: the isolated timeout case and all 653 web tests with one
+  Vitest worker passed; the default parallel suite timed out in that case twice.
+  `origin/main` `46224dfa` subsequently passed all 12 CI jobs. Integration,
+  publication, and live comparison remain separate delivery steps.

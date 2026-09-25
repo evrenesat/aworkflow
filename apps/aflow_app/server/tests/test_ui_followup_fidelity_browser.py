@@ -939,7 +939,18 @@ def test_ui_followup_run_rows(
         + "\n",
         encoding="utf-8",
     )
-    assert page_errors == [], page_errors
+    # WebKit can report a canceled same-origin detail read as an access-control
+    # page error when this matrix deliberately navigates to its next viewport.
+    unexpected_page_errors = [
+        error for error in page_errors
+        if not (
+            browser_name == "webkit"
+            and "/api/control-plane/projects/" in error
+            and "/runs/" in error
+            and "due to access control checks." in error
+        )
+    ]
+    assert unexpected_page_errors == [], page_errors
 
 
 @pytest.mark.parametrize(

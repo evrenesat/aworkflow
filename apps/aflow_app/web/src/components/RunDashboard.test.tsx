@@ -4006,6 +4006,101 @@ describe('RunDashboard', () => {
     expect(onRunSelectionChange).not.toHaveBeenCalledWith(expect.objectContaining({ runId: 'run-owned' }))
   })
 
+  it('moves one selected deep-linked row from its compact pin into the loaded page', async () => {
+    const olderRun = { ...ownedRun, run_id: 'history-older', status: 'completed', progress: null }
+    vi.mocked(api.listControlPlaneRuns).mockImplementation(async (_project, request) => request?.cursor
+      ? { runs: [olderRun], next_cursor: null, schema_version: 1 }
+      : { runs: [ownedRun], next_cursor: ownedRun.run_id, schema_version: 1 })
+    vi.mocked(api.getControlPlaneRun).mockImplementation(async (_project, runId) => runId === olderRun.run_id ? olderRun : ownedRun)
+    const onRunSelectionChange = vi.fn()
+    const { container } = renderDashboard({ requestedRunId: olderRun.run_id, onRunSelectionChange })
+
+    await waitFor(() => expect(container.querySelector('.run-list-pinned')?.getAttribute('data-run-key')).toBe(olderRun.run_id))
+    await waitFor(() => expect(container.querySelector('.run-list > .section-heading > span')?.textContent).toBe('1 loaded'))
+    expect(screen.getByText('Selected · older history')).toBeDefined()
+    expect(container.querySelectorAll(`[data-run-key="${olderRun.run_id}"]`)).toHaveLength(1)
+    expect(screen.queryByText(/outside the loaded history page/)).toBeNull()
+    const pinnedSelection = findRunSelection(olderRun.run_id)!
+    pinnedSelection.focus()
+    fireEvent.click(screen.getByRole('button', { name: 'Load more runs' }))
+
+    await waitFor(() => expect(container.querySelector('.run-list-pinned')).toBeNull())
+    expect(container.querySelector('.run-list > .section-heading > span')?.textContent).toBe('2 recorded')
+    expect(container.querySelectorAll(`[data-run-key="${olderRun.run_id}"]`)).toHaveLength(1)
+    expect(findRunSelection(olderRun.run_id)?.getAttribute('aria-current')).toBe('true')
+    expect(document.activeElement).toBe(findRunSelection(olderRun.run_id))
+    expect(onRunSelectionChange).not.toHaveBeenCalledWith(expect.objectContaining({ runId: ownedRun.run_id }))
+  })
+
+  it('opens the outcome group when a pinned selected gap reaches a later page', async () => {
+    const gap = {
+      ...ownedRun, run_id: 'history-gap', status: 'needs_attention' as const,
+      status_reason_code: 'unit_missing', activity: 'unknown' as const,
+      started_at: null, progress: null,
+      evidence: { unit_observation: 'missing', has_run_metadata: false, can_resume: false },
+    }
+    vi.mocked(api.listControlPlaneRuns).mockImplementation(async (_project, request) => request?.cursor
+      ? { runs: [gap], next_cursor: null, schema_version: 1 }
+      : { runs: [ownedRun], next_cursor: ownedRun.run_id, schema_version: 1 })
+    vi.mocked(api.getControlPlaneRun).mockImplementation(async (_project, runId) => runId === gap.run_id ? gap : ownedRun)
+    const { container } = renderDashboard({ requestedRunId: gap.run_id })
+
+    await waitFor(() => expect(container.querySelector('.run-list-pinned')?.getAttribute('data-run-key')).toBe(gap.run_id))
+    findRunSelection(gap.run_id)!.focus()
+    fireEvent.click(screen.getByRole('button', { name: 'Load more runs' }))
+
+    await waitFor(() => expect(container.querySelector('.run-list-pinned')).toBeNull())
+    expect(container.querySelectorAll(`[data-run-key="${gap.run_id}"]`)).toHaveLength(1)
+    expect(screen.getByRole('button', { name: /Older runs without a recorded outcome · 1 loaded/ }).getAttribute('aria-expanded')).toBe('true')
+    expect(container.querySelector('.run-list-gap-items')?.hasAttribute('hidden')).toBe(false)
+    expect(document.activeElement).toBe(findRunSelection(gap.run_id))
+  })
+
+  it('keeps the counted outcome-gap group stable across equal, changed, and failed refreshes', async () => {
+    const gap = (id: string) => ({
+      ...ownedRun, run_id: id, status: 'needs_attention' as const, status_reason_code: 'unit_missing',
+      activity: 'unknown' as const, progress: null, started_at: null, ended_at: null,
+      original_plan_display_name: `historical-work-${id}-20260925.md`,
+      original_plan_path: `/plans/historical-work-${id}-20260925.md`,
+      evidence: { unit_observation: 'missing', has_run_metadata: false, can_resume: false },
+    })
+    const gaps = [gap('gap-002'), gap('gap-001')]
+    const failed = { ...ownedRun, run_id: 'failed-real', status: 'failed' as const, progress: null }
+    const actionable = { ...ownedRun, run_id: 'attention-real', status: 'needs_attention' as const, progress: null }
+    const initial = [ownedRun, failed, actionable, ...gaps]
+    vi.mocked(api.listControlPlaneRuns).mockResolvedValue({ runs: initial, next_cursor: null, schema_version: 1 })
+    const { container } = renderDashboard()
+
+    const toggle = await screen.findByRole('button', { name: /Older runs without a recorded outcome · 2 loaded/ })
+    const gapItems = container.querySelector('.run-list-gap-items')!
+    expect(toggle.getAttribute('aria-expanded')).toBe('false')
+    expect(gapItems.hasAttribute('hidden')).toBe(true)
+    expect(container.querySelectorAll('.run-list > .run-list-item')).toHaveLength(3)
+    fireEvent.click(toggle)
+    expect(gapItems.hasAttribute('hidden')).toBe(false)
+    expect(gapItems.querySelectorAll('.run-list-item')).toHaveLength(2)
+    expect(gapItems.querySelectorAll('.status-pill')).toHaveLength(0)
+    const selectedBefore = findRunSelection(ownedRun.run_id)!
+    selectedBefore.focus()
+    fireEvent.click(screen.getByRole('button', { name: 'Refresh', exact: true }))
+    await waitFor(() => expect(api.listControlPlaneRuns).toHaveBeenCalledTimes(2))
+    expect(toggle.getAttribute('aria-expanded')).toBe('true')
+    expect(findRunSelection(ownedRun.run_id)).toBe(selectedBefore)
+    expect(document.activeElement).toBe(selectedBefore)
+
+    vi.mocked(api.listControlPlaneRuns).mockResolvedValueOnce({ runs: [ownedRun, failed, actionable, { ...gaps[0], status: 'failed' }, gaps[1]], next_cursor: null, schema_version: 1 })
+    fireEvent.click(screen.getByRole('button', { name: 'Refresh', exact: true }))
+    await waitFor(() => expect(toggle.textContent).toContain('1 loaded'))
+    expect(gapItems.querySelectorAll('.run-list-item')).toHaveLength(1)
+    expect(container.querySelectorAll(`[data-run-key="${gaps[0].run_id}"]`)).toHaveLength(1)
+
+    vi.mocked(api.listControlPlaneRuns).mockRejectedValueOnce(new Error('history unavailable'))
+    fireEvent.click(screen.getByRole('button', { name: 'Refresh', exact: true }))
+    await screen.findByText(/Existing run data remains visible/)
+    expect(toggle.getAttribute('aria-expanded')).toBe('true')
+    expect(gapItems.querySelectorAll('.run-list-item')).toHaveLength(1)
+  })
+
   it('keeps a selected older run outside the page when its URL request is cleared and the list refreshes', async () => {
     const olderRun = { ...ownedRun, run_id: 'run-older', status: 'completed' }
     vi.mocked(api.getControlPlaneRun).mockImplementation(async (_projectId, runId) => runId === 'run-older' ? olderRun : ownedRun)
@@ -4597,7 +4692,9 @@ describe('RunDashboard', () => {
 
     renderDashboard({ requestedRunId: historicalGap.run_id })
 
-    expect(await screen.findAllByText('Outcome not recorded', { selector: '.status-pill' })).toHaveLength(2)
+    expect(await screen.findAllByText('Outcome not recorded', { selector: '.status-pill' })).toHaveLength(1)
+    expect(screen.getByRole('button', { name: /Older runs without a recorded outcome · 1 loaded/ }).getAttribute('aria-expanded')).toBe('true')
+    expect(findRunSelection(historicalGap.run_id)?.closest('.run-list-gap-items')?.hasAttribute('hidden')).toBe(false)
     expect(screen.queryByText(/Outcome not recorded — current work is not reported/)).toBeNull()
     expect(screen.queryByText(historicalGap.reason)).toBeNull()
     openTechnicalDetails()

@@ -871,7 +871,7 @@ def _assert_action_hit_test(page: Page, action, *, after_trial=None) -> None:
 def test_responsive_action_hit_test_survives_late_context_growth(
     control_client, monkeypatch
 ):
-    """Keep the exact Diagnostics target valid while run context expands."""
+    """Keep the exact Diagnostics target valid after late context settles."""
     _, root, _, _ = control_client
     _seed_responsive_fixture(root)
     dist = Path(__file__).resolve().parents[2] / "web" / "dist"
@@ -898,19 +898,17 @@ def test_responsive_action_hit_test_survives_late_context_growth(
 
         pending = held_context[:]
         held_context.clear()
-        for route in pending:
-            route.continue_()
+        with page.expect_response(lambda response: "/runs/responsive-run-39/context" in response.url):
+            for route in pending:
+                route.continue_()
         page.unroute(context_pattern, hold_context)
-        page.wait_for_function(
-            "element => element.getBoundingClientRect().y > innerHeight",
-            arg=target,
-        )
+        page.evaluate("() => new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve)))")
         after = target.bounding_box()
-        assert after and after["y"] > before["y"] and after["y"] >= 568, {
+        assert after and after["y"] >= before["y"] - 1, {
             "before": before,
             "after": after,
         }
-        assert not target.evaluate("""element => {
+        hit_after = target.evaluate("""element => {
             const rect = element.getBoundingClientRect()
             const hit = document.elementFromPoint(
                 rect.left + rect.width / 2,
@@ -918,6 +916,7 @@ def test_responsive_action_hit_test_survives_late_context_growth(
             )
             return hit === element || Boolean(hit && element.contains(hit))
         }""")
+        assert hit_after == (after["y"] + after["height"] / 2 < 568)
 
     with live_server() as url, sync_playwright() as playwright:
         browser = _browser(playwright)
@@ -1721,6 +1720,7 @@ def test_global_run_overview_visible_progress_journey(control_client, monkeypatc
         limit,
         cursor,
         history="visible",
+        order="oldest",
         include_progress=True,
     ):
         return original_list_runs(
@@ -1728,6 +1728,7 @@ def test_global_run_overview_visible_progress_journey(control_client, monkeypatc
             limit=min(limit, 10),
             cursor=cursor,
             history=history,
+            order=order,
             include_progress=include_progress,
         )
 

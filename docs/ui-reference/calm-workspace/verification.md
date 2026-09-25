@@ -85,3 +85,48 @@ enlarged text, long labels, open menus, failures, focus restoration, list/detail
 Back, refresh retention, and save/conflict/recovery journeys. Physical mobile
 keyboard behavior remains separate from this emulated evidence. These local
 results do not establish deployment or live usability.
+
+## 2026-09-25 — Recent-first project sidebar, Checkpoint 2
+
+The populated browser fixture contains 120 older runs without a recorded
+outcome plus recent running, failed, and completed runs with long plan titles.
+`test_recent_runs_are_on_first_history_page_without_extra_fetch` writes
+`run-sidebar-{light,dark}-{320x568,390x844,1280x720,1440x900}.png` under
+its pytest temporary directory in each engine. All 16 captures were inspected
+against the frozen light desktop/phone reference renders and the dark reference
+surface. The reference uses a running detail example; this fixture selects the
+newest failed run, so its detail correctly shows a failure. The authenticated
+two-row header and richer real detail remain known surface differences.
+
+At every captured size, the first three rows are the recent failed, completed,
+and running runs. Their statuses are complete and readable, the long desktop
+titles use at most two lines, and the phone titles wrap naturally. The 97 older
+outcome gaps appear under one closed, counted disclosure instead of a wall of
+repeated badges. The 320px phone still shows the three rows, disclosure, and
+Load more control above the fold. Browser assertions also cover no horizontal
+document overflow or page errors, a 44px preview target, no sibling shift on
+preview, touch access, selected old-run Back/focus/scroll restoration, and
+unique identities after Load more. No material sidebar hierarchy or clipping
+gap was found in the rendered comparison. Physical mobile keyboard behavior
+and hosted live data remain separate delivery checks.
+
+Local Checkpoint 2 gates: 653 web tests, production build, 37 Chromium and 37
+WebKit follow-up/navigation browser cases, 512 full server tests, and
+`git diff --check` all passed. The built-app browser evidence is local; it
+does not establish publication or live activation.
+
+Checkpoint 2 count follow-up: the 123-run fixture's first page has a live
+cursor, so its heading now reads `100 loaded` above the `97 loaded` outcome-gap
+disclosure and Load more control. After the final page it reads `123 recorded`.
+The 1280×720 light Chromium and WebKit populated captures were inspected with
+the corrected heading. A focused pinned-run component assertion confirms that
+the direct-link row does not increase the loaded count. The 653-test web suite,
+production build, focused Chromium and WebKit browser cases, and diff check
+passed locally. The current `origin/main` delivery gate is red; this evidence
+does not authorize publication or establish live activation.
+
+Review update: `origin/main` `46224dfa` passed all 12 CI jobs. The focused
+count repair passed Chromium/WebKit checks and the full web suite with one
+Vitest worker (653 tests); the default parallel suite timed out on one
+130-row refresh test, which passed alone. Publication and live comparison
+remain pending.

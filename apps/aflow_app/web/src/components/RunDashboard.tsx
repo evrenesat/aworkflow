@@ -1038,6 +1038,9 @@ export function RunDashboard({ visible = true, page, onNewRun, onCancelNewRun, o
   const currentHistoryScope = JSON.stringify([projectId, historyFilter])
   const [historyLoad, setHistoryLoad] = useState<{ scope: string; status: 'pending' | 'ready' | 'error' }>({ scope: '', status: 'pending' })
   const [historySnapshot, setHistorySnapshot] = useState<{ scope: string; runIds: string[] }>({ scope: '', runIds: [] })
+  const [gapDisclosure, setGapDisclosure] = useState<{ scope: string; open: boolean }>({ scope: '', open: false })
+  const runListRef = useRef<HTMLElement>(null)
+  const pendingPinTransitionRef = useRef<{ runId: string; scrollTop: number; focus: 'select' | 'preview' | null } | null>(null)
   const loadedHistory = useRef({ scope: '', pages: 1 })
   const historyRequest = useRef(0)
   const [nextRunCursor, setNextRunCursor] = useState<string | null>(null)
@@ -1516,6 +1519,17 @@ export function RunDashboard({ visible = true, page, onNewRun, onCancelNewRun, o
             ? current
             : { scope, status: 'ready' })
           const runIds = result.runs.map(run => run.run_id)
+          const pinnedRow = runListRef.current?.querySelector<HTMLElement>('.run-list-pinned')
+          if (pinnedRow && runIds.includes(pinnedRow.dataset.runKey ?? '')) {
+            const focused = document.activeElement
+            pendingPinTransitionRef.current = {
+              runId: pinnedRow.dataset.runKey!,
+              scrollTop: document.scrollingElement?.scrollTop ?? 0,
+              focus: focused && pinnedRow.contains(focused)
+                ? focused.classList.contains('run-row-preview-toggle') ? 'preview' : 'select'
+                : null,
+            }
+          }
           setHistorySnapshot(current => current.scope === scope
             && current.runIds.length === runIds.length
             && current.runIds.every((runId, index) => runId === runIds[index])
@@ -1761,11 +1775,38 @@ export function RunDashboard({ visible = true, page, onNewRun, onCancelNewRun, o
   const historyLoadedCount = historySnapshot.scope === currentHistoryScope
     ? listedRuns.filter(run => historySnapshot.runIds.includes(run.run_id)).length
     : 0
+  const historyCountLabel = historyIncomplete
+    ? `${historyLoadedCount} loaded so far`
+    : `${historyLoadedCount} ${nextRunCursor ? 'loaded' : 'recorded'}`
   const selectedRunOutsideLoadedHistory = Boolean(selectedRun && (
     historyIncomplete
     || historySnapshot.scope !== currentHistoryScope
     || !historySnapshot.runIds.includes(selectedRun.run_id)
   ))
+  const pageIds = historySnapshot.scope === currentHistoryScope ? new Set(historySnapshot.runIds) : new Set<string>()
+  const pageRuns = listedRuns.filter(run => pageIds.has(run.run_id))
+  const pinnedRun = selectedRunOutsideLoadedHistory && selectedRun && !pageIds.has(selectedRun.run_id)
+    && listedRuns.some(run => run.run_id === selectedRun.run_id) ? selectedRun : null
+  const ordinaryRuns = pageRuns.filter(run => runDisplayProjection(run).category !== 'outcome-unrecorded')
+  const outcomeGapRuns = pageRuns.filter(run => runDisplayProjection(run).category === 'outcome-unrecorded')
+  const selectedGapInGroup = outcomeGapRuns.some(run => run.run_id === selectedRunId)
+  const gapUserOpen = gapDisclosure.scope === currentHistoryScope && gapDisclosure.open
+  const gapOpen = selectedGapInGroup || gapUserOpen
+  useLayoutEffect(() => {
+    const transition = pendingPinTransitionRef.current
+    if (!transition) return
+    if (selectedRunId !== transition.runId) {
+      pendingPinTransitionRef.current = null
+      return
+    }
+    if (pinnedRun || !pageIds.has(transition.runId)) return
+    pendingPinTransitionRef.current = null
+    const row = Array.from(runListRef.current?.querySelectorAll<HTMLElement>('.run-list-item') ?? [])
+      .find(item => item.dataset.runKey === transition.runId)
+    const focusTarget = row?.querySelector<HTMLElement>(transition.focus === 'preview' ? '.run-row-preview-toggle' : '.run-list-select')
+    if (transition.focus && focusTarget) focusTarget.focus({ preventScroll: true })
+    if (document.scrollingElement) document.scrollingElement.scrollTop = transition.scrollTop
+  }, [historySnapshot, pinnedRun, pageIds, selectedRunId])
   function invalidateCopyFeedback() {
     copyRequestRef.current += 1
   }
@@ -3675,13 +3716,14 @@ export function RunDashboard({ visible = true, page, onNewRun, onCancelNewRun, o
 
       {projectAvailable && !newRunPage && (
         <SidebarEditorLayout selection={selectedRunId} navigationVersion={navigationVersion} listLabel="Run history" detailEntry={explicitRunNavigation ?? Boolean(requestedRunId)} navigation={
-          <section className="card run-list" aria-label="Project runs">
-            <div className="section-heading"><h3>Project runs</h3><span className="text-xs text-dim">{historyIncomplete ? `${historyLoadedCount} loaded so far` : `${listedRuns.length} recorded`}</span></div>
+          <section ref={runListRef} className="card run-list" aria-label="Project runs">
+            <div className="section-heading"><h3>Project runs</h3><span className="text-xs text-dim">{historyCountLabel}</span></div>
             {!hosted && <label>Run history<select className="input" aria-label="Run history" value={historyFilter} onChange={event => setHistoryFilter(event.target.value as typeof historyFilter)}><option value="visible">Visible</option><option value="archived">Archived</option><option value="all">All history</option></select></label>}
-            {selectedRunOutsideLoadedHistory && selectedRun && <p className="notice text-sm" role="status">
-              Selected run: {runPlanPresentationForRun(selectedRun).label} · {statusLabel(selectedRun)} · {shortRunId(selectedRun.run_id)}. It is outside the loaded history page; this view will not fetch more runs automatically.
-            </p>}
-            {listedRuns.length === 0 ? (historyIncomplete ? null : <p className="text-sm text-dim">No runs yet</p>) : listedRuns.map((run) => (
+            {pinnedRun && <>
+              <span className="run-list-pinned-label">Selected · older history</span>
+              <RunListItem key={pinnedRun.run_id} run={pinnedRun} stableKey={pinnedRun.run_id} dataSidebarEditorItem={pinnedRun.run_id} rowClassName="run-list-pinned" contextLabel="Selected · older history" selected onSelect={() => selectRun(pinnedRun.run_id)} />
+            </>}
+            {pageRuns.length === 0 && !pinnedRun ? (historyIncomplete ? null : <p className="text-sm text-dim">No runs yet</p>) : ordinaryRuns.map((run) => (
               <RunListItem
                 key={run.run_id}
                 run={run}
@@ -3691,6 +3733,15 @@ export function RunDashboard({ visible = true, page, onNewRun, onCancelNewRun, o
                 onSelect={() => selectRun(run.run_id)}
               />
             ))}
+            {outcomeGapRuns.length > 0 && <div className="run-list-gap-group">
+              <button type="button" className="run-list-gap-toggle" aria-expanded={gapOpen} aria-controls={`${technicalId}-outcome-gap`} disabled={selectedGapInGroup} onClick={() => setGapDisclosure({ scope: currentHistoryScope, open: !gapOpen })}>
+                <span aria-hidden="true">{gapOpen ? '▾' : '▸'}</span>
+                <span>Older runs without a recorded outcome · {outcomeGapRuns.length} loaded</span>
+              </button>
+              <div id={`${technicalId}-outcome-gap`} hidden={!gapOpen} className="run-list-gap-items">
+                {outcomeGapRuns.map(run => <RunListItem key={run.run_id} run={run} stableKey={run.run_id} dataSidebarEditorItem={run.run_id} selected={selectedRunId === run.run_id} quietOutcome onSelect={() => selectRun(run.run_id)} />)}
+              </div>
+            </div>}
             {nextRunCursor && <button className="btn btn-secondary" disabled={refreshing} onClick={() => void loadMoreRuns()}>Load more runs</button>}
           </section>}>
 

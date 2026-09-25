@@ -1195,7 +1195,8 @@ input::placeholder, textarea::placeholder {
 }
 
 .run-list {
-  padding: 18px 10px;
+  padding: 12px 10px;
+  gap: 2px;
 }
 
 .run-list > .section-heading,
@@ -1206,7 +1207,18 @@ input::placeholder, textarea::placeholder {
 }
 
 .run-list > .section-heading {
-  margin-bottom: 12px;
+  margin-bottom: 8px;
+  flex-wrap: nowrap;
+  gap: 4px;
+}
+
+.run-list > .section-heading h3 {
+  font-size: 1rem;
+  white-space: nowrap;
+}
+
+.run-list > .section-heading > span {
+  white-space: nowrap;
 }
 
 .run-list > label {
@@ -1258,6 +1270,79 @@ input::placeholder, textarea::placeholder {
   text-overflow: ellipsis;
   white-space: nowrap;
   overflow-wrap: normal;
+}
+
+.run-list .run-list-select {
+  padding-block: 4px;
+}
+
+.run-list .run-list-title {
+  display: -webkit-box;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 2;
+  white-space: normal;
+  overflow-wrap: anywhere;
+  line-height: 1.2;
+}
+
+.run-list .run-list-item .run-row-meta {
+  flex-wrap: wrap;
+  overflow: visible;
+}
+
+.run-list .run-row-meta > .status-pill {
+  flex: 0 0 auto;
+  white-space: nowrap;
+}
+
+.run-list-pinned-label {
+  margin: 4px 10px 0;
+  color: var(--color-text-dim);
+  font-size: 0.75rem;
+  font-weight: 600;
+}
+
+.run-list-gap-group {
+  min-width: 0;
+  margin-block: 8px;
+  border-top: 1px solid var(--color-border);
+}
+
+.run-list-gap-toggle {
+  display: flex;
+  align-items: center;
+  gap: var(--spacing-xs);
+  width: 100%;
+  min-height: var(--tap-target);
+  padding: 6px 10px;
+  color: var(--color-text-dim);
+  text-align: left;
+  overflow-wrap: anywhere;
+}
+
+.run-list-gap-toggle:disabled {
+  cursor: default;
+  opacity: 1;
+}
+
+.run-list-gap-toggle:not(:disabled):hover {
+  background: var(--color-surface-hover);
+}
+
+.run-list-gap-items {
+  display: grid;
+  gap: 2px;
+}
+
+.run-list-gap-items[hidden] {
+  display: none;
+}
+
+@media (max-width: 959px), (max-height: 599px) {
+  .run-list .run-list-title {
+    display: block;
+    overflow: visible;
+  }
 }
 
 .run-row-preview-toggle {

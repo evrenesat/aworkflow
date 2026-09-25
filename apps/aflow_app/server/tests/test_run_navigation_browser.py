@@ -74,16 +74,23 @@ def wait_for_visible_run_detail_focus(page) -> None:
     assert detail.evaluate('(node) => node.contains(document.activeElement)')
 
 
-def test_recent_runs_are_on_first_history_page_without_extra_fetch(control_client, monkeypatch):
+def test_recent_runs_are_on_first_history_page_without_extra_fetch(control_client, monkeypatch, tmp_path):
     client, root, units, _ = control_client
     for index in range(120):
         run_id = f'history-{index:03}'
         create_launch_manifest(root, LaunchManifest(run_id=run_id, project_root=str(root), plan_path='plans/todo/test-plan.md', workflow_name='managed', max_turns=5))
-    for name, status in (('zz-recent-active', 'running'), ('zz-recent-failed', 'failed'), ('zz-recent-completed', 'completed')):
-        create_launch_manifest(root, LaunchManifest(run_id=name, project_root=str(root), plan_path='plans/todo/test-plan.md', workflow_name='managed', max_turns=5))
+    recent = (
+        ('zz-recent-active', 'running', 'Prepare current release and verify the newest project history 20260925.md'),
+        ('zz-recent-failed', 'failed', 'Investigate failed delivery and repair the status notice 20260925.md'),
+        ('zz-recent-completed', 'completed', 'Complete verified run history pagination 20260925.md'),
+    )
+    for name, status, title in recent:
+        plan = root / 'plans' / 'todo' / title
+        plan.write_text(f'# {title}\n')
+        create_launch_manifest(root, LaunchManifest(run_id=name, project_root=str(root), plan_path=str(plan), workflow_name='managed', max_turns=5))
         path = root / '.aflow' / 'runs' / name / 'run.json'
         path.parent.mkdir(parents=True)
-        path.write_text(json.dumps({'status': status, 'plan_path': 'plans/todo/test-plan.md'}))
+        path.write_text(json.dumps({'status': status, 'plan_path': str(plan)}))
     units.units['aflow-run-zz-recent-active.service'] = UnitState(name='aflow-run-zz-recent-active.service', active_state='active', sub_state='running')
     old = client.get(f'/api/control-plane/projects/{PROJECT_ID}/runs/history-000').json()
     assert old['status'] == 'needs_attention' and old['status_reason_code'] == 'unit_missing'
@@ -99,12 +106,18 @@ def test_recent_runs_are_on_first_history_page_without_extra_fetch(control_clien
         try:
             page = browser.new_page(viewport={'width': 1280, 'height': 720})
             history_requests = []
-            _login(page, url)
+            page_errors = []
+            page.on('pageerror', lambda error: page_errors.append(str(error)))
             page.on('request', lambda request: history_requests.append(request.url) if f'/projects/{PROJECT_ID}/runs?' in request.url else None)
             page.goto(f'{url}/?project={PROJECT_ID}&view=runs')
+            page.get_by_placeholder('Auth token').fill(TOKEN)
+            page.get_by_role('button', name='Login', exact=True).click()
             nav = _run_history_navigation(page)
             first_rows = nav.locator('.run-list-item')
             expect(first_rows).to_have_count(100)
+            history_count = nav.locator('.run-list > .section-heading > span')
+            expect(history_count).to_have_text('100 loaded')
+            expect(nav.get_by_role('button', name='Load more runs', exact=True)).to_be_visible()
             assert [first_rows.nth(index).locator('[data-sidebar-editor-item]').get_attribute('data-sidebar-editor-item') for index in range(3)] == [
                 'zz-recent-failed', 'zz-recent-completed', 'zz-recent-active',
             ]
@@ -113,11 +126,87 @@ def test_recent_runs_are_on_first_history_page_without_extra_fetch(control_clien
             assert 'cursor=' not in recent_requests[0]
             assert all('order=' not in request for request in history_requests if 'include_progress=false' in request)
             assert page.evaluate("() => new URL(location.href).searchParams.get('run')") == 'zz-recent-failed'
+            gap_toggle = nav.get_by_role('button', name=re.compile(r'Older runs without a recorded outcome · 97 loaded'))
+            expect(gap_toggle).to_have_attribute('aria-expanded', 'false')
+            gap_items = nav.locator('.run-list-gap-items')
+            assert gap_items.is_hidden()
+            for theme in ('light', 'dark'):
+                page.evaluate('(value) => { document.documentElement.dataset.theme = value; document.documentElement.style.colorScheme = value; localStorage.setItem("aflow.appearance", value) }', theme)
+                for width, height in ((320, 568), (390, 844), (1280, 720), (1440, 900)):
+                    page.set_viewport_size({'width': width, 'height': height})
+                    page.evaluate('() => new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve)))')
+                    back = page.get_by_role('button', name='← Back to Run history', exact=True)
+                    if back.is_visible():
+                        back.click()
+                    nav.wait_for(state='visible')
+                    assert gap_items.is_hidden()
+                    for index in range(3):
+                        expect(first_rows.nth(index)).to_be_visible()
+                    assert all(not first_rows.nth(index).locator('.run-list-title').inner_text().startswith('history-') for index in range(3))
+                    assert page.evaluate('() => document.documentElement.scrollWidth <= innerWidth + 1')
+                    geometry = page.evaluate("""() => [...document.querySelectorAll('.run-list > .run-list-item')].slice(0, 3).map(row => {
+                      const title = row.querySelector('.run-list-title');
+                      const status = row.querySelector('.status-pill');
+                      const preview = row.querySelector('.run-row-preview-toggle');
+                      const box = row.getBoundingClientRect();
+                      const statusBox = status.getBoundingClientRect();
+                      return {height: box.height, titleHeight: title.getBoundingClientRect().height,
+                        lineHeight: parseFloat(getComputedStyle(title).lineHeight),
+                        statusWidth: statusBox.width, statusScrollWidth: status.scrollWidth,
+                        previewHeight: preview.getBoundingClientRect().height};
+                    })""")
+                    assert len(geometry) == 3, geometry
+                    if width >= 960:
+                        assert all(item['titleHeight'] <= item['lineHeight'] * 2 + 2 for item in geometry), geometry
+                    assert all(item['statusScrollWidth'] <= item['statusWidth'] + 1 for item in geometry), geometry
+                    assert all(item['previewHeight'] >= 44 for item in geometry), geometry
+                    page.screenshot(path=str(tmp_path / f'run-sidebar-{theme}-{width}x{height}.png'), full_page=True)
+            page.set_viewport_size({'width': 390, 'height': 844})
+            preview = first_rows.first.locator('.run-row-preview-toggle')
+            selected_url = page.url
+            before_sibling = first_rows.nth(1).bounding_box()
+            preview.click()
+            expect(page.get_by_role('dialog', name=re.compile('Preview Investigate failed delivery'))).to_be_visible()
+            assert page.url == selected_url
+            assert first_rows.nth(1).bounding_box() == before_sibling
+            page.keyboard.press('Escape')
+            gap_toggle.click()
+            expect(gap_toggle).to_have_attribute('aria-expanded', 'true')
+            assert gap_items.is_visible()
+            assert gap_items.locator('.status-pill').count() == 0
+            old_row = gap_items.locator("[data-sidebar-editor-item='history-119']")
+            old_row.scroll_into_view_if_needed()
+            before_back_scroll = page.evaluate('() => document.scrollingElement.scrollTop')
+            old_row.click()
+            _run_history_detail(page).wait_for(state='visible')
+            assert page.evaluate("() => new URL(location.href).searchParams.get('run')") == 'history-119'
+            page.get_by_role('button', name='← Back to Run history', exact=True).click()
+            nav.wait_for(state='visible')
+            wait_for_restored_document_scroll(page, before_back_scroll)
+            assert page.evaluate('() => document.activeElement?.dataset.sidebarEditorItem') == 'history-119'
             page.get_by_role('button', name='Load more runs', exact=True).click()
             expect(first_rows).to_have_count(123)
+            expect(history_count).to_have_text('123 recorded')
+            expect(nav.get_by_role('button', name='Load more runs', exact=True)).to_have_count(0)
             recent_requests = [request for request in history_requests if 'order=recent' in request]
             assert len(recent_requests) == 3, history_requests
             assert len({row.locator('[data-sidebar-editor-item]').get_attribute('data-sidebar-editor-item') for row in first_rows.all()}) == 123
+            assert not page_errors, page_errors
+            touch = browser.new_page(viewport={'width': 390, 'height': 844}, has_touch=True)
+            try:
+                touch_errors = []
+                touch.on('pageerror', lambda error: touch_errors.append(str(error)))
+                touch.goto(f'{url}/?project={PROJECT_ID}&view=runs')
+                touch.get_by_placeholder('Auth token').fill(TOKEN)
+                touch.get_by_role('button', name='Login', exact=True).click()
+                touch_nav = _run_history_navigation(touch)
+                touch_preview = touch_nav.locator('.run-list-item').first.locator('.run-row-preview-toggle')
+                touch_preview.tap()
+                expect(touch.get_by_role('dialog', name=re.compile('Preview Investigate failed delivery'))).to_be_visible()
+                assert touch.evaluate("() => new URL(location.href).searchParams.get('run')") == 'zz-recent-failed'
+                assert not touch_errors, touch_errors
+            finally:
+                touch.close()
         finally:
             browser.close()
 
@@ -228,8 +317,14 @@ def test_run_navigation_scroll_selection_and_history(control_client, monkeypatch
                     if compact:
                         page.get_by_role('button', name='← Back to Run history', exact=True).click()
                         nav.wait_for(state='visible')
+                    pinned = nav.locator(".run-list-pinned[data-run-key='history-000']")
+                    expect(pinned).to_have_count(1)
+                    expect(nav.locator('.run-list-pinned-label')).to_have_text('Selected · older history')
+                    assert nav.locator("[data-run-key='history-000']").count() == 1
                     page.get_by_role('button', name='Load more runs', exact=True).click()
                     page.wait_for_function("document.querySelectorAll('.run-list-item').length === 130")
+                    expect(pinned).to_have_count(0)
+                    assert nav.locator("[data-run-key='history-000']").count() == 1
                     row = nav.locator("[data-sidebar-editor-item='history-069']")
                     row.scroll_into_view_if_needed()
                     before_list_scroll = page.evaluate('() => document.scrollingElement.scrollTop')

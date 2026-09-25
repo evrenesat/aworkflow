@@ -3,6 +3,7 @@ import type { CSSProperties, FocusEvent, PointerEvent } from 'react'
 import type { RunStatus } from '../types'
 import {
   isTerminalInactiveRun,
+  formatLocalTimestamp,
   runActivityText,
   runDurationText,
   runPlanPresentationForRun,
@@ -27,6 +28,9 @@ export interface RunListItemProps {
   dataEnrichmentState?: string
   loadState?: RunProgressLoadState
   loadMessage?: string | null
+  /** Project history can show one informational row without repeating its status badge. */
+  quietOutcome?: boolean
+  contextLabel?: string
 }
 
 function previewKey(value: string): string {
@@ -59,6 +63,8 @@ export function RunListItem({
   dataEnrichmentState,
   loadState = 'ready',
   loadMessage = null,
+  quietOutcome = false,
+  contextLabel,
 }: RunListItemProps): JSX.Element {
   const [previewOpen, setPreviewOpen] = useState(false)
   const [previewStyle, setPreviewStyle] = useState<CSSProperties>({})
@@ -87,10 +93,12 @@ export function RunListItem({
   const activity = knownFact(runActivityText(run))
   const compactProgressFact = run.progress ? compactRunProgressText(run.progress, run) : null
   const rowActivityFact = compactProgressFact || isTerminalInactiveRun(run) ? null : activity
+  const startedAt = formatLocalTimestamp(run.started_at)
+  const quietFact = plan.date ?? (startedAt ? `Started ${startedAt}` : null) ?? compactProgressFact
   const accessibleFacts = [plan.label, plan.date, progressLabel, progressLoadLabel, duration, activity].filter((value): value is string => Boolean(value))
   const accessibleName = projectLabel
     ? [projectLabel, status, ...accessibleFacts, run.run_id].join(' · ')
-    : [`${run.run_id} ${status}`, ...accessibleFacts].join(' · ')
+    : [contextLabel, `${run.run_id} ${status}`, ...accessibleFacts].filter(Boolean).join(' · ')
 
   function clearTimers(): void {
     if (openTimerRef.current !== null) window.clearTimeout(openTimerRef.current)
@@ -281,11 +289,15 @@ export function RunListItem({
           <strong className="run-list-title" title={plan.label}>{plan.label}</strong>
         </span>
         <span className="run-row-meta text-xs text-dim">
-          <span className={`status-pill status-${statusPresentation.category}`} data-status-category={statusPresentation.category}>{status}</span>
-          {run.history_state === 'archived' && <span className="status-pill">Archived</span>}
-          {projectLabel && <span className="global-run-row-project" title={projectLabel}>{projectLabel}</span>}
-          <RunProgress run={run} mode="row" loadState={loadState} loadMessage={loadMessage} />
-          {rowActivityFact && <span className="run-row-meta-fact" title={rowActivityFact}>{rowActivityFact}</span>}
+          {quietOutcome && statusPresentation.category === 'outcome-unrecorded' ? (
+            quietFact && <span className="run-row-meta-fact" title={quietFact}>{quietFact}</span>
+          ) : <>
+            <span className={`status-pill status-${statusPresentation.category}`} data-status-category={statusPresentation.category}>{status}</span>
+            {run.history_state === 'archived' && <span className="status-pill">Archived</span>}
+            {projectLabel && <span className="global-run-row-project" title={projectLabel}>{projectLabel}</span>}
+            <RunProgress run={run} mode="row" loadState={loadState} loadMessage={loadMessage} />
+            {rowActivityFact && <span className="run-row-meta-fact" title={rowActivityFact}>{rowActivityFact}</span>}
+          </>}
         </span>
       </span>
     </button>
