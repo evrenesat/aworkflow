@@ -17,6 +17,7 @@ from aflow.hotplug import HANDOVER_HEADINGS
 from aflow.harnesses.base import HarnessInvocation
 from aflow.harnesses.codex import CodexAdapter
 from aflow.harnesses.session import SessionCapabilities, SessionResult
+from aflow.live_config import load_live_config
 from aflow.run_state import ControllerConfig, resolve_resume_override
 from aflow.workflow import WorkflowError, run_workflow
 from tests._support import _BROKEN_PLAN, _COMPLETE_PLAN, _VALID_PLAN, _write_plan, _write_split_config
@@ -143,6 +144,7 @@ def _live_workflows(
     team: str = "base",
     include_added_step: bool = False,
     remove_future: bool = False,
+    upgrade_after_repairs: int | None = None,
 ) -> str:
     added = (
         '\n[workflow.live.steps.added]\n'
@@ -160,9 +162,15 @@ prompts = ["future"]
 go = [{{ to = "END", when = "DONE" }}, {{ to = "future" }}]
 '''
     next_target = "END" if remove_future else "future"
+    upgrade_policy = (
+        f"upgrade_after_repairs = {upgrade_after_repairs}\n"
+        if upgrade_after_repairs is not None
+        else ""
+    )
     return f'''\
 [workflow.live]
 team = "{team}"
+{upgrade_policy}
 
 [workflow.live.steps.work]
 role = "worker"
@@ -410,6 +418,52 @@ def test_live_defaults_and_turn_inputs_refresh_at_the_loop_edge(tmp_path: Path) 
     ]
     assert "old prompt" in str(adapter.invocations[0]["user_prompt"])
     assert "new prompt" in str(adapter.invocations[1]["user_prompt"])
+
+
+def test_live_reloaded_upgrade_threshold_is_exposed_at_loop_boundary(
+    tmp_path: Path,
+) -> None:
+    plan_path = tmp_path / "plan.md"
+    _write_plan(plan_path, _VALID_PLAN)
+    config_path, workflows_path = _make_live_source(
+        tmp_path,
+        max_turns=2,
+        workflows=_live_workflows(upgrade_after_repairs=2),
+    )
+    adapter = RecordingAdapter()
+    calls = 0
+    observed_thresholds: list[int] = []
+
+    def runner(argv, **kwargs):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            workflows_path.write_text(
+                _live_workflows(upgrade_after_repairs=4),
+                encoding="utf-8",
+            )
+        else:
+            _write_plan(plan_path, _COMPLETE_PLAN)
+        return subprocess.CompletedProcess(argv, 0, "ok", "")
+
+    def capture_live_config(path, *args, **kwargs):
+        loaded = load_live_config(path, *args, **kwargs)
+        observed_thresholds.append(
+            loaded.workflow_config.workflows["live"].upgrade_after_repairs
+        )
+        return loaded
+
+    with patch("aflow.workflow.load_live_config", side_effect=capture_live_config):
+        result = _run_live(
+            config_path,
+            plan_path,
+            adapter,
+            runner,
+            max_turns=2,
+        )
+
+    assert result.final_snapshot.is_complete
+    assert observed_thresholds == [2, 4]
 
 
 def test_live_profile_edit_updates_model_effort_prompt_and_reuses_session(

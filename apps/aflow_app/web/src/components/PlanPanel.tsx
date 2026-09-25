@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState } from 'react'
 import { ApiError } from '../api'
 import * as api from '../api'
-import type { PlanBackupPage, PlanBackupSummary, PlanDocument, ProjectInfo } from '../types'
+import type { PlanBackupPage, PlanBackupSummary, PlanDocument, ProjectInfo, ProjectQueue, ProjectQueuePlan } from '../types'
 import { formatMachineLabel } from '../label'
 import { MenuItem, MoreMenu } from './MoreMenu'
 import { useHeaderSlots } from './HeaderSlots'
@@ -12,6 +12,7 @@ interface PlanPanelProps {
   /** Reports unsaved text so the shell can guard navigation. */
   onDirtyChange: (dirty: boolean) => void
   onOpenRunDashboard: (planPath: string) => void
+  onOpenRun?: (runId: string) => void
   /** Opens the exact draft path handed off by another workspace surface. */
   initialPlanPath?: string | null
   onInitialPlanHandled?: () => void
@@ -37,6 +38,10 @@ function planIdentity(projectId: string, plan: PlanDocument): string {
 
 function samePlan(left: PlanDocument, right: PlanDocument): boolean {
   return JSON.stringify(left) === JSON.stringify(right)
+}
+
+function samePlanQueue(left: ProjectQueue | null, right: ProjectQueue): boolean {
+  return left !== null && JSON.stringify(left) === JSON.stringify(right)
 }
 
 function reconcilePlans(previous: PlanDocument[], next: PlanDocument[]): PlanDocument[] {
@@ -68,11 +73,32 @@ function backupEventLabel(event: string | null): string {
 }
 
 function lifecycleLabel(status: PlanDocument['status']): string {
-  return status === 'todo' ? 'Draft' : status === 'in_progress' ? 'Ready' : 'Done'
+  return ({ todo: 'Draft', in_progress: 'Ready', done: 'Done', failed: 'Failed', needs_plan_change: 'Needs plan change' })[status]
 }
 
-/** Lifecycle sections always render in canonical order with runnable guidance. */
+function queueReason(plan: ProjectQueuePlan): string | null {
+  if (plan.dependency === 'sequence_conflict') return 'Sequence names need correction'
+  if (plan.dependency) return `Waiting for ${plan.dependency} to be delivered`
+  if (plan.reason === 'capacity') return 'Waiting for an implementation slot'
+  if (plan.reason === 'automatic_disabled') return 'Automatic starts are off for this project'
+  if (plan.reason === 'unstable') return 'Waiting for the plan to settle'
+  if (plan.reason === 'dependency_evidence_unavailable') return 'Dependency evidence needs attention'
+  if (plan.reason === 'claim_retained' || plan.reason === 'uncertain') return 'Run ownership needs attention'
+  return plan.reason && !['todo', 'done'].includes(plan.reason) ? formatMachineLabel(plan.reason) : null
+}
+
+/** Show plans needing attention before ordinary work, then the archive. */
 const LIFECYCLE_SECTIONS: Array<{ status: PlanDocument['status']; title: string; hint: string }> = [
+  {
+    status: 'failed',
+    title: 'Failed',
+    hint: 'Review the failure and correct the plan before requeueing.',
+  },
+  {
+    status: 'needs_plan_change',
+    title: 'Needs plan change',
+    hint: 'Correct and save these plans before requeueing.',
+  },
   {
     status: 'todo',
     title: 'Draft',
@@ -97,8 +123,10 @@ const READY_START_GUIDANCE = 'Ready is a plan lifecycle state; startup checks ru
  * preserved on every network or conflict failure; the server copy is only
  * reloaded after an explicit confirmation.
  */
-export function PlanPanel({ project, onDirtyChange, onOpenRunDashboard, initialPlanPath = null, onInitialPlanHandled = () => {} }: PlanPanelProps) {
+export function PlanPanel({ project, onDirtyChange, onOpenRunDashboard, onOpenRun, initialPlanPath = null, onInitialPlanHandled = () => {} }: PlanPanelProps) {
   const [plans, setPlans] = useState<PlanDocument[]>([])
+  const [queue, setQueue] = useState<ProjectQueue | null>(null)
+  const [queueError, setQueueError] = useState<string | null>(null)
   const [selected, setSelected] = useState<PlanDocument | null>(null)
   const [content, setContent] = useState('')
   const [savedContent, setSavedContent] = useState('')
@@ -108,6 +136,8 @@ export function PlanPanel({ project, onDirtyChange, onOpenRunDashboard, initialP
   const [conflict, setConflict] = useState<ConflictState | null>(null)
   const [confirmReload, setConfirmReload] = useState(false)
   const [confirmClose, setConfirmClose] = useState(false)
+  const [confirmRequeue, setConfirmRequeue] = useState(false)
+  const [requeueNotice, setRequeueNotice] = useState<string | null>(null)
   const [pendingOpenPlan, setPendingOpenPlan] = useState<PlanDocument | null>(null)
   const [historyOpen, setHistoryOpen] = useState(false)
   const [history, setHistory] = useState<BackupHistoryState>({ page: null, loading: false, error: null })
@@ -183,6 +213,8 @@ export function PlanPanel({ project, onDirtyChange, onOpenRunDashboard, initialP
     planListRequest.current += 1
     plansLoadedRef.current = false
     setPlans([])
+    setQueue(null)
+    setQueueError(null)
     setPlansLoading(true)
     setPlansRefreshing(false)
     setSelected(null)
@@ -191,6 +223,8 @@ export function PlanPanel({ project, onDirtyChange, onOpenRunDashboard, initialP
     setConflict(null)
     setConfirmReload(false)
     setConfirmClose(false)
+    setConfirmRequeue(false)
+    setRequeueNotice(null)
     setPendingOpenPlan(null)
     initialPlanHandledRef.current = null
     resetBackupHistory()
@@ -204,10 +238,19 @@ export function PlanPanel({ project, onDirtyChange, onOpenRunDashboard, initialP
     try {
       if (initial) setPlansLoading(true)
       else setPlansRefreshing(true)
-      const listed = await api.listProjectPlans(project.id)
+      const [listed, projected] = await Promise.allSettled([
+        api.listProjectPlans(project.id), api.getProjectQueue(project.id),
+      ])
       if (request !== planListRequest.current || projectIdRef.current !== project.id) return
+      if (projected.status === 'fulfilled') {
+        setQueue(current => samePlanQueue(current, projected.value) ? current : projected.value)
+        setQueueError(null)
+      } else {
+        setQueueError('Current queue reasons are unavailable. Refresh to retry.')
+      }
+      if (listed.status === 'rejected') throw listed.reason
       plansLoadedRef.current = true
-      setPlans(current => reconcilePlans(current, listed))
+      setPlans(current => reconcilePlans(current, listed.value))
       setError(null)
     } catch (err) {
       if (request !== planListRequest.current || projectIdRef.current !== project.id) return
@@ -228,6 +271,8 @@ export function PlanPanel({ project, onDirtyChange, onOpenRunDashboard, initialP
       setError(null)
       setConflict(null)
       setConfirmReload(false)
+      setConfirmRequeue(false)
+      setRequeueNotice(null)
       const loaded = await api.readProjectPlan(expectedProjectId, plan.status, plan.name)
       if (request !== planLoadRequest.current || projectIdRef.current !== expectedProjectId) return
       if (loaded.project_id !== expectedProjectId || planIdentity(expectedProjectId, loaded) !== expectedIdentity) return
@@ -313,7 +358,7 @@ export function PlanPanel({ project, onDirtyChange, onOpenRunDashboard, initialP
   }
 
   async function promotePlan() {
-    if (!selected || selected.status === 'done' || dirty) return
+    if (!selected || (selected.status !== 'todo' && selected.status !== 'in_progress') || dirty) return
     try {
       setBusy(true)
       setError(null)
@@ -339,6 +384,49 @@ export function PlanPanel({ project, onDirtyChange, onOpenRunDashboard, initialP
         setError(err instanceof Error ? err.message : 'Failed to promote plan')
       }
       // The edited text stays in the editor for every failure.
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  async function requeuePlan() {
+    if (!selected || !['failed', 'needs_plan_change'].includes(selected.status) || dirty) return
+    const source = selected
+    try {
+      setBusy(true)
+      setError(null)
+      const result = await api.requeueProjectPlan(
+        project.id, source.status as 'failed' | 'needs_plan_change', source.name,
+        { expected_revision: source.revision, ...(source.lifecycle?.source_run_id ? { source_run_id: source.lifecycle.source_run_id } : {}) },
+      )
+      setSelected(result.plan)
+      setContent(result.plan.content ?? content)
+      setSavedContent(result.plan.content ?? content)
+      setConflict(null)
+      setConfirmRequeue(false)
+      setRequeueNotice(result.run ? 'The corrected plan was requeued and its recorded run resumed.' : 'The corrected plan was requeued to Ready.')
+      resetBackupHistory()
+      await refresh()
+    } catch (err) {
+      if (err instanceof ApiError && err.code === 'revision_conflict') {
+        const current = err.detail.current_revision
+        setConflict({ currentRevision: typeof current === 'string' ? current : 'unknown' })
+      } else if (err instanceof ApiError && err.code === 'plan_requeue_resume_conflict'
+          && err.detail.plan_path === `plans/in-progress/${source.name}`) {
+        setConfirmRequeue(false)
+        try {
+          const moved = await api.readProjectPlan(project.id, 'in_progress', source.name)
+          setSelected(moved)
+          setContent(moved.content ?? content)
+          setSavedContent(moved.content ?? content)
+        } catch {
+          // The queue refresh still exposes the durable move if this read fails.
+        }
+        await refresh()
+        setError('The corrected plan is Ready, but its recorded run could not resume. Use View recorded run to resolve its attention state before retrying.')
+      } else {
+        setError(err instanceof Error ? err.message : 'Failed to requeue plan')
+      }
     } finally {
       setBusy(false)
     }
@@ -392,6 +480,8 @@ export function PlanPanel({ project, onDirtyChange, onOpenRunDashboard, initialP
     setConflict(null)
     setConfirmReload(false)
     setConfirmClose(false)
+    setConfirmRequeue(false)
+    setRequeueNotice(null)
     setPendingOpenPlan(null)
     resetBackupHistory()
   }
@@ -404,6 +494,9 @@ export function PlanPanel({ project, onDirtyChange, onOpenRunDashboard, initialP
   }
 
   const runnable = selected !== null && selected.status === 'in_progress' && !dirty
+  const selectedQueue = selected ? queue?.plans.find(plan => plan.path === selected.path) : null
+  const selectedRunId = selectedQueue?.run_id ?? selected?.lifecycle?.source_run_id ?? null
+  const requeueable = selected !== null && (selected.status === 'failed' || selected.status === 'needs_plan_change')
   const saveState = busy
     ? 'Saving…'
     : conflict
@@ -430,8 +523,10 @@ export function PlanPanel({ project, onDirtyChange, onOpenRunDashboard, initialP
     primary: selected ? <button className="btn btn-primary btn-sm" onClick={() => void savePlan()} disabled={busy}>{busy ? 'Working…' : 'Save'}</button> : <button className="btn btn-primary btn-sm" onClick={() => void createPlan()} disabled={busy || !newName.trim()}>Create plan</button>,
     more: selected ? <MoreMenu label="More plan actions" triggerLabel="More">
       {conflict && !confirmReload && <MenuItem onClick={() => setConfirmReload(true)}>Reload from server…</MenuItem>}
-      {selected.status !== 'done' && <MenuItem disabled={busy || dirty} onClick={() => void promotePlan()}>Move to {selected.status === 'todo' ? 'Ready' : 'Done'}</MenuItem>}
+      {(selected.status === 'todo' || selected.status === 'in_progress') && <MenuItem disabled={busy || dirty} onClick={() => void promotePlan()}>Move to {selected.status === 'todo' ? 'Ready' : 'Done'}</MenuItem>}
       {selected.status === 'in_progress' && <MenuItem disabled={!runnable} onClick={() => onOpenRunDashboard(selected.path)}>Configure run…</MenuItem>}
+      {requeueable && <MenuItem disabled={busy || dirty} onClick={() => setConfirmRequeue(true)}>Review requeue…</MenuItem>}
+      {selectedRunId && onOpenRun && <MenuItem disabled={dirty} onClick={() => onOpenRun(selectedRunId)}>View recorded run</MenuItem>}
     </MoreMenu> : <MoreMenu label="More plan actions" triggerLabel="More"><MenuItem disabled={plansLoading || plansRefreshing} onClick={() => void refresh()}>Refresh plans</MenuItem></MoreMenu>,
   })
 
@@ -440,6 +535,10 @@ export function PlanPanel({ project, onDirtyChange, onOpenRunDashboard, initialP
     // state explains its next step instead of exposing a button that no-ops.
     const lifecycleExplanation = selected.status === 'todo'
       ? 'This draft is not runnable yet. Save it and move it to Ready before configuring a run.'
+      : selected.status === 'failed'
+        ? 'Review the failure, correct and save the plan, then review requeue. The recorded run may resume after confirmation.'
+        : selected.status === 'needs_plan_change'
+          ? 'Correct and save the plan before reviewing requeue. The server validates the corrected checkpoint and run lineage.'
       : selected.status === 'done'
         ? 'Done plans are kept for the record and cannot run. Create a new plan and move it through Draft → Ready to run this work again.'
         : dirty
@@ -455,6 +554,9 @@ export function PlanPanel({ project, onDirtyChange, onOpenRunDashboard, initialP
           <span className="plan-save-state text-xs text-dim" role="status" aria-live="polite">{saveState}</span>
         </div>}
         {error && <div className="error-message" role="alert">{error}</div>}
+        {queueError && <div className="notice" role="alert">{queueError}</div>}
+        {requeueNotice && <div className="success-message" role="status">{requeueNotice}</div>}
+        {selectedQueue && queueReason(selectedQueue) && <p className="notice" role="status">{queueReason(selectedQueue)}</p>}
         {conflict && (
           <div className="error-message" role="alert">
             <p>
@@ -488,6 +590,17 @@ export function PlanPanel({ project, onDirtyChange, onOpenRunDashboard, initialP
             </div>
           </div>
         )}
+        {confirmRequeue && requeueable && (
+          <div className="notice" role="alertdialog" aria-label="Review plan requeue">
+            <p>Requeue this saved plan to Ready? {selected.lifecycle?.source_run_id
+              ? `Its recorded run ${selected.lifecycle.source_run_id} may resume immediately and use an implementation slot.`
+              : 'It may start automatically when project scheduling permits.'}</p>
+            <div className="dashboard-actions">
+              <button className="btn btn-primary btn-sm" disabled={busy || dirty} onClick={() => void requeuePlan()}>Confirm requeue{selected.lifecycle?.source_run_id ? ' and resume' : ''}</button>
+              <button className="btn btn-secondary btn-sm" disabled={busy} onClick={() => setConfirmRequeue(false)}>Cancel</button>
+            </div>
+          </div>
+        )}
         <TextEditor
           className="mono plan-editor-textarea"
           aria-label="Plan content"
@@ -501,6 +614,9 @@ export function PlanPanel({ project, onDirtyChange, onOpenRunDashboard, initialP
             <div><dt>Lifecycle</dt><dd>{lifecycleLabel(selected.status)}</dd></div>
             <div><dt>Revision</dt><dd className="mono" title={selected.revision}>{shortRevision(selected.revision)}</dd></div>
             <div><dt>Content size</dt><dd>{selected.size_bytes} bytes</dd></div>
+            {selectedQueue?.identity && <div><dt>Identity</dt><dd className="mono">{selectedQueue.identity}</dd></div>}
+            {selectedRunId && <div><dt>Recorded run</dt><dd className="mono">{selectedRunId}</dd></div>}
+            {selected.lifecycle?.reason_code && <div><dt>Reason</dt><dd>{formatMachineLabel(selected.lifecycle.reason_code)}</dd></div>}
           </dl>
         </details>
         <details
@@ -578,7 +694,7 @@ export function PlanPanel({ project, onDirtyChange, onOpenRunDashboard, initialP
         </details>
         {!hosted && <div className="plan-editor-actions">
           <button className="btn btn-primary" onClick={() => void savePlan()} disabled={busy}>Save</button>
-          {selected.status !== 'done' && (
+          {(selected.status === 'todo' || selected.status === 'in_progress') && (
             <button className="btn btn-secondary" onClick={() => void promotePlan()} disabled={busy || dirty}>
               Move to {selected.status === 'todo' ? 'Ready' : 'Done'}
             </button>
@@ -592,6 +708,8 @@ export function PlanPanel({ project, onDirtyChange, onOpenRunDashboard, initialP
               Configure run…
             </button>
           )}
+          {requeueable && <button className="btn btn-secondary" disabled={busy || dirty} onClick={() => setConfirmRequeue(true)}>Review requeue…</button>}
+          {selectedRunId && onOpenRun && <button className="btn btn-secondary" disabled={dirty} onClick={() => onOpenRun(selectedRunId)}>View recorded run</button>}
         </div>}
         {lifecycleExplanation && <div className="text-sm text-dim">{lifecycleExplanation}</div>}
         {dirty && selected.status !== 'in_progress' && (
@@ -604,6 +722,8 @@ export function PlanPanel({ project, onDirtyChange, onOpenRunDashboard, initialP
   return (
     <div className="plan-list">
       {error && <div className="error-message" role="alert">{error}</div>}
+      {queueError && <div className="notice" role="alert">{queueError}</div>}
+      {queue && <p className="plan-queue-capacity text-sm" role="status">Implementation slots: {queue.capacity.available_slots} of {queue.capacity.limit} available{!queue.settings.auto_consume_plans ? ' · Automatic starts off' : ''}</p>}
       {plansLoading && <div className="card dashboard-loading" role="status"><div className="spinner" />Loading plans…</div>}
       {!hosted && <div className="card" style={{ display: 'flex', gap: 'var(--spacing-sm)', flexWrap: 'wrap' }}>
         <input
@@ -617,25 +737,28 @@ export function PlanPanel({ project, onDirtyChange, onOpenRunDashboard, initialP
           Create plan
         </button>
       </div>}
+      {!plansLoading && plans.length === 0 && <div className="card text-dim text-sm">No plans yet. Create a draft to begin.</div>}
       {!plansLoading && LIFECYCLE_SECTIONS.map(({ status, title, hint }) => {
         const matching = plans.filter((plan) => plan.status === status)
+        if (matching.length === 0) return null
         return (
           <section key={status}>
             <h3 style={{ fontSize: '1.05rem', fontWeight: 600, marginBottom: 'var(--spacing-xs)' }}>{title}</h3>
             <p className="text-xs text-dim" style={{ marginTop: 0 }}>{hint}</p>
-            {matching.length === 0 ? (
-              <div className="card text-dim text-sm">No plans</div>
-            ) : matching.map((plan) => (
-              <button key={plan.path} className="card card-interactive content-button" onClick={() => void openPlan(plan)}>
+            {matching.map((plan) => {
+              const queued = queue?.plans.find(item => item.path === plan.path)
+              const reason = queued ? queueReason(queued) : null
+              return <button key={plan.path} className="card card-interactive content-button" onClick={() => void openPlan(plan)}>
                 <div className="content-button-row">
                   <span className="mono text-sm">{plan.name}</span>
                   <span className="plan-list-row-facts">
-                    <span className={`status-pill ${plan.status === 'in_progress' ? 'status-awaiting' : ''}`}>{lifecycleLabel(plan.status)}</span>
+                    <span className={`status-pill ${plan.status === 'in_progress' ? 'status-awaiting' : ''}`}>{queued?.outcome === 'blocked' ? 'Blocked' : lifecycleLabel(plan.status)}</span>
                     <span className="text-xs text-dim">{plan.size_bytes} bytes</span>
                   </span>
                 </div>
+                {reason && <span className="text-xs text-dim plan-list-reason">{reason}</span>}
               </button>
-            ))}
+            })}
           </section>
         )
       })}

@@ -3,9 +3,10 @@
 from __future__ import annotations
 
 from collections.abc import Callable, Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 import hashlib
 from importlib.resources import files
+import json
 import os
 from pathlib import Path
 import re
@@ -15,7 +16,12 @@ from typing import Literal
 from urllib.parse import quote
 
 from aflow.control_plane import ContextBundle, RunStatus
+from aflow.control_plane.repository import RunRepository
 from aflow.control_plane.models import startup_failure
+from aflow.daemon import DaemonError
+from aflow.plan import PlanParseError, parse_git_tracking_metadata, parse_plan_text
+from aflow.plan_lifecycle import PlanLifecycle, PlanLifecycleConflict, PlanLifecycleError
+from aflow.project_admission import ProjectAdmission, ProjectAdmissionError
 
 from aflow.plan_backups import (
     backup_reference_for_plan,
@@ -32,8 +38,11 @@ from aflow.plan_backups import (
 
 from .project_registry import ProjectRegistry, ProjectRegistryError
 
-PlanStatus = Literal["todo", "in_progress", "done"]
-_STATUS_DIRS: dict[PlanStatus, str] = {"todo": "todo", "in_progress": "in-progress", "done": "done"}
+PlanStatus = Literal["todo", "in_progress", "done", "failed", "needs_plan_change"]
+_STATUS_DIRS: dict[PlanStatus, str] = {
+    "todo": "todo", "in_progress": "in-progress", "done": "done",
+    "failed": "failed", "needs_plan_change": "needs-plan-change",
+}
 _NEXT_STATUS: dict[PlanStatus, PlanStatus] = {"todo": "in_progress", "in_progress": "done"}
 _PLAN_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,199}\.md$")
 _MAX_PLAN_BYTES = 256 * 1024
@@ -67,6 +76,14 @@ class PlanRevisionConflict(PlanServiceError):
     def __init__(self, current_revision: str) -> None:
         super().__init__("plan revision does not match")
         self.current_revision = current_revision
+
+
+class PlanRequeueResumeConflict(PlanServiceError):
+    """The corrected plan is durable, but its recorded run needs attention."""
+
+    def __init__(self, plan_path: str) -> None:
+        super().__init__("recorded run resume was rejected; corrected plan remains queued")
+        self.plan_path = plan_path
 
 
 def _load_draft_template() -> str:
@@ -321,6 +338,9 @@ class PlanDocument:
     revision: str
     size_bytes: int
     content: str | None = None
+    lifecycle: dict[str, object] | None = None
+    resume_source_run_id: str | None = None
+    resume_idempotency_key: str | None = None
 
     def to_dict(self) -> dict[str, object]:
         payload: dict[str, object] = {
@@ -329,14 +349,41 @@ class PlanDocument:
         }
         if self.content is not None:
             payload["content"] = self.content
+        if self.lifecycle is not None:
+            payload["lifecycle"] = self.lifecycle
         return payload
+
+
+def resume_requeued_plan(
+    project_id: str,
+    plan: PlanDocument,
+    control_plane: object,
+    *,
+    idempotency_key: str | None,
+) -> object | None:
+    """Resume only the checked journal source, with a stable replay key."""
+    if plan.resume_source_run_id is None:
+        return None
+    if plan.resume_idempotency_key is None:
+        raise PlanServiceError("requeue lineage is incomplete")
+    try:
+        return control_plane.resume(
+            project_id, plan.resume_source_run_id,
+            idempotency_key=idempotency_key or plan.resume_idempotency_key,
+        )
+    except DaemonError as exc:
+        raise PlanRequeueResumeConflict(plan.path) from exc
 
 class PlanService:
     """Manage only direct regular Markdown files in canonical plan directories."""
 
-    def __init__(self, registry: ProjectRegistry, *, max_plan_bytes: int = _MAX_PLAN_BYTES) -> None:
+    def __init__(
+        self, registry: ProjectRegistry, *, max_plan_bytes: int = _MAX_PLAN_BYTES,
+        on_change: Callable[[str], None] | None = None,
+    ) -> None:
         self._registry = registry
         self._max_plan_bytes = max_plan_bytes
+        self._on_change = on_change
         self._locks_guard = RLock()
         self._locks: dict[str, RLock] = {}
 
@@ -344,9 +391,14 @@ class PlanService:
         with self._locks_guard:
             return self._locks.setdefault(project_id, RLock())
 
+    def _notify_change(self, project_id: str) -> None:
+        if self._on_change is not None:
+            self._on_change(project_id)
+
     def list(self, project_id: str, status_filter: PlanStatus | None = None) -> tuple[PlanDocument, ...]:
         with self._project_lock(project_id):
             root = self._root(project_id)
+            self._recover_lifecycle(root)
             statuses = (status_filter,) if status_filter is not None else tuple(_STATUS_DIRS)
             documents: list[PlanDocument] = []
             for plan_status in statuses:
@@ -366,6 +418,7 @@ class PlanService:
         with self._project_lock(project_id):
             root = self._root(project_id)
             path = self._plan_path(root, status_value, name, create_dir=False)
+            self._recover_lifecycle(root, path)
             data = self._read_regular(path)
             return self._document(project_id, status_value, name, data, include_content=True)
 
@@ -496,9 +549,12 @@ class PlanService:
         with self._project_lock(project_id):
             root = self._root(project_id)
             path = self._plan_path(root, status_value, name, create_dir=False)
+            self._recover_lifecycle(root, path)
             current = self._read_regular(path)
             self._require_revision(current, expected_revision)
             self._atomic_write(path, data, replace=True)
+            if status_value == "in_progress":
+                self._notify_change(project_id)
             return self._document(project_id, status_value, name, data, include_content=True)
 
     def promote(self, project_id: str, status_value: PlanStatus, name: str, expected_revision: str, target_name: str | None = None) -> PlanDocument:
@@ -587,7 +643,204 @@ class PlanService:
                             "plan promotion metadata rollback failed"
                         ) from metadata_rollback_error
                 raise PlanServiceError("plan promotion failed") from exc
+            self._notify_change(project_id)
             return self._document(project_id, target_status, target_name, current, include_content=True)
+
+    def classify(
+        self,
+        project_id: str,
+        name: str,
+        expected_revision: str,
+        *,
+        target: Literal["failed", "needs_plan_change"],
+        reason_code: str,
+        reason: str,
+        source_run_id: str | None = None,
+        run_status_reader: RunStatusReader | None = None,
+    ) -> PlanDocument:
+        """Move only the original in-progress plan after checked evidence."""
+        self._validate_revision(expected_revision)
+        with self._project_lock(project_id):
+            root = self._root(project_id)
+            source = self._plan_path(root, "in_progress", name, create_dir=False)
+            self._recover_lifecycle(root, source)
+            data = self._read_regular(source)
+            self._require_revision(data, expected_revision)
+            if target == "failed" and source_run_id is None:
+                raise PlanInvalid("failed plans require a confirmed source run")
+            if source_run_id is not None:
+                if run_status_reader is None:
+                    raise PlanServiceError("source run evidence is unavailable")
+                run = run_status_reader(project_id, source_run_id)
+                if (
+                    run.status not in {"failed", "interrupted"}
+                    or not self._run_owns_plan(root, source_run_id, source)
+                    or not ProjectAdmission(root).predecessor_inactive_for_preview(source_run_id)
+                ):
+                    raise PlanInvalid("source run ownership is not confirmed inactive")
+            try:
+                with ProjectAdmission(root).plan_lifecycle_guard(
+                    source, source_run_id=source_run_id
+                ):
+                    destination = PlanLifecycle(root).move(
+                        source, target, expected_revision=expected_revision,
+                        reason_code=reason_code, reason=reason,
+                        source_run_id=source_run_id,
+                    )
+            except PlanLifecycleConflict as exc:
+                raise PlanAlreadyExists("plan lifecycle move conflicts with current state") from exc
+            except ProjectAdmissionError as exc:
+                raise PlanInvalid("plan has an unresolved run claim") from exc
+            except PlanLifecycleError as exc:
+                raise PlanServiceError("plan lifecycle move failed") from exc
+            return self._document(project_id, target, destination.name, data, include_content=True)
+
+    def requeue(
+        self,
+        project_id: str,
+        source_status: Literal["failed", "needs_plan_change"],
+        name: str,
+        expected_revision: str,
+        *,
+        source_run_id: str | None = None,
+        run_status_reader: RunStatusReader | None = None,
+    ) -> PlanDocument:
+        """Explicitly restore one corrected revision for managed continuation."""
+        self._validate_revision(expected_revision)
+        if source_status not in {"failed", "needs_plan_change"}:
+            raise PlanInvalid("only failed or invalid plans may be requeued")
+        with self._project_lock(project_id):
+            root = self._root(project_id)
+            source = self._plan_path(root, source_status, name, create_dir=False)
+            lifecycle = PlanLifecycle(root)
+            self._recover_lifecycle(root, source)
+            if not source.exists() and not source.is_symlink():
+                target = self._plan_path(root, "in_progress", name, create_dir=False)
+                data = self._read_regular(target)
+                self._require_revision(data, expected_revision)
+                record = lifecycle.record_for(target)
+                if (
+                    record is None
+                    or record.get("source") != source_status
+                    or record.get("destination") != "in_progress"
+                    or record.get("revision") != expected_revision
+                    or record.get("reason_code") != "explicit_requeue"
+                ):
+                    raise PlanInvalid("plan requeue replay has no matching lifecycle record")
+                self._checked_requeue_source(
+                    project_id, root, record, source_run_id=source_run_id,
+                    run_status_reader=run_status_reader,
+                )
+                return self._requeue_document(project_id, name, data, record)
+            data = self._read_regular(source)
+            self._require_revision(data, expected_revision)
+            try:
+                parsed = parse_plan_text(data.decode("utf-8"), source_path=source)
+                tracking = parse_git_tracking_metadata(data.decode("utf-8"))
+            except (PlanParseError, ValueError) as exc:
+                raise PlanInvalid("corrected plan content is invalid") from exc
+            if (
+                parsed.snapshot.is_complete or tracking is None
+                or not tracking.plan_branch or not tracking.pre_handoff_base_head
+            ):
+                raise PlanInvalid("corrected plan needs an unchecked checkpoint and complete Git Tracking")
+            record = lifecycle.record_for(source)
+            if record is None or record.get("current_location") != source_status:
+                raise PlanInvalid("plan has no verified lifecycle identity")
+            recorded_run_id = self._checked_requeue_source(
+                project_id, root, record, source_run_id=source_run_id,
+                run_status_reader=run_status_reader,
+            )
+            try:
+                target = root / "plans" / "in-progress" / name
+                with ProjectAdmission(root).plan_lifecycle_guard(
+                    target, source_run_id=str(recorded_run_id) if recorded_run_id else None,
+                    require_file=False,
+                ):
+                    destination = lifecycle.move(
+                        source, "in_progress", expected_revision=expected_revision,
+                        reason_code="explicit_requeue", reason="Corrected plan requeued",
+                        source_run_id=source_run_id or (str(recorded_run_id) if recorded_run_id else None),
+                    )
+            except PlanLifecycleConflict as exc:
+                raise PlanAlreadyExists("requeue destination already exists") from exc
+            except ProjectAdmissionError as exc:
+                raise PlanInvalid("plan has an unresolved run claim") from exc
+            except PlanLifecycleError as exc:
+                raise PlanServiceError("plan requeue failed") from exc
+            moved_record = lifecycle.record_for(destination)
+            if moved_record is None:
+                raise PlanServiceError("requeued plan lineage is unavailable")
+            return self._requeue_document(project_id, destination.name, data, moved_record)
+
+    def _requeue_document(
+        self, project_id: str, name: str, data: bytes, record: Mapping[str, object],
+    ) -> PlanDocument:
+        document = self._document(project_id, "in_progress", name, data, include_content=True)
+        source_run_id = record.get("source_run_id")
+        if source_run_id is None:
+            return document
+        identity = record.get("identity")
+        if not isinstance(identity, str) or not isinstance(source_run_id, str):
+            raise PlanServiceError("requeued plan lineage is invalid")
+        material = f"{identity}:{document.revision}:{source_run_id}".encode("utf-8")
+        replay_key = "plan-requeue-" + hashlib.sha256(material).hexdigest()[:32]
+        return replace(
+            document,
+            resume_source_run_id=source_run_id,
+            resume_idempotency_key=replay_key,
+        )
+
+    def _checked_requeue_source(
+        self, project_id: str, root: Path, record: Mapping[str, object], *,
+        source_run_id: str | None, run_status_reader: RunStatusReader | None,
+    ) -> str | None:
+        recorded = record.get("source_run_id")
+        if source_run_id is not None and recorded != source_run_id:
+            raise PlanInvalid("requeue source run does not match plan lineage")
+        if recorded is None:
+            return None
+        if not isinstance(recorded, str):
+            raise PlanInvalid("requeue source run identity is invalid")
+        if run_status_reader is None:
+            raise PlanServiceError("source run evidence is unavailable")
+        run = run_status_reader(project_id, recorded)
+        original_path = record.get("original_path")
+        if (
+            run.status == "owner_stopped"
+            or not isinstance(original_path, str)
+            or not self._run_owns_plan(root, recorded, Path(original_path))
+            or not ProjectAdmission(root).predecessor_inactive_for_preview(recorded)
+        ):
+            raise PlanInvalid("source run is not eligible for requeue")
+        return recorded
+
+    @staticmethod
+    def _recover_lifecycle(root: Path, path: Path | None = None) -> None:
+        try:
+            lifecycle = PlanLifecycle(root)
+            if path is None:
+                lifecycle.recover()
+            else:
+                lifecycle.recover_for_path(path)
+        except PlanLifecycleError as exc:
+            raise PlanServiceError("plan lifecycle recovery needs attention") from exc
+
+    @staticmethod
+    def _run_owns_plan(root: Path, run_id: str, original: Path) -> bool:
+        """Match an exact saved original path, never a repair overlay alias."""
+        try:
+            run_dir = RunRepository(root).run_directory(run_id)
+            metadata_path = run_dir / "run.json"
+            if metadata_path.is_symlink() or metadata_path.stat().st_size > 4 * 1024 * 1024:
+                return False
+            metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return False
+        return (
+            isinstance(metadata, Mapping)
+            and metadata.get("original_plan_path") == str(original)
+        )
 
     def _root(self, project_id: str) -> Path:
         try:
@@ -731,8 +984,35 @@ class PlanService:
 
     def _document(self, project_id: str, status_value: PlanStatus, name: str, data: bytes, *, include_content: bool = False) -> PlanDocument:
         relative = f"plans/{_STATUS_DIRS[status_value]}/{name}"
+        lifecycle = None
+        if status_value in {"failed", "needs_plan_change", "in_progress"}:
+            try:
+                record = PlanLifecycle(self._root(project_id)).record_for(self._root(project_id) / relative)
+                if status_value == "in_progress" and record is not None:
+                    # Only the moved, identity-bound requeue journal can
+                    # expose a predecessor after its run claim is absent.
+                    if not (
+                        record.get("phase") == "moved"
+                        and record.get("current_location") == "in_progress"
+                        and record.get("destination") == "in_progress"
+                        and record.get("source") in {"failed", "needs_plan_change"}
+                        and record.get("reason_code") == "explicit_requeue"
+                        and record.get("name") == name
+                        and isinstance(record.get("source_run_id"), str)
+                        and re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]{0,63}", record["source_run_id"])
+                    ):
+                        record = None
+                if record is not None:
+                    lifecycle = {
+                        key: record.get(key) for key in (
+                            "reason_code", "reason", "source_run_id", "original_path", "current_location",
+                        )
+                    }
+            except PlanLifecycleError:
+                pass
         return PlanDocument(
             project_id=project_id, name=name, path=relative, status=status_value,
             revision=self._revision(data), size_bytes=len(data),
             content=data.decode("utf-8") if include_content else None,
+            lifecycle=lifecycle,
         )

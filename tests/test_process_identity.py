@@ -360,6 +360,37 @@ def test_ps_fallback_failure_and_dead_pid_return_none(monkeypatch: pytest.Monkey
     assert process_identity.process_birth_identity(2_000_000_000) is None
 
 
+def test_process_liveness_reports_confirmed_absence_separately(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(process_identity.sys, "platform", "linux")
+    _mock_proc_reads(monkeypatch, FileNotFoundError("missing target"))
+    monkeypatch.setattr(process_identity, "_linux_procfs_is_usable", lambda: True)
+    monkeypatch.setattr(
+        process_identity.os,
+        "kill",
+        lambda _pid, _signal: (_ for _ in ()).throw(ProcessLookupError("gone")),
+    )
+
+    assert process_identity.process_liveness(123) == "absent"
+
+
+def test_process_liveness_keeps_unavailable_identity_unknown(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(process_identity.sys, "platform", "linux")
+    _mock_proc_reads(monkeypatch, PermissionError("target denied"))
+    monkeypatch.setattr(
+        process_identity.subprocess,
+        "run",
+        lambda *args, **kwargs: subprocess.CompletedProcess(
+            args[0], 1, stdout="", stderr="permission denied"
+        ),
+    )
+
+    assert process_identity.process_liveness(123) == "unknown"
+
+
 def test_ownership_consumers_reject_reused_identities(monkeypatch: pytest.MonkeyPatch) -> None:
     record = ui_cli.UIRecord(
         pid=123,

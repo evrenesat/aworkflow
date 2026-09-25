@@ -3,6 +3,8 @@ import type {
   PlanBackupPage,
   PlanDocument,
   PlanStatus,
+  ProjectQueue,
+  ProjectScheduling,
   ProjectConfig,
   ProjectConfigFormRequest,
   ProjectConfigFormResponse,
@@ -307,6 +309,23 @@ export async function listProjectPlans(projectId: string, status?: PlanStatus): 
   return fetchJson<PlanDocument[]>(`${API_BASE}/projects/${encodeURIComponent(projectId)}/plans${buildQuery({ status })}`)
 }
 
+export async function getProjectScheduling(projectId: string): Promise<ProjectScheduling> {
+  return fetchJson<ProjectScheduling>(`${API_BASE}/projects/${encodeURIComponent(projectId)}/scheduling`)
+}
+
+export async function patchProjectScheduling(
+  projectId: string,
+  request: { expected_revision: string; auto_consume_plans?: boolean; max_concurrent_implementations?: number },
+): Promise<ProjectScheduling> {
+  return fetchJson<ProjectScheduling>(`${API_BASE}/projects/${encodeURIComponent(projectId)}/scheduling`, {
+    method: 'PATCH', body: JSON.stringify(request),
+  })
+}
+
+export async function getProjectQueue(projectId: string): Promise<ProjectQueue> {
+  return fetchJson<ProjectQueue>(`${API_BASE}/projects/${encodeURIComponent(projectId)}/queue`)
+}
+
 export async function createProjectPlan(
   projectId: string,
   request: { name: string; content?: string | null },
@@ -366,6 +385,17 @@ export async function promoteProjectPlan(
   return fetchJson<PlanDocument>(`${planPath(projectId, status, name)}/promote`, {
     method: 'POST',
     body: JSON.stringify(request),
+  })
+}
+
+export async function requeueProjectPlan(
+  projectId: string,
+  status: 'failed' | 'needs_plan_change',
+  name: string,
+  request: { expected_revision: string; source_run_id?: string; idempotency_key?: string },
+): Promise<{ plan: PlanDocument; run?: RunStatus }> {
+  return fetchJson<{ plan: PlanDocument; run?: RunStatus }>(`${planPath(projectId, status, name)}/requeue`, {
+    method: 'POST', body: JSON.stringify(request),
   })
 }
 

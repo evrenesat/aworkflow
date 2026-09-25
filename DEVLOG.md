@@ -158,6 +158,131 @@
   consequence remain visible, focus stays on its heading, and the final Start
   run action remains separate from opening the review. No run is allocated by
   review. Checkpoint changes remain uncommitted for review.
+## 2026-09-25 — Scheduling and repair policy API contracts (Checkpoint 6)
+
+- Added authenticated, revisioned project scheduling REST/MCP endpoints over
+  the shared settings service, plus plan queue projections with identity,
+  claims, reason, dependency, run, and effective capacity. Existing failed
+  plan requeue remains the shared revision-checked REST/MCP operation.
+- Added typed global and per-workflow repair-threshold actions under the
+  existing pair lock. Null removes a workflow override; guided projections
+  show declared and effective values with inheritance provenance.
+- Contract tests cover defaults, auth, stale revisions, read purity, queue
+  parity, and threshold inheritance across REST and MCP.
+
+## 2026-09-24 — Background automatic plan consumption (Checkpoint 5)
+
+- Added server-owned, per-project scanner election and stable two-scan
+  observation for direct in-progress plans. API mutations and filesystem
+  plan/run artifacts wake the scanner; periodic passes cover missed events.
+- Automatic starts use the managed control-plane path with a durable plan key;
+  the daemon resolves the current global default workflow/team and requires
+  isolated worktree lifecycle.
+  Admission rechecks plan bytes and opt-out under the shared project lock.
+- Added focused process, restart, capacity, opt-out, file-change, invalid-plan,
+  and transport-boundary tests. Scanner shutdown leaves workflow units running.
+- Serialized shared-main publication with a separate primary-root lock; the
+  admission lock is never held for fetch, merge, or push.
+
+## 2026-09-24 — Admit numbered plans after delivered predecessors (Checkpoint 4)
+
+- Added a durable series inventory at the shared admission lock. Known lower
+  members survive deletion, and duplicate or malformed members hold their
+  series while unrelated plans retain capacity.
+- Linked-worktree launches include numbered files in the verified launching
+  checkout and coalesce copies of the same filename across checkouts. A linked
+  member clears only with matching receipt-backed delivery evidence, including
+  when its successor is launched later from the primary checkout.
+- Delivery credit requires the same plan identity's Done ownership and a
+  matching valid published receipt with a completed lifecycle record.
+
+## 2026-09-24 — Resume requeued plans through the supported control-plane transport
+
+- Requeue now uses the control-plane REST default, which maps both HTTP and MCP
+  requests to the same project bearer scope before daemon resume.
+
+## 2026-09-24 — Release repaired publication lineage gates
+
+- Publication keeps historical failed receipts and blocks unrelated delivery
+  until a descendant in the recorded resume lineage has a valid published
+  receipt for the same configured target. Pending, failed, malformed, and
+  unrelated receipts do not release the gate.
+
+## 2026-09-24 — Repair managed requeue and lifecycle crash access
+
+- HTTP and MCP requeue now carry the checked journal source through the plan
+  service, using a stable request key for retries and reporting rejected resume
+  admission while retaining the corrected plan for retry.
+- Normal plan access and direct controller entry recover prepared lifecycle
+  moves before reading affected paths. Recovery keeps exact byte, inode, and
+  identity checks and leaves colliding files untouched.
+
+## 2026-09-24 — Classify failed plans and requeue corrected originals (Checkpoint 3)
+
+- Added a journaled, revision-checked lifecycle move for original plans. It
+  preserves stable identity and run provenance, rejects destination collisions,
+  and recovers interrupted moves without accepting replacement files.
+- Invalid content enters `needs-plan-change`; confirmed inactive terminal
+  execution failures enter `failed`. Failed publication retains its claim and
+  gates unrelated publication until the owning lineage repairs its receipt.
+  Authenticated REST and MCP requeue validate corrected content and resume a
+  recorded eligible run through shared admission. Owner-stopped runs remain
+  ineligible.
+
+## 2026-09-24 — Check direct resume ownership at admission (Checkpoint 2 repair)
+
+- A validated CLI resume marker retains its source and plan provenance role,
+  while shared admission now checks current source inactivity under the lock
+  before exempting the source's historical plan claim. Active and uncertain
+  sources cannot start a second controller for the same plan.
+- Marked-resume regressions cover live ownership, uncertain ownership, and a
+  running-looking source with a confirmed worker exit. Synthetic resume tests
+  now record terminal source ownership where continuation is expected.
+
+## 2026-09-24 — Keep one unresolved run claim per plan (Checkpoint 2 repair)
+
+- Shared admission now records a verified plan identity and checks live,
+  uncertain, reserved, and pending-startup owners under the project lock.
+  Distinct request keys cannot launch the same plan concurrently; exact replay,
+  confirmed inactive retries, supported continuations, and parallel different
+  plans remain available. Daemon, worker fallback, and direct controllers pass
+  their plan paths to the same boundary. Server conflicts use a bounded
+  `project_plan_claim_conflict` response with HTTP 409.
+- Added process-race, daemon, and direct-controller regressions for duplicate
+  plan claims and prelaunch cleanup.
+
+## 2026-09-24 — Align resume availability with admission (Checkpoint 2 repair)
+
+- The daemon's read-only resume preview now shares admission's authoritative
+  predecessor inactivity check. Stopping a unit while controller metadata still
+  says running leaves resume unavailable; terminal evidence permits it. The
+  mutation still rechecks under the project lock.
+- Server fixtures now use terminal evidence for successful resumes, retain an
+  uncertain-source rejection regression, and check the exact nonce-bearing
+  worker environment alongside project isolation and the configured secret.
+
+## 2026-09-24 — Prevent duplicate continuation ownership (Checkpoint 2 repair)
+
+- A project admission now rejects a distinct successor while another live,
+  held, or uncertain successor claims the same predecessor. The check runs
+  under the existing project lock and recovers lineage from launch, startup,
+  and controller artifacts when a journal entry is absent. Exact retries and
+  confirmed inactive successor handoffs remain available.
+- Verification: 333 runtime/repair tests and 327 admission/daemon/CLI/resume/
+  settings tests passed; Ruff and whitespace checks passed.
+
+## 2026-09-24 — Add shared project launch admission (Checkpoint 2)
+
+- Added a primary-project reservation journal and lock shared by managed starts,
+  resumes, daemon workers, and direct controllers. Canonical run evidence keeps
+  uncertain launches charged until confirmed inactive; pending startup input
+  retains its plan claim and reacquires capacity before launch.
+- Closed the rejected-start and rejected-resume transient instruction leak by
+  publishing those instructions only after admission succeeds. Focused tests
+  cover repeated capacity rejections and a subsequent admitted launch. The
+  server returns HTTP 409 for the bounded capacity conflict. Verification passed:
+  333 runtime/repair tests, 319 admission/daemon/CLI/resume/settings tests, the
+  focused REST capacity test, Ruff, compilation, and whitespace checks.
 
 ## 2026-09-24 — Restore New run preparation and review on the published baseline (Checkpoint 1)
 

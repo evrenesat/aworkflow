@@ -174,6 +174,61 @@ def test_profile_combobox_enter_preserves_raw_identity(control_client, tmp_path,
             browser.close()
 
 
+def test_project_scheduling_and_repair_threshold_share_settings_save(
+    control_client, monkeypatch, tmp_path,
+):
+    from aflow_app_server import main, config as config_module
+
+    client, root, _, _ = control_client
+    config_dir = root.parent / 'global'
+    monkeypatch.setattr(main, 'global_config_dir', lambda: config_dir)
+    monkeypatch.setattr(config_module, 'global_config_dir', lambda: config_dir)
+    dist = Path(__file__).resolve().parents[2] / 'web' / 'dist'
+    monkeypatch.setenv('AFLOW_APP_WEB_DIST', str(dist))
+    with live_server() as url, sync_playwright() as playwright:
+        browser = launch_test_browser(playwright)
+        try:
+            page = browser.new_page(viewport={'width': 1280, 'height': 720})
+            page.goto(url)
+            page.get_by_placeholder('Auth token').fill(TOKEN)
+            page.get_by_role('button', name='Login', exact=True).click()
+            page.goto(f'{url}/?project={PROJECT_ID}&view=settings')
+            select_settings_section(page, 'General')
+            automatic = page.get_by_label('Automatic plan consumption', exact=True)
+            expect(automatic).to_be_checked()
+            concurrent = page.get_by_label('Concurrent implementations', exact=True)
+            expect(concurrent).to_have_value('2')
+            automatic.uncheck()
+            concurrent.fill('3')
+            select_settings_section(page, 'Workflows')
+            page.get_by_role('button', name='Defaults', exact=True).click()
+            threshold = page.get_by_label('Default repair threshold', exact=True)
+            expect(threshold).to_have_value('1')
+            threshold.fill('2')
+            page.get_by_role('button', name='Save all changes', exact=True).click()
+            expect(page.get_by_text('Project scheduling saved;', exact=False)).to_be_visible()
+            saved = client.get(f'/api/projects/{PROJECT_ID}/scheduling').json()
+            assert saved['auto_consume_plans'] is False
+            assert saved['max_concurrent_implementations'] == 3
+            assert 'upgrade_after_repairs = 2' in client.get('/api/config').json()['workflows_toml']
+            select_settings_section(page, 'General')
+            expect(automatic).not_to_be_checked()
+            expect(concurrent).to_have_value('3')
+            for theme in ('light', 'dark'):
+                page.get_by_label('Color theme').select_option(theme)
+                for width, height in ((1280, 720), (390, 844)):
+                    page.set_viewport_size({'width': width, 'height': height})
+                    assert_settings_section_navigation(page, 'General', width)
+                    assert not page.evaluate('document.documentElement.scrollWidth > innerWidth')
+                    if width == 1280:
+                        assert document_metrics(page)['headerBottom'] <= 112
+                    image = tmp_path / f'cp7-settings-{theme}-{width}x{height}.png'
+                    page.screenshot(path=str(image), full_page=True)
+                    print('CP7_SETTINGS_SCREENSHOT', image)
+        finally:
+            browser.close()
+
+
 def test_changelog_settings_responsive_journey(control_client, tmp_path, monkeypatch):
     """Exercise the release view and draft ownership in real browsers."""
     _, root, _, _ = control_client
@@ -416,6 +471,8 @@ def test_settings_toolbar_stays_visible_through_long_scroll(control_client, monk
                         nav.wait_for(state='visible')
                         if section_name == 'Workflows':
                             nav.get_by_role('button', name='Defaults', exact=True).click()
+                            page.get_by_role('button', name='Set default workflow in General…', exact=True).click()
+                            assert_settings_section_navigation(page, 'General', width)
                             default_workflow = page.get_by_role('combobox', name='Default workflow', exact=True)
                             default_workflow.focus()
                             default_workflow.fill('Workflow 00')
@@ -431,8 +488,10 @@ def test_settings_toolbar_stays_visible_through_long_scroll(control_client, monk
                             )
                             if pending_preview.is_visible():
                                 pending_preview.wait_for(state='hidden')
+                            select_settings_section(page, 'Workflows')
                             if compact:
-                                page.get_by_role('button', name=f'← Back to {list_label}', exact=True).click()
+                                if not nav.is_visible():
+                                    page.get_by_role('button', name=f'← Back to {list_label}', exact=True).click()
                                 nav.wait_for(state='visible')
                         row = nav.get_by_role('button', name=display_name, exact=True)
                         row.scroll_into_view_if_needed()

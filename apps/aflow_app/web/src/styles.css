@@ -2654,6 +2654,8 @@ input::placeholder, textarea::placeholder {
 /* Global settings keep fields readable at desktop and phone widths. */
 .settings-fields { display: flex; flex-direction: column; gap: var(--spacing-md); margin-block: var(--spacing-md); }
 .settings-fields label { display: flex; flex-direction: column; gap: var(--spacing-xs); }
+.settings-fields .settings-checkbox-row { flex-direction: row; align-items: center; min-height: var(--tap-target); }
+.settings-checkbox-row input { width: 1.15rem; height: 1.15rem; }
 .settings-body { border: 0; padding: 0; min-width: 0; }
 .global-run-row {
   width: 100%;
@@ -3198,6 +3200,8 @@ input::placeholder, textarea::placeholder {
 
 .plan-editor { gap: var(--spacing-md); }
 .plan-list { gap: var(--spacing-lg); }
+.plan-queue-capacity { margin: 0; }
+.plan-list-reason { display: block; margin-top: var(--spacing-xs); overflow-wrap: anywhere; text-align: left; }
 .plan-editor-header,
 .plan-editor-actions {
   display: flex;

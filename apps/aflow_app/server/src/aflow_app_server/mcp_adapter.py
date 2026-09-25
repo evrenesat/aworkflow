@@ -39,9 +39,14 @@ from .plan_service import (
     PlanNotFound,
     PlanProjectNotFound,
     PlanRevisionConflict,
+    PlanRequeueResumeConflict,
     PlanServiceError,
 )
 from .project_config_service import ProjectConfigError, ProjectConfigRevisionConflict
+from .scheduling_service import SchedulingService
+from .mcp_scheduling import register_scheduling_tools
+from aflow.project_admission import ProjectAdmissionError
+from aflow.project_settings import ProjectSettingsError, ProjectSettingsRevisionConflict
 
 __all__ = [
     "ControlPlaneServiceGetter",
@@ -56,6 +61,7 @@ def create_control_plane_mcp(
     *,
     get_plan_service: PlanServiceGetter | None = None,
     get_global_config_service: GlobalConfigServiceGetter | None = None,
+    get_scheduling_service: Callable[[], SchedulingService] | None = None,
 ) -> FastMCP:
     """Create the stateless web MCP registry with app-specific composition.
 
@@ -65,7 +71,8 @@ def create_control_plane_mcp(
     the transport-neutral registry.
     """
     registrar: MCPToolRegistrar | None = None
-    if get_plan_service is not None or get_global_config_service is not None:
+    if (get_plan_service is not None or get_global_config_service is not None
+            or get_scheduling_service is not None):
 
         def register_web_tools(mcp: FastMCP, tool_result: MCPToolResult) -> None:
             if get_plan_service is not None:
@@ -79,6 +86,10 @@ def create_control_plane_mcp(
                 register_global_config_tools(
                     mcp, get_global_config_service, tool_result
                 )
+            if get_scheduling_service is not None:
+                register_scheduling_tools(
+                    mcp, get_scheduling_service, tool_result,
+                )
 
         registrar = register_web_tools
     return _create_control_plane_mcp(
@@ -91,10 +102,14 @@ def create_control_plane_mcp(
             PlanNotFound: "plan_not_found",
             PlanInvalid: "invalid_plan",
             PlanAlreadyExists: "plan_exists",
+            PlanRequeueResumeConflict: "plan_requeue_resume_conflict",
             PlanServiceError: "operation_rejected",
             ProjectConfigRevisionConflict: "revision_conflict",
             GuidedConfigError: "operation_rejected",
             ProjectConfigError: "operation_rejected",
+            ProjectSettingsRevisionConflict: "revision_conflict",
+            ProjectSettingsError: "operation_rejected",
+            ProjectAdmissionError: "operation_rejected",
         },
         register_tools=registrar,
     )

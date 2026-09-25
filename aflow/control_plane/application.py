@@ -7,6 +7,7 @@ from pathlib import Path
 
 from aflow.config import WorkflowUserConfig
 from aflow.live_config import load_live_config
+from aflow.project_settings import ProjectSettingsService
 
 from .capabilities import CapabilityService
 from .reconciliation import ReconciliationService
@@ -27,6 +28,11 @@ class ControlPlaneApplication:
     startup_questions: StartupQuestionService
     reconciliation: ReconciliationService
     units: UnitManager
+
+    @property
+    def project_settings(self) -> ProjectSettingsService:
+        """Return the settings service for the application's project root."""
+        return self.repository.project_settings
 
 
 def compose_control_plane(
