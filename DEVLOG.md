@@ -3739,3 +3739,20 @@ HISTORY: Published clipboard history `c14f1f2`/`cd78d53` remains separate and mu
 - At worker handoff, the checkpoint remained uncommitted for Sol/Astra review.
   Hosted CI for the resulting SHA and deployment activation remain with the
   coordinator.
+
+## 2026-09-25 — Carry reviewed resume evidence fix onto current main (Checkpoint 1)
+
+- Fast-forwarded the clean managed worktree from `9eb433e4` to published
+  `origin/main` `e3156de0`. The manager-context source and test files had no
+  newer-main overlap; their applied patch ID matches the reviewed `f47630a0`
+  two-file patch exactly.
+- Manager context now binds immutable schema-v2 plan and checkpoint references
+  to validated digest artifacts in the current run after resume. Live resumed
+  boundaries reject invalid copied evidence before a manager decision. The
+  focused tests cover one and two hops, missing/corrupt evidence, wrong kind,
+  hash, size, symlink/escape, and scope mismatch; existing schema-v1 tests pass.
+- Verification: focused manager/resume suite 130 passed; isolated full core
+  suite 2,205 passed and 239 subtests passed under Python 3.13.14;
+  `git diff --check` passed. The scoped source/test diff is 2 files,
+  190 insertions and 8 deletions. No original core run or worktree was resumed
+  or edited. Changes remain uncommitted for checkpoint review.

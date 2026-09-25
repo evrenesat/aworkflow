@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import hashlib
+import shutil
 
 import pytest
 from pathlib import Path
@@ -2574,6 +2575,146 @@ def test_v3_live_capture_repair_overlay_keeps_original_checkpoint_authority(
     assert context_v2["active_plan_content"] == overlay_text
     assert context_v2["original_plan_content"] == original_text
     assert context_v2["plan_state"]["current_checkpoint"]["index"] == 3
+
+
+@pytest.mark.parametrize("hops", [1, 2])
+def test_resumed_repair_binds_copied_scope_evidence_to_current_run(
+    tmp_path: Path, hops: int,
+) -> None:
+    source, repo, original, overlay, boundary, original_text, overlay_text = (
+        _repair_context_fixture(tmp_path)
+    )
+    predecessor = source
+    for hop in range(1, hops + 1):
+        successor = source.parent / f"successor-{hop}"
+        shutil.copytree(predecessor / "scopes", successor / "scopes")
+        shutil.copytree(predecessor / "evidence", successor / "evidence")
+        shutil.copy2(source / "run.json", successor / "run.json")
+        metadata = json.loads((successor / "run.json").read_text(encoding="utf-8"))
+        metadata["resumed_from_run_id"] = predecessor.name
+        _write_json(successor / "run.json", metadata)
+        for artifact in (predecessor / "evidence").rglob("*.md"):
+            artifact.unlink()
+        predecessor = successor
+    _write_turn(predecessor, 1, step="implement", role="implementer", stdout="repair complete")
+    boundary = {**boundary, "proposed_transition": "review", "eligible_actions": ["continue", "stop"]}
+
+    context = build_manager_context(
+        predecessor, level="full", boundary=boundary,
+        active_plan_content=overlay_text, capture_evidence=True,
+    )
+    state = context["plan_state"]
+    assert state["active_repair_plan"] is True
+    assert state["current_checkpoint"]["index"] == 3
+    assert state["parse_error"] is None
+    assert context["controller_state"]["proposed_next_step"] == "review"
+    assert "continue" in context["controller_state"]["eligible_actions"]
+    evidence = context["evidence"]
+    for kind, expected in (("original_plan", original_text), ("checkpoint", "### [ ] Checkpoint 3: Third")):
+        entry = evidence[kind]
+        assert entry["available"] is True
+        reference = entry["reference"]
+        assert reference["path"].startswith(f".aflow/runs/{predecessor.name}/")
+        contents = (repo / reference["path"]).read_text(encoding="utf-8")
+        assert expected in contents
+    summary = context["controller_state"]["repartition_evidence"]["envelope_summary"]
+    assert summary["plan_ref"]["path"].startswith(f".aflow/runs/{predecessor.name}/")
+    assert original.read_text(encoding="utf-8") == original_text
+    assert overlay.read_text(encoding="utf-8") == overlay_text
+
+
+@pytest.mark.parametrize("failure", ["missing_plan", "corrupt_plan", "missing_checkpoint", "corrupt_checkpoint", "symlink_checkpoint"])
+def test_resumed_repair_rejects_invalid_copied_scope_evidence_before_manager(
+    tmp_path: Path, failure: str,
+) -> None:
+    source, _, _, _, boundary, _, overlay_text = _repair_context_fixture(tmp_path)
+    successor = source.parent / "successor"
+    shutil.copytree(source / "scopes", successor / "scopes")
+    shutil.copytree(source / "evidence", successor / "evidence")
+    shutil.copy2(source / "run.json", successor / "run.json")
+    _write_turn(successor, 1, step="implement", role="implementer", stdout="repair complete")
+    kind = "plans" if failure.endswith("plan") else "checkpoints"
+    artifact = next((successor / "evidence" / kind).glob("*.md"))
+    if failure.startswith("missing"):
+        artifact.unlink()
+    elif failure.startswith("corrupt"):
+        artifact.write_bytes(b"corrupt")
+    else:
+        artifact.unlink()
+        artifact.symlink_to(next((source / "evidence" / kind).glob("*.md")))
+    original_bytes = {
+        path.relative_to(source): path.read_bytes()
+        for path in (source / "evidence").rglob("*.md")
+    }
+    source_envelope = source / boundary["envelope_artifact_path"]
+    successor_envelope = successor / boundary["envelope_artifact_path"]
+    envelope_bytes = source_envelope.read_bytes()
+    with pytest.raises(ValueError, match="invalid copied scope evidence"):
+        build_manager_context(
+            successor, level="full", boundary=boundary,
+            active_plan_content=overlay_text, capture_evidence=True,
+        )
+    assert original_bytes == {
+        path.relative_to(source): path.read_bytes()
+        for path in (source / "evidence").rglob("*.md")
+    }
+    assert source_envelope.read_bytes() == envelope_bytes
+    assert successor_envelope.read_bytes() == envelope_bytes
+
+
+@pytest.mark.parametrize("failure", ["wrong_size", "wrong_hash", "wrong_kind", "escaped_path", "scope_identity"])
+def test_resumed_repair_rejects_invalid_envelope_identity_before_manager(
+    tmp_path: Path, failure: str,
+) -> None:
+    source, _, _, _, boundary, _, overlay_text = _repair_context_fixture(tmp_path)
+    successor = source.parent / "successor"
+    shutil.copytree(source / "scopes", successor / "scopes")
+    shutil.copytree(source / "evidence", successor / "evidence")
+    shutil.copy2(source / "run.json", successor / "run.json")
+    metadata = json.loads((successor / "run.json").read_text(encoding="utf-8"))
+    metadata["resumed_from_run_id"] = source.name
+    _write_json(successor / "run.json", metadata)
+    _write_turn(successor, 1, step="implement", role="implementer", stdout="repair complete")
+    boundary = dict(boundary)
+    if failure == "scope_identity":
+        boundary["active_implementation_scope"] = {
+            **boundary["active_implementation_scope"],
+            "checkpoint_name": "Checkpoint 3: Different",
+        }
+    else:
+        artifact = successor / boundary["envelope_artifact_path"]
+        payload = json.loads(artifact.read_text(encoding="utf-8"))
+        reference = payload["checkpoint_ref"]
+        if failure == "wrong_size":
+            reference["byte_size"] += 1
+        elif failure == "wrong_hash":
+            reference["sha256"] = "a" * 64
+            reference["path"] = reference["path"].rsplit("/", 1)[0] + "/" + "a" * 64 + ".md"
+        elif failure == "wrong_kind":
+            reference["kind"] = "plan"
+        else:
+            reference["path"] = "../outside.md"
+        canonical = {key: value for key, value in payload.items() if key != "canonical_envelope_sha256"}
+        payload["canonical_envelope_sha256"] = hashlib.sha256(
+            json.dumps(canonical, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+        ).hexdigest()
+        artifact.write_text(json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False) + "\n", encoding="utf-8")
+        boundary["envelope_artifact_sha256"] = hashlib.sha256(artifact.read_bytes()).hexdigest()
+        boundary["envelope_canonical_sha256"] = payload["canonical_envelope_sha256"]
+    envelope = successor / boundary["envelope_artifact_path"]
+    envelope_bytes = envelope.read_bytes()
+    source_bytes = (source / boundary["envelope_artifact_path"]).read_bytes()
+    with pytest.raises(ValueError, match="invalid copied scope evidence"):
+        build_manager_context(
+            successor, level="full", boundary=boundary,
+            active_plan_content=overlay_text, capture_evidence=True,
+            run_metadata={
+                key: value for key, value in metadata.items()
+                if key != "resumed_from_run_id"
+            },
+        )
+    assert envelope.read_bytes() == envelope_bytes
+    assert (source / boundary["envelope_artifact_path"]).read_bytes() == source_bytes
 
 
 def test_v3_live_repair_invalid_envelope_stays_unavailable(

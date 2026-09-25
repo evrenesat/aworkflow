@@ -7,7 +7,7 @@ captured plan solely to derive bounded controller-owned scope metadata.
 
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 from datetime import datetime
 import hashlib
 import json
@@ -423,6 +423,8 @@ def _resolve_validated_envelope(
     expected_artifact_sha256: str,
     expected_canonical_sha256: str,
     active_scope: Mapping[str, Any] | None,
+    *,
+    require_valid_evidence: bool = False,
 ) -> dict[str, Any] | None:
     """Resolve, read, hash-check, and parse a validated envelope.
 
@@ -476,6 +478,34 @@ def _resolve_validated_envelope(
         or parsed.canonical_envelope_sha256 != expected_canonical_sha256
     ):
         return None
+    # The envelope is immutable across resumes, so its v2 paths still name
+    # the opening run. Bind only its validated kind/digest/size to this run's
+    # canonical store, then validate both copied byte streams and their span.
+    from .repartition import ScopeEnvelopeV2
+    if isinstance(parsed, ScopeEnvelopeV2):
+        from .runlog import evidence_reference, resolve_envelope_texts
+
+        paths = _v3_run_paths(run_dir)
+        try:
+            plan_ref = evidence_reference(
+                paths, parsed.plan_ref.kind, parsed.plan_ref.sha256,
+                parsed.plan_ref.byte_size,
+            )
+            checkpoint_ref = evidence_reference(
+                paths, parsed.checkpoint_ref.kind, parsed.checkpoint_ref.sha256,
+                parsed.checkpoint_ref.byte_size,
+            )
+            bound = replace(
+                parsed,
+                plan_ref=replace(parsed.plan_ref, path=plan_ref.path),
+                checkpoint_ref=replace(parsed.checkpoint_ref, path=checkpoint_ref.path),
+            )
+            resolve_envelope_texts(paths, bound)
+        except (OSError, UnicodeError, ValueError, TypeError) as exc:
+            if require_valid_evidence:
+                raise ValueError("invalid copied scope evidence") from exc
+            return None
+        parsed = bound
     payload = parsed.to_dict()
     payload.update({
         "artifact_path": artifact_path,
@@ -1991,13 +2021,13 @@ def build_manager_context(
     """
     run_dir = Path(run_dir)
     run_json_path = run_dir / "run.json"
-    if run_metadata is not None:
-        run_json = dict(run_metadata)
-    else:
-        try:
-            run_json = json.loads(run_json_path.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError):
-            run_json = {}
+    try:
+        persisted_run_json = json.loads(run_json_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        persisted_run_json = {}
+    if not isinstance(persisted_run_json, dict):
+        persisted_run_json = {}
+    run_json = dict(run_metadata) if run_metadata is not None else persisted_run_json
     boundary_was_supplied = boundary is not None
     boundary = dict(boundary or {})
     turns = list(turns) if turns is not None else _load_turns(run_dir)
@@ -2062,7 +2092,18 @@ def build_manager_context(
             boundary["envelope_artifact_sha256"],
             boundary["envelope_canonical_sha256"],
             active_scope_mapping,
+            require_valid_evidence=capture_evidence,
         )
+        if (
+            capture_evidence
+            and validated_envelope is None
+            and isinstance(persisted_run_json.get("resumed_from_run_id"), str)
+            and persisted_run_json["resumed_from_run_id"]
+        ):
+            # A continuation already admitted the immutable envelope and its
+            # copies. Losing that authority at a live boundary is a prelaunch
+            # error, not a reason to consult the mutable repair overlay.
+            raise ValueError("invalid copied scope evidence")
     captured_plan_state = boundary.get("captured_plan_state")
     current_authority_boundary = (
         isinstance(
