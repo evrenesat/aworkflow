@@ -16,6 +16,9 @@ from .models import (
     RunProgressExecutor,
     RunProgressSummary,
     RunProgressTruncation,
+    StartupCheckpoint,
+    StartupContextSummary,
+    StartupRelatedRun,
     RunControlRequest,
     RunEvent,
     RunPage,
@@ -27,6 +30,7 @@ from .models import (
     WorkflowCapability,
 )
 from .application import ControlPlaneApplication, compose_control_plane
+from .startup_context import project_plan_startup_context
 from .recovery import (
     DurableEvidenceRecoveryRequest,
     RecoveryEvidenceReference,
@@ -97,6 +101,10 @@ __all__ = [
     "RunProgressExecutor",
     "RunProgressSummary",
     "RunProgressTruncation",
+    "StartupCheckpoint",
+    "StartupContextSummary",
+    "StartupRelatedRun",
+    "project_plan_startup_context",
     "RunControlRequest",
     "RunEvent",
     "RunPage",

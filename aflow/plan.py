@@ -463,28 +463,9 @@ def rewrite_git_tracking_field(text: str, field: str, new_value: str) -> str:
 def _collect_sections(text: str, *, source_path: Path) -> tuple[CheckpointSection, ...]:
     sections: list[CheckpointSection] = []
     current_section: dict[str, object] | None = None
-    in_fence = False
-    fence_char: str | None = None
-    fence_len = 0
     in_checkpoint_scope = False
 
-    for line_number, line in enumerate(text.splitlines(), start=1):
-        fence_match = FENCE_RE.match(line)
-        if fence_match:
-            marker = fence_match.group(1)
-            if not in_fence:
-                in_fence = True
-                fence_char = marker[0]
-                fence_len = len(marker)
-            elif marker[0] == fence_char and len(marker) >= fence_len:
-                in_fence = False
-                fence_char = None
-                fence_len = 0
-            continue
-
-        if in_fence:
-            continue
-
+    for line_number, line in live_plan_lines(text):
         section_match = SECTION_RE.match(line)
         if section_match:
             if current_section is not None:
@@ -540,6 +521,53 @@ def _collect_sections(text: str, *, source_path: Path) -> tuple[CheckpointSectio
         )
 
     return tuple(sections)
+
+
+def live_plan_lines(text: str):
+    """Yield numbered lines visible to checkpoint parsing, excluding fences."""
+    in_fence = False
+    fence_char: str | None = None
+    fence_len = 0
+    for line_number, line in enumerate(text.splitlines(), start=1):
+        fence_match = FENCE_RE.match(line)
+        if fence_match:
+            marker = fence_match.group(1)
+            if not in_fence:
+                in_fence = True
+                fence_char = marker[0]
+                fence_len = len(marker)
+            elif marker[0] == fence_char and len(marker) >= fence_len:
+                in_fence = False
+                fence_char = None
+                fence_len = 0
+            continue
+
+        if in_fence:
+            continue
+        yield line_number, line
+
+
+def unchecked_step_texts(text: str, section: CheckpointSection, *, limit: int = 5) -> tuple[tuple[str, ...], int]:
+    """Extract first-line task text using the same live lines and scope rules as counts."""
+    texts: list[str] = []
+    count = 0
+    in_scope = False
+    for line_number, line in live_plan_lines(text):
+        if line_number == section.line_number:
+            in_scope = True
+            continue
+        if not in_scope:
+            continue
+        if NON_CHECKPOINT_HEADING_RE.match(line):
+            break
+        step_match = STEP_RE.match(line)
+        if step_match and step_match.group(1) == " ":
+            task = line[step_match.end():].strip()
+            if task:
+                count += 1
+                if len(texts) < limit:
+                    texts.append(task)
+    return tuple(texts), count
 
 
 def _validate_sections(sections: tuple[CheckpointSection, ...], *, source_path: Path) -> None:

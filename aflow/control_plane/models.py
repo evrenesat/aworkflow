@@ -12,6 +12,7 @@ from typing import Any, Literal, Mapping
 
 CONTROL_PLANE_SCHEMA_VERSION = 1
 RUN_PROGRESS_SCHEMA_VERSION = 1
+STARTUP_CONTEXT_SCHEMA_VERSION = 1
 MAX_SERIALIZED_TEXT = 4_096
 MAX_SERIALIZED_ITEMS = 128
 WORKTREE_PREFLIGHT_DEFAULT_LIMIT = 200
@@ -129,6 +130,68 @@ ProgressEventAssociation = Literal[
     "outside_returned",
     "unassigned",
 ]
+
+StartupAvailability = Literal["available", "partial", "unavailable", "not_applicable"]
+StartupRecommendation = Literal[
+    "start", "open_existing_run", "review_previous_run", "inspect_previous_runs", "blocked"
+]
+
+
+@dataclass(frozen=True)
+class StartupCheckpoint:
+    """Recorded plan checklist facts; no execution or approval is implied."""
+
+    ordinal: int
+    title: str
+    heading_checked: bool
+    checked_tasks: int
+    total_tasks: int
+
+
+@dataclass(frozen=True)
+class StartupRelatedRun:
+    run_id: str
+    status: str | None = None
+    step: str | None = None
+    failure_reason: str | None = None
+    worktree_path: str | None = None
+    branch: str | None = None
+    unmerged_work: bool | None = None
+    uncommitted_work: bool | None = None
+    can_resume: bool | None = None
+
+
+@dataclass(frozen=True)
+class StartupContextSummary:
+    """Bounded, read-only observation made before workflow execution."""
+
+    schema_version: int = STARTUP_CONTEXT_SCHEMA_VERSION
+    availability: StartupAvailability = "unavailable"
+    reason_codes: tuple[str, ...] = ()
+    reason: str | None = None
+    observed_at: str | None = None
+    plan_path: str | None = None
+    plan_identity: str | None = None
+    plan_revision: str | None = None
+    total_checkpoints: int | None = None
+    recorded_complete_checkpoints: int | None = None
+    next_checkpoint: StartupCheckpoint | None = None
+    checkpoints: tuple[StartupCheckpoint, ...] = ()
+    pending_tasks: tuple[str, ...] = ()
+    checkpoint_outline_truncated: bool = False
+    pending_tasks_truncated: bool = False
+    text_truncated: bool = False
+    workflow_name: str | None = None
+    selected_step: str | None = None
+    step_source: Literal["workflow_default", "explicit", "resume"] | None = None
+    recommendation: StartupRecommendation | None = None
+    recommendation_reason: str | None = None
+    related_runs: tuple[StartupRelatedRun, ...] = ()
+    related_runs_complete: bool | None = None
+    related_runs_truncated: bool = False
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
 
 
 def _progress_safe(value: Any, *, key: str | None = None, depth: int = 0) -> Any:
