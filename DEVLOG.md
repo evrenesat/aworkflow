@@ -4607,3 +4607,20 @@ HISTORY: Published clipboard history `c14f1f2`/`cd78d53` remains separate and mu
   evidence, and kept exact-unit stop and bounded timeout behavior. Fixture
   tests cover authorization, replay, and failed unit observations. Real-record
   reconciliation belongs to the coordinator after deployment.
+
+## 2026-09-27 — Compact selected-run focus delivery repair
+
+- CI 36308511775 exposed a product race: opening a compact history row while
+  its exact detail was pending focused the temporary “Loading run details”
+  heading. Replacing that heading dropped focus outside the visible detail.
+  A deferred-response component test reproduced the row → loading heading →
+  lost-focus sequence before the repair.
+- The shared layout now focuses its retained detail surface while the selected
+  response is pending, then its durable heading if focus has stayed there.
+  Back, inactive surfaces, and deliberate focus changes cancel that transfer;
+  settled refreshes do not request it again. The dashboard marks a selected
+  detail ready only after its exact response is accepted.
+- Deferred selection, Back with a late response, and deliberate-focus tests
+  passed. The full web suite passed 673 tests; the production build and the
+  existing Chromium and WebKit navigation journey passed. Publication,
+  exact-SHA CI, and live activation remain coordinator gates.

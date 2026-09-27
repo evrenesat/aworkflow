@@ -116,6 +116,22 @@ describe('SidebarEditorLayout compact presentation', () => {
     expect((container.querySelector('.sidebar-editor-detail h3') as HTMLElement).tabIndex).toBe(-1)
   })
 
+  it('keeps deliberate focus during a pending detail response', () => {
+    installMedia(true)
+    const view = (ready: boolean) => <SidebarEditorLayout selection="one" detailEntry detailReady={ready} navigation={<h3>Items</h3>}>
+      <h3>{ready ? 'Ready detail' : 'Loading detail'}</h3>
+      <button type="button">Inspect loading</button>
+    </SidebarEditorLayout>
+    const { container, rerender } = render(view(false))
+    const detail = container.querySelector('.sidebar-editor-detail') as HTMLElement
+    expect(document.activeElement).toBe(detail)
+    const inspect = screen.getByRole('button', { name: 'Inspect loading' })
+    inspect.focus()
+    rerender(view(true))
+    expect(document.activeElement).toBe(inspect)
+    expect(detail.contains(document.activeElement)).toBe(true)
+  })
+
   it('falls back to the labelled list surface when the opened row is removed', async () => {
     installMedia(true)
     const { container } = render(<DemoLayout />)

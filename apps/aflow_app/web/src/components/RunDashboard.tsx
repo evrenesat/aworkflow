@@ -3744,7 +3744,7 @@ export function RunDashboard({ visible = true, page, onNewRun, onCancelNewRun, o
       )}
 
       {projectAvailable && !newRunPage && (
-        <SidebarEditorLayout selection={selectedRunId} navigationVersion={navigationVersion} listLabel="Run history" detailEntry={explicitRunNavigation ?? Boolean(requestedRunId)} navigation={
+        <SidebarEditorLayout selection={selectedRunId} navigationVersion={navigationVersion} listLabel="Run history" detailEntry={explicitRunNavigation ?? Boolean(requestedRunId)} detailReady={selectedDetailAccepted || Boolean(selectedRunId && deletedIds.has(selectedRunId))} navigation={
           <section ref={runListRef} className="card run-list" aria-label="Project runs">
             <div className="section-heading"><h3>Project runs</h3><span className="text-xs text-dim">{historyCountLabel}</span></div>
             {!hosted && <label>Run history<select className="input" aria-label="Run history" value={historyFilter} onChange={event => setHistoryFilter(event.target.value as typeof historyFilter)}><option value="visible">Visible</option><option value="archived">Archived</option><option value="all">All history</option></select></label>}

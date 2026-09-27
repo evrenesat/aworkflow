@@ -3940,6 +3940,8 @@ describe('RunDashboard', () => {
 
     const row = await screen.findByRole('button', { name: /run-other Completed/ })
     await waitFor(() => expect(container.querySelector('.run-detail')?.textContent).toContain('run-owned'))
+    row.focus()
+    expect(document.activeElement).toBe(row)
     fireEvent.click(row)
 
     const detail = await screen.findByLabelText('Run details')
@@ -3947,12 +3949,15 @@ describe('RunDashboard', () => {
     expect(within(detail).getByText('run-other')).toBeDefined()
     expect(within(detail).queryByRole('button', { name: 'run-owned', exact: true })).toBeNull()
     expect(screen.getByRole('button', { name: '← Back to Run history' })).toBeDefined()
+    expect(document.activeElement).toBe(detail.closest('.sidebar-editor-detail'))
 
     await act(async () => {
       selectedDetail.resolve(otherRun)
       await selectedDetail.promise
     })
     expect(within(detail).getByRole('button', { name: 'run-other', exact: true })).toBeDefined()
+    expect(document.activeElement).toBe(detail.querySelector('.run-progress-header h3'))
+    expect(detail.closest('.sidebar-editor-detail')?.contains(document.activeElement)).toBe(true)
 
     fireEvent.click(screen.getByRole('button', { name: '← Back to Run history' }))
     await waitFor(() => expect(document.activeElement).toBe(row))
@@ -3963,6 +3968,33 @@ describe('RunDashboard', () => {
     })
     await waitFor(() => expect(screen.getByRole('button', { name: 'Refresh', exact: true })).toHaveProperty('disabled', false))
     expect(document.activeElement).toBe(row)
+  })
+
+  it('restores compact list focus when Back precedes a late selected-run response', async () => {
+    installCompactMedia()
+    const selectedDetail = deferred<typeof ownedRun>()
+    const otherRun = { ...ownedRun, run_id: 'run-other', revision: 2 }
+    vi.mocked(api.listControlPlaneRuns).mockResolvedValue({ runs: [ownedRun, otherRun], next_cursor: null, schema_version: 1 })
+    vi.mocked(api.getControlPlaneRun).mockImplementation((_projectId, runId) => (
+      runId === otherRun.run_id ? selectedDetail.promise : Promise.resolve(ownedRun)
+    ))
+    const { container } = renderDashboard()
+    const row = await screen.findByRole('button', { name: /run-other Running/ })
+    await waitFor(() => expect(container.querySelector('.run-detail')?.textContent).toContain('run-owned'))
+    fireEvent.click(row)
+    const detail = container.querySelector('.sidebar-editor-detail') as HTMLElement
+    expect(document.activeElement).toBe(detail)
+    fireEvent.click(screen.getByRole('button', { name: '← Back to Run history' }))
+    await waitFor(() => expect(document.activeElement).toBe(row))
+    expect(detail.hidden).toBe(true)
+
+    await act(async () => {
+      selectedDetail.resolve(otherRun)
+      await selectedDetail.promise
+    })
+    expect(detail.hidden).toBe(true)
+    expect(document.activeElement).toBe(row)
+    expect(findRunSelection(otherRun.run_id)?.getAttribute('aria-current')).toBe('true')
   })
 
   it('blocks boundary stop and an open immediate-stop confirmation during renewed initial admission', async () => {

@@ -16,6 +16,8 @@ export interface SidebarEditorLayoutProps {
   active?: boolean
   /** A URL/deep-link entry that should open the detail surface on compact screens. */
   detailEntry?: boolean
+  /** Whether the selected detail has a durable heading to receive open focus. */
+  detailReady?: boolean
 }
 
 export function useCompactLayout(): boolean {
@@ -87,6 +89,7 @@ export function SidebarEditorLayout({
   detailHeading,
   active = true,
   detailEntry = false,
+  detailReady = true,
 }: SidebarEditorLayoutProps) {
   const compact = useCompactLayout()
   const [detailOpen, setDetailOpen] = useState(() => !compact || detailEntry)
@@ -98,6 +101,7 @@ export function SidebarEditorLayout({
   const previousSelectionRef = useRef(selection)
   const userOpenedRef = useRef(detailEntry)
   const pendingOpenRef = useRef(detailEntry)
+  const focusedPendingSurfaceRef = useRef(false)
   const restorePointRef = useRef<ListRestorePoint | null>(null)
   const previousRevealRef = useRef({ navigationVersion, selection, detailEntry: false })
   const revealPendingRef = useRef(false)
@@ -108,6 +112,7 @@ export function SidebarEditorLayout({
     }
     userOpenedRef.current = true
     pendingOpenRef.current = true
+    focusedPendingSurfaceRef.current = false
     setDetailOpen(true)
   }
 
@@ -142,6 +147,7 @@ export function SidebarEditorLayout({
     if (detailEntry && (entryChanged || selectionChanged)) {
       userOpenedRef.current = true
       pendingOpenRef.current = true
+      focusedPendingSurfaceRef.current = false
       setDetailOpen(true)
     }
   }, [detailEntry, selection])
@@ -156,18 +162,44 @@ export function SidebarEditorLayout({
     else setDetailOpen(true)
   }, [compact])
 
-  // Open transitions focus the detail heading after its mounted content exists.
-  // selection is included so a URL/deferred detail load gets one retry without
-  // making passive polling a focus or scroll event.
+  // A loading detail may replace its heading. Focus the retained detail surface
+  // first, then its durable heading only if the user has kept focus there.
+  // Settled background updates never create another open intent.
   useEffect(() => {
     if (!active || !pendingOpenRef.current || !detailOpen) return
-    const heading = detailRef.current?.querySelector<HTMLElement>('h1, h2, h3, h4, h5, h6, legend')
+    const detail = detailRef.current
+    if (!detail) return
+    if (!detailReady) {
+      if (focusedPendingSurfaceRef.current) {
+        if (document.activeElement !== detail) pendingOpenRef.current = false
+        return
+      }
+      detail.tabIndex = -1
+      scrollDocumentTo(0)
+      focusWithoutScroll(detail)
+      focusedPendingSurfaceRef.current = true
+      return
+    }
+    if (focusedPendingSurfaceRef.current && document.activeElement !== detail) {
+      pendingOpenRef.current = false
+      focusedPendingSurfaceRef.current = false
+      return
+    }
+    const heading = detail.querySelector<HTMLElement>('h1, h2, h3, h4, h5, h6, legend')
     if (!heading) return
     heading.tabIndex = -1
     scrollDocumentTo(0)
     focusWithoutScroll(heading)
     pendingOpenRef.current = false
-  }, [active, children, detailOpen, selection, navigationVersion])
+    focusedPendingSurfaceRef.current = false
+  }, [active, children, detailOpen, detailReady, selection, navigationVersion])
+
+  useEffect(() => {
+    if (!active) {
+      pendingOpenRef.current = false
+      focusedPendingSurfaceRef.current = false
+    }
+  }, [active])
 
   // Explicit wide-screen selection changes reveal the already-rendered row in
   // its existing list owner. Passive refreshes do not change either signal,
@@ -233,6 +265,8 @@ export function SidebarEditorLayout({
       restorePointRef.current = { scrollTop: documentScrollTop(), itemId: selection }
     }
     userOpenedRef.current = false
+    pendingOpenRef.current = false
+    focusedPendingSurfaceRef.current = false
     setDetailOpen(false)
   }
 
