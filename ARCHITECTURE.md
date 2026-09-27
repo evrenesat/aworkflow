@@ -157,6 +157,18 @@ by default. Direct repository status and history callers retain their existing
 progress-bearing defaults, while internal raw reconciliation stays free of
 identity and progress reduction.
 
+Preflight and pre-execution single-run status carry an optional bounded
+`startup_context` built from the same plan projector and validated live workflow
+selection. Pending manifests retain their selection provenance; an omitted step
+uses the current configured default. The context describes plan checkpoints,
+related-run evidence and safe recovery recommendations without answering a
+startup question or changing admission state. Lite/full run context reuses the
+already authorized status projection. Once `run.json` records execution, normal
+progress remains authoritative and startup context is omitted. History rows,
+including `include_progress=false` reads, omit the expensive startup projection.
+REST and MCP share these canonical response shapes and structured startup
+failure codes, including a reserved run ID when one exists.
+
 `ReconciliationService` consumes the inclusive repository union as a bounded raw
 status snapshot: each batch page is classified once under the reconciliation
 lock, and each single-run read requests the same progress-free status form. The

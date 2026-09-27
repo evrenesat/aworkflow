@@ -42,7 +42,8 @@ from aflow.api.startup import (
     prepare_startup_with_answer,
     require_safe_fresh_worktree,
 )
-from aflow.control_plane.models import startup_failure
+from aflow.control_plane.models import StartupContextSummary, startup_failure
+from aflow.control_plane.startup_context import project_startup_context, with_startup_selection
 from aflow.control_plane.worker_diagnostics import confirmed_inactive
 from aflow.config import ConfigError, WorkflowUserConfig, load_workflow_config
 from aflow.live_config import load_live_config
@@ -761,28 +762,48 @@ class DaemonService:
         or unit operation is performed here.
         """
         with self._lock:
-            self._refresh_workflow_config()
-            normalized = self._normalize_request(
-                request,
-                caller_scope=caller_scope,
-                idempotency_key=None,
-            )
-            candidate = self._initial_manifest_for(
-                run_id="preflight-preview",
-                request=normalized,
-                caller_scope=caller_scope,
-                idempotency_key="preflight-preview",
-            )
-            from aflow.api.startup import _check_worktree_dirtiness
+            result, _, _ = self._preflight_locked(request, caller_scope=caller_scope)
+            return result
 
-            try:
-                return _check_worktree_dirtiness(
-                    normalized,
-                    candidate.workflow_name,
-                    reject_blockers=False,
-                )
-            except StartupError as exc:
-                raise DaemonError(str(exc)) from exc
+    def preflight_with_startup_context(
+        self, request: StartupRequest, *, caller_scope: str = "local",
+    ) -> tuple[WorktreePreflight, StartupContextSummary]:
+        """Use the same normalized live request for dirtiness and plan context."""
+        with self._lock:
+            result, normalized, candidate = self._preflight_locked(
+                request, caller_scope=caller_scope,
+            )
+            workflow = normalized.workflow_config.workflows[candidate.workflow_name]
+            summary = project_startup_context(
+                normalized.repo_root, normalized.plan_path,
+                workflow=workflow, admission=self._admission,
+            )
+            return result, with_startup_selection(
+                summary, workflow_name=candidate.workflow_name,
+                selected_step=candidate.start_step or workflow.first_step,
+                step_source="explicit" if normalized.start_step is not None else "workflow_default",
+            )
+
+    def _preflight_locked(
+        self, request: StartupRequest, *, caller_scope: str,
+    ) -> tuple[WorktreePreflight, StartupRequest, LaunchManifest]:
+        self._refresh_workflow_config()
+        normalized = self._normalize_request(
+            request, caller_scope=caller_scope, idempotency_key=None,
+        )
+        candidate = self._initial_manifest_for(
+            run_id="preflight-preview", request=normalized,
+            caller_scope=caller_scope, idempotency_key="preflight-preview",
+        )
+        from aflow.api.startup import _check_worktree_dirtiness
+
+        try:
+            result = _check_worktree_dirtiness(
+                normalized, candidate.workflow_name, reject_blockers=False,
+            )
+        except StartupError as exc:
+            raise DaemonError(str(exc)) from exc
+        return result, normalized, candidate
 
     def answer_startup(
         self,
@@ -1319,6 +1340,7 @@ class DaemonService:
         *,
         include_progress: bool = True,
         include_resume_preview: bool = True,
+        include_startup_context: bool = True,
     ) -> RunStatus:
         """Project a persisted startup question into canonical run status.
 
@@ -1332,7 +1354,14 @@ class DaemonService:
 
         def finalize(candidate: RunStatus) -> RunStatus:
             projected = project_activity(candidate)
-            return repository.with_progress(projected) if include_progress else projected
+            if not include_progress:
+                return projected
+            projected = repository.with_progress(projected)
+            if include_startup_context and not projected.evidence.get("has_run_metadata"):
+                summary = self._startup_context_for_status(projected)
+                if summary is not None:
+                    projected = replace(projected, startup_context=summary)
+            return projected
 
         status = repository.get_run_status(run_id, include_progress=False)
         if not include_resume_preview and "can_resume" in status.evidence:
@@ -1400,6 +1429,74 @@ class DaemonService:
                     skipped_steps=tuple(skipped),
                 ))
         return finalize(status)
+
+    def _startup_context_for_status(
+        self, status: RunStatus,
+    ) -> StartupContextSummary | None:
+        """Project a pre-execution run from its exact persisted launch intent."""
+        if status.ownership != "control_plane":
+            return None
+        manifest = self._application.repository.get_launch_manifest(status.run_id)
+        if manifest is None:
+            return None
+        try:
+            record = self._read_record(status.run_id)
+        except DaemonError:
+            record = {}
+        try:
+            current = load_live_config(
+                self._config.config_path, loader=load_workflow_config,
+            ).workflow_config
+        except (ConfigError, OSError, ValueError):
+            current = None
+        workflow = current.workflows.get(manifest.workflow_name) if current else None
+        summary = project_startup_context(
+            self._config.repo_root, Path(manifest.plan_path),
+            workflow=workflow, admission=self._admission,
+            daemon=self, pending_run_id=status.run_id,
+        )
+        prepared = record.get("prepared")
+        prepared = prepared if isinstance(prepared, Mapping) else {}
+        request = record.get("request")
+        request = request if isinstance(request, Mapping) else {}
+        resumed = record.get("mode") == "resume"
+        explicit = (
+            prepared.get("start_step_explicit") is True
+            or request.get("start_step_explicit") is True
+            or request.get("start_step") is not None
+            or manifest.start_step is not None
+        )
+        source = "resume" if resumed else "explicit" if explicit else "workflow_default"
+        raw_step = (
+            prepared.get("start_step") if resumed or explicit else None
+        ) or request.get("start_step") or manifest.start_step
+        selected: str | None = None
+        invalid_selection = False
+        if workflow is not None:
+            if source == "workflow_default":
+                selected = workflow.first_step
+            elif isinstance(raw_step, str):
+                try:
+                    selected = _resolve_configured_start_step(
+                        raw_step, manifest.workflow_name, workflow.steps,
+                        excluded_steps=workflow.excluded_steps,
+                    )
+                except DaemonError:
+                    selected = raw_step[:256]
+                    invalid_selection = True
+            else:
+                invalid_selection = True
+        summary = with_startup_selection(
+            summary, workflow_name=manifest.workflow_name,
+            selected_step=selected, step_source=source,
+        )
+        if invalid_selection:
+            summary = replace(
+                summary, availability="partial", recommendation="blocked",
+                recommendation_reason="The saved start step is unavailable in the current workflow.",
+                reason_codes=tuple(dict.fromkeys((*summary.reason_codes, "selected_step_unavailable"))),
+            )
+        return summary
 
     def _can_resume(self, status: RunStatus) -> bool:
         """Read-only admission preview; resume rechecks before any reservation."""

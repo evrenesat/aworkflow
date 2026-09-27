@@ -495,6 +495,7 @@ class RunStatus:
     worker_exit: Mapping[str, Any] | None = None
     evidence: Mapping[str, Any] = field(default_factory=dict)
     progress: RunProgressSummary | None = None
+    startup_context: StartupContextSummary | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return bounded_redacted(asdict(self))
@@ -631,6 +632,7 @@ class WorktreePreflightResult:
     limit: int = WORKTREE_PREFLIGHT_DEFAULT_LIMIT
     next_offset: int | None = None
     items: tuple[WorktreeStatusItem, ...] = ()
+    startup_context: StartupContextSummary | None = None
 
     @staticmethod
     def validate_page(*, offset: int, limit: int) -> None:
@@ -653,6 +655,7 @@ class WorktreePreflightResult:
         *,
         offset: int,
         limit: int,
+        startup_context: StartupContextSummary | None = None,
     ) -> "WorktreePreflightResult":
         """Project the CP7 domain result into one bounded response page."""
         cls.validate_page(offset=offset, limit=limit)
@@ -686,6 +689,7 @@ class WorktreePreflightResult:
             limit=limit,
             next_offset=next_offset,
             items=items[offset:end],
+            startup_context=startup_context,
         )
 
     def to_dict(self) -> dict[str, Any]:

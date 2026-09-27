@@ -15,6 +15,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from aflow.api.models import StartupQuestion, StartupQuestionKind
+from aflow.api.startup import PriorWorkStartupError
 from aflow.control_plane import ContextBundle, RunStatus
 from aflow.control_plane.units import UnitState
 from aflow.daemon import DaemonError, ExtraInstructionsValidationError
@@ -231,7 +232,8 @@ def test_mcp_historical_owner_stop_acknowledgement(mcp_client) -> None:
     assert _mcp_tool_error(client, "owner_stop", arguments) == "operation_forbidden"
 
 
-def test_mcp_stateless_http_auth_metadata_resources_and_rest_parity(mcp_client) -> None:
+def test_mcp_stateless_http_auth_metadata_resources_and_rest_parity(mcp_client, monkeypatch) -> None:
+    monkeypatch.setattr("aflow.control_plane.startup_context.utc_now", lambda: "2026-09-27T00:00:00+00:00")
     client, _, _, _ = mcp_client
     initialization = _mcp_request(
         client,
@@ -765,6 +767,78 @@ def test_mcp_run_context_progress_matches_authenticated_rest(mcp_client) -> None
     assert progress["total_checkpoints"] == {"value": 14, "coverage": "complete"}
     assert len(progress["checkpoints"]) == 14
     assert progress["truncation"]["events_read"] == 2
+
+
+def test_mcp_startup_context_matches_rest_preflight_and_pending_reads(mcp_client) -> None:
+    client, root, units, monkeypatch = mcp_client
+    monkeypatch.setattr(
+        "aflow.control_plane.startup_context.utc_now",
+        lambda: "2026-09-27T00:00:00+00:00",
+    )
+    arguments = {"project_id": PROJECT_ID, "plan_path": "plans/todo/test-plan.md"}
+    rest_preflight = client.post(
+        f"/api/control-plane/projects/{PROJECT_ID}/runs/preflight",
+        json={"plan_path": "plans/todo/test-plan.md"},
+    )
+    assert rest_preflight.status_code == 200
+    assert _mcp_tool(client, "preflight_run", arguments) == rest_preflight.json()
+
+    pending = _rest_start_pending(client, monkeypatch)
+    question = pending["startup_question"]
+    assert isinstance(question, dict)
+    run_id = question["run_id"]
+    assert isinstance(run_id, str)
+    status = client.get(f"/api/control-plane/projects/{PROJECT_ID}/runs/{run_id}")
+    assert status.status_code == 200
+    assert _mcp_tool(client, "get_run", {"project_id": PROJECT_ID, "run_id": run_id}) == status.json()
+    assert status.json()["startup_context"]["next_checkpoint"]["ordinal"] == 1
+    for level, full_scope in (("lite", False), ("full", True)):
+        rest = client.get(
+            f"/api/control-plane/projects/{PROJECT_ID}/runs/{run_id}/context",
+            params={"level": level, "full_scope": str(full_scope).lower()},
+        )
+        assert rest.status_code == 200
+        assert _mcp_tool(
+            client, "get_run_context",
+            {"project_id": PROJECT_ID, "run_id": run_id, "level": level,
+             "full_scope": full_scope},
+        ) == rest.json()
+        assert rest.json()["data"]["startup_context"] == status.json()["startup_context"]
+    assert units.start_calls == []
+    assert not (root / ".aflow" / "runs" / run_id / "run.json").exists()
+
+
+def test_mcp_and_rest_prior_work_error_share_code_and_reserved_run(mcp_client) -> None:
+    client, _, units, monkeypatch = mcp_client
+    pending = _rest_start_pending(client, monkeypatch)
+    question = pending["startup_question"]
+    assert isinstance(question, dict)
+
+    def blocked(*_args):
+        raise PriorWorkStartupError(
+            "prior_work_unverified", "Earlier work could not be verified."
+        )
+
+    monkeypatch.setattr("aflow.daemon.prepare_startup_with_answer", blocked)
+    rest = client.post(
+        f"/api/control-plane/projects/{PROJECT_ID}/startup-answers/{question['question_id']}",
+        headers={"Idempotency-Key": "unverified-answer"},
+        json={"answer": "implement"},
+    )
+    assert rest.status_code == 422
+    detail = rest.json()["detail"]
+    assert detail["code"] == "prior_work_unverified"
+    assert detail["run_id"] == question["run_id"]
+    mcp = _mcp_request(
+        client, "tools/call",
+        {"name": "answer_startup", "arguments": {
+            "project_id": PROJECT_ID, "question_id": question["question_id"],
+            "answer": "implement", "idempotency_key": "unverified-answer",
+        }},
+    )
+    assert mcp["result"]["isError"] is True
+    assert json.loads(mcp["result"]["content"][0]["text"]) == detail
+    assert units.start_calls == []
 
 
 def test_mcp_and_rest_context_ignore_agent_transcript_stop(mcp_client) -> None:
@@ -1896,7 +1970,8 @@ def test_mcp_start_normalizes_blank_git_tracking_before_launch(mcp_client) -> No
     assert len(units.start_calls) == 1
 
 
-def test_mcp_startup_control_and_resume_are_idempotent_and_match_rest(mcp_client) -> None:
+def test_mcp_startup_control_and_resume_are_idempotent_and_match_rest(mcp_client, monkeypatch) -> None:
+    monkeypatch.setattr("aflow.control_plane.startup_context.utc_now", lambda: "2026-09-27T00:00:00+00:00")
     client, root, units, monkeypatch = mcp_client
     monkeypatch.setattr(
         "aflow.daemon.prepare_startup",
@@ -1999,10 +2074,15 @@ def test_mcp_startup_control_and_resume_are_idempotent_and_match_rest(mcp_client
     )
     assert controlled == replayed_control
     assert controlled["revision"] == 1
-    assert controlled["run"] == client.get(
+    detail_after_control = client.get(
         f"/api/control-plane/projects/{PROJECT_ID}/runs/{run_id}",
         headers={"Authorization": f"Bearer {TOKEN}"},
     ).json()
+    assert {key: value for key, value in controlled["run"].items() if key != "startup_context"} == {
+        key: value for key, value in detail_after_control.items() if key != "startup_context"
+    }
+    assert controlled["run"]["startup_context"] is None
+    assert detail_after_control["startup_context"] is not None
 
     boundary = _mcp_tool(
         client,
@@ -2030,10 +2110,13 @@ def test_mcp_startup_control_and_resume_are_idempotent_and_match_rest(mcp_client
             "idempotency_key": "mcp-boundary-stop-1",
         },
     ) == boundary
-    assert boundary["run"] == client.get(
+    detail_after_boundary = client.get(
         f"/api/control-plane/projects/{PROJECT_ID}/runs/{run_id}",
         headers={"Authorization": f"Bearer {TOKEN}"},
     ).json()
+    assert {key: value for key, value in boundary["run"].items() if key != "startup_context"} == {
+        key: value for key, value in detail_after_boundary.items() if key != "startup_context"
+    }
     assert _mcp_tool_error(
         client,
         "control_run",

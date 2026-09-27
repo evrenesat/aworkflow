@@ -246,13 +246,16 @@ class ControlPlaneService:
 
     @staticmethod
     def _status(
-        item, run_id: str, *, include_progress: bool = True, include_resume_preview: bool = True
+        item, run_id: str, *, include_progress: bool = True,
+        include_resume_preview: bool = True,
+        include_startup_context: bool = True,
     ) -> RunStatus:
         """Return the daemon's finalized status for one run."""
         return item.daemon.service.run_status(
             run_id,
             include_progress=include_progress,
             include_resume_preview=include_resume_preview,
+            include_startup_context=include_startup_context,
         )
 
     def list_plans(
@@ -286,6 +289,7 @@ class ControlPlaneService:
                 identity.run_id,
                 include_progress=include_progress,
                 include_resume_preview=False,
+                include_startup_context=False,
             )
             if not include_progress:
                 status = item.daemon.application.repository.with_original_plan_identity(status)
@@ -389,7 +393,7 @@ class ControlPlaneService:
                 restarted_from_run_id=restarted_from_run_id,
                 dirty_worktree_confirmed=dirty_worktree_confirmed,
             )
-            result = item.daemon.service.preflight(
+            result, startup_context = item.daemon.service.preflight_with_startup_context(
                 request,
                 caller_scope=self._caller_scope(project_id, caller_scope),
             )
@@ -397,6 +401,7 @@ class ControlPlaneService:
                 result,
                 offset=offset,
                 limit=limit,
+                startup_context=startup_context,
             )
 
     def start_run(
@@ -477,7 +482,7 @@ class ControlPlaneService:
             caller_scope=self._caller_scope(project_id, caller_scope),
             idempotency_key=idempotency_key,
         )
-        return result, self._status(item, run_id)
+        return result, self._status(item, run_id, include_startup_context=False)
 
     def owner_stop(
         self,

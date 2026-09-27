@@ -11,7 +11,7 @@ from pathlib import Path
 import re
 import stat
 import subprocess
-from typing import TYPE_CHECKING, Mapping
+from typing import TYPE_CHECKING, Literal, Mapping
 
 from aflow.plan import (
     MISSING_CHECKPOINT_SECTIONS,
@@ -138,6 +138,47 @@ def _text_is_truncated(value: str) -> bool:
 
 def _serialized_size(summary: StartupContextSummary) -> int:
     return len(json.dumps(summary.to_dict(), ensure_ascii=False, separators=(",", ":")).encode("utf-8"))
+
+
+def with_startup_selection(
+    summary: StartupContextSummary,
+    *,
+    workflow_name: str | None,
+    selected_step: str | None,
+    step_source: Literal["workflow_default", "explicit", "resume"] | None,
+) -> StartupContextSummary:
+    """Attach one validated selection without exceeding the context budget."""
+    selected = replace(
+        summary,
+        workflow_name=workflow_name,
+        selected_step=selected_step,
+        step_source=step_source,
+    )
+    if _serialized_size(selected) <= MAX_CONTEXT_BYTES:
+        return selected
+    reasons = tuple(dict.fromkeys((*selected.reason_codes, "response_truncated")))
+    while _serialized_size(selected) > MAX_CONTEXT_BYTES and selected.checkpoints:
+        selected = replace(
+            selected, checkpoints=selected.checkpoints[:-1],
+            checkpoint_outline_truncated=True, availability="partial",
+            reason_codes=reasons,
+        )
+    while _serialized_size(selected) > MAX_CONTEXT_BYTES and selected.related_runs:
+        selected = replace(
+            selected, related_runs=selected.related_runs[:-1],
+            related_runs_truncated=True, related_runs_complete=False,
+            availability="partial", reason_codes=reasons,
+            recommendation="inspect_previous_runs",
+            recommendation_reason="The related-run summary was shortened. Inspect run history before starting.",
+        )
+    if _serialized_size(selected) > MAX_CONTEXT_BYTES:
+        return replace(
+            selected, availability="unavailable", recommendation="blocked",
+            recommendation_reason="The startup summary exceeds its display limit.",
+            checkpoints=(), related_runs=(), pending_tasks=(),
+            reason_codes=tuple(dict.fromkeys((*reasons, "response_too_large"))),
+        )
+    return selected
 
 
 def project_plan_startup_context(repo_root: Path, plan_path: Path) -> StartupContextSummary:

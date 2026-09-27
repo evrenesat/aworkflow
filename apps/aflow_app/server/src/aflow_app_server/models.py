@@ -210,6 +210,59 @@ class RunProgressDetailResponse(RunProgressSummaryResponse):
     truncation: RunProgressTruncationResponse = Field(default_factory=RunProgressTruncationResponse)
 
 
+class StartupCheckpointResponse(CanonicalTransportModel):
+    ordinal: int
+    title: str
+    heading_checked: bool
+    checked_tasks: int
+    total_tasks: int
+
+
+class StartupRelatedRunResponse(CanonicalTransportModel):
+    run_id: str
+    status: str | None = None
+    step: str | None = None
+    activity: Literal["active", "inactive", "unknown"] = "unknown"
+    history_state: Literal["visible", "archived"] = "visible"
+    failure_reason: str | None = None
+    worktree_path: str | None = None
+    worktree_verified: bool = False
+    branch: str | None = None
+    branch_verified: bool = False
+    unmerged_work: bool | None = None
+    uncommitted_work: bool | None = None
+    can_resume: bool | None = None
+
+
+class StartupContextResponse(CanonicalTransportModel):
+    schema_version: int = 1
+    availability: Literal["available", "partial", "unavailable", "not_applicable"] = "unavailable"
+    reason_codes: tuple[str, ...] = ()
+    reason: str | None = None
+    observed_at: str | None = None
+    plan_path: str | None = None
+    plan_identity: str | None = None
+    plan_revision: str | None = None
+    total_checkpoints: int | None = None
+    recorded_complete_checkpoints: int | None = None
+    next_checkpoint: StartupCheckpointResponse | None = None
+    checkpoints: tuple[StartupCheckpointResponse, ...] = ()
+    pending_tasks: tuple[str, ...] = ()
+    checkpoint_outline_truncated: bool = False
+    pending_tasks_truncated: bool = False
+    text_truncated: bool = False
+    workflow_name: str | None = None
+    selected_step: str | None = None
+    step_source: Literal["workflow_default", "explicit", "resume"] | None = None
+    recommendation: Literal[
+        "start", "open_existing_run", "review_previous_run", "inspect_previous_runs", "blocked"
+    ] | None = None
+    recommendation_reason: str | None = None
+    related_runs: tuple[StartupRelatedRunResponse, ...] = ()
+    related_runs_complete: bool | None = None
+    related_runs_truncated: bool = False
+
+
 class RunStatusResponse(CanonicalTransportModel):
     activity: Literal["active", "inactive", "unknown"] = "unknown"
     status_reason_code: str = "activity_unknown"
@@ -239,6 +292,7 @@ class RunStatusResponse(CanonicalTransportModel):
     restarted_from_run_id: str | None = None
     evidence: Mapping[str, Any]
     progress: RunProgressSummaryResponse | None = None
+    startup_context: StartupContextResponse | None = None
 
 
 class StartRunResponse(CanonicalTransportModel):
@@ -284,6 +338,7 @@ class WorktreePreflightResponse(CanonicalTransportModel):
     limit: int
     next_offset: int | None = None
     items: tuple[WorktreeStatusItemResponse, ...]
+    startup_context: StartupContextResponse | None = None
 
 
 class RunControlPayload(CanonicalTransportModel):

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from dataclasses import replace
 from pathlib import Path
 from typing import cast
 
@@ -27,6 +28,7 @@ from aflow.control_plane import (
     read_events,
     ServiceAuthorizationError,
     StartupQuestionService,
+    StartupContextSummary,
     create_launch_manifest,
 )
 from aflow.run_state import load_override_request
@@ -347,6 +349,33 @@ def test_context_detail_reuses_status_summary_without_full_context_escalation(
     full = ContextService(repository).get("owned-run", level="full", full_scope=True)
     assert full.to_dict()["data"]["progress"]["total_checkpoints"] == detail["total_checkpoints"]
     assert full.to_dict()["data"]["execution_progress"] == execution
+
+
+def test_context_uses_authorized_status_startup_context_without_another_loader(
+    tmp_path: Path,
+) -> None:
+    _owned_run(tmp_path)
+    repository = RunRepository(tmp_path)
+    status = repository.get_run_status("owned-run")
+    startup = StartupContextSummary(
+        availability="available", plan_path="plans/in-progress/plan.md",
+        total_checkpoints=2, recorded_complete_checkpoints=1,
+        workflow_name="managed", selected_step="implement",
+        step_source="workflow_default", recommendation="start",
+    )
+    status = replace(status, startup_context=startup)
+    authorized = []
+    context = ContextService(
+        repository, authorizer=lambda action, _status: authorized.append(action) or True,
+    )
+    lite = context.get("owned-run", status=status).to_dict()
+    full = context.get("owned-run", level="full", full_scope=True, status=status).to_dict()
+    expected = json.loads(json.dumps(startup.to_dict()))
+    assert lite["data"]["startup_context"] == expected
+    assert full["data"]["startup_context"] == expected
+    assert authorized == ["context:lite", "context:full"]
+    with pytest.raises(ValueError, match="does not belong"):
+        context.get("other-run", status=status)
 
 
 def test_startup_questions_are_opaque_transient_service_records(monkeypatch: pytest.MonkeyPatch) -> None:

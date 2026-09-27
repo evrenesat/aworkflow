@@ -17,6 +17,7 @@ import uvicorn
 from fastapi.testclient import TestClient
 
 from aflow.api.models import PreparedRun, StartupQuestion, StartupQuestionKind
+from aflow.api.startup import PriorWorkStartupError
 from aflow.control_plane import (
     CapabilitySet,
     ContextBundle,
@@ -765,6 +766,7 @@ def test_automatic_start_rechecks_revision_and_opt_out_in_real_service(control_c
     import hashlib
 
     _commit_fixture_repository(root)
+    subprocess.run(("git", "branch", "-M", "main"), cwd=root, check=True)
     config_path = root.parent / "global" / "aflow.toml"
     config_path.write_text(
         config_path.read_text().replace(
@@ -879,6 +881,7 @@ def test_consumer_starts_pristine_review_plan_once_after_tracking_preparation(co
 
     _, root, units, monkeypatch = control_client
     _commit_fixture_repository(root)
+    subprocess.run(("git", "branch", "-M", "main"), cwd=root, check=True)
     config_path, plan = _automatic_review_plan_setup(root)
     assert parse_git_tracking_metadata(plan.read_text(encoding="utf-8")) is None
     monkeypatch.setattr("aflow.daemon.prepare_startup", _prepared)
@@ -1713,6 +1716,149 @@ def test_control_plane_preflight_is_paged_read_only_and_reports_relative_paths(
         merge_head.unlink()
 
 
+def test_startup_context_preflight_pending_and_context_share_plan_facts(
+    control_client, monkeypatch,
+) -> None:
+    client, root, units, _ = control_client
+    monkeypatch.setattr(
+        "aflow.control_plane.startup_context.utc_now",
+        lambda: "2026-09-27T00:00:00+00:00",
+    )
+    plan = root / "plans" / "todo" / "test-plan.md"
+    before_plan = (plan.read_bytes(), plan.stat().st_mtime_ns)
+    preflight = client.post(
+        f"/api/control-plane/projects/{PROJECT_ID}/runs/preflight",
+        json=_preflight_request(),
+    )
+    assert preflight.status_code == 200, preflight.text
+    preview = preflight.json()["startup_context"]
+    assert preview["total_checkpoints"] == 1
+    assert preview["next_checkpoint"]["ordinal"] == 1
+    assert preview["selected_step"] == "implement"
+    assert preview["step_source"] == "workflow_default"
+    assert preview["recommendation"] == "start"
+    assert units.start_calls == []
+
+    pending = _start_pending(client, monkeypatch)
+    question = pending["startup_question"]
+    assert isinstance(question, dict)
+    run_id = question["run_id"]
+    assert isinstance(run_id, str)
+    record = root / ".aflow" / "start-requests" / f"{run_id}.json"
+    before_record = (record.read_bytes(), record.stat().st_mtime_ns)
+    detail = client.get(f"/api/control-plane/projects/{PROJECT_ID}/runs/{run_id}")
+    lite = client.get(f"/api/control-plane/projects/{PROJECT_ID}/runs/{run_id}/context")
+    full = client.get(
+        f"/api/control-plane/projects/{PROJECT_ID}/runs/{run_id}/context",
+        params={"level": "full", "full_scope": "true"},
+    )
+    assert detail.status_code == lite.status_code == full.status_code == 200
+    status_payload = detail.json()
+    context = status_payload["startup_context"]
+    assert status_payload["status"] == "awaiting_startup_answer"
+    assert status_payload["evidence"]["startup_question"]["kind"] == "pick_step"
+    assert context["next_checkpoint"] == preview["next_checkpoint"]
+    assert context["selected_step"] == "implement"
+    assert lite.json()["data"]["startup_context"] == context
+    assert full.json()["data"]["startup_context"] == context
+    assert (plan.read_bytes(), plan.stat().st_mtime_ns) == before_plan
+    assert (record.read_bytes(), record.stat().st_mtime_ns) == before_record
+    assert units.start_calls == []
+
+    unauthorized = client.get(
+        f"/api/control-plane/projects/{PROJECT_ID}/runs/{run_id}",
+        headers={"Authorization": "Bearer wrong-token"},
+    )
+    assert unauthorized.status_code == 401
+    from aflow_app_server import main
+    assert main._project_registry is not None
+    _register_peer_project(main._project_registry, root.parent)
+    cross_project = client.get(f"/api/control-plane/projects/peer-project/runs/{run_id}")
+    assert cross_project.status_code == 404
+
+    run_dir = root / ".aflow" / "runs" / run_id
+    (run_dir / "run.json").write_text('{"status":"running"}\n')
+    executing = client.get(f"/api/control-plane/projects/{PROJECT_ID}/runs/{run_id}")
+    assert executing.status_code == 200
+    assert executing.json()["startup_context"] is None
+
+
+def test_startup_context_tracks_live_default_and_missing_plan_without_row_scans(
+    control_client, monkeypatch,
+) -> None:
+    client, root, units, _ = control_client
+    pending = _start_pending(client, monkeypatch)
+    question = pending["startup_question"]
+    assert isinstance(question, dict)
+    run_id = question["run_id"]
+    assert isinstance(run_id, str)
+    config_path = root.parent / "global" / "workflows.toml"
+    config_path.write_text(config_path.read_text().replace("implement", "revised"))
+    detail = client.get(f"/api/control-plane/projects/{PROJECT_ID}/runs/{run_id}")
+    assert detail.status_code == 200
+    assert detail.json()["startup_context"]["selected_step"] == "revised"
+    assert detail.json()["startup_context"]["step_source"] == "workflow_default"
+
+    plan = root / "plans" / "todo" / "test-plan.md"
+    plan.write_text("# Test\n\n### [ ] Checkpoint 1: Revised plan\n- [ ] new task\n")
+    revised = client.get(f"/api/control-plane/projects/{PROJECT_ID}/runs/{run_id}")
+    assert revised.status_code == 200
+    assert revised.json()["startup_context"]["next_checkpoint"]["title"] == "Checkpoint 1: Revised plan"
+    plan.unlink()
+    missing = client.get(f"/api/control-plane/projects/{PROJECT_ID}/runs/{run_id}")
+    assert missing.status_code == 200
+    assert "missing_plan" in missing.json()["startup_context"]["reason_codes"]
+    assert missing.json()["startup_context"]["next_checkpoint"] is None
+    assert units.start_calls == []
+
+    def forbidden_scan(*_args, **_kwargs):
+        raise AssertionError("history rows must not project startup context")
+
+    monkeypatch.setattr("aflow.daemon.project_startup_context", forbidden_scan)
+    for include_progress in (False, True):
+        listed = client.get(
+            f"/api/control-plane/projects/{PROJECT_ID}/runs",
+            params={"include_progress": str(include_progress).lower()},
+        )
+        assert listed.status_code == 200, listed.text
+        row = next(item for item in listed.json()["runs"] if item["run_id"] == run_id)
+        assert row["startup_context"] is None
+
+
+def test_typed_prior_work_answer_error_keeps_run_id_and_read_context(
+    control_client, monkeypatch,
+) -> None:
+    client, root, units, _ = control_client
+    pending = _start_pending(client, monkeypatch)
+    question = pending["startup_question"]
+    assert isinstance(question, dict)
+    run_id = question["run_id"]
+    assert isinstance(run_id, str)
+
+    def blocked(*_args):
+        raise PriorWorkStartupError(
+            "prior_work_requires_recovery", "Previous work needs recovery."
+        )
+
+    monkeypatch.setattr("aflow.daemon.prepare_startup_with_answer", blocked)
+    answer = client.post(
+        f"/api/control-plane/projects/{PROJECT_ID}/startup-answers/{question['question_id']}",
+        headers={"Idempotency-Key": "recovery-blocked"},
+        json={"answer": "implement"},
+    )
+    assert answer.status_code == 422
+    assert answer.json()["detail"] == {
+        "code": "prior_work_requires_recovery",
+        "message": "Previous work needs recovery.",
+        "run_id": run_id,
+    }
+    detail = client.get(f"/api/control-plane/projects/{PROJECT_ID}/runs/{run_id}")
+    assert detail.status_code == 200
+    assert detail.json()["evidence"]["startup_failure"]["code"] == "prior_work_requires_recovery"
+    assert detail.json()["startup_context"] is not None
+    assert units.start_calls == []
+
+
 def test_control_plane_start_rechecks_dirt_and_replays_acknowledgment_as_identity(
     control_client,
 ) -> None:
@@ -1913,6 +2059,14 @@ def test_transport_models_match_canonical_control_plane_models() -> None:
     assert set(ResumeRunPayload.model_fields) == {"extra_instructions", "recovery"}
     assert set(ContextResponse.model_fields) == set(payloads["context"])
     assert set(WorktreePreflightResponse.model_fields) == set(payloads["preflight"])
+    assert RunStatusResponse.model_validate({
+        key: value for key, value in payloads["run"].items()
+        if key != "startup_context"
+    }).startup_context is None
+    assert WorktreePreflightResponse.model_validate({
+        key: value for key, value in payloads["preflight"].items()
+        if key != "startup_context"
+    }).startup_context is None
 
 
 def test_progress_transport_models_keep_optional_status_and_full_detail_shapes() -> None:
@@ -4113,6 +4267,11 @@ def test_real_dirty_startup_failure_survives_api_reload(control_client):
     question = response.json()["startup_question"]
     assert question["kind"] == "confirm_worktree_dirty"
     assert units.start_calls == []
+    pending_status = client.get(
+        f"/api/control-plane/projects/{PROJECT_ID}/runs/{question['run_id']}"
+    )
+    assert pending_status.status_code == 200
+    assert pending_status.json()["startup_context"]["next_checkpoint"]["ordinal"] == 1
     declined = client.post(
         f"/api/control-plane/projects/{PROJECT_ID}/startup-answers/{question['question_id']}",
         headers={"Idempotency-Key": "dirty-failure-answer"},

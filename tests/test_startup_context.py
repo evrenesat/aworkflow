@@ -127,6 +127,14 @@ def test_long_plan_keeps_exact_counts_and_late_next_checkpoint(tmp_path: Path) -
     assert context.pending_tasks_truncated
     assert context.text_truncated
     assert len(json.dumps(context.to_dict(), ensure_ascii=False).encode()) <= 48 * 1024
+    selected = startup_module.with_startup_selection(
+        context,
+        workflow_name="managed",
+        selected_step="implement",
+        step_source="workflow_default",
+    )
+    assert selected.selected_step == "implement"
+    assert len(json.dumps(selected.to_dict(), ensure_ascii=False).encode()) <= 48 * 1024
 
 
 @pytest.mark.parametrize(
