@@ -1974,6 +1974,8 @@ def test_ui_demo_selected_run_background_refresh_probe(
     phase = {"value": "initial"}
     held: list[tuple[object, bytes, int, dict[str, str]]] = []
     requested: list[str] = []
+    equal_requests: list[object] = []
+    finished_requests: set[object] = set()
     writes: list[str] = []
     page_errors: list[str] = []
 
@@ -1989,6 +1991,8 @@ def test_ui_demo_selected_run_background_refresh_probe(
             route.continue_()
             return
         requested.append(path)
+        if phase["value"] == "equal":
+            equal_requests.append(request)
         if phase["value"] == "failure" and path == selected_path:
             route.fulfill(status=503, content_type="application/json", body='{"detail":"read unavailable"}')
             return
@@ -2012,6 +2016,7 @@ def test_ui_demo_selected_run_background_refresh_probe(
         browser = _browser(playwright)
         page = browser.new_page(viewport={"width": width, "height": height})
         page.on("pageerror", lambda error: page_errors.append(str(error)))
+        page.on("requestfinished", lambda request: finished_requests.add(request))
         # The dashboard uses POST /config/form for a read-only projection.
         page.on("request", lambda request: writes.append(request.url) if phase["value"] != "initial" and request.method not in {"GET", "OPTIONS"} and "/api/" in request.url and not urlsplit(request.url).path.endswith("/config/form") else None)
         page.route("**/api/control-plane/projects/*/runs**", intercept)
@@ -2030,9 +2035,14 @@ def test_ui_demo_selected_run_background_refresh_probe(
             actions = detail.get_by_role("button", name="Actions", exact=True)
             actions.focus()
             page.evaluate("window.scrollTo(0, Math.min(document.body.scrollHeight - innerHeight, 180))")
-            # Progress, context and diagnostics settle on independent reads.
-            # Do not attribute their initial paint to a later refresh.
-            page.wait_for_timeout(2_500)
+            page.wait_for_function("document.visibilityState === 'visible'")
+            # Initial progress, events and context settle on separate reads.
+            selected_reads = {base, selected_path, f"{selected_path}/events", f"{selected_path}/context"}
+            for _ in range(400):
+                if selected_reads.issubset({urlsplit(request.url).path for request in finished_requests}):
+                    break
+                page.wait_for_timeout(25)
+            assert selected_reads.issubset({urlsplit(request.url).path for request in finished_requests})
             install_refresh_probe(page, {
                 "detail": ".run-detail",
                 "disclosure": "details[data-ui-fidelity-anchor='first-disclosure']",
@@ -2074,7 +2084,11 @@ def test_ui_demo_selected_run_background_refresh_probe(
             while held:
                 route, body, status, headers = held.pop(0)
                 route.fulfill(status=status, headers=headers, body=body)
-            page.wait_for_timeout(250)
+            for _ in range(400):
+                if equal_requests and all(request in finished_requests for request in equal_requests):
+                    break
+                page.wait_for_timeout(25)
+            assert equal_requests and all(request in finished_requests for request in equal_requests), "equal refresh responses did not finish"
             after_equal = capture_refresh_probe(page)
             assert all(root["sameNode"] for root in after_equal["roots"].values())
             assert after_equal["roots"]["disclosure"]["open"] is True
@@ -2088,14 +2102,11 @@ def test_ui_demo_selected_run_background_refresh_probe(
 
             phase["value"] = "changed"
             requested.clear()
-            for _ in range(5):
-                page.evaluate("window.dispatchEvent(new Event('aflow-history-changed'))")
-                for _ in range(30):
-                    if f"{selected_path}/events" in requested:
-                        break
-                    page.wait_for_timeout(50)
+            page.evaluate("window.dispatchEvent(new Event('aflow-history-changed'))")
+            for _ in range(400):
                 if f"{selected_path}/events" in requested:
                     break
+                page.wait_for_timeout(25)
             assert f"{selected_path}/events" in requested, requested
             expect(detail).to_contain_text("Refresh probe changed event")
             after_changed = capture_refresh_probe(page)
@@ -2108,14 +2119,11 @@ def test_ui_demo_selected_run_background_refresh_probe(
 
             phase["value"] = "failure"
             requested.clear()
-            for _ in range(5):
-                page.evaluate("window.dispatchEvent(new Event('aflow-history-changed'))")
-                for _ in range(30):
-                    if selected_path in requested:
-                        break
-                    page.wait_for_timeout(50)
+            page.evaluate("window.dispatchEvent(new Event('aflow-history-changed'))")
+            for _ in range(400):
                 if selected_path in requested:
                     break
+                page.wait_for_timeout(25)
             assert selected_path in requested, requested
             expect(page.get_by_role("alert").filter(has_text="read unavailable")).to_be_visible()
             after_failure = capture_refresh_probe(page)

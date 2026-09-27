@@ -4387,6 +4387,35 @@ describe('RunDashboard', () => {
     expect(api.getControlPlaneRun).toHaveBeenCalledTimes(callsBeforeFailure + 2)
   })
 
+  it('replays one background refresh after events arrive during a selected-run read', async () => {
+    const { container } = renderDashboard()
+    const detail = await screen.findByLabelText('Run details')
+    const row = container.querySelector('.run-list-select[aria-current="true"]')!
+    row.focus()
+    const readsBefore = vi.mocked(api.getControlPlaneRun).mock.calls.length
+    const heldRead = deferred<typeof ownedRun>()
+    vi.mocked(api.getControlPlaneRun).mockImplementationOnce(() => heldRead.promise)
+
+    act(() => window.dispatchEvent(new Event('aflow-history-changed')))
+    await waitFor(() => expect(api.getControlPlaneRun).toHaveBeenCalledTimes(readsBefore + 1))
+    vi.mocked(api.getControlPlaneRun).mockResolvedValue({ ...ownedRun, status: 'failed' })
+    act(() => {
+      window.dispatchEvent(new Event('aflow-history-changed'))
+      window.dispatchEvent(new Event('aflow-history-changed'))
+    })
+    expect(api.getControlPlaneRun).toHaveBeenCalledTimes(readsBefore + 1)
+
+    await act(async () => {
+      heldRead.resolve(ownedRun)
+      await heldRead.promise
+    })
+    await waitFor(() => expect(api.getControlPlaneRun).toHaveBeenCalledTimes(readsBefore + 2))
+    await waitFor(() => expect(detail.textContent).toContain('Failed'))
+    expect(screen.getByLabelText('Run details')).toBe(detail)
+    expect(container.querySelector('.run-list-select[aria-current="true"]')).toBe(row)
+    expect(document.activeElement).toBe(row)
+  })
+
   it('keeps owner actions ahead of the complete canonical checkpoint evidence', async () => {
     const listed = { ...ownedRun, evidence: {}, plan_path: null, progress: canonicalListProgress() }
     const canonicalDetail = canonicalDetailProgress()

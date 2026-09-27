@@ -1,5 +1,27 @@
 # DEVLOG
 
+## 2026-09-27 — Selected-run refresh delivery gate repair (Checkpoint 1)
+
+- The macOS dashboard failure had no changed-phase event request. The browser
+  probe released equal-phase responses, waited 250 ms, then dispatched the next
+  event without observing completion. The loader also discarded background
+  events received during an active page refresh. It now remembers one pending
+  background pass, consumes it after the current pass, and lets an already
+  queued explicit refresh cover it. Epoch, selection, and visibility guards
+  still gate the read.
+- The selected-run browser probe now waits for the visible document and initial
+  list/status/events/context completions, then tracks completion of each held
+  equal-phase request before dispatching a changed event. It retains changed
+  event, read failure, DOM identity, focus, scroll, disclosure, and no-write
+  assertions. A frontend race test verifies one follow-up read after an event
+  burst during a held selected-run read.
+- Focused dashboard tests passed 162/162; the web build passed. The full web
+  suite passed 671/671 on an isolated rerun after one 5-second history-test
+  timeout during concurrent browser runs. The selected-run browser journey
+  passed 4/4 in Chromium and 4/4 in WebKit on Linux. The named macOS failure
+  did not reproduce in the local baseline run after the bundle was built;
+  exact-SHA macOS CI, publication, and deployment remain coordinator checks.
+
 ## 2026-09-25 — Keep changed All runs progress moving (Checkpoint 1)
 
 - The integrated invisible-refresh change kept the overview generation stable,

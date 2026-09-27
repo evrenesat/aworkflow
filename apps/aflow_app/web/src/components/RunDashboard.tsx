@@ -1663,11 +1663,13 @@ export function RunDashboard({ visible = true, page, onNewRun, onCancelNewRun, o
 
   const pageRefreshRef = useRef<Promise<void> | null>(null)
   const manualRefreshRef = useRef<Promise<void> | null>(null)
+  const pendingBackgroundRefreshRef = useRef(false)
   const refreshEpochRef = useRef(0)
   useEffect(() => {
     refreshEpochRef.current += 1
     pageRefreshRef.current = null
     manualRefreshRef.current = null
+    pendingBackgroundRefreshRef.current = false
     return () => { requestAbortRef.current.abort(); contextAbortRef.current.abort(); refreshEpochRef.current += 1; snapshotRequestRef.current += 1; contextRequestRef.current += 1 }
   }, [projectId, selectedRunId, visible])
   async function refreshPage({ background = false }: { background?: boolean } = {}) {
@@ -1692,6 +1694,11 @@ export function RunDashboard({ visible = true, page, onNewRun, onCancelNewRun, o
         if (active() && pageRefreshRef.current === task) {
           pageRefreshRef.current = null
           if (!runInBackground) setRefreshing(false)
+          if (pendingBackgroundRefreshRef.current) {
+            pendingBackgroundRefreshRef.current = false
+            // A queued explicit refresh already makes a fresh read after this pass.
+            if (!runInBackground || !manualRefreshRef.current) void startRefresh(true)
+          }
         }
       })
       pageRefreshRef.current = task
@@ -1700,7 +1707,10 @@ export function RunDashboard({ visible = true, page, onNewRun, onCancelNewRun, o
 
     if (!background && manualRefreshRef.current) return manualRefreshRef.current
     if (pageRefreshRef.current) {
-      if (background) return pageRefreshRef.current
+      if (background) {
+        pendingBackgroundRefreshRef.current = true
+        return pageRefreshRef.current
+      }
       const olderRefresh = pageRefreshRef.current
       let queuedRefresh: Promise<void>
       queuedRefresh = olderRefresh.catch(() => undefined).then(() => {
