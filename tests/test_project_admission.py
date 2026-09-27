@@ -15,6 +15,7 @@ from aflow.plan_backups import move_plan_identity
 from aflow.control_plane import (
     InMemoryUnitManager,
     LaunchManifest,
+    RunRepository,
     UnitState,
     append_run_event,
     create_launch_manifest,
@@ -94,6 +95,69 @@ def _terminal_manifest(root: Path, run_id: str) -> None:
     (run_dir / "run.json").write_text(
         '{"schema_version":2,"status":"completed"}\n', encoding="utf-8"
     )
+
+
+def test_queue_view_reads_each_canonical_run_once_and_refreshes_next_operation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    settings = ProjectSettingsService(tmp_path)
+    settings.save(
+        ProjectSettings(max_concurrent_implementations=4),
+        expected_revision=settings.read().revision,
+    )
+    admission = ProjectAdmission(tmp_path)
+    for run_id in ("first-run", "second-run"):
+        admission.acquire(run_id)
+        _manifest(tmp_path, run_id, phase="launch_started")
+    plan = tmp_path / "claimed.md"
+    plan.write_text("# Claimed\n")
+    admission.acquire("claim-run", plan_path=plan)
+
+    reads: list[str] = []
+    original = RunRepository.get_run_status
+
+    def counted(self, run_id, *, include_progress=True):
+        reads.append(run_id)
+        return original(self, run_id, include_progress=include_progress)
+
+    monkeypatch.setattr(RunRepository, "get_run_status", counted)
+    capacity, claims, roots = admission.queue_view()
+    assert capacity.occupied_count == 3
+    assert claims == (("claimed.md", "claim-run", "reserved", False),)
+    assert roots == (tmp_path.resolve(),)
+    assert sorted(reads) == ["first-run", "second-run"]
+
+    run_dir = tmp_path / ".aflow" / "runs" / "first-run"
+    run_dir.mkdir(parents=True)
+    (run_dir / "run.json").write_text('{"status":"completed"}\n')
+    reads.clear()
+    capacity, claims, roots = admission.queue_view()
+    assert capacity.occupied_count == 2
+    assert claims == (("claimed.md", "claim-run", "reserved", False),)
+    assert roots == (tmp_path.resolve(),)
+    assert sorted(reads) == ["first-run", "second-run"]
+
+
+def test_acquire_verifies_git_roots_once_within_its_lock(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = _committed_separate_git_repo(tmp_path / "primary")
+    plan = root / "plans" / "in-progress" / "one.md"
+    plan.parent.mkdir(parents=True)
+    plan.write_text("# Work\n")
+    original = admission_module.subprocess.run
+    scans = 0
+
+    def counted(*args, **kwargs):
+        nonlocal scans
+        command = args[0]
+        if "worktree" in command and "list" in command:
+            scans += 1
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(admission_module.subprocess, "run", counted)
+    ProjectAdmission(root).acquire("one-run", plan_path=plan)
+    assert scans == 1
 
 
 def _race_worker(

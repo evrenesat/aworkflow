@@ -37,7 +37,10 @@ same primary-checkout `ProjectSettingsService` document. GET leaves absent
 settings at their defaults; PATCH uses its revisioned compare-and-swap. Queue
 reads combine plan lifecycle records, admission claims/capacity, known
 receipt-backed dependencies, and the consumer's current reason codes without
-creating another scheduler. Global typed repair-threshold actions transform
+creating another scheduler. One admission lock operation supplies queue
+capacity, retained claims and verified roots from one fresh evidence view;
+the queue reads validated plan owner records once for its displayed plans.
+Global typed repair-threshold actions transform
 the locked `aflow.toml`/`workflows.toml` pair; the form reports declared and
 effective values and their inheritance source.
 
@@ -45,6 +48,10 @@ effective values and their inheritance source.
 the primary project's `.aflow` directory. It reconciles controller, startup,
 unit, receipt, and process-birth evidence before counting reserved, starting,
 active, and uncertain logical runs against the project scheduling limit. A
+lock-scoped read view shares one verified root inventory and canonical run
+projection among reconciliation, predecessor checks, claims and capacity.
+The view is discarded before lock release; each later mutation rebuilds it.
+The admission snapshot copies the view when adding request-local evidence. A
 daemon start or resume reserves before launch publication; its worker consumes
 the same reservation. Direct CLI and API controllers enter through
 `run_workflow`. Startup questions retain their plan claim while releasing the
@@ -1517,7 +1524,11 @@ under admission, then calls the existing control-plane start service with a
 stable key derived from plan identity. It checks the saved global default
 before dispatch; the daemon resolves that
 default and its team again for admission. Only isolated worktree delivery
-workflows are eligible. The consumer holds no publication or provider lock;
+workflows are eligible. A saturated pass reads capacity once and labels later
+stable candidates from that result; a later pass reads again, and a successful
+launch requires a new capacity read before the next candidate. Registered
+linked worktrees defer to their verified primary scanner without an error log.
+The consumer holds no publication or provider lock;
 capacity and plan claims remain with project admission, and the controller
 continues to own publication. Publication itself holds a separate lock in the
 verified shared Git common directory across fetch, reconciliation, push, and

@@ -1,5 +1,24 @@
 # DEVLOG
 
+## 2026-09-27 — Reuse fresh admission evidence per operation (Checkpoint 2)
+
+- Admission now resolves verified roots, run identities, and canonical status
+  once within each lock operation. Queue receives capacity, claims, and roots
+  together; plan owner records are loaded once for the displayed documents.
+  A full consumer pass reads capacity once, then checks it again on the next
+  pass or after a successful launch. Verified linked registrations defer to
+  the primary scanner without logging an expected identity error.
+- Read-only in-process queue replay on the same current 223-plan primary
+  corpus (194 occupied runs, 63 verified roots) measured separate admission
+  calls at 2.373s/2.491s and combined calls at 1.256s/1.082s, with plan
+  owner batching active in both paths. The two-sample means differ by 52%.
+  Before owner batching, plan identity reads consumed 1.280s of a 2.262s
+  combined queue projection; after batching, the remaining local projection
+  was about 1.1–1.3s. This replay suppressed admission writes and lifecycle
+  recovery. The earlier 5.34s HTTP queue baseline involved different live
+  conditions, so exact-SHA deployment, HTTP timing, and complete page
+  readiness still need coordinator measurement.
+
 ## 2026-09-27 — Selected-run refresh delivery gate repair (Checkpoint 1)
 
 - The macOS dashboard failure had no changed-phase event request. The browser

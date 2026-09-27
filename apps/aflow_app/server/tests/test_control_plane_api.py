@@ -1076,6 +1076,48 @@ def test_project_scheduling_rest_auth_cas_queue_and_pure_defaults(control_client
     assert later_item["dependency"] == first.name
 
 
+def test_queue_reads_one_admission_view_and_one_identity_set(
+    control_client, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from aflow.plan_backups import plan_identity_for_path
+    from aflow_app_server import main, scheduling_service
+
+    client, root, _, _ = control_client
+    assert main._plan_service is not None
+    created = main._plan_service.create(
+        PROJECT_ID, "queue-identity.md",
+        "# Queue identity\n\n### [ ] Checkpoint 1: Work\n- [ ] Work\n",
+    )
+    calls = {"admission": 0, "owners": 0}
+    real_owners = scheduling_service._plan_identities
+
+    class CountAdmission(ProjectAdmission):
+        def queue_view(self):
+            calls["admission"] += 1
+            return super().queue_view()
+
+        def snapshot(self):
+            raise AssertionError("queue made a separate capacity read")
+
+        def plan_claims(self):
+            raise AssertionError("queue made a separate claim read")
+
+        def project_roots(self):
+            raise AssertionError("queue made a separate roots read")
+
+    def counted_owners(*args, **kwargs):
+        calls["owners"] += 1
+        return real_owners(*args, **kwargs)
+
+    monkeypatch.setattr(scheduling_service, "ProjectAdmission", CountAdmission)
+    monkeypatch.setattr(scheduling_service, "_plan_identities", counted_owners)
+    response = client.get(f"/api/projects/{PROJECT_ID}/queue")
+    assert response.status_code == 200, response.text
+    item = next(item for item in response.json()["plans"] if item["name"] == created.name)
+    assert item["identity"] == plan_identity_for_path(root, root / created.path)
+    assert calls == {"admission": 1, "owners": 1}
+
+
 def test_upgrade_threshold_actions_preserve_inheritance_and_pair_cas(control_client) -> None:
     client, _, _, _ = control_client
     before = client.get("/api/config").json()

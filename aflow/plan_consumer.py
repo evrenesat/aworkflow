@@ -121,6 +121,15 @@ class PlanConsumer:
         with self._root_locks_guard:
             return self._root_locks.setdefault(root, Lock())
 
+    @staticmethod
+    def _registered_primary_root(
+        declared_root: Path, settings: ProjectSettingsService,
+    ) -> Path | None:
+        if settings.checkout_root != Path(declared_root):
+            raise ProjectSettingsError("registered checkout identity is invalid")
+        # Linked worktrees share the primary scanner and admission state.
+        return settings.primary_root if settings.primary_root == Path(declared_root) else None
+
     def _refresh_workers(self) -> None:
         projects = tuple(self._projects())
         current: set[Path] = set()
@@ -128,11 +137,12 @@ class PlanConsumer:
             if self._stop.is_set():
                 break
             try:
-                root = ProjectSettingsService(declared_root).primary_root
-                if root != Path(declared_root):
-                    raise ProjectSettingsError("registered root is not primary")
+                settings = ProjectSettingsService(declared_root)
+                root = self._registered_primary_root(declared_root, settings)
             except Exception:
                 _LOGGER.exception("automatic plan project identity failed for %s", project_id)
+                continue
+            if root is None:
                 continue
             current.add(root)
             existing = self._workers.get(root)
@@ -203,11 +213,11 @@ class PlanConsumer:
             if not stopped.is_set():
                 _LOGGER.exception("automatic plan completion watch failed")
 
-    def _scan_registered(self, project_id: str, declared_root: Path) -> Path:
+    def _scan_registered(self, project_id: str, declared_root: Path) -> Path | None:
         settings = ProjectSettingsService(declared_root)
-        root = settings.primary_root
-        if root != Path(declared_root):
-            raise ProjectSettingsError("registered root is not primary")
+        root = self._registered_primary_root(declared_root, settings)
+        if root is None:
+            return None
         with self._root_lock(root):
             if self._own(root):
                 self._scan_project(project_id, root, settings)
@@ -223,7 +233,9 @@ class PlanConsumer:
         current: set[Path] = set()
         for project_id, declared_root in projects:
             try:
-                current.add(self._scan_registered(project_id, declared_root))
+                root = self._scan_registered(project_id, declared_root)
+                if root is not None:
+                    current.add(root)
             except Exception:
                 _LOGGER.exception("automatic plan project scan failed for %s", project_id)
         for root in tuple(self._owners):
@@ -325,6 +337,7 @@ class PlanConsumer:
         if not directory.exists():
             return
         seen: set[tuple[Path, str]] = set()
+        full_capacity = False
         for path in sorted(directory.iterdir(), key=lambda item: item.name):
             if self._stop.is_set():
                 break
@@ -384,11 +397,13 @@ class PlanConsumer:
                 self._set_reason(key, "unavailable")
                 continue
             try:
-                capacity = ProjectAdmission(root).snapshot()
+                if not full_capacity:
+                    capacity = ProjectAdmission(root).snapshot()
+                    full_capacity = capacity.occupied_count >= capacity.limit
             except ProjectAdmissionError:
                 self._set_reason(key, "unavailable")
                 continue
-            if capacity.occupied_count >= capacity.limit:
+            if full_capacity:
                 self._set_reason(key, "capacity")
                 continue
             request_key = "automatic:" + hashlib.sha256(

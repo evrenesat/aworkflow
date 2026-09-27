@@ -16,7 +16,8 @@ from __future__ import annotations
 
 from collections.abc import Iterator, Mapping
 from contextlib import contextmanager
-from dataclasses import dataclass, replace
+from contextvars import ContextVar
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 import fcntl
 import hashlib
@@ -63,6 +64,20 @@ ReservationState = Literal["reserved", "starting", "active", "uncertain", "relea
 _LIVE_RESERVATION_STATES = frozenset({"reserved", "starting", "active", "uncertain"})
 _RESERVATION_STATES = _LIVE_RESERVATION_STATES | {"released"}
 _BIRTH_IDENTITY_PREFIXES = ("linux-start-ticks:", "ps-lstart:")
+
+
+@dataclass
+class _AdmissionReadView:
+    """Fresh evidence reused only while one admission lock is held."""
+
+    owner: object
+    roots: tuple[Path, ...] | None = None
+    evidence: dict[str, _RunEvidence] | None = None
+    statuses: dict[tuple[Path, str], Any] = field(default_factory=dict)
+    run_ids: dict[Path, tuple[frozenset[str], frozenset[str]]] = field(default_factory=dict)
+
+
+_READ_VIEW: ContextVar[_AdmissionReadView | None] = ContextVar("admission_read_view", default=None)
 
 
 class ProjectAdmissionError(RuntimeError):
@@ -544,15 +559,15 @@ class ProjectAdmission:
             source_run_id = _validate_source_provenance_id(source_run_id)
         if source_run_id == valid_run_id:
             raise ProjectAdmissionConflict("a reservation cannot restart itself")
-        plan_key = (
-            self._plan_key(
-                plan_path, root=self._checkout_root,
-                require_file=direct_resume_proof is None,
-            )
-            if plan_path is not None else None
-        )
         self._validate_key(idempotency_key)
         with self._locked():
+            plan_key = (
+                self._plan_key(
+                    plan_path, root=self._checkout_root,
+                    require_file=direct_resume_proof is None,
+                )
+                if plan_path is not None else None
+            )
             reservations = self._load_locked(preserve_run_ids={valid_run_id})
             reservations = self._reconcile_locked(reservations)
             # The direct-resume marker validates provenance and permits the
@@ -697,8 +712,8 @@ class ProjectAdmission:
             source_run_id = validate_run_id(source_run_id)
             if source_run_id == valid_run_id:
                 raise ProjectAdmissionConflict("a reservation cannot restart itself")
-        plan_key = self._plan_key(plan_path, root=self._checkout_root, require_file=True) if plan_path is not None else None
         with self._locked():
+            plan_key = self._plan_key(plan_path, root=self._checkout_root, require_file=True) if plan_path is not None else None
             reservations = self._load_locked(preserve_run_ids={valid_run_id})
             reservations = self._reconcile_locked(reservations)
             self._require_inactive_predecessor_locked(source_run_id)
@@ -1015,10 +1030,10 @@ class ProjectAdmission:
             _validate_source_provenance_id(source_run_id)
             if source_run_id is not None else None
         )
-        plan_key = self._plan_key(
-            plan_path, root=self._checkout_root, require_file=require_file
-        )
         with self._locked():
+            plan_key = self._plan_key(
+                plan_path, root=self._checkout_root, require_file=require_file
+            )
             reservations = self._reconcile_locked(self._load_locked())
             self._require_inactive_predecessor_locked(source)
             self._require_unique_plan_claim_locked(
@@ -1064,10 +1079,15 @@ class ProjectAdmission:
                     return True
                 continue
             try:
-                status = repository.get_run_status(
-                    canonical_source_run_id,
-                    include_progress=False,
+                view = _READ_VIEW.get()
+                status = (
+                    view.statuses.get((root, canonical_source_run_id))
+                    if view is not None and view.owner is self else None
                 )
+                if status is None:
+                    status = repository.get_run_status(
+                        canonical_source_run_id, include_progress=False,
+                    )
             except RepositoryNotFoundError:
                 continue
             except RepositoryError as exc:
@@ -1216,18 +1236,36 @@ class ProjectAdmission:
         """Return current capacity after one fail-closed evidence pass."""
         return self.reconcile()
 
+    def queue_view(self) -> tuple[
+        AdmissionSnapshot, tuple[tuple[str, str, str, bool], ...], tuple[Path, ...]
+    ]:
+        """Read capacity, claims and roots from one fresh locked evidence view."""
+        with self._locked():
+            reservations = self._reconcile_locked(self._load_locked())
+            return (
+                self._snapshot_locked(reservations),
+                self._claims_from_reservations(reservations),
+                self._repository_roots(),
+            )
+
+    @staticmethod
+    def _claims_from_reservations(
+        reservations: Mapping[str, AdmissionReservation],
+    ) -> tuple[tuple[str, str, str, bool], ...]:
+        return tuple(sorted(
+            (reservation.plan_key, reservation.run_id, reservation.state,
+             reservation.claim_retained)
+            for reservation in reservations.values()
+            if reservation.plan_key is not None
+            and (reservation.state in _LIVE_RESERVATION_STATES
+                 or reservation.claim_retained)
+        ))
+
     def plan_claims(self) -> tuple[tuple[str, str, str, bool], ...]:
         """Return bounded public plan ownership without reservation nonces."""
         with self._locked():
             reservations = self._reconcile_locked(self._load_locked())
-            return tuple(sorted(
-                (reservation.plan_key, reservation.run_id, reservation.state,
-                 reservation.claim_retained)
-                for reservation in reservations.values()
-                if reservation.plan_key is not None
-                and (reservation.state in _LIVE_RESERVATION_STATES
-                     or reservation.claim_retained)
-            ))
+            return self._claims_from_reservations(reservations)
 
     def project_roots(self) -> tuple[Path, ...]:
         """Return verified checkouts used for shared project evidence."""
@@ -1275,7 +1313,11 @@ class ProjectAdmission:
             if not stat.S_ISREG(metadata.st_mode) or metadata.st_nlink != 1:
                 raise ProjectAdmissionSafetyError("project admission lock must be a regular file")
             fcntl.flock(descriptor, fcntl.LOCK_EX)
-            yield
+            token = _READ_VIEW.set(_AdmissionReadView(owner=self))
+            try:
+                yield
+            finally:
+                _READ_VIEW.reset(token)
         finally:
             try:
                 fcntl.flock(descriptor, fcntl.LOCK_UN)
@@ -1522,6 +1564,7 @@ class ProjectAdmission:
             occupied_run_ids.discard(exclude_run_id)
         all_evidence = self._all_run_evidence()
         if extra_evidence is not None:
+            all_evidence = dict(all_evidence)
             all_evidence[extra_evidence[0]] = extra_evidence[1]
         unmanaged: list[str] = []
         for run_id, evidence in all_evidence.items():
@@ -1545,44 +1588,31 @@ class ProjectAdmission:
         )
 
     def _all_run_evidence(self) -> dict[str, _RunEvidence]:
+        view = _READ_VIEW.get()
+        if view is not None and view.owner is self and view.evidence is not None:
+            return view.evidence
         evidence: dict[str, _RunEvidence] = {}
         for root in self._repository_roots():
             repository = RunRepository(root)
             try:
                 run_ids, legacy_run_ids = self._scan_repository_run_ids(root)
-                if legacy_run_ids:
-                    for run_id in sorted(run_ids - legacy_run_ids):
-                        status = repository.get_run_status(
-                            run_id,
-                            include_progress=False,
-                        )
-                        candidate = self._classify_status(status)
-                        prior = evidence.get(status.run_id)
-                        if prior is None or self._evidence_rank(candidate) > self._evidence_rank(prior):
-                            evidence[status.run_id] = candidate
-                    for run_id in sorted(legacy_run_ids):
+                for run_id in sorted(run_ids):
+                    if run_id in legacy_run_ids:
                         candidate = self._legacy_directory_evidence(root, run_id)
-                        prior = evidence.get(run_id)
-                        if prior is None or self._evidence_rank(candidate) > self._evidence_rank(prior):
-                            evidence[run_id] = candidate
-                else:
-                    cursor: str | None = None
-                    while True:
-                        page = repository.list_runs(
-                            limit=1_000,
-                            cursor=cursor,
-                            include_progress=False,
+                    else:
+                        status = repository.get_run_status(
+                            run_id, include_progress=False,
                         )
-                        for status in page.runs:
-                            candidate = self._classify_status(status)
-                            prior = evidence.get(status.run_id)
-                            if prior is None or self._evidence_rank(candidate) > self._evidence_rank(prior):
-                                evidence[status.run_id] = candidate
-                        if page.next_cursor is None:
-                            break
-                        cursor = page.next_cursor
+                        if view is not None and view.owner is self:
+                            view.statuses[(root, run_id)] = status
+                        candidate = self._classify_status(status)
+                    prior = evidence.get(run_id)
+                    if prior is None or self._evidence_rank(candidate) > self._evidence_rank(prior):
+                        evidence[run_id] = candidate
             except RepositoryError as exc:
                 raise ProjectAdmissionSafetyError(str(exc)) from exc
+        if view is not None and view.owner is self:
+            view.evidence = evidence
         return evidence
 
     @staticmethod
@@ -1602,6 +1632,10 @@ class ProjectAdmission:
     ) -> tuple[set[str], set[str]]:
         """Find run identities, allowing only safe legacy directory names."""
         root = Path(root).resolve()
+        view = _READ_VIEW.get()
+        if view is not None and view.owner is self and root in view.run_ids:
+            cached, legacy = view.run_ids[root]
+            return set(cached), set(legacy)
         run_ids: set[str] = set()
         legacy_run_ids: set[str] = set()
 
@@ -1648,6 +1682,8 @@ class ProjectAdmission:
                         "launch directory contains an invalid identity"
                     ) from exc
 
+        if view is not None and view.owner is self:
+            view.run_ids[root] = (frozenset(run_ids), frozenset(legacy_run_ids))
         return run_ids, legacy_run_ids
 
     def _legacy_directory_evidence(self, root: Path, run_id: str) -> _RunEvidence:
@@ -1684,6 +1720,9 @@ class ProjectAdmission:
 
     def _repository_roots(self) -> tuple[Path, ...]:
         """Find the primary checkout and verified linked worktree roots."""
+        view = _READ_VIEW.get()
+        if view is not None and view.owner is self and view.roots is not None:
+            return view.roots
         roots: list[Path] = [self._root]
         if self._checkout_root != self._root:
             roots.append(self._checkout_root)
@@ -1732,7 +1771,10 @@ class ProjectAdmission:
                     roots.append(identity.checkout_root)
                 if len(roots) >= 256:
                     raise ProjectAdmissionSafetyError("too many Git worktrees for admission")
-        return tuple(roots)
+        result = tuple(roots)
+        if view is not None and view.owner is self:
+            view.roots = result
+        return result
 
     @staticmethod
     def _evidence_rank(evidence: _RunEvidence) -> int:

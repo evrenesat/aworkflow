@@ -7,6 +7,7 @@ from pathlib import Path
 from threading import Event
 import hashlib
 import json
+import subprocess
 import time
 from types import SimpleNamespace
 
@@ -112,6 +113,76 @@ def test_stable_plans_fill_two_slots_and_third_waits(tmp_path: Path) -> None:
     assert consumer.reason(root, "c.md") == "capacity"
     consumer.scan_once()
     assert len(calls) == 2
+    consumer.stop()
+
+
+def test_full_pass_reads_capacity_once_and_next_pass_sees_release(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = _project(tmp_path)
+    config = _config(tmp_path)
+    for index in range(10):
+        _plan(root, f"plan-{index:02}.md")
+    admission = ProjectAdmission(root)
+    held = [admission.acquire(f"hold-{index}") for index in range(2)]
+    launched: list[str] = []
+
+    def launch(_project, path, key, revision, _workflow, _team, identity):
+        launched.append(path)
+        ProjectAdmission(root).acquire(
+            "new-run", plan_path=root / path, idempotency_key=key,
+            expected_plan_revision=revision, expected_plan_identity=identity,
+        )
+        return SimpleNamespace(run_id="new-run")
+
+    original = ProjectAdmission.snapshot
+    snapshots = 0
+
+    def counted(self):
+        nonlocal snapshots
+        snapshots += 1
+        return original(self)
+
+    monkeypatch.setattr(ProjectAdmission, "snapshot", counted)
+    consumer = _consumer(root, config, launch)
+    consumer.scan_once()  # establish stable revisions
+    snapshots = 0
+    consumer.scan_once()
+    assert snapshots == 1
+    assert launched == []
+    assert all(consumer.reason(root, f"plan-{index:02}.md") == "capacity" for index in range(10))
+
+    admission.release(held[0].run_id, held[0].nonce)
+    snapshots = 0
+    consumer.scan_once()
+    assert launched == ["plans/in-progress/plan-00.md"]
+    assert snapshots >= 2  # a successful launch triggers a fresh next-candidate read
+    consumer.stop()
+
+
+def test_registered_linked_worktree_uses_one_primary_scanner_without_error(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture,
+) -> None:
+    root = _project(tmp_path, "primary")
+    config = _config(tmp_path)
+    subprocess.run(("git", "init", "-q", "-b", "main", str(root)), check=True)
+    for key, value in (("user.name", "Test"), ("user.email", "test@example.test")):
+        subprocess.run(("git", "-C", str(root), "config", key, value), check=True)
+    (root / "README.md").write_text("project\n")
+    subprocess.run(("git", "-C", str(root), "add", "README.md"), check=True)
+    subprocess.run(("git", "-C", str(root), "commit", "-q", "-m", "initial"), check=True)
+    linked = tmp_path / "linked"
+    subprocess.run(("git", "-C", str(root), "worktree", "add", "-q", "-b", "linked", str(linked)), check=True)
+    consumer = _consumer(
+        root, config, lambda *_: None,
+        projects=lambda: (("primary", root), ("linked", linked)),
+    )
+    with caplog.at_level("ERROR"):
+        consumer.scan_once()
+        consumer._refresh_workers()
+    assert list(consumer._workers) == [root]
+    assert "automatic plan project identity failed" not in caplog.text
+    assert "automatic plan project scan failed" not in caplog.text
     consumer.stop()
 
 

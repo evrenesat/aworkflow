@@ -5,7 +5,7 @@ from __future__ import annotations
 from collections.abc import Callable, Mapping
 from pathlib import Path
 
-from aflow.plan_backups import plan_identity_for_path
+from aflow.plan_backups import BackupProvenanceError, _path_value, _plan_identities
 from aflow.plan_dependencies import PlanDependencies, PlanDependencyError, parse_sequence_name
 from aflow.project_admission import ProjectAdmission
 from aflow.project_settings import ProjectSettingsService
@@ -55,17 +55,34 @@ class SchedulingService:
         root = self._root(project_id)
         settings = ProjectSettingsService(root).read()
         admission = ProjectAdmission(root)
-        capacity = admission.snapshot().to_dict()
+        capacity_snapshot, plan_claims, roots = admission.queue_view()
+        capacity = capacity_snapshot.to_dict()
         claims: dict[str, tuple[str, str, bool]] = {}
-        for plan_key, run_id, state, retained in admission.plan_claims():
+        for plan_key, run_id, state, retained in plan_claims:
             previous = claims.get(plan_key)
             if previous is None or (previous[2] and not retained):
                 claims[plan_key] = (run_id, state, retained)
         documents = self._plans.list(project_id)
         dependencies = PlanDependencies(admission.primary_root)
-        roots = admission.project_roots()
+        # Use the same validated owner records as plan_identity_for_path, but
+        # read them once for the queue rather than once per displayed plan.
+        try:
+            owner_records = _plan_identities(root, strict=False)
+        except (BackupProvenanceError, OSError):
+            owner_records = ()
+        owners: dict[str, list[str]] = {}
+        for record in owner_records:
+            path = record.get("current_path")
+            identity = record.get("plan_identity_id")
+            if isinstance(path, str) and isinstance(identity, str):
+                owners.setdefault(path, []).append(identity)
         plans: list[dict[str, object]] = []
         for document in documents:
+            try:
+                owner_path = _path_value(root / document.path, require_file=False)
+            except (BackupProvenanceError, OSError):
+                owner_path = None
+            matching_owners = owners.get(owner_path, ()) if owner_path is not None else ()
             claim = claims.get(document.path)
             reason = self._reason(root, document.name) if self._reason is not None else None
             dependency: str | None = None
@@ -130,7 +147,7 @@ class SchedulingService:
                 "name": document.name,
                 "path": document.path,
                 "status": document.status,
-                "identity": plan_identity_for_path(root, root / document.path),
+                "identity": matching_owners[0] if len(matching_owners) == 1 else None,
                 "outcome": outcome,
                 "reason": reason,
                 "dependency": dependency,
