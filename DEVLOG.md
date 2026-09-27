@@ -1,5 +1,37 @@
 # DEVLOG
 
+## 2026-09-27 — Startup context browser and recovery evidence (Checkpoint 6)
+
+- Added disposable real-browser journeys for a partial-plan start at the live
+  default with no explicit step, a legacy no-agent question, preserved earlier
+  dirty/unmerged work and its recorded macOS blocker, exact-run cancellation,
+  and failure/refresh while that cancellation is pending. Reads and navigation
+  preserve the synthetic prior worktrees; no extra start or resume occurs.
+  Changed, invalid and missing plans, two possible predecessors, and an older
+  server without startup context retain safe explanations.
+- Chromium and WebKit each passed the startup journey at 320×568, 390×844,
+  768×1024, 844×390, 1280×720, 1440×900 and 390×420 in light/dark, plus
+  enlarged text. Inspected populated captures; the checkpoint title wraps,
+  the action remains readable, and measured primary target height is 44px at
+  every viewport. Document scroll, focus, disclosure/Expand all, compact Back,
+  and unchanged-refresh retention passed. The 30 screenshots and two manifests
+  are in `/root/code/evidence/aflow-startup-context-cp6-20260927/` via the
+  browser artifact format used by CI.
+- Verification: 368 Python tests and 147 subtests passed; 689 web tests passed
+  on a standalone rerun after one 5-second history-refresh timeout during a
+  parallel run; the web build passed. The final integrated server command
+  passed 156 tests (an earlier rerun was interrupted by SIGTERM without a
+  pytest failure). The full WebKit startup/responsive command passed 48 tests after
+  updating disposable fixtures: the family launch plan now has a real
+  checkpoint, and fake workers clear the inherited AFlow reservation nonce.
+  `git diff --check` passed.
+- Physical phone keyboard/browser-toolbar checks, owner comprehension, live
+  pending-run read-only inspection, exact-SHA CI/deployment and activation
+  remain post-publication checks. The frozen demo and UI guidelines stay as
+  their existing design baseline; other reference docs need no change because
+  this checkpoint changes browser evidence and clarifies delivered startup
+  behavior without changing setup, API routes, or layout rules.
+
 ## 2026-09-27 — Verify bounded saturated scans (Checkpoint 1)
 
 - The reported saturated project had 45 in-progress plans and 180 uncertain

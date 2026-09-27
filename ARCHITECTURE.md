@@ -169,6 +169,16 @@ including `include_progress=false` reads, omit the expensive startup projection.
 REST and MCP share these canonical response shapes and structured startup
 failure codes, including a reserved run ID when one exists.
 
+The Runs client presents this context before execution: the next checkpoint,
+recorded completion, bounded pending tasks, configured or explicitly selected
+step, and any verified earlier run. A recovery recommendation disables fresh
+launch. Opening a related run is navigation; cancelling an empty reservation
+requires a separate review and a fresh exact-run status check before owner stop.
+Cancellation does not resume the earlier run. If an older server omits
+`startup_context`, the client shows the saved startup question and a bounded
+fallback explanation without inventing plan progress. Background refresh keeps
+the selected run and disclosure state mounted.
+
 `ReconciliationService` consumes the inclusive repository union as a bounded raw
 status snapshot: each batch page is classified once under the reconciliation
 lock, and each single-run read requests the same progress-free status form. The

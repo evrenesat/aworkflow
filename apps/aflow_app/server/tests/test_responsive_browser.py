@@ -145,6 +145,14 @@ def _seed_visible_progress_fixture(root: Path) -> None:
 def _seed_team_family_fixture(root: Path) -> None:
     """Replace the disposable global pair with a family/conversion fixture."""
     _seed_responsive_fixture(root)
+    # Launch review now requires a valid startup plan; this journey starts one.
+    launch_plan = root / "plans" / "in-progress" / "ready-launch-plan.md"
+    launch_plan.write_text(
+        launch_plan.read_text(encoding="utf-8")
+        + "\n### [ ] Checkpoint 1: Run the selected family\n"
+        "- [ ] Exercise the selected worker\n",
+        encoding="utf-8",
+    )
     config_dir = root.parent / "global"
     (config_dir / "aflow.toml").write_text(
         """
@@ -3763,6 +3771,7 @@ def test_stop_after_current_turn_delayed_worker_journey(control_client, monkeypa
     from aflow.daemon import worker_main
 
     client, root, units, _ = control_client
+    monkeypatch.delenv("AFLOW_ADMISSION_RESERVATION_NONCE", raising=False)
     config_path = root.parent / "global" / "aflow.toml"
     config_path.write_text(
         """
@@ -4073,6 +4082,8 @@ def test_durable_recovery_ui_journey(control_client, monkeypatch, tmp_path):
     from aflow.workflow import load_scope_evidence_for_resume
     from aflow_app_server import main
     from test_control_plane_api import _commit_fixture_repository
+
+    monkeypatch.delenv("AFLOW_ADMISSION_RESERVATION_NONCE", raising=False)
 
     _, root, units, _ = control_client
     service = main._control_plane_service

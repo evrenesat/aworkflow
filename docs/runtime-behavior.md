@@ -29,6 +29,24 @@ Before a fresh worktree executes, AFlow checks related run and Git evidence
 against the configured starting branch. Preserved earlier implementation or
 uncertain evidence blocks a new worktree with a recovery or inspection reason.
 
+Authenticated preflight and pending-run detail expose bounded startup context
+before an agent starts. The UI shows the next checkpoint and pending tasks from
+the current plan, its recorded checked headings, the selected workflow step,
+and verified related-run facts. These are plan records, not approvals or
+executor progress. A valid partial plan with no explicit step begins at the
+live workflow default; an old saved step question still needs an explicit
+answer. Missing, invalid, or changed plan bytes are reported without invented
+checkpoint counts. An older server that omits context leaves the saved startup
+question visible with a fallback explanation.
+
+A related run with unmerged or uncommitted implementation blocks a fresh
+worktree. Runs labels its recorded failure as previously reported and offers
+navigation to that run. For a reservation with no agent or active unit, the
+user may review and cancel that exact pending start before opening the earlier
+run. A current status recheck and revision-bound owner stop guard cancellation;
+failure leaves the pending run selected. Reading, navigating, or cancelling
+does not discard the prior worktree or resume the earlier run.
+
 ## Fresh Review Plan Git Tracking
 
 At the normal startup-preparation boundary, AFlow backs up and validates the

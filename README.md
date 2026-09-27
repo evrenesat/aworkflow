@@ -79,6 +79,12 @@ question. `--start-step` remains available for a deliberate override; a saved
 resume uses its validated step. Existing pending step questions still need an
 explicit answer. A new worktree is blocked when related earlier implementation
 is preserved or cannot be verified against its configured starting branch.
+Before starting, Runs shows the next checkpoint, recorded completion and
+remaining tasks. A pending reservation shows the same facts and says when no
+agent has started. Verified earlier work links to its run; an empty pending
+start can be cancelled after review, then the earlier run opens without
+resuming it. Missing plan or older-server context is explained without
+claiming unrecorded progress. See [runtime behavior](docs/runtime-behavior.md).
 
 The dirty-worktree checkbox is a separate startup choice. An existing-checkout
 run sees acknowledged source changes, while a fresh worktree starts from the
