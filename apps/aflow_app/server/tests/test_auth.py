@@ -250,7 +250,12 @@ def test_expired_tampered_malformed_and_overlong_sessions_are_rejected(session_c
     login_response = _login(client)
     fresh_value = login_response.cookies["aflow_session"]
 
-    client.cookies.set("aflow_session", fresh_value[:-2] + ("aa" if fresh_value[-2:] != "aa" else "bb"))
+    body, signature = fresh_value.split(".")
+    signature_bytes = base64.urlsafe_b64decode(signature + "=" * (-len(signature) % 4))
+    tampered_bytes = bytes([signature_bytes[0] ^ 1]) + signature_bytes[1:]
+    assert tampered_bytes != signature_bytes
+    tampered_signature = base64.urlsafe_b64encode(tampered_bytes).rstrip(b"=").decode("ascii")
+    client.cookies.set("aflow_session", f"{body}.{tampered_signature}")
     assert client.get("/api/projects").status_code == 401
     client.cookies.set("aflow_session", "garbage-cookie-value")
     assert client.get("/api/projects").status_code == 401

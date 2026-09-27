@@ -4726,3 +4726,10 @@ HISTORY: Published clipboard history `c14f1f2`/`cd78d53` remains separate and mu
 - CI 36313739241 passed all 44 WebKit checks in 379.77 seconds, then cancelled
   the Ubuntu Python 3.12 dashboard job at its 25-minute limit. Raised only that
   matrix cell's job budget to 35 minutes; the other dashboard cells retain 25.
+
+## 2026-09-27 — Session tampering fixture CI repair
+
+- CI 36315525783 failed the macOS Python 3.13 auth test when replacing the last
+  two Base64 signature characters changed only unused padding bits, leaving the
+  decoded HMAC unchanged. The fixture now flips a decoded signature byte before
+  re-encoding it; production session verification is unchanged.
