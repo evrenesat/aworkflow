@@ -126,6 +126,7 @@ const READY_START_GUIDANCE = 'Ready is a plan lifecycle state; startup checks ru
 export function PlanPanel({ project, onDirtyChange, onOpenRunDashboard, onOpenRun, initialPlanPath = null, onInitialPlanHandled = () => {} }: PlanPanelProps) {
   const [plans, setPlans] = useState<PlanDocument[]>([])
   const [queue, setQueue] = useState<ProjectQueue | null>(null)
+  const [queuePending, setQueuePending] = useState(true)
   const [queueError, setQueueError] = useState<string | null>(null)
   const [selected, setSelected] = useState<PlanDocument | null>(null)
   const [content, setContent] = useState('')
@@ -214,6 +215,7 @@ export function PlanPanel({ project, onDirtyChange, onOpenRunDashboard, onOpenRu
     plansLoadedRef.current = false
     setPlans([])
     setQueue(null)
+    setQueuePending(true)
     setQueueError(null)
     setPlansLoading(true)
     setPlansRefreshing(false)
@@ -235,28 +237,37 @@ export function PlanPanel({ project, onDirtyChange, onOpenRunDashboard, onOpenRu
   async function refresh() {
     const request = ++planListRequest.current
     const initial = !plansLoadedRef.current
+    const projectId = project.id
+    const current = () => request === planListRequest.current && projectIdRef.current === projectId
+    // Queue evidence has its own completion path; a slow queue must not hold the list.
+    setQueuePending(true)
+    void api.getProjectQueue(projectId).then(
+      projected => {
+        if (!current()) return
+        setQueue(previous => samePlanQueue(previous, projected) ? previous : projected)
+        setQueueError(null)
+      },
+      () => {
+        if (!current()) return
+        setQueue(null)
+        setQueueError('Current queue reasons are unavailable. Refresh to retry.')
+      },
+    ).finally(() => {
+      if (current()) setQueuePending(false)
+    })
     try {
       if (initial) setPlansLoading(true)
       else setPlansRefreshing(true)
-      const [listed, projected] = await Promise.allSettled([
-        api.listProjectPlans(project.id), api.getProjectQueue(project.id),
-      ])
-      if (request !== planListRequest.current || projectIdRef.current !== project.id) return
-      if (projected.status === 'fulfilled') {
-        setQueue(current => samePlanQueue(current, projected.value) ? current : projected.value)
-        setQueueError(null)
-      } else {
-        setQueueError('Current queue reasons are unavailable. Refresh to retry.')
-      }
-      if (listed.status === 'rejected') throw listed.reason
+      const listed = await api.listProjectPlans(projectId)
+      if (!current()) return
       plansLoadedRef.current = true
-      setPlans(current => reconcilePlans(current, listed.value))
+      setPlans(previous => reconcilePlans(previous, listed))
       setError(null)
     } catch (err) {
-      if (request !== planListRequest.current || projectIdRef.current !== project.id) return
+      if (!current()) return
       setError(err instanceof Error ? err.message : 'Failed to load plans')
     } finally {
-      if (request !== planListRequest.current || projectIdRef.current !== project.id) return
+      if (!current()) return
       if (initial) setPlansLoading(false)
       else setPlansRefreshing(false)
     }
@@ -281,6 +292,7 @@ export function PlanPanel({ project, onDirtyChange, onOpenRunDashboard, onOpenRu
       setContent(loadedContent)
       setSavedContent(loadedContent)
     } catch (err) {
+      if (request !== planLoadRequest.current || projectIdRef.current !== expectedProjectId) return
       setError(err instanceof Error ? err.message : 'Failed to load plan')
     }
   }
@@ -555,6 +567,7 @@ export function PlanPanel({ project, onDirtyChange, onOpenRunDashboard, onOpenRu
         </div>}
         {error && <div className="error-message" role="alert">{error}</div>}
         {queueError && <div className="notice" role="alert">{queueError}</div>}
+        {queuePending && !queue && !queueError && <p className="notice" role="status">Queue evidence loading…</p>}
         {requeueNotice && <div className="success-message" role="status">{requeueNotice}</div>}
         {selectedQueue && queueReason(selectedQueue) && <p className="notice" role="status">{queueReason(selectedQueue)}</p>}
         {conflict && (
@@ -723,6 +736,7 @@ export function PlanPanel({ project, onDirtyChange, onOpenRunDashboard, onOpenRu
     <div className="plan-list">
       {error && <div className="error-message" role="alert">{error}</div>}
       {queueError && <div className="notice" role="alert">{queueError}</div>}
+      {queuePending && !queue && !queueError && <p className="notice" role="status">Queue evidence loading…</p>}
       {queue && <p className="plan-queue-capacity text-sm" role="status">Implementation slots: {queue.capacity.available_slots} of {queue.capacity.limit} available{!queue.settings.auto_consume_plans ? ' · Automatic starts off' : ''}</p>}
       {plansLoading && <div className="card dashboard-loading" role="status"><div className="spinner" />Loading plans…</div>}
       {!hosted && <div className="card" style={{ display: 'flex', gap: 'var(--spacing-sm)', flexWrap: 'wrap' }}>

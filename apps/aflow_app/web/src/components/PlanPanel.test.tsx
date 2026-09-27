@@ -1,9 +1,10 @@
-import { fireEvent, render, screen, waitFor } from '@testing-library/react'
+import { act, fireEvent, render, screen, waitFor } from '@testing-library/react'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 import { ApiError } from '../api'
 import * as api from '../api'
-import type { PlanBackupPage, PlanBackupSummary, PlanDocument, ProjectInfo } from '../types'
+import type { PlanBackupPage, PlanBackupSummary, PlanDocument, ProjectInfo, ProjectQueue } from '../types'
 import { PlanPanel } from './PlanPanel'
+import { HeaderSlotsProvider } from './HeaderSlots'
 
 vi.mock('../api', async () => {
   const actual = await vi.importActual<typeof import('../api')>('../api')
@@ -36,6 +37,26 @@ const inProgressPlan: PlanDocument = {
 
 function mockList() {
   vi.mocked(api.listProjectPlans).mockResolvedValue([todoPlan, inProgressPlan])
+}
+
+function deferred<T>() {
+  let resolve!: (value: T) => void
+  let reject!: (reason: Error) => void
+  const promise = new Promise<T>((yes, no) => { resolve = yes; reject = no })
+  return { promise, resolve, reject }
+}
+
+function hosted(projectInfo: ProjectInfo) {
+  return <HeaderSlotsProvider renderHeader={slots => <div>{slots.local}{slots.primary}{slots.more}</div>}>
+    <PlanPanel project={projectInfo} onDirtyChange={vi.fn()} onOpenRunDashboard={vi.fn()} />
+  </HeaderSlotsProvider>
+}
+
+const queueEvidence: ProjectQueue = {
+  project_id: 'alpha',
+  settings: { auto_consume_plans: true, max_concurrent_implementations: 2, revision: 'q'.repeat(64), persisted: false, source: 'defaults' },
+  capacity: { limit: 2, available_slots: 2, reserved_count: 0, starting_count: 0, active_count: 0, uncertain_count: 0 },
+  plans: [],
 }
 
 async function openPlan(plan: PlanDocument, content: string) {
@@ -74,14 +95,105 @@ function backupPage(
 
 describe('PlanPanel', () => {
   beforeEach(() => {
-    vi.clearAllMocks()
+    vi.resetAllMocks()
     mockList()
-    vi.mocked(api.getProjectQueue).mockResolvedValue({
-      project_id: 'alpha',
-      settings: { auto_consume_plans: true, max_concurrent_implementations: 2, revision: 'q'.repeat(64), persisted: false, source: 'defaults' },
-      capacity: { limit: 2, available_slots: 2, reserved_count: 0, starting_count: 0, active_count: 0, uncertain_count: 0 },
-      plans: [],
+    vi.mocked(api.getProjectQueue).mockResolvedValue(queueEvidence)
+  })
+
+  it('publishes the list while queue evidence is held and keeps an edited document on queue failure', async () => {
+    const held = deferred<ProjectQueue>()
+    vi.mocked(api.getProjectQueue).mockReturnValueOnce(held.promise)
+    vi.mocked(api.readProjectPlan).mockResolvedValue({ ...todoPlan, content: '# Original' })
+    render(<PlanPanel project={project} onDirtyChange={vi.fn()} onOpenRunDashboard={vi.fn()} />)
+    const row = await screen.findByRole('button', { name: /plan-a.md/ })
+    expect(screen.queryByText('Loading plans…')).toBeNull()
+    expect(screen.getByText('Queue evidence loading…')).toBeDefined()
+    expect(screen.queryByText(/Implementation slots:/)).toBeNull()
+    fireEvent.click(row)
+    await screen.findByLabelText('Plan content')
+    const editor = screen.getByLabelText('Plan content') as HTMLTextAreaElement
+    fireEvent.change(editor, { target: { value: '# Local draft' } })
+    held.reject(new Error('queue offline'))
+    await screen.findByText(/Current queue reasons are unavailable/)
+    expect(editor.value).toBe('# Local draft')
+    expect(screen.queryByText(/Implementation slots:/)).toBeNull()
+  })
+
+  it('keeps list failure visible when queue succeeds', async () => {
+    const list = deferred<PlanDocument[]>()
+    const queue = deferred<ProjectQueue>()
+    vi.mocked(api.listProjectPlans).mockReturnValueOnce(list.promise)
+    vi.mocked(api.getProjectQueue).mockReturnValueOnce(queue.promise)
+    render(<PlanPanel project={project} onDirtyChange={vi.fn()} onOpenRunDashboard={vi.fn()} />)
+    await act(async () => queue.resolve(queueEvidence))
+    expect(screen.getByText(/Implementation slots:/)).toBeDefined()
+    await act(async () => list.reject(new Error('list offline')))
+    expect(screen.getByRole('alert').textContent).toContain('list offline')
+    expect(screen.queryByText('Loading plans…')).toBeNull()
+
+  })
+
+  it('rejects late list and queue responses after a project switch', async () => {
+    const oldList = deferred<PlanDocument[]>()
+    const oldQueue = deferred<ProjectQueue>()
+    vi.mocked(api.listProjectPlans).mockReturnValueOnce(oldList.promise).mockResolvedValueOnce([])
+    vi.mocked(api.getProjectQueue).mockReturnValueOnce(oldQueue.promise).mockResolvedValueOnce({ ...queueEvidence, project_id: 'beta' })
+    const view = render(<PlanPanel project={project} onDirtyChange={vi.fn()} onOpenRunDashboard={vi.fn()} />)
+    view.rerender(<PlanPanel project={{ ...project, id: 'beta' }} onDirtyChange={vi.fn()} onOpenRunDashboard={vi.fn()} />)
+    await screen.findByText('No plans yet. Create a draft to begin.')
+    await act(async () => { oldList.resolve([todoPlan]); oldQueue.resolve(queueEvidence) })
+    expect(screen.queryByRole('button', { name: /plan-a.md/ })).toBeNull()
+    expect(screen.getByText(/Implementation slots: 2 of 2/)).toBeDefined()
+  })
+
+  it('retains equal plan rows and capacity while a repeat queue request is pending', async () => {
+    render(hosted(project))
+    const row = await screen.findByRole('button', { name: /plan-a.md/ })
+    await screen.findByText(/Implementation slots: 2 of 2/)
+    const list = deferred<PlanDocument[]>()
+    const queue = deferred<ProjectQueue>()
+    vi.mocked(api.listProjectPlans).mockReturnValueOnce(list.promise)
+    vi.mocked(api.getProjectQueue).mockReturnValueOnce(queue.promise)
+    fireEvent.click(screen.getByRole('button', { name: 'More' }))
+    fireEvent.click(screen.getByRole('menuitem', { name: 'Refresh plans' }))
+    expect(screen.getByRole('button', { name: /plan-a.md/ })).toBe(row)
+    await act(async () => list.resolve([{ ...todoPlan }, { ...inProgressPlan }]))
+    expect(screen.getByRole('button', { name: /plan-a.md/ })).toBe(row)
+    await act(async () => queue.resolve({ ...queueEvidence }))
+    expect(screen.getByRole('button', { name: /plan-a.md/ })).toBe(row)
+    expect(screen.getByText(/Implementation slots: 2 of 2/)).toBeDefined()
+  })
+
+  it('applies only the newest refresh and preserves equal rows and a dirty editor', async () => {
+    render(hosted(project))
+    await screen.findByRole('button', { name: /plan-a.md/ })
+    const firstList = deferred<PlanDocument[]>()
+    const firstQueue = deferred<ProjectQueue>()
+    const secondList = deferred<PlanDocument[]>()
+    const secondQueue = deferred<ProjectQueue>()
+    vi.mocked(api.listProjectPlans).mockReturnValueOnce(firstList.promise).mockReturnValueOnce(secondList.promise)
+    vi.mocked(api.getProjectQueue).mockReturnValueOnce(firstQueue.promise).mockReturnValueOnce(secondQueue.promise)
+    fireEvent.click(screen.getByRole('button', { name: 'More' }))
+    fireEvent.click(screen.getByRole('menuitem', { name: 'Refresh plans' }))
+    await openPlan(todoPlan, '# Original')
+    const editor = screen.getByLabelText('Plan content') as HTMLTextAreaElement
+    fireEvent.change(editor, { target: { value: '# Edited' } })
+    // A save starts a newer refresh while the first queue and list are pending.
+    vi.mocked(api.updateProjectPlan).mockResolvedValue({ ...todoPlan, content: '# Edited' })
+    fireEvent.click(screen.getByRole('button', { name: 'Save' }))
+    await waitFor(() => expect(api.listProjectPlans).toHaveBeenCalledTimes(3))
+    await act(async () => {
+      secondList.resolve([{ ...todoPlan }, { ...inProgressPlan }])
+      secondQueue.resolve({ ...queueEvidence, capacity: { ...queueEvidence.capacity, available_slots: 1 } })
     })
+    await act(async () => {
+      firstList.resolve([])
+      firstQueue.resolve({ ...queueEvidence, capacity: { ...queueEvidence.capacity, available_slots: 0 } })
+    })
+    expect(editor.value).toBe('# Edited')
+    fireEvent.click(screen.getByRole('button', { name: '← Back to Plans' }))
+    expect(screen.getByText(/Implementation slots: 1 of 2/)).toBeDefined()
+    expect(screen.getByRole('button', { name: /plan-a.md/ })).toBeDefined()
   })
 
   it('shows failed and needs-change plans with queue evidence and reviews requeue before acting', async () => {

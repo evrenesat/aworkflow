@@ -8,6 +8,7 @@ import os
 from pathlib import Path
 import re
 import subprocess
+import time
 from urllib.parse import urlsplit
 
 import pytest
@@ -711,6 +712,117 @@ def test_ui_demo_fixture_captures_authenticated_built_app(
             "disposable": True,
         },
     )
+
+
+@pytest.mark.parametrize(
+    ("width", "height", "theme"),
+    ((1280, 720, "light"), (1280, 720, "dark"), (390, 844, "light"), (390, 844, "dark"), (390, 420, "light")),
+)
+def test_ui_demo_plan_list_ready_while_queue_held(
+    control_client,  # noqa: F811
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    width: int,
+    height: int,
+    theme: str,
+) -> None:
+    """A fresh list and editable plan are usable during a five-second queue hold."""
+    _, root, units, _ = control_client
+    plan = root / "plans" / "in-progress" / "latency-probe.md"
+    plan.parent.mkdir(parents=True, exist_ok=True)
+    content = "# Latency probe\n\n" + "Editable continuity line.\n" * 40
+    plan.write_text(content, encoding="utf-8")
+    monkeypatch.setenv("AFLOW_APP_WEB_DIST", str(Path(__file__).resolve().parents[2] / "web" / "dist"))
+    artifact_dir = _fidelity_artifact_dir(tmp_path)
+    artifact_dir.mkdir(parents=True, exist_ok=True)
+    stem = f"cp3-plan-queue-{theme}-{width}x{height}"
+    queue_path = f"/api/projects/{PROJECT_ID}/queue"
+    list_path = f"/api/projects/{PROJECT_ID}/plans"
+    held: list[tuple[object, object]] = []
+    timestamps: dict[str, float] = {}
+    page_errors: list[str] = []
+
+    def intercept(route) -> None:
+        path = urlsplit(route.request.url).path
+        if route.request.method == "GET" and path == queue_path:
+            response = route.fetch()
+            timestamps["queue_started"] = time.perf_counter()
+            held.append((route, response))
+        elif route.request.method == "GET" and path == list_path:
+            response = route.fetch()
+            route.fulfill(response=response)
+            timestamps["list_released"] = time.perf_counter()
+        else:
+            route.continue_()
+
+    with live_server() as url, sync_playwright() as playwright:
+        browser = _browser(playwright)
+        page = browser.new_page(viewport={"width": width, "height": height})
+        page.on("pageerror", lambda error: page_errors.append(str(error)))
+        page.route(f"**/api/projects/{PROJECT_ID}/queue", intercept)
+        page.route(f"**/api/projects/{PROJECT_ID}/plans", intercept)
+        try:
+            _login(page, url)
+            page.emulate_media(color_scheme=theme)  # type: ignore[arg-type]
+            _set_theme_preference(page, theme)
+            timestamps["navigation_started"] = time.perf_counter()
+            page.goto(f"{url}/?project={PROJECT_ID}&view=plans")
+            row = page.get_by_role("button", name=re.compile("latency-probe.md"))
+            expect(row).to_be_visible()
+            timestamps["list_visible"] = time.perf_counter()
+            assert held and "list_released" in timestamps
+            response_to_visible_ms = 1000 * (timestamps["list_visible"] - timestamps["list_released"])
+            assert response_to_visible_ms < 250, response_to_visible_ms
+            expect(page.get_by_text("Queue evidence loading…")).to_be_visible()
+            expect(page.get_by_text(re.compile("Implementation slots:"))).to_have_count(0)
+            page.screenshot(path=str(artifact_dir / f"{stem}-list-held.png"), full_page=True)
+
+            row.click()
+            editor = page.get_by_label("Plan content", exact=True)
+            expect(editor).to_have_value(content)
+            draft = content + "\nLocal unsaved draft."
+            editor.fill(draft)
+            editor.evaluate("node => { node.setSelectionRange(node.value.length - 8, node.value.length - 3); node.scrollTop = node.scrollHeight; node.focus(); }")
+            install_refresh_probe(page, {"editor": ".plan-editor", "textarea": ".plan-editor-textarea"})
+            before = capture_refresh_probe(page)
+            selection = editor.evaluate("node => [node.selectionStart, node.selectionEnd, node.scrollTop]")
+            editor_top = editor.bounding_box()["y"]
+            page.screenshot(path=str(artifact_dir / f"{stem}-editor-held.png"), full_page=True)
+            # This condition enforces the queue delay; visibility was asserted above.
+            remaining_ms = max(0, 5000 - int(1000 * (time.perf_counter() - timestamps["queue_started"])))
+            page.wait_for_function("deadline => Date.now() >= deadline", arg=page.evaluate("remaining => Date.now() + remaining", remaining_ms), timeout=7000)
+            route, response = held.pop()
+            payload = json.loads(response.body())
+            payload["capacity"]["available_slots"] = 0
+            payload["plans"] = [item for item in payload["plans"] if item["path"] != "plans/in-progress/latency-probe.md"]
+            payload["plans"].append({
+                "name": "latency-probe.md", "path": "plans/in-progress/latency-probe.md",
+                "status": "in_progress", "identity": "latency-probe", "outcome": "blocked",
+                "reason": "capacity", "dependency": None, "run_id": None,
+                "revision": "changed-queue-revision",
+            })
+            route.fulfill(status=response.status, headers=response.headers, body=json.dumps(payload))
+            expect(page.get_by_text("Waiting for an implementation slot", exact=True)).to_be_visible()
+            timestamps["queue_visible"] = time.perf_counter()
+            after = capture_refresh_probe(page)
+            assert all(root_state["sameNode"] for root_state in after["roots"].values()), after
+            assert after["focused"] == before["focused"]
+            assert after["roots"]["textarea"]["scrollTop"] == before["roots"]["textarea"]["scrollTop"]
+            assert abs(editor.bounding_box()["y"] - editor_top) <= 1
+            assert editor.evaluate("node => [node.selectionStart, node.selectionEnd, node.scrollTop]") == selection
+            assert editor.input_value() == draft
+            assert not [item for item in read_refresh_probe_mutations(page) if item["root"] == "textarea" and item["classification"] in {"subtree", "root-replacement", "value", "visibility"}]
+            page.screenshot(path=str(artifact_dir / f"{stem}-editor-settled.png"), full_page=True)
+            assert page_errors == [] and units.start_calls == []
+            _write_artifact_manifest(artifact_dir / f"{stem}.json", {"response_to_visible_ms": response_to_visible_ms, "queue_hold_seconds": timestamps["queue_visible"] - timestamps["queue_started"], "complete_page_ready_seconds": timestamps["queue_visible"] - timestamps["navigation_started"], "before": before, "after": after, "page_errors": page_errors})
+        finally:
+            for route, response in held:
+                try:
+                    route.fulfill(response=response)
+                except Exception:
+                    pass
+            page.unroute_all(behavior="ignoreErrors")
+            browser.close()
 
 
 @pytest.mark.parametrize(

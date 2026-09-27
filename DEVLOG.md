@@ -1,5 +1,26 @@
 # DEVLOG
 
+## 2026-09-27 — Independent plan-list readiness (Checkpoint 3)
+
+- PlanPanel now publishes the fresh list when that read settles, independently
+  of queue evidence. Initial queue state has no capacity or run claims. A failed
+  queue read clears its projection while leaving the list and edited document
+  usable. Project and refresh generations reject late responses.
+- The pre-change live HTTP baseline was 5.34s for queue and 1.58s/1.88s for
+  recent ten-run reads without/with rich progress. Those were captured before
+  this UI change and under different live conditions. The controlled WebKit
+  browser runs with queue held for at least 5s showed fresh plan-list response
+  to visible row in 34–101ms in WebKit and 35–46ms in Chromium across
+  populated desktop/mobile light/dark and 390×420 cases. Controlled complete
+  page readiness, including the changed queue reason, was 5.20–5.24s in
+  WebKit and 5.15–5.17s in Chromium. Both engines verified
+  opening and editing during the hold, then applying changed queue evidence
+  without replacing the editor node, focus, selection, scroll or draft.
+- These are local controlled timings, not deployed page-completion results.
+  The coordinator must measure live queue, recent-run list, first usable content
+  and complete page readiness on the same corpus after exact-SHA activation.
+  No deployed comparison or physical mobile keyboard check is claimed here.
+
 ## 2026-09-27 — Reuse fresh admission evidence per operation (Checkpoint 2)
 
 - Admission now resolves verified roots, run identities, and canonical status
