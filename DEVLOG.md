@@ -4720,3 +4720,9 @@ HISTORY: Published clipboard history `c14f1f2`/`cd78d53` remains separate and mu
 - The nine affected browser cases passed in Chromium and WebKit locally, as did
   the web build, Ruff checks, and `git diff --check`. No product source changed;
   exact-SHA macOS CI and deployment remain coordinator gates.
+
+## 2026-09-27 — Dashboard WebKit job budget repair
+
+- CI 36313739241 passed all 44 WebKit checks in 379.77 seconds, then cancelled
+  the Ubuntu Python 3.12 dashboard job at its 25-minute limit. Raised only that
+  matrix cell's job budget to 35 minutes; the other dashboard cells retain 25.
