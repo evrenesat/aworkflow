@@ -29,7 +29,7 @@ Each concrete workflow can also set `retry_inconsistent_checkpoint_state` to ove
 ```toml
 # aflow.toml
 [aflow]
-default_workflow = "medium"
+default_workflow = "plan_review_then_final_squash"
 keep_runs = 10
 max_turns = 12
 retry_inconsistent_checkpoint_state = 1
@@ -105,7 +105,7 @@ setup = ["worktree", "branch"]
 teardown = ["merge", "rm_worktree"]
 main_branch = "main"
 
-[workflow.ralph.steps.implement_plan]
+[workflow.implement_only.steps.implement_plan]
 role = "worker"
 prompts = ["simple_implementation"]
 go = [
@@ -113,8 +113,8 @@ go = [
   { to = "implement_plan" },
 ]
 
-[workflow.ralph_jr]
-extends = "ralph"
+[workflow.implement_only_jr]
+extends = "implement_only"
 team = "high"
 setup = ["branch"]
 teardown = ["merge"]
@@ -295,7 +295,7 @@ repartition_skill = "aflow-repartition-checkpoint"
 
 ```toml
 # workflows.toml, in one workflow that should use manager supervision
-[workflow.review_implement_cp_review]
+[workflow.plan_review_then_checkpoint_review_then_final]
 manager_enabled = true
 ```
 
@@ -405,6 +405,9 @@ and does not change quality-upgrade routing.
 
 ## Workflows
 
+- Packaged definitions use `implement_only`, `plan_review_then_final_squash`,
+  and `plan_review_then_checkpoint_review_then_final`. Legacy IDs remain
+  aliases; the packaged default is `plan_review_then_final_squash`.
 - Bare `[workflow]` in `workflows.toml` is the lifecycle defaults table, not a runnable workflow.
 - Concrete workflows live under `[workflow.<name>]`.
 - Alias workflows use `extends = "base_workflow"` and may set an optional `team`.

@@ -1,4 +1,5 @@
 from dataclasses import asdict
+import tomllib
 
 from tests._support import *  # noqa: F401,F403
 from aflow.workflow import resolve_role_prompt
@@ -150,6 +151,33 @@ def test_packaged_workflows_disable_manager_by_default() -> None:
     assert "manager_enabled = true" not in (
         package_root / "starter" / "workflows.toml"
     ).read_text(encoding="utf-8")
+
+
+def test_packaged_workflow_aliases_preserve_resolved_behavior() -> None:
+    package_root = Path(__file__).resolve().parents[1] / "aflow"
+    declarations = tomllib.loads(
+        (package_root / "workflows.toml").read_text(encoding="utf-8")
+    )["workflow"]
+    config = load_workflow_config(package_root / "aflow.toml")
+    aliases = {
+        "ralph": "implement_only",
+        "review_implement_review": "plan_review_then_final_squash",
+        "review_implement_cp_review": "plan_review_then_checkpoint_review_then_final",
+        "hard": "plan_review_then_checkpoint_review_then_final",
+        "medium": "plan_review_then_final_squash",
+    }
+
+    assert config.aflow.default_workflow == "plan_review_then_final_squash"
+    assert "medium" in config.workflows  # The former packaged default still resolves.
+    for old_name, canonical_name in aliases.items():
+        assert declarations[old_name] == {"extends": canonical_name}
+        assert "steps" in declarations[canonical_name]
+        old = asdict(config.workflows[old_name])
+        canonical = asdict(config.workflows[canonical_name])
+        # Inheritance records its source name; execution uses the resolved value.
+        old.pop("upgrade_after_repairs_source")
+        canonical.pop("upgrade_after_repairs_source")
+        assert old == canonical, old_name
 
 
 def test_workflow_manager_enabled_preserves_explicit_true_and_false() -> None:
@@ -869,7 +897,7 @@ class WorkflowConfigTests(unittest.TestCase):
     def test_bundled_config_validates_without_errors(self) -> None:
         repo_root = Path(__file__).resolve().parents[1]
         config = load_workflow_config(repo_root / 'aflow' / 'aflow.toml')
-        assert config.aflow.default_workflow == 'medium'
+        assert config.aflow.default_workflow == 'plan_review_then_final_squash'
         assert config.aflow.max_turns == 15
         assert config.aflow.team_lead == 'senior_architect'
         assert config.manager.repartition_skill == 'aflow-repartition-checkpoint'

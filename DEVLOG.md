@@ -1,5 +1,13 @@
 # DEVLOG
 
+## 2026-09-27 — Behavior-based packaged workflow IDs (Checkpoint 2)
+
+- Packaged definitions now name their review stages. `ralph`,
+  `review_implement_review`, `review_implement_cp_review`, `hard`, and `medium`
+  remain aliases with equivalent resolved behavior; the packaged default uses
+  `plan_review_then_final_squash`. The live-only mapping and staged activation
+  are documented in README; no installed configuration or active run changed.
+
 ## 2026-09-27 — Phase-specific verification guidance (Checkpoint 1)
 
 - Bundled planning guidance now requires focused checkpoint commands and a

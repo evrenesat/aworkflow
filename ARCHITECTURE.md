@@ -1270,6 +1270,11 @@ Workflows are state machines defined in `workflows.toml`. Each step has:
 - A `go` array of transitions, each with a `to` target (step name or `END`) and an optional `when` condition expression.
 
 Workflow tables can also use `extends` to alias a concrete base workflow and `team` to override the team for that alias. In v1, aliases inherit the base workflow's steps and cannot redefine them.
+Packaged workflow definitions now use behavior-based IDs; historical IDs are
+one-hop aliases to those definitions. The packaged default selects the same
+resolved graph as its former `medium` value. Installed, live-only workflows
+receive their own canonical IDs and compatibility aliases only at the
+coordinator's post-publication activation boundary, after affected runs finish.
 
 Bare `[workflow]` in `workflows.toml` is a lifecycle defaults table. It supplies `setup`, `teardown`, `main_branch`, and `merge_prompt` values that all concrete workflows and aliases inherit unless they override them individually. It is not a runnable workflow.
 

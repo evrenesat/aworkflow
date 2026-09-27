@@ -9,8 +9,8 @@ manager_enabled = false
 # Number of reviewed repairs before the next eligible worker team is used.
 upgrade_after_repairs = 1
 
-# Ralph loop, single-step implementation with no review phase.
-[workflow.ralph.steps.implement_plan]
+# Single-step implementation with no review phase.
+[workflow.implement_only.steps.implement_plan]
 # The step runs under a role. The selected team decides which selector that role maps to at runtime.
 role = "worker"
 # Prompt keys are rendered in order.
@@ -21,14 +21,11 @@ go = [
   { to = "implement_plan" },
 ]
 
-# Alias workflow, inherits `ralph` steps but runs branch-only lifecycle with a per-workflow merge prompt.
-# Alias workflows can also use `exclude = ["step_name"]` to keep declared steps visible in `aflow show`
-# while removing them from the executable graph.
-
-
+# Alias workflows can use `exclude = ["step_name"]` to keep declared steps visible
+# in `aflow show` while removing them from the executable graph.
 
 # Review, implement, then squash approved follow-up work into one final commit.
-[workflow.review_implement_review.steps.review_plan]
+[workflow.plan_review_then_final_squash.steps.review_plan]
 role = "architect"
 prompts = ["review_plan"]
 go = [
@@ -36,7 +33,7 @@ go = [
   { to = "implement_plan" },
 ]
 
-[workflow.review_implement_review.steps.implement_plan]
+[workflow.plan_review_then_final_squash.steps.implement_plan]
 role = "worker"
 prompts = ["implementation_plans", "cp_loop_implementation"]
 go = [
@@ -45,7 +42,7 @@ go = [
   { to = "implement_plan", preserve_active_plan = true },
 ]
 
-[workflow.review_implement_review.steps.review_implementation]
+[workflow.plan_review_then_final_squash.steps.review_implementation]
 role = "reviewer"
 prompts = ["review_plans","review_squash"]
 go = [
@@ -56,7 +53,7 @@ go = [
 
 
 # Review each checkpoint, then do a final no-squash audit of the finished plan.
-[workflow.review_implement_cp_review.steps.review_plan]
+[workflow.plan_review_then_checkpoint_review_then_final.steps.review_plan]
 role = "architect"
 prompts = ["review_plan"]
 go = [
@@ -64,7 +61,7 @@ go = [
   { to = "implement_plan" },
 ]
 
-[workflow.review_implement_cp_review.steps.implement_plan]
+[workflow.plan_review_then_checkpoint_review_then_final.steps.implement_plan]
 role = "worker"
 prompts = ["implementation_plans", "cp_loop_implementation"]
 go = [
@@ -72,7 +69,7 @@ go = [
   { to = "review_cp_implementation", preserve_active_plan = true },
 ]
 
-[workflow.review_implement_cp_review.steps.review_cp_implementation]
+[workflow.plan_review_then_checkpoint_review_then_final.steps.review_cp_implementation]
 role = "reviewer"
 prompts = ["review_plans","review_cp"]
 go = [
@@ -82,7 +79,7 @@ go = [
 ]
 
 # Final review against the original plan before any optional follow-up work.
-[workflow.review_implement_cp_review.steps.final_review]
+[workflow.plan_review_then_checkpoint_review_then_final.steps.final_review]
 role = "architect"
 prompts = ["review_plans","final_review"]
 go = [
@@ -91,7 +88,7 @@ go = [
   { to = "END" },
 ]
 
-[workflow.review_implement_cp_review.steps.followup]
+[workflow.plan_review_then_checkpoint_review_then_final.steps.followup]
 role = "senior_architect"
 prompts = ["implementation_plans", "followup_implementation"]
 go = [
@@ -99,10 +96,18 @@ go = [
   { to = "final_review", preserve_active_plan = true },
 ]
 
-# Alias workflows
+# Legacy workflow IDs remain valid for existing plans, runs, and scripts.
+[workflow.ralph]
+extends = "implement_only"
+
+[workflow.review_implement_review]
+extends = "plan_review_then_final_squash"
+
+[workflow.review_implement_cp_review]
+extends = "plan_review_then_checkpoint_review_then_final"
+
 [workflow.hard]
-extends = "review_implement_cp_review"
+extends = "plan_review_then_checkpoint_review_then_final"
 
 [workflow.medium]
-extends = "review_implement_review"
-
+extends = "plan_review_then_final_squash"

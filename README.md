@@ -508,13 +508,33 @@ invalid.
 
 ## Included workflows
 
-- `ralph`: repeat one implementation step without a review phase.
-- `review_implement_review`: review the plan, implement it, then review and
-  squash the completed work.
-- `review_implement_cp_review`: review each checkpoint and finish with a
-  no-squash audit of the full plan.
-- `medium`: alias for `review_implement_review` and the packaged default.
-- `hard`: alias for `review_implement_cp_review`.
+- `implement_only`: repeat one implementation step without review (`ralph` alias).
+- `plan_review_then_final_squash`: review the plan, implement it, then review
+  and squash the completed work (`review_implement_review` and `medium` aliases).
+  This is the packaged default.
+- `plan_review_then_checkpoint_review_then_final`: review each checkpoint and
+  finish with a no-squash final audit (`review_implement_cp_review` and `hard`
+  aliases).
+
+For existing live-only workflows, post-publication activation uses this
+mapping and keeps every legacy ID valid:
+
+| Existing ID | Canonical ID |
+| --- | --- |
+| `hard_no_plan_review` | `checkpoint_review_then_final_senior_fixes` |
+| `checkpoint_delivery` | `checkpoint_review_only` |
+| `checkpoint_delivery_in_place` | `checkpoint_review_only_in_place` |
+| `cumulative_delivery` | `final_review_then_squash` |
+| `cumulative_delivery_in_place` | `final_review_then_squash_in_place` |
+| `luna_checkpoint_astra_final` | `checkpoint_review_then_final` |
+
+After reviewed code reaches `origin/main`, CI passes, and affected workflows
+finish, the coordinator compares live skill and config customizations with
+reviewed definitions, applies the reviewed skill policy, adds these canonical
+IDs and aliases without changing resolved behavior, then sets the installed
+default to `checkpoint_review_then_final`. Config validation and
+rendered-prompt inspection precede live use. The senior follow-up role in
+`hard_no_plan_review` is preserved; no active run is renamed.
 
 Run `aflow show [WORKFLOW]` to inspect the effective steps, transitions, roles,
 and teams.

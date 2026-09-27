@@ -1,6 +1,6 @@
 [aflow]
 # Default workflow used when the CLI does not name one.
-default_workflow = "medium"
+default_workflow = "plan_review_then_final_squash"
 # Keep this many run directories under `.aflow/runs/` before pruning the oldest.
 keep_runs = 20
 # Hard turn cap for a run. `--max-turns` can override this for a single invocation.
