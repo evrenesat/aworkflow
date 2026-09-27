@@ -430,6 +430,57 @@ export interface WorktreeStatusItem {
   original_path: string | null
 }
 
+export interface StartupCheckpoint {
+  ordinal: number
+  title: string
+  heading_checked: boolean
+  checked_tasks: number
+  total_tasks: number
+}
+
+export interface StartupRelatedRun {
+  run_id: string
+  status: string | null
+  step: string | null
+  activity: 'active' | 'inactive' | 'unknown'
+  history_state: 'visible' | 'archived'
+  failure_reason: string | null
+  worktree_path: string | null
+  worktree_verified: boolean
+  branch: string | null
+  branch_verified: boolean
+  unmerged_work: boolean | null
+  uncommitted_work: boolean | null
+  can_resume: boolean | null
+}
+
+export interface StartupContext {
+  schema_version: 1
+  availability: 'available' | 'partial' | 'unavailable' | 'not_applicable'
+  reason_codes: string[]
+  reason: string | null
+  observed_at: string | null
+  plan_path: string | null
+  plan_identity: string | null
+  plan_revision: string | null
+  total_checkpoints: number | null
+  recorded_complete_checkpoints: number | null
+  next_checkpoint: StartupCheckpoint | null
+  checkpoints: StartupCheckpoint[]
+  pending_tasks: string[]
+  checkpoint_outline_truncated: boolean
+  pending_tasks_truncated: boolean
+  text_truncated: boolean
+  workflow_name: string | null
+  selected_step: string | null
+  step_source: 'workflow_default' | 'explicit' | 'resume' | null
+  recommendation: 'start' | 'open_existing_run' | 'review_previous_run' | 'inspect_previous_runs' | 'blocked' | null
+  recommendation_reason: string | null
+  related_runs: StartupRelatedRun[]
+  related_runs_complete: boolean | null
+  related_runs_truncated: boolean
+}
+
 export interface WorktreePreflight {
   checkout_path: string
   execution_mode: 'same_checkout' | 'new_worktree'
@@ -441,6 +492,7 @@ export interface WorktreePreflight {
   limit: number
   next_offset: number | null
   items: WorktreeStatusItem[]
+  startup_context?: StartupContext | null
 }
 
 export interface RunStatus {
@@ -473,6 +525,7 @@ export interface RunStatus {
   evidence: Record<string, unknown>
   /** Additive canonical progress; absent/null remains valid for legacy runs. */
   progress?: RunProgressSummary | null
+  startup_context?: StartupContext | null
 }
 
 export interface RecoveryWorkerEvidence {
@@ -685,6 +738,7 @@ export interface RunProgressDetail extends RunProgressSummary {
 }
 
 export interface RunContextData extends Record<string, unknown> {
+  startup_context?: StartupContext | null
   /** Bounded compatibility projection for older execution-summary consumers. */
   execution_progress?: RunProgress | null
   /** Canonical history and approval projection. */
