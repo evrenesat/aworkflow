@@ -1,5 +1,22 @@
 # DEVLOG
 
+## 2026-09-27 — Verify bounded saturated scans (Checkpoint 1)
+
+- The reported saturated project had 45 in-progress plans and 180 uncertain
+  historical runs against two slots. The current base already contains the
+  same-pass full-capacity cache and verified linked-worktree skip from
+  `47a85e08`; this pass retains those admission and identity boundaries.
+- Strengthened the focused consumer tests to verify one primary scan per pass,
+  no linked-worktree scanner or expected error, visible unsafe registry errors,
+  and the locked admission rejection when another actor fills capacity after
+  the scan's observation. The existing test covers one snapshot for ten stable
+  plans at full capacity and a later pass admitting after release.
+- Verification: 90 passed across consumer, admission, and settings on the
+  default interpreter; 65 passed across consumer and admission on Python 3.12;
+  Ruff passed for the consumer and its tests. The tracked diff contains only
+  focused tests and these two notes. The ignored local plan records checkpoint
+  progress for review.
+
 ## 2026-09-27 — Cumulative verification handoff (Checkpoint 3)
 
 - The original plan records two September 24 server-suite examples at 594.17s

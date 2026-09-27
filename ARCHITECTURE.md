@@ -9,8 +9,14 @@ AFlow is a plan-driven workflow orchestrator that runs coding tasks through exis
 The UI server owns one `PlanConsumer` scanner per registered primary project,
 elected with a cross-process scanner lock. It examines direct regular Markdown
 files in `plans/in-progress` after two stable observations, on a bounded
-five-second pass or a plan/completion wakeup. Drafts stay in `plans/todo`;
-invalid content and confirmed inactive run failures move through the journal
+five-second pass or a plan/completion wakeup. Verified linked worktrees share
+the primary scanner and are skipped as scanner roots, while identity failures
+remain visible. Once a pass observes full admission capacity, later stable
+candidates receive a capacity reason without another project-wide snapshot.
+The next pass reads capacity again; available
+slots still pass through the control plane's locked admission recheck. Drafts
+stay in `plans/todo`; invalid content and confirmed inactive run failures move
+through the journal
 to `plans/needs-plan-change` and `plans/failed`. A revision-checked requeue
 returns a corrected original to Ready and resumes eligible recorded lineage.
 Only receipt-backed publication moves an original to `plans/done`. These five

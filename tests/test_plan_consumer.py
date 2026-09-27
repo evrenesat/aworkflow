@@ -160,8 +160,39 @@ def test_full_pass_reads_capacity_once_and_next_pass_sees_release(
     consumer.stop()
 
 
+def test_admission_rechecks_capacity_after_scan_observation(tmp_path: Path) -> None:
+    root = _project(tmp_path)
+    config = _config(tmp_path)
+    for name in ("a.md", "b.md"):
+        _plan(root, name)
+    admission = ProjectAdmission(root)
+    attempts: list[str] = []
+
+    def launch(_project, path, key, revision, _workflow, _team, identity):
+        attempts.append(path)
+        if len(attempts) == 1:
+            admission.acquire("concurrent-1")
+            admission.acquire("concurrent-2")
+        admission.acquire(
+            "candidate", plan_path=root / path, idempotency_key=key,
+            expected_plan_revision=revision, expected_plan_identity=identity,
+        )
+        return SimpleNamespace(run_id="candidate")
+
+    consumer = _consumer(root, config, launch)
+    consumer.scan_once()
+    consumer.scan_once()
+    assert attempts == ["plans/in-progress/a.md"]
+    assert consumer.reason(root, "a.md") == "capacity"
+    assert consumer.reason(root, "b.md") == "capacity"
+    assert admission.reservation("candidate") is None
+    assert admission.snapshot().occupied_count == 2
+    consumer.stop()
+
+
 def test_registered_linked_worktree_uses_one_primary_scanner_without_error(
     tmp_path: Path, caplog: pytest.LogCaptureFixture,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     root = _project(tmp_path, "primary")
     config = _config(tmp_path)
@@ -177,13 +208,35 @@ def test_registered_linked_worktree_uses_one_primary_scanner_without_error(
         root, config, lambda *_: None,
         projects=lambda: (("primary", root), ("linked", linked)),
     )
+    scanned: list[Path] = []
+    original_scan = consumer._scan_project
+
+    def record_scan(project_id, scan_root, settings):
+        scanned.append(scan_root)
+        original_scan(project_id, scan_root, settings)
+
+    monkeypatch.setattr(consumer, "_scan_project", record_scan)
     with caplog.at_level("ERROR"):
         consumer.scan_once()
+        consumer.scan_once()
+        assert scanned == [root, root]
         consumer._refresh_workers()
     assert list(consumer._workers) == [root]
     assert "automatic plan project identity failed" not in caplog.text
     assert "automatic plan project scan failed" not in caplog.text
     consumer.stop()
+
+    unsafe_root = tmp_path / "unsafe-alias"
+    unsafe_root.symlink_to(root, target_is_directory=True)
+    broken = _consumer(
+        root, config, lambda *_: None,
+        projects=lambda: (("unsafe", unsafe_root),),
+    )
+    caplog.clear()
+    with caplog.at_level("ERROR"):
+        broken._refresh_workers()
+    assert "automatic plan project identity failed for unsafe" in caplog.text
+    assert broken._workers == {}
 
 
 def test_managed_queue_delivery_failure_and_restart_scenario(tmp_path: Path) -> None:
