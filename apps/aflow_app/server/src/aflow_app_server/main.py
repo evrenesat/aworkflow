@@ -1320,10 +1320,15 @@ def control_plane_restart_options(
 def control_plane_run(
     project_id: str,
     run_id: str,
+    include_resume_preview: bool = Query(default=True),
     _: str = Depends(verify_token),
     service: ControlPlaneService = Depends(get_control_plane_service),
 ) -> RunStatusResponse:
-    return RunStatusResponse.from_canonical(service.run_status(project_id, run_id))
+    return RunStatusResponse.from_canonical(
+        service.run_status(
+            project_id, run_id, include_resume_preview=include_resume_preview
+        )
+    )
 
 
 @app.post(

@@ -1,5 +1,26 @@
 # DEVLOG
 
+## 2026-09-27 — Lean All-runs progress detail (Checkpoint 4)
+
+- Run-detail REST accepts `include_resume_preview`, defaulting to true. Only
+  All-runs display enrichment requests false; selected-run and MCP detail
+  reads keep the full default. The lean response omits `can_resume` while
+  retaining fresh status, activity, worker and progress fields. The overview's
+  four-request pump, generation checks and cancellation remain unchanged.
+- On an identical three-run browser fixture with a controlled 0.7s delay in
+  each resume preview, first usable rows took 0.17–0.24s and complete raw
+  coverage took 0.19–0.27s across Chromium/WebKit desktop and mobile. Visible
+  progress finished in 0.98–1.04s with full previews and 0.19–0.27s with
+  lean detail, a 74–81% reduction; preview calls fell from 3–6 to zero.
+  The delay isolates a scan-dominated case. Equal, changed and failed refresh
+  journeys passed in both engines, and populated screenshots were reviewed.
+- The earlier live baseline showed first rows at 2.72s with many progress
+  rows still loading at 47.73s during administrative recovery. It is not
+  directly comparable to this controlled fixture. Exact-SHA deployment,
+  same-corpus live timing and complete-page acceptance remain coordinator
+  delivery checks. If live completion is still slow, measure the remaining
+  detail-read and coverage costs before specifying any persisted projection.
+
 ## 2026-09-27 — Independent plan-list readiness (Checkpoint 3)
 
 - PlanPanel now publishes the fresh list when that read settles, independently

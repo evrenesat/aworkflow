@@ -300,10 +300,13 @@ class ControlPlaneService:
             next_cursor=page.next_cursor,
         )
 
-    def run_status(self, project_id: str, run_id: str) -> RunStatus:
+    def run_status(
+        self, project_id: str, run_id: str, *, include_resume_preview: bool = True
+    ) -> RunStatus:
         item = self._project(project_id)
         return RunHistory(item.daemon.application.repository).project(
-            self._status(item, run_id), external=True
+            self._status(item, run_id, include_resume_preview=include_resume_preview),
+            external=True,
         )
 
     def change_history(self, project_id, run_id, *, state, expected_revision, idempotency_key, acknowledge_active=False):

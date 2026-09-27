@@ -478,7 +478,7 @@ describe('GlobalRunOverview project context', () => {
 
     failedProject.reject(new Error('child unavailable'))
     expect((await screen.findByRole('alert')).textContent).toMatch(/Partial or stale results/)
-    await waitFor(() => expect(api.getControlPlaneRun).toHaveBeenCalledWith('primary', usable.run_id, { signal: expect.anything() }))
+    await waitFor(() => expect(api.getControlPlaneRun).toHaveBeenCalledWith('primary', usable.run_id, { signal: expect.anything(), includeResumePreview: false }))
     await waitFor(() => expect(row.getAttribute('data-enrichment-state')).toBe('settled'))
     expect(row.textContent).toContain('1/1 approved')
   })
@@ -546,7 +546,7 @@ describe('GlobalRunOverview project context', () => {
     childPage.resolve(page([makeRun('current-child', { history_state: 'archived' })]))
     expect(await screen.findByRole('button', { name: /current-child/ })).toBeTruthy()
     await waitFor(() => expect(screen.queryByRole('status')).toBeNull())
-    await waitFor(() => expect(api.getControlPlaneRun).toHaveBeenCalledWith('child', 'current-child', { signal: expect.anything() }))
+    await waitFor(() => expect(api.getControlPlaneRun).toHaveBeenCalledWith('child', 'current-child', { signal: expect.anything(), includeResumePreview: false }))
   })
 
   it('retains partial pages on failure without complete empty claims', async () => {
@@ -625,7 +625,7 @@ describe('GlobalRunOverview project context', () => {
 
     fireEvent.change(screen.getByRole('searchbox', { name: 'Search loaded runs' }), { target: { value: 'Hidden original title' } })
     const row = await screen.findByRole('button', { name: /Hidden original title.*hidden-canonical/ })
-    await waitFor(() => expect(api.getControlPlaneRun).toHaveBeenCalledWith('primary', target.run_id, { signal: expect.anything() }))
+    await waitFor(() => expect(api.getControlPlaneRun).toHaveBeenCalledWith('primary', target.run_id, { signal: expect.anything(), includeResumePreview: false }))
     expect(row.getAttribute('data-enrichment-state')).toBe('loading')
     expect(row.getAttribute('aria-label')).toContain('Loading checkpoint progress…')
     expect(row.querySelector('.compact-run-progress-row-notice')).toBeNull()
@@ -733,8 +733,8 @@ describe('GlobalRunOverview project context', () => {
         laterPage.resolve(page([laterRun]))
         await laterPage.promise
       })
-      await waitFor(() => expect(api.getControlPlaneRun).toHaveBeenCalledWith('primary', laterRun.run_id, { signal: expect.anything() }))
-      await waitFor(() => expect(api.getControlPlaneRun).toHaveBeenCalledWith('primary', staleRun.run_id, { signal: expect.anything() }))
+      await waitFor(() => expect(api.getControlPlaneRun).toHaveBeenCalledWith('primary', laterRun.run_id, { signal: expect.anything(), includeResumePreview: false }))
+      await waitFor(() => expect(api.getControlPlaneRun).toHaveBeenCalledWith('primary', staleRun.run_id, { signal: expect.anything(), includeResumePreview: false }))
       mismatchResponse.resolve({ ...staleRun, status: 'running' } as RunStatus)
       await waitFor(() => expect(row.getAttribute('data-enrichment-state')).toBe('stale'))
       expect(vi.mocked(api.getControlPlaneRun).mock.calls.filter(([, runId]) => runId === staleRun.run_id)).toHaveLength(1)
@@ -763,7 +763,7 @@ describe('GlobalRunOverview project context', () => {
 
     render(<GlobalRunOverview projects={[primary]} onOpen={vi.fn()} />)
     const staleRow = await screen.findByRole('button', { name: /stale-attention-1$/ })
-    await waitFor(() => expect(api.getControlPlaneRun).toHaveBeenCalledWith('primary', staleRun.run_id, { signal: expect.anything() }))
+    await waitFor(() => expect(api.getControlPlaneRun).toHaveBeenCalledWith('primary', staleRun.run_id, { signal: expect.anything(), includeResumePreview: false }))
     mismatchResponse.resolve({ ...staleRun, status: 'running' } as RunStatus)
     await waitFor(() => expect(staleRow.getAttribute('data-enrichment-state')).toBe('stale'))
     const callsBeforeExpansion = vi.mocked(api.getControlPlaneRun).mock.calls.filter(([, runId]) => runId === staleRun.run_id).length
@@ -1006,7 +1006,7 @@ describe('GlobalRunOverview project context', () => {
 
     fireEvent.click(screen.getByRole('button', { name: 'Show more (1 remaining)' }))
     const expanded = await screen.findByRole('button', { name: /attention-11/ })
-    await waitFor(() => expect(api.getControlPlaneRun).toHaveBeenCalledWith('primary', 'attention-11', { signal: expect.anything() }))
+    await waitFor(() => expect(api.getControlPlaneRun).toHaveBeenCalledWith('primary', 'attention-11', { signal: expect.anything(), includeResumePreview: false }))
     pending.get('attention-11')?.resolve(matchingDetail(runs[10]))
     await waitFor(() => expect(expanded.getAttribute('data-enrichment-state')).toBe('settled'))
     expect(api.getControlPlaneRun).toHaveBeenCalledTimes(11)

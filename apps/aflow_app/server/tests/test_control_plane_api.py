@@ -612,6 +612,13 @@ def test_detached_early_worker_failure_is_visible_without_service_restart(contro
         assert "PRIVATE-MARKER" not in response.text
         assert payload["evidence"]["can_resume"] is False
         assert payload["started_at"] is None
+    lean = client.get(endpoint, params={"include_resume_preview": "false"})
+    assert lean.status_code == 200, lean.text
+    assert lean.json()["status"] == payload["status"]
+    assert lean.json()["activity"] == payload["activity"]
+    assert lean.json()["worker_exit"] == payload["worker_exit"]
+    assert lean.json()["progress"] == payload["progress"]
+    assert "can_resume" not in lean.json()["evidence"]
     assert client.get(endpoint + "/restart-options").json()["eligible"] is True
     detail = client.get(endpoint + "/context?level=full&full_scope=true")
     assert detail.status_code == 200 and "rest-worker-marker" in detail.text
@@ -2066,6 +2073,26 @@ def test_history_pages_skip_resume_preview_but_detail_keeps_it(control_client, m
     assert detail.json()["evidence"]["can_resume"] is False
     assert preview_calls == ["history-122"]
     assert admission_calls == ["history-122"]
+    lean = client.get(f"{endpoint}/history-122", params={"include_resume_preview": "false"})
+    assert lean.status_code == 200, lean.text
+    assert lean.json()["status"] == detail.json()["status"]
+    assert lean.json()["activity"] == detail.json()["activity"]
+    assert lean.json()["progress"] is not None
+    assert {
+        key: value for key, value in lean.json()["progress"].items()
+        if key != "observed_at"
+    } == {
+        key: value for key, value in detail.json()["progress"].items()
+        if key != "observed_at"
+    }
+    assert "can_resume" not in lean.json()["evidence"]
+    assert preview_calls == ["history-122"]
+    assert admission_calls == ["history-122"]
+    explicit = client.get(f"{endpoint}/history-122", params={"include_resume_preview": "true"})
+    assert explicit.status_code == 200, explicit.text
+    assert explicit.json()["evidence"]["can_resume"] is False
+    assert preview_calls == ["history-122", "history-122"]
+    assert admission_calls == ["history-122", "history-122"]
 
 
 def test_run_list_uses_summary_only_without_context_requests(control_client, monkeypatch):
@@ -4342,6 +4369,7 @@ def test_history_api_filters_deleted_links_replays_and_auth(control_client):
     assert deleted.status_code == 200
     assert client.request('DELETE', endpoint, json={'expected_revision': 1}, headers={'Idempotency-Key': 'delete-history'}).json() == deleted.json()
     assert client.get(endpoint).status_code == 410
+    assert client.get(endpoint, params={'include_resume_preview': 'false'}).status_code == 410
     assert client.get(endpoint + '/context').status_code == 410
     assert client.get(endpoint.rsplit('/', 1)[0] + '?history=all').json()['runs'] == []
     assert client.post(endpoint + '/restore', json={'expected_revision': 2}, headers={'Idempotency-Key': 'restore-deleted'}).status_code == 410
@@ -4357,6 +4385,15 @@ def test_history_active_acknowledgement_keeps_unit_running(control_client):
     create_launch_manifest(root, LaunchManifest(run_id='active-history', project_root=str(root), plan_path='plans/todo/test-plan.md', workflow_name='managed', max_turns=5))
     unit = 'aflow-run-active-history.service'
     units.start(unit, ('test',), cwd=root)
+    detail_endpoint = f'/api/control-plane/projects/{PROJECT_ID}/runs/active-history'
+    full = client.get(detail_endpoint)
+    lean = client.get(detail_endpoint, params={'include_resume_preview': 'false'})
+    assert full.status_code == lean.status_code == 200
+    assert lean.json()['status'] == full.json()['status']
+    assert lean.json()['activity'] == full.json()['activity']
+    assert lean.json()['evidence']['unit_active'] == full.json()['evidence']['unit_active']
+    assert lean.json()['progress'] is not None
+    assert 'can_resume' not in lean.json()['evidence']
     endpoint = f'/api/control-plane/projects/{PROJECT_ID}/runs/active-history/archive'
     headers = {'Idempotency-Key': 'active-archive'}
     assert client.post(endpoint, json={'expected_revision': 0}, headers=headers).status_code == 422

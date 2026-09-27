@@ -716,6 +716,100 @@ def test_ui_demo_fixture_captures_authenticated_built_app(
 
 @pytest.mark.parametrize(
     ("width", "height", "theme"),
+    ((1280, 720, "light"), (390, 844, "dark")),
+)
+def test_ui_demo_all_runs_lean_detail_readiness(
+    control_client,  # noqa: F811
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    width: int,
+    height: int,
+    theme: str,
+) -> None:
+    """Measure complete visible progress with and without a scan-dominated preview."""
+    _, root, _, _ = control_client
+    seed_demo_fidelity_fixture(root)
+    from aflow_app_server import main
+
+    service = main._control_plane_service
+    assert service is not None
+    daemon = service._project(PROJECT_ID).daemon.service
+    original_preview = daemon._can_resume
+    preview_calls: list[str] = []
+
+    def measured_preview(status):
+        preview_calls.append(status.run_id)
+        time.sleep(0.7)  # Controlled scan-dominated baseline; never used as a readiness signal.
+        return original_preview(status)
+
+    monkeypatch.setattr(daemon, "_can_resume", measured_preview)
+    monkeypatch.setenv("AFLOW_APP_WEB_DIST", str(Path(__file__).resolve().parents[2] / "web" / "dist"))
+    artifact_dir = _fidelity_artifact_dir(tmp_path)
+    artifact_dir.mkdir(parents=True, exist_ok=True)
+    stem = f"cp4-all-runs-{theme}-{width}x{height}"
+    page_errors: list[str] = []
+    captures: dict[str, object] = {}
+
+    with live_server() as url, sync_playwright() as playwright:
+        browser = _browser(playwright)
+        try:
+            for phase in ("baseline", "lean"):
+                page = browser.new_page(viewport={"width": width, "height": height})
+                page.on("pageerror", lambda error: page_errors.append(str(error)))
+                _login(page, url)
+                page.emulate_media(color_scheme=theme)  # type: ignore[arg-type]
+                _set_theme_preference(page, theme)
+                detail_requests: list[str] = []
+
+                def route_detail(route) -> None:
+                    request_url = route.request.url
+                    if re.fullmatch(r"/api/control-plane/projects/[^/]+/runs/[^/]+", urlsplit(request_url).path):
+                        detail_requests.append(request_url)
+                        if phase == "baseline":
+                            assert "include_resume_preview=false" in request_url
+                            response = route.fetch(url=request_url.replace("include_resume_preview=false", "include_resume_preview=true"))
+                            route.fulfill(response=response)
+                            return
+                    route.continue_()
+
+                page.route("**/api/control-plane/projects/**", route_detail)
+                calls_before = len(preview_calls)
+                started = time.perf_counter()
+                page.goto(f"{url}/?view=all-runs")
+                page.locator(".global-run-row:visible").first.wait_for(state="visible")
+                first_rows = time.perf_counter() - started
+                page.locator(".global-run-results[aria-busy='false']").wait_for(state="visible")
+                raw_coverage = time.perf_counter() - started
+                expect(page.locator(".global-run-row[data-enrichment-state='loading']:visible")).to_have_count(0, timeout=15_000)
+                visible_progress = time.perf_counter() - started
+                states = page.locator(".global-run-row:visible").evaluate_all("rows => rows.map(row => row.getAttribute('data-enrichment-state'))")
+                assert states and all(state == "settled" for state in states), states
+                count = len(preview_calls) - calls_before
+                assert count > 0 if phase == "baseline" else count == 0
+                assert detail_requests and all("include_resume_preview=false" in request for request in detail_requests)
+                page.screenshot(path=str(artifact_dir / f"{stem}-{phase}.png"), full_page=True)
+                captures[phase] = {
+                    "first_usable_seconds": first_rows,
+                    "raw_coverage_seconds": raw_coverage,
+                    "visible_progress_seconds": visible_progress,
+                    "preview_calls": count,
+                    "visible_rows": len(states),
+                    "states": states,
+                }
+                page.close()
+        finally:
+            browser.close()
+
+    assert page_errors == []
+    baseline = captures["baseline"]
+    lean = captures["lean"]
+    assert isinstance(baseline, dict) and isinstance(lean, dict)
+    assert lean["visible_progress_seconds"] < baseline["visible_progress_seconds"] * 0.5, captures
+    _write_artifact_manifest(artifact_dir / f"{stem}.json", {"captures": captures, "page_errors": page_errors})
+
+
+@pytest.mark.parametrize(
+    ("width", "height", "theme"),
     ((1280, 720, "light"), (1280, 720, "dark"), (390, 844, "light"), (390, 844, "dark"), (390, 420, "light")),
 )
 def test_ui_demo_plan_list_ready_while_queue_held(
@@ -1760,7 +1854,8 @@ def test_ui_demo_cp9_settings_effective_values_and_disclosures(
     ),
 )
 def test_ui_demo_cp9_combined_six_screen_matrix(
-    control_client, monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+    control_client,  # noqa: F811
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
     width: int, height: int, theme: str, text_scale: float,
 ) -> None:
     """Compare six populated app screens to their frozen-demo counterparts."""
@@ -2357,7 +2452,7 @@ def test_ui_demo_all_runs_background_refresh_probe(
         # Treat the read-only form projection separately from actual writes.
         page.on("request", lambda request: writes.append(request.url) if phase["value"] != "initial" and request.method not in {"GET", "OPTIONS"} and "/api/" in request.url and not urlsplit(request.url).path.endswith("/config/form") else None)
         page.route("**/api/control-plane/projects/*/runs?*", intercept)
-        page.route(f"**/api/control-plane/projects/{second_id}/runs/{changed_run_id}", intercept)
+        page.route(f"**/api/control-plane/projects/{second_id}/runs/{changed_run_id}?*", intercept)
         try:
             _login(page, url)
             page.emulate_media(color_scheme=theme)  # type: ignore[arg-type]
@@ -2431,7 +2526,8 @@ def test_ui_demo_all_runs_background_refresh_probe(
                     break
                 page.wait_for_timeout(50)
             expect(second_row).to_have_attribute("data-enrichment-state", "settled", timeout=15_000)
-            assert len(detail_requests) == 1 and detail_requests[0].endswith(f"/{changed_run_id}"), detail_requests
+            assert len(detail_requests) == 1 and urlsplit(detail_requests[0]).path.endswith(f"/{changed_run_id}"), detail_requests
+            assert "include_resume_preview=false" in urlsplit(detail_requests[0]).query
             changed = capture_refresh_probe(page)
             assert all(root["sameNode"] for root in changed["roots"].values()), [name for name, root in changed["roots"].items() if not root["sameNode"]]
             assert changed["roots"]["selected_row"]["text"] == before["roots"]["selected_row"]["text"]

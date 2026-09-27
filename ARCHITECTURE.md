@@ -272,6 +272,13 @@ resolutions. Returning visible requeues current pending rendered rows through th
 same lifecycle once the current raw traversal is settled; there is no per-row
 polling or request loop.
 
+Overview enrichment requests `include_resume_preview=false` on run detail, so
+its displayed progress avoids a project-wide resume admission scan per row.
+The optional REST query defaults to true for selected-run controls, MCP reads,
+and other callers. A false read omits `evidence.can_resume`; it retains fresh
+status, activity, worker and progress evidence, and never grants mutation
+admission. Start, resume and restart still validate at their existing boundary.
+
 Unreadable turn results and malformed event records make dependent history
 counts partial without discarding readable events, plan structure, or
 authoritative status. A retained executor remains attached to its own event,

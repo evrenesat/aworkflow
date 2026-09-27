@@ -491,8 +491,11 @@ export async function listControlPlaneRuns(
   return fetchJson<RunPage>(`${controlProjectPath(projectId)}/runs${buildQuery(request)}`, options)
 }
 
-export async function getControlPlaneRun(projectId: string, runId: string, options: { signal?: AbortSignal } = {}): Promise<RunStatus> {
-  return fetchJson<RunStatus>(`${controlProjectPath(projectId)}/runs/${encodeURIComponent(runId)}`, options)
+export async function getControlPlaneRun(projectId: string, runId: string, options: { signal?: AbortSignal; includeResumePreview?: boolean } = {}): Promise<RunStatus> {
+  return fetchJson<RunStatus>(
+    `${controlProjectPath(projectId)}/runs/${encodeURIComponent(runId)}${buildQuery({ include_resume_preview: options.includeResumePreview })}`,
+    { signal: options.signal },
+  )
 }
 
 export interface RestartOptions {

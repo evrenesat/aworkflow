@@ -419,7 +419,7 @@ export function GlobalRunOverview({ projects, onOpen, registryLoading = false, r
         const request: EnrichmentRequest = { ...target, controller }
         const requestEpoch = enrichmentEpochRef.current
         activeEnrichmentRef.current.set(target.key, request)
-        void api.getControlPlaneRun(target.projectId, target.runId, { signal: controller.signal })
+        void api.getControlPlaneRun(target.projectId, target.runId, { signal: controller.signal, includeResumePreview: false })
           .then(detail => {
             if (controller.signal.aborted || enrichmentEpochRef.current !== requestEpoch) return
             if (

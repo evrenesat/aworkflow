@@ -380,6 +380,22 @@ describe('workflow control API client', () => {
     }))
   })
 
+  it('sends an explicit resume-preview choice only for requested run-detail reads', async () => {
+    const signal = new AbortController().signal
+    mockOkJson({ run_id: 'run-1' })
+    await api.getControlPlaneRun('project-1', 'run-1', { signal, includeResumePreview: false })
+    expect(global.fetch).toHaveBeenLastCalledWith(
+      '/api/control-plane/projects/project-1/runs/run-1?include_resume_preview=false',
+      expect.objectContaining({ signal }),
+    )
+    mockOkJson({ run_id: 'run-1' })
+    await api.getControlPlaneRun('project-1', 'run-1', { includeResumePreview: true })
+    expect(vi.mocked(global.fetch).mock.calls.at(-1)![0]).toBe('/api/control-plane/projects/project-1/runs/run-1?include_resume_preview=true')
+    mockOkJson({ run_id: 'run-1' })
+    await api.getControlPlaneRun('project-1', 'run-1')
+    expect(vi.mocked(global.fetch).mock.calls.at(-1)![0]).toBe('/api/control-plane/projects/project-1/runs/run-1')
+  })
+
   it('surfaces structured API failures', async () => {
     vi.mocked(global.fetch).mockResolvedValueOnce({
       ok: false, status: 409,
