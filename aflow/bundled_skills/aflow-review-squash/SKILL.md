@@ -66,6 +66,12 @@ Selection rules:
 7. Review the actual code state, not just commit messages.
 8. When reporting or updating review state, prefer checkpoint/version labels such as "reviewed through `cp5 v01`". Include exact SHAs only when they materially help disambiguate the history.
 
+## Cumulative Verification
+
+- Independently review the full accumulated code and coverage against the original plan. Run every exact command and observable check in its top-level `## Final Verification` section on the cumulative source state; retain any explicit final gate in an older plan without that heading.
+- Run the declared full regression set once per valid source, test, dependency, configuration, and environment state. Record each command, working directory, tested revision and dirty state, outcome, elapsed time, and primary log. A checkpoint pass or summary alone does not prove the cumulative gate.
+- After a fix or relevant state change, rerun affected focused checks and any prior full-suite result that the change invalidated. Explain additional invocations. Missing, failed, interrupted, or uninspectable required evidence blocks approval; do not defer this gate to an unspecified later CI run.
+
 ## Approval Path
 
 If the accumulated work looks correct:

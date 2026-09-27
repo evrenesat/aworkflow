@@ -77,6 +77,13 @@ Selection rules:
 7. Review the actual code state, not just commit messages.
 8. When reporting or updating review state, prefer checkpoint/version labels such as "reviewed through `cp5 v01`". Include exact SHAs only when they materially help disambiguate the history.
 
+## Checkpoint Verification
+
+- Independently inspect the changed code, assertions, and coverage against the checkpoint's acceptance criteria. Follow every explicit checkpoint command and observable check in the current plan; a skill or prompt cannot waive one.
+- Reuse worker test evidence only when the primary log is inspectable and records the exact command, working directory, tested revision and dirty state, result, and elapsed time. Confirm the relevant source, tests, dependencies, configuration, and environment are unchanged. A summary or claimed pass alone is insufficient.
+- Run missing or invalidated focused checks and explain each additional invocation, including why valid worker evidence did not suffice. Do not routinely rerun an unchanged worker check or add a broad suite assigned to cumulative final review. Preserve focused browser and visual coverage required by the checkpoint.
+- A failed, interrupted, or missing required check blocks approval. After a fix, rerun affected checks; report any explicit broad checkpoint command that seems misplaced instead of silently weakening or skipping it.
+
 ## Approval Path
 
 If the checkpoint looks correct:

@@ -479,6 +479,14 @@ acceptance belongs in a separate top-level `## User Acceptance Pending` section
 after the checkpoints, remains pending until evidence is supplied, and does not
 change implementation completion.
 
+New plans assign exact, focused checks to each checkpoint and place the complete
+cumulative regression commands in a top-level `## Final Verification` section.
+Checkpoint reviewers independently inspect coverage and may reuse inspectable
+worker results for unchanged relevant state. Final reviewers run the declared
+full set on the accumulated result. A workflow without a final review must
+complete its required regression coverage before its last approval. Existing
+plan commands remain binding, including affected UI browser and visual checks.
+
 On the first launch of a pristine plan, review workflows automatically add the
 minimal controller-owned `## Git Tracking` section before the first checkpoint.
 Ready repositories record the current commit; an empty-repository lifecycle

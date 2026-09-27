@@ -179,12 +179,22 @@ This file is not yet exist, if you are tasked to create a follow-up plan for pos
 NEW_PLAN_PATH: "{NEW_PLAN_PATH}"
 """
 
-cp_loop_implementation = "Implement {ACTIVE_PLAN_PATH} using 'aflow-execute-checkpoint' skill. Do not create checkpoint commits; leave verified scoped changes uncommitted for review. {WORK_ON_NEXT_CHECKPOINT_CMD}"
-followup_implementation = "Implement {ACTIVE_PLAN_PATH} using 'aflow-execute-plan' skill. Treat {ACTIVE_PLAN_PATH} as the only plan file you should edit. Do not read, move, delete, or rewrite other plan files under plans/in-progress unless the active plan explicitly tells you to."
+cp_loop_implementation = """Implement {ACTIVE_PLAN_PATH} using 'aflow-execute-checkpoint' skill. Do not create checkpoint commits; leave verified scoped changes uncommitted for review. {WORK_ON_NEXT_CHECKPOINT_CMD}
+Run every checkpoint check the current plan requires, including focused UI/browser checks. Use targeted diagnostics after failures; do not add routine final-review suites or silently replace an explicit broad command. Report a seemingly misplaced broad command to the coordinator.
+"""
+followup_implementation = """Implement {ACTIVE_PLAN_PATH} using 'aflow-execute-plan' skill. Treat {ACTIVE_PLAN_PATH} as the only plan file you should edit. Do not read, move, delete, or rewrite other plan files under plans/in-progress unless the active plan explicitly tells you to.
+Run every check the active fix plan requires. Use targeted diagnostics after failures; do not silently replace an explicit command or add routine broad suites assigned to final review.
+"""
 
-review_squash = "Use 'aflow-review-squash' skill. Take into account both ORIGINAL_PLAN and ACTIVE_PLAN (if they differ)"
-final_review = "Use 'aflow-review-final' skill."
-review_cp = "Use 'aflow-review-checkpoint' skill."
+review_squash = """Use 'aflow-review-squash' skill. Take into account both ORIGINAL_PLAN and ACTIVE_PLAN (if they differ).
+Review the cumulative change and run the original plan's Final Verification full regression set once per valid state. Record primary evidence; rerun invalidated checks and block approval for missing, failed, or interrupted evidence.
+"""
+final_review = """Use 'aflow-review-final' skill.
+Review the cumulative change and run the original plan's Final Verification full regression set once per valid state. Record primary evidence; rerun invalidated checks and block approval for missing, failed, or interrupted evidence.
+"""
+review_cp = """Use 'aflow-review-checkpoint' skill.
+Independently inspect checkpoint code and coverage. Reuse inspectable worker evidence only for unchanged relevant state; explain additional focused checks. Run every check the plan requires, including browser checks, without routine full-suite reruns.
+"""
 review_plan = "Review the plan at {ORIGINAL_PLAN_PATH} for obvious/indisputable weak spots, ambiguity, and missing constraints and directly apply improvements to the plan file."
 
 

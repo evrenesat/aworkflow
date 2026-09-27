@@ -53,9 +53,10 @@ Include these sections in substance, adapting headings when that improves clarit
 4. `Critical Invariants`
 5. `Forbidden Implementations`
 6. `Checkpoints`
-7. `Behavioral Acceptance Tests`
-8. `Plan-to-Verification Matrix`
-9. `Assumptions And Defaults`
+7. `Final Verification`
+8. `Behavioral Acceptance Tests`
+9. `Plan-to-Verification Matrix`
+10. `Assumptions And Defaults`
 
 Keep the content concise. Omit repetition, background already captured elsewhere in the plan, and instructions owned by execution or review tooling.
 
@@ -66,6 +67,9 @@ Keep the content concise. Omit repetition, background already captured elsewhere
 - Make each checkpoint independently implementable and verifiable.
 - State exact behavior, interfaces, defaults, precedence, validation, error handling, and preserved compatibility where relevant.
 - Include context bootstrapping commands, allowed and excluded scope, dependencies, exact verification commands, and documentation impact.
+- Give each checkpoint exact commands and expected results for new or directly affected behavior, including focused non-regression checks. Keep required browser and visual checks for affected UI across the Chromium/WebKit and desktop/mobile cases named by project guidance.
+- Add a top-level `## Final Verification` section outside checkpoint task lists. Specify exact commands and expected results for the complete cumulative regression set, including build, integration, or browser checks where applicable. State who executes this gate and when. Do not count an unspecified future CI run as the local final gate.
+- Put a broad suite in checkpoint verification only when a documented concrete shared-fixture or integration risk needs it there, or when the selected workflow has no cumulative final-review gate. In the latter case, assign the complete required coverage to a checkpoint before approval and record that coverage in `Final Verification`. Never silently move or omit an explicit check in an existing plan.
 - Name plausible harmful shortcuts in `Forbidden Implementations`.
 - Express behavioral acceptance tests as inputs and observable outcomes, not only test commands.
 - Map every important requirement to at least one concrete verification method.
@@ -162,11 +166,8 @@ Name shortcuts that are plausible and harmful, such as retaining two competing c
 
 ### Acceptance And Verification
 
-- State observable behavior for each major requirement.
-- Prefer given/when/then or an equally explicit input/action/outcome form.
-- Use exact test, smoke, search, file, metadata, or build checks.
 - Include negative and failure-path coverage where behavior depends on rejection, recovery, security, or concurrency.
-- Keep verification proportionate to the checkpoint while preserving meaningful non-regression coverage.
+- Separate focused checkpoint verification from the complete cumulative regression set under `## Final Verification`. Name exact commands, working directories when needed, and observable passing outcomes for both phases. If broad checkpoint coverage is necessary, state the concrete risk.
 
 ### Documentation
 

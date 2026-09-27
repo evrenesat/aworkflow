@@ -78,8 +78,9 @@ Do not use this skill to invent a second execution spec. The plan should already
 
 - Run the exact required verification commands for the active checkpoint.
 - Treat the checkpoint as incomplete until those commands succeed.
-- Use failing output as feedback for the next iteration.
+- After a failure, use small targeted diagnostic reruns to locate the cause, then rerun the required commands affected by the fix. Keep failed or interrupted checks marked as unverified.
 - Do not replace required checks with weaker smoke tests.
+- Do not add routine broad regression suites to a checkpoint when its plan assigns them to cumulative final review. If an existing explicit full-suite command appears misplaced, report it to the coordinator; run it as written unless the plan is formally revised before the attempt. Never silently substitute a focused check.
 - If the plan names observable acceptance criteria in addition to commands, confirm both the commands and the behavior.
 
 ## Step Validation Standard

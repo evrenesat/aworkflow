@@ -1,6 +1,43 @@
 from tests._support import *  # noqa: F401,F403
+import tomllib
 
 class SkillDocsTests(unittest.TestCase):
+
+    def test_bundled_verification_policy_preserves_each_review_gate(self) -> None:
+        repo_root = Path(__file__).resolve().parents[1]
+        skills = repo_root / 'aflow' / 'bundled_skills'
+        plan = (skills / 'aflow-plan' / 'SKILL.md').read_text(encoding='utf-8')
+        execute = [
+            (skills / name / 'SKILL.md').read_text(encoding='utf-8')
+            for name in ('aflow-execute-checkpoint', 'aflow-execute-plan')
+        ]
+        checkpoint_review = (skills / 'aflow-review-checkpoint' / 'SKILL.md').read_text(encoding='utf-8')
+        final_reviews = [
+            (skills / name / 'SKILL.md').read_text(encoding='utf-8')
+            for name in ('aflow-review-final', 'aflow-review-squash')
+        ]
+        prompts = tomllib.loads((repo_root / 'aflow' / 'aflow.toml').read_text(encoding='utf-8'))['prompts']
+
+        assert '`Final Verification`' in plan
+        assert 'top-level `## Final Verification` section outside checkpoint task lists' in plan
+        assert 'no cumulative final-review gate' in plan
+        assert 'Chromium/WebKit and desktop/mobile' in plan
+        for skill in execute:
+            assert 'Run the exact required verification commands' in skill
+            assert 'small targeted diagnostic reruns' in skill
+            assert 'Never silently substitute a focused check' in skill
+        assert 'Independently inspect the changed code, assertions, and coverage' in checkpoint_review
+        assert 'primary log is inspectable' in checkpoint_review
+        assert 'Do not routinely rerun an unchanged worker check' in checkpoint_review
+        for skill in final_reviews:
+            assert 'Run every exact command and observable check' in skill
+            assert 'full regression set once per valid source' in skill
+            assert 'Missing, failed, interrupted, or uninspectable required evidence blocks approval' in skill
+        assert 'Run every checkpoint check the current plan requires' in prompts['cp_loop_implementation']
+        assert 'Reuse inspectable worker evidence' in prompts['review_cp']
+        for name in ('final_review', 'review_squash'):
+            assert 'Final Verification full regression set' in prompts[name]
+            assert 'block approval for missing, failed, or interrupted evidence' in prompts[name]
 
     def test_skill_files_do_not_contain_workflow_placeholders(self) -> None:
         repo_root = Path(__file__).resolve().parents[1]

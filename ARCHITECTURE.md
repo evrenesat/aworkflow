@@ -567,6 +567,15 @@ body as the system instruction with structured runtime data in the user
 prompt; the closed JSON protocol, including the structured stop-report shape,
 stays enforced in code. Invalid manager output at a terminal incident cannot
 replace the original controller failure as the report's primary cause.
+
+Verification ownership is carried by bundled planning, execution, and review
+skills plus their packaged step prompts, not by a runtime test scheduler. The
+plan's checkpoint commands bind workers and checkpoint reviewers; the top-level
+`Final Verification` commands bind cumulative final/squash reviewers. Evidence
+reuse requires an inspectable log tied to the exact command and relevant tested
+state. Workflows without a final gate must finish required coverage before
+approval, while UI checkpoints retain their focused browser and visual checks.
+
 Manager invocation and note-correction execution is owned by one private,
 module-level `_ManagerCallExecutor` with explicit stable dependencies, while
 the changing plan and step identities plus the current baseline team remain

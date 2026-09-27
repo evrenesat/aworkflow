@@ -1,5 +1,14 @@
 # DEVLOG
 
+## 2026-09-27 — Phase-specific verification guidance (Checkpoint 1)
+
+- Bundled planning guidance now requires focused checkpoint commands and a
+  separate cumulative `Final Verification` set. Workers follow existing plan
+  commands, checkpoint reviewers inspect coverage and reuse valid primary
+  evidence, and final reviewers own the complete regression gate. Packaged
+  prompts echo this division; workflows and live installed skills remain
+  unchanged in this checkpoint.
+
 ## 2026-09-27 — Lean All-runs progress detail (Checkpoint 4)
 
 - Run-detail REST accepts `include_resume_preview`, defaulting to true. Only
