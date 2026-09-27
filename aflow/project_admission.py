@@ -1077,6 +1077,9 @@ class ProjectAdmission:
             status_evidence = (
                 status.evidence if isinstance(status.evidence, Mapping) else {}
             )
+            if status_evidence.get("retained_terminal_summary") is True:
+                # Capacity proof is not the predecessor's execution context.
+                continue
             if status.ownership == "legacy" and (
                 status_evidence.get("recorded_status")
                 in {"completed", "failed", "interrupted", "owner_stopped"}

@@ -1064,7 +1064,16 @@ the successor's own file. An unchanged accepted digest is already consumed.
 Rejected state remains a hard gate when the required selected-predecessor file
 is missing or unreadable.
 
-Prunes old run directories to respect `keep_runs`.
+Prunes old run directories toward `keep_runs`. A managed directory is eligible
+only after its manifest-bound controller outcome or explicit owner stop is
+validated and a compact schema-v1 terminal proof is atomically retained at
+`.aflow/run-summaries/<run_id>.json`. A failed proof write or uncertain/active
+owner keeps the directory, so `keep_runs` is a target rather than permission to
+erase ownership evidence. The repository reads the bounded summary only after
+the original directory is absent, checks exact project/run/unit identity, and
+projects the raw outcome without treating it as publication or resumable
+execution context. Old launch markers without proof remain uncertain. Explicit
+recovery and delivery predecessor preservation still retains full directories.
 
 ### `git_status.py`
 Git snapshot helpers used by the banner and CLI. Provides the snapshot data

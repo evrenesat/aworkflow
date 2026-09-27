@@ -747,6 +747,7 @@ def test_unbound_release_keeps_partial_manifest_fail_closed(tmp_path: Path) -> N
 def test_nonce_less_resume_worker_rechecks_predecessor_inactivity(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
+    monkeypatch.delenv("AFLOW_ADMISSION_RESERVATION_NONCE", raising=False)
     observed_sources: list[str | None] = []
     run_id = "resume-worker"
     predecessor = "resume-predecessor"
@@ -1132,6 +1133,7 @@ def test_resume_accepts_only_authoritative_inactive_predecessor(
         _terminal_manifest(root, predecessor)
     else:
         _manifest(root, predecessor, phase="owner_stopped")
+        (root / ".aflow" / "runs" / predecessor).mkdir(parents=True)
 
     reservation = ProjectAdmission(root).acquire(
         f"{predecessor_kind}-successor",

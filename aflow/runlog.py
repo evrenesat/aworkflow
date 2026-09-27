@@ -651,11 +651,68 @@ def _run_dir_sort_key(path: Path) -> tuple[int, str]:
 def prune_old_runs(
     runs_root: Path, keep_runs: int, *, preserved_run_ids: frozenset[str] = frozenset(),
 ) -> None:
-    run_dirs = [path for path in runs_root.iterdir() if path.is_dir() and path.name not in preserved_run_ids]
+    from .control_plane.repository import RunRepository, RepositoryError
+    from .control_plane.run_summaries import retain_terminal_summary
+
+    run_dirs = [
+        path for path in runs_root.iterdir()
+        if path.is_dir() and not path.is_symlink() and path.name not in preserved_run_ids
+    ]
     run_dirs.sort(key=_run_dir_sort_key)
-    while len(run_dirs) > keep_runs:
-        doomed = run_dirs.pop(0)
+    repository = (
+        RunRepository(runs_root.parent.parent)
+        if runs_root.name == "runs" and runs_root.parent.name == ".aflow"
+        else None
+    )
+    remaining_count = len(run_dirs)
+    for doomed in run_dirs:
+        if remaining_count <= keep_runs:
+            break
+        if repository is None:
+            manifest = None
+        else:
+            try:
+                manifest = repository.get_launch_manifest(doomed.name)
+            except (RepositoryError, ValueError):
+                # An unreadable ownership record cannot authorize deletion.
+                continue
+            if manifest is None and not re.fullmatch(
+                r"\d{8}T\d{6}Z-[0-9a-f]{8}", doomed.name
+            ):
+                # A canonical run with missing manifest may be mid-launch.
+                continue
+        if manifest is not None:
+            try:
+                status = repository.get_run_status(doomed.name, include_progress=False)
+                evidence = status.evidence
+                if evidence.get("unit_active") is True or evidence.get("preparation_active") is True:
+                    continue
+                if status.status == "owner_stopped" and status.launch_phase == "owner_stopped":
+                    if not any(
+                        event.event_type == "owner_stopped"
+                        and event.data.get("unit_name") == manifest.intended_unit
+                        for event in repository.tail_events(doomed.name, limit=1_000)
+                    ):
+                        continue
+                    provenance = "owner_stop_phase"
+                elif (
+                    status.status in {"completed", "failed", "interrupted"}
+                    and evidence.get("controller_terminal") is True
+                    and evidence.get("recorded_status") == status.status
+                ):
+                    provenance = "controller_run_json"
+                else:
+                    continue
+                if not retain_terminal_summary(
+                    repository.repo_root, doomed.name, manifest,
+                    status=status.status, ended_at=status.ended_at,
+                    provenance=provenance,
+                ):
+                    continue
+            except (RepositoryError, ValueError, OSError, RuntimeError):
+                continue
         shutil.rmtree(doomed)
+        remaining_count -= 1
 
 
 def load_run_json(run_dir: Path) -> dict[str, object] | None:

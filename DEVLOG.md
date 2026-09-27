@@ -22,6 +22,16 @@
   did not reproduce in the local baseline run after the bundle was built;
   exact-SHA macOS CI, publication, and deployment remain coordinator checks.
 
+## 2026-09-27 — Retain terminal proof through run pruning (Checkpoint 1)
+
+- `keep_runs` now preserves managed directories whose outcome is active or
+  uncertain. Before pruning a proven terminal run it stores a small, versioned,
+  manifest-bound summary outside the run directory and verifies the write.
+  Fresh repository and admission reads can then retain the raw terminal outcome
+  and release capacity. Missing or invalid summaries remain uncertain; no old
+  launch marker is promoted to success. Recovery and delivery predecessors
+  still keep their full artifacts.
+
 ## 2026-09-25 — Keep changed All runs progress moving (Checkpoint 1)
 
 - The integrated invisible-refresh change kept the overview generation stable,

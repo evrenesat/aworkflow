@@ -321,6 +321,12 @@ class RunRepository:
 
         phase_data = self._launch_state(valid)
         phase = _optional_text(phase_data.get("phase"))
+        startup = self._startup_record(valid)
+        retained_summary = None
+        if not run_dir.is_dir() and preparation_active(startup.get("preparation_owner")) is not True:
+            from .run_summaries import read_terminal_summary
+
+            retained_summary = read_terminal_summary(self.repo_root, valid, manifest)
         reconciled = self._latest_reconciliation(run_dir) if run_dir.is_dir() else {}
         metadata_status = _optional_text(metadata.get("status"))
         reconciled_status = _optional_text(reconciled.get("status"))
@@ -339,15 +345,16 @@ class RunRepository:
         # A collected transient unit is not completion evidence.  Only a
         # durable controller terminal record (or the daemon's explicit owner
         # stop control) may classify a missing unit as terminal.
-        if phase == "owner_stopped":
+        if retained_summary is not None:
+            status = retained_summary["status"]
+        elif phase == "owner_stopped" and run_dir.is_dir():
             status = "owner_stopped"
         elif recorded_status is not None:
             status = recorded_status
-        elif phase in {"completed", "failed", "interrupted"}:
+        elif phase in {"completed", "failed", "interrupted", "owner_stopped"}:
             status = "needs_attention"
         else:
             status = phase or "manifest_only"
-        startup = self._startup_record(valid)
         failure = startup.get("startup_failure")
         failure = bounded_redacted(failure) if isinstance(failure, Mapping) else None
         startup_reason = None
@@ -366,6 +373,8 @@ class RunRepository:
         ended_at = _optional_text(phase_data.get("updated_at")) if phase in {
             "completed", "failed", "interrupted", "owner_stopped"
         } else None
+        if retained_summary is not None:
+            ended_at = retained_summary["ended_at"]
         from .worker_diagnostics import project_worker_status
         recovery_worker = _recovery_worker_evidence(metadata, valid)
 
@@ -379,7 +388,7 @@ class RunRepository:
             started_at=_optional_text(metadata.get("run_started_at")),
             ended_at=ended_at,
             unit_name=manifest.intended_unit or f"aflow-run-{valid}.service",
-            launch_phase=phase,
+            launch_phase=("owner_stopped" if status == "owner_stopped" and retained_summary is not None else phase),
             workflow_name=_optional_text(metadata.get("workflow_name")) or manifest.workflow_name,
             team=_optional_text(metadata.get("team")) or manifest.team,
             current_step=_optional_text(metadata.get("current_step_name")),
@@ -390,9 +399,12 @@ class RunRepository:
             restarted_from_run_id=manifest.restarted_from_run_id,
             evidence={
                 "has_run_metadata": bool(metadata),
-                "recorded_status": metadata_status,
+                "recorded_status": retained_summary["status"] if retained_summary is not None else metadata_status,
                 "startup_question_valid": valid_startup_question(startup),
-                "controller_terminal": metadata_status in {"completed", "failed", "interrupted"},
+                "controller_terminal": metadata_status in {"completed", "failed", "interrupted"} or (
+                    retained_summary is not None and retained_summary["provenance"] == "controller_run_json"
+                ),
+                **({"retained_terminal_summary": True} if retained_summary is not None else {}),
                 "manifest_created_at": manifest.created_at,
                 "reconciled": bool(reconciled),
                 "startup_state": startup.get("state"),
