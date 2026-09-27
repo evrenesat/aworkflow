@@ -833,6 +833,7 @@ def test_ui_demo_plan_list_ready_while_queue_held(
     queue_path = f"/api/projects/{PROJECT_ID}/queue"
     list_path = f"/api/projects/{PROJECT_ID}/plans"
     held: list[tuple[object, object]] = []
+    pending_list: list[tuple[object, object]] = []
     timestamps: dict[str, float] = {}
     page_errors: list[str] = []
 
@@ -844,8 +845,8 @@ def test_ui_demo_plan_list_ready_while_queue_held(
             held.append((route, response))
         elif route.request.method == "GET" and path == list_path:
             response = route.fetch()
-            route.fulfill(response=response)
-            timestamps["list_released"] = time.perf_counter()
+            timestamps["list_requested"] = time.perf_counter()
+            pending_list.append((route, response))
         else:
             route.continue_()
 
@@ -853,6 +854,21 @@ def test_ui_demo_plan_list_ready_while_queue_held(
         browser = _browser(playwright)
         page = browser.new_page(viewport={"width": width, "height": height})
         page.on("pageerror", lambda error: page_errors.append(str(error)))
+        # Start the list request first, then allow the independent queue fetch.
+        # The list response remains held until the queue route has its response.
+        page.add_init_script(f"""(() => {{
+          const queuePath = {json.dumps(queue_path)};
+          const originalFetch = window.fetch.bind(window);
+          let releaseQueue;
+          const queueReady = new Promise(resolve => {{ releaseQueue = resolve }});
+          window.__releaseQueueFetch = releaseQueue;
+          window.fetch = (input, init) => {{
+            const url = typeof input === 'string' ? input : input.url;
+            return new URL(url, location.href).pathname === queuePath
+              ? queueReady.then(() => originalFetch(input, init))
+              : originalFetch(input, init);
+          }};
+        }})()""")
         page.route(f"**/api/projects/{PROJECT_ID}/queue", intercept)
         page.route(f"**/api/projects/{PROJECT_ID}/plans", intercept)
         try:
@@ -861,6 +877,21 @@ def test_ui_demo_plan_list_ready_while_queue_held(
             _set_theme_preference(page, theme)
             timestamps["navigation_started"] = time.perf_counter()
             page.goto(f"{url}/?project={PROJECT_ID}&view=plans")
+            for _ in range(100):
+                if pending_list:
+                    break
+                page.wait_for_timeout(25)
+            assert pending_list, "plan list request was not intercepted"
+            page.evaluate("window.__releaseQueueFetch()")
+            for _ in range(100):
+                if held:
+                    break
+                page.wait_for_timeout(25)
+            assert held, "queue request was not intercepted after the list request"
+            assert timestamps["list_requested"] < timestamps["queue_started"], timestamps
+            list_route, list_response = pending_list.pop()
+            timestamps["list_released"] = time.perf_counter()
+            list_route.fulfill(response=list_response)
             row = page.get_by_role("button", name=re.compile("latency-probe.md"))
             expect(row).to_be_visible()
             timestamps["list_visible"] = time.perf_counter()
@@ -910,6 +941,11 @@ def test_ui_demo_plan_list_ready_while_queue_held(
             assert page_errors == [] and units.start_calls == []
             _write_artifact_manifest(artifact_dir / f"{stem}.json", {"response_to_visible_ms": response_to_visible_ms, "queue_hold_seconds": timestamps["queue_visible"] - timestamps["queue_started"], "complete_page_ready_seconds": timestamps["queue_visible"] - timestamps["navigation_started"], "before": before, "after": after, "page_errors": page_errors})
         finally:
+            for route, response in pending_list:
+                try:
+                    route.fulfill(response=response)
+                except Exception:
+                    pass
             for route, response in held:
                 try:
                     route.fulfill(response=response)
@@ -2181,30 +2217,77 @@ def test_ui_demo_selected_run_background_refresh_probe(
     phase = {"value": "initial"}
     held: list[tuple[object, bytes, int, dict[str, str]]] = []
     requested: list[str] = []
-    equal_requests: list[object] = []
-    finished_requests: set[object] = set()
+    reads = {base, selected_path, f"{selected_path}/events", f"{selected_path}/context"}
+    lifecycle: dict[object, dict[str, object]] = {}
     writes: list[str] = []
     page_errors: list[str] = []
+
+    def record_request(request) -> None:
+        path = urlsplit(request.url).path
+        if request.method == "GET" and path in reads and (path != base or "order=recent" in request.url):
+            lifecycle[request] = {"path": path, "phase": phase["value"], "url": request.url,
+                                  "started_at": time.perf_counter(), "route_action": None,
+                                  "response": None, "terminal": None}
+
+    def fulfill(route, *, status: int, body, headers=None, content_type=None) -> None:
+        if route.request in lifecycle:
+            lifecycle[route.request].update({"route_action": "fulfilled", "fulfilled_at": time.perf_counter(),
+                                             "fulfillment_status": status})
+        route.fulfill(status=status, body=body, headers=headers, content_type=content_type)
+
+    def record_response(response) -> None:
+        if response.request in lifecycle:
+            lifecycle[response.request]["response"] = response.status
+
+    def record_terminal(request, outcome: str) -> None:
+        if request in lifecycle:
+            lifecycle[request]["terminal"] = outcome
+            if outcome == "requestfailed":
+                lifecycle[request]["failure"] = request.failure
+
+    def phase_records(name: str) -> list[dict[str, object]]:
+        return [entry for entry in lifecycle.values() if entry["phase"] == name]
+
+    def settled(name: str) -> bool:
+        entries = phase_records(name)
+        if not reads.issubset({entry["path"] for entry in entries}):
+            return False
+        if any(entry["terminal"] is None for entry in entries):
+            return False
+        for path in reads:
+            matching = [entry for entry in entries if entry["path"] == path]
+            current = matching[-1]
+            expected_status = 503 if name == "failure" and path == selected_path else 200
+            if current["terminal"] != "requestfinished" or current["response"] != expected_status:
+                return False
+            if any(entry["terminal"] == "requestfailed" for entry in matching[:-1]):
+                # Only a terminally cancelled predecessor with a settled
+                # current request is a legitimate superseded read.
+                if not all(any(marker in str(entry.get("failure", "")).lower() for marker in ("abort", "cancel"))
+                           for entry in matching[:-1] if entry["terminal"] == "requestfailed"):
+                    return False
+        return True
 
     def intercept(route) -> None:
         request = route.request
         path = urlsplit(request.url).path
-        if request.method != "GET" or not (path == base or path in {
+        if request.method != "GET" or (path == base and "order=recent" not in request.url) or not (path == base or path in {
             selected_path, f"{selected_path}/events", f"{selected_path}/context"
         }):
             route.continue_()
             return
         if phase["value"] == "initial":
+            if request in lifecycle:
+                lifecycle[request]["route_action"] = "continued"
             route.continue_()
             return
         requested.append(path)
-        if phase["value"] == "equal":
-            equal_requests.append(request)
         if phase["value"] == "failure" and path == selected_path:
-            route.fulfill(status=503, content_type="application/json", body='{"detail":"read unavailable"}')
+            fulfill(route, status=503, content_type="application/json", body='{"detail":"read unavailable"}')
             return
         response = route.fetch()
         if phase["value"] == "equal":
+            lifecycle[request]["route_action"] = "held"
             held.append((route, response.body(), response.status, response.headers))
         elif phase["value"] == "changed" and path == f"{selected_path}/events":
             payload = json.loads(response.body())
@@ -2215,15 +2298,18 @@ def test_ui_demo_selected_run_background_refresh_probe(
                 "timestamp": "2026-09-25T17:00:00Z",
                 "data": {"summary": "Refresh probe changed event"},
             })
-            route.fulfill(status=200, content_type="application/json", body=json.dumps(payload))
+            fulfill(route, status=200, content_type="application/json", body=json.dumps(payload))
         else:
-            route.fulfill(status=response.status, headers=response.headers, body=response.body())
+            fulfill(route, status=response.status, headers=response.headers, body=response.body())
 
     with live_server() as url, sync_playwright() as playwright:
         browser = _browser(playwright)
         page = browser.new_page(viewport={"width": width, "height": height})
         page.on("pageerror", lambda error: page_errors.append(str(error)))
-        page.on("requestfinished", lambda request: finished_requests.add(request))
+        page.on("request", record_request)
+        page.on("response", record_response)
+        page.on("requestfinished", lambda request: record_terminal(request, "requestfinished"))
+        page.on("requestfailed", lambda request: record_terminal(request, "requestfailed"))
         # The dashboard uses POST /config/form for a read-only projection.
         page.on("request", lambda request: writes.append(request.url) if phase["value"] != "initial" and request.method not in {"GET", "OPTIONS"} and "/api/" in request.url and not urlsplit(request.url).path.endswith("/config/form") else None)
         page.route("**/api/control-plane/projects/*/runs**", intercept)
@@ -2244,12 +2330,11 @@ def test_ui_demo_selected_run_background_refresh_probe(
             page.evaluate("window.scrollTo(0, Math.min(document.body.scrollHeight - innerHeight, 180))")
             page.wait_for_function("document.visibilityState === 'visible'")
             # Initial progress, events and context settle on separate reads.
-            selected_reads = {base, selected_path, f"{selected_path}/events", f"{selected_path}/context"}
             for _ in range(400):
-                if selected_reads.issubset({urlsplit(request.url).path for request in finished_requests}):
+                if settled("initial"):
                     break
                 page.wait_for_timeout(25)
-            assert selected_reads.issubset({urlsplit(request.url).path for request in finished_requests})
+            assert settled("initial"), [(entry["url"], entry["response"], entry["terminal"], entry.get("failure")) for entry in phase_records("initial")]
             install_refresh_probe(page, {
                 "detail": ".run-detail",
                 "disclosure": "details[data-ui-fidelity-anchor='first-disclosure']",
@@ -2276,26 +2361,35 @@ def test_ui_demo_selected_run_background_refresh_probe(
             assert held_snapshot["scrollY"] == before["scrollY"]
             held_mutations = read_refresh_probe_mutations(page)
             assert not [item for item in held_mutations if item.get("classification") in {"subtree", "root-replacement"}], held_mutations
-            while held:
-                route, body, status, headers = held.pop(0)
-                route.fulfill(status=status, headers=headers, body=body)
-                page.wait_for_timeout(40)
-                if selected_path in requested and f"{selected_path}/events" in requested and f"{selected_path}/context" in requested:
-                    break
+            # The list read gates selected status/events/context. Release it
+            # first, then deliberately complete the selected reads out of order.
+            list_index = next(index for index, (route, *_rest) in enumerate(held)
+                              if urlsplit(route.request.url).path == base)
+            route, body, status, headers = held.pop(list_index)
+            fulfill(route, status=status, headers=headers, body=body)
             for _ in range(100):
-                if selected_path in requested and f"{selected_path}/events" in requested and f"{selected_path}/context" in requested:
+                if {selected_path, f"{selected_path}/events", f"{selected_path}/context"}.issubset(
+                    {urlsplit(route.request.url).path for route, *_ in held}
+                ):
                     break
                 page.wait_for_timeout(25)
-            assert {base, selected_path, f"{selected_path}/events", f"{selected_path}/context"}.issubset(requested)
-            phase["value"] = "released"
-            while held:
-                route, body, status, headers = held.pop(0)
-                route.fulfill(status=status, headers=headers, body=body)
+            assert reads.issubset(requested), {"requested": requested, "lifecycle": phase_records("equal")}
+            assert {selected_path, f"{selected_path}/events", f"{selected_path}/context"}.issubset(
+                {urlsplit(route.request.url).path for route, *_ in held}
+            ), {"held": [route.request.url for route, *_ in held], "lifecycle": phase_records("equal")}
+            for path in (f"{selected_path}/context", f"{selected_path}/events", selected_path):
+                index = next(index for index, (route, *_rest) in enumerate(held)
+                             if urlsplit(route.request.url).path == path)
+                route, body, status, headers = held.pop(index)
+                fulfill(route, status=status, headers=headers, body=body)
+            # A coalesced replacement can start while responses settle. Keep
+            # it in this phase so its exact terminal outcome remains visible.
             for _ in range(400):
-                if equal_requests and all(request in finished_requests for request in equal_requests):
+                if settled("equal"):
                     break
                 page.wait_for_timeout(25)
-            assert equal_requests and all(request in finished_requests for request in equal_requests), "equal refresh responses did not finish"
+            assert settled("equal"), {"equal": phase_records("equal"), "held": [route.request.url for route, *_ in held]}
+            phase["value"] = "released"
             after_equal = capture_refresh_probe(page)
             assert all(root["sameNode"] for root in after_equal["roots"].values())
             assert after_equal["roots"]["disclosure"]["open"] is True
@@ -2315,6 +2409,11 @@ def test_ui_demo_selected_run_background_refresh_probe(
                     break
                 page.wait_for_timeout(25)
             assert f"{selected_path}/events" in requested, requested
+            for _ in range(400):
+                if settled("changed"):
+                    break
+                page.wait_for_timeout(25)
+            assert settled("changed"), phase_records("changed")
             expect(detail).to_contain_text("Refresh probe changed event")
             after_changed = capture_refresh_probe(page)
             assert all(root["sameNode"] for root in after_changed["roots"].values())
@@ -2322,8 +2421,6 @@ def test_ui_demo_selected_run_background_refresh_probe(
             assert after_changed["roots"]["disclosure"]["open"] is True
             assert after_changed["focused"] == before["focused"]
             assert after_changed["scrollY"] == before["scrollY"]
-            page.wait_for_timeout(300)
-
             phase["value"] = "failure"
             requested.clear()
             page.evaluate("window.dispatchEvent(new Event('aflow-history-changed'))")
@@ -2332,6 +2429,11 @@ def test_ui_demo_selected_run_background_refresh_probe(
                     break
                 page.wait_for_timeout(25)
             assert selected_path in requested, requested
+            for _ in range(400):
+                if settled("failure"):
+                    break
+                page.wait_for_timeout(25)
+            assert settled("failure"), phase_records("failure")
             expect(page.get_by_role("alert").filter(has_text="read unavailable")).to_be_visible()
             after_failure = capture_refresh_probe(page)
             assert all(root["sameNode"] for root in after_failure["roots"].values())
@@ -2348,11 +2450,12 @@ def test_ui_demo_selected_run_background_refresh_probe(
                 "failure": after_failure, "held_mutations": held_mutations,
                 "equal_mutations": equal_mutations,
                 "requested": requested, "page_errors": page_errors, "writes": writes,
+                "lifecycle": {name: phase_records(name) for name in ("initial", "equal", "changed", "failure")},
             })
         finally:
             for route, body, status, headers in held:
                 try:
-                    route.fulfill(status=status, headers=headers, body=body)
+                    fulfill(route, status=status, headers=headers, body=body)
                 except Exception:
                     pass
             page.unroute_all(behavior="ignoreErrors")

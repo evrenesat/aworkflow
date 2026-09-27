@@ -4702,3 +4702,21 @@ HISTORY: Published clipboard history `c14f1f2`/`cd78d53` remains separate and mu
   which is eligible for pruning without a launch manifest. A paired retention
   regression keeps a canonical missing-manifest run while pruning the legacy
   CLI run. Production retention policy is unchanged.
+
+## 2026-09-27 — Browser readiness ordering CI repair
+
+- CI 36311583627 exposed two probe assumptions: a visible plan row did not
+  prove the independent queue request had reached its interceptor, and the
+  selected-run probe grouped other clients' run-list reads with the dashboard's
+  `order=recent` read by path alone. A separate initial run-list request was
+  observed without a terminal event while the dashboard's own read finished.
+- The queue fixture now starts the list request first, waits for the queue
+  interceptor to hold a real response, then releases the list and measures
+  response-to-render time. The five-second queue hold and editor assertions
+  remain intact. The selected-run fixture traces exact request start, response,
+  finish or cancellation by phase, releases context/events/status out of order,
+  and requires the latest read of every selected class to settle before UI
+  continuity checks. Changed and failed phases also wait for their read outcomes.
+- The nine affected browser cases passed in Chromium and WebKit locally, as did
+  the web build, Ruff checks, and `git diff --check`. No product source changed;
+  exact-SHA macOS CI and deployment remain coordinator gates.
