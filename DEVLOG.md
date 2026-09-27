@@ -1,5 +1,22 @@
 # DEVLOG
 
+## 2026-09-27 — Cumulative verification handoff (Checkpoint 3)
+
+- The original plan records two September 24 server-suite examples at 594.17s
+  and 771.19s, both with failures. Its September 27 web examples are 2–3s
+  for a focused two-test repair run and 34.37s for a 671-test suite. These
+  differ in scope and are reference timings, not a measured speedup from this
+  policy change.
+- After publication, green CI, and safe activation of the installed
+  `checkpoint_review_then_final` default, audit the first three terminal runs
+  launched without an explicit workflow that resolve to that default. Include
+  failed runs. Record run IDs and source/config revisions, then use existing
+  turn logs to total synchronous checkpoint test seconds by worker and reviewer,
+  count full-suite calls before final review and unexplained repeats, and time
+  final review with its regression result. Report exceptions and missing
+  evidence; target zero routine pre-final full-suite calls and zero unexplained
+  repeats. The cumulative `uv run pytest -q` gate remains with final review.
+
 ## 2026-09-27 — Behavior-based packaged workflow IDs (Checkpoint 2)
 
 - Packaged definitions now name their review stages. `ralph`,
