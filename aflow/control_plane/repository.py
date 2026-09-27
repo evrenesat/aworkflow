@@ -698,6 +698,9 @@ class RunRepository:
             raise RepositorySchemaError("launch manifest is unreadable") from exc
         if not isinstance(payload, Mapping):
             raise RepositorySchemaError("launch manifest is not an object")
+        stored_scope = payload.get("caller_scope")
+        if stored_scope is not None and not isinstance(stored_scope, str):
+            raise RepositorySchemaError("launch manifest caller scope is invalid")
         try:
             manifest = LaunchManifest(
                 schema_version=int(payload["schema_version"]),
@@ -709,7 +712,7 @@ class RunRepository:
                 team=_optional_text(payload.get("team")),
                 start_step=_optional_text(payload.get("start_step")),
                 idempotency_key=_optional_text(payload.get("idempotency_key")),
-                caller_scope=_optional_text(payload.get("caller_scope")),
+                caller_scope=stored_scope,
                 request_digest=_optional_text(payload.get("request_digest")),
                 frozen_config_fingerprint=_optional_text(payload.get("frozen_config_fingerprint")),
                 intended_unit=_optional_text(payload.get("intended_unit")),

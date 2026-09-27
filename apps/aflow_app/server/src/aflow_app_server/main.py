@@ -1429,6 +1429,7 @@ def owner_stop(
             run_id,
             expected_revision=payload.expected_revision,
             idempotency_key=idempotency_key,
+            acknowledge_unscoped_legacy=payload.acknowledge_unscoped_legacy,
         )
     )
 

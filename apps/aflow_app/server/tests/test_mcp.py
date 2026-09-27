@@ -16,6 +16,7 @@ from fastapi.testclient import TestClient
 
 from aflow.api.models import StartupQuestion, StartupQuestionKind
 from aflow.control_plane import ContextBundle, RunStatus
+from aflow.control_plane.units import UnitState
 from aflow.daemon import DaemonError, ExtraInstructionsValidationError
 from aflow_app_server.main import app
 from test_control_plane_api import (
@@ -32,6 +33,7 @@ from test_control_plane_api import (
     _seed_recovery_source,
     _seed_managed_owner_stopped_resume_source,
     _seed_issue35_progress_fixture,
+    _seed_owner_stop_manifest,
     _source_artifact_bytes,
     _start_pending as _rest_start_pending,
     control_client as _control_client_fixture,  # noqa: F401
@@ -201,6 +203,32 @@ def _mcp_tool_error(
     result = response["result"]
     assert result.get("isError") is True
     return result["content"][0]["text"]
+
+
+def test_mcp_historical_owner_stop_acknowledgement(mcp_client) -> None:
+    client, root, units, _ = mcp_client
+    run_id = "mcp-historical-stop"
+    _seed_owner_stop_manifest(root, run_id)
+    unit_name = f"aflow-run-{run_id}.service"
+    units.units[unit_name] = UnitState(unit_name, "active", "running")
+    arguments = {
+        "project_id": PROJECT_ID,
+        "run_id": run_id,
+        "expected_revision": 0,
+        "idempotency_key": "mcp-historical-stop-1",
+    }
+    assert _mcp_tool_error(client, "owner_stop", arguments) == "operation_forbidden"
+    assert _mcp_tool_error(client, "owner_stop", {**arguments, "acknowledge_unscoped_legacy": False}) == "operation_forbidden"
+    for malformed in (1, "true", None):
+        assert _mcp_tool_error(client, "owner_stop", {**arguments, "acknowledge_unscoped_legacy": malformed})
+    assert units.stop_calls == []
+    stopped = _mcp_tool(client, "owner_stop", {**arguments, "acknowledge_unscoped_legacy": True})
+    assert stopped["status"] == "owner_stopped"
+    assert units.stop_calls == [unit_name]
+    replay = _mcp_tool(client, "owner_stop", {**arguments, "acknowledge_unscoped_legacy": True})
+    assert replay["status"] == "owner_stopped"
+    assert units.stop_calls == [unit_name]
+    assert _mcp_tool_error(client, "owner_stop", arguments) == "operation_forbidden"
 
 
 def test_mcp_stateless_http_auth_metadata_resources_and_rest_parity(mcp_client) -> None:

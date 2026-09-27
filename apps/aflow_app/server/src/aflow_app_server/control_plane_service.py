@@ -465,6 +465,9 @@ class ControlPlaneService:
         caller_scope: str = "rest",
     ) -> tuple[ControlWriteResult, RunStatus]:
         item = self._project(project_id)
+        item.daemon.service._assert_manifest_caller(
+            run_id, self._caller_scope(project_id, caller_scope)
+        )
         result = item.daemon.application.controls.apply(
             run_id,
             request,
@@ -481,6 +484,7 @@ class ControlPlaneService:
         expected_revision: int,
         idempotency_key: str | None,
         caller_scope: str = "rest",
+        acknowledge_unscoped_legacy: bool = False,
     ) -> RunStatus:
         with self.project_lock(project_id):
             item = self._project(project_id)
@@ -489,6 +493,7 @@ class ControlPlaneService:
                 expected_revision=expected_revision,
                 caller_scope=self._caller_scope(project_id, caller_scope),
                 idempotency_key=idempotency_key,
+                acknowledge_unscoped_legacy=acknowledge_unscoped_legacy,
             )
             return item.daemon.application.repository.with_progress(status)
 

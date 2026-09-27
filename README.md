@@ -380,6 +380,14 @@ The shared lifecycle registry exposes these 14 tools:
 - `control_run` — apply a revision-checked run control; `owner_stop=true`
   requests the existing stop-after-current-turn boundary intent.
 - `owner_stop` — immediately interrupt the exact active unit and stop a run.
+  For a historical managed run whose immutable launch manifest has no caller
+  scope, an authenticated owner of the registered project may set
+  `acknowledge_unscoped_legacy=true` on this operation. The daemon verifies
+  the exact project root, run, and intended unit before stopping it. This is
+  explicit administrative closure, not proof of successful completion or an
+  automatic inference from inactivity. Omission or `false` retains the normal
+  scope check; use the same flag on an idempotent retry. Reconcile real
+  historical records only after the deployed API is verified.
 - `resume_run` — create an idempotent continuation of a run.
 
 The UI-server registry also exposes these web authoring tools over the same

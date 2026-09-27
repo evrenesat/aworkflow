@@ -15,6 +15,7 @@ from typing import Any, Literal, Mapping
 
 from fastmcp import FastMCP
 from fastmcp.exceptions import ResourceError, ToolError
+from pydantic import StrictBool
 
 from aflow.control_plane import (
     ControlConflictError,
@@ -607,11 +608,13 @@ def create_control_plane_mcp(
         run_id: str,
         expected_revision: int,
         idempotency_key: str,
+        acknowledge_unscoped_legacy: StrictBool = False,
     ) -> dict[str, Any]:
         """Immediately stop the exact active unit and finalize the run.
 
         This interrupts the active worker/reviewer call and is separate from
         ``control_run(owner_stop=true)``. Neither action approves a checkpoint.
+        Historical null-scope runs require explicit acknowledgement.
         """
         return tool_result(
             lambda: (
@@ -622,6 +625,10 @@ def create_control_plane_mcp(
                     expected_revision=_validated_revision(expected_revision),
                     idempotency_key=_bounded_idempotency_key(idempotency_key),
                     caller_scope="mcp",
+                    acknowledge_unscoped_legacy=_validated_boolean(
+                        acknowledge_unscoped_legacy,
+                        "acknowledge_unscoped_legacy",
+                    ),
                 )
                 .to_dict()
             ),
@@ -630,6 +637,7 @@ def create_control_plane_mcp(
                 "run_id": run_id,
                 "expected_revision": expected_revision,
                 "idempotency_key": idempotency_key,
+                "acknowledge_unscoped_legacy": acknowledge_unscoped_legacy,
             },
         )
 
@@ -748,6 +756,12 @@ def _validated_revision(revision: int) -> int:
     if revision < 0:
         raise ValueError("expected revision must be non-negative")
     return revision
+
+
+def _validated_boolean(value: object, name: str) -> bool:
+    if type(value) is not bool:
+        raise ValueError(f"{name} must be a boolean")
+    return value
 
 
 def _control_response(result: tuple[Any, Any]) -> dict[str, Any]:

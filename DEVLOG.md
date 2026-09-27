@@ -4596,3 +4596,14 @@ HISTORY: Published clipboard history `c14f1f2`/`cd78d53` remains separate and mu
 - CI 36307782108 caught a race in the pinned gap migration test: it focused the row before the initial deep-linked detail had finished opening, so the detail heading's pending focus effect could run afterward. The adjacent ordinary-row test had the same ordering gap.
 - Both tests now hold the selected-detail response, confirm the detail and pin are absent while pending, release it, and wait for the detail heading's initial focus before focusing the pinned row and loading the next page. They retain exact selection, outcome-group visibility, and replacement-row focus assertions. No product focus change was needed after readiness.
 - Verification: the focused two-test command passed three consecutive runs; the full web suite passed 671/671; the production build and `git diff --check` passed.
+
+## 2026-09-27 — Explicit owner-stop for unscoped historical runs
+
+- Added a boolean acknowledgement to REST and MCP owner-stop. Only a validated
+  null-scope manifest with the exact registered root, run, and intended unit
+  can use the narrow daemon exception; other lifecycle controls retain strict
+  scope checks.
+- Bound acknowledgement to control idempotency, recorded it in owner-stop
+  evidence, and kept exact-unit stop and bounded timeout behavior. Fixture
+  tests cover authorization, replay, and failed unit observations. Real-record
+  reconciliation belongs to the coordinator after deployment.

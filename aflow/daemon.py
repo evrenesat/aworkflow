@@ -913,15 +913,35 @@ class DaemonService:
         expected_revision: int,
         caller_scope: str = "local",
         idempotency_key: str | None = None,
+        acknowledge_unscoped_legacy: bool = False,
     ) -> RunStatus:
         """Write owner-stop intent, stop the exact unit, and persist terminal evidence."""
+        if type(acknowledge_unscoped_legacy) is not bool:
+            raise ValueError("acknowledge_unscoped_legacy must be a boolean")
+        if not isinstance(caller_scope, str) or not caller_scope.strip():
+            raise DaemonAuthorizationError("caller scope must be non-empty")
         with self._lock:
             status = self._application.repository.get_run_status(run_id)
             if status.ownership != "control_plane":
                 raise DaemonError(
                     "legacy runs are read-only and cannot be stopped by the daemon"
                 )
-            self._assert_manifest_caller(run_id, caller_scope)
+            legacy_acknowledged = False
+            if acknowledge_unscoped_legacy:
+                manifest = self._application.repository.get_launch_manifest(run_id)
+                if manifest is not None and manifest.caller_scope is None:
+                    expected_unit = _unit_name(run_id)
+                    if (
+                        manifest.run_id != validate_run_id(run_id)
+                        or Path(manifest.project_root).resolve() != self._config.repo_root.resolve()
+                        or manifest.intended_unit != expected_unit
+                    ):
+                        raise DaemonAuthorizationError(
+                            "historical run ownership identity is not authorized"
+                        )
+                    legacy_acknowledged = True
+            if not legacy_acknowledged:
+                self._assert_manifest_caller(run_id, caller_scope)
             artifact_path = (
                 self._config.repo_root
                 / ".aflow"
@@ -930,6 +950,10 @@ class DaemonService:
             )
             if artifact_path.is_symlink():
                 raise DaemonError("run artifact path is unsafe")
+            unit_name = _unit_name(run_id)
+            observed = self._application.units.get(unit_name)
+            if observed is not None and observed.name != unit_name:
+                raise DaemonError("observed workflow unit identity does not match the run")
             run_dir = self._application.repository.run_directory(run_id)
             if not run_dir.is_dir():
                 if run_dir.exists():
@@ -942,14 +966,15 @@ class DaemonService:
                 RunControlRequest(expected_revision=expected_revision, owner_stop=True),
                 caller_scope=caller_scope,
                 idempotency_key=idempotency_key,
+                owner_stop_acknowledgement=acknowledge_unscoped_legacy,
             )
-            unit_name = _unit_name(run_id)
-            observed = self._application.units.get(unit_name)
             if observed is not None and observed.is_active:
                 self._application.units.stop(unit_name)
             deadline = time.monotonic() + self._config.stop_timeout_seconds
             while True:
                 observed = self._application.units.get(unit_name)
+                if observed is not None and observed.name != unit_name:
+                    raise DaemonError("observed workflow unit identity does not match the run")
                 if observed is None or not observed.is_active:
                     break
                 if time.monotonic() >= deadline:
@@ -961,7 +986,11 @@ class DaemonService:
             append_run_event(
                 self._application.repository.run_directory(run_id),
                 "owner_stopped",
-                {"source": "daemon", "unit_name": unit_name},
+                {
+                    "source": "daemon",
+                    "unit_name": unit_name,
+                    "acknowledge_unscoped_legacy": legacy_acknowledged,
+                },
             )
             return self._application.repository.get_run_status(run_id)
 

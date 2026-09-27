@@ -69,13 +69,16 @@ class ControlService:
         *,
         caller_scope: str = "local",
         idempotency_key: str | None = None,
+        owner_stop_acknowledgement: bool = False,
     ) -> ControlWriteResult:
         status = self._repository.get_run_status(run_id)
         self._authorize("control", status)
         if status.ownership != "control_plane":
             raise ServiceAuthorizationError("legacy runs are read-only")
         run_dir = self._repository.run_directory(run_id)
-        digest = _control_digest(request)
+        if owner_stop_acknowledgement and request.owner_stop is not True:
+            raise ValueError("legacy acknowledgement requires owner-stop")
+        digest = _control_digest(request, owner_stop_acknowledgement=owner_stop_acknowledgement)
         if idempotency_key is not None:
             replay = self._idempotent_replay(
                 run_dir,
@@ -101,6 +104,7 @@ class ControlService:
                 "revision": result.revision,
                 "changed": result.changed,
                 "owner_stop": result.owner_stop,
+                "acknowledge_unscoped_legacy": owner_stop_acknowledgement,
             },
         )
         return result
@@ -315,7 +319,11 @@ def _question_record(question_id: str, question: StartupQuestion) -> StartupQues
     )
 
 
-def _control_digest(request: RunControlRequest) -> str:
+def _control_digest(
+    request: RunControlRequest, *, owner_stop_acknowledgement: bool = False
+) -> str:
     payload = asdict(request)
+    if owner_stop_acknowledgement:
+        payload["acknowledge_unscoped_legacy"] = True
     encoded = json.dumps(payload, sort_keys=True, separators=(",", ":"), default=str).encode("utf-8")
     return hashlib.sha256(encoded).hexdigest()

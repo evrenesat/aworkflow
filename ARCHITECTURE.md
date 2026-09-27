@@ -115,6 +115,14 @@ history mutations require authentication, revision and idempotency checks;
 external deleted reads return 410. No history action signals a process or removes
 workflow artifacts.
 
+The owner-stop daemon path alone accepts explicit acknowledgement of a null
+caller-scope historical manifest. The registered project still resolves one
+repository root; the manifest must match that root, run ID, and canonical
+systemd unit. The control request binds acknowledgement intent to its existing
+idempotency digest and the terminal event records the exception. Other controls,
+resume, and restart retain strict caller-scope checks. Closure does not rewrite
+the launch manifest or infer a successful workflow outcome.
+
 Project run history defaults to oldest-first identity order for repository,
 REST, and MCP callers. The REST `GET /api/control-plane/projects/{project_id}/runs`
 query accepts `order=recent` to reverse the filtered identity order before

@@ -406,6 +406,7 @@ class StartupAnswerPayload(CanonicalTransportModel):
 
 class OwnerStopPayload(CanonicalTransportModel):
     expected_revision: int = Field(ge=0)
+    acknowledge_unscoped_legacy: StrictBool = False
 
 
 class ConfigValidationIssueModel(CanonicalTransportModel):

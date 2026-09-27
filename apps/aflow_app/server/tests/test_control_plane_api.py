@@ -33,11 +33,12 @@ from aflow.control_plane import (
     create_launch_manifest,
     write_launch_phase,
 )
-from aflow.control_plane.persistence import append_run_event
+from aflow.control_plane.persistence import append_run_event, read_events
 from aflow.control_plane.persistent_units import PersistentUnitManager
 from aflow.control_plane.units import InMemoryUnitManager, UnitState
 from aflow.daemon import (
     AflowDaemon,
+    DaemonError,
     DaemonStartupError,
     ExtraInstructionsValidationError,
     _validate_extra_instructions,
@@ -70,6 +71,32 @@ from aflow.run_state import ResumeContext
 
 TOKEN = "control-plane-test-token"
 PROJECT_ID = "test-project"
+
+
+def _seed_owner_stop_manifest(
+    root: Path,
+    run_id: str,
+    *,
+    caller_scope: str | None = None,
+    project_root: str | None = None,
+    intended_unit: str | None = None,
+) -> Path:
+    create_launch_manifest(
+        root,
+        LaunchManifest(
+            run_id=run_id,
+            project_root=project_root or str(root.resolve()),
+            plan_path=str((root / "plans" / "todo" / "test-plan.md").resolve()),
+            workflow_name="managed",
+            max_turns=5,
+            caller_scope=caller_scope,
+            intended_unit=intended_unit or f"aflow-run-{run_id}.service",
+        ),
+    )
+    run_dir = root / ".aflow" / "runs" / run_id
+    run_dir.mkdir(parents=True, exist_ok=True)
+    (run_dir / "run.json").write_text('{"status":"running"}\n')
+    return run_dir
 
 
 @contextmanager
@@ -2406,6 +2433,151 @@ def test_control_events_context_controls_owner_stop_and_resume(control_client) -
     assert stopped_replay.json()["status"] == "owner_stopped"
     assert stopped_replay.json()["launch_phase"] == "owner_stopped"
     assert len(units.stop_calls) == stop_call_count
+
+
+def test_rest_historical_owner_stop_requires_explicit_acknowledgement(control_client) -> None:
+    client, root, units, _ = control_client
+    run_id = "historical-owner-stop"
+    run_dir = _seed_owner_stop_manifest(root, run_id)
+    manifest_path = root / ".aflow" / "launches" / f"{run_id}.json"
+    manifest_before = manifest_path.read_bytes()
+    unit_name = f"aflow-run-{run_id}.service"
+    units.units[unit_name] = UnitState(unit_name, "active", "running")
+    url = f"/api/control-plane/projects/{PROJECT_ID}/runs/{run_id}/owner-stop"
+
+    for payload in ({"expected_revision": 0}, {"expected_revision": 0, "acknowledge_unscoped_legacy": False}):
+        rejected = client.post(url, json=payload)
+        assert rejected.status_code == 403
+    for malformed in (1, "true", None, []):
+        rejected = client.post(url, json={"expected_revision": 0, "acknowledge_unscoped_legacy": malformed})
+        assert rejected.status_code == 422
+    assert units.stop_calls == []
+    assert not (run_dir / "overrides.toml").exists()
+
+    headers = {"Idempotency-Key": "historical-stop-1"}
+    accepted = client.post(url, headers=headers, json={"expected_revision": 0, "acknowledge_unscoped_legacy": True})
+    assert accepted.status_code == 200, accepted.text
+    assert accepted.json()["status"] == "owner_stopped"
+    assert units.stop_calls == [unit_name]
+    assert manifest_path.read_bytes() == manifest_before
+    events = client.get(f"/api/control-plane/projects/{PROJECT_ID}/runs/{run_id}/events").json()["events"]
+    assert any(event["event_type"] == "owner_stopped" and event["data"]["acknowledge_unscoped_legacy"] is True for event in events)
+    replay = client.post(url, headers=headers, json={"expected_revision": 0, "acknowledge_unscoped_legacy": True})
+    assert replay.status_code == 200
+    assert units.stop_calls == [unit_name]
+    changed_intent = client.post(url, headers=headers, json={"expected_revision": 0})
+    assert changed_intent.status_code == 403
+    resume = client.post(
+        f"/api/control-plane/projects/{PROJECT_ID}/runs/{run_id}/resume",
+        headers={"Idempotency-Key": "historical-resume-rejected"},
+    )
+    assert resume.status_code != 200
+    from aflow_app_server import main
+
+    service = main._control_plane_service
+    assert service is not None
+    daemon = service._project(PROJECT_ID).daemon.service
+    with pytest.raises(PermissionError):
+        daemon._validate_restart_source(
+            run_id,
+            successor_run_id="historical-successor",
+            caller_scope=f"rest:{PROJECT_ID}",
+        )
+
+
+@pytest.mark.parametrize("identity", ["foreign-scope", "empty-scope", "wrong-root", "wrong-unit", "wrong-run"])
+def test_rest_historical_owner_stop_rejects_wrong_identity(control_client, identity: str) -> None:
+    client, root, units, _ = control_client
+    run_id = f"historical-{identity}"
+    kwargs = {
+        "foreign-scope": {"caller_scope": "bearer:another-project"},
+        "empty-scope": {},
+        "wrong-root": {"project_root": str(root.parent)},
+        "wrong-unit": {"intended_unit": "aflow-run-another-run.service"},
+        "wrong-run": {},
+    }[identity]
+    run_dir = _seed_owner_stop_manifest(root, run_id, **kwargs)
+    if identity in {"wrong-run", "empty-scope"}:
+        manifest_path = root / ".aflow" / "launches" / f"{run_id}.json"
+        payload = json.loads(manifest_path.read_text())
+        if identity == "wrong-run":
+            payload["run_id"] = "another-run"
+        else:
+            payload["caller_scope"] = ""
+        manifest_path.write_text(json.dumps(payload))
+    unit_name = f"aflow-run-{run_id}.service"
+    units.units[unit_name] = UnitState(unit_name, "active", "running")
+    rejected = client.post(
+        f"/api/control-plane/projects/{PROJECT_ID}/runs/{run_id}/owner-stop",
+        json={"expected_revision": 0, "acknowledge_unscoped_legacy": True},
+    )
+    assert rejected.status_code == 403
+    assert units.stop_calls == []
+    assert not (run_dir / "overrides.toml").exists()
+
+
+def test_historical_acknowledgement_does_not_authorize_other_controls(control_client) -> None:
+    client, root, units, _ = control_client
+    run_id = "historical-other-controls"
+    run_dir = _seed_owner_stop_manifest(root, run_id)
+    control = client.patch(
+        f"/api/control-plane/projects/{PROJECT_ID}/runs/{run_id}/control",
+        json={"expected_revision": 0, "max_turns": 7},
+    )
+    assert control.status_code == 403
+    assert not (run_dir / "overrides.toml").exists()
+    assert units.stop_calls == []
+
+
+def test_scoped_owner_stop_rejects_changed_acknowledgement_replay(control_client) -> None:
+    client, root, units, _ = control_client
+    run_id = "scoped-stop-replay"
+    _seed_owner_stop_manifest(root, run_id, caller_scope=f"bearer:{PROJECT_ID}")
+    url = f"/api/control-plane/projects/{PROJECT_ID}/runs/{run_id}/owner-stop"
+    headers = {"Idempotency-Key": "scoped-stop-key"}
+    accepted = client.post(url, headers=headers, json={"expected_revision": 0})
+    assert accepted.status_code == 200
+    changed = client.post(
+        url,
+        headers=headers,
+        json={"expected_revision": 0, "acknowledge_unscoped_legacy": True},
+    )
+    assert changed.status_code == 409
+    assert units.stop_calls == []
+
+
+@pytest.mark.parametrize("failure", ["unexpected-unit", "stop-timeout"])
+def test_historical_owner_stop_preserves_hold_on_unit_failure(control_client, failure: str) -> None:
+    from aflow_app_server import main
+
+    _, root, units, monkeypatch = control_client
+    run_id = f"historical-{failure}"
+    run_dir = _seed_owner_stop_manifest(root, run_id)
+    expected_unit = f"aflow-run-{run_id}.service"
+    service = main._control_plane_service
+    assert service is not None
+    daemon = service._project(PROJECT_ID).daemon.service
+    if failure == "unexpected-unit":
+        monkeypatch.setattr(
+            units,
+            "get",
+            lambda _name: UnitState("aflow-run-another.service", "active", "running"),
+        )
+    else:
+        units.units[expected_unit] = UnitState(expected_unit, "active", "running")
+        monkeypatch.setattr(units, "stop", lambda _name: units.units[expected_unit])
+        object.__setattr__(daemon._config, "stop_timeout_seconds", 0)
+    with pytest.raises(DaemonError):
+        daemon.owner_stop(
+            run_id,
+            expected_revision=0,
+            caller_scope=f"rest:{PROJECT_ID}",
+            acknowledge_unscoped_legacy=True,
+        )
+    assert "owner_stopped" not in (root / ".aflow" / "launches" / f"{run_id}.state.json").read_text()
+    assert not any(event.event_type == "owner_stopped" for event in read_events(run_dir))
+    if failure == "unexpected-unit":
+        assert not (run_dir / "overrides.toml").exists()
 
 
 def test_stopped_unit_with_running_metadata_is_not_offered_or_admitted(
