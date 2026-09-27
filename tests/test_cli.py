@@ -5631,7 +5631,8 @@ class WorkflowStartupFlowTests(unittest.TestCase):
             plan_path.write_text(_VALID_PLAN, encoding="utf-8")
             config_path = repo_root / "aflow.toml"
             config_path.write_text("", encoding="utf-8")
-            run_dir = repo_root / ".aflow" / "runs" / "prior-run"
+            # Direct CLI runs use legacy IDs, which can be pruned without a manifest.
+            run_dir = repo_root / ".aflow" / "runs" / "20260101T000000Z-deadbeef"
             pending, artifacts, scope = _bound_pending_repartition_fixture(
                 run_dir,
                 plan_path,

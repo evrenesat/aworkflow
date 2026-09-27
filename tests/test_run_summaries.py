@@ -64,6 +64,22 @@ def test_owner_stop_without_event_is_not_pruned(tmp_path: Path) -> None:
     assert run_dir.exists()
 
 
+def test_missing_manifest_preserves_canonical_but_prunes_legacy_cli_run(
+    tmp_path: Path,
+) -> None:
+    runs_root = tmp_path / ".aflow" / "runs"
+    canonical = runs_root / "canonical-run"
+    legacy = runs_root / "20260101T000000Z-deadbeef"
+    for run_dir in (canonical, legacy):
+        run_dir.mkdir(parents=True)
+        (run_dir / "run.json").write_text('{"status":"failed"}\n', encoding="utf-8")
+
+    prune_old_runs(runs_root, keep_runs=0)
+
+    assert canonical.exists()
+    assert not legacy.exists()
+
+
 def test_fresh_active_unit_overrides_retained_terminal_proof(tmp_path: Path) -> None:
     run_dir = _managed(tmp_path, "terminal-run", "failed")
     prune_old_runs(run_dir.parent, keep_runs=0)

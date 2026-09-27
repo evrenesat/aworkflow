@@ -4695,3 +4695,10 @@ HISTORY: Published clipboard history `c14f1f2`/`cd78d53` remains separate and mu
   passed. The full web suite passed 673 tests; the production build and the
   existing Chromium and WebKit navigation journey passed. Publication,
   exact-SHA CI, and live activation remain coordinator gates.
+
+## 2026-09-27 — Recovery pruning fixture CI repair
+
+- The pending-artifact recovery fixture now uses a legacy direct CLI run ID,
+  which is eligible for pruning without a launch manifest. A paired retention
+  regression keeps a canonical missing-manifest run while pruning the legacy
+  CLI run. Production retention policy is unchanged.
