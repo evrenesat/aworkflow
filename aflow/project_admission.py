@@ -1015,6 +1015,11 @@ class ProjectAdmission:
             return False
         return True
 
+    def classify_run_for_preview(self, status: Any) -> tuple[str, bool]:
+        """Read one run's ownership without reconciliation or a project scan."""
+        evidence = self._classify_status(status)
+        return evidence.state, evidence.claim_retained
+
     @contextmanager
     def plan_lifecycle_guard(
         self, plan_path: Path, *, source_run_id: str | None = None,

@@ -153,9 +153,13 @@ class StartupRelatedRun:
     run_id: str
     status: str | None = None
     step: str | None = None
+    activity: Literal["active", "inactive", "unknown"] = "unknown"
+    history_state: Literal["visible", "archived"] = "visible"
     failure_reason: str | None = None
     worktree_path: str | None = None
+    worktree_verified: bool = False
     branch: str | None = None
+    branch_verified: bool = False
     unmerged_work: bool | None = None
     uncommitted_work: bool | None = None
     can_resume: bool | None = None

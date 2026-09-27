@@ -30,7 +30,7 @@ from .models import (
     WorkflowCapability,
 )
 from .application import ControlPlaneApplication, compose_control_plane
-from .startup_context import project_plan_startup_context
+from .startup_context import project_plan_startup_context, project_startup_context
 from .recovery import (
     DurableEvidenceRecoveryRequest,
     RecoveryEvidenceReference,
@@ -105,6 +105,7 @@ __all__ = [
     "StartupContextSummary",
     "StartupRelatedRun",
     "project_plan_startup_context",
+    "project_startup_context",
     "RunControlRequest",
     "RunEvent",
     "RunPage",
