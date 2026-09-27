@@ -16,7 +16,7 @@ At a high level:
 
 1. `aflow` loads the selected workflow and reads the original plan file.
 2. If the workflow has lifecycle setup, `aflow` inspects git state, optionally bootstraps an empty repo, runs lifecycle preflight, and creates the execution environment.
-3. The run starts at the workflow's first declared step unless startup selected another step.
+3. A fresh run starts at the live workflow's first executable step unless an explicit override selected another step. A validated resume uses its saved step. Checked plan headings alone do not prompt for a step; old pending step questions still require an answer.
 4. The engine renders prompts, resolves the step role through the selected team and global roles, and runs the harness CLI once.
 5. After the harness returns, it re-reads the original plan, computes the proposed recovery or normal transition, and durably finalizes the turn artifacts.
 6. When manager supervision is enabled, the manager accepts or changes that proposed control action before it is applied, including a proposed `END`.
@@ -24,6 +24,10 @@ At a high level:
 8. If teardown includes `merge`, `aflow` invokes a merge handoff through the configured `team_lead` role and verifies the result.
 
 At run start, `aflow` prints the new run ID immediately. Resumed runs also show which prior run they came from.
+
+Before a fresh worktree executes, AFlow checks related run and Git evidence
+against the configured starting branch. Preserved earlier implementation or
+uncertain evidence blocks a new worktree with a recovery or inspection reason.
 
 ## Fresh Review Plan Git Tracking
 

@@ -11,6 +11,7 @@ from types import SimpleNamespace
 import pytest
 
 from aflow.api.models import PreparedRun, StartupRequest
+from aflow.api.startup import PriorWorkStartupError
 from aflow.config import (
     AflowSection,
     GoTransition,
@@ -1261,3 +1262,15 @@ def test_worker_reloads_edited_defaults_without_a_snapshot_or_stale_step(
     assert units.start_calls[0][1][
         units.start_calls[0][1].index("--config") + 1
     ] == str(request.config_path)
+
+    def reject_prior_work(*_args, **_kwargs):
+        raise PriorWorkStartupError(
+            "prior_work_requires_recovery", "Previous work needs recovery."
+        )
+
+    monkeypatch.setattr("aflow.daemon.require_safe_fresh_worktree", reject_prior_work)
+    with pytest.raises(PriorWorkStartupError) as blocked:
+        _worker_prepared(
+            record, manifest, request.repo_root, request.config_path, edited,
+        )
+    assert blocked.value.code == "prior_work_requires_recovery"

@@ -587,7 +587,7 @@ class LibraryStartupTests(unittest.TestCase):
         assert isinstance(resumed, PreparedRun)
         self.assertEqual(resumed.start_step, "step1")
 
-    def test_prepare_startup_multi_step_plan_asks_for_selection(self) -> None:
+    def test_prepare_startup_multi_step_plan_uses_default(self) -> None:
         config_text = (
             '[aflow]\ndefault_workflow = "test"\n\n'
             '[workflow.test.steps.step1]\nrole = "architect"\nprompts = ["p"]\ngo = [{to = "step2"}]\n\n'
@@ -617,10 +617,9 @@ class LibraryStartupTests(unittest.TestCase):
         with patch('sys.stdin.isatty', return_value=True), \
              patch('sys.stdout.isatty', return_value=True):
             result = prepare_startup(request)
-        self.assertIsInstance(result, StartupQuestion)
-        self.assertEqual(result.kind, StartupQuestionKind.PICK_STEP)
-        self.assertIn("step1", result.choices)
-        self.assertIn("step2", result.choices)
+        self.assertIsInstance(result, PreparedRun)
+        self.assertEqual(result.start_step, "step1")
+        self.assertIs(result.start_step_explicit, False)
 
     def test_prepare_startup_with_answer_pick_step(self) -> None:
         config_text = (
@@ -648,22 +647,26 @@ class LibraryStartupTests(unittest.TestCase):
             extra_instructions=(),
         )
 
-        with patch('sys.stdin.isatty', return_value=True), \
-             patch('sys.stdout.isatty', return_value=True):
-            question = prepare_startup(request)
-        self.assertIsInstance(question, StartupQuestion)
+        question = StartupQuestion(
+            kind=StartupQuestionKind.PICK_STEP,
+            message="Select the workflow step to start from:",
+            choices=["step1", "step2"],
+            continuation_request=request,
+        )
 
         with patch('sys.stdin.isatty', return_value=True), \
              patch('sys.stdout.isatty', return_value=True):
             result = prepare_startup_with_answer(question, request, 0)
         self.assertIsInstance(result, PreparedRun)
         self.assertEqual(result.start_step, "step1")
+        self.assertIs(result.start_step_explicit, True)
 
         with patch('sys.stdin.isatty', return_value=True), \
              patch('sys.stdout.isatty', return_value=True):
             result = prepare_startup_with_answer(question, request, 1)
         self.assertIsInstance(result, PreparedRun)
         self.assertEqual(result.start_step, "step2")
+        self.assertIs(result.start_step_explicit, True)
 
     def test_prepare_startup_with_answer_step_by_name(self) -> None:
         config_text = (
@@ -691,10 +694,12 @@ class LibraryStartupTests(unittest.TestCase):
             extra_instructions=(),
         )
 
-        with patch('sys.stdin.isatty', return_value=True), \
-             patch('sys.stdout.isatty', return_value=True):
-            question = prepare_startup(request)
-        self.assertIsInstance(question, StartupQuestion)
+        question = StartupQuestion(
+            kind=StartupQuestionKind.PICK_STEP,
+            message="Select the workflow step to start from:",
+            choices=["step1", "step2"],
+            continuation_request=request,
+        )
 
         with patch('sys.stdin.isatty', return_value=True), \
              patch('sys.stdout.isatty', return_value=True):
@@ -743,18 +748,10 @@ class LibraryStartupTests(unittest.TestCase):
              patch('sys.stdout.isatty', return_value=True):
             question2 = prepare_startup_with_answer(question1, request, True)
 
-        self.assertIsInstance(question2, StartupQuestion)
-        self.assertEqual(question2.kind, StartupQuestionKind.PICK_STEP)
-        self.assertIsNotNone(question2.continuation_request)
-        self.assertIsNotNone(question2.continuation_request.pre_recovered_plan)
-
-        with patch('sys.stdin.isatty', return_value=True), \
-             patch('sys.stdout.isatty', return_value=True):
-            result = prepare_startup_with_answer(question2, request, "step2")
-
-        self.assertIsInstance(result, PreparedRun)
-        self.assertEqual(result.start_step, "step2")
-        self.assertIsNotNone(result.startup_retry)
+        self.assertIsInstance(question2, PreparedRun)
+        self.assertEqual(question2.start_step, "step1")
+        self.assertIs(question2.start_step_explicit, False)
+        self.assertIsNotNone(question2.startup_retry)
 
     def test_prepare_startup_recovery_then_dirty_confirmation(self) -> None:
         from unittest.mock import patch as mock_patch
@@ -809,10 +806,10 @@ class LibraryStartupTests(unittest.TestCase):
         self.assertIsNotNone(result.startup_retry)
 
     def test_prepare_startup_recovery_step_selection_dirty_confirmation(self) -> None:
-        """Test the combined recovery -> step selection -> dirty confirmation chain.
+        """Test recovery and dirty confirmation without an automatic step picker.
 
         This regression test ensures that the full public API chain works without
-        hidden state reconstruction: CONFIRM_RECOVERY -> PICK_STEP -> CONFIRM_WORKTREE_DIRTY -> PreparedRun.
+        hidden state reconstruction: CONFIRM_RECOVERY -> CONFIRM_WORKTREE_DIRTY -> PreparedRun.
         """
         from unittest.mock import patch as mock_patch
 
@@ -858,26 +855,18 @@ class LibraryStartupTests(unittest.TestCase):
             dirty_probe = type('obj', (object,), {'is_dirty': True, 'modified_count': 1, 'added_count': 0, 'removed_count': 0})()
             mock_probe.return_value = dirty_probe
 
-            # Step 2: Confirm recovery, ask for step selection
+            # Step 2: Confirm recovery, ask for dirty confirmation
             question2 = prepare_startup_with_answer(question1, request, True)
             self.assertIsInstance(question2, StartupQuestion)
-            self.assertEqual(question2.kind, StartupQuestionKind.PICK_STEP)
-            self.assertIn("step1", question2.choices)
-            self.assertIn("step2", question2.choices)
+            self.assertEqual(question2.kind, StartupQuestionKind.CONFIRM_WORKTREE_DIRTY)
             self.assertIsNotNone(question2.continuation_request)
             self.assertIsNotNone(question2.continuation_request.pre_recovered_plan)
 
-            # Step 3: Select a step, ask for dirty confirmation
-            question3 = prepare_startup_with_answer(question2, request, "step2")
-            self.assertIsInstance(question3, StartupQuestion)
-            self.assertEqual(question3.kind, StartupQuestionKind.CONFIRM_WORKTREE_DIRTY)
-            self.assertIsNotNone(question3.continuation_request)
-
-            # Step 4: Confirm dirty worktree, reach final PreparedRun
-            result = prepare_startup_with_answer(question3, request, True)
+            # Step 3: Confirm dirty worktree, reach final PreparedRun
+            result = prepare_startup_with_answer(question2, request, True)
             self.assertIsInstance(result, PreparedRun)
-            # Verify selected step survived through the chain
-            self.assertEqual(result.start_step, "step2")
+            self.assertEqual(result.start_step, "step1")
+            self.assertIs(result.start_step_explicit, False)
             # Verify startup retry context survived
             self.assertIsNotNone(result.startup_retry)
 

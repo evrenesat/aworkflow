@@ -4469,7 +4469,7 @@ class WorkflowStartupFlowTests(unittest.TestCase):
             assert 'plan is already complete, --start-step has no effect' in stderr_capture.getvalue()
             assert not (repo_root / '.aflow').exists()
 
-    def test_cli_prompts_for_start_step_on_half_done_multi_step_plan(self) -> None:
+    def test_cli_uses_default_step_on_half_done_multi_step_plan(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             tmp_path = Path(tmpdir)
             repo_root = tmp_path
@@ -4513,7 +4513,7 @@ class WorkflowStartupFlowTests(unittest.TestCase):
                     os.chdir(repo_root)
                     with patch('sys.stdin.isatty', return_value=True), \
                          patch('sys.stdout.isatty', return_value=True), \
-                         patch('builtins.input', side_effect=['2']), \
+                         patch('builtins.input', side_effect=AssertionError('unexpected input')), \
                          patch('sys.stderr', stderr_capture):
                         result = main(['run', str(plan_path)])
             finally:
@@ -4522,7 +4522,7 @@ class WorkflowStartupFlowTests(unittest.TestCase):
             run_dirs = sorted((repo_root / '.aflow' / 'runs').iterdir())
             assert len(run_dirs) == 1
             run_json = json.loads((run_dirs[0] / 'run.json').read_text(encoding='utf-8'))
-            assert run_json['selected_start_step'] == 'implement_plan'
+            assert run_json['selected_start_step'] == 'review_plan'
             assert run_json['startup_recovery_used'] is False
             assert run_json['startup_recovery_reason'] is None
 
@@ -4664,7 +4664,7 @@ class WorkflowStartupFlowTests(unittest.TestCase):
                     os.chdir(repo_root)
                     with patch('sys.stdin.isatty', return_value=True), \
                          patch('sys.stdout.isatty', return_value=True), \
-                         patch('builtins.input', side_effect=['y', '2']), \
+                         patch('builtins.input', side_effect=['y']), \
                          patch('sys.stderr', stderr_capture):
                         result = main(['run', str(plan_path)])
             finally:
@@ -4673,7 +4673,7 @@ class WorkflowStartupFlowTests(unittest.TestCase):
             run_dirs = sorted((repo_root / '.aflow' / 'runs').iterdir())
             assert len(run_dirs) == 1
             run_json = json.loads((run_dirs[0] / 'run.json').read_text(encoding='utf-8'))
-            assert run_json['selected_start_step'] == 'implement_plan'
+            assert run_json['selected_start_step'] == 'review_plan'
             assert run_json['startup_recovery_used'] is True
             assert 'inconsistent checkpoint state' in run_json['startup_recovery_reason']
             turn_result = json.loads((run_dirs[0] / 'turns' / 'turn-001' / 'result.json').read_text(encoding='utf-8'))
@@ -4717,7 +4717,7 @@ class WorkflowStartupFlowTests(unittest.TestCase):
             assert 'startup aborted' in stderr_capture.getvalue().lower()
             assert not (repo_root / '.aflow').exists()
 
-    def test_cli_requires_tty_for_multi_step_start_selection(self) -> None:
+    def test_cli_default_step_does_not_require_tty(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             tmp_path = Path(tmpdir)
             repo_root = tmp_path
@@ -4755,10 +4755,13 @@ class WorkflowStartupFlowTests(unittest.TestCase):
                         result = main(['run', str(plan_path)])
             finally:
                 os.chdir(original_cwd)
-            assert result == 1
+            assert result in {0, 1}
             stderr_output = stderr_capture.getvalue().lower()
-            assert 're-run with --start-step' in stderr_output
-            assert 'available steps' in stderr_output
+            assert 're-run with --start-step' not in stderr_output
+            run_dirs = sorted((repo_root / '.aflow' / 'runs').iterdir())
+            assert len(run_dirs) == 1
+            run_json = json.loads((run_dirs[0] / 'run.json').read_text(encoding='utf-8'))
+            assert run_json['selected_start_step'] == 'review_plan'
 
     def test_cli_requires_tty_for_startup_recovery(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:

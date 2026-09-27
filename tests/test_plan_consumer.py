@@ -554,6 +554,33 @@ def test_startup_question_is_left_for_explicit_answer(tmp_path: Path) -> None:
     consumer.stop()
 
 
+@pytest.mark.parametrize("code", ["prior_work_requires_recovery", "prior_work_unverified"])
+def test_prior_work_blocker_is_held_for_attention_not_relaunched(
+    tmp_path: Path, code: str,
+) -> None:
+    root = _project(tmp_path)
+    config = _config(tmp_path)
+    _plan(root, "one.md")
+    attempts = []
+    invalid = []
+
+    def launch(*_args):
+        attempts.append(True)
+        raise SimpleNamespaceError(code)
+
+    class SimpleNamespaceError(Exception):
+        def __init__(self, value: str) -> None:
+            self.code = value
+
+    consumer = _consumer(root, config, launch, lambda *args: invalid.append(args))
+    for _ in range(4):
+        consumer.scan_once()
+    assert len(attempts) == 1
+    assert consumer.reason(root, "one.md") == "prior_work"
+    assert invalid == []
+    consumer.stop()
+
+
 def test_revision_is_rechecked_under_admission_after_scan(tmp_path: Path) -> None:
     root = _project(tmp_path)
     config = _config(tmp_path)

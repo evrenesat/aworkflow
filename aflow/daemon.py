@@ -36,9 +36,11 @@ from aflow.api.startup import (
     PLAN_ADMISSION_CHECKPOINT_KIND,
     PLAN_ADMISSION_TRACKING_KIND,
     PlanAdmissionError,
+    PriorWorkStartupError,
     StartupError,
     prepare_startup,
     prepare_startup_with_answer,
+    require_safe_fresh_worktree,
 )
 from aflow.control_plane.models import startup_failure
 from aflow.control_plane.worker_diagnostics import confirmed_inactive
@@ -810,6 +812,15 @@ class DaemonService:
                     raise DaemonIdempotencyConflict(
                         "startup answer idempotency key was reused for a different answer"
                     )
+                failure = record.get("startup_failure")
+                if record.get("state") == "needs_attention" and isinstance(failure, Mapping):
+                    message = failure.get("message")
+                    code = failure.get("code")
+                    if isinstance(message, str):
+                        raise DaemonStartupError(
+                            run_id, message,
+                            code=code if isinstance(code, str) else "startup_failed",
+                        )
                 return self._pending_response_locked(record)
             if question_generation != _question_generation(record):
                 raise DaemonError("startup question identity is stale")
@@ -842,6 +853,7 @@ class DaemonService:
                     code=exc.code,
                     kind=exc.kind,
                 )
+                _record_answer(updated, question_generation, answer_digest, idempotency_key)
                 self._write_record(updated)
                 self._release_unbound_admission(
                     run_id,
@@ -857,14 +869,20 @@ class DaemonService:
                 updated = dict(record)
                 updated["state"] = "needs_attention"
                 updated.pop("preparation_owner", None)
-                updated["startup_failure"] = startup_failure("preparation", str(exc))
+                updated["startup_failure"] = startup_failure(
+                    "preparation", str(exc), code=getattr(exc, "code", None)
+                )
+                _record_answer(updated, question_generation, answer_digest, idempotency_key)
                 self._write_record(updated)
                 self._release_unbound_admission(
                     run_id,
                     reservation.nonce,
                     reason="startup_preparation_failed",
                 )
-                raise DaemonStartupError(run_id, updated["startup_failure"]["message"]) from exc
+                raise DaemonStartupError(
+                    run_id, updated["startup_failure"]["message"],
+                    code=getattr(exc, "code", "startup_failed"),
+                ) from exc
             if isinstance(prepared_or_question, StartupQuestion):
                 updated = dict(record)
                 _record_answer(
@@ -1760,14 +1778,19 @@ class DaemonService:
             updated = dict(record)
             updated["state"] = "needs_attention"
             updated.pop("preparation_owner", None)
-            updated["startup_failure"] = startup_failure("preparation", str(exc))
+            updated["startup_failure"] = startup_failure(
+                "preparation", str(exc), code=getattr(exc, "code", None)
+            )
             self._write_record(updated)
             self._release_unbound_admission(
                 str(record["run_id"]),
                 reservation.nonce,
                 reason="startup_preparation_failed",
             )
-            raise DaemonStartupError(str(record["run_id"]), updated["startup_failure"]["message"]) from exc
+            raise DaemonStartupError(
+                str(record["run_id"]), updated["startup_failure"]["message"],
+                code=getattr(exc, "code", "startup_failed"),
+            ) from exc
         if isinstance(prepared_or_question, StartupQuestion):
             updated = dict(record)
             updated["state"] = "awaiting_startup_answer"
@@ -1855,6 +1878,28 @@ class DaemonService:
             )
         if status.launch_phase not in _REPLAYABLE_PHASES:
             return self._existing_start_result(run_id)
+
+        if record.get("mode") != "resume" and prepared.continuation_mode != "current_branch":
+            self._refresh_workflow_config()
+            workflow = self._workflow_config.workflows.get(prepared.workflow_name)
+            if workflow is None:
+                raise DaemonError("configured workflow is unavailable before launch")
+            try:
+                require_safe_fresh_worktree(
+                    prepared.repo_root, prepared.plan_path, workflow,
+                    pending_run_id=run_id,
+                )
+            except PriorWorkStartupError as exc:
+                updated = dict(record)
+                updated["state"] = "needs_attention"
+                updated["startup_failure"] = startup_failure(
+                    "preparation", exc.safe_message, code=exc.code
+                )
+                self._write_record(updated)
+                self._release_unbound_admission(
+                    run_id, reservation.nonce, reason="prior_work_recovery_required"
+                )
+                raise DaemonStartupError(run_id, exc.safe_message, code=exc.code) from exc
 
         extra_instructions = self._transient_extra_instructions.get(run_id, ())
         expected_extra_digest = _optional_string(record.get("extra_instructions_digest"))
@@ -3369,7 +3414,10 @@ def worker_main(
         from aflow.control_plane.models import startup_failure
         from aflow.control_plane.persistent_units import _receipts_for, _write_receipt
 
-        failure = startup_failure(stage, str(exc))
+        failure = startup_failure(
+            stage, str(exc),
+            code=getattr(exc, "code", getattr(exc, "failure_kind", None)),
+        )
         try:
             receipts = _receipts_for(_unit_name(validate_run_id(run_id)), Path(repo_root).resolve())
             if receipts is not None and receipts.nonce == os.environ.get("AFLOW_WORKER_NONCE"):
@@ -4059,6 +4107,12 @@ def _worker_prepared(
         workflow_config, prepared.workflow_name, prepared.start_step
     ):
         raise DaemonError("daemon worker skipped-step state is invalid")
+    if prepared.continuation_mode != "current_branch":
+        require_safe_fresh_worktree(
+            prepared.repo_root, prepared.plan_path,
+            workflow_config.workflows[prepared.workflow_name],
+            pending_run_id=run_id,
+        )
     return prepared, None
 
 

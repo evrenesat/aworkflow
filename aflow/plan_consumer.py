@@ -35,6 +35,7 @@ _LOCK_NAME = "plan-consumer.lock"
 _REASON_CODES = frozenset({
     "capacity", "dependency", "claimed", "configuration", "provider",
     "startup_input", "unsafe_plan", "unstable", "validation", "unavailable",
+    "prior_work",
 })
 
 
@@ -437,6 +438,9 @@ class PlanConsumer:
                         self._observed.pop(key, None)
                         self._reasons.pop(key, None)
                         continue
+                elif code in {"prior_work_requires_recovery", "prior_work_unverified"}:
+                    reason = "prior_work"
+                    self._held[key] = identity
                 else:
                     reason = "provider"
                 self._set_reason(key, reason)

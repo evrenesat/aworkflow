@@ -74,6 +74,12 @@ limits, and workflow steps. Invalid current TOML or an unusable selected target
 fails clearly before a harness starts; an invalid remote control is rejected
 without changing the prior accepted control.
 
+A partially checked plan starts at the live workflow default without a step
+question. `--start-step` remains available for a deliberate override; a saved
+resume uses its validated step. Existing pending step questions still need an
+explicit answer. A new worktree is blocked when related earlier implementation
+is preserved or cannot be verified against its configured starting branch.
+
 The dirty-worktree checkbox is a separate startup choice. An existing-checkout
 run sees acknowledged source changes, while a fresh worktree starts from the
 selected committed tree and leaves source changes in place. Configuration edits

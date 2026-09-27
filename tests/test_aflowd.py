@@ -15,6 +15,7 @@ from threading import Barrier, Event
 import pytest
 
 from aflow.api.models import PreparedRun, StartupQuestion, StartupQuestionKind, StartupRequest
+from aflow.api.startup import PriorWorkStartupError
 from aflow.config import (
     GoTransition,
     TeamConfig,
@@ -1114,6 +1115,8 @@ def test_daemon_persists_startup_question_then_launches_once_when_answered(
 
     assert started.status == "running"
     assert len(units.start_calls) == 1
+
+
     name, argv, cwd = units.start_calls[0]
     assert name == f"aflow-run-{started.run_id}.service"
     assert argv[:2] == (str((tmp_path / "repo" / "release" / "bin" / "aflow").resolve()), "daemon-worker")
@@ -1132,6 +1135,54 @@ def test_daemon_persists_startup_question_then_launches_once_when_answered(
     assert replay.run_id == started.run_id
     assert replay.created is False
     assert len(units.start_calls) == 1
+
+
+def test_failed_legacy_answer_replays_same_typed_outcome(tmp_path: Path, monkeypatch) -> None:
+    units = InMemoryUnitManager()
+    daemon, request = _daemon(tmp_path, monkeypatch, units)
+    question = StartupQuestion(
+        kind=StartupQuestionKind.PICK_STEP,
+        message="Choose a step",
+        choices=["implement"],
+    )
+    monkeypatch.setattr("aflow.daemon.prepare_startup", lambda _request: question)
+
+    def blocked(*_args):
+        raise PriorWorkStartupError(
+            "prior_work_requires_recovery", "Previous work needs recovery."
+        )
+
+    monkeypatch.setattr("aflow.daemon.prepare_startup_with_answer", blocked)
+    pending = daemon.service.start(
+        request, caller_scope="project:one", idempotency_key="start-blocked"
+    )
+    with pytest.raises(DaemonStartupError) as outcome:
+        daemon.service.answer_startup(
+            pending.question_id, "implement", caller_scope="project:one",
+            idempotency_key="answer-blocked",
+        )
+    assert outcome.value.code == "prior_work_requires_recovery"
+    assert outcome.value.run_id == pending.run_id
+    peer = AflowDaemon(daemon._config, units=units)
+    peer.start()
+    with pytest.raises(DaemonStartupError) as replayed_answer:
+        peer.service.answer_startup(
+            pending.question_id, "implement", caller_scope="project:one",
+            idempotency_key="answer-blocked",
+        )
+    assert replayed_answer.value.code == "prior_work_requires_recovery"
+    assert replayed_answer.value.run_id == pending.run_id
+    with pytest.raises(DaemonIdempotencyConflict):
+        daemon.service.answer_startup(
+            pending.question_id, "implement", caller_scope="project:one",
+            idempotency_key="changed-answer-key",
+        )
+    replayed_start = daemon.service.start(
+        request, caller_scope="project:one", idempotency_key="start-blocked"
+    )
+    assert replayed_start.run_id == pending.run_id
+    assert replayed_start.status == "needs_attention"
+    assert units.start_calls == []
 
 
 def test_daemon_replays_active_idempotent_start_and_restarts_by_reconciling_only(

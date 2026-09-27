@@ -5,17 +5,21 @@ import json
 import os
 from pathlib import Path
 import subprocess
+from dataclasses import replace
 from types import SimpleNamespace
 
 import pytest
 
-from aflow.config import WorkflowConfig
+from aflow.config import WorkflowConfig, WorkflowStepConfig, WorkflowUserConfig
+from aflow.api.models import PreparedRun, StartupRequest
+from aflow.api.startup import prepare_startup
 from aflow.control_plane import LaunchManifest, RunRepository, create_launch_manifest, project_plan_startup_context
 from aflow.control_plane import startup_context as startup_module
 from aflow.control_plane.models import RunPage
 from aflow.control_plane.run_history import RunHistory
 from aflow.plan_backups import create_plan_identity
 from aflow.project_admission import ProjectAdmission
+from aflow.api.startup import PriorWorkStartupError, require_safe_fresh_worktree
 
 
 def _plan(repo: Path, body: str) -> Path:
@@ -305,6 +309,76 @@ def test_unmerged_commit_and_clean_integrated_work(tmp_path: Path) -> None:
     assert integrated.recommendation == "start"
     assert integrated.related_runs[0].unmerged_work is False
     assert integrated.related_runs[0].uncommitted_work is False
+
+
+def test_fresh_worktree_guard_rechecks_preserved_and_integrated_work(tmp_path: Path) -> None:
+    repo, plan, worktree, _, workflow = _related_fixture(tmp_path)
+    _record_previous(repo, plan, worktree)
+    (worktree / "implementation.py").write_text("work = True\n")
+    with pytest.raises(PriorWorkStartupError) as dirty:
+        require_safe_fresh_worktree(repo, plan, workflow)
+    assert dirty.value.code == "prior_work_requires_recovery"
+
+    _git("add", "implementation.py", cwd=worktree)
+    _git("commit", "-m", "implementation", cwd=worktree)
+    with pytest.raises(PriorWorkStartupError) as unmerged:
+        require_safe_fresh_worktree(repo, plan, workflow)
+    assert unmerged.value.code == "prior_work_requires_recovery"
+
+    _git("merge", "--ff-only", "previous-branch", cwd=repo)
+    require_safe_fresh_worktree(repo, plan, workflow)
+
+    _git("worktree", "remove", "--force", str(worktree), cwd=repo)
+    _git("branch", "-D", "previous-branch", cwd=repo)
+    # Removing both references makes the earlier baseline unverifiable.
+    with pytest.raises(PriorWorkStartupError) as missing:
+        require_safe_fresh_worktree(repo, plan, workflow)
+    assert missing.value.code == "prior_work_unverified"
+
+
+def test_startup_guard_cannot_be_bypassed_by_step_or_dirty_ack(tmp_path: Path) -> None:
+    repo, plan, worktree, base, workflow = _related_fixture(tmp_path)
+    workflow = replace(
+        workflow,
+        steps={
+            "alpha": WorkflowStepConfig(role="worker", prompts=("p",)),
+            "omega": WorkflowStepConfig(role="worker", prompts=("p",)),
+        },
+        first_step="alpha",
+    )
+    config = WorkflowUserConfig(workflows={"managed": workflow})
+    request = StartupRequest(
+        repo_root=repo, plan_path=plan, config_path=tmp_path / "config.toml",
+        workflow_config=config, workflow_name="managed",
+        start_step="omega", max_turns=None, team=None,
+        extra_instructions=(), dirty_worktree_confirmed=True,
+    )
+    _record_previous(repo, plan, worktree)
+    (worktree / "implementation.py").write_text("work = True\n")
+    with pytest.raises(PriorWorkStartupError) as blocked:
+        prepare_startup(request)
+    assert blocked.value.code == "prior_work_requires_recovery"
+
+    _git("add", "implementation.py", cwd=worktree)
+    _git("commit", "-m", "implementation", cwd=worktree)
+    _git("merge", "--ff-only", "previous-branch", cwd=repo)
+    # A started plan also requires its separate Git Tracking base reconciliation.
+    current_head = _git("rev-parse", "HEAD", cwd=repo)
+    plan.write_text(
+        plan.read_text().replace(
+            f"Pre-Handoff Base HEAD: `{base}`",
+            f"Pre-Handoff Base HEAD: `{current_head}`",
+        )
+    )
+    prepared = prepare_startup(request)
+    assert isinstance(prepared, PreparedRun)
+    assert prepared.start_step == "omega"
+    assert prepared.start_step_explicit is True
+
+    implicit = prepare_startup(replace(request, start_step=None))
+    assert isinstance(implicit, PreparedRun)
+    assert implicit.start_step == "alpha"
+    assert implicit.start_step_explicit is False
 
 
 def test_plan_only_dirt_is_not_implementation_work(tmp_path: Path) -> None:

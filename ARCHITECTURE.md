@@ -773,9 +773,16 @@ Entry point. Exposes three subcommands:
 5. Resolve any numeric `--start-step` value to a canonical workflow step name by validating the index against the selected workflow's declared step order. Out-of-range indexes fail with a clear bounds error listing the valid range.
 6. Load the original plan strictly.
 7. If the plan is complete and `--start-step` was given, fail with a clear error.
-8. If the plan is half-done and the workflow has more than one step, require a TTY and prompt for an explicit step unless `--start-step` was given.
+8. A fresh plan, including a partially checked plan, uses the live workflow's configured first executable step unless `--start-step` was given. The omitted choice stays implicit, so worker boot can apply a changed live default. Validated resume state retains its saved step. Existing persisted `pick_step` questions still require an explicit answer.
 9. If strict plan loading fails with `inconsistent_checkpoint_state`, require a TTY and ask whether to recover.
 10. When recovery is accepted, load a tolerant snapshot from the invalid plan, seed startup retry state, and pass both the parsed plan and retry context into `run_workflow()`.
+
+For a fresh worktree start, startup preparation and the final execution boundary
+recheck bounded related-run evidence against the configured starting branch.
+Preserved or unverifiable earlier work returns `prior_work_requires_recovery` or
+`prior_work_unverified` before lifecycle setup. An explicit step or dirty-worktree
+acknowledgement does not override this check; validated resumes and explicit
+current-checkout continuations retain their existing ownership paths.
 
 `run_workflow()` then establishes plan authority before durable run identity:
 it probes repository/bootstrap state, backs up and loads the plan, and
