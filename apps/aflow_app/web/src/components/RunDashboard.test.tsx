@@ -4051,20 +4051,30 @@ describe('RunDashboard', () => {
 
   it('moves one selected deep-linked row from its compact pin into the loaded page', async () => {
     const olderRun = { ...ownedRun, run_id: 'history-older', status: 'completed', progress: null }
+    const selectedDetail = deferred<typeof olderRun>()
     vi.mocked(api.listControlPlaneRuns).mockImplementation(async (_project, request) => request?.cursor
       ? { runs: [olderRun], next_cursor: null, schema_version: 1 }
       : { runs: [ownedRun], next_cursor: ownedRun.run_id, schema_version: 1 })
-    vi.mocked(api.getControlPlaneRun).mockImplementation(async (_project, runId) => runId === olderRun.run_id ? olderRun : ownedRun)
+    vi.mocked(api.getControlPlaneRun).mockImplementation((_project, runId) => runId === olderRun.run_id ? selectedDetail.promise : Promise.resolve(ownedRun))
     const onRunSelectionChange = vi.fn()
     const { container } = renderDashboard({ requestedRunId: olderRun.run_id, onRunSelectionChange })
 
+    await waitFor(() => expect(api.getControlPlaneRun).toHaveBeenCalledWith('control-project', olderRun.run_id, expect.anything()))
+    expect(within(screen.getByLabelText('Run details')).queryByRole('heading', { level: 3 })).toBeNull()
+    expect(container.querySelector('.run-list-pinned')).toBeNull()
+    await act(async () => {
+      selectedDetail.resolve(olderRun)
+      await selectedDetail.promise
+    })
     await waitFor(() => expect(container.querySelector('.run-list-pinned')?.getAttribute('data-run-key')).toBe(olderRun.run_id))
+    await waitFor(() => expect(document.activeElement).toBe(container.querySelector('.run-progress-header h3')))
     await waitFor(() => expect(container.querySelector('.run-list > .section-heading > span')?.textContent).toBe('1 loaded'))
     expect(screen.getByText('Selected · older history')).toBeDefined()
     expect(container.querySelectorAll(`[data-run-key="${olderRun.run_id}"]`)).toHaveLength(1)
     expect(screen.queryByText(/outside the loaded history page/)).toBeNull()
     const pinnedSelection = findRunSelection(olderRun.run_id)!
     pinnedSelection.focus()
+    expect(document.activeElement).toBe(pinnedSelection)
     fireEvent.click(screen.getByRole('button', { name: 'Load more runs' }))
 
     await waitFor(() => expect(container.querySelector('.run-list-pinned')).toBeNull())
@@ -4082,14 +4092,25 @@ describe('RunDashboard', () => {
       started_at: null, progress: null,
       evidence: { unit_observation: 'missing', has_run_metadata: false, can_resume: false },
     }
+    const selectedDetail = deferred<typeof gap>()
     vi.mocked(api.listControlPlaneRuns).mockImplementation(async (_project, request) => request?.cursor
       ? { runs: [gap], next_cursor: null, schema_version: 1 }
       : { runs: [ownedRun], next_cursor: ownedRun.run_id, schema_version: 1 })
-    vi.mocked(api.getControlPlaneRun).mockImplementation(async (_project, runId) => runId === gap.run_id ? gap : ownedRun)
+    vi.mocked(api.getControlPlaneRun).mockImplementation((_project, runId) => runId === gap.run_id ? selectedDetail.promise : Promise.resolve(ownedRun))
     const { container } = renderDashboard({ requestedRunId: gap.run_id })
 
+    await waitFor(() => expect(api.getControlPlaneRun).toHaveBeenCalledWith('control-project', gap.run_id, expect.anything()))
+    expect(within(screen.getByLabelText('Run details')).queryByRole('heading', { level: 3 })).toBeNull()
+    expect(container.querySelector('.run-list-pinned')).toBeNull()
+    await act(async () => {
+      selectedDetail.resolve(gap)
+      await selectedDetail.promise
+    })
     await waitFor(() => expect(container.querySelector('.run-list-pinned')?.getAttribute('data-run-key')).toBe(gap.run_id))
-    findRunSelection(gap.run_id)!.focus()
+    await waitFor(() => expect(document.activeElement).toBe(container.querySelector('.run-progress-header h3')))
+    const pinnedSelection = findRunSelection(gap.run_id)!
+    pinnedSelection.focus()
+    expect(document.activeElement).toBe(pinnedSelection)
     fireEvent.click(screen.getByRole('button', { name: 'Load more runs' }))
 
     await waitFor(() => expect(container.querySelector('.run-list-pinned')).toBeNull())
