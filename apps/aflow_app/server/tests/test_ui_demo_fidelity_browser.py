@@ -1054,6 +1054,7 @@ def test_ui_demo_project_and_global_overview_captures(
         pytest.param(390, 844, "light", False, id="mobile-light"),
         pytest.param(390, 844, "dark", False, id="mobile-dark"),
         pytest.param(1280, 720, "dark", True, id="desktop-dark-held-refresh"),
+        pytest.param(390, 844, "dark", True, id="mobile-dark-held-refresh"),
     ),
 )
 def test_ui_demo_cp8_plan_editor_and_review_captures(
@@ -1090,6 +1091,8 @@ def test_ui_demo_cp8_plan_editor_and_review_captures(
     routed_preflights: list[dict[str, object]] = []
     routed_requests = []
     routed_terminals: list[dict[str, object]] = []
+    observed_preflight_requests = []
+    observed_preflight_terminals: list[dict[str, object]] = []
     trace_active = False
     latest_preflight_identity: dict[str, object] | None = None
     latest_preflight_readiness: dict[str, object] | None = None
@@ -1134,6 +1137,9 @@ def test_ui_demo_cp8_plan_editor_and_review_captures(
     def route_index_for(request) -> int | None:
         return next((index for index, routed in enumerate(routed_requests) if routed is request), None)
 
+    def observed_index_for(request) -> int | None:
+        return next((index for index, observed in enumerate(observed_preflight_requests) if observed is request), None)
+
     def routed_outcome_records() -> list[dict[str, object]]:
         return [
             {
@@ -1154,6 +1160,8 @@ def test_ui_demo_cp8_plan_editor_and_review_captures(
             return
         event: dict[str, object] = {"kind": "request", "endpoint": endpoint, "method": request.method}
         if endpoint == "preflight":
+            event["request_index"] = len(observed_preflight_requests)
+            observed_preflight_requests.append(request)
             event["identity"] = preflight_identity(request)
             latest_preflight_identity = event["identity"]
         append_preflight_trace(event)
@@ -1187,20 +1195,24 @@ def test_ui_demo_cp8_plan_editor_and_review_captures(
             }
             latest_preflight_readiness = event["readiness"]
             event["identity"] = preflight_identity(response.request)
+            event["request_index"] = observed_index_for(response.request)
             event["route_index"] = route_index_for(response.request)
         append_preflight_trace(event)
 
     def trace_terminal(request, outcome: str) -> None:
-        route_index = route_index_for(request)
-        if route_index is None:
+        if endpoint_for(request.url) != "preflight" or not trace_active:
             return
+        route_index = route_index_for(request)
         event = {
             "kind": outcome,
             "endpoint": "preflight",
+            "request_index": observed_index_for(request),
             "route_index": route_index,
             "identity": preflight_identity(request),
         }
-        routed_terminals.append(event)
+        observed_preflight_terminals.append(event)
+        if route_index is not None:
+            routed_terminals.append(event)
         append_preflight_trace(event)
 
     def trace_dom(label: str) -> dict[str, object]:
@@ -1213,6 +1225,12 @@ def test_ui_demo_cp8_plan_editor_and_review_captures(
               const review = [...document.querySelectorAll('button')]
                 .find(button => button.textContent?.trim() === 'Review start…' && button.getClientRects().length > 0) ?? null;
               const reviewRegion = dashboard?.querySelector('[role="region"][aria-label="Review start"]') ?? null;
+              const reviewHeading = reviewRegion?.querySelector('.launch-review-heading') ?? null;
+              const reviewRequirements = reviewRegion?.querySelector('.launch-review-requirements') ?? null;
+              const reviewRequirement = name => [...(reviewRequirements?.querySelectorAll('div') ?? [])]
+                .find(row => row.querySelector('dt')?.textContent?.trim() === name)?.querySelector('dd')?.textContent?.trim() ?? null;
+              const startAction = [...document.querySelectorAll('button')]
+                .find(button => button.textContent?.trim() === 'Start run' && button.getClientRects().length > 0) ?? null;
               const value = name => dashboard?.querySelector(`[aria-label="${name}"]`)?.value ?? null;
               const confirmation = dashboard?.querySelector('.worktree-confirmation input[type="checkbox"]') ?? null;
               const feedback = [...document.querySelectorAll('[role="alert"], [role="status"]')]
@@ -1239,8 +1257,13 @@ def test_ui_demo_cp8_plan_editor_and_review_captures(
                 review_enabled: review !== null && !review.hasAttribute('disabled'),
                 review_region_present: reviewRegion !== null,
                 review_region_visible: reviewRegion !== null && reviewRegion.getClientRects().length > 0,
+                review_heading_present: reviewHeading !== null,
+                review_working_tree: reviewRequirement('Working tree'),
+                review_start_readiness: reviewRequirement('Start readiness'),
+                start_action_present: startAction !== null,
+                start_action_disabled: startAction?.hasAttribute('disabled') ?? null,
                 action_feedback: feedback,
-                focused_element: active === reviewRegion?.querySelector('.launch-review-heading')
+                focused_element: active === reviewHeading
                   ? 'review-heading'
                   : active?.tagName?.toLowerCase() ?? null,
               };
@@ -1258,6 +1281,7 @@ def test_ui_demo_cp8_plan_editor_and_review_captures(
             "events": list(preflight_trace),
             "routed_count": len(routed_preflights),
             "routed": routed_outcome_records(),
+            "observed_request_count": len(observed_preflight_requests),
             "final_dom": snapshot,
         }
 
@@ -1274,7 +1298,7 @@ def test_ui_demo_cp8_plan_editor_and_review_captures(
             screenshot_error = type(screenshot_exception).__name__
         evidence = {
             "error_type": type(error).__name__,
-            "error": str(error).splitlines()[0][:240],
+            "error": (str(error).splitlines() or [type(error).__name__])[0][:240],
             "trace": trace_payload(label),
             "start_call_count": len(units.start_calls),
             "screenshot": failure_screenshot.name if screenshot_error is None else None,
@@ -1559,7 +1583,7 @@ def test_ui_demo_cp8_plan_editor_and_review_captures(
                     route_registered = False
                     named_route_indexes = [0, changed_route_index, restored_route_index]
                     page.wait_for_function(
-                        "indexes => window.__aflowCp8NamedRoutesSettled(indexes)",
+                        "async indexes => await window.__aflowCp8NamedRoutesSettled(indexes)",
                         arg=named_route_indexes,
                     )
                     outcomes = routed_outcome_records()
@@ -1631,6 +1655,7 @@ def test_ui_demo_cp8_plan_editor_and_review_captures(
                 expect(review_region).to_be_visible(timeout=30_000)
                 after_review_click = trace_dom("review-click-after")
                 assert after_review_click["review_region_visible"] is True, after_review_click
+                assert len(units.start_calls) == 0
                 stable_choices = ("plan_path", "workflow", "team", "team_stage", "max_turns", "start_step")
                 assert {key: after_review_click["launch_identity"][key] for key in stable_choices} == {
                     key: before_review_click["launch_identity"][key] for key in stable_choices
@@ -1650,7 +1675,7 @@ def test_ui_demo_cp8_plan_editor_and_review_captures(
                     screenshot_error = type(error).__name__
                 evidence = {
                     "error_type": type(review_error).__name__,
-                    "error": str(review_error).splitlines()[0][:240],
+                    "error": (str(review_error).splitlines() or [type(review_error).__name__])[0][:240],
                     "before_click": before_review_click,
                     "after_click": trace_dom("review-click-failure"),
                     "trace": list(preflight_trace),
@@ -1666,20 +1691,43 @@ def test_ui_demo_cp8_plan_editor_and_review_captures(
                 "after_click": after_review_click,
                 "preflight_trace": list(preflight_trace),
             }
-            expect(review_region).to_contain_text("Read-only check — no run has been allocated.")
-            expect(review_region).to_contain_text("Ready for the final start action.")
-            expect(review_region).to_contain_text(plan_path)
-            expect(review_region).to_contain_text("Managed")
-            expect(review_region).to_contain_text("no team — global role assignments apply")
-            expect(review_region).to_contain_text("15 · server default")
-            expect(review_region.locator(".launch-review-consequence")).to_be_visible()
-            review_heading = review_region.locator("h4.launch-review-heading")
-            expect(review_heading).to_be_visible()
-            expect(review_heading).to_have_attribute("tabindex", "-1")
-            expect(review_heading).to_be_focused()
-            final_start = page.get_by_role("button", name="Start run", exact=True)
-            expect(final_start).to_be_enabled()
-            expect(page.get_by_role("button", name="Review start…", exact=True)).to_have_count(0)
+            try:
+                expect(review_region).to_contain_text("Read-only check — no run has been allocated.")
+                post_click = trace_dom("review-final-readiness-before")
+                if post_click["preflight_status"] == "loading":
+                    assert post_click["start_action_disabled"] is True, post_click
+                    assert post_click["focused_element"] == "review-heading", post_click
+                    assert len(units.start_calls) == 0
+                    assert observed_preflight_requests, trace_payload("review-without-request")
+                    settled = wait_for_current_preflight("review-current-request-ready", require_review=False)
+                    assert settled["preflight_status"] == "ready", settled
+                    current_index = len(observed_preflight_requests) - 1
+                    current_identity = preflight_identity(observed_preflight_requests[current_index])
+                    assert current_identity == before_review_click["latest_preflight_identity"], {
+                        "before_click": before_review_click["latest_preflight_identity"],
+                        "current": current_identity,
+                    }
+                    assert any(
+                        event["request_index"] == current_index and event["kind"] == "requestfinished"
+                        for event in observed_preflight_terminals
+                    ), trace_payload("review-current-request-not-finished")
+                    assert len(units.start_calls) == 0
+                expect(review_region).to_contain_text("Ready for the final start action.")
+                expect(review_region).to_contain_text(plan_path)
+                expect(review_region).to_contain_text("Managed")
+                expect(review_region).to_contain_text("no team — global role assignments apply")
+                expect(review_region).to_contain_text("15 · server default")
+                expect(review_region.locator(".launch-review-consequence")).to_be_visible()
+                review_heading = review_region.locator("h4.launch-review-heading")
+                expect(review_heading).to_be_visible()
+                expect(review_heading).to_have_attribute("tabindex", "-1")
+                expect(review_heading).to_be_focused()
+                final_start = page.get_by_role("button", name="Start run", exact=True)
+                expect(final_start).to_be_enabled()
+                expect(page.get_by_role("button", name="Review start…", exact=True)).to_have_count(0)
+            except Exception as review_error:
+                save_preflight_failure("review-final-readiness", review_error)
+                raise
             review_screenshot = tmp_path / f"cp8-review-{theme}-{width}x{height}.png"
             page.evaluate("window.scrollTo(0, 0)")
             page.screenshot(path=str(review_screenshot), full_page=True)
@@ -1698,6 +1746,61 @@ def test_ui_demo_cp8_plan_editor_and_review_captures(
                     "final_action": "button:has-text('Start run')",
                 }),
             }
+            if held_refresh:
+                post_review_routes = []
+                post_review_released = False
+
+                def hold_post_review(route) -> None:
+                    if not post_review_routes:
+                        post_review_routes.append(route)
+                    else:
+                        route.continue_()
+
+                page.route("**/runs/preflight", hold_post_review)
+                try:
+                    with page.expect_request("**/runs/preflight") as post_review_request_info:
+                        preflight.get_by_role("button", name="Refresh worktree inspection", exact=True).click()
+                    post_review_request = post_review_request_info.value
+                    post_review_index = observed_index_for(post_review_request)
+                    assert post_review_index is not None
+                    assert preflight_identity(post_review_request) == before_review_click["latest_preflight_identity"]
+                    expect(preflight).to_have_attribute("data-preflight-status", "loading")
+                    inspection_pending = trace_dom("review-held-inspection-pending")
+                    assert inspection_pending["review_region_visible"] is True, inspection_pending
+                    assert inspection_pending["review_working_tree"] == "Inspection in progress", inspection_pending
+                    assert inspection_pending["start_action_disabled"] is True, inspection_pending
+                    assert len(units.start_calls) == 0
+                    assert len(post_review_routes) == 1
+                    post_review_routes[0].continue_()
+                    post_review_released = True
+                    inspection_ready = wait_for_current_preflight("review-held-inspection-ready", require_review=False)
+                    assert inspection_ready["preflight_status"] == "ready", inspection_ready
+                    assert inspection_ready["launch_identity"] == before_review_click["launch_identity"], inspection_ready
+                    current_index = len(observed_preflight_requests) - 1
+                    assert preflight_identity(observed_preflight_requests[current_index]) == preflight_identity(post_review_request)
+                    assert any(
+                        event["request_index"] == current_index and event["kind"] == "requestfinished"
+                        for event in observed_preflight_terminals
+                    ), trace_payload("review-held-inspection-not-finished")
+                    expect(review_region).to_contain_text("Ready for the final start action.")
+                    expect(final_start).to_be_enabled()
+                    assert len(units.start_calls) == 0
+                    captures["states"]["review_held_inspection"] = {
+                        "pending": inspection_pending,
+                        "ready": inspection_ready,
+                        "request_index": post_review_index,
+                    }
+                except Exception as review_error:
+                    save_preflight_failure("review-held-inspection", review_error)
+                    raise
+                finally:
+                    if not post_review_released:
+                        for held_route in post_review_routes:
+                            try:
+                                held_route.continue_()
+                            except PlaywrightError:
+                                pass
+                    page.unroute("**/runs/preflight", hold_post_review)
             review_region.get_by_role("button", name="Cancel review", exact=True).click()
             expect(page.get_by_role("region", name="Review start", exact=True)).to_have_count(0)
             assert len(units.start_calls) == 0

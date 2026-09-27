@@ -17,6 +17,32 @@
   focused tests and these two notes. The ignored local plan records checkpoint
   progress for review.
 
+## 2026-09-27 — Trace CP8 review readiness after held preflight
+
+- Exact-SHA CI run `36195706894` opened Review with the selected plan,
+  workflow, team and default turn limit, but working-tree inspection was still
+  pending at the five-second assertion. Eight isolated Chromium repeats on
+  Python 3.12 did not reproduce a stuck review. A controlled post-review
+  inspection exposed a separate safety gap: the panel showed loading while
+  the shell's Start run button was briefly enabled by its passive slot update.
+- The dashboard now synchronizes that header button's disabled state before
+  paint and sends its click through the latest launch guard. The exact held
+  request keeps the review blocked until it finishes; the server remains the
+  final admission authority.
+- The CP8 browser fixture now captures the post-click readiness failure,
+  including sanitized request identities, response/terminal events, review
+  focus, current status, final-action state and zero-start evidence. If a
+  current request is pending, it waits for that exact request, follows a
+  recorded successor after cancellation, and still requires ready Review and
+  enabled Start run. The 390×844 held-refresh case joins desktop coverage.
+  A component regression checks a new inspection while Review is open, and
+  the held browser journey directly checks the post-review pending/ready
+  transition.
+- The final controlled journey passed three isolated desktop Chromium repeats
+  and desktop/mobile WebKit, with mobile Chromium included in the full suite.
+  All 680 web tests, the production build and all 638 Python 3.12 server tests
+  passed on the final behavior. Exact-SHA CI remains a reviewer/delivery gate.
+
 ## 2026-09-27 — Cumulative verification handoff (Checkpoint 3)
 
 - The original plan records two September 24 server-suite examples at 594.17s

@@ -1165,6 +1165,38 @@ describe('RunDashboard', () => {
     expect(api.startControlPlaneRun).not.toHaveBeenCalled()
   })
 
+  it('blocks an open review until its refreshed inspection settles', async () => {
+    const refreshedInspection = deferred<WorktreePreflight>()
+    vi.mocked(api.preflightControlPlaneRun)
+      .mockResolvedValueOnce(preflightResult())
+      .mockReturnValueOnce(refreshedInspection.promise)
+    renderDashboard()
+
+    await openNewRun()
+    choose('Run plan', 'plans/in-progress/demo.md')
+    choose('Run workflow', 'managed')
+    await screen.findByText('No uncommitted changes detected.')
+    fireEvent.click(screen.getByRole('button', { name: 'Review start…', exact: true }))
+    const review = await screen.findByRole('region', { name: 'Review start', exact: true })
+    expect(review.textContent).toContain('Ready for the final start action.')
+
+    fireEvent.click(screen.getByRole('button', { name: 'Refresh worktree inspection' }))
+    await waitFor(() => expect(api.preflightControlPlaneRun).toHaveBeenCalledTimes(2))
+    expect(review.textContent).toContain('Inspection in progress')
+    expect((screen.getByRole('button', { name: 'Start run', exact: true }) as HTMLButtonElement).disabled).toBe(true)
+    expect(api.startControlPlaneRun).not.toHaveBeenCalled()
+
+    await act(async () => {
+      refreshedInspection.resolve(preflightResult())
+      await refreshedInspection.promise
+    })
+    await waitFor(() => expect(review.textContent).toContain('Ready for the final start action.'))
+    expect((screen.getByRole('button', { name: 'Start run', exact: true }) as HTMLButtonElement).disabled).toBe(false)
+    expect(api.startControlPlaneRun).not.toHaveBeenCalled()
+    fireEvent.click(screen.getByRole('button', { name: 'Cancel review', exact: true }))
+    expect((screen.getByLabelText('Run plan') as HTMLInputElement).value).toBe('plans/in-progress/demo.md')
+  })
+
   it('focuses the review heading, reports its consequence, and restores the preparation trigger', async () => {
     const scrollIntoView = vi.fn()
     const originalScrollIntoView = Object.getOwnPropertyDescriptor(HTMLElement.prototype, 'scrollIntoView')

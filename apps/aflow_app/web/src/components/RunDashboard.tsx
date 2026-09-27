@@ -3655,10 +3655,30 @@ export function RunDashboard({ visible = true, page, onNewRun, onCancelNewRun, o
   const renderAcceptedDetail = projectAvailable === true && selectedDetailAccepted && !newRunPage
   const retainedProjectShell = exposedShellProjectId === projectId && projectAvailable !== false && !newRunPage
   const dashboardRenderable = !loading || renderAcceptedDetail || retainedProjectShell
+  const headerStartButtonRef = useRef<HTMLButtonElement | null>(null)
+  const headerStartActionRef = useRef<(trigger: HTMLButtonElement) => void>(() => undefined)
+  const headerStartBlocked = startDisabled || Boolean(restartActions)
+    || (startReviewIdentity !== null && (!startReviewReady || startRevalidationPendingForRender))
+  headerStartActionRef.current = (trigger) => {
+    if (!newRunPage || headerStartBlocked) return
+    if (startReviewIdentity !== null) {
+      // The slot can still display the preparation label for one commit.
+      // A second click on that label must never become a final Start.
+      if (trigger.textContent?.trim() !== 'Start run') return
+      void confirmStart()
+    } else openStartReview(trigger)
+  }
+  useLayoutEffect(() => {
+    // Header slots register in a passive effect. Close the one-commit gap
+    // between a new preflight state and the header action it must block.
+    if (headerStartButtonRef.current) {
+      headerStartButtonRef.current.disabled = !newRunPage || headerStartBlocked
+    }
+  }, [newRunPage, headerStartBlocked])
   const hosted = useHeaderSlots(`run-dashboard:${projectId}`, {
     context: <h2 className="header-context-title">{newRunPage ? 'New run' : 'Runs'}</h2>,
     local: newRunPage ? <button className="btn btn-secondary btn-sm" onClick={cancelNewRun}>← Run history</button> : <label className="header-filter-select"><span>Run history</span><select aria-label="Run history" value={historyFilter} onChange={event => setHistoryFilter(event.target.value as typeof historyFilter)}><option value="visible">Visible</option><option value="archived">Archived</option><option value="all">All history</option></select></label>,
-    primary: newRunPage ? <button className="btn btn-primary btn-sm" onClick={(event) => void (startReviewIdentity ? confirmStart() : openStartReview(event.currentTarget))} disabled={startReviewIdentity ? startDisabled || !startReviewReady || startRevalidationPendingForRender || Boolean(restartActions) : startDisabled || Boolean(restartActions)}>{busyAction === 'start' ? 'Starting…' : startRevalidationPendingForRender ? 'Checking…' : startReviewIdentity ? 'Start run' : 'Review start…'}</button> : <button className="btn btn-primary btn-sm" onClick={openNewRunPage}>New run</button>,
+    primary: newRunPage ? <button ref={headerStartButtonRef} className="btn btn-primary btn-sm" onClick={(event) => headerStartActionRef.current(event.currentTarget)} disabled={headerStartBlocked}>{busyAction === 'start' ? 'Starting…' : startRevalidationPendingForRender ? 'Checking…' : startReviewIdentity ? 'Start run' : 'Review start…'}</button> : <button className="btn btn-primary btn-sm" onClick={openNewRunPage}>New run</button>,
     more: <MoreMenu label={newRunPage ? 'More new run actions' : 'More run page actions'} triggerLabel="More">
       {newRunPage ? <MenuItem disabled={busyAction === 'start'} onClick={startReviewIdentity ? cancelStartReview : cancelNewRun}>{startReviewIdentity ? 'Cancel review' : 'Cancel'}</MenuItem> : <>
         <MenuItem onClick={() => void handleCopyLink()}>Copy link</MenuItem>
