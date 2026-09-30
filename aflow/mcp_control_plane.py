@@ -188,6 +188,19 @@ def _bounded_cursor(cursor: str | None) -> str | None:
     return cursor
 
 
+_PLAN_CURSOR_MAX_LENGTH = 4_096
+
+
+def _bounded_plan_cursor(cursor: str | None) -> str | None:
+    if cursor is None:
+        return cursor
+    if len(cursor) > _PLAN_CURSOR_MAX_LENGTH:
+        raise ValueError("plan cursor must be at most 4096 characters")
+    if any(ord(char) <= 0x1F or ord(char) == 0x7F for char in cursor):
+        raise ValueError("plan cursor may not contain control characters")
+    return cursor
+
+
 def _bounded_idempotency_key(idempotency_key: str | None) -> str | None:
     if idempotency_key is not None and len(idempotency_key) > 256:
         raise ValueError("idempotency key must be at most 256 characters")
@@ -288,6 +301,8 @@ def create_control_plane_mcp(
 
         This is the run-control view of plans. The web registry's
         ``list_plan_documents`` tool lists revisioned Markdown documents.
+        The cursor is the exact final plan path from the previous page, a
+        lexicographic continuation key of at most 4096 characters.
         """
         return tool_result(
             lambda: {
@@ -296,7 +311,7 @@ def create_control_plane_mcp(
                     for plan in get_service().list_plans(
                         project_id,
                         limit=_bounded_limit(limit),
-                        cursor=_bounded_cursor(cursor),
+                        cursor=_bounded_plan_cursor(cursor),
                     )
                 ]
             },

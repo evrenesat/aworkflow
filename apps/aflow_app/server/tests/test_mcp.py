@@ -231,6 +231,100 @@ def test_mcp_historical_owner_stop_acknowledgement(mcp_client) -> None:
     assert _mcp_tool_error(client, "owner_stop", arguments) == "operation_forbidden"
 
 
+def test_mcp_list_plans_pages_full_path_cursors_past_64_characters(mcp_client) -> None:
+    client, root, _, _ = mcp_client
+    todo = root / "plans" / "todo"
+    names = [f"aaa-{index:03d}.md" for index in range(99)]
+    boundary_64 = "macos-plan-lifecycle-path-alias-ci-repair-20260925.md"
+    names.append(boundary_64)
+    names += [f"mmm-{index:03d}.md" for index in range(100, 197)]
+    names += ["second-plan.md", "test-plan.md"]
+    boundary_71 = "zzz-macos-plan-lifecycle-path-alias-ci-repair-20260925-pg.md"
+    names.append(boundary_71)
+    names += [f"zzz-tail-{index:03d}.md" for index in range(201, 236)]
+    for name in names:
+        (todo / name).write_text(f"# {name}\n", encoding="utf-8")
+    expected = sorted(f"plans/todo/{name}" for name in names)
+    assert len(expected) == 235
+    assert expected[99] == f"plans/todo/{boundary_64}"
+    assert len(expected[99]) == 64
+    assert expected[199] == f"plans/todo/{boundary_71}"
+    assert len(expected[199]) == 71
+
+    first_page = _mcp_tool(client, "list_plans", {"project_id": PROJECT_ID, "limit": 100})
+    assert [plan["path"] for plan in first_page["plans"]] == expected[:100]
+
+    second_page = _mcp_tool(
+        client,
+        "list_plans",
+        {"project_id": PROJECT_ID, "limit": 100, "cursor": expected[99]},
+    )
+    assert [plan["path"] for plan in second_page["plans"]] == expected[100:200]
+
+    third_page = _mcp_tool(
+        client,
+        "list_plans",
+        {"project_id": PROJECT_ID, "limit": 100, "cursor": expected[199]},
+    )
+    assert [plan["path"] for plan in third_page["plans"]] == expected[200:]
+
+    empty_page = _mcp_tool(
+        client,
+        "list_plans",
+        {"project_id": PROJECT_ID, "limit": 100, "cursor": expected[-1]},
+    )
+    assert empty_page["plans"] == []
+
+    beyond_page = _mcp_tool(
+        client,
+        "list_plans",
+        {"project_id": PROJECT_ID, "limit": 100, "cursor": "z" * 4096},
+    )
+    assert beyond_page["plans"] == []
+
+    assert _mcp_tool_error(
+        client,
+        "list_plans",
+        {"project_id": PROJECT_ID, "cursor": "z" * 4097},
+    ) == "operation_rejected"
+    for control in ("\x00", "\x1f", "\x7f"):
+        message = _mcp_tool_error(
+            client,
+            "list_plans",
+            {"project_id": PROJECT_ID, "cursor": f"plans/todo/{control}plan.md"},
+        )
+        assert message == "operation_rejected"
+        assert control not in message
+    assert _mcp_tool_error(
+        client,
+        "list_plans",
+        {"project_id": PROJECT_ID, "cursor": 123},
+    )
+
+
+def test_mcp_list_runs_keeps_64_character_cursor_contract(mcp_client) -> None:
+    client, root, _, _ = mcp_client
+    _seed_owner_stop_manifest(root, "mcp-run-cursor-a")
+    _seed_owner_stop_manifest(root, "mcp-run-cursor-b")
+
+    first_page = _mcp_tool(client, "list_runs", {"project_id": PROJECT_ID, "limit": 1})
+    assert [run["run_id"] for run in first_page["runs"]] == ["mcp-run-cursor-a"]
+    assert first_page["next_cursor"] == "mcp-run-cursor-a"
+
+    second_page = _mcp_tool(
+        client,
+        "list_runs",
+        {"project_id": PROJECT_ID, "limit": 1, "cursor": first_page["next_cursor"]},
+    )
+    assert [run["run_id"] for run in second_page["runs"]] == ["mcp-run-cursor-b"]
+
+    assert _mcp_tool_error(
+        client,
+        "list_runs",
+        {"project_id": PROJECT_ID, "cursor": "a" * 65},
+    ) == "operation_rejected"
+
+
 def test_mcp_get_run_exposes_defect_confirmation(mcp_client) -> None:
     from aflow.control_plane import write_launch_phase
 

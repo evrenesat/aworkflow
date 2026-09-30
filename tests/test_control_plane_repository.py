@@ -92,6 +92,45 @@ def test_repository_lists_stable_plan_and_run_metadata(tmp_path: Path) -> None:
     assert legacy_metadata.read_text() == '{"status":"running","workflow_name":"old"}\n'
 
 
+def test_repository_pages_plans_past_long_path_boundaries(tmp_path: Path) -> None:
+    todo = tmp_path / "plans" / "todo"
+    todo.mkdir(parents=True)
+    names = [f"aaa-{index:03d}.md" for index in range(99)]
+    boundary_64 = "macos-plan-lifecycle-path-alias-ci-repair-20260925.md"
+    names.append(boundary_64)
+    names += [f"mmm-{index:03d}.md" for index in range(100, 197)]
+    names += ["second-plan.md", "test-plan.md"]
+    boundary_71 = "zzz-macos-plan-lifecycle-path-alias-ci-repair-20260925-pg.md"
+    names.append(boundary_71)
+    names += [f"zzz-tail-{index:03d}.md" for index in range(201, 236)]
+    for name in names:
+        (todo / name).write_text(f"# {name}\n", encoding="utf-8")
+    expected = sorted(f"plans/todo/{name}" for name in names)
+    assert len(expected) == 235
+    assert expected[99] == f"plans/todo/{boundary_64}"
+    assert len(expected[99]) == 64
+    assert expected[199] == f"plans/todo/{boundary_71}"
+    assert len(expected[199]) == 71
+
+    repository = RunRepository(tmp_path)
+
+    collected: list[str] = []
+    page_sizes: list[int] = []
+    cursor: str | None = None
+    while True:
+        page = repository.list_plans(limit=100, cursor=cursor)
+        page_sizes.append(len(page))
+        if not page:
+            break
+        collected.extend(record.path for record in page)
+        cursor = page[-1].path
+
+    assert page_sizes == [100, 100, 35, 0]
+    assert collected == expected
+    assert len(collected) == len(set(collected))
+    assert cursor == expected[-1]
+
+
 def test_repository_status_and_list_expose_only_the_canonical_summary(
     tmp_path: Path,
 ) -> None:

@@ -1,5 +1,41 @@
 # DEVLOG
 
+## 2026-09-30 — Accept bounded full-path plan cursors in mounted MCP (Checkpoint 1)
+
+- The mounted MCP `list_plans` tool shared the run cursor's 64-character
+  `_bounded_cursor` limit with `list_runs`, so the live pagination sequence
+  from issue #56 broke: the 64-character first-page continuation
+  (`plans/done/macos-plan-lifecycle-path-alias-ci-repair-20260925.md`,
+  exactly 64 characters) succeeded, while the 71-character second-page
+  continuation returned `operation_rejected`. `aflow/mcp_control_plane.py`
+  now has a plan-specific `_bounded_plan_cursor` used only by `list_plans`:
+  it accepts full plan paths of at most 4,096 characters, preserves `None`
+  and empty-string start cursors, rejects C0 control characters and DEL with
+  the secret-safe fixed `operation_rejected` code (never echoing the
+  supplied value), and passes the cursor through unchanged as a
+  lexicographic continuation key. `list_runs`, `_bounded_cursor`, the
+  64-character run cursor limit, response shapes, authentication, and
+  credential rejection are unchanged.
+- Repository coverage walks 235 regular plan files with the exact
+  64-character issue path at the page-1 boundary and a 71-character path at
+  the page-2 boundary; following each returned final path yields every
+  record exactly once in repository order and terminates on the empty page.
+  Authenticated mounted-MCP coverage (`_mcp_tool`/`_mcp_tool_error`)
+  reproduces the corrected live sequence across real 100-item boundaries —
+  the 64-character first-page continuation succeeds and the returned
+  71-character second-page continuation now succeeds — plus a 4,096-character
+  cursor accepted with an empty page, rejection at 4,097 characters,
+  rejection of C0/DEL control characters without echo, non-string cursor
+  schema rejection, and a run-pagination non-regression (valid run cursors
+  follow `next_cursor`; a 65-character run cursor is still rejected). The
+  new MCP test fails with the old shared 64-character limit and passes with
+  the fix.
+- Verification: from the repository root, `uv run pytest
+  tests/test_control_plane_repository.py -q` (38 passed) and `uv run ruff
+  check aflow/mcp_control_plane.py` (clean); from `apps/aflow_app/server`,
+  `uv run pytest tests/test_mcp.py -q` (44 passed); `git diff --check` is
+  clean. No UI change is included.
+
 ## 2026-09-30 — Canonicalize trusted package root in assertion confirmation
 
 - The macOS CI failure was a path-alias mismatch: temporary paths under
