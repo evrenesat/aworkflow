@@ -345,19 +345,36 @@ def build_planning_prompt(
     return prompt
 
 
+def _validate_planner_choice(value: object, *, label: str) -> str:
+    if (
+        not isinstance(value, str)
+        or not value.strip()
+        or any(character.isspace() for character in value)
+    ):
+        raise PlannerFailure(f"planner_{label}_invalid")
+    return value
+
+
 def build_codex_argv(
-    *, worktree: Path, schema_path: Path, output_path: Path
+    *,
+    worktree: Path,
+    schema_path: Path,
+    output_path: Path,
+    model: str = PLANNER_MODEL,
+    effort: str = PLANNER_EFFORT,
 ) -> tuple[str, ...]:
     """Return the reviewed, bounded Codex invocation contract."""
+    model = _validate_planner_choice(model, label="model")
+    effort = _validate_planner_choice(effort, label="effort")
     return (
         "codex",
         "exec",
         "--model",
-        PLANNER_MODEL,
+        model,
         "-c",
         "approval_policy='never'",
         "-c",
-        f"model_reasoning_effort='{PLANNER_EFFORT}'",
+        f"model_reasoning_effort='{effort}'",
         "--sandbox",
         "read-only",
         "--output-schema",
@@ -370,6 +387,28 @@ def build_codex_argv(
         str(worktree),
         "-",
     )
+
+
+CONCIERGE_VERIFICATION_COMMAND_RE = re.compile(r"Run:\s*`[^`\n]+`")
+
+
+def validate_concierge_plan_evidence(markdown: str, *, issue_url: str) -> None:
+    """Reject a concierge plan before MCP authoring when evidence is missing.
+
+    A launchable owner plan must reference its source issue, map behavior to
+    acceptance tests, name the exact verification command, and state safe
+    defaults.
+    """
+    if not isinstance(markdown, str) or not markdown.strip():
+        raise PlannerFailure("planner_plan_empty")
+    if issue_url not in markdown:
+        raise PlannerFailure("planner_plan_missing_issue_reference")
+    if CONCIERGE_VERIFICATION_COMMAND_RE.search(markdown) is None:
+        raise PlannerFailure("planner_plan_missing_verification_command")
+    if "Behavioral Acceptance Tests" not in markdown:
+        raise PlannerFailure("planner_plan_missing_acceptance_mapping")
+    if "Assumptions And Defaults" not in markdown:
+        raise PlannerFailure("planner_plan_missing_safe_defaults")
 
 
 def _terminate_process_group(
@@ -748,6 +787,9 @@ class IssueIntakePlanner:
         state_root: Path,
         skill_loader: Callable[[], str] | None = None,
         process_runner: ProcessRunner | None = None,
+        model: str | None = None,
+        effort: str | None = None,
+        require_concierge_evidence: bool = False,
     ) -> None:
         self.client = client
         candidate_root = Path(state_root).expanduser()
@@ -756,6 +798,13 @@ class IssueIntakePlanner:
         self.state_root = candidate_root
         self.skill_loader = skill_loader or _load_effective_plan_skill
         self.process_runner = process_runner or _run_codex
+        self.model = _validate_planner_choice(
+            PLANNER_MODEL if model is None else model, label="model"
+        )
+        self.effort = _validate_planner_choice(
+            PLANNER_EFFORT if effort is None else effort, label="effort"
+        )
+        self.require_concierge_evidence = bool(require_concierge_evidence)
 
     def _registered_project_root(self, project_id: str) -> Path:
         try:
@@ -1050,8 +1099,8 @@ class IssueIntakePlanner:
     ) -> dict[str, object]:
         return {
             "kind": "codex_planner",
-            "model": PLANNER_MODEL,
-            "effort": PLANNER_EFFORT,
+            "model": self.model,
+            "effort": self.effort,
             "base_sha": workspace.base_sha,
             "project_root": str(workspace.project_root),
             "artifact_manifest": str(workspace.manifest_path),
@@ -1103,9 +1152,18 @@ class IssueIntakePlanner:
             worktree=workspace.worktree,
             schema_path=workspace.schema_path,
             output_path=workspace.output_path,
+            model=self.model,
+            effort=self.effort,
         )
         process = self.process_runner(argv, workspace.worktree, prompt.encode("utf-8"))
         result, output_bytes = _parse_process_response(workspace, process)
+        if self.require_concierge_evidence and result.status == "plan":
+            validate_concierge_plan_evidence(
+                result.markdown,
+                issue_url=(
+                    f"https://github.com/{repository_full_name}/issues/{issue_number}"
+                ),
+            )
         _atomic_write(
             workspace.manifest_path,
             _manifest_for(workspace, result, output_bytes, process.returncode),
@@ -1179,4 +1237,5 @@ __all__ = [
     "PlanningWorkspace",
     "build_codex_argv",
     "build_planning_prompt",
+    "validate_concierge_plan_evidence",
 ]

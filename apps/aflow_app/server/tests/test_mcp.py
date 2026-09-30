@@ -322,6 +322,13 @@ def test_mcp_stateless_http_auth_metadata_resources_and_rest_parity(mcp_client) 
     }
     capabilities = _mcp_tool(client, "get_capabilities")
     assert capabilities == client.get("/api/control-plane/capabilities", headers={"Authorization": f"Bearer {TOKEN}"}).json()
+    projection = capabilities["projects"][PROJECT_ID]["publication"]
+    assert set(projection) == {
+        "available",
+        "publish_remote",
+        "publish_branch",
+    }
+    assert isinstance(projection["available"], bool)
     assert _mcp_tool(client, "list_projects") == client.get(
         "/api/control-plane/projects",
         headers={"Authorization": f"Bearer {TOKEN}"},

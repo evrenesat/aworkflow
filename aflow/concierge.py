@@ -1,0 +1,2219 @@
+"""Bounded, non-overlapping concierge tick for the p100 owner-issue relay.
+
+Each tick owns one short-lived advisory Codex CLI process running
+``gpt-6.1-sol`` at ``xhigh`` reasoning effort, configured for the local
+AFlow MCP endpoint with environment-variable-backed bearer authentication.
+The concierge process is the authoritative decision and execution boundary:
+it reads the queue and plan documents through MCP, plans eligible
+owner-authored issues with the read-only ``gpt-6-astra`` high-effort
+planner, and performs at most one bounded MCP action per tick.  The tick
+follows the packaged one-plan triage policy: it prefers a verified
+resumable failed lineage, then one launchable plan, then the oldest
+owner-authored issue that no plan document already covers.  It never edits
+implementation code, never uses a non-MCP AFlow control channel, never
+performs blind recovery, and never persists raw transcripts.  Only a
+bounded, redacted status record is written.
+"""
+
+from __future__ import annotations
+
+from collections.abc import Callable, Iterator, Mapping, Sequence
+from contextlib import contextmanager
+from dataclasses import dataclass, field
+from importlib import resources
+import argparse
+import asyncio
+import fcntl
+import hashlib
+import http.client
+import json
+import os
+from pathlib import Path
+import re
+import signal
+import stat
+import subprocess
+import sys
+import tempfile
+import threading
+import time
+import tomllib
+from typing import Any, Protocol
+from urllib import parse as urllib_parse
+from urllib import request as urllib_request
+
+CONCIERGE_MODEL = "gpt-6.1-sol"
+CONCIERGE_EFFORT = "xhigh"
+CONCIERGE_MCP_NAME = "aflow"
+CONCIERGE_MCP_URL = "http://127.0.0.1:8765/mcp"
+CONCIERGE_TOKEN_ENV = "AFLOW_APP_TOKEN"
+CONCIERGE_GITHUB_TOKEN_ENV = "GITHUB_TOKEN"
+CONCIERGE_STATUS_SCHEMA_VERSION = 2
+TICK_INTERVAL_SECONDS = 20 * 60
+DEFAULT_TIMEOUT_SECONDS = 15 * 60
+DEFAULT_STATE_DIR = Path("/var/lib/aflowd/concierge")
+DEFAULT_WORK_DIR = Path("/root/code")
+CONCIERGE_PROJECT_ROOT_DEFAULT = Path("/root/code/agent-flow")
+GITHUB_API_URL_DEFAULT = "https://api.github.com"
+CONCIERGE_STREAM_MAX_BYTES = 2 * 1024 * 1024
+CONCIERGE_STATUS_TAIL_MAX_CHARS = 4096
+CONCIERGE_PROMPT_RESOURCE = "concierge_prompt.md"
+CONCIERGE_PROMPT_MAX_BYTES = 32 * 1024
+CONCIERGE_OWNER_ID = 591691
+CONCIERGE_PLANNER_MODEL = "gpt-6-astra"
+CONCIERGE_PLANNER_EFFORT = "high"
+CONCIERGE_WORKFLOW_NAME = "checkpoint_delivery"
+CONCIERGE_TEAM = "xtx-mtp"
+REQUIRED_WORKFLOW_SETUP = frozenset({"worktree", "branch"})
+REQUIRED_WORKFLOW_TEARDOWN = frozenset({"merge", "rm_worktree"})
+CONCIERGE_MCP_CALL_TIMEOUT_SECONDS = 60.0
+CONCIERGE_GITHUB_TIMEOUT_SECONDS = 30.0
+CONCIERGE_GITHUB_MAX_PAGES = 5
+CONCIERGE_PAGE_LIMIT = 100
+CONCIERGE_MAX_PAGES = 100
+CONCIERGE_PLANNER_QUESTION_MAX_CHARS = 512
+ACTIVE_RUN_ACTIVITY = "active"
+UNCERTAIN_RUN_ACTIVITY = "unknown"
+INACTIVE_RUN_ACTIVITY = "inactive"
+TERMINAL_FAILED_RUN_STATUSES = frozenset({"failed", "stopped"})
+LAUNCHABLE_PLAN_STATUSES = frozenset({"todo", "draft"})
+PLANNED_EVIDENCE_STATUSES = frozenset({"todo", "in-progress", "failed", "done"})
+MUTATING_TICK_ACTIONS = frozenset({"resume", "start", "plan_and_start"})
+TOKEN_MIN_LENGTH = 8
+TOKEN_MAX_LENGTH = 1024
+_TOKEN_SAFE_RE = re.compile(r"^[A-Za-z0-9._~-]+$")
+_ISSUE_URL_RE = re.compile(
+    r"https://github\.com/([A-Za-z0-9._-]+)/([A-Za-z0-9._-]+)/issues/(\d+)"
+)
+_GITHUB_HTTPS_REMOTE_RE = re.compile(
+    r"^https://github\.com/([A-Za-z0-9._-]+)/([A-Za-z0-9._-]+?)(?:\.git)?/?$"
+)
+_GITHUB_SSH_REMOTE_RE = re.compile(
+    r"^git@github\.com:([A-Za-z0-9._-]+)/([A-Za-z0-9._-]+?)(?:\.git)?/?$"
+)
+_GITHUB_LINK_NEXT_RE = re.compile(r'\s*<([^>]+)>;\s*rel="next"')
+_PLAN_STATUS_BY_DIRECTORY = {
+    "todo": "todo",
+    "in-progress": "in_progress",
+    "failed": "failed",
+    "done": "done",
+    "needs-plan-change": "needs_plan_change",
+}
+
+
+class ConciergeError(RuntimeError):
+    """A bounded concierge failure with a safe, fixed reason code."""
+
+    def __init__(self, reason: str) -> None:
+        self.reason = reason
+        super().__init__(reason)
+
+
+class TickDeferral(ConciergeError):
+    """A tick that must defer because another tick owns the single slot."""
+
+
+@dataclass(frozen=True)
+class TickProcessResult:
+    """Bounded process output kept out of durable records."""
+
+    returncode: int
+    stdout: bytes = b""
+    stderr: bytes = b""
+    timed_out: bool = False
+    overflowed: bool = False
+    interrupted: bool = False
+
+
+class ProcessRunner(Protocol):
+    def __call__(
+        self,
+        argv: Sequence[str],
+        cwd: Path,
+        prompt: bytes,
+        timeout_seconds: float,
+    ) -> TickProcessResult: ...
+
+
+@dataclass(frozen=True)
+class TickObservation:
+    """Bounded MCP/GitHub snapshot for one triage decision.
+
+    ``runs`` and ``plans`` entries are the MCP ``list_runs``/``list_plans``
+    mappings; ``issues`` entries carry ``number``, ``author_id``,
+    ``full_name``, ``created_at``, and ``state``.  ``plan_documents`` maps
+    every relevant plan path to its read document content; duplicate
+    detection matches canonical source issue URLs inside that content.
+    """
+
+    project: Mapping[str, object]
+    runs: tuple[Mapping[str, object], ...] = ()
+    plans: tuple[Mapping[str, object], ...] = ()
+    issues: tuple[Mapping[str, object], ...] = ()
+    plan_documents: Mapping[str, str] = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
+class GithubIssuePage:
+    """Bounded open-issue evidence for one repository."""
+
+    repository_id: int
+    issues: tuple[Mapping[str, object], ...]
+
+
+@dataclass(frozen=True)
+class ConciergeCanonicalIssue:
+    """Canonical owner-issue text for one planner claim."""
+
+    title: str
+    body: str
+    title_body_sha256: str
+
+
+@dataclass(frozen=True)
+class TickOutcome:
+    """Bounded result of one authoritative tick decision and execution."""
+
+    action: str
+    reason: str
+    mutating: bool = False
+    details: Mapping[str, object] = field(default_factory=dict)
+
+
+class McpClient(Protocol):
+    def call_tool(
+        self, name: str, arguments: Mapping[str, object]
+    ) -> Mapping[str, object]: ...
+
+    def close(self) -> None: ...
+
+
+class GithubClient(Protocol):
+    def open_issues(self, full_name: str) -> GithubIssuePage: ...
+
+
+class TickExecutor(Protocol):
+    def execute(
+        self,
+        *,
+        state_dir: Path,
+        project_root: Path,
+        environment: Mapping[str, str],
+    ) -> TickOutcome: ...
+
+    def close(self) -> None: ...
+
+
+@dataclass(frozen=True)
+class TriageDecision:
+    """The single bounded action (or non-action) chosen for one tick."""
+
+    action: str
+    reason: str
+    run_id: str | None = None
+    plan_path: str | None = None
+    issue_number: int | None = None
+    issue_url: str | None = None
+    idempotency_key: str | None = None
+    workflow_name: str | None = None
+    team: str | None = None
+
+    @property
+    def mutating(self) -> bool:
+        return self.action in MUTATING_TICK_ACTIONS
+
+
+def read_bearer_token(environment: Mapping[str, str]) -> str:
+    """Read and validate the local UI bearer from the current environment."""
+    token = environment.get(CONCIERGE_TOKEN_ENV)
+    if not isinstance(token, str) or not token:
+        raise ConciergeError("bearer_token_missing")
+    if any(character.isspace() for character in token):
+        raise ConciergeError("bearer_token_unsafe")
+    if not (TOKEN_MIN_LENGTH <= len(token) <= TOKEN_MAX_LENGTH):
+        raise ConciergeError("bearer_token_unsafe")
+    if not _TOKEN_SAFE_RE.fullmatch(token):
+        raise ConciergeError("bearer_token_unsafe")
+    return token
+
+
+def build_codex_argv(*, work_dir: Path) -> tuple[str, ...]:
+    """Return the reviewed, bounded Codex invocation contract.
+
+    The bearer is referenced only by environment-variable name; the token
+    value never appears in argv.  ``--skip-git-repo-check`` keeps the tick
+    runnable from the configured parent directory, which is not required to
+    be a Git repository; the tick itself stays read-only.
+    """
+    return (
+        "codex",
+        "exec",
+        "--skip-git-repo-check",
+        "--model",
+        CONCIERGE_MODEL,
+        "-c",
+        f"model_reasoning_effort='{CONCIERGE_EFFORT}'",
+        "-c",
+        f"mcp_servers.{CONCIERGE_MCP_NAME}.url='{CONCIERGE_MCP_URL}'",
+        "-c",
+        f"mcp_servers.{CONCIERGE_MCP_NAME}.bearer_token_env_var='{CONCIERGE_TOKEN_ENV}'",
+        "--sandbox",
+        "read-only",
+        "--ephemeral",
+        "-C",
+        str(work_dir),
+        "-",
+    )
+
+
+def load_tick_prompt() -> str:
+    """Load the packaged one-plan triage tick prompt with bounded size."""
+    try:
+        text = (
+            resources.files("aflow")
+            .joinpath(CONCIERGE_PROMPT_RESOURCE)
+            .read_text(encoding="utf-8")
+        )
+    except (OSError, UnicodeError, AttributeError) as exc:
+        raise ConciergeError("tick_prompt_unavailable") from exc
+    if not text.strip() or "\x00" in text:
+        raise ConciergeError("tick_prompt_invalid")
+    if len(text.encode("utf-8")) > CONCIERGE_PROMPT_MAX_BYTES:
+        raise ConciergeError("tick_prompt_too_large")
+    return text
+
+
+def build_tick_prompt() -> str:
+    """Build the bounded one-plan triage tick prompt."""
+    return load_tick_prompt()
+
+
+def _start_key(identity: str) -> str:
+    """Derive the stable lifecycle start key for one logical action."""
+    digest = hashlib.sha256(identity.encode("utf-8")).hexdigest()
+    return f"concierge-start-{digest[:16]}"
+
+
+def _run_activity(run: Mapping[str, object]) -> str:
+    value = run.get("activity")
+    if value in (ACTIVE_RUN_ACTIVITY, INACTIVE_RUN_ACTIVITY, UNCERTAIN_RUN_ACTIVITY):
+        return str(value)
+    return UNCERTAIN_RUN_ACTIVITY
+
+
+def _validate_observation(observation: TickObservation) -> None:
+    project = observation.project
+    if not isinstance(project, Mapping) or not isinstance(
+        project.get("project_id"), str
+    ) or not project.get("project_id"):
+        raise ConciergeError("observation_project_invalid")
+    for run in observation.runs:
+        if (
+            not isinstance(run, Mapping)
+            or not isinstance(run.get("run_id"), str)
+            or not run.get("run_id")
+        ):
+            raise ConciergeError("observation_run_invalid")
+    for plan in observation.plans:
+        if (
+            not isinstance(plan, Mapping)
+            or not isinstance(plan.get("path"), str)
+            or not plan.get("path")
+        ):
+            raise ConciergeError("observation_plan_invalid")
+    for issue in observation.issues:
+        if (
+            not isinstance(issue, Mapping)
+            or type(issue.get("number")) is not int
+            or type(issue.get("author_id")) is not int
+            or not isinstance(issue.get("full_name"), str)
+            or not issue.get("full_name")
+            or not isinstance(issue.get("created_at"), str)
+            or not issue.get("created_at")
+        ):
+            raise ConciergeError("observation_issue_invalid")
+    documents = observation.plan_documents
+    if not isinstance(documents, Mapping):
+        raise ConciergeError("observation_plan_documents_invalid")
+    for path, content in documents.items():
+        if not isinstance(path, str) or not path or not isinstance(content, str):
+            raise ConciergeError("observation_plan_documents_invalid")
+
+
+def _normalized_plan_status(value: object) -> str:
+    if not isinstance(value, str):
+        return ""
+    return value.replace("_", "-")
+
+
+def _issue_urls_in(text: str) -> frozenset[str]:
+    """Extract canonical source issue URLs from one plan document."""
+    return frozenset(
+        f"https://github.com/{owner}/{repo}/issues/{number}"
+        for owner, repo, number in _ISSUE_URL_RE.findall(text)
+    )
+
+
+def _issue_url(issue: Mapping[str, object]) -> str:
+    return f"https://github.com/{issue['full_name']}/issues/{issue['number']}"
+
+
+def repository_full_name(project_root: Path) -> str:
+    """Derive the GitHub ``owner/repo`` identity from the origin remote."""
+    try:
+        completed = subprocess.run(
+            ("git", "-C", str(project_root), "remote", "get-url", "origin"),
+            capture_output=True,
+            timeout=30.0,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise ConciergeError("repository_full_name_unavailable") from exc
+    if completed.returncode != 0:
+        raise ConciergeError("repository_full_name_unavailable")
+    remote = completed.stdout.decode("utf-8", errors="replace").strip()
+    for pattern in (_GITHUB_HTTPS_REMOTE_RE, _GITHUB_SSH_REMOTE_RE):
+        match = pattern.fullmatch(remote)
+        if match is not None:
+            return f"{match.group(1)}/{match.group(2)}"
+    raise ConciergeError("repository_full_name_unsupported")
+
+
+def _lifecycle_array(value: object) -> tuple[str, ...] | None:
+    """Validate one workflow lifecycle list of non-empty step names."""
+    if not isinstance(value, (list, tuple)):
+        return None
+    for item in value:
+        if not isinstance(item, str) or not item:
+            return None
+    return tuple(value)
+
+
+def _resolve_workflow_lifecycle(
+    workflows_toml: str, workflow_name: str
+) -> tuple[tuple[str, ...], tuple[str, ...]] | None:
+    """Resolve a workflow's effective setup/teardown from the shared document.
+
+    Mirrors the shared ``[workflow]`` defaults and ``extends`` inheritance so
+    a listed workflow cannot hide a missing delivery boundary.  Returns
+    ``None`` when the document, the workflow, or a lifecycle list is missing
+    or malformed.
+    """
+    try:
+        document = tomllib.loads(workflows_toml)
+    except (tomllib.TOMLDecodeError, ValueError):
+        return None
+    if not isinstance(document, Mapping):
+        return None
+    root = document.get("workflow")
+    if not isinstance(root, Mapping):
+        return None
+    default_setup = _lifecycle_array(root.get("setup"))
+    default_teardown = _lifecycle_array(root.get("teardown"))
+    if default_setup is None:
+        default_setup = ()
+    if default_teardown is None:
+        default_teardown = ()
+    resolved: dict[str, tuple[tuple[str, ...], tuple[str, ...]]] = {}
+    resolving: set[str] = set()
+
+    def resolve(name: str) -> tuple[tuple[str, ...], tuple[str, ...]] | None:
+        if name in resolved:
+            return resolved[name]
+        if name in resolving:
+            return None
+        table = root.get(name)
+        if not isinstance(table, Mapping):
+            return None
+        resolving.add(name)
+        setup = _lifecycle_array(table.get("setup"))
+        teardown = _lifecycle_array(table.get("teardown"))
+        extends = table.get("extends")
+        if extends is None:
+            if setup is None:
+                setup = default_setup
+            if teardown is None:
+                teardown = default_teardown
+        else:
+            if not isinstance(extends, str) or not extends:
+                resolving.discard(name)
+                return None
+            base = resolve(extends)
+            if base is None:
+                resolving.discard(name)
+                return None
+            if setup is None:
+                setup = base[0]
+            if teardown is None:
+                teardown = base[1]
+        lifecycle = (setup, teardown)
+        resolved[name] = lifecycle
+        resolving.discard(name)
+        return lifecycle
+
+    return resolve(workflow_name)
+
+
+def _publication_settings_evidence(
+    capabilities: Mapping[str, object],
+) -> tuple[str, str] | None:
+    """Return the exact origin/main publication grant from the capabilities read.
+
+    Returns None when the project-scoped projection is unavailable or does not
+    grant exactly aflow.publishRemote=origin and aflow.publishBranch=main.
+    """
+    publication = capabilities.get("publication")
+    if not isinstance(publication, Mapping) or publication.get("available") is not True:
+        return None
+    remote = publication.get("publish_remote")
+    branch = publication.get("publish_branch")
+    if remote != "origin" or branch != "main":
+        return None
+    return remote, branch
+
+
+def triage_tick(observation: TickObservation) -> TriageDecision:
+    """Choose at most one bounded action for the observed queue state.
+
+    Priority order: defer on active/uncertain runs, resume a verified
+    inactive failed lineage, start exactly one launchable plan, then plan
+    and start the oldest eligible owner issue.  Ambiguity reports without a
+    guessed action.
+    """
+    _validate_observation(observation)
+    runs = observation.runs
+
+    active = [run for run in runs if _run_activity(run) == ACTIVE_RUN_ACTIVITY]
+    if active:
+        return TriageDecision(
+            action="defer",
+            reason="active_run_present",
+            run_id=str(active[0]["run_id"]),
+        )
+    uncertain = [
+        run for run in runs if _run_activity(run) == UNCERTAIN_RUN_ACTIVITY
+    ]
+    if uncertain:
+        return TriageDecision(
+            action="defer",
+            reason="uncertain_run_present",
+            run_id=str(uncertain[0]["run_id"]),
+        )
+
+    plans = observation.plans
+    plan_paths = {plan.get("path") for plan in plans}
+
+    failed = [
+        run
+        for run in runs
+        if _run_activity(run) == INACTIVE_RUN_ACTIVITY
+        and run.get("status") in TERMINAL_FAILED_RUN_STATUSES
+    ]
+    if failed:
+        for run in sorted(failed, key=lambda item: str(item["run_id"])):
+            path = run.get("plan_path")
+            if not (isinstance(path, str) and path):
+                return TriageDecision(
+                    action="report",
+                    reason="failed_lineage_missing_plan",
+                    run_id=str(run["run_id"]),
+                )
+        by_plan: dict[str, int] = {}
+        for run in failed:
+            by_plan[str(run["plan_path"])] = by_plan.get(str(run["plan_path"]), 0) + 1
+        ambiguous = sorted(
+            path for path, count in by_plan.items() if count > 1
+        )
+        if ambiguous:
+            return TriageDecision(
+                action="report",
+                reason="ambiguous_predecessor_ownership",
+                plan_path=ambiguous[0],
+            )
+        run = sorted(failed, key=lambda item: str(item["run_id"]))[0]
+        path = str(run["plan_path"])
+        if path not in plan_paths:
+            return TriageDecision(
+                action="report",
+                reason="failed_lineage_plan_unregistered",
+                run_id=str(run["run_id"]),
+                plan_path=path,
+            )
+        competing = [
+            other
+            for other in runs
+            if other.get("plan_path") == path
+            and other.get("run_id") != run.get("run_id")
+        ]
+        if competing:
+            return TriageDecision(
+                action="report",
+                reason="competing_run_ownership",
+                run_id=str(run["run_id"]),
+                plan_path=path,
+            )
+        return TriageDecision(
+            action="resume",
+            reason="failed_lineage_resumable",
+            run_id=str(run["run_id"]),
+            plan_path=path,
+            idempotency_key=f"concierge-resume-{run['run_id']}",
+        )
+
+    referenced = {run.get("plan_path") for run in runs}
+    launchable = [
+        plan
+        for plan in plans
+        if plan.get("status") in LAUNCHABLE_PLAN_STATUSES
+        and plan.get("path") not in referenced
+    ]
+    if len(launchable) > 1:
+        return TriageDecision(
+            action="report",
+            reason="multiple_launchable_plans",
+            plan_path=sorted(str(plan["path"]) for plan in launchable)[0],
+        )
+    if len(launchable) == 1:
+        path = str(launchable[0]["path"])
+        return TriageDecision(
+            action="start",
+            reason="single_launchable_plan",
+            plan_path=path,
+            idempotency_key=_start_key(path),
+            workflow_name=CONCIERGE_WORKFLOW_NAME,
+            team=CONCIERGE_TEAM,
+        )
+
+    owner_issues = [
+        issue
+        for issue in observation.issues
+        if issue.get("author_id") == CONCIERGE_OWNER_ID
+        and issue.get("state", "open") == "open"
+    ]
+    if not owner_issues:
+        return TriageDecision(action="idle", reason="no_eligible_work")
+    planned_urls: set[str] = set()
+    for plan in plans:
+        if _normalized_plan_status(plan.get("status")) not in PLANNED_EVIDENCE_STATUSES:
+            continue
+        path = str(plan["path"])
+        content = observation.plan_documents.get(path)
+        if not isinstance(content, str):
+            return TriageDecision(
+                action="report",
+                reason="plan_evidence_unavailable",
+                plan_path=path,
+            )
+        planned_urls.update(_issue_urls_in(content))
+    unplanned = [issue for issue in owner_issues if _issue_url(issue) not in planned_urls]
+    if not unplanned:
+        return TriageDecision(action="idle", reason="no_eligible_work")
+    issue = sorted(
+        unplanned,
+        key=lambda item: (str(item["created_at"]), int(item["number"])),
+    )[0]
+    number = int(issue["number"])
+    full_name = str(issue["full_name"])
+    return TriageDecision(
+        action="plan_and_start",
+        reason="oldest_owner_issue",
+        issue_number=number,
+        issue_url=f"https://github.com/{full_name}/issues/{number}",
+        idempotency_key=_start_key(f"issue:{full_name}:{number}"),
+        workflow_name=CONCIERGE_WORKFLOW_NAME,
+        team=CONCIERGE_TEAM,
+    )
+
+
+class McpHttpEndpoint:
+    """Minimal synchronous client for the local AFlow MCP endpoint.
+
+    One dedicated event-loop thread owns the streamable-HTTP session; every
+    ``call_tool`` is dispatched to it and bounded by a call timeout.  All
+    failures collapse to bounded :class:`ConciergeError` reason codes.
+    """
+
+    def __init__(
+        self,
+        url: str,
+        token: str,
+        *,
+        call_timeout: float = CONCIERGE_MCP_CALL_TIMEOUT_SECONDS,
+    ) -> None:
+        self._url = url
+        self._token = token
+        self._call_timeout = call_timeout
+        self._loop: asyncio.AbstractEventLoop | None = None
+        self._thread: threading.Thread | None = None
+        self._session: Any = None
+        self._stack: Any = None
+        self._lock = threading.Lock()
+
+    def call_tool(
+        self, name: str, arguments: Mapping[str, object]
+    ) -> Mapping[str, object]:
+        with self._lock:
+            self._ensure_session()
+            loop = self._loop
+        if loop is None:
+            raise ConciergeError("mcp_unavailable")
+        try:
+            future = asyncio.run_coroutine_threadsafe(
+                self._call_tool(name, dict(arguments)), loop
+            )
+            return future.result(timeout=self._call_timeout)
+        except ConciergeError:
+            raise
+        except Exception as exc:
+            raise ConciergeError("mcp_call_failed") from exc
+
+    def close(self) -> None:
+        with self._lock:
+            loop = self._loop
+            if loop is None:
+                return
+            try:
+                asyncio.run_coroutine_threadsafe(
+                    self._close_session(), loop
+                ).result(timeout=10.0)
+            except Exception:
+                pass
+            self._stop_loop()
+
+    def _ensure_session(self) -> None:
+        if self._loop is not None:
+            return
+        loop = asyncio.new_event_loop()
+        thread = threading.Thread(
+            target=self._run_loop, args=(loop,), name="aflow-concierge-mcp", daemon=True
+        )
+        self._loop = loop
+        self._thread = thread
+        thread.start()
+        try:
+            asyncio.run_coroutine_threadsafe(
+                self._start_session(), loop
+            ).result(timeout=self._call_timeout)
+        except ConciergeError:
+            self._stop_loop()
+            raise
+        except Exception as exc:
+            self._stop_loop()
+            raise ConciergeError("mcp_unavailable") from exc
+
+    def _run_loop(self, loop: asyncio.AbstractEventLoop) -> None:
+        asyncio.set_event_loop(loop)
+        loop.run_forever()
+
+    async def _start_session(self) -> None:
+        from contextlib import AsyncExitStack
+
+        from mcp import ClientSession
+        from mcp.client.streamable_http import streamablehttp_client
+
+        stack = AsyncExitStack()
+        try:
+            read, write, _ = await stack.enter_async_context(
+                streamablehttp_client(
+                    self._url,
+                    headers={"Authorization": f"Bearer {self._token}"},
+                )
+            )
+            session = ClientSession(read, write)
+            await stack.enter_async_context(session)
+            await session.initialize()
+        except Exception as exc:
+            await stack.aclose()
+            raise ConciergeError("mcp_unavailable") from exc
+        self._stack = stack
+        self._session = session
+
+    async def _call_tool(
+        self, name: str, arguments: dict[str, object]
+    ) -> Mapping[str, object]:
+        session = self._session
+        if session is None:
+            raise ConciergeError("mcp_unavailable")
+        try:
+            result = await session.call_tool(name, arguments)
+        except Exception as exc:
+            raise ConciergeError("mcp_call_failed") from exc
+        if getattr(result, "isError", False):
+            raise ConciergeError("mcp_tool_rejected")
+        contents = list(getattr(result, "content", ()) or ())
+        if len(contents) != 1:
+            raise ConciergeError("mcp_tool_invalid_payload")
+        text = getattr(contents[0], "text", None)
+        if not isinstance(text, str):
+            raise ConciergeError("mcp_tool_invalid_payload")
+        try:
+            payload = json.loads(text)
+        except (UnicodeError, json.JSONDecodeError, ValueError) as exc:
+            raise ConciergeError("mcp_tool_invalid_payload") from exc
+        if not isinstance(payload, Mapping):
+            raise ConciergeError("mcp_tool_invalid_payload")
+        return payload
+
+    async def _close_session(self) -> None:
+        stack = self._stack
+        self._stack = None
+        self._session = None
+        if stack is not None:
+            try:
+                await stack.aclose()
+            except Exception:
+                pass
+
+    def _stop_loop(self) -> None:
+        loop, thread = self._loop, self._thread
+        self._loop = None
+        self._thread = None
+        if loop is not None:
+            try:
+                loop.call_soon_threadsafe(loop.stop)
+            except RuntimeError:
+                pass
+        if thread is not None:
+            thread.join(timeout=5.0)
+            try:
+                loop.close()
+            except Exception:
+                pass
+
+
+class GithubRestClient:
+    """Bounded read-only GitHub evidence client for open issues."""
+
+    def __init__(
+        self,
+        *,
+        api_url: str = GITHUB_API_URL_DEFAULT,
+        token: str | None = None,
+        timeout_seconds: float = CONCIERGE_GITHUB_TIMEOUT_SECONDS,
+        max_pages: int = CONCIERGE_GITHUB_MAX_PAGES,
+    ) -> None:
+        self._api_url = api_url.rstrip("/")
+        self._token = token
+        self._timeout_seconds = timeout_seconds
+        self._max_pages = max_pages
+
+    def open_issues(self, full_name: str) -> GithubIssuePage:
+        quoted = urllib_parse.quote(full_name, safe="/")
+        repository, _ = self._request(f"/repos/{quoted}")
+        repository_id = repository.get("id") if isinstance(repository, Mapping) else None
+        if type(repository_id) is not int or repository_id <= 0:
+            raise ConciergeError("github_repository_invalid")
+        issues: list[Mapping[str, object]] = []
+        path = f"/repos/{quoted}/issues?state=open&per_page={CONCIERGE_PAGE_LIMIT}"
+        for _ in range(self._max_pages):
+            payload, headers = self._request(path)
+            if not isinstance(payload, list):
+                raise ConciergeError("github_issues_invalid")
+            for item in payload:
+                issue = self._issue_mapping(item, full_name)
+                if issue is not None:
+                    issues.append(issue)
+            path = self._next_path(headers)
+            if path is None:
+                break
+        return GithubIssuePage(
+            repository_id=repository_id, issues=tuple(issues)
+        )
+
+    def _issue_mapping(
+        self, payload: object, full_name: str
+    ) -> Mapping[str, object] | None:
+        if not isinstance(payload, Mapping) or "pull_request" in payload:
+            return None
+        number = payload.get("number")
+        user = payload.get("user")
+        title = payload.get("title")
+        body = payload.get("body")
+        state = payload.get("state")
+        created_at = payload.get("created_at")
+        author_id = user.get("id") if isinstance(user, Mapping) else None
+        if (
+            type(number) is not int
+            or number <= 0
+            or type(author_id) is not int
+            or author_id <= 0
+            or not isinstance(title, str)
+            or body is not None
+            and not isinstance(body, str)
+            or not isinstance(state, str)
+            or not isinstance(created_at, str)
+            or not created_at
+        ):
+            return None
+        return {
+            "number": number,
+            "author_id": author_id,
+            "full_name": full_name,
+            "title": title,
+            "body": body or "",
+            "state": state,
+            "created_at": created_at,
+        }
+
+    def _next_path(self, headers: Mapping[str, str]) -> str | None:
+        link = headers.get("link")
+        if not isinstance(link, str):
+            return None
+        match = _GITHUB_LINK_NEXT_RE.search(link)
+        if match is None:
+            return None
+        url = match.group(1)
+        if url.startswith(self._api_url):
+            return url[len(self._api_url) :]
+        return url
+
+    def _request(self, path: str) -> tuple[object, Mapping[str, str]]:
+        url = path if path.startswith("http") else self._api_url + path
+        headers = {
+            "Accept": "application/vnd.github+json",
+            "User-Agent": "aflow-concierge",
+        }
+        if self._token:
+            headers["Authorization"] = f"Bearer {self._token}"
+        request = urllib_request.Request(url, headers=headers)
+        try:
+            with urllib_request.urlopen(request, timeout=self._timeout_seconds) as response:
+                body = response.read(CONCIERGE_STREAM_MAX_BYTES + 1)
+                response_headers = {
+                    key.lower(): value for key, value in response.headers.items()
+                }
+        except (OSError, TimeoutError, http.client.HTTPException, ValueError) as exc:
+            raise ConciergeError("github_unavailable") from exc
+        if len(body) > CONCIERGE_STREAM_MAX_BYTES:
+            raise ConciergeError("github_response_too_large")
+        try:
+            payload = json.loads(body.decode("utf-8"))
+        except (UnicodeError, json.JSONDecodeError, ValueError) as exc:
+            raise ConciergeError("github_response_invalid") from exc
+        return payload, response_headers
+
+
+class McpRegistryClient:
+    """Serve the planner's project-registry lookup through MCP reads."""
+
+    def __init__(self, mcp: McpClient) -> None:
+        self._mcp = mcp
+
+    def get_json(self, scope: str, path: str) -> Mapping[str, object]:
+        if scope != "private" or path != "/api/control-plane/projects":
+            raise ConciergeError("planner_registry_path_unsupported")
+        return self._mcp.call_tool("list_projects", {})
+
+
+def _build_concierge_planner(state_dir: Path, mcp: McpClient) -> Any:
+    """Build the live tick planner: read-only, Astra, high, evidence-gated."""
+    from aflow.issue_intake_planner import IssueIntakePlanner
+
+    return IssueIntakePlanner(
+        client=McpRegistryClient(mcp),
+        state_root=state_dir / "planner",
+        model=CONCIERGE_PLANNER_MODEL,
+        effort=CONCIERGE_PLANNER_EFFORT,
+        require_concierge_evidence=True,
+    )
+
+
+class ConciergeTickExecutor:
+    """Authoritative concierge tick: MCP reads, triage, bounded execution."""
+
+    def __init__(
+        self,
+        *,
+        mcp: McpClient,
+        github: GithubClient,
+        planner_factory: Callable[[Path, McpClient], Any] | None = None,
+    ) -> None:
+        self._mcp = mcp
+        self._github = github
+        self._planner_factory = planner_factory
+
+    def execute(
+        self,
+        *,
+        state_dir: Path,
+        project_root: Path,
+        environment: Mapping[str, str],
+    ) -> TickOutcome:
+        project = self._resolve_project(project_root)
+        if project is None:
+            return TickOutcome("report", "project_not_registered")
+        project_id = str(project["project_id"])
+        full_name: str | None
+        try:
+            full_name = repository_full_name(project_root)
+        except ConciergeError:
+            full_name = None
+        try:
+            runs, plans, plan_documents = self._gather_evidence(project_id)
+        except ConciergeError:
+            return TickOutcome("report", "evidence_unavailable")
+        issues: tuple[Mapping[str, object], ...] = ()
+        github_gap = full_name is None
+        if full_name is not None:
+            try:
+                issues = self._github.open_issues(full_name).issues
+            except ConciergeError:
+                github_gap = True
+        observation = TickObservation(
+            project=project,
+            runs=runs,
+            plans=plans,
+            issues=issues,
+            plan_documents=plan_documents,
+        )
+        try:
+            decision = triage_tick(observation)
+        except ConciergeError as exc:
+            return TickOutcome("report", exc.reason, details=self._decision_details(decision=None))
+        if not decision.mutating:
+            if github_gap and decision.action == "idle":
+                return TickOutcome(
+                    "report", "github_evidence_unavailable",
+                    details=self._decision_details(decision=decision),
+                )
+            return TickOutcome(
+                decision.action, decision.reason,
+                details=self._decision_details(decision=decision),
+            )
+        if decision.action == "resume":
+            return self._execute_resume(project_id, decision)
+        if decision.action == "start":
+            return self._execute_start(project_id, decision)
+        if decision.action == "plan_and_start":
+            if full_name is None:
+                return TickOutcome("report", "repository_full_name_unavailable")
+            return self._execute_plan_and_start(
+                project_id, decision, state_dir, full_name
+            )
+        return TickOutcome("report", "unrecognized_decision")
+
+    def close(self) -> None:
+        self._mcp.close()
+
+    @staticmethod
+    def _decision_details(
+        *, decision: TriageDecision | None
+    ) -> dict[str, object]:
+        if decision is None:
+            return {}
+        details: dict[str, object] = {}
+        if decision.run_id is not None:
+            details["run_id"] = decision.run_id
+        if decision.plan_path is not None:
+            details["plan_path"] = decision.plan_path
+        if decision.issue_number is not None:
+            details["issue_number"] = decision.issue_number
+        return details
+
+    def _resolve_project(self, project_root: Path) -> Mapping[str, object] | None:
+        try:
+            payload = self._mcp.call_tool("list_projects", {})
+        except ConciergeError:
+            return None
+        projects = payload.get("projects")
+        if not isinstance(projects, list):
+            return None
+        try:
+            target = project_root.resolve()
+        except (OSError, RuntimeError):
+            return None
+        for item in projects:
+            if not isinstance(item, Mapping) or not isinstance(
+                item.get("project_id"), str
+            ):
+                continue
+            root = item.get("root")
+            if not isinstance(root, str) or not root:
+                continue
+            try:
+                if Path(root).resolve() == target:
+                    return item
+            except (OSError, RuntimeError):
+                continue
+        return None
+
+    def _gather_evidence(
+        self, project_id: str
+    ) -> tuple[
+        tuple[Mapping[str, object], ...],
+        tuple[Mapping[str, object], ...],
+        dict[str, str],
+    ]:
+        runs = self._list_runs(project_id)
+        plans = self._list_plans(project_id)
+        documents: dict[str, str] = {}
+        for plan in plans:
+            status = _normalized_plan_status(plan.get("status"))
+            if status not in PLANNED_EVIDENCE_STATUSES:
+                continue
+            path = str(plan.get("path") or "")
+            parts = path.split("/")
+            if len(parts) != 3 or parts[0] != "plans":
+                raise ConciergeError("plan_path_invalid")
+            plan_status = _PLAN_STATUS_BY_DIRECTORY.get(parts[1])
+            if plan_status is None:
+                continue
+            payload = self._mcp.call_tool(
+                "read_plan",
+                {"project_id": project_id, "plan_status": plan_status, "name": parts[2]},
+            )
+            content = payload.get("content")
+            if not isinstance(content, str):
+                raise ConciergeError("plan_document_unavailable")
+            documents[path] = content
+        return runs, plans, documents
+
+    def _list_runs(self, project_id: str) -> tuple[Mapping[str, object], ...]:
+        runs: list[Mapping[str, object]] = []
+        cursor: str | None = None
+        for _ in range(CONCIERGE_MAX_PAGES):
+            payload = self._mcp.call_tool(
+                "list_runs",
+                {"project_id": project_id, "limit": CONCIERGE_PAGE_LIMIT, "cursor": cursor},
+            )
+            page = payload.get("runs")
+            if not isinstance(page, list):
+                raise ConciergeError("run_page_invalid")
+            runs.extend(item for item in page if isinstance(item, Mapping))
+            next_cursor = payload.get("next_cursor")
+            if not isinstance(next_cursor, str) or not next_cursor:
+                return tuple(runs)
+            cursor = next_cursor
+        raise ConciergeError("run_page_overflow")
+
+    def _list_plans(self, project_id: str) -> tuple[Mapping[str, object], ...]:
+        plans: list[Mapping[str, object]] = []
+        cursor: str | None = None
+        for _ in range(CONCIERGE_MAX_PAGES):
+            payload = self._mcp.call_tool(
+                "list_plans",
+                {"project_id": project_id, "limit": CONCIERGE_PAGE_LIMIT, "cursor": cursor},
+            )
+            page = payload.get("plans")
+            if not isinstance(page, list):
+                raise ConciergeError("plan_page_invalid")
+            if not page:
+                return tuple(plans)
+            plans.extend(item for item in page if isinstance(item, Mapping))
+            last_path = page[-1].get("path") if isinstance(page[-1], Mapping) else None
+            if (
+                len(page) < CONCIERGE_PAGE_LIMIT
+                or not isinstance(last_path, str)
+                or not last_path
+                or last_path == cursor
+            ):
+                return tuple(plans)
+            cursor = last_path
+        raise ConciergeError("plan_page_overflow")
+
+    @staticmethod
+    def _preflight_admits_launch(preflight: object) -> bool:
+        if not isinstance(preflight, Mapping):
+            return False
+        if preflight.get("execution_mode") != "new_worktree":
+            return False
+        blockers = preflight.get("blockers")
+        if not isinstance(blockers, (list, tuple)) or blockers:
+            return False
+        return preflight.get("requires_confirmation") is False
+
+    @staticmethod
+    def _scheduling_keeps_single_slot(scheduling: Mapping[str, object]) -> bool:
+        limit = scheduling.get("max_concurrent_implementations")
+        if type(limit) is not int or limit != 1:
+            return False
+        return scheduling.get("auto_consume_plans") is False
+
+    @staticmethod
+    def _runs_block_launch(runs: Sequence[Mapping[str, object]]) -> bool:
+        return any(
+            _run_activity(run) in (ACTIVE_RUN_ACTIVITY, UNCERTAIN_RUN_ACTIVITY)
+            for run in runs
+        )
+
+    @classmethod
+    def _queue_admits_single_launch(cls, queue: object, plan_path: str) -> bool:
+        if not isinstance(queue, Mapping):
+            return False
+        settings = queue.get("settings")
+        if not isinstance(settings, Mapping) or not cls._scheduling_keeps_single_slot(
+            settings
+        ):
+            return False
+        capacity = queue.get("capacity")
+        if not isinstance(capacity, Mapping):
+            return False
+        available = capacity.get("available_slots")
+        if type(available) is not int or available < 1:
+            return False
+        plans = queue.get("plans")
+        if not isinstance(plans, (list, tuple)):
+            return False
+        for plan in plans:
+            if not isinstance(plan, Mapping):
+                return False
+            if plan.get("path") == plan_path and plan.get("run_id"):
+                return False
+        return True
+
+    def _verify_launch_evidence(
+        self,
+        project_id: str,
+        plan_path: str,
+        decision: TriageDecision,
+    ) -> dict[str, object]:
+        """Validate preflight and resolved launch settings before a start.
+
+        Returns bounded verified details on success and raises a bounded
+        :class:`ConciergeError` when evidence is missing or contradictory.
+        """
+        try:
+            preflight = self._mcp.call_tool(
+                "preflight_run",
+                {
+                    "project_id": project_id,
+                    "plan_path": plan_path,
+                    "workflow_name": decision.workflow_name,
+                    "team": decision.team,
+                },
+            )
+        except ConciergeError as exc:
+            raise ConciergeError("launch_evidence_unavailable") from exc
+        if not self._preflight_admits_launch(preflight):
+            raise ConciergeError("launch_evidence_contradictory")
+        workflow_name = decision.workflow_name
+        team = decision.team
+        if (
+            not isinstance(workflow_name, str)
+            or not workflow_name
+            or not isinstance(team, str)
+            or not team
+        ):
+            raise ConciergeError("launch_evidence_contradictory")
+        try:
+            capabilities = self._mcp.call_tool(
+                "get_project_capabilities", {"project_id": project_id}
+            )
+            scheduling = self._mcp.call_tool(
+                "get_project_scheduling", {"project_id": project_id}
+            )
+        except ConciergeError as exc:
+            raise ConciergeError("launch_evidence_unavailable") from exc
+        if not isinstance(capabilities, Mapping) or not isinstance(
+            scheduling, Mapping
+        ):
+            raise ConciergeError("launch_evidence_contradictory")
+        workflows = capabilities.get("workflows")
+        teams = capabilities.get("teams")
+        if (
+            not isinstance(workflows, (list, tuple))
+            or workflow_name not in workflows
+            or not isinstance(teams, (list, tuple))
+            or team not in teams
+        ):
+            raise ConciergeError("launch_evidence_contradictory")
+        workflow_details = capabilities.get("workflow_details")
+        detail = (
+            workflow_details.get(workflow_name)
+            if isinstance(workflow_details, Mapping)
+            else None
+        )
+        executable_steps = (
+            detail.get("executable_steps") if isinstance(detail, Mapping) else None
+        )
+        if (
+            not isinstance(executable_steps, (list, tuple))
+            or not executable_steps
+        ):
+            raise ConciergeError("launch_evidence_contradictory")
+        if not self._scheduling_keeps_single_slot(scheduling):
+            raise ConciergeError("launch_evidence_contradictory")
+        try:
+            config = self._mcp.call_tool("get_global_config", {})
+        except ConciergeError as exc:
+            raise ConciergeError("launch_evidence_unavailable") from exc
+        if not isinstance(config, Mapping):
+            raise ConciergeError("launch_evidence_contradictory")
+        validation = config.get("validation")
+        if (
+            not isinstance(validation, Mapping)
+            or validation.get("state") != "ready"
+        ):
+            raise ConciergeError("launch_evidence_contradictory")
+        workflows_toml = config.get("workflows_toml")
+        if not isinstance(workflows_toml, str) or not workflows_toml:
+            raise ConciergeError("launch_evidence_contradictory")
+        lifecycle = _resolve_workflow_lifecycle(workflows_toml, workflow_name)
+        if (
+            lifecycle is None
+            or not REQUIRED_WORKFLOW_SETUP <= set(lifecycle[0])
+            or not REQUIRED_WORKFLOW_TEARDOWN <= set(lifecycle[1])
+        ):
+            raise ConciergeError("launch_evidence_contradictory")
+        publication_projection = capabilities.get("publication")
+        if (
+            not isinstance(publication_projection, Mapping)
+            or publication_projection.get("available") is not True
+        ):
+            raise ConciergeError("launch_evidence_unavailable")
+        publication = _publication_settings_evidence(capabilities)
+        if publication is None:
+            raise ConciergeError("launch_evidence_contradictory")
+        return {
+            "execution_mode": "new_worktree",
+            "publish_remote": publication[0],
+            "publish_branch": publication[1],
+        }
+
+    def _start_with_evidence(
+        self,
+        project_id: str,
+        plan_path: str,
+        decision: TriageDecision,
+        details: dict[str, object],
+    ) -> TickOutcome:
+        try:
+            payload = self._mcp.call_tool(
+                "start_run",
+                {
+                    "project_id": project_id,
+                    "plan_path": plan_path,
+                    "idempotency_key": decision.idempotency_key,
+                    "workflow_name": decision.workflow_name,
+                    "team": decision.team,
+                },
+            )
+        except ConciergeError as exc:
+            if self._plan_has_active_run(project_id, plan_path):
+                reconciled = (
+                    "start_reconciled_active"
+                    if decision.action == "start"
+                    else "planned_and_reconciled_active"
+                )
+                return TickOutcome(
+                    decision.action, reconciled, mutating=True, details=details
+                )
+            return TickOutcome("report", exc.reason, details=details)
+        if not isinstance(payload, Mapping):
+            return TickOutcome("report", "start_result_invalid", details=details)
+        question = payload.get("startup_question")
+        if isinstance(question, Mapping):
+            message = str(question.get("message") or "")
+            return TickOutcome(
+                "report",
+                "startup_question",
+                details={
+                    **details,
+                    "question": message[:CONCIERGE_PLANNER_QUESTION_MAX_CHARS],
+                },
+            )
+        result = payload.get("result")
+        if (
+            not isinstance(result, Mapping)
+            or not isinstance(result.get("run_id"), str)
+            or not result.get("run_id")
+        ):
+            return TickOutcome("report", "start_result_invalid", details=details)
+        started = (
+            "started" if decision.action == "start" else "planned_and_started"
+        )
+        return TickOutcome(
+            decision.action,
+            started,
+            mutating=True,
+            details={**details, "run_id": str(result["run_id"])},
+        )
+
+    def _fresh_decision(
+        self,
+        project_id: str,
+        decision: TriageDecision,
+        full_name: str | None,
+    ) -> TriageDecision | None:
+        try:
+            runs, plans, plan_documents = self._gather_evidence(project_id)
+        except ConciergeError:
+            return None
+        issues: tuple[Mapping[str, object], ...] = ()
+        if full_name is not None:
+            try:
+                issues = self._github.open_issues(full_name).issues
+            except ConciergeError:
+                return None
+        observation = TickObservation(
+            project={"project_id": project_id},
+            runs=runs,
+            plans=plans,
+            issues=issues,
+            plan_documents=plan_documents,
+        )
+        try:
+            fresh = triage_tick(observation)
+        except ConciergeError:
+            return None
+        if fresh.action != decision.action:
+            return None
+        if fresh.idempotency_key != decision.idempotency_key:
+            return None
+        if decision.action == "resume" and fresh.run_id != decision.run_id:
+            return None
+        if decision.action == "start" and fresh.plan_path != decision.plan_path:
+            return None
+        if (
+            decision.action == "plan_and_start"
+            and fresh.issue_number != decision.issue_number
+        ):
+            return None
+        return fresh
+
+    def _execute_resume(
+        self, project_id: str, decision: TriageDecision
+    ) -> TickOutcome:
+        if self._fresh_decision(project_id, decision, None) is None:
+            return TickOutcome(
+                "report", "state_changed_before_action",
+                details=self._decision_details(decision=decision),
+            )
+        if not self._resume_admits(project_id, decision):
+            return TickOutcome(
+                "report", "resume_not_admitted",
+                details=self._decision_details(decision=decision),
+            )
+        try:
+            self._mcp.call_tool(
+                "resume_run",
+                {
+                    "project_id": project_id,
+                    "run_id": decision.run_id,
+                    "idempotency_key": decision.idempotency_key,
+                },
+            )
+        except ConciergeError as exc:
+            if self._run_is_active(project_id, str(decision.run_id)):
+                return TickOutcome(
+                    "resume", "resume_reconciled_active", mutating=True,
+                    details=self._decision_details(decision=decision),
+                )
+            return TickOutcome("report", exc.reason)
+        return TickOutcome(
+            "resume", "resumed", mutating=True,
+            details=self._decision_details(decision=decision),
+        )
+
+    def _resume_admits(self, project_id: str, decision: TriageDecision) -> bool:
+        """Require the exact failed predecessor to be MCP-admissible now."""
+        try:
+            payload = self._mcp.call_tool(
+                "get_run",
+                {"project_id": project_id, "run_id": str(decision.run_id)},
+            )
+        except ConciergeError:
+            return False
+        if not isinstance(payload, Mapping):
+            return False
+        if payload.get("run_id") != decision.run_id:
+            return False
+        if payload.get("activity") != INACTIVE_RUN_ACTIVITY:
+            return False
+        if payload.get("status") not in TERMINAL_FAILED_RUN_STATUSES:
+            return False
+        plan_path = payload.get("plan_path")
+        if not isinstance(plan_path, str) or plan_path != decision.plan_path:
+            return False
+        evidence = payload.get("evidence")
+        return isinstance(evidence, Mapping) and evidence.get("can_resume") is True
+
+    def _execute_start(
+        self, project_id: str, decision: TriageDecision
+    ) -> TickOutcome:
+        if self._fresh_decision(project_id, decision, None) is None:
+            return TickOutcome(
+                "report", "state_changed_before_action",
+                details=self._decision_details(decision=decision),
+            )
+        plan_path = str(decision.plan_path)
+        details = self._decision_details(decision=decision)
+        try:
+            details.update(
+                self._verify_launch_evidence(project_id, plan_path, decision)
+            )
+        except ConciergeError as exc:
+            return TickOutcome("report", exc.reason, details=details)
+        return self._start_with_evidence(project_id, plan_path, decision, details)
+
+    def _execute_plan_and_start(
+        self,
+        project_id: str,
+        decision: TriageDecision,
+        state_dir: Path,
+        full_name: str,
+    ) -> TickOutcome:
+        if self._fresh_decision(project_id, decision, full_name) is None:
+            return TickOutcome(
+                "report", "state_changed_before_action",
+                details=self._decision_details(decision=decision),
+            )
+        number = int(decision.issue_number)
+        details: dict[str, object] = {
+            **self._decision_details(decision=decision),
+            "planner_model": CONCIERGE_PLANNER_MODEL,
+            "planner_effort": CONCIERGE_PLANNER_EFFORT,
+        }
+        page: GithubIssuePage | None = None
+        try:
+            page = self._github.open_issues(full_name)
+        except ConciergeError:
+            return TickOutcome(
+                "report", "github_evidence_unavailable", details=details
+            )
+        issue = next(
+            (
+                candidate
+                for candidate in page.issues
+                if int(candidate["number"]) == number
+            ),
+            None,
+        )
+        if issue is None:
+            return TickOutcome(
+                "report", "state_changed_before_action", details=details
+            )
+        title = str(issue["title"])
+        body = str(issue["body"])
+        from aflow.issue_intake import source_hash
+
+        try:
+            source_sha256 = source_hash(title, body)
+        except (TypeError, ValueError) as exc:
+            raise ConciergeError("canonical_source_invalid") from exc
+        canonical = ConciergeCanonicalIssue(
+            title=title, body=body, title_body_sha256=source_sha256
+        )
+        claim_sha256 = hashlib.sha256(
+            f"concierge-plan:{full_name}:{number}:{source_sha256}".encode("utf-8")
+        ).hexdigest()
+        record_path = state_dir / "planner-records" / f"{claim_sha256}.json"
+        record: Mapping[str, object] | None
+        if record_path.is_file():
+            try:
+                loaded = json.loads(record_path.read_text(encoding="utf-8"))
+            except (OSError, UnicodeError, json.JSONDecodeError):
+                loaded = None
+            record = loaded if isinstance(loaded, Mapping) else None
+        else:
+            record = None
+
+        def persist_workspace(workspace_record: Mapping[str, object]) -> None:
+            _atomic_write(
+                record_path,
+                (json.dumps(dict(workspace_record), sort_keys=True) + "\n").encode(
+                    "utf-8"
+                ),
+                label="planner_workspace",
+            )
+
+        factory = self._planner_factory or _build_concierge_planner
+        planner = factory(state_dir, self._mcp)
+        try:
+            if record is not None:
+                result = planner.recover(
+                    record=record,
+                    repository_id=page.repository_id,
+                    issue_number=number,
+                    project_id=project_id,
+                    claim_sha256=claim_sha256,
+                )
+                details["planner_recovered"] = True
+            else:
+                result = planner.plan(
+                    repository_id=page.repository_id,
+                    repository_full_name=full_name,
+                    issue_number=number,
+                    project_id=project_id,
+                    claim_sha256=claim_sha256,
+                    canonical=canonical,
+                    persist_workspace=persist_workspace,
+                )
+        except Exception as exc:
+            reason = getattr(exc, "reason", None)
+            return TickOutcome(
+                "report",
+                "planner_failed",
+                details={
+                    **details,
+                    "planner_reason": str(reason or "planner_failure")[:128],
+                },
+            )
+        if result.status == "needs_attention":
+            question = str(result.question or "")[:CONCIERGE_PLANNER_QUESTION_MAX_CHARS]
+            return TickOutcome(
+                "report", "planner_needs_attention", details={**details, "question": question}
+            )
+        if result.status != "plan" or not isinstance(result.markdown, str):
+            return TickOutcome("report", "planner_result_invalid", details=details)
+        try:
+            runs, plans, plan_documents = self._gather_evidence(project_id)
+        except ConciergeError:
+            return TickOutcome("report", "evidence_unavailable", details=details)
+        if self._runs_block_launch(runs):
+            return TickOutcome(
+                "report", "state_changed_before_action", details=details
+            )
+        try:
+            fresh_page = self._github.open_issues(full_name)
+        except ConciergeError:
+            return TickOutcome(
+                "report", "github_evidence_unavailable", details=details
+            )
+        fresh_issue = next(
+            (
+                candidate
+                for candidate in fresh_page.issues
+                if int(candidate["number"]) == number
+            ),
+            None,
+        )
+        fresh_author = fresh_issue.get("author_id") if fresh_issue else None
+        if (
+            fresh_issue is None
+            or type(fresh_author) is not int
+            or fresh_author != CONCIERGE_OWNER_ID
+            or fresh_issue.get("state", "open") != "open"
+        ):
+            return TickOutcome(
+                "report", "state_changed_before_action", details=details
+            )
+        plan_name = f"owner-issue-{number}.md"
+        plan_path = f"plans/todo/{plan_name}"
+        try:
+            queue = self._mcp.call_tool(
+                "get_project_queue", {"project_id": project_id}
+            )
+        except ConciergeError:
+            return TickOutcome(
+                "report", "launch_evidence_unavailable", details=details
+            )
+        if not self._queue_admits_single_launch(queue, plan_path):
+            return TickOutcome(
+                "report", "state_changed_before_action", details=details
+            )
+        planned_urls: set[str] = set()
+        for plan in plans:
+            if _normalized_plan_status(plan.get("status")) not in PLANNED_EVIDENCE_STATUSES:
+                continue
+            content = plan_documents.get(str(plan.get("path") or ""))
+            if not isinstance(content, str):
+                return TickOutcome("report", "evidence_unavailable", details=details)
+            planned_urls.update(_issue_urls_in(content))
+        if decision.issue_url in planned_urls:
+            return TickOutcome(
+                "report", "duplicate_detected_before_authoring", details=details
+            )
+        try:
+            self._mcp.call_tool(
+                "create_plan",
+                {"project_id": project_id, "name": plan_name, "content": result.markdown},
+            )
+        except ConciergeError as exc:
+            return TickOutcome("report", exc.reason, details=details)
+        try:
+            runs, _, _ = self._gather_evidence(project_id)
+            queue = self._mcp.call_tool(
+                "get_project_queue", {"project_id": project_id}
+            )
+        except ConciergeError:
+            return TickOutcome("report", "evidence_unavailable", details=details)
+        if self._runs_block_launch(runs) or not self._queue_admits_single_launch(
+            queue, plan_path
+        ):
+            return TickOutcome(
+                "report", "state_changed_before_action", details=details
+            )
+        try:
+            details.update(
+                self._verify_launch_evidence(project_id, plan_path, decision)
+            )
+        except ConciergeError as exc:
+            return TickOutcome("report", exc.reason, details=details)
+        return self._start_with_evidence(project_id, plan_path, decision, details)
+
+    def _run_is_active(self, project_id: str, run_id: str) -> bool:
+        try:
+            payload = self._mcp.call_tool(
+                "get_run", {"project_id": project_id, "run_id": run_id}
+            )
+        except ConciergeError:
+            return False
+        return payload.get("activity") == ACTIVE_RUN_ACTIVITY
+
+    def _plan_has_active_run(self, project_id: str, plan_path: str) -> bool:
+        try:
+            runs = self._list_runs(project_id)
+        except ConciergeError:
+            return False
+        return any(
+            run.get("plan_path") == plan_path
+            and run.get("activity") == ACTIVE_RUN_ACTIVITY
+            for run in runs
+        )
+
+
+def _build_production_executor(
+    token: str, environment: Mapping[str, str]
+) -> ConciergeTickExecutor:
+    return ConciergeTickExecutor(
+        mcp=McpHttpEndpoint(CONCIERGE_MCP_URL, token),
+        github=GithubRestClient(token=environment.get(CONCIERGE_GITHUB_TOKEN_ENV)),
+        planner_factory=_build_concierge_planner,
+    )
+
+
+def redact_text(text: str, secrets: Sequence[str]) -> str:
+    """Replace every known secret value with a fixed marker."""
+    redacted = text
+    for secret in secrets:
+        if secret:
+            redacted = redacted.replace(secret, "[REDACTED]")
+    return redacted
+
+
+@contextmanager
+def tick_lock(state_dir: Path) -> Iterator[None]:
+    """Own the single concierge tick slot for the duration of the body."""
+    lock_path = state_dir / "concierge.lock"
+    descriptor = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o600)
+    locked = False
+    try:
+        try:
+            fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError as exc:
+            raise TickDeferral("tick_in_progress") from exc
+        locked = True
+        os.ftruncate(descriptor, 0)
+        os.lseek(descriptor, 0, os.SEEK_SET)
+        os.write(descriptor, f"{os.getpid()}\n".encode("ascii"))
+        os.fsync(descriptor)
+        yield
+    finally:
+        if locked:
+            try:
+                fcntl.flock(descriptor, fcntl.LOCK_UN)
+            except OSError:
+                pass
+        os.close(descriptor)
+
+
+def _terminate_process_group(
+    process: subprocess.Popen[bytes], *, grace: float = 5.0
+) -> None:
+    """Terminate only the process group created for this tick."""
+    try:
+        os.killpg(process.pid, signal.SIGTERM)
+    except ProcessLookupError:
+        return
+    except OSError:
+        try:
+            process.terminate()
+        except OSError:
+            return
+    try:
+        process.wait(timeout=grace)
+    except subprocess.TimeoutExpired:
+        pass
+    # The leader can exit on SIGTERM while a descendant keeps the owned
+    # session alive. Do not treat a successful leader wait as group
+    # completion; escalate against the session before returning.
+    try:
+        os.killpg(process.pid, signal.SIGKILL)
+    except ProcessLookupError:
+        return
+    except OSError:
+        try:
+            process.kill()
+        except OSError:
+            return
+    try:
+        process.wait(timeout=grace)
+    except subprocess.TimeoutExpired:
+        pass
+
+
+def _run_tick_process(
+    argv: Sequence[str],
+    cwd: Path,
+    prompt: bytes,
+    timeout_seconds: float,
+) -> TickProcessResult:
+    """Run the tick process with bounded streams and owned cancellation."""
+    if not argv:
+        raise ConciergeError("concierge_argv_empty")
+    try:
+        process = subprocess.Popen(
+            list(argv),
+            cwd=str(cwd),
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            start_new_session=True,
+        )
+    except FileNotFoundError as exc:
+        raise ConciergeError("concierge_unavailable") from exc
+    except OSError as exc:
+        raise ConciergeError("concierge_launch_failed") from exc
+
+    deadline = time.monotonic() + timeout_seconds
+    stdout_buffer = bytearray()
+    stderr_buffer = bytearray()
+    overflow = threading.Event()
+    termination_requested = threading.Event()
+
+    def drain(stream: Any, buffer: bytearray) -> None:
+        try:
+            read_chunk = getattr(stream, "read1", stream.read)
+            while True:
+                chunk = read_chunk(65536)
+                if not chunk:
+                    return
+                if len(buffer) + len(chunk) > CONCIERGE_STREAM_MAX_BYTES:
+                    overflow.set()
+                if len(buffer) < CONCIERGE_STREAM_MAX_BYTES:
+                    remaining = CONCIERGE_STREAM_MAX_BYTES + 1 - len(buffer)
+                    buffer.extend(chunk[:remaining])
+        except OSError:
+            return
+
+    stdout_thread = threading.Thread(
+        target=drain, args=(process.stdout, stdout_buffer), daemon=True
+    )
+    stderr_thread = threading.Thread(
+        target=drain, args=(process.stderr, stderr_buffer), daemon=True
+    )
+    stdout_thread.start()
+    stderr_thread.start()
+    timed_out = False
+    overflowed = False
+    interrupted = False
+    stdin_thread: threading.Thread | None = None
+    previous_sigterm: Any = None
+    signal_handler_installed = False
+
+    def handle_sigterm(_signum: int, _frame: Any) -> None:
+        nonlocal interrupted
+        interrupted = True
+        termination_requested.set()
+        _terminate_process_group(process, grace=1.0)
+
+    try:
+        previous_sigterm = signal.getsignal(signal.SIGTERM)
+        signal.signal(signal.SIGTERM, handle_sigterm)
+        signal_handler_installed = True
+    except ValueError:
+        # A caller embedded in a non-main thread cannot install process signal
+        # handlers; the normal deadline still applies.
+        pass
+
+    def feed_stdin() -> None:
+        assert process.stdin is not None
+        try:
+            process.stdin.write(prompt)
+            process.stdin.close()
+        except (BrokenPipeError, OSError, ValueError):
+            try:
+                process.stdin.close()
+            except (OSError, ValueError):
+                pass
+
+    try:
+        assert process.stdin is not None
+        stdin_thread = threading.Thread(target=feed_stdin, daemon=True)
+        stdin_thread.start()
+        while process.poll() is None:
+            if termination_requested.is_set():
+                break
+            if overflow.is_set():
+                overflowed = True
+                _terminate_process_group(process)
+                break
+            if time.monotonic() >= deadline:
+                timed_out = True
+                _terminate_process_group(process)
+                break
+            time.sleep(0.05)
+        if process.poll() is None:
+            process.wait(timeout=5.0)
+    except KeyboardInterrupt:
+        interrupted = True
+        _terminate_process_group(process)
+    except BaseException:
+        _terminate_process_group(process)
+        raise
+    finally:
+        # A successful leader exit does not prove that its owned session has
+        # no descendants. Escalate before closing any inherited pipes; an
+        # already-empty group returns immediately.
+        _terminate_process_group(process, grace=1.0)
+        try:
+            if process.stdin is not None:
+                process.stdin.close()
+        except (OSError, ValueError):
+            pass
+        if stdin_thread is not None:
+            stdin_thread.join(timeout=5.0)
+        stdout_thread.join(timeout=5.0)
+        stderr_thread.join(timeout=5.0)
+        for stream in (process.stdout, process.stderr):
+            try:
+                if stream is not None:
+                    stream.close()
+            except (OSError, ValueError):
+                pass
+        if signal_handler_installed:
+            signal.signal(signal.SIGTERM, previous_sigterm)
+    return TickProcessResult(
+        returncode=process.returncode if process.returncode is not None else -1,
+        stdout=bytes(stdout_buffer),
+        stderr=bytes(stderr_buffer),
+        timed_out=timed_out,
+        overflowed=overflowed or overflow.is_set(),
+        interrupted=interrupted,
+    )
+
+
+def _validate_state_dir(state_dir: Path) -> None:
+    if not state_dir.is_absolute():
+        raise ConciergeError("state_dir_must_be_absolute")
+    current = Path("/")
+    for part in state_dir.parts:
+        current = current / part
+        if current.is_symlink():
+            raise ConciergeError("state_dir_unsafe")
+
+
+def _ensure_private_directory(path: Path) -> Path:
+    if path.is_symlink():
+        raise ConciergeError("state_dir_unsafe")
+    try:
+        path.mkdir(mode=0o700, parents=True, exist_ok=True)
+    except OSError as exc:
+        raise ConciergeError("state_dir_unavailable") from exc
+    try:
+        metadata = path.lstat()
+    except OSError as exc:
+        raise ConciergeError("state_dir_unavailable") from exc
+    if path.is_symlink() or not stat.S_ISDIR(metadata.st_mode):
+        raise ConciergeError("state_dir_unsafe")
+    try:
+        os.chmod(path, 0o700)
+    except OSError as exc:
+        raise ConciergeError("state_dir_unsafe") from exc
+    return path
+
+
+def _atomic_write(path: Path, data: bytes, *, label: str) -> None:
+    parent = _ensure_private_directory(path.parent)
+    if path.is_symlink():
+        raise ConciergeError(f"{label}_symlink")
+    temporary: Path | None = None
+    try:
+        descriptor, temporary_name = tempfile.mkstemp(
+            prefix=f".{path.name}.", suffix=".tmp", dir=parent
+        )
+        temporary = Path(temporary_name)
+        os.fchmod(descriptor, 0o600)
+        with os.fdopen(descriptor, "wb") as handle:
+            handle.write(data)
+            handle.flush()
+            os.fsync(handle.fileno())
+        if path.is_symlink():
+            raise ConciergeError(f"{label}_symlink")
+        os.replace(temporary, path)
+        temporary = None
+        directory_descriptor = os.open(parent, os.O_RDONLY)
+        try:
+            os.fsync(directory_descriptor)
+        finally:
+            os.close(directory_descriptor)
+    except ConciergeError:
+        raise
+    except OSError as exc:
+        raise ConciergeError(f"{label}_write_failed") from exc
+    finally:
+        if temporary is not None:
+            try:
+                temporary.unlink()
+            except FileNotFoundError:
+                pass
+
+
+def _write_status(state_dir: Path, status: Mapping[str, object]) -> None:
+    _atomic_write(
+        state_dir / "status.json",
+        (json.dumps(dict(status), sort_keys=True) + "\n").encode("utf-8"),
+        label="status",
+    )
+
+
+def _bounded_redacted_tail(raw: bytes, secret: str) -> str:
+    text = redact_text(raw.decode("utf-8", errors="replace"), [secret])
+    return text[-CONCIERGE_STATUS_TAIL_MAX_CHARS:]
+
+
+def dry_run(
+    *,
+    state_dir: Path,
+    work_dir: Path,
+    environment: Mapping[str, str],
+    timeout_seconds: float = DEFAULT_TIMEOUT_SECONDS,
+    journal: Callable[[str], None] = print,
+) -> int:
+    """Validate configuration and report the tick plan without side effects.
+
+    A dry run never creates the state directory, never acquires the lock,
+    and never launches a process.
+    """
+    token = read_bearer_token(environment)
+    argv = build_codex_argv(work_dir=work_dir)
+    if any(token in part for part in argv):
+        raise ConciergeError("bearer_token_leak")
+    for line in (
+        "aflow-concierge: dry-run (no lock, no process, no state)",
+        f"  model={CONCIERGE_MODEL}",
+        f"  effort={CONCIERGE_EFFORT}",
+        f"  mcp_url={CONCIERGE_MCP_URL}",
+        f"  token_env={CONCIERGE_TOKEN_ENV}",
+        f"  work_dir={work_dir}",
+        f"  state_dir={state_dir}",
+        f"  timeout_seconds={timeout_seconds:g}",
+        f"  argv={redact_text(' '.join(argv), [token])}",
+    ):
+        journal(line)
+    return 0
+
+
+def run_tick(
+    *,
+    state_dir: Path,
+    work_dir: Path,
+    environment: Mapping[str, str],
+    timeout_seconds: float = DEFAULT_TIMEOUT_SECONDS,
+    runner: ProcessRunner | None = None,
+    tick_executor: TickExecutor | None = None,
+    project_root: Path | None = None,
+    journal: Callable[[str], None] = print,
+) -> int:
+    """Run one bounded, non-overlapping concierge tick.
+
+    The authoritative decision and at most one bounded MCP action come from
+    ``tick_executor`` (the production :class:`ConciergeTickExecutor` by
+    default).  The short-lived Codex process remains an advisory read-only
+    review whose bounded output is recorded in the status file.
+    """
+    token = read_bearer_token(environment)
+    _validate_state_dir(state_dir)
+    _ensure_private_directory(state_dir)
+    executor = tick_executor if tick_executor is not None else None
+    owns_executor = executor is None
+    if owns_executor:
+        executor = _build_production_executor(token, environment)
+    resolved_project_root = (
+        project_root if project_root is not None else CONCIERGE_PROJECT_ROOT_DEFAULT
+    )
+    outcome: TickOutcome | None = None
+    try:
+        with tick_lock(state_dir):
+            try:
+                outcome = executor.execute(
+                    state_dir=state_dir,
+                    project_root=resolved_project_root,
+                    environment=environment,
+                )
+            except ConciergeError as exc:
+                outcome = TickOutcome("report", exc.reason)
+            process_runner = runner if runner is not None else _run_tick_process
+            argv = build_codex_argv(work_dir=work_dir)
+            prompt = build_tick_prompt().encode("utf-8")
+            started_at = time.time()
+            result = process_runner(argv, work_dir, prompt, timeout_seconds)
+            finished_at = time.time()
+            stdout_tail = _bounded_redacted_tail(result.stdout, token)
+            stderr_tail = _bounded_redacted_tail(result.stderr, token)
+            if result.timed_out:
+                phase, reason, exit_code = "timed_out", "concierge_timed_out", 1
+            elif result.overflowed:
+                phase, reason, exit_code = "failed", "concierge_stream_overflow", 1
+            elif result.interrupted:
+                phase, reason, exit_code = "failed", "concierge_interrupted", 1
+            elif result.returncode == 0:
+                phase, reason, exit_code = "completed", "concierge_tick_completed", 0
+            else:
+                phase, reason, exit_code = "failed", "concierge_process_failed", 1
+            status = {
+                "schema_version": CONCIERGE_STATUS_SCHEMA_VERSION,
+                "phase": phase,
+                "reason": reason,
+                "model": CONCIERGE_MODEL,
+                "effort": CONCIERGE_EFFORT,
+                "mcp_url": CONCIERGE_MCP_URL,
+                "started_at": started_at,
+                "finished_at": finished_at,
+                "duration_seconds": round(finished_at - started_at, 3),
+                "returncode": result.returncode,
+                "stdout_tail": stdout_tail,
+                "stderr_tail": stderr_tail,
+                "action": outcome.action,
+                "outcome": outcome.reason,
+                "mutating": outcome.mutating,
+                "planner_model": CONCIERGE_PLANNER_MODEL,
+                "planner_effort": CONCIERGE_PLANNER_EFFORT,
+            }
+            for key, value in outcome.details.items():
+                if key in {"run_id", "plan_path", "issue_number"}:
+                    status[f"decision_{key}"] = value
+            _write_status(state_dir, status)
+            journal(f"aflow-concierge: phase={phase} reason={reason}")
+            journal(
+                f"aflow-concierge: action={outcome.action} outcome={outcome.reason}"
+            )
+            return exit_code
+    except TickDeferral:
+        status = {
+            "schema_version": CONCIERGE_STATUS_SCHEMA_VERSION,
+            "phase": "deferred",
+            "reason": "tick_in_progress",
+            "model": CONCIERGE_MODEL,
+            "effort": CONCIERGE_EFFORT,
+            "mcp_url": CONCIERGE_MCP_URL,
+            "started_at": time.time(),
+            "finished_at": time.time(),
+            "duration_seconds": 0.0,
+            "returncode": None,
+            "stdout_tail": "",
+            "stderr_tail": "",
+            "action": "deferred",
+            "outcome": "tick_in_progress",
+            "mutating": False,
+            "planner_model": CONCIERGE_PLANNER_MODEL,
+            "planner_effort": CONCIERGE_PLANNER_EFFORT,
+        }
+        _write_status(state_dir, status)
+        journal("aflow-concierge: phase=deferred reason=tick_in_progress")
+        return 0
+    finally:
+        if owns_executor:
+            try:
+                executor.close()
+            except Exception:
+                pass
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(
+        prog="aflow-concierge",
+        description=(
+            "Run one bounded, non-overlapping AFlow owner-issue concierge tick."
+        ),
+    )
+    parser.add_argument(
+        "--state-dir",
+        type=Path,
+        default=DEFAULT_STATE_DIR,
+        help="private state directory for the tick lock and status record",
+    )
+    parser.add_argument(
+        "--work-dir",
+        type=Path,
+        default=DEFAULT_WORK_DIR,
+        help=(
+            "read-only working directory for the tick process; need not be a "
+            "Git repository because the invocation passes --skip-git-repo-check"
+        ),
+    )
+    parser.add_argument(
+        "--project-root",
+        type=Path,
+        default=CONCIERGE_PROJECT_ROOT_DEFAULT,
+        help="registered AFlow project root the concierge serves",
+    )
+    parser.add_argument(
+        "--timeout-seconds",
+        type=float,
+        default=DEFAULT_TIMEOUT_SECONDS,
+        help="internal tick timeout, strictly below the 20-minute interval",
+    )
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="validate configuration and print the tick plan without side effects",
+    )
+    args = parser.parse_args(argv)
+    if not 0 < args.timeout_seconds < TICK_INTERVAL_SECONDS:
+        print(
+            "aflow-concierge: timeout_seconds must be greater than zero and "
+            "strictly below the 20-minute tick interval",
+            file=sys.stderr,
+        )
+        return 1
+    environment = dict(os.environ)
+    try:
+        if args.dry_run:
+            return dry_run(
+                state_dir=args.state_dir,
+                work_dir=args.work_dir,
+                environment=environment,
+                timeout_seconds=args.timeout_seconds,
+            )
+        return run_tick(
+            state_dir=args.state_dir,
+            work_dir=args.work_dir,
+            environment=environment,
+            timeout_seconds=args.timeout_seconds,
+            project_root=args.project_root,
+        )
+    except ConciergeError as exc:
+        print(f"aflow-concierge: {exc.reason}", file=sys.stderr)
+        return 1
+
+
+__all__ = [
+    "CONCIERGE_EFFORT",
+    "CONCIERGE_GITHUB_TOKEN_ENV",
+    "CONCIERGE_MCP_URL",
+    "CONCIERGE_MODEL",
+    "CONCIERGE_OWNER_ID",
+    "CONCIERGE_PLANNER_EFFORT",
+    "CONCIERGE_PLANNER_MODEL",
+    "CONCIERGE_PROJECT_ROOT_DEFAULT",
+    "CONCIERGE_TEAM",
+    "CONCIERGE_TOKEN_ENV",
+    "CONCIERGE_WORKFLOW_NAME",
+    "ConciergeCanonicalIssue",
+    "ConciergeError",
+    "ConciergeTickExecutor",
+    "GithubClient",
+    "GithubIssuePage",
+    "McpClient",
+    "McpHttpEndpoint",
+    "McpRegistryClient",
+    "TickDeferral",
+    "TickExecutor",
+    "TickObservation",
+    "TickOutcome",
+    "TickProcessResult",
+    "TriageDecision",
+    "build_codex_argv",
+    "build_tick_prompt",
+    "dry_run",
+    "load_tick_prompt",
+    "main",
+    "read_bearer_token",
+    "redact_text",
+    "repository_full_name",
+    "run_tick",
+    "tick_lock",
+    "triage_tick",
+]

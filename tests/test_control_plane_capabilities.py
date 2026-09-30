@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import subprocess
+
 import pytest
 
 from aflow.config import (
@@ -51,6 +53,31 @@ def test_capabilities_are_derived_from_config_with_full_upgrade_chains() -> None
     assert capabilities.admitted_role_selectors["worker"] == ("codex.high",)
     assert "owner_stopped" in capabilities.status_values
     assert "adapter:codex" in capabilities.service_features
+    assert capabilities.publication.available is False
+    assert capabilities.publication.publish_remote is None
+    assert capabilities.publication.publish_branch is None
+
+
+def test_capabilities_expose_project_publication_settings(tmp_path) -> None:
+    root = tmp_path / "repo"
+    subprocess.run(["git", "init", "-q", "--initial-branch=main", str(root)], check=True)
+    subprocess.run(
+        ["git", "-C", str(root), "config", "aflow.publishRemote", "origin"], check=True
+    )
+    subprocess.run(
+        ["git", "-C", str(root), "config", "aflow.publishBranch", "main"], check=True
+    )
+    config = WorkflowUserConfig()
+    capabilities = CapabilityService(config, project_root=root).get()
+    assert capabilities.publication.available is True
+    assert capabilities.publication.publish_remote == "origin"
+    assert capabilities.publication.publish_branch == "main"
+    payload = capabilities.to_dict()
+    assert payload["publication"] == {
+        "available": True,
+        "publish_remote": "origin",
+        "publish_branch": "main",
+    }
 
 
 def test_capabilities_reject_upgrade_cycles() -> None:

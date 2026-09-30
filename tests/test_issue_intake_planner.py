@@ -20,6 +20,7 @@ from aflow.issue_intake_planner import (
     PlannerFailure,
     PlannerProcessResult,
     build_codex_argv,
+    validate_concierge_plan_evidence,
 )
 
 
@@ -28,6 +29,27 @@ ISSUE_NUMBER = 7
 PROJECT_ID = "project"
 PLAN_TEXT = "# Plan\n\n### [ ] Checkpoint 1: First\n- [ ] implement\n"
 BASE_BODY = "Please inspect the repository."
+CONCIERGE_ISSUE_URL = "https://github.com/owner/repo/issues/7"
+CONCIERGE_PLAN_TEXT = (
+    "# Plan\n"
+    "\n"
+    f"Source issue: {CONCIERGE_ISSUE_URL}\n"
+    "\n"
+    "### [ ] Checkpoint 1: First\n"
+    "- [ ] implement the change\n"
+    "\n"
+    "## Behavioral Acceptance Tests\n"
+    "\n"
+    "- An eligible owner issue produces one validated draft plan.\n"
+    "\n"
+    "## Assumptions And Defaults\n"
+    "\n"
+    "- Default to the checkpoint_delivery workflow with the xtx-mtp team.\n"
+    "\n"
+    "## Verification\n"
+    "\n"
+    "- Run: `uv run pytest tests/test_concierge.py -q`\n"
+)
 
 
 def _git(root: Path, *arguments: str) -> str:
@@ -99,10 +121,14 @@ class _FakeCodex:
         response: Mapping[str, object] | None = None,
         result: PlannerProcessResult | None = None,
         edit_worktree: bool = False,
+        model: str = PLANNER_MODEL,
+        effort: str = PLANNER_EFFORT,
     ) -> None:
         self.response = response or {"status": "plan", "markdown": PLAN_TEXT}
         self.result = result
         self.edit_worktree = edit_worktree
+        self.model = model
+        self.effort = effort
         self.calls: list[tuple[tuple[str, ...], Path, bytes]] = []
 
     def __call__(
@@ -114,7 +140,7 @@ class _FakeCodex:
         normalized = tuple(argv)
         self.calls.append((normalized, cwd, prompt))
         assert normalized[:2] == ("codex", "exec")
-        assert normalized[normalized.index("--model") + 1] == PLANNER_MODEL
+        assert normalized[normalized.index("--model") + 1] == self.model
         assert normalized[normalized.index("--sandbox") + 1] == "read-only"
         assert normalized[normalized.index("-C") + 1] == str(cwd)
         config_values = [
@@ -123,7 +149,7 @@ class _FakeCodex:
             if value == "-c"
         ]
         assert "approval_policy='never'" in config_values
-        assert f"model_reasoning_effort='{PLANNER_EFFORT}'" in config_values
+        assert f"model_reasoning_effort='{self.effort}'" in config_values
         assert "--dangerously-bypass-approvals-and-sandbox" not in normalized
         assert "--approve-for-me" not in normalized
         assert "--full-auto" not in normalized
@@ -705,3 +731,139 @@ def test_recovered_generated_plan_rejects_checked_progress(tmp_path: Path) -> No
             )
     finally:
         planner._cleanup_workspace(workspace)
+
+
+def _concierge_planner(
+    tmp_path: Path, codex: _FakeCodex
+) -> tuple[IssueIntakePlanner, _RegistryAPI, _FakeCodex, Path]:
+    root = _repository(tmp_path)
+    api = _RegistryAPI(root)
+    planner = IssueIntakePlanner(
+        client=api,
+        state_root=tmp_path / "state",
+        skill_loader=lambda: "CANONICAL EFFECTIVE SKILL",
+        process_runner=codex,
+        model="gpt-6-astra",
+        effort="high",
+        require_concierge_evidence=True,
+    )
+    return planner, api, codex, root
+
+
+def test_concierge_planner_invocation_uses_astra_high_and_records_provenance(
+    tmp_path: Path,
+) -> None:
+    codex = _FakeCodex(
+        response={"status": "plan", "markdown": CONCIERGE_PLAN_TEXT},
+        effort="high",
+    )
+    planner, api, runner, _root = _concierge_planner(tmp_path, codex)
+    result = _plan_call(planner)
+    assert result.status == "plan"
+    argv = runner.calls[0][0]
+    assert argv[argv.index("--model") + 1] == "gpt-6-astra"
+    config_values = [
+        argv[index + 1] for index, value in enumerate(argv) if value == "-c"
+    ]
+    assert "model_reasoning_effort='high'" in config_values
+    assert result.provenance["model"] == "gpt-6-astra"
+    assert result.provenance["effort"] == "high"
+
+
+def test_default_planner_invocation_unchanged(tmp_path: Path) -> None:
+    codex = _FakeCodex()
+    planner, _api, runner, _root = _planner(tmp_path, codex=codex)
+    _plan_call(planner)
+    argv = runner.calls[0][0]
+    assert argv[argv.index("--model") + 1] == PLANNER_MODEL
+    config_values = [
+        argv[index + 1] for index, value in enumerate(argv) if value == "-c"
+    ]
+    assert f"model_reasoning_effort='{PLANNER_EFFORT}'" in config_values
+
+
+def test_concierge_evidence_requires_issue_reference(tmp_path: Path) -> None:
+    markdown = CONCIERGE_PLAN_TEXT.replace(CONCIERGE_ISSUE_URL, "no reference")
+    codex = _FakeCodex(
+        response={"status": "plan", "markdown": markdown}, effort="high"
+    )
+    planner, _api, _runner, _root = _concierge_planner(tmp_path, codex)
+    with pytest.raises(PlannerFailure, match="planner_plan_missing_issue_reference"):
+        _plan_call(planner)
+
+
+def test_concierge_evidence_requires_verification_command(tmp_path: Path) -> None:
+    markdown = CONCIERGE_PLAN_TEXT.replace(
+        "- Run: `uv run pytest tests/test_concierge.py -q`", "- Run the suite."
+    )
+    codex = _FakeCodex(
+        response={"status": "plan", "markdown": markdown}, effort="high"
+    )
+    planner, _api, _runner, _root = _concierge_planner(tmp_path, codex)
+    with pytest.raises(
+        PlannerFailure, match="planner_plan_missing_verification_command"
+    ):
+        _plan_call(planner)
+
+
+def test_concierge_evidence_requires_acceptance_mapping(tmp_path: Path) -> None:
+    markdown = CONCIERGE_PLAN_TEXT.replace(
+        "## Behavioral Acceptance Tests", "## Tests"
+    )
+    codex = _FakeCodex(
+        response={"status": "plan", "markdown": markdown}, effort="high"
+    )
+    planner, _api, _runner, _root = _concierge_planner(tmp_path, codex)
+    with pytest.raises(
+        PlannerFailure, match="planner_plan_missing_acceptance_mapping"
+    ):
+        _plan_call(planner)
+
+
+def test_concierge_evidence_requires_safe_defaults(tmp_path: Path) -> None:
+    markdown = CONCIERGE_PLAN_TEXT.replace(
+        "## Assumptions And Defaults", "## Notes"
+    )
+    codex = _FakeCodex(
+        response={"status": "plan", "markdown": markdown}, effort="high"
+    )
+    planner, _api, _runner, _root = _concierge_planner(tmp_path, codex)
+    with pytest.raises(PlannerFailure, match="planner_plan_missing_safe_defaults"):
+        _plan_call(planner)
+
+
+def test_concierge_evidence_accepts_complete_plan(tmp_path: Path) -> None:
+    codex = _FakeCodex(
+        response={"status": "plan", "markdown": CONCIERGE_PLAN_TEXT}, effort="high"
+    )
+    planner, _api, _runner, _root = _concierge_planner(tmp_path, codex)
+    result = _plan_call(planner)
+    assert result.status == "plan"
+    assert result.markdown == CONCIERGE_PLAN_TEXT
+    assert len(_runner.calls) == 1
+
+
+def test_concierge_planner_question_is_attention_without_authoring(
+    tmp_path: Path,
+) -> None:
+    codex = _FakeCodex(
+        response={"status": "needs_attention", "question": "Which scope?"},
+        effort="high",
+    )
+    planner, _api, runner, _root = _concierge_planner(tmp_path, codex)
+    result = _plan_call(planner)
+    assert result.status == "needs_attention"
+    assert result.question == "Which scope?"
+    assert result.markdown is None
+    assert len(runner.calls) == 1
+
+
+def test_validate_concierge_plan_evidence_rejects_empty_markdown() -> None:
+    with pytest.raises(PlannerFailure, match="planner_plan_empty"):
+        validate_concierge_plan_evidence("   ", issue_url=CONCIERGE_ISSUE_URL)
+
+
+def test_validate_concierge_plan_evidence_accepts_complete_markdown() -> None:
+    validate_concierge_plan_evidence(
+        CONCIERGE_PLAN_TEXT, issue_url=CONCIERGE_ISSUE_URL
+    )

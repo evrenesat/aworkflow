@@ -50,6 +50,7 @@ def compose_control_plane(
 
     capabilities = CapabilityService(
         config_loader=load_current_config,
+        project_root=repo_root,
         service_features=(
             "run_repository",
             "capabilities",

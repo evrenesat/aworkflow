@@ -40,6 +40,12 @@ class WorkflowCapabilityResponse(CanonicalTransportModel):
     default_team: str | None = None
 
 
+class PublicationSettingsResponse(CanonicalTransportModel):
+    available: bool
+    publish_remote: str | None = None
+    publish_branch: str | None = None
+
+
 class CapabilityResponse(CanonicalTransportModel):
     schema_version: int
     workflows: tuple[str, ...]
@@ -53,6 +59,7 @@ class CapabilityResponse(CanonicalTransportModel):
     team_upgrade_chains: Mapping[str, tuple[str, ...]]
     control_safety: Mapping[str, Literal["safe", "restart_required"]]
     service_features: tuple[str, ...]
+    publication: PublicationSettingsResponse
 
 
 class RunProgressCountResponse(CanonicalTransportModel):

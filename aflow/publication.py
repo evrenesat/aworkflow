@@ -38,6 +38,19 @@ class CompletedPlanLifecycle:
     phase: str
 
 
+@dataclass(frozen=True)
+class PublicationSettings:
+    """Repository-local Git publication grant projected for preflight.
+
+    ``available`` is true only when both grants are present and readable;
+    absent or unreadable values stay unavailable rather than guessed.
+    """
+
+    available: bool = False
+    publish_remote: str | None = None
+    publish_branch: str | None = None
+
+
 _PLAN_LIFECYCLE_KEY = "plan_lifecycle"
 _PLAN_LIFECYCLE_SCHEMA = 1
 _PLAN_LIFECYCLE_COMMIT_MESSAGE = "chore/plans: Record completed plan lifecycle move"
@@ -1102,6 +1115,26 @@ def _publication_lock(root: Path) -> Iterator[None]:
             fcntl.flock(descriptor, fcntl.LOCK_UN)
     finally:
         os.close(descriptor)
+
+
+def read_publication_settings(root: Path) -> PublicationSettings:
+    """Project the two repository-local publication grants; never raises.
+
+    Mirrors :func:`publish_completed_run` reading semantics. Absent or
+    unreadable settings are reported unavailable, never as a guessed default.
+    """
+    try:
+        remote = _git(root, "config", "--local", "--get", "aflow.publishRemote", optional=True)
+        branch = _git(root, "config", "--local", "--get", "aflow.publishBranch", optional=True)
+    except PublicationError:
+        return PublicationSettings()
+    if not remote or not branch:
+        return PublicationSettings()
+    return PublicationSettings(
+        available=True,
+        publish_remote=remote,
+        publish_branch=branch,
+    )
 
 
 def publish_completed_run(root: Path, run_dir: Path, *, source_ref: str = "HEAD") -> str | None:

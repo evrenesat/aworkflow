@@ -1,0 +1,10 @@
+[Unit]
+Description=AFlow owner-issue concierge tick schedule
+
+[Timer]
+OnCalendar=*:00,20,40
+Persistent=true
+Unit=aflow-concierge.service
+
+[Install]
+WantedBy=timers.target

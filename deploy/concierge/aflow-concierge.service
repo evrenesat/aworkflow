@@ -1,0 +1,25 @@
+[Unit]
+Description=AFlow owner-issue concierge tick
+Documentation=file:/opt/aflowd/current/src/deploy/concierge/README.md
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=root
+Group=root
+WorkingDirectory=/root/code
+Environment=HOME=/root
+Environment=CODEX_HOME=/var/lib/aflowd/concierge/codex-home
+Environment=PATH=/opt/aflowd/current/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+EnvironmentFile=/etc/aflowd/aflowd.env
+ExecStart=/opt/aflowd/current/venv/bin/python -P -c 'from aflow.concierge import main; raise SystemExit(main())'
+TimeoutStartSec=16min
+KillMode=control-group
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=full
+ProtectHome=read-only
+StateDirectory=aflowd
+ReadWritePaths=/var/lib/aflowd /root/code/agent-flow
+UMask=0077

@@ -12,6 +12,7 @@ from aflow.publication import (
     PublicationError,
     finalize_completed_plan,
     publish_completed_run,
+    read_publication_settings,
 )
 
 
@@ -24,6 +25,61 @@ def commit(root, name, text):
     git(root, "add", name)
     git(root, "commit", "-qm", name)
     return git(root, "rev-parse", "HEAD")
+
+
+def _bare_repo(tmp_path, name="repo"):
+    root = tmp_path / name
+    subprocess.run(
+        ["git", "init", "-q", "--initial-branch=main", str(root)],
+        check=True,
+    )
+    git(root, "config", "user.name", "Test")
+    git(root, "config", "user.email", "test@example.invalid")
+    return root
+
+
+def test_read_publication_settings_reports_exact_local_config(tmp_path):
+    root = _bare_repo(tmp_path)
+    git(root, "config", "aflow.publishRemote", "origin")
+    git(root, "config", "aflow.publishBranch", "main")
+    settings = read_publication_settings(root)
+    assert settings.available is True
+    assert settings.publish_remote == "origin"
+    assert settings.publish_branch == "main"
+
+
+def test_read_publication_settings_reports_other_configured_values(tmp_path):
+    root = _bare_repo(tmp_path)
+    git(root, "config", "aflow.publishRemote", "upstream")
+    git(root, "config", "aflow.publishBranch", "release")
+    settings = read_publication_settings(root)
+    assert settings.available is True
+    assert settings.publish_remote == "upstream"
+    assert settings.publish_branch == "release"
+
+
+def test_read_publication_settings_unavailable_when_incomplete(tmp_path):
+    root = _bare_repo(tmp_path)
+    git(root, "config", "aflow.publishRemote", "origin")
+    settings = read_publication_settings(root)
+    assert settings.available is False
+    assert settings.publish_remote is None
+    assert settings.publish_branch is None
+
+
+def test_read_publication_settings_unavailable_when_absent(tmp_path):
+    root = _bare_repo(tmp_path)
+    settings = read_publication_settings(root)
+    assert settings.available is False
+    assert settings.publish_remote is None
+    assert settings.publish_branch is None
+
+
+def test_read_publication_settings_unavailable_outside_git(tmp_path):
+    settings = read_publication_settings(tmp_path)
+    assert settings.available is False
+    assert settings.publish_remote is None
+    assert settings.publish_branch is None
 
 
 def _lifecycle_repo(

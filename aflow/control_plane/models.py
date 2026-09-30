@@ -9,6 +9,8 @@ from pathlib import Path
 import re
 from typing import Any, Literal, Mapping
 
+from aflow.publication import PublicationSettings
+
 
 CONTROL_PLANE_SCHEMA_VERSION = 1
 RUN_PROGRESS_SCHEMA_VERSION = 1
@@ -396,6 +398,7 @@ class CapabilitySet:
         default_factory=dict
     )
     service_features: tuple[str, ...] = ()
+    publication: PublicationSettings = field(default_factory=PublicationSettings)
 
     def to_dict(self) -> dict[str, Any]:
         return bounded_redacted(asdict(self))

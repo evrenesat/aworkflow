@@ -8,6 +8,7 @@ from pathlib import Path
 from aflow.config import WorkflowUserConfig
 from aflow.harnesses import ADAPTERS
 from aflow.live_config import load_live_config
+from aflow.publication import PublicationSettings, read_publication_settings
 
 from .models import CapabilitySet, WorkflowCapability
 
@@ -25,6 +26,7 @@ class CapabilityService:
         *,
         config_path: Path | None = None,
         config_loader: Callable[[], WorkflowUserConfig] | None = None,
+        project_root: Path | None = None,
         service_features: tuple[str, ...] = (
             "run_repository",
             "capabilities",
@@ -46,6 +48,7 @@ class CapabilityService:
             self._config_loader = lambda: load_live_config(self._config_path).workflow_config
         else:
             self._config_loader = None
+        self._project_root = project_root
         self._service_features = tuple(sorted(set(service_features)))
 
     def get(self) -> CapabilitySet:
@@ -123,6 +126,11 @@ class CapabilityService:
                     set(self._service_features)
                     | {f"adapter:{name}" for name in config.harnesses if name in ADAPTERS}
                 )
+            ),
+            publication=(
+                read_publication_settings(self._project_root)
+                if self._project_root is not None
+                else PublicationSettings()
             ),
         )
 
