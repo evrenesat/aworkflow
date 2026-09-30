@@ -119,6 +119,15 @@ controller terminal state and explicit owner stop retain authority. API daemon
 composition reconciles read-only, including its first request; normal daemon
 startup and periodic reconciliation still persist observations.
 
+The optional `run.json` `defect_confirmation` is projected read-only onto
+canonical `RunStatus` and mirrored by `RunStatusResponse`, so REST
+`GET .../runs/{run_id}`, the runs list, and MCP `get_run`/`list_runs` expose
+the identical optional value without new tools or registries. The repository
+validates the exact six-field contract on read: malformed, legacy, or
+unconfirmed data projects `null` and never blocks a status read, while
+status, activity, worker receipts, resume evidence, and history behavior stay
+unchanged.
+
 `control_plane/run_history.py` owns atomic, versioned metadata under
 `.aflow/run-history/`, addressed by the SHA-256 of the exact validated run ID.
 It stores visibility, revision, timestamp, and bounded mutation replay receipts.
@@ -1080,6 +1089,17 @@ authority. Accepted override digests are durable before routing changes, rejecte
 `waiting_for_valid_override`, and corrected content can be retried on resume.
 Direct `run.json` editing, graph mutation, active-harness mutation, and
 lifecycle/manager/plan-lineage overrides are intentionally unsupported.
+
+An optional `defect_confirmation` mapping may exist in `run.json` only when
+the controller's own internal AssertionError fails inside installed AFlow
+package source. It carries the fixed six-field contract: `schema_version=1`,
+`kind=engine_internal_assertion`, `source=controller`, a package-relative
+`component` module path, a `function:line` `site`, and a 64-character
+lowercase SHA-256 `signature` derived from kind, component, function, and
+line. It never contains exception text, tracebacks, host paths, run IDs,
+timestamps, credentials, or provider output, and repeated occurrences of the
+same source site deduplicate to one signature. Generic startup, worker,
+provider, admission, and AFLOW_STOP failures write no confirmation.
 
 Every resume still creates a distinct durable run id linked through
 `resumed_from_run_id`; the lifecycle identity and reused execution context do

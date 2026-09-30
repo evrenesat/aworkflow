@@ -210,6 +210,24 @@ class RunProgressDetailResponse(RunProgressSummaryResponse):
     truncation: RunProgressTruncationResponse = Field(default_factory=RunProgressTruncationResponse)
 
 
+class DefectConfirmationResponse(CanonicalTransportModel):
+    """Strict mirror of the canonical trusted engine-assertion confirmation."""
+
+    schema_version: Literal[1]
+    kind: Literal["engine_internal_assertion"]
+    source: Literal["controller"]
+    component: str = Field(
+        pattern=r"^[A-Za-z_][A-Za-z0-9_]*(/[A-Za-z_][A-Za-z0-9_]*)*\.py$"
+    )
+    site: str = Field(
+        pattern=(
+            r"^(?:[A-Za-z_][A-Za-z0-9_]*|<module>|<lambda>|<listcomp>"
+            r"|<dictcomp>|<setcomp>|<genexpr>):\d+$"
+        )
+    )
+    signature: str = Field(pattern=r"^[0-9a-f]{64}$")
+
+
 class RunStatusResponse(CanonicalTransportModel):
     activity: Literal["active", "inactive", "unknown"] = "unknown"
     status_reason_code: str = "activity_unknown"
@@ -239,6 +257,7 @@ class RunStatusResponse(CanonicalTransportModel):
     restarted_from_run_id: str | None = None
     evidence: Mapping[str, Any]
     progress: RunProgressSummaryResponse | None = None
+    defect_confirmation: DefectConfirmationResponse | None = None
 
 
 class StartRunResponse(CanonicalTransportModel):

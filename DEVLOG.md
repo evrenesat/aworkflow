@@ -1,5 +1,25 @@
 # DEVLOG
 
+## 2026-09-30 — Project trusted defect confirmation through REST and MCP (Checkpoint 2)
+
+- Canonical `RunStatus` gains an optional typed `defect_confirmation`
+  (`DefectConfirmation`, the fixed six-field contract) and the repository
+  projects it only from validated control-plane-owned `run.json` metadata via
+  the checkpoint-1 strict validator. Malformed, legacy, and unconfirmed runs
+  project `null` without blocking status reads; status, activity, worker
+  receipts, resume evidence, and history behavior are unchanged.
+- `RunStatusResponse` mirrors the field with strict literal and pattern
+  validation, so REST `get_run`, the runs list, and MCP `get_run`/`list_runs`
+  expose the identical optional value through the existing tools with no new
+  registry, mutation surface, or raw diagnostics.
+- Focused tests cover the repository projection (valid, unconfirmed, sixteen
+  malformed shapes, legacy runs), the transport round trip and out-of-contract
+  rejection, and REST/MCP parity for both a valid record and a broken one.
+- Verification: 173 passed across `tests/test_control_plane_repository.py`,
+  `apps/aflow_app/server/tests/test_mcp.py`, and
+  `apps/aflow_app/server/tests/test_control_plane_api.py`; `git diff --check`
+  is clean. No UI visual change is included.
+
 ## 2026-09-27 — Verify bounded saturated scans (Checkpoint 1)
 
 - The reported saturated project had 45 in-progress plans and 180 uncertain

@@ -12,6 +12,9 @@ from typing import Any, Literal, Mapping
 
 CONTROL_PLANE_SCHEMA_VERSION = 1
 RUN_PROGRESS_SCHEMA_VERSION = 1
+DEFECT_CONFIRMATION_SCHEMA_VERSION = 1
+DEFECT_CONFIRMATION_KIND = "engine_internal_assertion"
+DEFECT_CONFIRMATION_SOURCE = "controller"
 MAX_SERIALIZED_TEXT = 4_096
 MAX_SERIALIZED_ITEMS = 128
 WORKTREE_PREFLIGHT_DEFAULT_LIMIT = 200
@@ -399,6 +402,27 @@ class CapabilitySet:
 
 
 @dataclass(frozen=True)
+class DefectConfirmation:
+    """A bounded, redacted confirmation of one trusted engine assertion.
+
+    The fixed six-field contract carries no exception text, host path, run
+    identity, timestamp, or provider output.  Only the controller's own
+    internal AssertionError recorded in control-plane-owned run metadata may
+    populate it; every other failure projects null.
+    """
+
+    schema_version: int = DEFECT_CONFIRMATION_SCHEMA_VERSION
+    kind: str = DEFECT_CONFIRMATION_KIND
+    source: str = DEFECT_CONFIRMATION_SOURCE
+    component: str = ""
+    site: str = ""
+    signature: str = ""
+
+    def to_dict(self) -> dict[str, Any]:
+        return bounded_redacted(asdict(self))
+
+
+@dataclass(frozen=True)
 class RunStatus:
     run_id: str
     status: str
@@ -428,6 +452,7 @@ class RunStatus:
     worker_exit: Mapping[str, Any] | None = None
     evidence: Mapping[str, Any] = field(default_factory=dict)
     progress: RunProgressSummary | None = None
+    defect_confirmation: DefectConfirmation | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return bounded_redacted(asdict(self))

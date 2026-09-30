@@ -15,6 +15,7 @@ from aflow.project_settings import ProjectSettingsService
 
 from .models import (
     CONTROL_PLANE_SCHEMA_VERSION,
+    DefectConfirmation,
     LaunchManifest,
     PlanRecord,
     ProjectRecord,
@@ -71,6 +72,35 @@ def _bounded_limit(limit: int) -> int:
     if not isinstance(limit, int) or isinstance(limit, bool) or not 1 <= limit <= MAX_PAGE_SIZE:
         raise RepositoryError(f"limit must be between 1 and {MAX_PAGE_SIZE}")
     return limit
+
+
+def _project_defect_confirmation(
+    metadata: Mapping[str, Any],
+) -> DefectConfirmation | None:
+    """Project the validated confirmation; malformed data stays null.
+
+    Only the strict six-field contract recorded by the controller in
+    control-plane-owned run metadata is projected.  Any deviation, including
+    legacy runs, malformed mappings, or unconfirmed failures, yields null
+    without blocking the status read.
+    """
+    value = metadata.get("defect_confirmation")
+    if value is None:
+        return None
+    from aflow.runlog import _validated_defect_confirmation
+
+    try:
+        validated = _validated_defect_confirmation(value)
+    except ValueError:
+        return None
+    return DefectConfirmation(
+        schema_version=int(validated["schema_version"]),
+        kind=str(validated["kind"]),
+        source=str(validated["source"]),
+        component=str(validated["component"]),
+        site=str(validated["site"]),
+        signature=str(validated["signature"]),
+    )
 
 
 def _recovery_worker_evidence(
@@ -397,6 +427,7 @@ class RunRepository:
             selected_start_step=manifest.start_step,
             skipped_steps=manifest.skipped_steps,
             restarted_from_run_id=manifest.restarted_from_run_id,
+            defect_confirmation=_project_defect_confirmation(metadata),
             evidence={
                 "has_run_metadata": bool(metadata),
                 "recorded_status": retained_summary["status"] if retained_summary is not None else metadata_status,

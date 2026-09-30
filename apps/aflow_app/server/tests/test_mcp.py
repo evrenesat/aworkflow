@@ -231,6 +231,59 @@ def test_mcp_historical_owner_stop_acknowledgement(mcp_client) -> None:
     assert _mcp_tool_error(client, "owner_stop", arguments) == "operation_forbidden"
 
 
+def test_mcp_get_run_exposes_defect_confirmation(mcp_client) -> None:
+    from aflow.control_plane import write_launch_phase
+
+    client, root, units, _ = mcp_client
+    run_id = "mcp-defect-run"
+    _seed_owner_stop_manifest(root, run_id)
+    run_dir = root / ".aflow" / "runs" / run_id
+    metadata_path = run_dir / "run.json"
+    confirmation = {
+        "schema_version": 1,
+        "kind": "engine_internal_assertion",
+        "source": "controller",
+        "component": "control_plane/repository.py",
+        "site": "get_run_status:418",
+        "signature": "a" * 64,
+    }
+    metadata = json.loads(metadata_path.read_text())
+    metadata["status"] = "failed"
+    metadata["defect_confirmation"] = confirmation
+    metadata_path.write_text(json.dumps(metadata))
+    write_launch_phase(root, run_id, "failed")
+
+    mcp_run = _mcp_tool(client, "get_run", {"project_id": PROJECT_ID, "run_id": run_id})
+    assert mcp_run["status"] == "failed"
+    assert mcp_run["defect_confirmation"] == confirmation
+
+    rest_run = client.get(
+        f"/api/control-plane/projects/{PROJECT_ID}/runs/{run_id}",
+        headers={"Authorization": f"Bearer {TOKEN}"},
+    ).json()
+    assert mcp_run["defect_confirmation"] == rest_run["defect_confirmation"] == confirmation
+
+    mcp_list = _mcp_tool(client, "list_runs", {"project_id": PROJECT_ID})
+    row = next(item for item in mcp_list["runs"] if item["run_id"] == run_id)
+    assert row["defect_confirmation"] == confirmation
+
+    # Malformed records project null on both transports without blocking reads.
+    metadata["defect_confirmation"] = {**confirmation, "signature": "broken"}
+    metadata_path.write_text(json.dumps(metadata))
+    assert (
+        _mcp_tool(client, "get_run", {"project_id": PROJECT_ID, "run_id": run_id})["defect_confirmation"]
+        is None
+    )
+    assert (
+        client.get(
+            f"/api/control-plane/projects/{PROJECT_ID}/runs/{run_id}",
+            headers={"Authorization": f"Bearer {TOKEN}"},
+        )
+        .json()["defect_confirmation"]
+        is None
+    )
+
+
 def test_mcp_stateless_http_auth_metadata_resources_and_rest_parity(mcp_client) -> None:
     client, _, _, _ = mcp_client
     initialization = _mcp_request(

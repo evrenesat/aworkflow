@@ -516,6 +516,173 @@ def test_status_reports_applied_turn_limit_not_pending_override(
     assert metadata_path.read_bytes() == before
 
 
+def _valid_defect_confirmation() -> dict[str, object]:
+    return {
+        "schema_version": 1,
+        "kind": "engine_internal_assertion",
+        "source": "controller",
+        "component": "control_plane/repository.py",
+        "site": "get_run_status:418",
+        "signature": "a" * 64,
+    }
+
+
+def _write_run_metadata(run_dir: Path, **extra: object) -> Path:
+    metadata_path = run_dir / "run.json"
+    metadata = json.loads(metadata_path.read_text())
+    metadata.update(extra)
+    metadata_path.write_text(json.dumps(metadata), encoding="utf-8")
+    return metadata_path
+
+
+def test_get_run_projects_validated_defect_confirmation(tmp_path: Path) -> None:
+    run_dir = _owned_run(tmp_path, status="failed")
+    repository = RunRepository(tmp_path)
+    baseline = repository.get_run_status("owned-run")
+    assert baseline.defect_confirmation is None
+    _write_run_metadata(run_dir, defect_confirmation=_valid_defect_confirmation())
+
+    status = repository.get_run_status("owned-run")
+
+    assert status.defect_confirmation is not None
+    assert status.defect_confirmation.schema_version == 1
+    assert status.defect_confirmation.kind == "engine_internal_assertion"
+    assert status.defect_confirmation.source == "controller"
+    assert status.defect_confirmation.component == "control_plane/repository.py"
+    assert status.defect_confirmation.site == "get_run_status:418"
+    assert status.defect_confirmation.signature == "a" * 64
+    assert status.to_dict()["defect_confirmation"] == _valid_defect_confirmation()
+    # Status, activity, and resume evidence stay unchanged by the projection.
+    assert (status.status, status.activity, status.status_reason_code) == (
+        baseline.status,
+        baseline.activity,
+        baseline.status_reason_code,
+    )
+    assert status.evidence == baseline.evidence
+    assert status.status == "failed"
+    assert status.evidence["recorded_status"] == "failed"
+    assert status.evidence["controller_terminal"] is True
+
+    listed = repository.list_runs().runs[0]
+    assert listed.run_id == "owned-run"
+    assert listed.defect_confirmation == status.defect_confirmation
+    assert listed.status == status.status
+    assert listed.to_dict()["defect_confirmation"] == _valid_defect_confirmation()
+
+
+def test_unconfirmed_failure_projects_null_defect_confirmation(tmp_path: Path) -> None:
+    _owned_run(tmp_path, status="failed")
+
+    status = RunRepository(tmp_path).get_run_status("owned-run")
+
+    assert status.defect_confirmation is None
+    assert status.to_dict()["defect_confirmation"] is None
+    assert status.status == "failed"
+
+
+@pytest.mark.parametrize(
+    "malformed",
+    [
+        {**_valid_defect_confirmation(), "schema_version": 2},
+        {**_valid_defect_confirmation(), "kind": "worker_failure"},
+        {**_valid_defect_confirmation(), "source": "worker"},
+        {**_valid_defect_confirmation(), "component": "../escape.py"},
+        {**_valid_defect_confirmation(), "component": "/absolute/path.py"},
+        {**_valid_defect_confirmation(), "component": "sub/../sub/module.py"},
+        {**_valid_defect_confirmation(), "component": "module.txt"},
+        {**_valid_defect_confirmation(), "site": "no_line_number"},
+        {**_valid_defect_confirmation(), "site": "fn:-1"},
+        {**_valid_defect_confirmation(), "signature": "A" * 64},
+        {**_valid_defect_confirmation(), "signature": "abc123"},
+        {**_valid_defect_confirmation(), "detail": "assert x"},
+        {k: v for k, v in _valid_defect_confirmation().items() if k != "signature"},
+        ["schema_version", "kind", "source", "component", "site", "signature"],
+        "engine_internal_assertion",
+        42,
+    ],
+    ids=[
+        "schema-version",
+        "kind",
+        "source",
+        "component-traversal",
+        "component-absolute",
+        "component-dotdot",
+        "component-not-py",
+        "site-missing-line",
+        "site-negative-line",
+        "signature-uppercase",
+        "signature-short",
+        "extra-field",
+        "missing-field",
+        "list",
+        "string",
+        "number",
+    ],
+)
+def test_malformed_defect_confirmation_projects_null_without_blocking_reads(
+    tmp_path: Path,
+    malformed: object,
+) -> None:
+    run_dir = _owned_run(tmp_path, status="failed")
+    _write_run_metadata(run_dir, defect_confirmation=malformed)
+
+    repository = RunRepository(tmp_path)
+    status = repository.get_run_status("owned-run")
+
+    assert status.defect_confirmation is None
+    assert status.to_dict()["defect_confirmation"] is None
+    assert status.status == "failed"
+    assert status.evidence["recorded_status"] == "failed"
+
+
+def test_legacy_run_exposes_null_defect_confirmation_even_with_record(tmp_path: Path) -> None:
+    legacy_id = "20260809T172123Z-abc12345"
+    legacy = tmp_path / ".aflow" / "runs" / legacy_id
+    legacy.mkdir(parents=True)
+    metadata = legacy / "run.json"
+    metadata.write_text(
+        json.dumps(
+            {
+                "status": "failed",
+                "defect_confirmation": _valid_defect_confirmation(),
+            }
+        ),
+        encoding="utf-8",
+    )
+    before = metadata.read_bytes()
+
+    repository = RunRepository(tmp_path)
+    status = repository.get_run_status(legacy_id)
+    listed = repository.list_runs().runs
+
+    assert status.ownership == "legacy"
+    assert status.defect_confirmation is None
+    assert status.to_dict()["defect_confirmation"] is None
+    assert [item.defect_confirmation for item in listed] == [None]
+    assert metadata.read_bytes() == before
+
+
+def test_defect_confirmation_preserves_status_read_on_broken_metadata(tmp_path: Path) -> None:
+    run_dir = _owned_run(tmp_path, status="failed")
+    _write_run_metadata(run_dir, defect_confirmation=_valid_defect_confirmation())
+    metadata_path = run_dir / "run.json"
+    metadata = json.loads(metadata_path.read_text())
+    metadata["defect_confirmation"] = {
+        "schema_version": 1,
+        "kind": "engine_internal_assertion",
+        "source": "controller",
+        "component": "control_plane/repository.py",
+        "site": "get_run_status:418",
+        "signature": "not-a-signature",
+    }
+    metadata_path.write_text(json.dumps(metadata), encoding="utf-8")
+
+    status = RunRepository(tmp_path).get_run_status("owned-run")
+
+    assert status.defect_confirmation is None
+    assert status.status == "failed"
+
+
 def test_old_startup_failure_is_read_only_and_active_terminal_authority_wins(tmp_path):
     from aflow.control_plane import write_launch_phase
     create_launch_manifest(tmp_path, _manifest("old-failure"))

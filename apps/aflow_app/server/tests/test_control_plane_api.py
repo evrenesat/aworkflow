@@ -33,6 +33,7 @@ from aflow.control_plane import (
     create_launch_manifest,
     write_launch_phase,
 )
+from aflow.control_plane.models import DefectConfirmation
 from aflow.control_plane.persistence import append_run_event, read_events
 from aflow.control_plane.persistent_units import PersistentUnitManager
 from aflow.control_plane.units import InMemoryUnitManager, UnitState
@@ -1943,6 +1944,47 @@ def test_progress_transport_models_keep_optional_status_and_full_detail_shapes()
     assert detail_response.model_dump(mode="json")["truncation"]["response_limit_checkpoints"] == 2
 
 
+def test_defect_confirmation_transport_round_trips_and_rejects_out_of_contract() -> None:
+    confirmation = DefectConfirmation(
+        component="control_plane/repository.py",
+        site="get_run_status:418",
+        signature="a" * 64,
+    )
+    response = RunStatusResponse.from_canonical(
+        RunStatus(run_id="sample", status="failed", defect_confirmation=confirmation)
+    )
+    assert response.defect_confirmation is not None
+    assert response.defect_confirmation.model_dump() == {
+        "schema_version": 1,
+        "kind": "engine_internal_assertion",
+        "source": "controller",
+        "component": "control_plane/repository.py",
+        "site": "get_run_status:418",
+        "signature": "a" * 64,
+    }
+    assert (
+        RunStatusResponse.from_canonical(RunStatus(run_id="sample", status="failed")).defect_confirmation
+        is None
+    )
+
+    invalid = {
+        "bad-schema-version": replace(confirmation, schema_version=2),
+        "bad-kind": replace(confirmation, kind="worker_failure"),
+        "bad-source": replace(confirmation, source="worker"),
+        "traversal-component": replace(confirmation, component="../escape.py"),
+        "absolute-component": replace(confirmation, component="/absolute/module.py"),
+        "non-py-component": replace(confirmation, component="module.txt"),
+        "bad-site": replace(confirmation, site="no_line"),
+        "uppercase-signature": replace(confirmation, signature="A" * 64),
+        "short-signature": replace(confirmation, signature="abc123"),
+    }
+    for value in invalid.values():
+        with pytest.raises(ValueError):
+            RunStatusResponse.from_canonical(
+                RunStatus(run_id="sample", status="failed", defect_confirmation=value)
+            )
+
+
 def test_openapi_documents_control_plane_operations_and_models() -> None:
     schema = app.openapi()
     paths = schema["paths"]
@@ -2552,6 +2594,53 @@ def test_rest_historical_owner_stop_requires_explicit_acknowledgement(control_cl
             successor_run_id="historical-successor",
             caller_scope=f"rest:{PROJECT_ID}",
         )
+
+
+def _defect_confirmation_record(**overrides: object) -> dict[str, object]:
+    record = {
+        "schema_version": 1,
+        "kind": "engine_internal_assertion",
+        "source": "controller",
+        "component": "control_plane/repository.py",
+        "site": "get_run_status:418",
+        "signature": "a" * 64,
+    }
+    record.update(overrides)
+    return record
+
+
+def test_rest_run_status_projects_defect_confirmation(control_client) -> None:
+    client, root, units, _ = control_client
+    run_id = "defect-confirmed-run"
+    run_dir = _seed_owner_stop_manifest(root, run_id)
+    confirmation = _defect_confirmation_record()
+    metadata_path = run_dir / "run.json"
+    metadata = json.loads(metadata_path.read_text())
+    metadata["status"] = "failed"
+    metadata["defect_confirmation"] = confirmation
+    metadata_path.write_text(json.dumps(metadata))
+    write_launch_phase(root, run_id, "failed")
+
+    endpoint = f"/api/control-plane/projects/{PROJECT_ID}/runs/{run_id}"
+    response = client.get(endpoint)
+    assert response.status_code == 200, response.text
+    payload = response.json()
+    assert payload["status"] == "failed"
+    assert payload["defect_confirmation"] == confirmation
+    assert "PRIVATE" not in response.text
+
+    listed = client.get(f"/api/control-plane/projects/{PROJECT_ID}/runs").json()
+    row = next(item for item in listed["runs"] if item["run_id"] == run_id)
+    assert row["defect_confirmation"] == confirmation
+
+    # Malformed records project null without blocking the status read.
+    metadata["defect_confirmation"] = _defect_confirmation_record(signature="broken")
+    metadata_path.write_text(json.dumps(metadata))
+    response = client.get(endpoint)
+    assert response.status_code == 200, response.text
+    payload = response.json()
+    assert payload["status"] == "failed"
+    assert payload["defect_confirmation"] is None
 
 
 @pytest.mark.parametrize("identity", ["foreign-scope", "empty-scope", "wrong-root", "wrong-unit", "wrong-run"])
