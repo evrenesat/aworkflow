@@ -4,6 +4,7 @@ from dataclasses import replace
 from unittest.mock import patch
 import errno
 import hashlib
+import importlib.util
 import os
 from typing import Mapping
 from aflow.analyzer import extract_text_signals
@@ -12522,6 +12523,105 @@ class StopMarkerTests(unittest.TestCase):
             assert turn_json['error'] == 'AFLOW_STOP: exact-stop-reason'
             issues = (ctx.value.run_dir / 'issues.md').read_text(encoding='utf-8')
             assert 'unexpected-turn-exception' not in issues
+
+    def _load_package_module(self, package_dir: Path, name: str, source: str):
+        package_dir.mkdir(parents=True, exist_ok=True)
+        module_path = package_dir / f"{name}.py"
+        module_path.write_text(source, encoding="utf-8")
+        spec = importlib.util.spec_from_file_location(
+            f"defect_fixture_{name}", module_path
+        )
+        assert spec is not None and spec.loader is not None
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        return module
+
+    def test_internal_assertion_records_bounded_defect_confirmation(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repo_root = Path(tmpdir)
+            plan_path = repo_root / 'plan.md'
+            _write_plan(plan_path, _VALID_PLAN)
+            package_dir = repo_root / 'fakepkg'
+            engine = self._load_package_module(
+                package_dir,
+                'engine',
+                'def trip():\n'
+                '    assert False, "internal invariant broken secret-token /host/absolute/path"\n',
+            )
+
+            def runner(argv, **kwargs):
+                return subprocess.CompletedProcess(
+                    argv, 0, stdout='noop\n', stderr='',
+                )
+
+            class RaisingObserver(CollectingObserver):
+                def on_event(self, event):
+                    super().on_event(event)
+                    if isinstance(event, TurnFinishedEvent):
+                        engine.trip()
+
+            with patch('aflow.runlog._PACKAGE_SOURCE_ROOT', package_dir):
+                with pytest.raises(WorkflowError) as ctx:
+                    run_workflow(
+                        ControllerConfig(repo_root=repo_root, plan_path=plan_path, max_turns=5),
+                        self._make_wf_config(),
+                        'simple',
+                        config_dir=repo_root,
+                        snapshot_config=False,
+                        adapter=CodexAdapter(),
+                        runner=runner,
+                        observer=RaisingObserver(),
+                    )
+
+            run_json = json.loads((ctx.value.run_dir / 'run.json').read_text(encoding='utf-8'))
+            assert run_json['status'] == 'failed'
+            confirmation = run_json.get('defect_confirmation')
+            assert confirmation is not None
+            assert confirmation['schema_version'] == 1
+            assert confirmation['kind'] == 'engine_internal_assertion'
+            assert confirmation['source'] == 'controller'
+            assert confirmation['component'] == 'engine.py'
+            assert confirmation['site'].startswith('trip:')
+            assert len(confirmation['signature']) == 64
+            serialized = json.dumps(confirmation, sort_keys=True)
+            assert 'secret-token' not in serialized
+            assert '/host/absolute/path' not in serialized
+            assert 'internal invariant broken' not in serialized
+
+    def test_external_assertion_records_no_defect_confirmation(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repo_root = Path(tmpdir)
+            plan_path = repo_root / 'plan.md'
+            _write_plan(plan_path, _VALID_PLAN)
+
+            def runner(argv, **kwargs):
+                return subprocess.CompletedProcess(
+                    argv, 0, stdout='noop\n', stderr='',
+                )
+
+            class RaisingObserver(CollectingObserver):
+                def on_event(self, event):
+                    super().on_event(event)
+                    if isinstance(event, TurnFinishedEvent):
+                        assert False, 'external observer failure secret-token'
+
+            with pytest.raises(WorkflowError) as ctx:
+                run_workflow(
+                    ControllerConfig(repo_root=repo_root, plan_path=plan_path, max_turns=5),
+                    self._make_wf_config(),
+                    'simple',
+                    config_dir=repo_root,
+                    snapshot_config=False,
+                    adapter=CodexAdapter(),
+                    runner=runner,
+                    observer=RaisingObserver(),
+                )
+
+            run_json = json.loads((ctx.value.run_dir / 'run.json').read_text(encoding='utf-8'))
+            assert run_json['status'] == 'failed'
+            assert 'defect_confirmation' not in run_json
+            serialized = json.dumps(run_json, sort_keys=True)
+            assert 'secret-token' not in serialized
 
     def test_stop_marker_in_stdout_fails_workflow(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:

@@ -136,7 +136,7 @@ from .hotplug import (
     safe_hotplug_artifact_path, validate_hotplug_resume_artifacts,
 )
 from .harnesses.session import SessionDriver, SessionRequest, SessionResult
-from .runlog import create_repartition_attempt_paths, create_run_paths, finalize_turn_artifacts, load_run_json, prune_old_runs, write_issue_summary, write_manager_artifacts, write_manager_note_correction_artifacts, write_repartition_artifact, RunMetadataWriter, RunPaths, write_turn_artifacts_start
+from .runlog import create_repartition_attempt_paths, create_run_paths, engine_assertion_confirmation, finalize_turn_artifacts, load_run_json, prune_old_runs, write_issue_summary, write_manager_artifacts, write_manager_note_correction_artifacts, write_repartition_artifact, RunMetadataWriter, RunPaths, write_turn_artifacts_start
 from .stop_marker import (
     COMMAND_OUTPUT_CONTRACT,
     FINAL_TEXT_OUTPUT_SOURCE,
@@ -9713,6 +9713,7 @@ def _run_workflow_unchecked(
             current_step_name=current_step_name,
             active_plan_path=active_plan_path,
             new_plan_path=new_plan_path,
+            defect_confirmation=engine_assertion_confirmation(exc),
         )
         try:
             _emit_event(observer, RunFailedEvent.create(

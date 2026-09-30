@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor
+import importlib.util
 import json
 from pathlib import Path
 
@@ -28,7 +29,11 @@ from aflow.run_state import (
     ImplementationAttempt,
     hotplug_resume_fields,
 )
-from aflow.runlog import RunMetadataWriter, create_run_paths
+from aflow.runlog import (
+    RunMetadataWriter,
+    create_run_paths,
+    engine_assertion_confirmation,
+)
 
 
 def _manifest(
@@ -836,3 +841,362 @@ def test_evidence_store_rejects_evidence_parent_symlink_and_run_dir_symlink(
     )
     with pytest.raises(ValueError, match="symlink"):
         store_evidence_artifact(swapped_paths, kind="plan", data=b"y\n")
+
+
+# Trusted engine defect confirmation (internal controller AssertionError)
+
+
+def _raise_from_source(source: str, package_dir: Path, name: str) -> BaseException:
+    """Execute a temporary package module and return the exception it raises."""
+    package_dir.mkdir(parents=True, exist_ok=True)
+    module_path = package_dir / f"{name}.py"
+    module_path.write_text(source, encoding="utf-8")
+    spec = importlib.util.spec_from_file_location(
+        f"defect_fixture_{name}", module_path
+    )
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    try:
+        module.raise_it()
+    except BaseException as exc:
+        return exc
+    raise AssertionError("fixture module did not raise")
+
+
+_ASSERTION_SOURCE = (
+    "def raise_it():\n"
+    '    assert False, "raw message with secret-token and /host/absolute/path"\n'
+)
+_ASSERTION_SOURCE_OFFSET = (
+    "def raise_it():\n"
+    "    placeholder = 1\n"
+    '    assert False, "raw message with secret-token and /host/absolute/path"\n'
+)
+
+
+def _valid_confirmation(
+    component: str = "inner.py",
+    function: str = "raise_it",
+    line: int = 2,
+) -> dict[str, object]:
+    signature = hashlib.sha256(
+        "\n".join(
+            ("engine_internal_assertion", component, function, str(line))
+        ).encode("utf-8")
+    ).hexdigest()
+    return {
+        "schema_version": 1,
+        "kind": "engine_internal_assertion",
+        "source": "controller",
+        "component": component,
+        "site": f"{function}:{line}",
+        "signature": signature,
+    }
+
+
+def _writer(tmp_path: Path):
+    tmp_path.mkdir(parents=True, exist_ok=True)
+    plan_path = tmp_path / "plan.md"
+    plan_path.write_text("# Plan\n", encoding="utf-8")
+    config = ControllerConfig(repo_root=tmp_path, plan_path=plan_path, max_turns=7)
+    state = ControllerState(last_snapshot=PlanSnapshot(None, 0, 0, False))
+    paths = create_run_paths(config)
+    writer = RunMetadataWriter(
+        paths=paths,
+        config=config,
+        state=state,
+        workflow_name="managed",
+    )
+    return writer, paths, plan_path
+
+
+def test_engine_assertion_confirmation_derives_bounded_record(tmp_path: Path) -> None:
+    package_dir = tmp_path / "pkg"
+    exc = _raise_from_source(_ASSERTION_SOURCE, package_dir, "inner")
+    confirmation = engine_assertion_confirmation(exc, package_root=package_dir)
+
+    assert confirmation is not None
+    assert confirmation["schema_version"] == 1
+    assert confirmation["kind"] == "engine_internal_assertion"
+    assert confirmation["source"] == "controller"
+    assert confirmation["component"] == "inner.py"
+    function, _, line = confirmation["site"].partition(":")
+    assert function == "raise_it"
+    assert int(line) > 0
+    assert len(confirmation["signature"]) == 64
+    assert confirmation["signature"] == hashlib.sha256(
+        "\n".join(
+            ("engine_internal_assertion", "inner.py", "raise_it", line)
+        ).encode("utf-8")
+    ).hexdigest()
+    serialized = json.dumps(confirmation, sort_keys=True)
+    assert "secret-token" not in serialized
+    assert "/host/absolute/path" not in serialized
+    assert "raw message" not in serialized
+
+
+def test_engine_assertion_confirmation_signature_stable_across_runs(
+    tmp_path: Path,
+) -> None:
+    package_dir = tmp_path / "pkg"
+    first = _raise_from_source(_ASSERTION_SOURCE, package_dir, "inner")
+    second = _raise_from_source(_ASSERTION_SOURCE, package_dir, "inner")
+    other = _raise_from_source(_ASSERTION_SOURCE, package_dir, "other")
+
+    conf_first = engine_assertion_confirmation(first, package_root=package_dir)
+    conf_second = engine_assertion_confirmation(second, package_root=package_dir)
+    conf_other = engine_assertion_confirmation(other, package_root=package_dir)
+
+    assert conf_first is not None
+    assert conf_second is not None
+    assert conf_other is not None
+    # Same source site across distinct occurrences -> one signature.
+    assert conf_first["signature"] == conf_second["signature"]
+    assert conf_first["component"] == conf_second["component"]
+    # A different source site -> a different signature.
+    assert conf_first["signature"] != conf_other["signature"]
+    assert conf_first["component"] != conf_other["component"]
+
+
+def test_engine_assertion_confirmation_line_changes_signature(
+    tmp_path: Path,
+) -> None:
+    pkg_a = tmp_path / "pkg_a"
+    pkg_b = tmp_path / "pkg_b"
+    exc_a = _raise_from_source(_ASSERTION_SOURCE, pkg_a, "inner")
+    exc_b = _raise_from_source(_ASSERTION_SOURCE_OFFSET, pkg_b, "inner")
+    conf_a = engine_assertion_confirmation(exc_a, package_root=pkg_a)
+    conf_b = engine_assertion_confirmation(exc_b, package_root=pkg_b)
+
+    assert conf_a is not None and conf_b is not None
+    assert conf_a["component"] == conf_b["component"] == "inner.py"
+    assert conf_a["site"] != conf_b["site"]
+    assert conf_a["signature"] != conf_b["signature"]
+
+
+def test_engine_assertion_confirmation_requires_exact_assertion_type(
+    tmp_path: Path,
+) -> None:
+    package_dir = tmp_path / "pkg"
+    package_dir.mkdir(parents=True, exist_ok=True)
+
+    subclass_src = (
+        "class _CustomAssert(AssertionError):\n"
+        "    pass\n"
+        "def raise_it():\n"
+        "    raise _CustomAssert('subclass message')\n"
+    )
+    sub_path = package_dir / "sub.py"
+    sub_path.write_text(subclass_src, encoding="utf-8")
+    sub_spec = importlib.util.spec_from_file_location(
+        "defect_fixture_sub", sub_path
+    )
+    assert sub_spec is not None and sub_spec.loader is not None
+    sub_module = importlib.util.module_from_spec(sub_spec)
+    sub_spec.loader.exec_module(sub_module)
+    try:
+        sub_module.raise_it()
+    except BaseException as subclass_exc:
+        assert engine_assertion_confirmation(
+            subclass_exc, package_root=package_dir
+        ) is None
+
+    runtime_src = (
+        "def raise_it():\n"
+        "    raise RuntimeError('AFLOW_STOP: explicit stop reason')\n"
+    )
+    rt_path = package_dir / "rt.py"
+    rt_path.write_text(runtime_src, encoding="utf-8")
+    rt_spec = importlib.util.spec_from_file_location("defect_fixture_rt", rt_path)
+    assert rt_spec is not None and rt_spec.loader is not None
+    rt_module = importlib.util.module_from_spec(rt_spec)
+    rt_spec.loader.exec_module(rt_module)
+    try:
+        rt_module.raise_it()
+    except BaseException as runtime_exc:
+        assert engine_assertion_confirmation(
+            runtime_exc, package_root=package_dir
+        ) is None
+
+    # A plain AssertionError with no traceback cannot be located in a frame.
+    assert (
+        engine_assertion_confirmation(
+            AssertionError("no traceback"), package_root=package_dir
+        )
+        is None
+    )
+
+
+def test_engine_assertion_confirmation_requires_trusted_package_frame(
+    tmp_path: Path,
+) -> None:
+    package_dir = tmp_path / "pkg"
+
+    # An AssertionError raised outside the package source is untrusted.
+    outside = tmp_path / "outside"
+    external = _raise_from_source(_ASSERTION_SOURCE, outside, "outer")
+    assert (
+        engine_assertion_confirmation(external, package_root=package_dir) is None
+    )
+
+    # Test files are excluded even when inside the package source.
+    tests_dir = package_dir / "tests"
+    test_exc = _raise_from_source(_ASSERTION_SOURCE, tests_dir, "test_inner")
+    assert (
+        engine_assertion_confirmation(test_exc, package_root=package_dir) is None
+    )
+    top_level_test = _raise_from_source(_ASSERTION_SOURCE, package_dir, "test_top")
+    assert (
+        engine_assertion_confirmation(
+            top_level_test, package_root=package_dir
+        )
+        is None
+    )
+
+
+def test_run_metadata_records_confirmation_only_with_failed_status(
+    tmp_path: Path,
+) -> None:
+    writer, paths, plan_path = _writer(tmp_path)
+    confirmation = _valid_confirmation()
+
+    with pytest.raises(ValueError, match="only recorded with failed status"):
+        writer.write(
+            status="running",
+            original_plan_path=plan_path,
+            defect_confirmation=confirmation,
+        )
+
+    writer.write(
+        status="failed",
+        failure_reason="boom",
+        original_plan_path=plan_path,
+        defect_confirmation=confirmation,
+    )
+    payload = json.loads(paths.run_json.read_text(encoding="utf-8"))
+    assert payload["status"] == "failed"
+    assert payload["defect_confirmation"] == confirmation
+    serialized = json.dumps(payload["defect_confirmation"], sort_keys=True)
+    assert "secret" not in serialized
+    assert "/host/" not in serialized
+
+
+def test_run_metadata_confirmation_absent_by_default(tmp_path: Path) -> None:
+    writer, paths, plan_path = _writer(tmp_path)
+    writer.write(status="running", original_plan_path=plan_path)
+    payload = json.loads(paths.run_json.read_text(encoding="utf-8"))
+    assert "defect_confirmation" not in payload
+
+
+def test_run_metadata_preserves_confirmation_across_later_writes(
+    tmp_path: Path,
+) -> None:
+    writer, paths, plan_path = _writer(tmp_path)
+    confirmation = _valid_confirmation()
+
+    writer.write(
+        status="failed",
+        failure_reason="boom",
+        original_plan_path=plan_path,
+        defect_confirmation=confirmation,
+    )
+    # A resume-like write (running, no new confirmation) retains the record.
+    writer.write(status="running", original_plan_path=plan_path)
+    payload = json.loads(paths.run_json.read_text(encoding="utf-8"))
+    assert payload["status"] == "running"
+    assert payload["defect_confirmation"] == confirmation
+
+    # A subsequent failed write without a new confirmation still retains it.
+    writer.write(
+        status="failed",
+        failure_reason="boom again",
+        original_plan_path=plan_path,
+    )
+    payload = json.loads(paths.run_json.read_text(encoding="utf-8"))
+    assert payload["status"] == "failed"
+    assert payload["defect_confirmation"] == confirmation
+
+
+def test_run_metadata_confirmation_stable_across_distinct_run_ids(
+    tmp_path: Path,
+) -> None:
+    confirmation = _valid_confirmation()
+    first_writer, first_paths, first_plan = _writer(tmp_path / "run_a")
+    second_writer, second_paths, second_plan = _writer(tmp_path / "run_b")
+
+    first_writer.write(
+        status="failed",
+        failure_reason="boom",
+        original_plan_path=first_plan,
+        defect_confirmation=confirmation,
+    )
+    second_writer.write(
+        status="failed",
+        failure_reason="boom",
+        original_plan_path=second_plan,
+        defect_confirmation=confirmation,
+    )
+
+    first_payload = json.loads(first_paths.run_json.read_text(encoding="utf-8"))
+    second_payload = json.loads(second_paths.run_json.read_text(encoding="utf-8"))
+    assert first_paths.run_dir.name != second_paths.run_dir.name
+    assert (
+        first_payload["defect_confirmation"]["signature"]
+        == second_payload["defect_confirmation"]["signature"]
+    )
+
+
+@pytest.mark.parametrize(
+    "mutate",
+    [
+        lambda conf: conf.update(kind="other_kind"),
+        lambda conf: conf.update(schema_version=2),
+        lambda conf: conf.update(source="worker"),
+        lambda conf: conf.update(component="/absolute/path.py"),
+        lambda conf: conf.update(component="a/../b.py"),
+        lambda conf: conf.update(component="inner.txt"),
+        lambda conf: conf.update(site="no-line-here"),
+        lambda conf: conf.update(site="raise_it:"),
+        lambda conf: conf.update(signature="Z" * 64),
+        lambda conf: conf.update(signature="abc"),
+        lambda conf: conf.update(extra="field"),
+        lambda conf: conf.pop("signature"),
+    ],
+)
+def test_run_metadata_rejects_malformed_confirmation(
+    tmp_path: Path, mutate
+) -> None:
+    writer, paths, plan_path = _writer(tmp_path)
+    confirmation = _valid_confirmation()
+    mutate(confirmation)
+    with pytest.raises(ValueError):
+        writer.write(
+            status="failed",
+            failure_reason="boom",
+            original_plan_path=plan_path,
+            defect_confirmation=confirmation,
+        )
+    assert not paths.run_json.exists()
+
+
+def test_run_metadata_drops_malformed_historical_confirmation(
+    tmp_path: Path,
+) -> None:
+    writer, paths, plan_path = _writer(tmp_path)
+    good = _valid_confirmation()
+    writer.write(
+        status="failed",
+        failure_reason="boom",
+        original_plan_path=plan_path,
+        defect_confirmation=good,
+    )
+    # Corrupt the stored record to simulate malformed historical data.
+    payload = json.loads(paths.run_json.read_text(encoding="utf-8"))
+    payload["defect_confirmation"]["signature"] = "F" * 64
+    paths.run_json.write_text(json.dumps(payload), encoding="utf-8")
+
+    writer.write(status="running", original_plan_path=plan_path)
+    payload = json.loads(paths.run_json.read_text(encoding="utf-8"))
+    assert payload["status"] == "running"
+    assert "defect_confirmation" not in payload

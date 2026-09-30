@@ -49,6 +49,24 @@ SHELL_PROCESS_NAMES = frozenset({
 _SHELL_ID_UNSAFE_RE = re.compile(r"[^A-Za-z0-9._-]+")
 MANAGER_REJECTED_DIAGNOSTIC_MAX_BYTES = 256 * 1024
 
+DEFECT_CONFIRMATION_SCHEMA_VERSION = 1
+DEFECT_CONFIRMATION_KIND = "engine_internal_assertion"
+DEFECT_CONFIRMATION_SOURCE = "controller"
+_PACKAGE_SOURCE_ROOT = Path(__file__).resolve().parent
+_DEFECT_MODULE_PART_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+_DEFECT_SITE_RE = re.compile(
+    r"^(?:"
+    r"[A-Za-z_][A-Za-z0-9_]*"
+    r"|<module>"
+    r"|<lambda>"
+    r"|<listcomp>"
+    r"|<dictcomp>"
+    r"|<setcomp>"
+    r"|<genexpr>"
+    r"):\d+$"
+)
+_DEFECT_SIGNATURE_RE = re.compile(r"^[0-9a-f]{64}$")
+
 
 @dataclass(frozen=True)
 class RunPaths:
@@ -1295,6 +1313,138 @@ def _validated_environment_preflight_payload(
     return result
 
 
+def _is_bounded_package_module(value: object) -> bool:
+    """True when value is a bounded package-relative ``.py`` module path."""
+    if not isinstance(value, str) or not value or len(value) > 240:
+        return False
+    if "\\" in value or value.startswith("/") or value.endswith("/"):
+        return False
+    parts = value.split("/")
+    for part in parts:
+        if not part or part in {".", ".."}:
+            return False
+    for part in parts[:-1]:
+        if not _DEFECT_MODULE_PART_RE.match(part):
+            return False
+    last = parts[-1]
+    if not last.endswith(".py"):
+        return False
+    return bool(_DEFECT_MODULE_PART_RE.match(last[: -len(".py")]))
+
+
+def _validated_defect_confirmation(value: object) -> dict[str, object]:
+    """Strictly validate a defect-confirmation mapping.
+
+    Raises ``ValueError`` for any deviation from the fixed six-field contract
+    so malformed or legacy data can never be persisted or projected.
+    """
+    if not isinstance(value, Mapping):
+        raise ValueError("defect_confirmation must be a mapping")
+    expected_keys = {
+        "schema_version",
+        "kind",
+        "source",
+        "component",
+        "site",
+        "signature",
+    }
+    if set(value.keys()) != expected_keys:
+        raise ValueError("defect_confirmation has an unexpected field set")
+    if value.get("schema_version") != DEFECT_CONFIRMATION_SCHEMA_VERSION:
+        raise ValueError("defect_confirmation.schema_version must be 1")
+    if value.get("kind") != DEFECT_CONFIRMATION_KIND:
+        raise ValueError("defect_confirmation.kind is invalid")
+    if value.get("source") != DEFECT_CONFIRMATION_SOURCE:
+        raise ValueError("defect_confirmation.source is invalid")
+    component = value.get("component")
+    if not _is_bounded_package_module(component):
+        raise ValueError("defect_confirmation.component is invalid")
+    site = value.get("site")
+    if not isinstance(site, str) or not _DEFECT_SITE_RE.match(site):
+        raise ValueError("defect_confirmation.site is invalid")
+    signature = value.get("signature")
+    if not isinstance(signature, str) or not _DEFECT_SIGNATURE_RE.match(signature):
+        raise ValueError("defect_confirmation.signature is invalid")
+    return {
+        "schema_version": DEFECT_CONFIRMATION_SCHEMA_VERSION,
+        "kind": DEFECT_CONFIRMATION_KIND,
+        "source": DEFECT_CONFIRMATION_SOURCE,
+        "component": component,
+        "site": site,
+        "signature": signature,
+    }
+
+
+def engine_assertion_confirmation(
+    exc: BaseException,
+    *,
+    package_root: Path | None = None,
+) -> dict[str, object] | None:
+    """Derive a bounded engine defect confirmation from an internal assertion.
+
+    Returns a fixed-format mapping only when ``exc`` is exactly
+    ``AssertionError`` and its innermost traceback frame is a regular ``.py``
+    file under the aflow package source, excluding tests and untrusted paths.
+    Every other exception (subclasses, external frames, missing tracebacks,
+    runtime/worker/provider failures, stop markers) yields ``None``. The
+    mapping never carries exception text, host paths, run identity, or secrets.
+    """
+    if type(exc) is not AssertionError:
+        return None
+    tb = exc.__traceback__
+    if tb is None:
+        return None
+    while tb.tb_next is not None:
+        tb = tb.tb_next
+    code = tb.tb_frame.f_code
+    frame_file = code.co_filename
+    if not frame_file:
+        return None
+    candidate = Path(frame_file)
+    if candidate.suffix != ".py":
+        return None
+    if candidate.is_symlink() or not candidate.is_file():
+        return None
+    root = (
+        Path(package_root).resolve()
+        if package_root is not None
+        else _PACKAGE_SOURCE_ROOT
+    )
+    try:
+        resolved = candidate.resolve(strict=True)
+        relative = resolved.relative_to(root)
+    except (OSError, ValueError):
+        return None
+    parts = relative.parts
+    if any(part in {"tests", "test"} for part in parts):
+        return None
+    if parts[-1].startswith("test_"):
+        return None
+    function = code.co_name
+    line = tb.tb_lineno
+    site = f"{function}:{line}"
+    if not _DEFECT_SITE_RE.match(site):
+        return None
+    signature = hashlib.sha256(
+        "\n".join(
+            (
+                DEFECT_CONFIRMATION_KIND,
+                relative.as_posix(),
+                function,
+                str(line),
+            )
+        ).encode("utf-8")
+    ).hexdigest()
+    return {
+        "schema_version": DEFECT_CONFIRMATION_SCHEMA_VERSION,
+        "kind": DEFECT_CONFIRMATION_KIND,
+        "source": DEFECT_CONFIRMATION_SOURCE,
+        "component": relative.as_posix(),
+        "site": site,
+        "signature": signature,
+    }
+
+
 @dataclass(frozen=True)
 class RunMetadataWriter:
     paths: RunPaths
@@ -1325,6 +1475,7 @@ class RunMetadataWriter:
         pending_retry: RetryContext | None = None,
         team: str | None = None,
         issues_summary_path: str | None = None,
+        defect_confirmation: Mapping[str, object] | None = None,
     ) -> None:
         if not isinstance(self.workflow_name, str) or not self.workflow_name.strip():
             raise ValueError("workflow_name must be a non-empty string")
@@ -1668,6 +1819,26 @@ class RunMetadataWriter:
                 pass
         if self.state is not None and self.state.harness_recovery_history:
             payload.update(build_recovery_payload(self.state.current_harness_recovery, self.state.harness_recovery_history))
+        if defect_confirmation is not None:
+            # A confirmation is only ever minted at the controller failure
+            # boundary; refuse to attach one to any other status.
+            if status != "failed":
+                raise ValueError(
+                    "defect_confirmation is only recorded with failed status"
+                )
+            payload["defect_confirmation"] = _validated_defect_confirmation(
+                defect_confirmation
+            )
+        elif isinstance(previous.get("defect_confirmation"), Mapping):
+            # Preserve an already-confirmed record across later writes (such as
+            # a resume) without inventing a new one; malformed historical data
+            # is dropped rather than allowed to block the status write.
+            try:
+                payload["defect_confirmation"] = _validated_defect_confirmation(
+                    previous["defect_confirmation"]
+                )
+            except ValueError:
+                pass
         _write_atomic_json(self.paths.run_json, payload)
 
 
