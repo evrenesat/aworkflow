@@ -1406,10 +1406,8 @@ def engine_assertion_confirmation(
     if candidate.is_symlink() or not candidate.is_file():
         return None
     root = (
-        Path(package_root).resolve()
-        if package_root is not None
-        else _PACKAGE_SOURCE_ROOT
-    )
+        Path(package_root) if package_root is not None else _PACKAGE_SOURCE_ROOT
+    ).resolve()
     try:
         resolved = candidate.resolve(strict=True)
         relative = resolved.relative_to(root)

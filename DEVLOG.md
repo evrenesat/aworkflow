@@ -1,5 +1,25 @@
 # DEVLOG
 
+## 2026-09-30 — Canonicalize trusted package root in assertion confirmation
+
+- The macOS CI failure was a path-alias mismatch: temporary paths under
+  `/var` canonicalize to `/private/var`, and `engine_assertion_confirmation`
+  resolved the candidate source file but compared it against the
+  uncanonicalized `_PACKAGE_SOURCE_ROOT`, so an aliased package root failed
+  containment and silently suppressed the bounded confirmation. The root is
+  now resolved symmetrically with the candidate whether supplied as
+  `package_root` or taken from `_PACKAGE_SOURCE_ROOT`; classification
+  semantics, signature inputs, the symlink/file checks, and the six-field
+  output contract are unchanged.
+- A new regression loads the fixture engine through a directory-symlink alias
+  of the package root and asserts the bounded confirmation is recorded; it
+  fails before the fix (no confirmation) and passes after on any platform
+  with directory symlinks. The positive internal and negative external
+  assertion tests are retained unchanged in behavior.
+- Verification: focused assertion tests pass (3 passed); full suite 2556
+  passed; `ruff check aflow apps/aflow_app/server/src` clean and no new
+  findings in the two modified files. No UI change is included.
+
 ## 2026-09-30 — Project trusted defect confirmation through REST and MCP (Checkpoint 2)
 
 - Canonical `RunStatus` gains an optional typed `defect_confirmation`

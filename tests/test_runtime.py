@@ -12536,57 +12536,85 @@ class StopMarkerTests(unittest.TestCase):
         spec.loader.exec_module(module)
         return module
 
-    def test_internal_assertion_records_bounded_defect_confirmation(self) -> None:
-        with tempfile.TemporaryDirectory() as tmpdir:
-            repo_root = Path(tmpdir)
-            plan_path = repo_root / 'plan.md'
-            _write_plan(plan_path, _VALID_PLAN)
-            package_dir = repo_root / 'fakepkg'
-            engine = self._load_package_module(
-                package_dir,
-                'engine',
-                'def trip():\n'
-                '    assert False, "internal invariant broken secret-token /host/absolute/path"\n',
+    def _run_internal_assertion_workflow(
+        self, repo_root: Path, aliased_root: bool
+    ) -> dict[str, object]:
+        plan_path = repo_root / 'plan.md'
+        _write_plan(plan_path, _VALID_PLAN)
+        package_dir = repo_root / 'fakepkg'
+        if aliased_root:
+            real_root = package_dir
+            real_root.mkdir(parents=True)
+            package_dir = repo_root / 'fakepkg-alias'
+            try:
+                package_dir.symlink_to(real_root)
+            except OSError:
+                self.skipTest('directory symlinks are unavailable on this platform')
+        engine = self._load_package_module(
+            package_dir,
+            'engine',
+            'def trip():\n'
+            '    assert False, "internal invariant broken secret-token /host/absolute/path"\n',
+        )
+
+        def runner(argv, **kwargs):
+            return subprocess.CompletedProcess(
+                argv, 0, stdout='noop\n', stderr='',
             )
 
-            def runner(argv, **kwargs):
-                return subprocess.CompletedProcess(
-                    argv, 0, stdout='noop\n', stderr='',
+        class RaisingObserver(CollectingObserver):
+            def on_event(self, event):
+                super().on_event(event)
+                if isinstance(event, TurnFinishedEvent):
+                    engine.trip()
+
+        with patch('aflow.runlog._PACKAGE_SOURCE_ROOT', package_dir):
+            with pytest.raises(WorkflowError) as ctx:
+                run_workflow(
+                    ControllerConfig(repo_root=repo_root, plan_path=plan_path, max_turns=5),
+                    self._make_wf_config(),
+                    'simple',
+                    config_dir=repo_root,
+                    snapshot_config=False,
+                    adapter=CodexAdapter(),
+                    runner=runner,
+                    observer=RaisingObserver(),
                 )
+        return json.loads(
+            (ctx.value.run_dir / 'run.json').read_text(encoding='utf-8')
+        )
 
-            class RaisingObserver(CollectingObserver):
-                def on_event(self, event):
-                    super().on_event(event)
-                    if isinstance(event, TurnFinishedEvent):
-                        engine.trip()
+    @staticmethod
+    def _assert_bounded_confirmation(run_json: dict[str, object]) -> None:
+        assert run_json['status'] == 'failed'
+        confirmation = run_json.get('defect_confirmation')
+        assert confirmation is not None
+        assert confirmation['schema_version'] == 1
+        assert confirmation['kind'] == 'engine_internal_assertion'
+        assert confirmation['source'] == 'controller'
+        assert confirmation['component'] == 'engine.py'
+        assert confirmation['site'].startswith('trip:')
+        assert len(confirmation['signature']) == 64
+        serialized = json.dumps(confirmation, sort_keys=True)
+        assert 'secret-token' not in serialized
+        assert '/host/absolute/path' not in serialized
+        assert 'internal invariant broken' not in serialized
 
-            with patch('aflow.runlog._PACKAGE_SOURCE_ROOT', package_dir):
-                with pytest.raises(WorkflowError) as ctx:
-                    run_workflow(
-                        ControllerConfig(repo_root=repo_root, plan_path=plan_path, max_turns=5),
-                        self._make_wf_config(),
-                        'simple',
-                        config_dir=repo_root,
-                        snapshot_config=False,
-                        adapter=CodexAdapter(),
-                        runner=runner,
-                        observer=RaisingObserver(),
-                    )
+    def test_internal_assertion_records_bounded_defect_confirmation(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            run_json = self._run_internal_assertion_workflow(
+                Path(tmpdir), aliased_root=False
+            )
+        self._assert_bounded_confirmation(run_json)
 
-            run_json = json.loads((ctx.value.run_dir / 'run.json').read_text(encoding='utf-8'))
-            assert run_json['status'] == 'failed'
-            confirmation = run_json.get('defect_confirmation')
-            assert confirmation is not None
-            assert confirmation['schema_version'] == 1
-            assert confirmation['kind'] == 'engine_internal_assertion'
-            assert confirmation['source'] == 'controller'
-            assert confirmation['component'] == 'engine.py'
-            assert confirmation['site'].startswith('trip:')
-            assert len(confirmation['signature']) == 64
-            serialized = json.dumps(confirmation, sort_keys=True)
-            assert 'secret-token' not in serialized
-            assert '/host/absolute/path' not in serialized
-            assert 'internal invariant broken' not in serialized
+    def test_internal_assertion_records_bounded_defect_confirmation_with_aliased_root(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            run_json = self._run_internal_assertion_workflow(
+                Path(tmpdir), aliased_root=True
+            )
+        self._assert_bounded_confirmation(run_json)
 
     def test_external_assertion_records_no_defect_confirmation(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
