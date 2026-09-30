@@ -39,6 +39,47 @@
   `apps/aflow_app/server/tests/test_mcp.py`, and
   `apps/aflow_app/server/tests/test_control_plane_api.py`; `git diff --check`
   is clean. No UI visual change is included.
+## 2026-09-30 — Concierge trusted defect reporting and exact-SHA delivery gate
+
+- Imported the scoped concierge draft from the preserved source worktree
+  (approved `1cff55ff`/`42c60758` plus its seven-file checkpoint-3 draft) and
+  completed the two review-blocking behaviors on current main.
+- The defect classifier now files only from the live MCP
+  `get_run.defect_confirmation` projection, strictly validated against the
+  fixed six-field contract (schema version 1, `engine_internal_assertion`,
+  `controller`, bounded package-relative component/site, 64-hex signature).
+  Missing, malformed, or unconfirmed data files nothing; the trusted
+  signature deduplicates across different run IDs, so one confirmed defect
+  files exactly one sanitized issue. A failed dedup search stays report-only,
+  and an already-filed defect never displaces the eligible safe action on a
+  later tick.
+- The exact-SHA delivery gate resolves the remote `main` tip with a bounded
+  read-only `git ls-remote` (never a stale local tracking ref, no fetch, no
+  shared-ref mutation) and projects CI (`green`/`red`/`pending`) from only
+  the deploy poller's qualifying CI workflow runs for that SHA (exact
+  `head_sha`, `event=push`, `head_branch=main`,
+  `path=.github/workflows/ci.yml`): the latest applicable attempt by
+  `(run_number, run_attempt)` decides, matching the deployed poller — latest
+  success is green, latest failure/cancelled is red, latest queued/running
+  is pending, and earlier attempts never override it. The deploy `phase`
+  comes from `/var/lib/aflowd/deploy/status.json` and the live release
+  (`installed`/`stale`/`missing`) from the `/opt/aflowd/current` release
+  name; missing evidence projects to `pending`, never success. A failed
+  exact-SHA delivery blocks fresh `start`/`plan_and_start` dispatch with
+  `delivery_gate_failed` until repaired and never blocks a verified
+  `resume`. CI and the live release are reported separately, so green CI
+  with a stale live release is `pending`, not `ok`.
+- The concierge GitHub client gained bounded run-number/attempt-aware
+  `workflow_runs` plus `search_issues` and `create_issue`; the injectable
+  `DeliveryGate` (production `LocalDeliveryGate`) keeps the gate testable
+  without the live host. The advisory prompt, the concierge deployment
+  runbook, and the architecture notes describe the implemented behavior.
+  Live p100 host binding and timer activation remain with the queued
+  binding plan.
+- Verification: focused concierge, planner, and MCP suites pass; `ruff check
+  aflow apps/aflow_app/server/src` is clean; `systemd-analyze verify` passes
+  for the concierge service and timer. Changes are left uncommitted for
+  review.
 
 ## 2026-09-27 — Verify bounded saturated scans (Checkpoint 1)
 

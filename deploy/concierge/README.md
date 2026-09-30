@@ -106,6 +106,61 @@ Any active or uncertain run defers the tick without mutation. Historical
 account, including issue 50, are ignored. Ambiguous ownership or uncertain
 provider outcomes are reported without a guessed action.
 
+## Delivery gate and defect reporting
+
+After triage, and before any fresh dispatch, the tick evaluates an exact-SHA
+delivery gate for the current remote `main` tip SHA and reports three facts
+separately. The remote tip is resolved with a bounded read-only
+`git ls-remote` (never a stale local `origin/main` tracking ref, and never a
+fetch or shared-ref mutation); an unreachable remote yields `pending`
+evidence.
+
+- **CI**: `green`, `red`, or `pending`, from only the deploy poller's
+  qualifying CI workflow runs for that exact SHA (exact `head_sha`,
+  `event=push`, `head_branch=main`, `path=.github/workflows/ci.yml`). An
+  unrelated workflow on the same SHA neither greens a failing CI run nor
+  reds a successful one. Among qualifying runs the latest attempt by
+  `(run_number, run_attempt)` decides: a completed `success` is `green`, a
+  completed `failure`/`cancelled` is `red`, and a non-terminal latest run
+  is `pending`. An earlier attempt never overrides a later one.
+- **Deploy phase**: the `phase` from
+  `/var/lib/aflowd/deploy/status.json` (for example `deployed`,
+  `waiting_for_ci`, `failed`).
+- **Live release**: `installed`, `stale`, or `missing`, from the
+  `/opt/aflowd/current` release directory name compared against the remote
+  `main` tip.
+
+The projection is best-effort and bounded: any missing or unreadable source
+collapses to absent evidence, which is reported as `pending`, never as
+success. A **failed** exact-SHA delivery (red CI or a failed deploy phase)
+blocks fresh `start` and `plan_and_start` dispatch with
+`delivery_gate_failed` until the release is repaired. That state does not
+block a verified `resume` of an existing failed lineage, which is recovery,
+not a fresh dispatch. The CI and live-release facts are always reported
+separately in the bounded status record, so a green CI with a stale live
+release is visible as `pending`, not `ok`.
+
+Defect filing is driven exclusively by the control plane's validated
+`defect_confirmation` projection. The tick reads each observed run through
+the live MCP `get_run` tool and files a defect only when the run carries a
+strictly validated `defect_confirmation` mapping (schema version 1,
+`engine_internal_assertion`, `controller`, a bounded package-relative
+component, a bounded site, and a 64-hex signature). Missing, malformed, or
+legacy data is ignored, so generic `startup_failed`, `controller_failed`,
+implementation, environmental, admission, provider, configuration, or
+uncertain failures file nothing. Filing deduplicates by trusted defect
+signature rather than run instance. Each tick processes the distinct
+confirmed signatures in stable order, searches the target repository's
+issues (open and closed) before filing, files the first signature not
+already filed in that repository, and stops for the tick; a matching
+fingerprint in another repository never satisfies this repository's
+deduplication. A failed dedup search or filing stays report-only, an
+already-filed signature never blocks a different unfiled one, and once
+every distinct signature is filed the tick continues to the eligible safe
+action.
+Any issue body carries only bounded sanitized evidence and never includes
+transcripts, tokens, stack traces, or raw logs.
+
 ## Post-delivery installation
 
 After this plan is reviewed, merged to `origin/main`, and the CI-gated

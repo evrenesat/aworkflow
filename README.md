@@ -699,4 +699,8 @@ checkout; conflicts preserve that checkout and fail delivery rather than overwri
 history. `publication.json` in the run directory records the source and published
 commit or a failed delivery. Existing CI/CD then validates and deploys main.
 Local approval, remote publication, passing CI, and live deployment are distinct
-outcomes; a successful push alone does not establish live availability.
+outcomes; a successful push alone does not establish live availability. The p100
+owner-issue concierge applies the same distinction to dispatch: its exact-SHA
+delivery gate reports CI and the live release separately, and a failed release
+blocks fresh plan starts (never a verified resume) until repaired. See
+[deploy/concierge/README.md](deploy/concierge/README.md).

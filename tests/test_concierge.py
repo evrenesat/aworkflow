@@ -3,8 +3,10 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import subprocess
 from pathlib import Path
 from typing import Mapping, Sequence
+from urllib import parse as urllib_parse
 
 import pytest
 
@@ -24,7 +26,11 @@ from aflow.concierge import (
     DEFAULT_WORK_DIR,
     ConciergeError,
     ConciergeTickExecutor,
+    DefectEvidence,
+    DeliveryEvidence,
+    DeliveryStatus,
     GithubIssuePage,
+    LocalDeliveryGate,
     McpRegistryClient,
     TickDeferral,
     TickObservation,
@@ -35,9 +41,18 @@ from aflow.concierge import (
     _run_tick_process,
     build_codex_argv,
     build_tick_prompt,
+    classify_defect,
+    defect_evidence,
+    defect_fingerprint,
+    defect_fingerprint_marker,
+    defect_issue_body,
+    defect_issue_title,
+    defect_signatures,
     dry_run,
+    has_defect_fingerprint,
     load_tick_prompt,
     main,
+    project_delivery,
     read_bearer_token,
     redact_text,
     repository_full_name,
@@ -408,6 +423,9 @@ class FakeGithub:
         self,
         page: GithubIssuePage | None = None,
         error: ConciergeError | None = None,
+        search_results: Sequence[Mapping[str, object]] = (),
+        workflow_runs: Sequence[tuple[int, int, str, str]] = (),
+        create_error: ConciergeError | None = None,
     ) -> None:
         self.page = (
             page
@@ -415,13 +433,49 @@ class FakeGithub:
             else GithubIssuePage(repository_id=0, issues=())
         )
         self.error = error
+        self.search_results = tuple(search_results)
+        self._workflow_run_data = tuple(workflow_runs)
+        self.create_error = create_error
         self.calls: list[str] = []
+        self.search_queries: list[tuple[str, str]] = []
+        self.workflow_sha_queries: list[tuple[str, str]] = []
+        self.created_issues: list[tuple[str, str, str]] = []
 
     def open_issues(self, full_name: str) -> GithubIssuePage:
         self.calls.append(full_name)
         if self.error is not None:
             raise self.error
         return self.page
+
+    def workflow_runs(
+        self, full_name: str, sha: str
+    ) -> tuple[tuple[int, int, str, str], ...]:
+        self.workflow_sha_queries.append((full_name, sha))
+        if self.error is not None:
+            raise self.error
+        return self._workflow_run_data
+
+    def search_issues(
+        self, full_name: str, query: str
+    ) -> tuple[Mapping[str, object], ...]:
+        self.search_queries.append((full_name, query))
+        if self.error is not None:
+            raise self.error
+        return self.search_results
+
+    def create_issue(
+        self, full_name: str, title: str, body: str
+    ) -> Mapping[str, object]:
+        self.created_issues.append((full_name, title, body))
+        if self.create_error is not None:
+            raise self.create_error
+        if self.error is not None:
+            raise self.error
+        number = 100 + len(self.created_issues)
+        return {
+            "number": number,
+            "html_url": f"https://github.com/{full_name}/issues/{number}",
+        }
 
 
 class FakePlanner:
@@ -1242,14 +1296,13 @@ def test_triage_starts_single_launchable_plan_with_concierge_defaults() -> None:
 
 
 def test_triage_reports_multiple_launchable_plans() -> None:
-    decision = triage_tick(
-        _observation(
-            plans=[
-                _plan(path="plans/todo/alpha.md"),
-                _plan(path="plans/todo/beta.md"),
-            ]
-        )
+    observation = _observation(
+        plans=[
+            _plan(path="plans/todo/alpha.md"),
+            _plan(path="plans/todo/beta.md"),
+        ]
     )
+    decision = triage_tick(observation)
     assert decision.action == "report"
     assert decision.reason == "multiple_launchable_plans"
     assert decision.plan_path == "plans/todo/alpha.md"
@@ -1516,6 +1569,7 @@ def _executor(
     mcp: FakeMcp,
     github: FakeGithub | None = None,
     planner: FakePlanner | None = None,
+    delivery_gate: object | None = None,
 ) -> ConciergeTickExecutor:
     monkeypatch.setattr(
         "aflow.concierge.repository_full_name", lambda root: "owner/repo"
@@ -1526,7 +1580,24 @@ def _executor(
         planner_factory=(
             (lambda state_dir, mcp_client: planner) if planner is not None else None
         ),
+        delivery_gate=(
+            delivery_gate
+            if delivery_gate is not None
+            else FakeDeliveryGate(
+                status=DeliveryStatus(state="pending", ci="pending", live="missing")
+            )
+        ),
     )
+
+
+class FakeDeliveryGate:
+    def __init__(self, status: DeliveryStatus) -> None:
+        self.status = status
+        self.calls: list[str | None] = []
+
+    def evaluate(self, *, full_name: str | None) -> DeliveryStatus:
+        self.calls.append(full_name)
+        return self.status
 
 
 def test_executor_reports_unregistered_project(
@@ -2623,3 +2694,1522 @@ def test_github_rest_client_filters_pull_requests_and_maps_issues(
     assert [issue["number"] for issue in page.issues] == [7]
     assert page.issues[0]["author_id"] == CONCIERGE_OWNER_ID
     assert page.issues[0]["full_name"] == "owner/repo"
+
+
+# Checkpoint 2: trusted defect confirmation and exact-SHA CI precedence
+# ---------------------------------------------------------------------------
+
+
+def _failed_run(
+    *,
+    run_id: str = "run-defect",
+    reason_code: str = "startup_failed",
+    activity: str = "inactive",
+    status: str = "failed",
+) -> dict[str, object]:
+    return {
+        "run_id": run_id,
+        "activity": activity,
+        "status": status,
+        "status_reason_code": reason_code,
+        "plan_path": "plans/in-progress/alpha.md",
+        "evidence": {"can_resume": True},
+    }
+
+
+def _valid_confirmation(**overrides: object) -> dict[str, object]:
+    confirmation = {
+        "schema_version": 1,
+        "kind": "engine_internal_assertion",
+        "source": "controller",
+        "component": "control_plane/repository.py",
+        "site": "get_run_status:418",
+        "signature": "a" * 64,
+    }
+    confirmation.update(overrides)
+    return confirmation
+
+
+def _confirmed_run(
+    *,
+    run_id: str = "run-defect",
+    signature: str = "a" * 64,
+    reason_code: str = "startup_failed",
+) -> dict[str, object]:
+    run = _failed_run(run_id=run_id, reason_code=reason_code)
+    run["defect_confirmation"] = _valid_confirmation(signature=signature)
+    return run
+
+
+def test_classify_defect_files_nothing_without_confirmation() -> None:
+    for reason_code in ("startup_failed", "controller_failed", "worker_failed"):
+        assert classify_defect(_failed_run(reason_code=reason_code)) is None
+    assert classify_defect(_failed_run(activity="active")) is None
+    assert classify_defect(_failed_run(status="succeeded")) is None
+    run = _failed_run()
+    del run["run_id"]
+    run["defect_confirmation"] = _valid_confirmation()
+    assert classify_defect(run) is None
+
+
+def test_classify_defect_rejects_malformed_confirmations() -> None:
+    malformed = (
+        None,
+        "confirmed",
+        42,
+        [_valid_confirmation()],
+        {**_valid_confirmation(), "schema_version": 2},
+        {**_valid_confirmation(), "kind": "worker_failure"},
+        {**_valid_confirmation(), "source": "worker"},
+        {**_valid_confirmation(), "component": "../escape.py"},
+        {**_valid_confirmation(), "component": "/absolute/path.py"},
+        {**_valid_confirmation(), "component": "sub/../sub/module.py"},
+        {**_valid_confirmation(), "component": "module.txt"},
+        {**_valid_confirmation(), "site": "no_line_number"},
+        {**_valid_confirmation(), "site": "fn:-1"},
+        {**_valid_confirmation(), "signature": "A" * 64},
+        {**_valid_confirmation(), "signature": "abc123"},
+        {k: v for k, v in _valid_confirmation().items() if k != "signature"},
+        {**_valid_confirmation(), "detail": "assert x"},
+    )
+    for confirmation in malformed:
+        run = _failed_run()
+        run["defect_confirmation"] = confirmation
+        assert classify_defect(run) is None, confirmation
+
+
+def test_classify_defect_returns_bounded_evidence_for_valid_confirmation() -> None:
+    run = _confirmed_run(run_id="run-42", signature="b" * 64)
+    evidence = classify_defect(run)
+    assert evidence is not None
+    assert evidence.source == "controller"
+    assert evidence.signature == "b" * 64
+    assert evidence.subject == "run-42"
+    assert evidence.component == "control_plane/repository.py"
+    assert evidence.site == "get_run_status:418"
+
+
+def test_defect_evidence_prefers_first_confirmed_run() -> None:
+    runs = [
+        _failed_run(run_id="run-b"),
+        _confirmed_run(run_id="run-a", signature="c" * 64),
+        _confirmed_run(run_id="run-c", signature="d" * 64),
+    ]
+    evidence = defect_evidence(runs)
+    assert evidence is not None
+    assert evidence.subject == "run-a"
+    assert evidence.signature == "c" * 64
+    assert defect_evidence([_failed_run()]) is None
+
+
+def test_defect_signatures_keeps_distinct_signatures_in_stable_order() -> None:
+    runs = [
+        _confirmed_run(run_id="run-c", signature="d" * 64),
+        _confirmed_run(run_id="run-a", signature="c" * 64),
+        _failed_run(run_id="run-b"),
+        _confirmed_run(run_id="run-d", signature="c" * 64),
+    ]
+    evidence = defect_signatures(runs)
+    assert [item.subject for item in evidence] == ["run-a", "run-c"]
+    assert [item.signature for item in evidence] == ["c" * 64, "d" * 64]
+    assert defect_signatures([_failed_run()]) == ()
+
+
+def test_defect_fingerprint_is_stable_per_signature_not_run() -> None:
+    first_run = DefectEvidence(source="controller", signature="a" * 64, subject="run-1")
+    second_run = DefectEvidence(source="controller", signature="a" * 64, subject="run-2")
+    first = defect_fingerprint(first_run)
+    second = defect_fingerprint(second_run)
+    assert first == second
+    assert len(first) == 64
+    marker = defect_fingerprint_marker(first)
+    assert marker.startswith("aflow-concierge-defect-fingerprint:")
+    assert has_defect_fingerprint("noise\n" + marker + "\n", first)
+    assert not has_defect_fingerprint("noise", first)
+    assert defect_fingerprint(
+        DefectEvidence(source="controller", signature="b" * 64, subject="run-1")
+    ) != first
+
+
+def test_defect_issue_body_is_sanitized_and_bounded() -> None:
+    evidence = classify_defect(_confirmed_run(run_id="run-1"))
+    assert evidence is not None
+    fingerprint = defect_fingerprint(evidence)
+    title = defect_issue_title(evidence)
+    body = defect_issue_body(evidence, fingerprint)
+    assert "control_plane/repository.py:get_run_status:418" in title
+    assert "run-1" in title
+    assert "source: controller" in body
+    assert "component: control_plane/repository.py" in body
+    assert "site: get_run_status:418" in body
+    assert f"signature: {'a' * 64}" in body
+    assert defect_fingerprint_marker(fingerprint) in body
+    assert "token" not in body.lower()
+    assert len(body.encode("utf-8")) < 2048
+
+
+def test_project_delivery_reports_pending_without_evidence() -> None:
+    status = project_delivery(DeliveryEvidence())
+    assert status.state == "pending"
+    assert status.ci == "pending"
+    assert status.live == "missing"
+
+
+def test_project_delivery_reports_ok_when_exact_sha_is_live() -> None:
+    sha = "a" * 40
+    status = project_delivery(
+        DeliveryEvidence(
+            origin_main_sha=sha,
+            ci="green",
+            deploy_phase="deployed",
+            current_commit=sha,
+            live_commit=sha,
+        )
+    )
+    assert status.state == "ok"
+    assert status.ci == "green"
+    assert status.live == "installed"
+
+
+def test_project_delivery_fails_on_red_ci_or_failed_deploy() -> None:
+    sha = "a" * 40
+    red = project_delivery(
+        DeliveryEvidence(
+            origin_main_sha=sha,
+            ci="red",
+            deploy_phase="deployed",
+            current_commit=sha,
+            live_commit=sha,
+        )
+    )
+    assert red.state == "failed"
+    assert red.ci == "red"
+    failed = project_delivery(
+        DeliveryEvidence(
+            origin_main_sha=sha,
+            ci="green",
+            deploy_phase="failed",
+            current_commit=sha,
+            live_commit=sha,
+        )
+    )
+    assert failed.state == "failed"
+    assert failed.live == "missing"
+
+
+def test_project_delivery_reports_live_release_separately_from_ci() -> None:
+    origin = "a" * 40
+    stale = "b" * 40
+    status = project_delivery(
+        DeliveryEvidence(
+            origin_main_sha=origin,
+            ci="green",
+            deploy_phase="deployed",
+            current_commit=stale,
+            live_commit=stale,
+        )
+    )
+    assert status.ci == "green"
+    assert status.live == "stale"
+    assert status.state == "pending"
+
+
+def test_executor_does_not_file_generic_startup_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    mcp = FakeMcp(
+        project_root=tmp_path,
+        runs=[_failed_run(reason_code="startup_failed")],
+        plans=[{"path": "plans/in-progress/alpha.md", "status": "in_progress"}],
+        documents={"plans/in-progress/alpha.md": "# Plan\n"},
+    )
+    github = FakeGithub()
+    executor = _executor(tmp_path, monkeypatch, mcp=mcp, github=github)
+    outcome = executor.execute(
+        state_dir=tmp_path / "state", project_root=tmp_path, environment=ENVIRONMENT
+    )
+    assert outcome.action == "resume"
+    assert outcome.reason == "resumed"
+    assert github.created_issues == []
+
+
+def test_executor_files_one_new_confirmed_defect(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    mcp = FakeMcp(
+        project_root=tmp_path,
+        runs=[_confirmed_run()],
+        plans=[{"path": "plans/in-progress/alpha.md", "status": "in_progress"}],
+        documents={"plans/in-progress/alpha.md": "# Plan\n"},
+    )
+    github = FakeGithub()
+    executor = _executor(tmp_path, monkeypatch, mcp=mcp, github=github)
+    outcome = executor.execute(
+        state_dir=tmp_path / "state", project_root=tmp_path, environment=ENVIRONMENT
+    )
+    assert outcome.action == "file_defect"
+    assert outcome.reason == "defect_filed"
+    assert outcome.mutating is True
+    assert len(github.created_issues) == 1
+    full_name, title, body = github.created_issues[0]
+    assert full_name == "owner/repo"
+    assert "control_plane/repository.py:get_run_status:418" in title
+    fingerprint = str(outcome.details["defect_fingerprint"])
+    assert defect_fingerprint_marker(fingerprint) in body
+    assert "resume_run" not in mcp.call_names()
+    assert "start_run" not in mcp.call_names()
+
+
+def test_executor_continues_after_an_already_filed_defect(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    mcp = FakeMcp(
+        project_root=tmp_path,
+        runs=[_confirmed_run()],
+        plans=[{"path": "plans/in-progress/alpha.md", "status": "in_progress"}],
+        documents={"plans/in-progress/alpha.md": "# Plan\n"},
+    )
+    evidence = classify_defect(_confirmed_run())
+    assert evidence is not None
+    fingerprint = defect_fingerprint(evidence)
+    github = FakeGithub(
+        search_results=[
+            {"number": 55, "body": f"previously filed\n{defect_fingerprint_marker(fingerprint)}\n"}
+        ]
+    )
+    executor = _executor(tmp_path, monkeypatch, mcp=mcp, github=github)
+    outcome = executor.execute(
+        state_dir=tmp_path / "state", project_root=tmp_path, environment=ENVIRONMENT
+    )
+    assert outcome.action == "resume"
+    assert outcome.reason == "resumed"
+    assert outcome.mutating is True
+    assert github.created_issues == []
+    assert mcp.call_names().count("resume_run") == 1
+
+
+def test_executor_retained_defect_files_once_then_continues_on_later_tick(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    mcp = FakeMcp(
+        project_root=tmp_path,
+        runs=[_confirmed_run()],
+        plans=[{"path": "plans/in-progress/alpha.md", "status": "in_progress"}],
+        documents={"plans/in-progress/alpha.md": "# Plan\n"},
+    )
+    github = FakeGithub()
+    executor = _executor(tmp_path, monkeypatch, mcp=mcp, github=github)
+    first = executor.execute(
+        state_dir=tmp_path / "state", project_root=tmp_path, environment=ENVIRONMENT
+    )
+    assert first.action == "file_defect"
+    assert first.reason == "defect_filed"
+    assert first.mutating is True
+    assert len(github.created_issues) == 1
+    assert "resume_run" not in mcp.call_names()
+    assert "start_run" not in mcp.call_names()
+
+    github.search_results = (
+        {"number": 101, "body": github.created_issues[0][2]},
+    )
+    second = executor.execute(
+        state_dir=tmp_path / "state", project_root=tmp_path, environment=ENVIRONMENT
+    )
+    assert second.action == "resume"
+    assert second.reason == "resumed"
+    assert second.mutating is True
+    assert len(github.created_issues) == 1
+    assert mcp.call_names().count("resume_run") == 1
+
+
+def test_executor_files_one_issue_for_same_signature_across_runs(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # First tick: run-1 confirms the defect and files exactly one issue.
+    mcp = FakeMcp(
+        project_root=tmp_path,
+        runs=[_confirmed_run(run_id="run-1")],
+        plans=[{"path": "plans/in-progress/alpha.md", "status": "in_progress"}],
+        documents={"plans/in-progress/alpha.md": "# Plan\n"},
+    )
+    github = FakeGithub()
+    executor = _executor(tmp_path, monkeypatch, mcp=mcp, github=github)
+    first = executor.execute(
+        state_dir=tmp_path / "state", project_root=tmp_path, environment=ENVIRONMENT
+    )
+    assert first.action == "file_defect"
+    assert len(github.created_issues) == 1
+
+    # Second tick: a different run ID with the same trusted signature must
+    # not file a duplicate.
+    mcp_later = FakeMcp(
+        project_root=tmp_path,
+        runs=[_confirmed_run(run_id="run-2")],
+        plans=[{"path": "plans/in-progress/alpha.md", "status": "in_progress"}],
+        documents={"plans/in-progress/alpha.md": "# Plan\n"},
+    )
+    github.search_results = (
+        {"number": 101, "body": github.created_issues[0][2]},
+    )
+    executor_later = _executor(tmp_path, monkeypatch, mcp=mcp_later, github=github)
+    second = executor_later.execute(
+        state_dir=tmp_path / "state", project_root=tmp_path, environment=ENVIRONMENT
+    )
+    assert second.action == "resume"
+    assert second.reason == "resumed"
+    assert len(github.created_issues) == 1
+
+
+def test_executor_files_later_signature_when_earlier_is_filed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    early = classify_defect(_confirmed_run(run_id="run-a", signature="a" * 64))
+    late = classify_defect(_confirmed_run(run_id="run-b", signature="b" * 64))
+    assert early is not None
+    assert late is not None
+    early_fingerprint = defect_fingerprint(early)
+    late_fingerprint = defect_fingerprint(late)
+    mcp = FakeMcp(
+        project_root=tmp_path,
+        runs=[
+            _confirmed_run(run_id="run-a", signature="a" * 64),
+            _confirmed_run(run_id="run-b", signature="b" * 64),
+        ],
+        plans=[{"path": "plans/in-progress/alpha.md", "status": "in_progress"}],
+        documents={"plans/in-progress/alpha.md": "# Plan\n"},
+    )
+    github = FakeGithub(
+        search_results=[
+            {
+                "number": 50,
+                "body": f"previously filed\n{defect_fingerprint_marker(early_fingerprint)}\n",
+            }
+        ]
+    )
+    executor = _executor(tmp_path, monkeypatch, mcp=mcp, github=github)
+    outcome = executor.execute(
+        state_dir=tmp_path / "state", project_root=tmp_path, environment=ENVIRONMENT
+    )
+    # The earlier signature is already filed, so the later distinct signature
+    # must be the one filed, and only one issue may be created this tick.
+    assert outcome.action == "file_defect"
+    assert outcome.reason == "defect_filed"
+    assert outcome.mutating is True
+    assert outcome.details["defect_fingerprint"] == late_fingerprint
+    assert len(github.created_issues) == 1
+    assert github.created_issues[0][0] == "owner/repo"
+    assert defect_fingerprint_marker(late_fingerprint) in github.created_issues[0][2]
+    assert "resume_run" not in mcp.call_names()
+    assert "start_run" not in mcp.call_names()
+
+
+def test_executor_continues_when_all_confirmed_signatures_are_filed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    early = classify_defect(_confirmed_run(run_id="run-a", signature="a" * 64))
+    late_run = _confirmed_run(run_id="run-b", signature="b" * 64)
+    # A distinct plan keeps triage ownership unambiguous across two failed
+    # runs, so the tick can continue to the eligible safe action.
+    late_run["plan_path"] = "plans/in-progress/beta.md"
+    late = classify_defect(late_run)
+    assert early is not None
+    assert late is not None
+    mcp = FakeMcp(
+        project_root=tmp_path,
+        runs=[
+            _confirmed_run(run_id="run-a", signature="a" * 64),
+            late_run,
+        ],
+        plans=[
+            {"path": "plans/in-progress/alpha.md", "status": "in_progress"},
+            {"path": "plans/in-progress/beta.md", "status": "in_progress"},
+        ],
+        documents={
+            "plans/in-progress/alpha.md": "# Plan\n",
+            "plans/in-progress/beta.md": "# Plan\n",
+        },
+    )
+    github = FakeGithub(
+        search_results=[
+            {
+                "number": 50,
+                "body": (
+                    "previously filed\n"
+                    f"{defect_fingerprint_marker(defect_fingerprint(early))}\n"
+                    f"{defect_fingerprint_marker(defect_fingerprint(late))}\n"
+                ),
+            }
+        ]
+    )
+    executor = _executor(tmp_path, monkeypatch, mcp=mcp, github=github)
+    outcome = executor.execute(
+        state_dir=tmp_path / "state", project_root=tmp_path, environment=ENVIRONMENT
+    )
+    # Every distinct signature is already filed, so the tick continues to the
+    # eligible safe action without filing anything.
+    assert outcome.action == "resume"
+    assert outcome.reason == "resumed"
+    assert github.created_issues == []
+    assert mcp.call_names().count("resume_run") == 1
+
+
+def test_executor_defect_search_failure_is_report_only(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    mcp = FakeMcp(
+        project_root=tmp_path,
+        runs=[
+            _confirmed_run(run_id="run-a", signature="a" * 64),
+            _confirmed_run(run_id="run-b", signature="b" * 64),
+        ],
+        plans=[{"path": "plans/in-progress/alpha.md", "status": "in_progress"}],
+        documents={"plans/in-progress/alpha.md": "# Plan\n"},
+    )
+    github = FakeGithub(error=ConciergeError("github_unavailable"))
+    executor = _executor(tmp_path, monkeypatch, mcp=mcp, github=github)
+    outcome = executor.execute(
+        state_dir=tmp_path / "state", project_root=tmp_path, environment=ENVIRONMENT
+    )
+    # An uncertain GitHub result must never be guessed as filing-safe.
+    assert outcome.action == "report"
+    assert outcome.reason == "defect_dedup_unavailable"
+    assert outcome.mutating is False
+    assert github.created_issues == []
+    assert "resume_run" not in mcp.call_names()
+    assert "start_run" not in mcp.call_names()
+
+
+def test_executor_partial_search_envelope_is_report_only(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    mcp = FakeMcp(
+        project_root=tmp_path,
+        runs=[_confirmed_run()],
+        plans=[{"path": "plans/in-progress/alpha.md", "status": "in_progress"}],
+        documents={"plans/in-progress/alpha.md": "# Plan\n"},
+    )
+    # A partial (incomplete_results: true) or malformed search envelope makes
+    # the REST client raise, exactly like an unavailable search.
+    github = FakeGithub(error=ConciergeError("github_search_invalid"))
+    executor = _executor(tmp_path, monkeypatch, mcp=mcp, github=github)
+    outcome = executor.execute(
+        state_dir=tmp_path / "state", project_root=tmp_path, environment=ENVIRONMENT
+    )
+    assert outcome.action == "report"
+    assert outcome.reason == "defect_dedup_unavailable"
+    assert outcome.mutating is False
+    assert github.created_issues == []
+    assert "resume_run" not in mcp.call_names()
+    assert "start_run" not in mcp.call_names()
+
+
+def test_executor_does_not_file_malformed_or_unconfirmed_failures(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    cases: list[dict[str, object]] = [
+        _failed_run(reason_code="startup_failed"),
+        _failed_run(reason_code="controller_failed"),
+        _failed_run(reason_code="worker_failed"),
+        _failed_run(reason_code="missing_completion"),
+    ]
+    broken = _confirmed_run()
+    broken["defect_confirmation"] = {
+        **_valid_confirmation(),
+        "signature": "not-a-signature",
+    }
+    cases.append(broken)
+    for run in cases:
+        mcp = FakeMcp(
+            project_root=tmp_path,
+            runs=[run],
+            plans=[{"path": "plans/in-progress/alpha.md", "status": "in_progress"}],
+            documents={"plans/in-progress/alpha.md": "# Plan\n"},
+        )
+        github = FakeGithub()
+        executor = _executor(tmp_path, monkeypatch, mcp=mcp, github=github)
+        outcome = executor.execute(
+            state_dir=tmp_path / "state", project_root=tmp_path, environment=ENVIRONMENT
+        )
+        assert outcome.action == "resume"
+        assert github.created_issues == []
+
+
+def test_delivery_gate_blocks_start_on_failed_release(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    mcp = FakeMcp(
+        project_root=tmp_path,
+        plans=[{"path": "plans/todo/alpha.md", "status": "todo"}],
+        documents={"plans/todo/alpha.md": "# Plan\n"},
+        publication=_publication_projection(available=True, remote="origin", branch="main"),
+    )
+    gate = FakeDeliveryGate(DeliveryStatus(state="failed", ci="red", live="missing"))
+    executor = _executor(tmp_path, monkeypatch, mcp=mcp, delivery_gate=gate)
+    outcome = executor.execute(
+        state_dir=tmp_path / "state", project_root=tmp_path, environment=ENVIRONMENT
+    )
+    assert outcome.action == "report"
+    assert outcome.reason == "delivery_gate_failed"
+    assert outcome.mutating is False
+    assert outcome.details["delivery_ci"] == "red"
+    assert outcome.details["delivery_live"] == "missing"
+    assert "start_run" not in mcp.call_names()
+
+
+def test_delivery_gate_blocks_plan_and_start_on_failed_release(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    mcp = FakeMcp(project_root=tmp_path)
+    github = FakeGithub(
+        page=GithubIssuePage(repository_id=42, issues=(_github_issue(),))
+    )
+    planner = FakePlanner(result=_plan_result())
+    gate = FakeDeliveryGate(DeliveryStatus(state="failed", ci="red", live="missing"))
+    executor = _executor(
+        tmp_path, monkeypatch, mcp=mcp, github=github, planner=planner, delivery_gate=gate
+    )
+    outcome = executor.execute(
+        state_dir=tmp_path / "state", project_root=tmp_path, environment=ENVIRONMENT
+    )
+    assert outcome.action == "report"
+    assert outcome.reason == "delivery_gate_failed"
+    assert outcome.mutating is False
+    assert planner.plan_calls == []
+    assert "create_plan" not in mcp.call_names()
+    assert "start_run" not in mcp.call_names()
+
+
+def test_delivery_gate_does_not_block_resume(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    mcp = FakeMcp(
+        project_root=tmp_path,
+        runs=[_failed_run(reason_code="worker_failed")],
+        plans=[{"path": "plans/in-progress/alpha.md", "status": "in_progress"}],
+        documents={"plans/in-progress/alpha.md": "# Plan\n"},
+    )
+    gate = FakeDeliveryGate(DeliveryStatus(state="failed", ci="red", live="missing"))
+    executor = _executor(tmp_path, monkeypatch, mcp=mcp, delivery_gate=gate)
+    outcome = executor.execute(
+        state_dir=tmp_path / "state", project_root=tmp_path, environment=ENVIRONMENT
+    )
+    assert outcome.action == "resume"
+    assert outcome.mutating is True
+
+
+def test_pending_delivery_gate_allows_start(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    mcp = FakeMcp(
+        project_root=tmp_path,
+        plans=[{"path": "plans/todo/alpha.md", "status": "todo"}],
+        documents={"plans/todo/alpha.md": "# Plan\n"},
+        publication=_publication_projection(available=True, remote="origin", branch="main"),
+    )
+    gate = FakeDeliveryGate(DeliveryStatus(state="pending", ci="pending", live="missing"))
+    executor = _executor(tmp_path, monkeypatch, mcp=mcp, delivery_gate=gate)
+    outcome = executor.execute(
+        state_dir=tmp_path / "state", project_root=tmp_path, environment=ENVIRONMENT
+    )
+    assert outcome.action == "start"
+    assert outcome.mutating is True
+
+
+def test_delivery_status_is_reported_on_idle_outcome(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    mcp = FakeMcp(project_root=tmp_path)
+    gate = FakeDeliveryGate(DeliveryStatus(state="pending", ci="pending", live="stale"))
+    executor = _executor(tmp_path, monkeypatch, mcp=mcp, delivery_gate=gate)
+    outcome = executor.execute(
+        state_dir=tmp_path / "state", project_root=tmp_path, environment=ENVIRONMENT
+    )
+    assert outcome.action == "idle"
+    assert outcome.details["delivery_state"] == "pending"
+    assert outcome.details["delivery_ci"] == "pending"
+    assert outcome.details["delivery_live"] == "stale"
+
+
+def test_local_delivery_gate_reports_pending_without_evidence(tmp_path: Path) -> None:
+    github = FakeGithub()
+    gate = LocalDeliveryGate(
+        github=github,
+        project_root=tmp_path,
+        deploy_status_path=tmp_path / "absent.json",
+        live_release_root=tmp_path / "absent-live",
+    )
+    status = gate.evaluate(full_name="owner/repo")
+    assert status.state == "pending"
+    assert status.ci == "pending"
+    assert status.live == "missing"
+
+
+def _live_release(live_root: Path, release_id: str) -> None:
+    release = live_root / release_id
+    release.mkdir(parents=True)
+    os.symlink(release, live_root / "current")
+
+
+def test_local_delivery_gate_reports_live_and_ci_separately(tmp_path: Path) -> None:
+    origin = "a" * 40
+    stale = "b" * 40
+    status_path = tmp_path / "status.json"
+    status_path.write_text(
+        json.dumps({"phase": "deployed", "current_commit": stale}), encoding="utf-8"
+    )
+    live_root = tmp_path / "live"
+    _live_release(live_root, stale)
+    github = FakeGithub(workflow_runs=[(1, 1, "completed", "success")])
+    gate = LocalDeliveryGate(
+        github=github,
+        project_root=tmp_path,
+        deploy_status_path=status_path,
+        live_release_root=live_root,
+    )
+    gate._origin_main_sha = lambda: origin  # type: ignore[method-assign]
+    status = gate.evaluate(full_name="owner/repo")
+    assert status.ci == "green"
+    assert status.live == "stale"
+    assert status.state == "pending"
+
+
+def test_local_delivery_gate_reports_ok_when_exact_sha_is_live(tmp_path: Path) -> None:
+    origin = "a" * 40
+    status_path = tmp_path / "status.json"
+    status_path.write_text(
+        json.dumps({"phase": "deployed", "current_commit": origin}), encoding="utf-8"
+    )
+    live_root = tmp_path / "live"
+    _live_release(live_root, origin)
+    github = FakeGithub(workflow_runs=[(1, 1, "completed", "success")])
+    gate = LocalDeliveryGate(
+        github=github,
+        project_root=tmp_path,
+        deploy_status_path=status_path,
+        live_release_root=live_root,
+    )
+    gate._origin_main_sha = lambda: origin  # type: ignore[method-assign]
+    status = gate.evaluate(full_name="owner/repo")
+    assert status.state == "ok"
+    assert status.ci == "green"
+    assert status.live == "installed"
+
+
+# Checkpoint 3 review fixes: remote main tip and qualifying CI only
+# ---------------------------------------------------------------------------
+
+
+def _git_run(argv: list[str], cwd: Path | None = None) -> None:
+    subprocess.run(
+        argv, cwd=cwd, check=True, capture_output=True, text=True
+    )
+
+
+def _git_head(repo: Path) -> str:
+    result = subprocess.run(
+        ["git", "rev-parse", "HEAD"],
+        cwd=repo,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    return result.stdout.strip()
+
+
+def _git_commit(repo: Path, filename: str, content: str) -> None:
+    (repo / filename).write_text(content, encoding="utf-8")
+    _git_run(["git", "add", filename], cwd=repo)
+    _git_run(["git", "commit", "-m", filename], cwd=repo)
+
+
+def _git_init_remote_and_repo(tmp_path: Path) -> tuple[Path, Path]:
+    """Create a bare remote and a working repo whose origin points to it."""
+    bare = tmp_path / "remote.git"
+    bare.mkdir()
+    _git_run(["git", "init", "--bare", "--initial-branch=main", "."], cwd=bare)
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _git_run(["git", "init", "--initial-branch=main", "."], cwd=repo)
+    _git_run(["git", "config", "user.email", "concierge@test"], cwd=repo)
+    _git_run(["git", "config", "user.name", "Concierge Test"], cwd=repo)
+    _git_run(["git", "remote", "add", "origin", str(bare)], cwd=repo)
+    return bare, repo
+
+
+def test_local_delivery_gate_uses_remote_main_tip_not_stale_tracking_ref(
+    tmp_path: Path,
+) -> None:
+    bare, repo = _git_init_remote_and_repo(tmp_path)
+    _git_commit(repo, "a.txt", "a")
+    _git_run(["git", "push", "origin", "main"], cwd=repo)
+    stale = _git_head(repo)
+
+    # A second publisher advances the remote main beyond this checkout's
+    # tracking ref, leaving ``origin/main`` stale in ``repo``.
+    repo2 = tmp_path / "repo2"
+    _git_run(["git", "clone", str(bare), str(repo2)])
+    _git_run(["git", "config", "user.email", "other@test"], cwd=repo2)
+    _git_run(["git", "config", "user.name", "Other"], cwd=repo2)
+    _git_commit(repo2, "b.txt", "b")
+    _git_run(["git", "push", "origin", "main"], cwd=repo2)
+    remote_tip = _git_head(repo2)
+    assert remote_tip != stale
+
+    # The live release sits at the stale SHA, so a gate that (wrongly) used the
+    # stale tracking ref would report it as installed.
+    live_root = tmp_path / "live"
+    _live_release(live_root, stale)
+    status_path = tmp_path / "status.json"
+    status_path.write_text(
+        json.dumps({"phase": "deployed", "current_commit": stale}),
+        encoding="utf-8",
+    )
+    github = FakeGithub(workflow_runs=[(1, 1, "completed", "success")])
+    gate = LocalDeliveryGate(
+        github=github,
+        project_root=repo,
+        deploy_status_path=status_path,
+        live_release_root=live_root,
+    )
+    assert gate._origin_main_sha() == remote_tip
+    status = gate.evaluate(full_name="owner/repo")
+    # Both the CI query and the live comparison use the remote tip, not the
+    # stale local tracking ref.
+    assert github.workflow_sha_queries == [("owner/repo", remote_tip)]
+    assert status.live == "stale"
+
+
+def test_local_delivery_gate_reports_pending_when_remote_unreachable(
+    tmp_path: Path,
+) -> None:
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _git_run(["git", "init", "--initial-branch=main", "."], cwd=repo)
+    _git_run(["git", "config", "user.email", "concierge@test"], cwd=repo)
+    _git_run(["git", "config", "user.name", "Concierge Test"], cwd=repo)
+    _git_commit(repo, "a.txt", "a")
+    stale = _git_head(repo)
+    # Point origin at a nonexistent path so ls-remote fails, and seed a stale
+    # local tracking ref that must never be used as a fallback.
+    _git_run(
+        ["git", "remote", "add", "origin", str(tmp_path / "absent.git")],
+        cwd=repo,
+    )
+    _git_run(
+        ["git", "update-ref", "refs/remotes/origin/main", stale], cwd=repo
+    )
+    github = FakeGithub(workflow_runs=[(1, 1, "completed", "success")])
+    gate = LocalDeliveryGate(
+        github=github,
+        project_root=repo,
+        deploy_status_path=tmp_path / "absent.json",
+        live_release_root=tmp_path / "absent-live",
+    )
+    assert gate._origin_main_sha() is None
+    status = gate.evaluate(full_name="owner/repo")
+    assert status.state == "pending"
+    assert status.ci == "pending"
+    # An unreachable remote must not fall back to the stale tracking ref.
+    assert github.workflow_sha_queries == []
+
+
+def _fake_github_response(
+    monkeypatch: pytest.MonkeyPatch,
+    paths: dict[str, object],
+    record: list[tuple[str, bytes | None]] | None = None,
+) -> None:
+    class FakeResponse:
+        headers = {"Content-Type": "application/json"}
+
+        def __init__(self, payload: object) -> None:
+            self._payload = json.dumps(payload).encode("utf-8")
+
+        def read(self, limit: int = -1) -> bytes:
+            return self._payload
+
+        def __enter__(self) -> "FakeResponse":
+            return self
+
+        def __exit__(self, *exc: object) -> bool:
+            return False
+
+    def fake_urlopen(request: object, timeout: float | None = None) -> FakeResponse:
+        url = request.full_url  # type: ignore[attr-defined]
+        path = url.replace("https://api.github.com", "")
+        if record is not None:
+            record.append((request.method, request.data))  # type: ignore[attr-defined]
+        return FakeResponse(paths[path])
+
+    monkeypatch.setattr("aflow.concierge.urllib_request.urlopen", fake_urlopen)
+
+
+def test_github_rest_client_filters_to_qualifying_ci_workflow(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from aflow.concierge import GithubRestClient
+
+    sha = "c" * 40
+    runs = [
+        # Qualifying CI: the only run that counts (a failure).
+        {
+            "head_sha": sha,
+            "event": "push",
+            "head_branch": "main",
+            "path": ".github/workflows/ci.yml",
+            "run_number": 4,
+            "run_attempt": 1,
+            "status": "completed",
+            "conclusion": "failure",
+        },
+        # Unrelated workflow that succeeded; must not green the CI.
+        {
+            "head_sha": sha,
+            "event": "push",
+            "head_branch": "main",
+            "path": ".github/workflows/unrelated.yml",
+            "status": "completed",
+            "conclusion": "success",
+        },
+        # Same CI workflow but a different branch; must not count.
+        {
+            "head_sha": sha,
+            "event": "push",
+            "head_branch": "feature",
+            "path": ".github/workflows/ci.yml",
+            "status": "completed",
+            "conclusion": "success",
+        },
+        # Same CI workflow but a pull_request event; must not count.
+        {
+            "head_sha": sha,
+            "event": "pull_request",
+            "head_branch": "main",
+            "path": ".github/workflows/ci.yml",
+            "status": "completed",
+            "conclusion": "success",
+        },
+        # Same CI workflow but a different SHA; must not count.
+        {
+            "head_sha": "d" * 40,
+            "event": "push",
+            "head_branch": "main",
+            "path": ".github/workflows/ci.yml",
+            "status": "completed",
+            "conclusion": "success",
+        },
+    ]
+    _fake_github_response(
+        monkeypatch,
+        {
+            f"/repos/owner/repo/actions/runs"
+            f"?head_sha={sha}&branch=main&event=push&per_page=100": {
+                "workflow_runs": runs,
+            }
+        },
+    )
+    client = GithubRestClient(token="gh-token")
+    assert client.workflow_runs("owner/repo", sha) == ((4, 1, "completed", "failure"),)
+
+
+def test_github_rest_client_search_is_repository_scoped(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from aflow.concierge import GithubRestClient
+
+    fingerprint = "f" * 64
+    marker = defect_fingerprint_marker(fingerprint)
+    # No state qualifier: the Search Issues API includes open and closed
+    # issues alike, and ``state:open,closed`` is not a supported term.
+    scoped = f"{marker} repo:owner/repo"
+    _fake_github_response(
+        monkeypatch,
+        {
+            f"/search/issues?q={urllib_parse.quote(scoped, safe='')}&per_page=100": {
+                "total_count": 2,
+                "incomplete_results": False,
+                "items": [
+                    {
+                        "number": 11,
+                        "state": "open",
+                        "body": f"still open\n{marker}\n",
+                        "repository_url": "https://api.github.com/repos/owner/repo",
+                    },
+                    {
+                        "number": 12,
+                        "state": "closed",
+                        "body": f"closed earlier\n{marker}\n",
+                        "repository_url": "https://api.github.com/repos/owner/repo",
+                    },
+                ]
+            }
+        },
+    )
+    client = GithubRestClient(token="gh-token")
+    results = client.search_issues("owner/repo", marker)
+    # Open and closed issues in the target repository both count as filed.
+    assert [item["number"] for item in results] == [11, 12]
+    for item in results:
+        assert has_defect_fingerprint(str(item["body"]), fingerprint)
+
+
+def test_github_rest_client_search_drops_other_repository_results(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from aflow.concierge import GithubRestClient
+
+    fingerprint = "f" * 64
+    marker = defect_fingerprint_marker(fingerprint)
+    scoped = f"{marker} repo:owner/repo"
+    _fake_github_response(
+        monkeypatch,
+        {
+            f"/search/issues?q={urllib_parse.quote(scoped, safe='')}&per_page=100": {
+                # total_count counts every returned item before repository
+                # filtering, not only the target repository's matches.
+                "total_count": 2,
+                "incomplete_results": False,
+                "items": [
+                    {
+                        "number": 11,
+                        "body": f"other repository\n{marker}\n",
+                        "repository_url": "https://api.github.com/repos/other/repo",
+                    },
+                    {
+                        "number": 12,
+                        "body": f"target repository\n{marker}\n",
+                        "repository_url": "https://api.github.com/repos/owner/repo",
+                    },
+                ]
+            }
+        },
+    )
+    client = GithubRestClient(token="gh-token")
+    results = client.search_issues("owner/repo", marker)
+    # A matching fingerprint in another repository can never satisfy this
+    # repository's deduplication.
+    assert [item["number"] for item in results] == [12]
+    assert has_defect_fingerprint(str(results[0]["body"]), fingerprint)
+
+
+@pytest.mark.parametrize(
+    ("items"),
+    [
+        # Item without any repository identity cannot be attributed.
+        [{"number": 12, "body": "unattributable"}],
+        # Repository identity that is not a well-formed repository URL.
+        [
+            {
+                "number": 12,
+                "body": "malformed identity",
+                "repository_url": "not-a-url",
+            }
+        ],
+        # Non-mapping item in the page.
+        ["not-a-mapping"],
+        # Target-repository item missing a usable issue number.
+        [
+            {
+                "number": "12",
+                "body": "bad number",
+                "repository_url": "https://api.github.com/repos/owner/repo",
+            }
+        ],
+    ],
+)
+def test_github_rest_client_search_rejects_unsafe_items(
+    monkeypatch: pytest.MonkeyPatch, items: object
+) -> None:
+    from aflow.concierge import GithubRestClient
+
+    marker = "m" + "f" * 63
+    scoped = f"{marker} repo:owner/repo"
+    _fake_github_response(
+        monkeypatch,
+        {
+            f"/search/issues?q={urllib_parse.quote(scoped, safe='')}&per_page=100": {
+                "total_count": len(items),
+                "incomplete_results": False,
+                "items": items,
+            }
+        },
+    )
+    client = GithubRestClient(token="gh-token")
+    # A malformed or incomplete search response must surface as an error so
+    # the caller stays report-only instead of filing a duplicate.
+    with pytest.raises(ConciergeError) as excinfo:
+        client.search_issues("owner/repo", marker)
+    assert excinfo.value.reason == "github_search_invalid"
+
+
+@pytest.mark.parametrize(
+    ("payload"),
+    [
+        # GitHub explicitly reports a partial result with no items.
+        {"items": [], "total_count": 0, "incomplete_results": True},
+        # A partial result can still carry nonmatching items.
+        {
+            "items": [
+                {
+                    "number": 12,
+                    "body": "no fingerprint",
+                    "repository_url": "https://api.github.com/repos/owner/repo",
+                }
+            ],
+            "total_count": 1,
+            "incomplete_results": True,
+        },
+        # More reported matches than the returned first page.
+        {"items": [], "total_count": 101, "incomplete_results": False},
+        # Missing completeness fields.
+        {"items": []},
+        {"items": [], "total_count": 0},
+        {"items": [], "incomplete_results": False},
+        # Malformed completeness fields.
+        {"items": [], "total_count": "0", "incomplete_results": False},
+        {"items": [], "total_count": -1, "incomplete_results": False},
+        {"items": [], "total_count": True, "incomplete_results": False},
+        {"items": [], "total_count": 0, "incomplete_results": "false"},
+        {"items": [], "total_count": 0, "incomplete_results": 0},
+    ],
+)
+def test_github_rest_client_search_requires_complete_envelope(
+    monkeypatch: pytest.MonkeyPatch, payload: object
+) -> None:
+    from aflow.concierge import GithubRestClient
+
+    marker = "m" + "f" * 63
+    scoped = f"{marker} repo:owner/repo"
+    _fake_github_response(
+        monkeypatch,
+        {
+            f"/search/issues?q={urllib_parse.quote(scoped, safe='')}&per_page=100": payload
+        },
+    )
+    client = GithubRestClient(token="gh-token")
+    # A partial, paginated, or malformed search cannot prove absence, so it
+    # must surface as an error and keep the caller report-only.
+    with pytest.raises(ConciergeError) as excinfo:
+        client.search_issues("owner/repo", marker)
+    assert excinfo.value.reason == "github_search_invalid"
+
+
+def test_github_rest_client_search_accepts_complete_empty_envelope(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from aflow.concierge import GithubRestClient
+
+    marker = "m" + "f" * 63
+    scoped = f"{marker} repo:owner/repo"
+    _fake_github_response(
+        monkeypatch,
+        {
+            f"/search/issues?q={urllib_parse.quote(scoped, safe='')}&per_page=100": {
+                "total_count": 0,
+                "incomplete_results": False,
+                "items": [],
+            }
+        },
+    )
+    client = GithubRestClient(token="gh-token")
+    # A complete empty search is sufficient negative evidence.
+    assert client.search_issues("owner/repo", marker) == ()
+
+
+def test_live_search_retains_filed_issue_and_blocks_duplicate_filing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from aflow.concierge import GithubRestClient
+
+    mcp = FakeMcp(
+        project_root=tmp_path,
+        runs=[_confirmed_run()],
+        plans=[{"path": "plans/in-progress/alpha.md", "status": "in_progress"}],
+        documents={"plans/in-progress/alpha.md": "# Plan\n"},
+    )
+    evidence = classify_defect(_confirmed_run())
+    assert evidence is not None
+    fingerprint = defect_fingerprint(evidence)
+    marker = defect_fingerprint_marker(fingerprint)
+    search_path = (
+        f"/search/issues?q={urllib_parse.quote(f'{marker} repo:owner/repo', safe='')}"
+        "&per_page=100"
+    )
+    paths: dict[str, object] = {
+        "/repos/owner/repo": {"id": 42},
+        "/repos/owner/repo/issues?state=open&per_page=100": [],
+        search_path: {
+            "total_count": 0,
+            "incomplete_results": False,
+            "items": [],
+        },
+        "/repos/owner/repo/issues": {
+            "number": 101,
+            "html_url": "https://github.com/owner/repo/issues/101",
+        },
+    }
+    requests: list[tuple[str, bytes | None]] = []
+    _fake_github_response(monkeypatch, paths, record=requests)
+    client = GithubRestClient(token="gh-token")
+    executor = _executor(tmp_path, monkeypatch, mcp=mcp, github=client)
+    first = executor.execute(
+        state_dir=tmp_path / "state", project_root=tmp_path, environment=ENVIRONMENT
+    )
+    assert first.action == "file_defect"
+    assert first.reason == "defect_filed"
+    posts = [entry for entry in requests if entry[0] == "POST"]
+    assert len(posts) == 1
+    created = json.loads(posts[0][1].decode("utf-8"))
+    # The next tick sees the filed issue in the live Search Issues shape,
+    # identified by repository_url, and must not file a duplicate.
+    paths[search_path] = {
+        "total_count": 1,
+        "incomplete_results": False,
+        "items": [
+            {
+                "number": 101,
+                "state": "open",
+                "title": str(created["title"]),
+                "body": str(created["body"]),
+                "repository_url": "https://api.github.com/repos/owner/repo",
+            }
+        ],
+    }
+    second = executor.execute(
+        state_dir=tmp_path / "state", project_root=tmp_path, environment=ENVIRONMENT
+    )
+    assert second.action == "resume"
+    assert second.reason == "resumed"
+    assert len([entry for entry in requests if entry[0] == "POST"]) == 1
+    assert mcp.call_names().count("resume_run") == 1
+
+
+@pytest.mark.parametrize(
+    ("search_payload"),
+    [
+        # GitHub reports a partial result: the empty page proves nothing.
+        {"items": [], "total_count": 0, "incomplete_results": True},
+        # The count exceeds the first page: matches may be beyond it.
+        {"items": [], "total_count": 101, "incomplete_results": False},
+    ],
+    ids=["incomplete_results", "count_beyond_first_page"],
+)
+def test_live_incomplete_search_keeps_tick_report_only(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    search_payload: object,
+) -> None:
+    from aflow.concierge import GithubRestClient
+
+    mcp = FakeMcp(
+        project_root=tmp_path,
+        runs=[_confirmed_run()],
+        plans=[{"path": "plans/in-progress/alpha.md", "status": "in_progress"}],
+        documents={"plans/in-progress/alpha.md": "# Plan\n"},
+    )
+    evidence = classify_defect(_confirmed_run())
+    assert evidence is not None
+    fingerprint = defect_fingerprint(evidence)
+    marker = defect_fingerprint_marker(fingerprint)
+    search_path = (
+        f"/search/issues?q={urllib_parse.quote(f'{marker} repo:owner/repo', safe='')}"
+        "&per_page=100"
+    )
+    requests: list[tuple[str, bytes | None]] = []
+    _fake_github_response(
+        monkeypatch,
+        {
+            "/repos/owner/repo": {"id": 42},
+            "/repos/owner/repo/issues?state=open&per_page=100": [],
+            search_path: search_payload,
+            "/repos/owner/repo/issues": {
+                "number": 101,
+                "html_url": "https://github.com/owner/repo/issues/101",
+            },
+        },
+        record=requests,
+    )
+    client = GithubRestClient(token="gh-token")
+    executor = _executor(tmp_path, monkeypatch, mcp=mcp, github=client)
+    outcome = executor.execute(
+        state_dir=tmp_path / "state", project_root=tmp_path, environment=ENVIRONMENT
+    )
+    # An incomplete search is uncertainty, not absence: no issue may be
+    # created and the tick stays report-only.
+    assert outcome.action == "report"
+    assert outcome.reason == "defect_dedup_unavailable"
+    assert outcome.mutating is False
+    assert [entry for entry in requests if entry[0] == "POST"] == []
+
+
+def test_github_rest_client_search_rejects_unsafe_full_name(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from aflow.concierge import GithubRestClient
+
+    client = GithubRestClient(token="gh-token")
+    for full_name in (
+        "owner",
+        "owner/repo repo:other/repo",
+        "../escape",
+        "owner/repo/extra",
+    ):
+        with pytest.raises(ConciergeError) as excinfo:
+            client.search_issues(full_name, "a" * 64)
+        assert excinfo.value.reason == "github_full_name_invalid"
+
+
+def test_local_delivery_gate_ci_uses_only_qualifying_workflow(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from aflow.concierge import GithubRestClient
+
+    sha = "e" * 40
+    runs = [
+        {
+            "head_sha": sha,
+            "event": "push",
+            "head_branch": "main",
+            "path": ".github/workflows/ci.yml",
+            "run_number": 3,
+            "run_attempt": 1,
+            "status": "completed",
+            "conclusion": "success",
+        },
+        {
+            "head_sha": sha,
+            "event": "push",
+            "head_branch": "main",
+            "path": ".github/workflows/unrelated.yml",
+            "status": "completed",
+            "conclusion": "failure",
+        },
+    ]
+    _fake_github_response(
+        monkeypatch,
+        {
+            f"/repos/owner/repo/actions/runs"
+            f"?head_sha={sha}&branch=main&event=push&per_page=100": {
+                "workflow_runs": runs,
+            }
+        },
+    )
+    gate = LocalDeliveryGate(
+        github=GithubRestClient(token="gh-token"),
+        project_root=tmp_path,
+        deploy_status_path=tmp_path / "absent.json",
+        live_release_root=tmp_path / "absent-live",
+    )
+    gate._origin_main_sha = lambda: sha  # type: ignore[method-assign]
+    status = gate.evaluate(full_name="owner/repo")
+    # The unrelated workflow's failure must not red the qualifying green CI.
+    assert status.ci == "green"
+
+
+def test_local_delivery_gate_ci_pending_when_only_unrelated_succeeded(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from aflow.concierge import GithubRestClient
+
+    sha = "a1" * 20
+    runs = [
+        {
+            "head_sha": sha,
+            "event": "push",
+            "head_branch": "main",
+            "path": ".github/workflows/ci.yml",
+            "run_number": 5,
+            "run_attempt": 1,
+            "status": "in_progress",
+            "conclusion": None,
+        },
+        {
+            "head_sha": sha,
+            "event": "push",
+            "head_branch": "main",
+            "path": ".github/workflows/unrelated.yml",
+            "status": "completed",
+            "conclusion": "success",
+        },
+    ]
+    _fake_github_response(
+        monkeypatch,
+        {
+            f"/repos/owner/repo/actions/runs"
+            f"?head_sha={sha}&branch=main&event=push&per_page=100": {
+                "workflow_runs": runs,
+            }
+        },
+    )
+    gate = LocalDeliveryGate(
+        github=GithubRestClient(token="gh-token"),
+        project_root=tmp_path,
+        deploy_status_path=tmp_path / "absent.json",
+        live_release_root=tmp_path / "absent-live",
+    )
+    gate._origin_main_sha = lambda: sha  # type: ignore[method-assign]
+    status = gate.evaluate(full_name="owner/repo")
+    # An unrelated success must not green a still-running qualifying CI.
+    assert status.ci == "pending"
+
+
+def _ci_run(
+    *,
+    sha: str,
+    number: int,
+    attempt: int = 1,
+    status: str = "completed",
+    conclusion: str | None = "success",
+) -> dict[str, object]:
+    return {
+        "head_sha": sha,
+        "event": "push",
+        "head_branch": "main",
+        "path": ".github/workflows/ci.yml",
+        "run_number": number,
+        "run_attempt": attempt,
+        "status": status,
+        "conclusion": conclusion,
+    }
+
+
+def _ci_gate(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, runs: list[dict[str, object]]
+) -> LocalDeliveryGate:
+    from aflow.concierge import GithubRestClient
+
+    sha = "e" * 40
+    _fake_github_response(
+        monkeypatch,
+        {
+            f"/repos/owner/repo/actions/runs"
+            f"?head_sha={sha}&branch=main&event=push&per_page=100": {
+                "workflow_runs": runs,
+            }
+        },
+    )
+    gate = LocalDeliveryGate(
+        github=GithubRestClient(token="gh-token"),
+        project_root=tmp_path,
+        deploy_status_path=tmp_path / "absent.json",
+        live_release_root=tmp_path / "absent-live",
+    )
+    gate._origin_main_sha = lambda: sha  # type: ignore[method-assign]
+    return gate
+
+
+def test_local_delivery_gate_ci_latest_run_wins(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    sha = "e" * 40
+    # An earlier success never greens a later failure.
+    gate = _ci_gate(
+        tmp_path,
+        monkeypatch,
+        [
+            _ci_run(sha=sha, number=1, conclusion="success"),
+            _ci_run(sha=sha, number=2, conclusion="failure"),
+        ],
+    )
+    assert gate.evaluate(full_name="owner/repo").ci == "red"
+    # An earlier failure never reds a later success.
+    gate = _ci_gate(
+        tmp_path,
+        monkeypatch,
+        [
+            _ci_run(sha=sha, number=1, conclusion="failure"),
+            _ci_run(sha=sha, number=2, conclusion="success"),
+        ],
+    )
+    assert gate.evaluate(full_name="owner/repo").ci == "green"
+    # A non-terminal latest run is pending even after an earlier failure.
+    gate = _ci_gate(
+        tmp_path,
+        monkeypatch,
+        [
+            _ci_run(sha=sha, number=1, conclusion="failure"),
+            _ci_run(sha=sha, number=2, status="in_progress", conclusion=None),
+        ],
+    )
+    assert gate.evaluate(full_name="owner/repo").ci == "pending"
+
+
+def test_local_delivery_gate_ci_rerun_attempt_overrides_earlier_attempt(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    sha = "e" * 40
+    # Same run number: the re-run (attempt 2) decides, not attempt 1.
+    gate = _ci_gate(
+        tmp_path,
+        monkeypatch,
+        [
+            _ci_run(sha=sha, number=7, attempt=1, conclusion="success"),
+            _ci_run(sha=sha, number=7, attempt=2, conclusion="cancelled"),
+        ],
+    )
+    assert gate.evaluate(full_name="owner/repo").ci == "red"
+    gate = _ci_gate(
+        tmp_path,
+        monkeypatch,
+        [
+            _ci_run(sha=sha, number=7, attempt=1, conclusion="failure"),
+            _ci_run(sha=sha, number=7, attempt=2, conclusion="success"),
+        ],
+    )
+    assert gate.evaluate(full_name="owner/repo").ci == "green"
+
+
+def test_fresh_dispatch_uses_only_qualifying_ci(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from aflow.concierge import GithubRestClient
+
+    sha = "f" * 40
+    runs = [
+        {
+            "head_sha": sha,
+            "event": "push",
+            "head_branch": "main",
+            "path": ".github/workflows/ci.yml",
+            "run_number": 6,
+            "run_attempt": 1,
+            "status": "completed",
+            "conclusion": "success",
+        },
+        {
+            "head_sha": sha,
+            "event": "push",
+            "head_branch": "main",
+            "path": ".github/workflows/unrelated.yml",
+            "status": "completed",
+            "conclusion": "failure",
+        },
+    ]
+    _fake_github_response(
+        monkeypatch,
+        {
+            f"/repos/owner/repo/actions/runs"
+            f"?head_sha={sha}&branch=main&event=push&per_page=100": {
+                "workflow_runs": runs,
+            }
+        },
+    )
+    gate = LocalDeliveryGate(
+        github=GithubRestClient(token="gh-token"),
+        project_root=tmp_path,
+        deploy_status_path=tmp_path / "absent.json",
+        live_release_root=tmp_path / "absent-live",
+    )
+    gate._origin_main_sha = lambda: sha  # type: ignore[method-assign]
+    mcp = FakeMcp(
+        project_root=tmp_path,
+        plans=[{"path": "plans/todo/alpha.md", "status": "todo"}],
+        documents={"plans/todo/alpha.md": "# Plan\n"},
+        publication=_publication_projection(available=True, remote="origin", branch="main"),
+    )
+    executor = _executor(tmp_path, monkeypatch, mcp=mcp, delivery_gate=gate)
+    outcome = executor.execute(
+        state_dir=tmp_path / "state", project_root=tmp_path, environment=ENVIRONMENT
+    )
+    # The unrelated workflow's failure must not block the fresh dispatch.
+    assert outcome.action == "start"
+    assert outcome.mutating is True

@@ -35,6 +35,27 @@ most one bounded MCP action per tick. You only review and report.
   `high` effort, effective `aflow-plan` skill, and validated concierge
   evidence (canonical issue URL present in the plan document). A plan that
   fails evidence validation is report-only, never started.
+- Exact-SHA delivery gate: the concierge process reports CI and the live
+  release separately for the `origin/main` SHA. A failed exact-SHA delivery
+  (red CI or a failed deploy) blocks fresh `start` and `plan_and_start`
+  dispatch until the release is repaired; it never blocks a verified `resume`
+  of an existing failed lineage. Missing delivery evidence projects to
+  `pending`, never success.
+- Bounded defect reporting: the concierge files a defect only from the
+  live MCP `get_run.defect_confirmation` projection, strictly validated
+  against the fixed six-field contract (schema version 1,
+  `engine_internal_assertion`, `controller`, bounded component and site,
+  64-hex signature). Missing, malformed, or unconfirmed data files
+  nothing, and generic startup, controller, implementation, environmental,
+  admission, provider, configuration, or uncertain failures file nothing.
+  Filing deduplicates by trusted defect signature across run IDs, never
+  files a duplicate for the same signature, checks each distinct signature
+  against the target repository's issues (including closed ones), files
+  the first unfiled signature, and stops for the tick; an already-filed
+  signature never blocks a different unfiled one, and once all are filed
+  the eligible safe action is not displaced. Any issue
+  body carries only bounded sanitized evidence and never includes
+  transcripts, tokens, stack traces, or raw logs.
 - Keep your output short and bounded: name the observed state, the single
   recommended action (resume, start, plan_and_start, idle, or report), and
   the evidence that supports it. Do not paste transcripts, tokens, or full

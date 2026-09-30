@@ -70,6 +70,8 @@ CONCIERGE_MCP_CALL_TIMEOUT_SECONDS = 60.0
 CONCIERGE_GITHUB_TIMEOUT_SECONDS = 30.0
 CONCIERGE_GITHUB_MAX_PAGES = 5
 CONCIERGE_PAGE_LIMIT = 100
+CONCIERGE_CI_WORKFLOW_PATH = ".github/workflows/ci.yml"
+CONCIERGE_GIT_REMOTE_TIMEOUT_SECONDS = 15.0
 CONCIERGE_MAX_PAGES = 100
 CONCIERGE_PLANNER_QUESTION_MAX_CHARS = 512
 ACTIVE_RUN_ACTIVITY = "active"
@@ -79,6 +81,10 @@ TERMINAL_FAILED_RUN_STATUSES = frozenset({"failed", "stopped"})
 LAUNCHABLE_PLAN_STATUSES = frozenset({"todo", "draft"})
 PLANNED_EVIDENCE_STATUSES = frozenset({"todo", "in-progress", "failed", "done"})
 MUTATING_TICK_ACTIONS = frozenset({"resume", "start", "plan_and_start"})
+DEFECT_FINGERPRINT_MARKER_PREFIX = "aflow-concierge-defect-fingerprint:"
+DEPLOY_STATUS_PATH_DEFAULT = Path("/var/lib/aflowd/deploy/status.json")
+LIVE_RELEASE_ROOT_DEFAULT = Path("/opt/aflowd")
+DEPLOY_DELIVERED_PHASES = frozenset({"deployed", "up_to_date"})
 TOKEN_MIN_LENGTH = 8
 TOKEN_MAX_LENGTH = 1024
 _TOKEN_SAFE_RE = re.compile(r"^[A-Za-z0-9._~-]+$")
@@ -91,7 +97,12 @@ _GITHUB_HTTPS_REMOTE_RE = re.compile(
 _GITHUB_SSH_REMOTE_RE = re.compile(
     r"^git@github\.com:([A-Za-z0-9._-]+)/([A-Za-z0-9._-]+?)(?:\.git)?/?$"
 )
+_GITHUB_FULL_NAME_RE = re.compile(
+    r"^[A-Za-z0-9](?:[A-Za-z0-9._-]*[A-Za-z0-9])?/"
+    r"[A-Za-z0-9](?:[A-Za-z0-9._-]*[A-Za-z0-9])?$"
+)
 _GITHUB_LINK_NEXT_RE = re.compile(r'\s*<([^>]+)>;\s*rel="next"')
+_GITHUB_SHA_RE = re.compile(r"^[0-9a-f]{40}$")
 _PLAN_STATUS_BY_DIRECTORY = {
     "todo": "todo",
     "in-progress": "in_progress",
@@ -180,6 +191,42 @@ class TickOutcome:
     details: Mapping[str, object] = field(default_factory=dict)
 
 
+@dataclass(frozen=True)
+class DefectEvidence:
+    """Bounded, sanitized identity for one confirmed AFlow engine defect.
+
+    Every field comes from the strictly validated six-field
+    ``defect_confirmation`` contract, so the evidence carries no exception
+    text, host path, transcript, or raw log.
+    """
+
+    source: str
+    signature: str
+    subject: str
+    component: str = ""
+    site: str = ""
+
+
+@dataclass(frozen=True)
+class DeliveryEvidence:
+    """Bounded raw exact-SHA delivery inputs for one projection."""
+
+    origin_main_sha: str | None = None
+    ci: str | None = None
+    deploy_phase: str | None = None
+    current_commit: str | None = None
+    live_commit: str | None = None
+
+
+@dataclass(frozen=True)
+class DeliveryStatus:
+    """Projected exact-SHA delivery state: overall, CI, and live release."""
+
+    state: str
+    ci: str
+    live: str
+
+
 class McpClient(Protocol):
     def call_tool(
         self, name: str, arguments: Mapping[str, object]
@@ -190,6 +237,22 @@ class McpClient(Protocol):
 
 class GithubClient(Protocol):
     def open_issues(self, full_name: str) -> GithubIssuePage: ...
+
+    def workflow_runs(
+        self, full_name: str, sha: str
+    ) -> tuple[tuple[int, int, str, str], ...]: ...
+
+    def search_issues(
+        self, full_name: str, query: str
+    ) -> tuple[Mapping[str, object], ...]: ...
+
+    def create_issue(
+        self, full_name: str, title: str, body: str
+    ) -> Mapping[str, object]: ...
+
+
+class DeliveryGate(Protocol):
+    def evaluate(self, *, full_name: str | None) -> DeliveryStatus: ...
 
 
 class TickExecutor(Protocol):
@@ -299,6 +362,134 @@ def _run_activity(run: Mapping[str, object]) -> str:
     if value in (ACTIVE_RUN_ACTIVITY, INACTIVE_RUN_ACTIVITY, UNCERTAIN_RUN_ACTIVITY):
         return str(value)
     return UNCERTAIN_RUN_ACTIVITY
+
+
+def classify_defect(run: Mapping[str, object]) -> DefectEvidence | None:
+    """Return bounded defect evidence for one strictly validated confirmation.
+
+    Only the live MCP ``get_run.defect_confirmation`` projection is trusted:
+    the fixed six-field contract (schema version 1,
+    ``engine_internal_assertion``, ``controller``, a bounded package-relative
+    component, a bounded site, and a 64-hex signature).  Missing, malformed,
+    or unconfirmed data yields ``None`` so nothing is filed.  Free-text
+    failure reasons, worker receipts, and evidence are never consulted.
+    """
+    from aflow.runlog import _validated_defect_confirmation
+
+    confirmation = run.get("defect_confirmation")
+    try:
+        validated = _validated_defect_confirmation(confirmation)
+    except ValueError:
+        return None
+    run_id = run.get("run_id")
+    if not isinstance(run_id, str) or not run_id:
+        return None
+    return DefectEvidence(
+        source=str(validated["source"]),
+        signature=str(validated["signature"]),
+        subject=run_id,
+        component=str(validated["component"]),
+        site=str(validated["site"]),
+    )
+
+
+def defect_signatures(
+    runs: Sequence[Mapping[str, object]],
+) -> tuple[DefectEvidence, ...]:
+    """Return the distinct confirmed defects across the observed runs.
+
+    Runs are visited in stable run-ID order.  Each strictly validated
+    confirmation contributes at most one entry, keyed by its fingerprint, so
+    the same signature across run IDs collapses to the first observed
+    subject while every distinct signature is preserved.  Malformed or
+    unconfirmed runs yield nothing.
+    """
+    seen: set[str] = set()
+    evidence: list[DefectEvidence] = []
+    for run in sorted(runs, key=lambda item: str(item.get("run_id") or "")):
+        item = classify_defect(run)
+        if item is None:
+            continue
+        fingerprint = defect_fingerprint(item)
+        if fingerprint in seen:
+            continue
+        seen.add(fingerprint)
+        evidence.append(item)
+    return tuple(evidence)
+
+
+def defect_evidence(
+    runs: Sequence[Mapping[str, object]],
+) -> DefectEvidence | None:
+    """Return the first confirmed defect across the observed runs, if any."""
+    signatures = defect_signatures(runs)
+    return signatures[0] if signatures else None
+
+
+def defect_fingerprint(evidence: DefectEvidence) -> str:
+    """Stable fingerprint for one bounded defect signature, not run instance."""
+    payload = "\x00".join((evidence.source, evidence.signature))
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def defect_fingerprint_marker(fingerprint: str) -> str:
+    return f"{DEFECT_FINGERPRINT_MARKER_PREFIX}{fingerprint}"
+
+
+def has_defect_fingerprint(body: str, fingerprint: str) -> bool:
+    return defect_fingerprint_marker(fingerprint) in body
+
+
+def defect_issue_title(evidence: DefectEvidence) -> str:
+    return (
+        f"AFlow concierge defect: {evidence.component}:{evidence.site} "
+        f"(run {evidence.subject})"
+    )
+
+
+def defect_issue_body(evidence: DefectEvidence, fingerprint: str) -> str:
+    return (
+        "Bounded AFlow engine defect observed by the p100 owner-issue "
+        "concierge. The confirmation came from the control plane's "
+        "validated `defect_confirmation` projection; no transcripts, "
+        "credentials, stack traces, or raw logs are included.\n"
+        "\n"
+        f"- source: {evidence.source}\n"
+        f"- component: {evidence.component}\n"
+        f"- site: {evidence.site}\n"
+        f"- signature: {evidence.signature}\n"
+        f"- run: {evidence.subject}\n"
+        "\n"
+        f"{defect_fingerprint_marker(fingerprint)}\n"
+    )
+
+
+def project_delivery(evidence: DeliveryEvidence) -> DeliveryStatus:
+    """Project bounded exact-SHA delivery inputs into overall/CI/live state.
+
+    Missing evidence projects to pending, never success.  A red exact-SHA CI
+    run or a failed deploy phase is a failed release; the live release is
+    reported separately from CI.
+    """
+    ci = evidence.ci
+    if ci not in ("green", "red", "pending"):
+        ci = "pending"
+    deployed = evidence.deploy_phase in DEPLOY_DELIVERED_PHASES
+    if not deployed or evidence.live_commit is None:
+        live = "missing"
+    elif evidence.origin_main_sha is None:
+        live = "installed"
+    elif evidence.live_commit == evidence.origin_main_sha:
+        live = "installed"
+    else:
+        live = "stale"
+    if ci == "red" or evidence.deploy_phase == "failed":
+        state = "failed"
+    elif ci == "green" and deployed and live == "installed":
+        state = "ok"
+    else:
+        state = "pending"
+    return DeliveryStatus(state=state, ci=ci, live=live)
 
 
 def _validate_observation(observation: TickObservation) -> None:
@@ -867,7 +1058,161 @@ class GithubRestClient:
             return url[len(self._api_url) :]
         return url
 
-    def _request(self, path: str) -> tuple[object, Mapping[str, str]]:
+    def workflow_runs(
+        self, full_name: str, sha: str
+    ) -> tuple[tuple[int, int, str, str], ...]:
+        # Only the deploy poller's qualifying CI workflow counts for delivery
+        # evidence. Unrelated workflows on the same SHA must neither green a
+        # failing CI run nor red a successful one, so the query is scoped to
+        # the main push CI and filtered exactly like the poller's
+        # ``_require_validated_ci``. Each result carries the run number and
+        # attempt so the caller can apply the poller's latest-attempt
+        # precedence.
+        if not _GITHUB_SHA_RE.fullmatch(sha):
+            raise ConciergeError("github_sha_invalid")
+        quoted = urllib_parse.quote(full_name, safe="/")
+        path = (
+            f"/repos/{quoted}/actions/runs"
+            f"?head_sha={sha}&branch=main&event=push"
+            f"&per_page={CONCIERGE_PAGE_LIMIT}"
+        )
+        payload, _ = self._request(path)
+        if not isinstance(payload, Mapping):
+            raise ConciergeError("github_workflow_runs_invalid")
+        runs = payload.get("workflow_runs")
+        if not isinstance(runs, list):
+            raise ConciergeError("github_workflow_runs_invalid")
+        results: list[tuple[int, int, str, str]] = []
+        for item in runs:
+            if not isinstance(item, Mapping):
+                continue
+            if item.get("head_sha") != sha:
+                continue
+            if item.get("event") != "push":
+                continue
+            if item.get("head_branch") != "main":
+                continue
+            if item.get("path") != CONCIERGE_CI_WORKFLOW_PATH:
+                continue
+            number = item.get("run_number")
+            if type(number) is not int or number <= 0:
+                continue
+            attempt = item.get("run_attempt")
+            if type(attempt) is not int or attempt <= 0:
+                continue
+            status = item.get("status")
+            if not isinstance(status, str):
+                continue
+            conclusion = item.get("conclusion")
+            results.append(
+                (
+                    number,
+                    attempt,
+                    status,
+                    conclusion if isinstance(conclusion, str) else "",
+                )
+            )
+        return tuple(results)
+
+    def search_issues(
+        self, full_name: str, query: str
+    ) -> tuple[Mapping[str, object], ...]:
+        if not _GITHUB_FULL_NAME_RE.fullmatch(full_name):
+            raise ConciergeError("github_full_name_invalid")
+        if not isinstance(query, str) or not query:
+            raise ConciergeError("github_search_query_invalid")
+        # Deduplication is repository-local: the repo qualifier keeps a
+        # matching fingerprint in another repository from suppressing the
+        # target repository issue. GitHub's issue search returns open and
+        # closed issues alike when no state qualifier is present, and the
+        # combined ``state:open,closed`` qualifier is not a supported search
+        # term (it silently matches nothing), so it must stay out of the query.
+        scoped_query = f"{query} repo:{full_name}"
+        quoted_query = urllib_parse.quote(scoped_query, safe="")
+        path = f"/search/issues?q={quoted_query}&per_page={CONCIERGE_PAGE_LIMIT}"
+        payload, _ = self._request(path)
+        if not isinstance(payload, Mapping):
+            raise ConciergeError("github_search_invalid")
+        # An empty or partial page is not evidence of absence. The search is
+        # sufficient negative evidence only when GitHub reports it complete:
+        # ``incomplete_results`` must be exactly ``false``, ``total_count``
+        # must be a nonnegative integer, and every reported match must be in
+        # this page.  A partial, paginated, or malformed envelope raises so
+        # the caller stays report-only instead of filing a duplicate.
+        if payload.get("incomplete_results") is not False:
+            raise ConciergeError("github_search_invalid")
+        total_count = payload.get("total_count")
+        if type(total_count) is not int or total_count < 0:
+            raise ConciergeError("github_search_invalid")
+        items = payload.get("items")
+        if not isinstance(items, list):
+            raise ConciergeError("github_search_invalid")
+        if total_count > len(items):
+            raise ConciergeError("github_search_invalid")
+        expected_repository_url = f"{self._api_url}/repos/{full_name}"
+        repository_prefix = f"{self._api_url}/repos/"
+        results: list[Mapping[str, object]] = []
+        for item in items:
+            # A search item that cannot be attributed to a repository means
+            # deduplication cannot be established safely, so the caller must
+            # not file; only a well-formed other-repository item is rejected.
+            if not isinstance(item, Mapping):
+                raise ConciergeError("github_search_invalid")
+            repository_url = item.get("repository_url")
+            if not isinstance(repository_url, str):
+                raise ConciergeError("github_search_invalid")
+            if repository_url != expected_repository_url:
+                other_name = (
+                    repository_url[len(repository_prefix) :]
+                    if repository_url.startswith(repository_prefix)
+                    else None
+                )
+                if other_name is None or not _GITHUB_FULL_NAME_RE.fullmatch(
+                    other_name
+                ):
+                    raise ConciergeError("github_search_invalid")
+                continue
+            number = item.get("number")
+            if type(number) is not int or number <= 0:
+                raise ConciergeError("github_search_invalid")
+            body = item.get("body")
+            results.append(
+                {
+                    "number": number,
+                    "body": body if isinstance(body, str) else "",
+                }
+            )
+        return tuple(results)
+
+    def create_issue(
+        self, full_name: str, title: str, body: str
+    ) -> Mapping[str, object]:
+        if not isinstance(title, str) or not title:
+            raise ConciergeError("github_issue_title_invalid")
+        quoted = urllib_parse.quote(full_name, safe="/")
+        payload, _ = self._request(
+            f"/repos/{quoted}/issues",
+            method="POST",
+            payload={"title": title, "body": body if isinstance(body, str) else ""},
+        )
+        if not isinstance(payload, Mapping):
+            raise ConciergeError("github_create_issue_invalid")
+        number = payload.get("number")
+        if type(number) is not int or number <= 0:
+            raise ConciergeError("github_create_issue_invalid")
+        html_url = payload.get("html_url")
+        return {
+            "number": number,
+            "html_url": html_url if isinstance(html_url, str) else None,
+        }
+
+    def _request(
+        self,
+        path: str,
+        *,
+        method: str = "GET",
+        payload: Mapping[str, object] | None = None,
+    ) -> tuple[object, Mapping[str, str]]:
         url = path if path.startswith("http") else self._api_url + path
         headers = {
             "Accept": "application/vnd.github+json",
@@ -875,7 +1220,13 @@ class GithubRestClient:
         }
         if self._token:
             headers["Authorization"] = f"Bearer {self._token}"
-        request = urllib_request.Request(url, headers=headers)
+        data = None
+        if payload is not None:
+            data = json.dumps(payload).encode("utf-8")
+            headers["Content-Type"] = "application/json"
+        request = urllib_request.Request(
+            url, data=data, headers=headers, method=method
+        )
         try:
             with urllib_request.urlopen(request, timeout=self._timeout_seconds) as response:
                 body = response.read(CONCIERGE_STREAM_MAX_BYTES + 1)
@@ -891,6 +1242,115 @@ class GithubRestClient:
         except (UnicodeError, json.JSONDecodeError, ValueError) as exc:
             raise ConciergeError("github_response_invalid") from exc
         return payload, response_headers
+
+
+class LocalDeliveryGate:
+    """Exact-SHA delivery evidence from git, deploy status, and live release.
+
+    Every evidence source is best-effort and bounded: a missing or unreadable
+    source collapses to absent evidence, which the projection reports as
+    pending rather than success.
+    """
+
+    def __init__(
+        self,
+        *,
+        github: GithubClient,
+        project_root: Path,
+        deploy_status_path: Path = DEPLOY_STATUS_PATH_DEFAULT,
+        live_release_root: Path = LIVE_RELEASE_ROOT_DEFAULT,
+    ) -> None:
+        self._github = github
+        self._project_root = project_root
+        self._deploy_status_path = deploy_status_path
+        self._live_release_root = live_release_root
+
+    def evaluate(self, *, full_name: str | None) -> DeliveryStatus:
+        return project_delivery(self._gather_evidence(full_name))
+
+    def _gather_evidence(self, full_name: str | None) -> DeliveryEvidence:
+        sha = self._origin_main_sha()
+        phase, commit_sha = self._deploy_status()
+        live_commit = self._live_commit()
+        ci = self._ci_status(full_name, sha)
+        return DeliveryEvidence(
+            origin_main_sha=sha,
+            ci=ci,
+            deploy_phase=phase,
+            current_commit=commit_sha,
+            live_commit=live_commit,
+        )
+
+    def _origin_main_sha(self) -> str | None:
+        # Resolve the remote's refs/heads/main directly. A local tracking ref
+        # can lag behind when another worktree publishes origin/main, so the
+        # stale ref must never stand in for the remote tip. ls-remote is a
+        # bounded, read-only query: it neither fetches nor mutates shared refs.
+        try:
+            result = subprocess.run(
+                ["git", "ls-remote", "origin", "refs/heads/main"],
+                cwd=self._project_root,
+                capture_output=True,
+                text=True,
+                timeout=CONCIERGE_GIT_REMOTE_TIMEOUT_SECONDS,
+                check=True,
+            )
+        except (OSError, subprocess.SubprocessError):
+            return None
+        for line in result.stdout.splitlines():
+            parts = line.split("\t")
+            if len(parts) != 2:
+                continue
+            sha, ref = parts
+            if ref != "refs/heads/main":
+                continue
+            return sha if _GITHUB_SHA_RE.fullmatch(sha) else None
+        return None
+
+    def _deploy_status(self) -> tuple[str | None, str | None]:
+        try:
+            payload = json.loads(self._deploy_status_path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeError, json.JSONDecodeError):
+            return None, None
+        if not isinstance(payload, Mapping):
+            return None, None
+        phase = payload.get("phase")
+        current = payload.get("current_commit")
+        return (
+            phase if isinstance(phase, str) else None,
+            current if isinstance(current, str) else None,
+        )
+
+    def _live_commit(self) -> str | None:
+        current = self._live_release_root / "current"
+        try:
+            release = current.resolve()
+        except (OSError, RuntimeError):
+            return None
+        release_id = release.name
+        return release_id if _GITHUB_SHA_RE.fullmatch(release_id) else None
+
+    def _ci_status(self, full_name: str | None, sha: str | None) -> str | None:
+        if full_name is None or sha is None:
+            return None
+        try:
+            runs = self._github.workflow_runs(full_name, sha)
+        except ConciergeError:
+            return None
+        if not runs:
+            return "pending"
+        # Match the deploy poller: the latest qualifying attempt by
+        # (run_number, run_attempt) decides. An earlier success never greens
+        # a later failure, and an earlier failure never reds a later success.
+        latest = max(runs, key=lambda item: (item[0], item[1]))
+        status, conclusion = latest[2], latest[3]
+        if status != "completed":
+            return "pending"
+        if conclusion == "success":
+            return "green"
+        if conclusion in {"failure", "cancelled"}:
+            return "red"
+        return "pending"
 
 
 class McpRegistryClient:
@@ -927,10 +1387,12 @@ class ConciergeTickExecutor:
         mcp: McpClient,
         github: GithubClient,
         planner_factory: Callable[[Path, McpClient], Any] | None = None,
+        delivery_gate: DeliveryGate | None = None,
     ) -> None:
         self._mcp = mcp
         self._github = github
         self._planner_factory = planner_factory
+        self._delivery_gate = delivery_gate
 
     def execute(
         self,
@@ -970,21 +1432,35 @@ class ConciergeTickExecutor:
             decision = triage_tick(observation)
         except ConciergeError as exc:
             return TickOutcome("report", exc.reason, details=self._decision_details(decision=None))
-        if not decision.mutating:
-            if github_gap and decision.action == "idle":
-                return TickOutcome(
-                    "report", "github_evidence_unavailable",
-                    details=self._decision_details(decision=decision),
-                )
+        if decision.action == "defer":
             return TickOutcome(
                 decision.action, decision.reason,
                 details=self._decision_details(decision=decision),
             )
+        defects = defect_signatures(observation.runs)
+        if defects and full_name is not None:
+            outcome = self._report_defects(full_name, defects)
+            if outcome is not None:
+                return outcome
+        delivery = self._delivery_status(full_name)
+        if not decision.mutating:
+            details = self._decision_details(decision=decision)
+            details.update(self._delivery_details(delivery))
+            if github_gap and decision.action == "idle":
+                return TickOutcome(
+                    "report", "github_evidence_unavailable",
+                    details=details,
+                )
+            return TickOutcome(decision.action, decision.reason, details=details)
         if decision.action == "resume":
             return self._execute_resume(project_id, decision)
-        if decision.action == "start":
-            return self._execute_start(project_id, decision)
-        if decision.action == "plan_and_start":
+        if decision.action in ("start", "plan_and_start"):
+            if delivery.state == "failed":
+                details = self._decision_details(decision=decision)
+                details.update(self._delivery_details(delivery))
+                return TickOutcome("report", "delivery_gate_failed", details=details)
+            if decision.action == "start":
+                return self._execute_start(project_id, decision)
             if full_name is None:
                 return TickOutcome("report", "repository_full_name_unavailable")
             return self._execute_plan_and_start(
@@ -994,6 +1470,66 @@ class ConciergeTickExecutor:
 
     def close(self) -> None:
         self._mcp.close()
+
+    def _delivery_status(self, full_name: str | None) -> DeliveryStatus:
+        gate = self._delivery_gate
+        if gate is None:
+            return project_delivery(DeliveryEvidence())
+        try:
+            return gate.evaluate(full_name=full_name)
+        except ConciergeError:
+            return project_delivery(DeliveryEvidence())
+
+    @staticmethod
+    def _delivery_details(delivery: DeliveryStatus) -> dict[str, object]:
+        return {
+            "delivery_state": delivery.state,
+            "delivery_ci": delivery.ci,
+            "delivery_live": delivery.live,
+        }
+
+    def _report_defects(
+        self, full_name: str, defects: tuple[DefectEvidence, ...]
+    ) -> TickOutcome | None:
+        # Process each distinct validated signature in stable order.  File the
+        # first signature not already filed in this repository, then stop for
+        # this tick (one issue mutation per tick).  A signature that is
+        # already filed is skipped so a later distinct signature can still be
+        # filed.  A failed search or filing remains report-only: never guess
+        # that filing is safe when the GitHub result is uncertain.
+        for defect in defects:
+            fingerprint = defect_fingerprint(defect)
+            marker = defect_fingerprint_marker(fingerprint)
+            try:
+                existing = self._github.search_issues(full_name, marker)
+            except ConciergeError:
+                return TickOutcome("report", "defect_dedup_unavailable")
+            if any(
+                isinstance(issue.get("body"), str)
+                and has_defect_fingerprint(issue.get("body"), fingerprint)
+                for issue in existing
+            ):
+                continue
+            title = defect_issue_title(defect)
+            body = defect_issue_body(defect, fingerprint)
+            try:
+                created = self._github.create_issue(full_name, title, body)
+            except ConciergeError:
+                return TickOutcome("report", "defect_filing_failed")
+            number = created.get("number")
+            url = created.get("html_url")
+            return TickOutcome(
+                "file_defect",
+                "defect_filed",
+                mutating=True,
+                details={
+                    "defect_fingerprint": fingerprint,
+                    "defect_subject": defect.subject,
+                    "issue_number": number if type(number) is int else None,
+                    "issue_url": url if isinstance(url, str) else None,
+                },
+            )
+        return None
 
     @staticmethod
     def _decision_details(
@@ -1666,10 +2202,14 @@ class ConciergeTickExecutor:
 def _build_production_executor(
     token: str, environment: Mapping[str, str]
 ) -> ConciergeTickExecutor:
+    github = GithubRestClient(token=environment.get(CONCIERGE_GITHUB_TOKEN_ENV))
     return ConciergeTickExecutor(
         mcp=McpHttpEndpoint(CONCIERGE_MCP_URL, token),
-        github=GithubRestClient(token=environment.get(CONCIERGE_GITHUB_TOKEN_ENV)),
+        github=github,
         planner_factory=_build_concierge_planner,
+        delivery_gate=LocalDeliveryGate(
+            github=github, project_root=CONCIERGE_PROJECT_ROOT_DEFAULT
+        ),
     )
 
 
@@ -2207,6 +2747,7 @@ __all__ = [
     "TriageDecision",
     "build_codex_argv",
     "build_tick_prompt",
+    "defect_signatures",
     "dry_run",
     "load_tick_prompt",
     "main",
