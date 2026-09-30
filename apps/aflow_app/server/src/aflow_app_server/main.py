@@ -22,6 +22,7 @@ from fastapi.responses import FileResponse, JSONResponse
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from pydantic import BaseModel, Field
 from sse_starlette.sse import EventSourceResponse
+from starlette.concurrency import run_in_threadpool
 from starlette.routing import Match, Mount, get_route_path
 from starlette.types import Scope
 
@@ -1212,8 +1213,8 @@ async def event_stream(
     _: str = Depends(verify_token),
     service: ControlPlaneService = Depends(get_control_plane_service),
 ) -> EventSourceResponse:
-    initial_events = service.events(
-        project_id, run_id, after_sequence=after_sequence, limit=limit
+    initial_events = await run_in_threadpool(
+        service.events, project_id, run_id, after_sequence=after_sequence, limit=limit
     )
 
     async def event_generator():
@@ -1242,8 +1243,8 @@ async def event_stream(
                 return
 
             try:
-                pending_events = service.events(
-                    project_id, run_id, after_sequence=cursor, limit=limit
+                pending_events = await run_in_threadpool(
+                    service.events, project_id, run_id, after_sequence=cursor, limit=limit
                 )
             except DeletedRunError:
                 return

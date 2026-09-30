@@ -7,7 +7,7 @@ from dataclasses import asdict, replace
 import json
 from pathlib import Path
 import subprocess
-from threading import Thread
+from threading import Event, Thread
 import time
 from types import SimpleNamespace
 
@@ -3206,6 +3206,105 @@ def test_control_admission_uses_live_targets_and_preserves_rejected_state(
     ).json()["events"] == original_events
 
 
+def test_event_reads_skip_resume_preview(control_client) -> None:
+    from aflow_app_server import main
+
+    client, root, _, monkeypatch = control_client
+    run_id = "event-preview-source"
+    create_launch_manifest(
+        root,
+        LaunchManifest(
+            run_id=run_id, project_root=str(root),
+            plan_path="plans/todo/test-plan.md", workflow_name="managed", max_turns=5,
+        ),
+    )
+    write_launch_phase(root, run_id, "unit_started")
+    event = append_run_event(root / ".aflow" / "runs" / run_id, "test_event", {})
+    service = main._control_plane_service
+    assert service is not None
+    daemon = service._project(PROJECT_ID).daemon.service
+    previews = []
+
+    def counted_preview(status):
+        previews.append(status.run_id)
+        return False
+
+    monkeypatch.setattr(daemon, "_can_resume", counted_preview)
+    endpoint = f"/api/control-plane/projects/{PROJECT_ID}/runs/{run_id}"
+    response = client.get(endpoint + "/events")
+    assert response.status_code == 200, response.text
+    assert response.json()["events"][-1]["sequence"] == event.sequence
+    assert previews == []
+    assert client.get(endpoint).json()["evidence"]["can_resume"] is False
+    assert previews == [run_id]
+
+
+@pytest.mark.parametrize("blocked_read", [1, 2], ids=["initial", "poll"])
+def test_event_stream_slow_reads_do_not_block_health(control_client, blocked_read) -> None:
+    from aflow_app_server import main
+
+    _, root, _, monkeypatch = control_client
+    run_id = "slow-event-source"
+    create_launch_manifest(
+        root,
+        LaunchManifest(
+            run_id=run_id, project_root=str(root),
+            plan_path="plans/todo/test-plan.md", workflow_name="managed", max_turns=5,
+        ),
+    )
+    write_launch_phase(root, run_id, "unit_started")
+    run_dir = root / ".aflow" / "runs" / run_id
+    run_dir.mkdir(parents=True, exist_ok=True)
+    service = main._control_plane_service
+    assert service is not None
+    original_events = service.events
+    read_started, release = Event(), Event()
+    reads = 0
+    received, failures = [], []
+
+    def slow_events(*args, **kwargs):
+        nonlocal reads
+        reads += 1
+        if reads == blocked_read:
+            read_started.set()
+            assert release.wait(10), "test never released the blocked event read"
+        return original_events(*args, **kwargs)
+
+    monkeypatch.setattr(service, "events", slow_events)
+
+    with live_server() as base_url:
+        def consume_stream():
+            try:
+                with httpx.Client(timeout=10) as streaming_client:
+                    with streaming_client.stream(
+                        "GET", f"{base_url}/api/control-plane/projects/{PROJECT_ID}/runs/{run_id}/events/stream",
+                        headers={"Authorization": f"Bearer {TOKEN}"},
+                    ) as response:
+                        response.raise_for_status()
+                        for line in response.iter_lines():
+                            if line.startswith("data: "):
+                                received.append(json.loads(line.removeprefix("data: ")))
+                                break
+            except Exception as exc:
+                failures.append(exc)
+
+        reader = Thread(target=consume_stream, daemon=True)
+        reader.start()
+        try:
+            assert read_started.wait(5)
+            health = httpx.get(base_url + "/health", timeout=2)
+            assert health.status_code == 200
+            assert health.json() == {"status": "ok"}
+            assert not release.is_set()
+        finally:
+            release.set()
+            append_run_event(run_dir, "after_slow_read", {})
+            reader.join(timeout=6)
+        assert not reader.is_alive()
+        assert failures == []
+        assert received[0]["events"][-1]["event_type"] == "after_slow_read"
+
+
 def test_event_stream_delivers_events_appended_after_connection(control_client) -> None:
     client, root, _, monkeypatch = control_client
     pending = _start_pending(client, monkeypatch)
@@ -4371,6 +4470,7 @@ def test_history_api_filters_deleted_links_replays_and_auth(control_client):
     assert client.get(endpoint).status_code == 410
     assert client.get(endpoint, params={'include_resume_preview': 'false'}).status_code == 410
     assert client.get(endpoint + '/context').status_code == 410
+    assert client.get(endpoint + '/events').status_code == 410
     assert client.get(endpoint.rsplit('/', 1)[0] + '?history=all').json()['runs'] == []
     assert client.post(endpoint + '/restore', json={'expected_revision': 2}, headers={'Idempotency-Key': 'restore-deleted'}).status_code == 410
     assert client.post(endpoint.replace(PROJECT_ID, 'unregistered') + '/archive', json=body, headers=headers).status_code == 404

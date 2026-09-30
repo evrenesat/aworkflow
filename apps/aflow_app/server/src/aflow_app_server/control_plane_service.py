@@ -331,7 +331,8 @@ class ControlPlaneService:
         after_sequence: int | None,
         limit: int,
     ) -> tuple[RunEvent, ...]:
-        self.run_status(project_id, run_id)
+        # Event polling needs visibility checks, not project-wide resume admission.
+        self.run_status(project_id, run_id, include_resume_preview=False)
         item = self._project(project_id)
         return item.daemon.service.poll_events(
             run_id,

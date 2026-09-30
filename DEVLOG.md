@@ -4810,3 +4810,12 @@ HISTORY: Published clipboard history `c14f1f2`/`cd78d53` remains separate and mu
   two Base64 signature characters changed only unused padding bits, leaving the
   decoded HMAC unchanged. The fixture now flips a decoded signature byte before
   re-encoding it; production session verification is unchanged.
+
+## 2026-09-30 — Live event-stream responsiveness
+
+- A p100 sample attributed 338 of 370 GIL-held samples to the event polling
+  path; resume admission scanned the project history on the async HTTP loop.
+  Event reads now skip that preview, and initial plus periodic SSE reads use
+  the existing thread pool. Explicit run-detail admission hints remain intact.
+- Regression checks cover skipped previews, unchanged event delivery, deleted
+  run visibility, and health responses while either SSE read is blocked.

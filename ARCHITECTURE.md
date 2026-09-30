@@ -1605,6 +1605,12 @@ and details; project-scoped `view=new-run` renders `NewRunPage`. The workspace
 retains per-project dashboard state across navigation so pending writes, drafts
 and startup answers keep their original identity. Legacy Overview links replace
 to Runs. Diagnostics and Adjust run disclose technical evidence and live controls.
+
+Event polling keeps the run visibility check but skips the read-only resume
+admission preview. The SSE handler runs its initial and periodic synchronous
+reads in the existing thread pool, so filesystem work cannot block the async
+HTTP loop. Explicit run-detail reads retain resume eligibility evidence.
+
 Hidden dashboards suspend streams/timers and reject stale loads; plan handoffs
 resolve only against fresh project plans and survive transient failures. Project
 plan reads traverse the control-plane's 100-record pages until a short response,
