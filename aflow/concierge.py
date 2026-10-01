@@ -20,6 +20,7 @@ from __future__ import annotations
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from importlib import resources
 import argparse
 import asyncio
@@ -78,7 +79,9 @@ ACTIVE_RUN_ACTIVITY = "active"
 UNCERTAIN_RUN_ACTIVITY = "unknown"
 INACTIVE_RUN_ACTIVITY = "inactive"
 TERMINAL_FAILED_RUN_STATUSES = frozenset({"failed", "stopped"})
-TERMINAL_RUN_STATUSES = frozenset({"completed", "failed", "interrupted", "owner_stopped"})
+TERMINAL_RUN_STATUSES = frozenset(
+    {"completed", "failed", "interrupted", "stopped", "owner_stopped"}
+)
 STARTUP_QUESTION_RUN_STATUS = "awaiting_startup_answer"
 STARTUP_FAILED_RUN_CODE = "startup_failed"
 OCCUPANCY_ACTIVE = "active"
@@ -86,6 +89,10 @@ OCCUPANCY_TERMINAL = "terminal"
 OCCUPANCY_STARTUP_HOLD = "startup_hold"
 OCCUPANCY_BLOCKED = "blocked"
 LAUNCHABLE_PLAN_STATUSES = frozenset({"todo"})
+READY_PLAN_STATUSES = frozenset({"in_progress"})
+RECOVERABLE_RUN_STATUSES = frozenset({"failed", "interrupted", "stopped"})
+QUEUE_READY_OUTCOMES = frozenset({"queued"})
+QUEUE_AUTO_DISABLED_OUTCOMES = frozenset({"held", "automatic_disabled"})
 CANONICAL_PLAN_STATUSES = frozenset(
     {"draft", "todo", "in_progress", "done", "failed", "needs_plan_change"}
 )
@@ -184,6 +191,11 @@ class TickObservation:
     issues: tuple[Mapping[str, object], ...] = ()
     plan_documents: Mapping[str, str] = field(default_factory=dict)
     occupancy: Mapping[str, object] = field(default_factory=dict)
+    queue: Mapping[str, object] | None = None
+    run_details: Mapping[str, Mapping[str, object]] | None = None
+    run_contexts: Mapping[str, Mapping[str, object]] | None = None
+    delivery: Mapping[str, object] | None = None
+    delivery_sha: str | None = None
 
 
 @dataclass(frozen=True)
@@ -254,6 +266,7 @@ class DeliveryStatus:
     state: str
     ci: str
     live: str
+    sha: str | None = None
 
 
 class McpClient(Protocol):
@@ -304,6 +317,7 @@ class TriageDecision:
     reason: str
     run_id: str | None = None
     plan_path: str | None = None
+    plan_revision: str | None = None
     issue_number: int | None = None
     issue_url: str | None = None
     idempotency_key: str | None = None
@@ -597,14 +611,18 @@ def project_delivery(evidence: DeliveryEvidence) -> DeliveryStatus:
         state = "ok"
     else:
         state = "pending"
-    return DeliveryStatus(state=state, ci=ci, live=live)
+    return DeliveryStatus(
+        state=state, ci=ci, live=live, sha=evidence.origin_main_sha
+    )
 
 
 def _validate_observation(observation: TickObservation) -> None:
     project = observation.project
     if not isinstance(project, Mapping) or not isinstance(
         project.get("project_id"), str
-    ) or not project.get("project_id"):
+    ) or not project.get("project_id") or not isinstance(
+        project.get("root"), str
+    ) or not project.get("root"):
         raise ConciergeError("observation_project_invalid")
     for run in observation.runs:
         if (
@@ -672,6 +690,39 @@ def _validate_observation(observation: TickObservation) -> None:
     for path, content in documents.items():
         if not isinstance(path, str) or not path or not isinstance(content, str):
             raise ConciergeError("observation_plan_documents_invalid")
+    if observation.queue is not None and not isinstance(
+        observation.queue, Mapping
+    ):
+        raise ConciergeError("observation_queue_invalid")
+    if observation.run_details is not None:
+        if not isinstance(observation.run_details, Mapping):
+            raise ConciergeError("observation_run_details_invalid")
+        for run_id, detail in observation.run_details.items():
+            if (
+                not isinstance(run_id, str)
+                or not run_id
+                or not isinstance(detail, Mapping)
+            ):
+                raise ConciergeError("observation_run_details_invalid")
+    if observation.run_contexts is not None:
+        if not isinstance(observation.run_contexts, Mapping):
+            raise ConciergeError("observation_run_contexts_invalid")
+        for run_id, context in observation.run_contexts.items():
+            if (
+                not isinstance(run_id, str)
+                or not run_id
+                or not isinstance(context, Mapping)
+            ):
+                raise ConciergeError("observation_run_contexts_invalid")
+    if observation.delivery is not None and not isinstance(
+        observation.delivery, Mapping
+    ):
+        raise ConciergeError("observation_delivery_invalid")
+    if observation.delivery_sha is not None and (
+        not isinstance(observation.delivery_sha, str)
+        or not observation.delivery_sha
+    ):
+        raise ConciergeError("observation_delivery_invalid")
 
 
 def _canonical_plan_status(value: object) -> str:
@@ -807,14 +858,372 @@ def _publication_settings_evidence(
     return remote, branch
 
 
-def triage_tick(observation: TickObservation) -> TriageDecision:
-    """Choose at most one bounded action for the observed queue state.
+def _timestamp_sort_key(value: object) -> tuple[int, str]:
+    if isinstance(value, str) and value:
+        try:
+            parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        except ValueError:
+            return (1, value)
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        return (0, parsed.astimezone(timezone.utc).isoformat())
+    if value is None:
+        return (1, "")
+    return (1, str(value))
 
-    Priority order: defer on the shared run-occupancy classification, resume
-    a verified inactive failed lineage, start exactly one launchable plan
-    not held by a verified pre-execution startup hold, then plan and start
-    the oldest eligible owner issue.  Ambiguity reports without a guessed
-    action.
+
+def _canonical_plan_identity(value: object, project_root: str) -> str | None:
+    if not isinstance(value, str) or not value:
+        return None
+    candidate = Path(value)
+    if not candidate.is_absolute():
+        candidate = Path(project_root) / candidate
+    try:
+        return str(candidate.resolve(strict=False))
+    except (OSError, RuntimeError):
+        return str(candidate)
+
+
+_CHECKPOINT_SECTION_RE = re.compile(r"^###\s+\[([ xX])\]\s+Checkpoint\b")
+
+
+def _plan_has_unchecked_checkpoint(content: str) -> bool:
+    for line in content.splitlines():
+        match = _CHECKPOINT_SECTION_RE.match(line)
+        if match is not None and match.group(1) == " ":
+            return True
+    return False
+
+
+def _explicit_prerequisite_paths(content: str) -> frozenset[str]:
+    paths: set[str] = set()
+    for line in content.splitlines():
+        if "prerequisite" not in line.casefold():
+            continue
+        paths.update(re.findall(r"plans/[A-Za-z0-9_./-]+\.md", line))
+    return frozenset(paths)
+
+
+def _plan_issue_reference(
+    content: str, issues: Sequence[Mapping[str, object]]
+) -> tuple[Mapping[str, object] | None, str | None]:
+    urls = _issue_urls_in(content)
+    if not urls:
+        return None, None
+    matching = [
+        issue
+        for issue in issues
+        if issue.get("author_id") == CONCIERGE_OWNER_ID
+        and issue.get("state", "open") == "open"
+        and _issue_url(issue) in urls
+    ]
+    if not matching:
+        return None, "plan_issue_not_owner_open"
+    issue = sorted(
+        matching,
+        key=lambda item: (
+            _timestamp_sort_key(item.get("created_at")),
+            int(item["number"]),
+        ),
+    )[0]
+    return issue, None
+
+
+def _context_data(context: Mapping[str, object] | None) -> Mapping[str, object]:
+    if not isinstance(context, Mapping):
+        return {}
+    data = context.get("data")
+    return data if isinstance(data, Mapping) else {}
+
+
+def _run_lineage_parent(
+    row: Mapping[str, object],
+    context: Mapping[str, object] | None,
+) -> str | None:
+    for source in (
+        row,
+        _context_data(context).get("run_metadata"),
+    ):
+        if not isinstance(source, Mapping):
+            continue
+        for key in ("restarted_from_run_id", "resumed_from_run_id"):
+            value = source.get(key)
+            if isinstance(value, str) and value:
+                return value
+    return None
+
+
+def _lineage_parent_proves_identity(
+    parent_id: str,
+    identity: str,
+    runs_by_id: Mapping[str, Mapping[str, object]],
+    project_root: str,
+) -> bool:
+    parent = runs_by_id.get(parent_id)
+    if parent is None:
+        return False
+    return (
+        _canonical_plan_identity(
+            parent.get("original_plan_path") or parent.get("plan_path"),
+            project_root,
+        )
+        == identity
+    )
+
+
+def _metadata_requires_restart(metadata: object) -> bool:
+    if not isinstance(metadata, Mapping):
+        return False
+    if any(
+        metadata.get(key) is True
+        for key in ("restart_required", "requeue_required", "requires_restart")
+    ):
+        return True
+    safety = metadata.get("control_safety")
+    return isinstance(safety, Mapping) and any(
+        str(value) == "restart_required" for value in safety.values()
+    )
+
+
+def _detail_matches_plan_identity(
+    detail: Mapping[str, object], identity: str, project_root: str
+) -> bool:
+    return any(
+        _canonical_plan_identity(detail.get(key), project_root) == identity
+        for key in ("original_plan_path", "plan_path")
+    )
+
+
+def _context_delivery_stages(context: Mapping[str, object] | None) -> dict[str, str]:
+    progress = _context_data(context).get("progress")
+    if not isinstance(progress, Mapping):
+        return {}
+    delivery = progress.get("delivery")
+    if not isinstance(delivery, (list, tuple)):
+        return {}
+    stages: dict[str, str] = {}
+    for stage in delivery:
+        if isinstance(stage, Mapping) and isinstance(stage.get("stage"), str):
+            stages[str(stage["stage"])] = str(stage.get("status") or "unknown")
+    return stages
+
+
+def _metadata_publication_failure(metadata: object) -> bool:
+    if not isinstance(metadata, Mapping):
+        return False
+    for key in (
+        "publish_status",
+        "ci_status",
+        "live_status",
+        "live_verification_status",
+    ):
+        if str(metadata.get(key) or "").casefold() in {
+            "failed",
+            "red",
+            "error",
+            "errored",
+        }:
+            return True
+    return metadata.get("publication_failure") is True
+
+
+def _has_publication_failure(
+    context: Mapping[str, object] | None,
+    detail: Mapping[str, object] | None,
+) -> bool:
+    if _metadata_publication_failure(_context_data(context).get("run_metadata")):
+        return True
+    if any(
+        _context_delivery_stages(context).get(stage) == "failed"
+        for stage in ("Publish", "CI", "Live verification")
+    ):
+        return True
+    if isinstance(detail, Mapping):
+        for key in ("run_metadata", "metadata"):
+            if _metadata_publication_failure(detail.get(key)):
+                return True
+    return False
+
+
+def _delivery_failure_gate(delivery: Mapping[str, object] | None) -> str | None:
+    # Classify against the projected DeliveryStatus values: project_delivery
+    # emits ci in {green, red, pending} and live in {missing, installed,
+    # stale}.  A red exact-SHA CI run is the CI gate; a failed deploy phase
+    # is the live gate (non-red CI with live missing).  Anything else is
+    # incomplete evidence and stays the conservative generic gate.
+    if not isinstance(delivery, Mapping) or delivery.get("state") != "failed":
+        return None
+    ci = delivery.get("ci")
+    if ci == "red":
+        return "ci"
+    if ci in ("green", "pending") and delivery.get("live") == "missing":
+        return "live"
+    return "delivery"
+
+
+_DELIVERY_GATE_TOKEN_PATTERNS: dict[str, tuple[re.Pattern[str], ...]] = {
+    gate: tuple(
+        re.compile(
+            r"\b" + r"\s+".join(re.escape(part) for part in token.split()) + r"\b"
+        )
+        for token in tokens
+    )
+    for gate, tokens in {
+        "ci": ("ci", "continuous integration"),
+        "live": ("live", "deploy", "deployment"),
+        "delivery": (
+            "delivery",
+            "publish",
+            "publication",
+            "ci",
+            "live",
+            "deploy",
+        ),
+    }.items()
+}
+
+
+def _plan_references_delivery_failure(
+    content: str, sha: str | None, gate: str
+) -> bool:
+    if not sha or sha not in content:
+        return False
+    lowered = content.casefold()
+    return any(
+        pattern.search(lowered) is not None
+        for pattern in _DELIVERY_GATE_TOKEN_PATTERNS.get(gate, ())
+    )
+
+
+_RUN_DELIVERY_SHA_KEYS = (
+    "delivery_sha",
+    "published_sha",
+    "commit_sha",
+    "origin_main_sha",
+)
+
+
+def _recorded_delivery_sha(
+    context: Mapping[str, object] | None,
+    detail: Mapping[str, object] | None,
+) -> str | None:
+    for source in (
+        _context_data(context).get("run_metadata"),
+        detail.get("run_metadata") if isinstance(detail, Mapping) else None,
+        detail.get("metadata") if isinstance(detail, Mapping) else None,
+    ):
+        if not isinstance(source, Mapping):
+            continue
+        for key in _RUN_DELIVERY_SHA_KEYS:
+            value = source.get(key)
+            if (
+                isinstance(value, str)
+                and value
+                and _GITHUB_SHA_RE.fullmatch(value) is not None
+            ):
+                return value
+    return None
+
+
+def _recovery_eligible_for_failed_delivery(
+    candidate: Mapping[str, object], observation: TickObservation
+) -> bool:
+    """Admit an owned failed-delivery lineage from structured evidence.
+
+    The exact-SHA document requirement belongs to fresh repair plans only;
+    the plan of a failed lineage predates the SHA that publication produced.
+    """
+    if candidate.get("publication_failure") is not True:
+        return False
+    delivery_sha = observation.delivery_sha
+    if delivery_sha is None:
+        return True
+    run_id = str(candidate.get("run_id"))
+    recorded = _recorded_delivery_sha(
+        (observation.run_contexts or {}).get(run_id),
+        (observation.run_details or {}).get(run_id),
+    )
+    return recorded is None or recorded == delivery_sha
+
+
+def _queue_row_allows_ready_plan(
+    queue: Mapping[str, object] | None,
+    path: str,
+    revision: object = None,
+    project_root: str = "",
+) -> tuple[bool, str | None]:
+    """Require exactly one canonical queue row admitting a fresh start.
+
+    A missing queue, a missing row, or a duplicated row is a candidate-local
+    evidence gap and never authorizes a start.
+    """
+    if not isinstance(queue, Mapping):
+        return False, "queue_row_missing"
+    plans = queue.get("plans")
+    if not isinstance(plans, (list, tuple)):
+        return False, "queue_plans_invalid"
+    identity = _canonical_plan_identity(path, project_root)
+    if identity is None:
+        return False, "queue_row_missing"
+    rows = [
+        row
+        for row in plans
+        if isinstance(row, Mapping)
+        and _canonical_plan_identity(row.get("path"), project_root)
+        == identity
+    ]
+    if not rows:
+        return False, "queue_row_missing"
+    if len(rows) > 1:
+        return False, "queue_row_duplicate"
+    row = rows[0]
+    if row.get("run_id"):
+        return False, "queue_row_claimed"
+    if row.get("dependency") not in (None, ""):
+        return False, "queue_dependency_present"
+    if row.get("outcome") not in (
+        *QUEUE_READY_OUTCOMES,
+        *QUEUE_AUTO_DISABLED_OUTCOMES,
+    ):
+        return False, "queue_not_ready"
+    if (
+        revision is not None
+        and row.get("revision") not in (None, "")
+        and str(row.get("revision")) != str(revision)
+    ):
+        return False, "queue_revision_mismatch"
+    return True, None
+
+
+def _candidate_sort_key(
+    issue: Mapping[str, object] | None,
+    plan_modified_at: object,
+    plan_path: str,
+    run_id: str,
+) -> tuple[object, ...]:
+    if issue is not None:
+        issue_key: tuple[object, ...] = (
+            0,
+            _timestamp_sort_key(issue.get("created_at")),
+            int(issue.get("number", 0)),
+        )
+    else:
+        issue_key = (1, (1, ""), 0)
+    return (
+        issue_key,
+        _timestamp_sort_key(plan_modified_at),
+        plan_path,
+        run_id,
+    )
+
+
+def triage_tick(observation: TickObservation) -> TriageDecision:
+    """Choose at most one bounded action from verified run/plan evidence.
+
+    Priority order: defer on shared occupancy, repair a verified failed
+    delivery, resume one safe failed lineage, start one ready in-progress
+    plan, then plan and start the oldest uncovered owner issue.  Candidate
+    ambiguity remains candidate-local and reports without a guessed action.
     """
     _validate_observation(observation)
     runs = observation.runs
@@ -841,95 +1250,369 @@ def triage_tick(observation: TickObservation) -> TriageDecision:
             ),
         )
 
-    plans = observation.plans
-    plan_paths = {plan.get("path") for plan in plans}
-    held_paths = {
-        path
-        for _run_id, path in occupancy.get("startup_holds", ())
+    project_root = str(observation.project.get("root"))
+    runs_by_id: dict[str, Mapping[str, object]] = {}
+    for run in runs:
+        run_id = run.get("run_id")
+        if isinstance(run_id, str) and run_id:
+            runs_by_id.setdefault(run_id, run)
+    plan_inventory: dict[str, Mapping[str, object]] = {}
+    for plan in sorted(
+        observation.plans, key=lambda item: str(item.get("path"))
+    ):
+        identity = _canonical_plan_identity(plan.get("path"), project_root)
+        if identity is not None:
+            plan_inventory.setdefault(identity, plan)
+
+    def document_for(identity: str) -> str | None:
+        plan = plan_inventory.get(identity)
+        if plan is None:
+            return None
+        content = observation.plan_documents.get(plan.get("path"))
+        return content if isinstance(content, str) else None
+
+    holds: list[tuple[str, str | None, str | None]] = []
+    recovery_candidates: list[dict[str, object]] = []
+    queue_rows_by_identity: dict[str, list[Mapping[str, object]]] = {}
+    if isinstance(observation.queue, Mapping):
+        queue_rows = observation.queue.get("plans")
+        if isinstance(queue_rows, (list, tuple)):
+            for row in queue_rows:
+                if not isinstance(row, Mapping):
+                    continue
+                queue_identity = _canonical_plan_identity(
+                    row.get("path"), project_root
+                )
+                if queue_identity is not None:
+                    queue_rows_by_identity.setdefault(queue_identity, []).append(
+                        row
+                    )
+    run_groups: dict[str, list[Mapping[str, object]]] = {}
+    run_plan_identities: set[str] = set()
+    for run in runs:
+        identity = _canonical_plan_identity(
+            run.get("original_plan_path") or run.get("plan_path"),
+            project_root,
+        )
+        for key in ("original_plan_path", "plan_path"):
+            candidate = _canonical_plan_identity(run.get(key), project_root)
+            if candidate is not None:
+                run_plan_identities.add(candidate)
+        if identity is None:
+            if (
+                _run_activity(run) == INACTIVE_RUN_ACTIVITY
+                and run.get("status") in RECOVERABLE_RUN_STATUSES
+            ):
+                holds.append(
+                    ("failed_lineage_missing_plan", None, str(run.get("run_id")))
+                )
+            continue
+        run_groups.setdefault(identity, []).append(run)
+
+    for identity in sorted(run_groups):
+        rows = run_groups[identity]
+        display_path = sorted(
+            (
+                row.get("plan_path")
+                for row in rows
+                if isinstance(row.get("plan_path"), str) and row.get("plan_path")
+            ),
+            key=str,
+        )
+        display_path = display_path[0] if display_path else None
+        contexts = observation.run_contexts or {}
+        parent_ids = set()
+        for row in rows:
+            parent_id = _run_lineage_parent(
+                row, contexts.get(str(row.get("run_id")))
+            )
+            if parent_id is not None:
+                parent_ids.add(parent_id)
+        unproven_parents = [
+            parent_id
+            for row in rows
+            if (
+                parent_id := _run_lineage_parent(
+                    row, contexts.get(str(row.get("run_id")))
+                )
+            ) is not None
+            and not _lineage_parent_proves_identity(
+                parent_id, identity, runs_by_id, project_root
+            )
+        ]
+        if unproven_parents:
+            first = sorted(rows, key=lambda item: str(item.get("run_id")))[0]
+            holds.append(
+                ("ambiguous_run_lineage", display_path, str(first.get("run_id")))
+            )
+            continue
+        lineage_incomplete = len(rows) > 1 and any(
+            _run_lineage_parent(
+                row, contexts.get(str(row.get("run_id")))
+            )
+            is None
+            and contexts.get(str(row.get("run_id"))) is None
+            and str(row.get("run_id")) not in parent_ids
+            for row in rows
+        )
+        if lineage_incomplete:
+            first = sorted(rows, key=lambda item: str(item.get("run_id")))[0]
+            holds.append(
+                ("ambiguous_run_lineage", display_path, str(first.get("run_id")))
+            )
+            continue
+        leaves = [
+            row for row in rows if str(row.get("run_id")) not in parent_ids
+        ]
+        if not leaves:
+            holds.append(("ambiguous_run_lineage", display_path, None))
+            continue
+        if len(leaves) > 1:
+            recoverable_leaves = [
+                row
+                for row in leaves
+                if _run_activity(row) == INACTIVE_RUN_ACTIVITY
+                and row.get("status") in RECOVERABLE_RUN_STATUSES
+            ]
+            reason = (
+                "ambiguous_run_lineage"
+                if len(recoverable_leaves) > 1
+                else "competing_run_ownership"
+            )
+            first = sorted(leaves, key=lambda item: str(item.get("run_id")))[0]
+            holds.append((reason, display_path, str(first.get("run_id"))))
+            continue
+        leaf = sorted(leaves, key=lambda item: str(item.get("run_id")))[0]
+        if (
+            _run_activity(leaf) != INACTIVE_RUN_ACTIVITY
+            or leaf.get("status") not in RECOVERABLE_RUN_STATUSES
+        ):
+            continue
+        run_id = str(leaf.get("run_id"))
+        if any(
+            isinstance(row.get("run_id"), str)
+            and row.get("run_id")
+            and row.get("run_id") != run_id
+            for row in queue_rows_by_identity.get(identity, [])
+        ):
+            holds.append(("queue_identity_conflict", display_path, run_id))
+            continue
+        detail = (observation.run_details or {}).get(run_id)
+        if not isinstance(detail, Mapping):
+            holds.append(("recovery_detail_unavailable", display_path, run_id))
+            continue
+        if detail.get("run_id") != run_id:
+            holds.append(
+                ("recovery_detail_mismatch", display_path, run_id)
+            )
+            continue
+        if _run_activity(detail) != INACTIVE_RUN_ACTIVITY:
+            holds.append(("recovery_not_inactive", display_path, run_id))
+            continue
+        if detail.get("status") not in RECOVERABLE_RUN_STATUSES:
+            holds.append(("recovery_status_changed", display_path, run_id))
+            continue
+        if detail.get("ownership") != "control_plane":
+            holds.append(
+                ("recovery_ownership_unverified", display_path, run_id)
+            )
+            continue
+        evidence = detail.get("evidence")
+        if not isinstance(evidence, Mapping) or evidence.get("can_resume") is not True:
+            holds.append(("recovery_evidence_incomplete", display_path, run_id))
+            continue
+        if not _detail_matches_plan_identity(detail, identity, project_root):
+            holds.append(("recovery_plan_mismatch", display_path, run_id))
+            continue
+        plan = plan_inventory.get(identity)
+        if plan is None:
+            holds.append(
+                ("failed_lineage_plan_unregistered", display_path, run_id)
+            )
+            continue
+        if _canonical_plan_status(plan.get("status")) == "done":
+            holds.append(("recovery_plan_complete", display_path, run_id))
+            continue
+        content = document_for(identity)
+        if content is None:
+            holds.append(("plan_evidence_unavailable", display_path, run_id))
+            continue
+        if not _plan_has_unchecked_checkpoint(content):
+            holds.append(
+                ("recovery_no_unchecked_checkpoint", display_path, run_id)
+            )
+            continue
+        context = (observation.run_contexts or {}).get(run_id)
+        if not isinstance(context, Mapping):
+            holds.append(("recovery_context_unavailable", display_path, run_id))
+            continue
+        metadata = _context_data(context).get("run_metadata")
+        if isinstance(metadata, Mapping) and metadata.get("end_reason") in {
+            "transition_end",
+            "owner_stopped",
+        }:
+            holds.append(
+                (
+                    "recovery_terminal_integration_only"
+                    if metadata.get("end_reason") == "transition_end"
+                    else "recovery_owner_stopped",
+                    display_path,
+                    run_id,
+                )
+            )
+            continue
+        if _metadata_requires_restart(metadata):
+            holds.append(("recovery_restart_required", display_path, run_id))
+            continue
+        issue, _ = _plan_issue_reference(content, observation.issues)
+        recovery_candidates.append(
+            {
+                "kind": "recovery",
+                "run_id": run_id,
+                "plan_path": plan.get("path"),
+                "revision": plan.get("revision"),
+                "modified_at": plan.get("modified_at"),
+                "issue": issue,
+                "content": content,
+                "publication_failure": _has_publication_failure(context, detail),
+            }
+        )
+
+    ready_candidates: list[dict[str, object]] = []
+    held_identities = {
+        _canonical_plan_identity(path, project_root)
+        for _run_id, path in (occupancy.get("startup_holds") or ())
         if isinstance(path, str) and path
     }
-
-    failed = [
-        run
-        for run in runs
-        if _run_activity(run) == INACTIVE_RUN_ACTIVITY
-        and run.get("status") in TERMINAL_FAILED_RUN_STATUSES
-    ]
-    if failed:
-        for run in sorted(failed, key=lambda item: str(item["run_id"])):
-            path = run.get("plan_path")
-            if not (isinstance(path, str) and path):
-                return TriageDecision(
-                    action="report",
-                    reason="failed_lineage_missing_plan",
-                    run_id=str(run["run_id"]),
+    for plan in sorted(
+        observation.plans, key=lambda item: str(item.get("path"))
+    ):
+        if _canonical_plan_status(plan.get("status")) not in READY_PLAN_STATUSES:
+            continue
+        identity = _canonical_plan_identity(plan.get("path"), project_root)
+        if (
+            identity is None
+            or identity in run_groups
+            or identity in run_plan_identities
+            or identity in held_identities
+        ):
+            continue
+        plan_path = str(plan.get("path"))
+        content = observation.plan_documents.get(plan_path)
+        if not isinstance(content, str):
+            holds.append(("plan_evidence_unavailable", plan_path, None))
+            continue
+        if not _plan_has_unchecked_checkpoint(content):
+            continue
+        queue_allows, queue_reason = _queue_row_allows_ready_plan(
+            observation.queue,
+            plan_path,
+            plan.get("revision"),
+            project_root,
+        )
+        if not queue_allows:
+            holds.append((queue_reason or "queue_not_ready", plan_path, None))
+            continue
+        unsatisfied_prerequisites = [
+            prerequisite
+            for prerequisite in sorted(_explicit_prerequisite_paths(content))
+            if (
+                (
+                    prerequisite_plan := plan_inventory.get(
+                        _canonical_plan_identity(prerequisite, project_root)
+                        or ""
+                    )
                 )
-        by_plan: dict[str, int] = {}
-        for run in failed:
-            by_plan[str(run["plan_path"])] = by_plan.get(str(run["plan_path"]), 0) + 1
-        ambiguous = sorted(
-            path for path, count in by_plan.items() if count > 1
-        )
-        if ambiguous:
-            return TriageDecision(
-                action="report",
-                reason="ambiguous_predecessor_ownership",
-                plan_path=ambiguous[0],
+                is None
+                or _canonical_plan_status(
+                    prerequisite_plan.get("status")
+                )
+                != "done"
             )
-        run = sorted(failed, key=lambda item: str(item["run_id"]))[0]
-        path = str(run["plan_path"])
-        if path not in plan_paths:
-            return TriageDecision(
-                action="report",
-                reason="failed_lineage_plan_unregistered",
-                run_id=str(run["run_id"]),
-                plan_path=path,
-            )
-        competing = [
-            other
-            for other in runs
-            if other.get("plan_path") == path
-            and other.get("run_id") != run.get("run_id")
         ]
-        if competing:
-            return TriageDecision(
-                action="report",
-                reason="competing_run_ownership",
-                run_id=str(run["run_id"]),
-                plan_path=path,
-            )
-        return TriageDecision(
-            action="resume",
-            reason="failed_lineage_resumable",
-            run_id=str(run["run_id"]),
-            plan_path=path,
-            idempotency_key=f"concierge-resume-{run['run_id']}",
+        if unsatisfied_prerequisites:
+            holds.append(("prerequisite_unsatisfied", plan_path, None))
+            continue
+        issue, issue_hold = _plan_issue_reference(content, observation.issues)
+        if issue_hold is not None:
+            holds.append((issue_hold, plan_path, None))
+            continue
+        ready_candidates.append(
+            {
+                "kind": "ready",
+                "run_id": None,
+                "plan_path": plan_path,
+                "revision": plan.get("revision"),
+                "modified_at": plan.get("modified_at"),
+                "issue": issue,
+                "content": content,
+                "publication_failure": False,
+            }
         )
 
-    referenced = {run.get("plan_path") for run in runs}
-    launchable = [
-        plan
-        for plan in plans
-        if plan.get("status") in LAUNCHABLE_PLAN_STATUSES
-        and plan.get("path") not in referenced
-        and plan.get("path") not in held_paths
-    ]
-    if len(launchable) > 1:
-        return TriageDecision(
-            action="report",
-            reason="multiple_launchable_plans",
-            plan_path=sorted(str(plan["path"]) for plan in launchable)[0],
+    def selection_key(candidate: Mapping[str, object]) -> tuple[object, ...]:
+        return (
+            0 if candidate.get("kind") == "recovery" else 1,
+            _candidate_sort_key(
+                candidate.get("issue"),
+                candidate.get("modified_at"),
+                str(candidate.get("plan_path")),
+                str(candidate.get("run_id") or ""),
+            ),
         )
-    if len(launchable) == 1:
-        path = str(launchable[0]["path"])
+
+    def decide(candidate: Mapping[str, object]) -> TriageDecision:
+        plan_path = str(candidate.get("plan_path"))
+        revision = candidate.get("revision")
+        plan_revision = (
+            str(revision) if isinstance(revision, str) and revision else None
+        )
+        if candidate.get("kind") == "recovery":
+            run_id = str(candidate.get("run_id"))
+            return TriageDecision(
+                action="resume",
+                reason="failed_lineage_resumable",
+                run_id=run_id,
+                plan_path=plan_path,
+                plan_revision=plan_revision,
+                idempotency_key=f"concierge-resume-{run_id}",
+            )
         return TriageDecision(
             action="start",
-            reason="single_launchable_plan",
-            plan_path=path,
-            idempotency_key=_start_key(path),
+            reason="ready_plan",
+            plan_path=plan_path,
+            plan_revision=plan_revision,
+            idempotency_key=_start_key(plan_path),
             workflow_name=CONCIERGE_WORKFLOW_NAME,
             team=CONCIERGE_TEAM,
         )
+
+    delivery_gate = _delivery_failure_gate(observation.delivery)
+    candidates = [*recovery_candidates, *ready_candidates]
+    if delivery_gate is not None:
+        eligible = [
+            candidate
+            for candidate in candidates
+            if (
+                candidate.get("kind") == "recovery"
+                and _recovery_eligible_for_failed_delivery(
+                    candidate, observation
+                )
+            )
+            or (
+                candidate.get("kind") == "ready"
+                and _plan_references_delivery_failure(
+                    str(candidate.get("content")),
+                    observation.delivery_sha,
+                    delivery_gate,
+                )
+            )
+        ]
+        if not eligible:
+            return TriageDecision(action="report", reason="delivery_gate_failed")
+        return decide(min(eligible, key=selection_key))
+    if candidates:
+        return decide(min(candidates, key=selection_key))
 
     owner_issues = [
         issue
@@ -937,39 +1620,64 @@ def triage_tick(observation: TickObservation) -> TriageDecision:
         if issue.get("author_id") == CONCIERGE_OWNER_ID
         and issue.get("state", "open") == "open"
     ]
-    if not owner_issues:
-        return TriageDecision(action="idle", reason="no_eligible_work")
-    planned_urls: set[str] = set()
-    for plan in plans:
-        if _canonical_plan_status(plan.get("status")) not in PLANNED_EVIDENCE_STATUSES:
-            continue
-        path = str(plan["path"])
-        content = observation.plan_documents.get(path)
-        if not isinstance(content, str):
+    if owner_issues:
+        planned_urls: set[str] = set()
+        missing_document_identities: list[str] = []
+        for identity in sorted(plan_inventory):
+            plan = plan_inventory[identity]
+            if (
+                _canonical_plan_status(plan.get("status"))
+                not in PLANNED_EVIDENCE_STATUSES
+            ):
+                continue
+            content = document_for(identity)
+            if content is None:
+                missing_document_identities.append(identity)
+            else:
+                planned_urls.update(_issue_urls_in(content))
+        unplanned = [
+            issue
+            for issue in owner_issues
+            if _issue_url(issue) not in planned_urls
+        ]
+        if unplanned:
+            if missing_document_identities:
+                plan = plan_inventory[missing_document_identities[0]]
+                return TriageDecision(
+                    action="report",
+                    reason="plan_evidence_unavailable",
+                    plan_path=str(plan.get("path")),
+                )
+            issue = sorted(
+                unplanned,
+                key=lambda item: (
+                    _timestamp_sort_key(item.get("created_at")),
+                    int(item["number"]),
+                ),
+            )[0]
+            number = int(issue["number"])
+            full_name = str(issue["full_name"])
             return TriageDecision(
-                action="report",
-                reason="plan_evidence_unavailable",
-                plan_path=path,
+                action="plan_and_start",
+                reason="oldest_owner_issue",
+                issue_number=number,
+                issue_url=f"https://github.com/{full_name}/issues/{number}",
+                idempotency_key=_start_key(f"issue:{full_name}:{number}"),
+                workflow_name=CONCIERGE_WORKFLOW_NAME,
+                team=CONCIERGE_TEAM,
             )
-        planned_urls.update(_issue_urls_in(content))
-    unplanned = [issue for issue in owner_issues if _issue_url(issue) not in planned_urls]
-    if not unplanned:
-        return TriageDecision(action="idle", reason="no_eligible_work")
-    issue = sorted(
-        unplanned,
-        key=lambda item: (str(item["created_at"]), int(item["number"])),
-    )[0]
-    number = int(issue["number"])
-    full_name = str(issue["full_name"])
-    return TriageDecision(
-        action="plan_and_start",
-        reason="oldest_owner_issue",
-        issue_number=number,
-        issue_url=f"https://github.com/{full_name}/issues/{number}",
-        idempotency_key=_start_key(f"issue:{full_name}:{number}"),
-        workflow_name=CONCIERGE_WORKFLOW_NAME,
-        team=CONCIERGE_TEAM,
-    )
+    if holds:
+        reason, plan_path, run_id = sorted(
+            holds,
+            key=lambda item: (item[0], str(item[1] or ""), str(item[2] or "")),
+        )[0]
+        return TriageDecision(
+            action="report",
+            reason=reason,
+            run_id=run_id,
+            plan_path=plan_path,
+        )
+    return TriageDecision(action="idle", reason="no_eligible_work")
 
 
 class McpHttpEndpoint:
@@ -1584,7 +2292,15 @@ class ConciergeTickExecutor:
         except ConciergeError:
             full_name = None
         try:
-            runs, plans, plan_documents = self._gather_evidence(project_id)
+            (
+                runs,
+                plans,
+                plan_documents,
+                queue,
+                run_details,
+                run_contexts,
+                delivery,
+            ) = self._gather_evidence(project_id, full_name)
         except ConciergeError:
             return TickOutcome("report", "evidence_unavailable")
         issues: tuple[Mapping[str, object], ...] = ()
@@ -1606,6 +2322,16 @@ class ConciergeTickExecutor:
             issues=issues,
             plan_documents=plan_documents,
             occupancy=occupancy,
+            queue=queue,
+            run_details=run_details,
+            run_contexts=run_contexts,
+            delivery={
+                "state": delivery.state,
+                "ci": delivery.ci,
+                "live": delivery.live,
+                "sha": delivery.sha,
+            },
+            delivery_sha=delivery.sha,
         )
         try:
             decision = triage_tick(observation)
@@ -1633,23 +2359,29 @@ class ConciergeTickExecutor:
             outcome = self._report_defects(full_name, defects)
             if outcome is not None:
                 return outcome
-        delivery = self._delivery_status(full_name)
         if not decision.mutating:
             details = self._decision_details(decision=decision)
             details.update(self._delivery_details(delivery))
             return TickOutcome(decision.action, decision.reason, details=details)
         if decision.action == "resume":
-            return self._execute_resume(project_id, decision)
-        if decision.action in ("start", "plan_and_start"):
+            return self._execute_resume(
+                project_id, decision, project, project_root, full_name
+            )
+        if decision.action == "plan_and_start":
             if delivery.state == "failed":
                 details = self._decision_details(decision=decision)
                 details.update(self._delivery_details(delivery))
                 return TickOutcome("report", "delivery_gate_failed", details=details)
-            if decision.action == "start":
-                return self._execute_start(project_id, decision)
             return self._execute_plan_and_start(
-                project_id, decision, state_dir, full_name
+                project_id, decision, state_dir, full_name, project
             )
+        if decision.action == "start":
+            # A start decision reaches this point only after triage_tick
+            # applied the delivery gate: while delivery is failed, only
+            # ready repair plans referencing the failed SHA and gate are
+            # selected, and unrelated work reports delivery_gate_failed
+            # before the executor runs.
+            return self._execute_start(project_id, decision, project, full_name)
         return TickOutcome("report", "unrecognized_decision")
 
     def close(self) -> None:
@@ -1758,14 +2490,19 @@ class ConciergeTickExecutor:
         return None
 
     def _gather_evidence(
-        self, project_id: str
+        self, project_id: str, full_name: str | None
     ) -> tuple[
         tuple[Mapping[str, object], ...],
         tuple[Mapping[str, object], ...],
         dict[str, str],
+        Mapping[str, object] | None,
+        Mapping[str, Mapping[str, object]],
+        Mapping[str, Mapping[str, object]],
+        DeliveryStatus,
     ]:
         """Gather the complete bounded inventory: runs, joined plan lifecycle
-        inventory, and per-path document content.
+        inventory, per-path document content, queue, fresh run recovery
+        evidence, and project delivery state.
 
         The plan inventory joins the lifecycle ``list_plans`` rows (which
         cover the draft/todo/in-progress/done directories) with
@@ -1808,7 +2545,35 @@ class ConciergeTickExecutor:
         content_by_path = {
             path: documents[path]["content"] for path in documents
         }
-        return runs, plans, content_by_path
+        queue = self._project_queue(project_id)
+        run_details: dict[str, Mapping[str, object]] = {}
+        run_contexts: dict[str, Mapping[str, object]] = {}
+        for run in sorted(runs, key=lambda item: str(item.get("run_id") or "")):
+            run_id = run.get("run_id")
+            if (
+                not isinstance(run_id, str)
+                or not run_id
+                or _run_activity(run) != INACTIVE_RUN_ACTIVITY
+                or run.get("status") not in RECOVERABLE_RUN_STATUSES
+            ):
+                continue
+            detail = self._run_detail(project_id, run_id)
+            if detail is None:
+                continue
+            run_details[run_id] = detail
+            context = self._run_context(project_id, run_id)
+            if context is not None:
+                run_contexts[run_id] = context
+        delivery = self._delivery_status(full_name)
+        return (
+            runs,
+            plans,
+            content_by_path,
+            queue,
+            run_details,
+            run_contexts,
+            delivery,
+        )
 
     def _list_runs(self, project_id: str) -> tuple[Mapping[str, object], ...]:
         """Page the complete run inventory through the opaque ``next_cursor``.
@@ -2079,6 +2844,22 @@ class ConciergeTickExecutor:
         if not isinstance(payload, Mapping) or payload.get("run_id") != run_id:
             return None
         return payload
+
+    def _run_context(
+        self, project_id: str, run_id: str
+    ) -> Mapping[str, object] | None:
+        try:
+            payload = self._mcp.call_tool(
+                "get_run_context",
+                {
+                    "project_id": project_id,
+                    "run_id": run_id,
+                    "level": "lite",
+                },
+            )
+        except ConciergeError:
+            return None
+        return payload if isinstance(payload, Mapping) else None
 
     def _startup_hold_verified(
         self, detail: Mapping[str, object], queue_permits: bool
@@ -2358,9 +3139,18 @@ class ConciergeTickExecutor:
         project_id: str,
         decision: TriageDecision,
         full_name: str | None,
+        project: Mapping[str, object],
     ) -> TriageDecision | None:
         try:
-            runs, plans, plan_documents = self._gather_evidence(project_id)
+            (
+                runs,
+                plans,
+                plan_documents,
+                queue,
+                run_details,
+                run_contexts,
+                delivery,
+            ) = self._gather_evidence(project_id, full_name)
         except ConciergeError:
             return None
         issues: tuple[Mapping[str, object], ...] = ()
@@ -2373,18 +3163,30 @@ class ConciergeTickExecutor:
                 return None
             issues = page.issues
         observation = TickObservation(
-            project={"project_id": project_id},
+            project=project,
             runs=runs,
             plans=plans,
             issues=issues,
             plan_documents=plan_documents,
             occupancy=self._occupancy_report(project_id, runs),
+            queue=queue,
+            run_details=run_details,
+            run_contexts=run_contexts,
+            delivery={
+                "state": delivery.state,
+                "ci": delivery.ci,
+                "live": delivery.live,
+                "sha": delivery.sha,
+            },
+            delivery_sha=delivery.sha,
         )
         try:
             fresh = triage_tick(observation)
         except ConciergeError:
             return None
         if fresh.action != decision.action:
+            return None
+        if fresh.reason != decision.reason:
             return None
         if fresh.idempotency_key != decision.idempotency_key:
             return None
@@ -2397,17 +3199,33 @@ class ConciergeTickExecutor:
             and fresh.issue_number != decision.issue_number
         ):
             return None
+        if decision.action in ("start", "resume"):
+            fresh_revision = fresh.plan_revision
+            if (
+                not isinstance(fresh_revision, str)
+                or not fresh_revision
+                or fresh_revision != decision.plan_revision
+            ):
+                return None
         return fresh
 
     def _execute_resume(
-        self, project_id: str, decision: TriageDecision
+        self,
+        project_id: str,
+        decision: TriageDecision,
+        project: Mapping[str, object],
+        project_root: Path,
+        full_name: str | None,
     ) -> TickOutcome:
-        if self._fresh_decision(project_id, decision, None) is None:
+        if (
+            self._fresh_decision(project_id, decision, full_name, project)
+            is None
+        ):
             return TickOutcome(
                 "report", "state_changed_before_action",
                 details=self._decision_details(decision=decision),
             )
-        if not self._resume_admits(project_id, decision):
+        if not self._resume_admits(project_id, decision, project_root):
             return TickOutcome(
                 "report", "resume_not_admitted",
                 details=self._decision_details(decision=decision),
@@ -2440,7 +3258,12 @@ class ConciergeTickExecutor:
             details=self._decision_details(decision=decision),
         )
 
-    def _resume_admits(self, project_id: str, decision: TriageDecision) -> bool:
+    def _resume_admits(
+        self,
+        project_id: str,
+        decision: TriageDecision,
+        project_root: Path,
+    ) -> bool:
         """Require the exact failed predecessor to be MCP-admissible now."""
         try:
             payload = self._mcp.call_tool(
@@ -2453,20 +3276,33 @@ class ConciergeTickExecutor:
             return False
         if payload.get("run_id") != decision.run_id:
             return False
-        if payload.get("activity") != INACTIVE_RUN_ACTIVITY:
+        if _run_activity(payload) != INACTIVE_RUN_ACTIVITY:
             return False
-        if payload.get("status") not in TERMINAL_FAILED_RUN_STATUSES:
+        if payload.get("status") not in RECOVERABLE_RUN_STATUSES:
             return False
-        plan_path = payload.get("plan_path")
-        if not isinstance(plan_path, str) or plan_path != decision.plan_path:
+        if payload.get("ownership") != "control_plane":
+            return False
+        root = str(project_root)
+        expected = _canonical_plan_identity(decision.plan_path, root)
+        if (
+            expected is None
+            or not _detail_matches_plan_identity(payload, expected, root)
+        ):
             return False
         evidence = payload.get("evidence")
         return isinstance(evidence, Mapping) and evidence.get("can_resume") is True
 
     def _execute_start(
-        self, project_id: str, decision: TriageDecision
+        self,
+        project_id: str,
+        decision: TriageDecision,
+        project: Mapping[str, object],
+        full_name: str | None,
     ) -> TickOutcome:
-        if self._fresh_decision(project_id, decision, None) is None:
+        if (
+            self._fresh_decision(project_id, decision, full_name, project)
+            is None
+        ):
             return TickOutcome(
                 "report", "state_changed_before_action",
                 details=self._decision_details(decision=decision),
@@ -2493,8 +3329,12 @@ class ConciergeTickExecutor:
         decision: TriageDecision,
         state_dir: Path,
         full_name: str,
+        project: Mapping[str, object],
     ) -> TickOutcome:
-        if self._fresh_decision(project_id, decision, full_name) is None:
+        if (
+            self._fresh_decision(project_id, decision, full_name, project)
+            is None
+        ):
             return TickOutcome(
                 "report", "state_changed_before_action",
                 details=self._decision_details(decision=decision),
@@ -2602,7 +3442,9 @@ class ConciergeTickExecutor:
         if result.status != "plan" or not isinstance(result.markdown, str):
             return TickOutcome("report", "planner_result_invalid", details=details)
         try:
-            runs, plans, plan_documents = self._gather_evidence(project_id)
+            runs, plans, plan_documents, *_ = self._gather_evidence(
+                project_id, full_name
+            )
         except ConciergeError:
             return TickOutcome("report", "evidence_unavailable", details=details)
         if self._occupancy_blocks(project_id, runs):
@@ -2671,7 +3513,7 @@ class ConciergeTickExecutor:
         except ConciergeError as exc:
             return TickOutcome("report", exc.reason, details=details)
         try:
-            runs, _, _ = self._gather_evidence(project_id)
+            runs, *_ = self._gather_evidence(project_id, full_name)
             queue = self._mcp.call_tool(
                 "get_project_queue", {"project_id": project_id}
             )

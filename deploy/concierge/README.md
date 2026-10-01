@@ -65,23 +65,45 @@ by exact Git root, `list_runs` paged with the opaque `next_cursor`,
 `list_plans` paged by exact last path until the final empty page,
 `list_plan_documents` joined to the lifecycle rows by exact canonical path,
 and `read_plan` for every plan document, including `failed` and
-`needs-plan-change`), then reads `get_run` for reconciliation and reads
+`needs-plan-change`), then reads the project queue, fresh `get_run` and
+`get_run_context` recovery evidence for inactive recoverable runs, and
 read-only GitHub open-issue evidence, and chooses at most one action, in
 priority order:
 
-1. Resume a confirmed-inactive failed run whose exact plan lineage is
-   verified, reusing the same idempotency key.
-2. Start exactly one launchable `todo` plan with the
-   `checkpoint_delivery` workflow and the explicit `xtx-mtp` team, after an
-   exact-path preflight. Legacy `draft` rows remain in the joined inventory
-   as held rows; they are never launchable and never suppress an independent
-   admissible `todo` plan.
-3. For the oldest open issue authored by GitHub user ID `591691` that no
+1. Defer on active or uncertain shared occupancy.
+2. Repair a failed exact-SHA delivery using only an admissible repair resume
+   backed by structured publication-failure evidence, or a ready repair plan
+   that names the current `origin/main` SHA and the failed gate.
+ 3. Resume one safe failed lineage: a unique lineage leaf whose fresh
+    `get_run` detail proves inactive activity, `failed` / `interrupted` /
+    `stopped` status, `control_plane` ownership, exact canonical
+    original-plan identity, and `evidence.can_resume=true`, with a readable
+    plan document containing an unchecked strict checkpoint, and no conflicting
+    queue-row run identity. Lineage parents are read from list rows or bounded
+    lite `get_run_context` metadata; ambiguous multi-run lineage is held.
+    Owner stops, restart/requeue-required metadata, and `transition_end` runs
+    with unchecked checkpoints are not resumed.
+4. Start exactly one ready `in_progress` plan with an unchecked strict
+   checkpoint, a readable document, exactly one admissible canonical queue
+   row, satisfied `done` prerequisites, and valid owner-issue references,
+   using the
+   `checkpoint_delivery` workflow and the explicit `xtx-mtp` team after an
+   exact-path preflight. The concierge never directly starts `todo`,
+   `draft`, `failed`, `needs_plan_change`, or `done` plans. Legacy `draft`
+   rows remain in the joined inventory as held rows and never suppress an
+   independent admissible ready plan.
+5. For the oldest open issue authored by GitHub user ID `591691` that no
    plan document already covers, author one plan with the read-only
    `gpt-6-astra` high-effort planner following `aflow-plan`. The plan must
    contain the issue URL, an acceptance mapping, exact verification
    commands, and safe defaults, and is validated before MCP plan create,
    update, or promote; the tick then preflights and starts once.
+
+Candidates are ranked deterministically: plans referencing open owner issues
+rank before operator-promoted plans, then by eligible issue
+`(created_at, number)`, plan `modified_at`, canonical plan path, and run ID.
+Input or page order never selects work. Candidate-local ambiguity is
+reported without blocking independent safe candidates.
 
 Duplicate detection is content-based: a plan covers an issue when its
 document references the canonical issue URL
@@ -114,10 +136,9 @@ validation.
 Occupancy is one conservative classifier applied at initial triage, fresh
 selection, post-planning, and timeout reconciliation. Any active run
 (active activity, active unit, or active preparation) defers the tick
-without mutation. Canonical terminal runs (`completed`, `failed`,
-`interrupted`, `owner_stopped`) whose activity is canonical (`unknown` or
-`inactive`) and which have no conflicting active evidence are history and
-never grant resume. A terminal row whose activity is missing or malformed is
+without mutation. Canonical terminal runs (`completed`, `failed`, `interrupted`, `stopped`,
+`owner_stopped`) whose activity is canonical (`unknown` or `inactive`) and
+which have no conflicting active evidence are history and never grant resume. A terminal row whose activity is missing or malformed is
 not provably historical and remains blocking until fresh canonical `get_run`
 detail resolves it. Uncertain, paused, waiting, malformed, or
 missing-evidence runs remain blocking. A run that verifiably failed before
@@ -132,10 +153,12 @@ by the tick. A missing,
 malformed, or conflicting inventory page, a duplicate identity, a repeated
 or non-advancing cursor, or an unconsumed continuation at the page cap
 reports a bounded evidence gap with zero mutations, and a partial inventory
-is never treated as complete. Historical `in-progress` plan files are not
-launch-ready. Issues from any other account, including issue 50, are
-ignored. Ambiguous ownership or uncertain provider outcomes are reported
-without a guessed action.
+is never treated as complete. An `in_progress` plan is launch-ready only
+when its document has an unchecked strict checkpoint and it has exactly one
+admissible canonical queue row. Issues from any other account, including
+issue 50, are ignored.
+Ambiguous ownership or uncertain provider outcomes are reported without a
+guessed action.
 
 ## Delivery gate and defect reporting
 
@@ -163,11 +186,14 @@ evidence.
 
 The projection is best-effort and bounded: any missing or unreadable source
 collapses to absent evidence, which is reported as `pending`, never as
-success. A **failed** exact-SHA delivery (red CI or a failed deploy phase)
-blocks fresh `start` and `plan_and_start` dispatch with
-`delivery_gate_failed` until the release is repaired. That state does not
-block a verified `resume` of an existing failed lineage, which is recovery,
-not a fresh dispatch. The CI and live-release facts are always reported
+success. A **failed** exact-SHA delivery (red CI, failed live verification,
+or a failed deploy phase) admits only a matching repair candidate: an
+admissible recovery resume with structured delivery-stage or
+`run_metadata` publication-failure evidence, or a ready `in_progress`
+repair plan whose document names the current `origin/main` SHA and the
+failed gate. Every unrelated `start`, `resume`, and `plan_and_start`
+candidate is suppressed and the tick reports `delivery_gate_failed` until
+the release is repaired. The CI and live-release facts are always reported
 separately in the bounded status record, so a green CI with a stale live
 release is visible as `pending`, not `ok`.
 

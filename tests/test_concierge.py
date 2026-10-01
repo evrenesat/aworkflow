@@ -42,6 +42,7 @@ from aflow.concierge import (
     TriageDecision,
     _PLAN_STATUS_BY_DIRECTORY,
     _build_concierge_planner,
+    _delivery_failure_gate,
     _run_tick_process,
     build_codex_argv,
     build_tick_prompt,
@@ -191,8 +192,15 @@ class FakeMcp:
         publication: Mapping[str, object] | None = None,
         global_config: Mapping[str, object] | None = None,
         get_run_payloads: Mapping[str, Mapping[str, object]] | None = None,
+        get_run_context_payloads: (
+            Mapping[str, Mapping[str, object]] | None
+        ) = None,
+        queue: Mapping[str, object] | None = None,
     ) -> None:
         self.project_root = project_root
+        self.queue_override = (
+            dict(queue) if queue is not None else None
+        )
         self.project_id = project_id
         self.registered = registered
         self.runs: list[dict[str, object]] = [dict(run) for run in runs]
@@ -222,6 +230,14 @@ class FakeMcp:
         self.get_run_payloads = (
             {key: dict(value) for key, value in get_run_payloads.items()}
             if get_run_payloads is not None
+            else None
+        )
+        self.get_run_context_payloads = (
+            {
+                key: dict(value)
+                for key, value in get_run_context_payloads.items()
+            }
+            if get_run_context_payloads is not None
             else None
         )
 
@@ -359,6 +375,14 @@ class FakeMcp:
                 return dict(run)
         raise ConciergeError("mcp_tool_rejected")
 
+    def _tool_get_run_context(self, args: dict[str, object]) -> dict[str, object]:
+        if self.get_run_context_payloads is None:
+            raise ConciergeError("mcp_tool_rejected")
+        payload = self.get_run_context_payloads.get(str(args.get("run_id")))
+        if payload is None:
+            raise ConciergeError("mcp_tool_rejected")
+        return dict(payload)
+
     def _tool_get_global_config(
         self, args: dict[str, object]
     ) -> dict[str, object]:
@@ -441,6 +465,8 @@ class FakeMcp:
         }
 
     def _tool_get_project_queue(self, args: dict[str, object]) -> dict[str, object]:
+        if self.queue_override is not None:
+            return dict(self.queue_override)
         active = [run for run in self.runs if run.get("activity") == "active"]
         plans: list[dict[str, object]] = []
         for plan in self.plans:
@@ -457,7 +483,17 @@ class FakeMcp:
                     "path": plan.get("path"),
                     "status": plan.get("status"),
                     "run_id": run_id,
-                    "outcome": "claimed" if run_id else "ready",
+                    "outcome": (
+                        "claimed"
+                        if run_id
+                        else "queued"
+                        if self.auto_consume_plans
+                        else "automatic_disabled"
+                    ),
+                    "dependency": None,
+                    "revision": self.revisions.get(
+                        str(plan.get("path")), "1"
+                    ),
                 }
             )
         return {
@@ -805,8 +841,8 @@ def test_run_tick_end_to_end_starts_eligible_plan_once(
 ) -> None:
     mcp = FakeMcp(
         project_root=tmp_path,
-        plans=[{"path": "plans/todo/alpha.md", "status": "todo"}],
-        documents={"plans/todo/alpha.md": "# Plan\n"},
+        plans=[{"path": "plans/in-progress/alpha.md", "status": "in_progress"}],
+        documents={"plans/in-progress/alpha.md": "### [ ] Checkpoint 1: step\n"},
         publication=_publication_projection(
             available=True, remote="origin", branch="main"
         ),
@@ -834,9 +870,9 @@ def test_run_tick_end_to_end_starts_eligible_plan_once(
 def test_run_tick_end_to_end_resumes_exact_predecessor_once(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    mcp = FakeMcp(
-        project_root=tmp_path,
-        runs=[
+    mcp = _recovery_mcp(
+        tmp_path,
+        [
             {
                 "run_id": "run-failed",
                 "activity": "inactive",
@@ -845,8 +881,6 @@ def test_run_tick_end_to_end_resumes_exact_predecessor_once(
                 "evidence": {"can_resume": True},
             }
         ],
-        plans=[{"path": "plans/in-progress/alpha.md", "status": "in_progress"}],
-        documents={"plans/in-progress/alpha.md": "# Plan\n"},
     )
     executor = _executor(tmp_path, monkeypatch, mcp=mcp)
     runner = FakeRunner(TickProcessResult(returncode=0, stdout=b"ok"))
@@ -1187,6 +1221,11 @@ def _observation(
     issues: Sequence[Mapping[str, object]] = (),
     plan_documents: Mapping[str, str] | None = None,
     occupancy: Mapping[str, object] | None = None,
+    queue: Mapping[str, object] | None = None,
+    run_details: Mapping[str, Mapping[str, object]] | None = None,
+    run_contexts: Mapping[str, Mapping[str, object]] | None = None,
+    delivery: Mapping[str, object] | None = None,
+    delivery_sha: str | None = None,
 ) -> TickObservation:
     return TickObservation(
         project={"project_id": "agent-flow-test", "root": "/root/code/agent-flow"},
@@ -1195,6 +1234,11 @@ def _observation(
         issues=tuple(issues),
         plan_documents=dict(plan_documents or {}),
         occupancy=dict(occupancy or {}),
+        queue=queue,
+        run_details=run_details,
+        run_contexts=run_contexts,
+        delivery=delivery,
+        delivery_sha=delivery_sha,
     )
 
 
@@ -1204,7 +1248,11 @@ def _run(
     activity: str = "inactive",
     status: str = "completed",
     plan_path: str | None = None,
+    original_plan_path: str | None = None,
     evidence: Mapping[str, object] | None = None,
+    ownership: str | None = None,
+    restarted_from_run_id: str | None = None,
+    resumed_from_run_id: str | None = None,
 ) -> dict[str, object]:
     row: dict[str, object] = {
         "run_id": run_id,
@@ -1212,9 +1260,121 @@ def _run(
         "status": status,
         "plan_path": plan_path,
     }
+    if original_plan_path is not None:
+        row["original_plan_path"] = original_plan_path
     if evidence is not None:
         row["evidence"] = dict(evidence)
+    if ownership is not None:
+        row["ownership"] = ownership
+    if restarted_from_run_id is not None:
+        row["restarted_from_run_id"] = restarted_from_run_id
+    if resumed_from_run_id is not None:
+        row["resumed_from_run_id"] = resumed_from_run_id
     return row
+
+
+def _run_detail(
+    *,
+    run_id: str,
+    status: str,
+    plan_path: str,
+    can_resume: bool = True,
+    ownership: str = "control_plane",
+    original_plan_path: str | None = None,
+) -> dict[str, object]:
+    payload: dict[str, object] = {
+        "run_id": run_id,
+        "activity": "inactive",
+        "status": status,
+        "ownership": ownership,
+        "plan_path": plan_path,
+        "evidence": {"can_resume": can_resume},
+    }
+    if original_plan_path is not None:
+        payload["original_plan_path"] = original_plan_path
+    return payload
+
+
+def _run_context(
+    *,
+    end_reason: str | None = None,
+    delivery: Sequence[Mapping[str, object]] = (),
+    lineage_parent: str | None = None,
+    metadata: Mapping[str, object] | None = None,
+) -> dict[str, object]:
+    context_metadata: dict[str, object] = dict(metadata or {})
+    if end_reason is not None:
+        context_metadata["end_reason"] = end_reason
+    if lineage_parent is not None:
+        context_metadata["resumed_from_run_id"] = lineage_parent
+    return {
+        "data": {
+            "run_metadata": context_metadata,
+            "progress": {"delivery": list(delivery)},
+        }
+    }
+
+
+def _recovery_mcp(
+    tmp_path: Path,
+    runs: Sequence[Mapping[str, object]],
+    *,
+    publication: Mapping[str, object] | None = None,
+    **overrides: object,
+) -> FakeMcp:
+    plan_paths: set[str] = set()
+    details: dict[str, dict[str, object]] = {}
+    contexts: dict[str, dict[str, object]] = {}
+    for run in runs:
+        run_id = str(run.get("run_id"))
+        plan_path = str(run.get("plan_path") or "plans/in-progress/alpha.md")
+        original_plan_path = run.get("original_plan_path")
+        identity_path = (
+            str(original_plan_path)
+            if isinstance(original_plan_path, str) and original_plan_path
+            else plan_path
+        )
+        plan_paths.add(identity_path)
+        evidence = run.get("evidence")
+        can_resume = (
+            evidence.get("can_resume") is True
+            if isinstance(evidence, Mapping)
+            else True
+        )
+        details[run_id] = _run_detail(
+            run_id=run_id,
+            status=str(run.get("status") or "failed"),
+            plan_path=plan_path,
+            can_resume=can_resume,
+            original_plan_path=(
+                str(original_plan_path)
+                if isinstance(original_plan_path, str) and original_plan_path
+                else None
+            ),
+        )
+        contexts[run_id] = _run_context()
+    plans = overrides.pop("plans", None)
+    documents = overrides.pop("documents", None)
+    detail_payloads = overrides.pop("get_run_payloads", None)
+    context_payloads = overrides.pop("get_run_context_payloads", None)
+    if plans is None:
+        plans = [
+            {"path": path, "status": "in_progress"} for path in sorted(plan_paths)
+        ]
+    if documents is None:
+        documents = {path: "### [ ] Checkpoint 1: step\n" for path in sorted(plan_paths)}
+    return FakeMcp(
+        project_root=tmp_path,
+        runs=[dict(run) for run in runs],
+        plans=plans,
+        documents=documents,
+        get_run_payloads=detail_payloads if detail_payloads is not None else details,
+        get_run_context_payloads=(
+            context_payloads if context_payloads is not None else contexts
+        ),
+        publication=publication,
+        **overrides,
+    )
 
 
 def _plan(
@@ -1229,6 +1389,39 @@ def _plan(
         "status": status,
         "revision": revision,
         "modified_at": modified_at,
+    }
+
+
+def _queue_row(
+    *,
+    path: str,
+    revision: str = "1",
+    run_id: str | None = None,
+    outcome: str = "automatic_disabled",
+    dependency: str | None = None,
+) -> dict[str, object]:
+    return {
+        "path": path,
+        "status": "in_progress",
+        "run_id": run_id,
+        "outcome": outcome,
+        "dependency": dependency,
+        "revision": revision,
+    }
+
+
+def _queue(*rows: Mapping[str, object]) -> dict[str, object]:
+    return {
+        "settings": {
+            "auto_consume_plans": False,
+            "max_concurrent_implementations": 1,
+        },
+        "capacity": {
+            "limit": 1,
+            "active_count": 0,
+            "available_slots": 1,
+        },
+        "plans": [dict(row) for row in rows],
     }
 
 
@@ -1288,6 +1481,15 @@ def test_triage_resumes_inactive_failed_lineage_with_stable_key() -> None:
         ],
         plans=[_plan(path="plans/in-progress/alpha.md", status="in_progress")],
         issues=[_issue()],
+        plan_documents={"plans/in-progress/alpha.md": "### [ ] Checkpoint 1: finish"},
+        run_details={
+            "run-failed": _run_detail(
+                run_id="run-failed",
+                status="failed",
+                plan_path="plans/in-progress/alpha.md",
+            )
+        },
+        run_contexts={"run-failed": _run_context()},
     )
     first = triage_tick(observation)
     second = triage_tick(observation)
@@ -1319,7 +1521,8 @@ def test_triage_reports_ambiguous_predecessor_ownership() -> None:
         )
     )
     assert decision.action == "report"
-    assert decision.reason == "ambiguous_predecessor_ownership"
+    assert decision.reason == "ambiguous_run_lineage"
+    assert decision.run_id == "run-a"
     assert decision.plan_path == "plans/in-progress/alpha.md"
     assert decision.idempotency_key is None
     assert decision.mutating is False
@@ -1344,7 +1547,15 @@ def test_triage_reports_unregistered_failed_plan_lineage() -> None:
                     status="failed",
                     plan_path="plans/in-progress/ghost.md",
                 )
-            ]
+            ],
+            run_details={
+                "run-failed": _run_detail(
+                    run_id="run-failed",
+                    status="failed",
+                    plan_path="plans/in-progress/ghost.md",
+                )
+            },
+            run_contexts={"run-failed": _run_context()},
         )
     )
     assert decision.action == "report"
@@ -1357,14 +1568,21 @@ def test_triage_reports_competing_run_ownership() -> None:
         _observation(
             runs=[
                 _run(
-                    run_id="run-failed",
-                    status="failed",
+                    run_id="run-root",
+                    status="completed",
                     plan_path="plans/in-progress/alpha.md",
                 ),
                 _run(
-                    run_id="run-other",
+                    run_id="run-a",
+                    status="failed",
+                    plan_path="plans/in-progress/alpha.md",
+                    restarted_from_run_id="run-root",
+                ),
+                _run(
+                    run_id="run-b",
                     status="completed",
                     plan_path="plans/in-progress/alpha.md",
+                    restarted_from_run_id="run-root",
                 ),
             ],
             plans=[_plan(path="plans/in-progress/alpha.md", status="in_progress")],
@@ -1372,16 +1590,81 @@ def test_triage_reports_competing_run_ownership() -> None:
     )
     assert decision.action == "report"
     assert decision.reason == "competing_run_ownership"
-    assert decision.run_id == "run-failed"
+    assert decision.run_id == "run-a"
     assert decision.mutating is False
 
 
-def test_triage_starts_single_launchable_plan_with_concierge_defaults() -> None:
-    observation = _observation(plans=[_plan()], issues=[_issue()])
+def test_triage_reports_two_admissible_lineage_leaves() -> None:
+    decision = triage_tick(
+        _observation(
+            runs=[
+                _run(
+                    run_id="run-root",
+                    status="completed",
+                    plan_path="plans/in-progress/alpha.md",
+                ),
+                _run(
+                    run_id="run-a",
+                    status="failed",
+                    plan_path="plans/in-progress/alpha.md",
+                    restarted_from_run_id="run-root",
+                ),
+                _run(
+                    run_id="run-b",
+                    status="failed",
+                    plan_path="plans/in-progress/alpha.md",
+                    restarted_from_run_id="run-root",
+                ),
+            ],
+            plans=[_plan(path="plans/in-progress/alpha.md", status="in_progress")],
+        )
+    )
+    assert decision.action == "report"
+    assert decision.reason == "ambiguous_run_lineage"
+    assert decision.plan_path == "plans/in-progress/alpha.md"
+    assert decision.mutating is False
+
+
+def test_triage_reports_unproven_multi_run_lineage() -> None:
+    decision = triage_tick(
+        _observation(
+            runs=[
+                _run(
+                    run_id="run-a",
+                    status="failed",
+                    plan_path="plans/in-progress/alpha.md",
+                ),
+                _run(
+                    run_id="run-b",
+                    status="failed",
+                    plan_path="plans/in-progress/alpha.md",
+                ),
+            ],
+            plans=[_plan(path="plans/in-progress/alpha.md", status="in_progress")],
+        )
+    )
+    assert decision.action == "report"
+    assert decision.reason == "ambiguous_run_lineage"
+    assert decision.plan_path == "plans/in-progress/alpha.md"
+    assert decision.mutating is False
+
+
+def test_triage_starts_single_ready_plan_with_concierge_defaults() -> None:
+    observation = _observation(
+        plans=[
+            _plan(
+                path="plans/in-progress/alpha.md",
+                status="in_progress",
+            )
+        ],
+        issues=[_issue()],
+        plan_documents={"plans/in-progress/alpha.md": "### [ ] Checkpoint 1: finish"},
+        queue=_queue(_queue_row(path="plans/in-progress/alpha.md")),
+    )
     decision = triage_tick(observation)
     assert decision.action == "start"
-    assert decision.reason == "single_launchable_plan"
-    assert decision.plan_path == "plans/todo/alpha.md"
+    assert decision.reason == "ready_plan"
+    assert decision.plan_path == "plans/in-progress/alpha.md"
     assert decision.workflow_name == CONCIERGE_WORKFLOW_NAME
     assert decision.team == CONCIERGE_TEAM
     assert decision.idempotency_key is not None
@@ -1390,18 +1673,34 @@ def test_triage_starts_single_launchable_plan_with_concierge_defaults() -> None:
     assert decision.mutating is True
 
 
-def test_triage_reports_multiple_launchable_plans() -> None:
+def test_triage_selects_one_ready_plan_among_multiple() -> None:
     observation = _observation(
         plans=[
-            _plan(path="plans/todo/alpha.md"),
-            _plan(path="plans/todo/beta.md"),
-        ]
+            _plan(
+                path="plans/in-progress/alpha.md",
+                status="in_progress",
+                modified_at="2026-01-02T00:00:00Z",
+            ),
+            _plan(
+                path="plans/in-progress/beta.md",
+                status="in_progress",
+                modified_at="2026-01-01T00:00:00Z",
+            ),
+        ],
+        plan_documents={
+            "plans/in-progress/alpha.md": "### [ ] Checkpoint 1: finish alpha",
+            "plans/in-progress/beta.md": "### [ ] Checkpoint 1: finish beta",
+        },
+        queue=_queue(
+            _queue_row(path="plans/in-progress/alpha.md"),
+            _queue_row(path="plans/in-progress/beta.md"),
+        ),
     )
     decision = triage_tick(observation)
-    assert decision.action == "report"
-    assert decision.reason == "multiple_launchable_plans"
-    assert decision.plan_path == "plans/todo/alpha.md"
-    assert decision.mutating is False
+    assert decision.action == "start"
+    assert decision.reason == "ready_plan"
+    assert decision.plan_path == "plans/in-progress/beta.md"
+    assert decision.mutating is True
 
 
 def test_triage_does_not_start_a_plan_already_referenced_by_a_run() -> None:
@@ -1418,11 +1717,71 @@ def test_triage_does_not_start_a_plan_already_referenced_by_a_run() -> None:
 def test_triage_treats_in_progress_plan_as_not_launchable() -> None:
     decision = triage_tick(
         _observation(
-            plans=[_plan(path="plans/in-progress/alpha.md", status="in_progress")]
+            plans=[_plan(path="plans/in-progress/alpha.md", status="in_progress")],
+            plan_documents={"plans/in-progress/alpha.md": "### [x] Checkpoint 1: done"},
         )
     )
     assert decision.action == "idle"
     assert decision.reason == "no_eligible_work"
+
+
+def test_triage_ready_start_requires_unchecked_strict_checkpoint_heading() -> None:
+    # A completed checkpoint plus only an owner-acceptance item is not
+    # runnable checkpoint work.
+    decision = triage_tick(
+        _observation(
+            plans=[_plan(path="plans/in-progress/alpha.md", status="in_progress")],
+            plan_documents={
+                "plans/in-progress/alpha.md": (
+                    "### [x] Checkpoint 1: Done\n"
+                    "\n"
+                    "## User Acceptance Pending\n"
+                    "\n"
+                    "- [ ] owner accepts the result\n"
+                )
+            },
+        )
+    )
+    assert decision.action == "idle"
+    assert decision.reason == "no_eligible_work"
+    assert decision.idempotency_key is None
+
+
+def test_triage_recovery_requires_unchecked_strict_checkpoint_heading() -> None:
+    observation = _observation(
+        runs=[
+            _run(
+                run_id="run-failed",
+                status="failed",
+                plan_path="plans/in-progress/alpha.md",
+            )
+        ],
+        plans=[_plan(path="plans/in-progress/alpha.md", status="in_progress")],
+        plan_documents={
+            "plans/in-progress/alpha.md": (
+                "### [x] Checkpoint 1: Done\n"
+                "\n"
+                "## User Acceptance Pending\n"
+                "\n"
+                "- [ ] owner accepts the result\n"
+            )
+        },
+        run_details={
+            "run-failed": _run_detail(
+                run_id="run-failed",
+                status="failed",
+                plan_path="plans/in-progress/alpha.md",
+            )
+        },
+        run_contexts={"run-failed": _run_context()},
+    )
+    decision = triage_tick(observation)
+    # The lineage is quarantined with a bounded report, never resumed.
+    assert decision.action == "report"
+    assert decision.reason == "recovery_no_unchecked_checkpoint"
+    assert decision.run_id == "run-failed"
+    assert decision.idempotency_key is None
+    assert decision.mutating is False
 
 
 def test_triage_ignores_non_owner_issue() -> None:
@@ -1442,15 +1801,22 @@ def test_triage_ignores_closed_owner_issue() -> None:
 
 
 def test_triage_avoids_duplicate_plan_for_owner_issue() -> None:
-    # A launchable plan already mapped to the issue is started, not re-planned.
+    # A planned todo document mapped to the issue is not started directly and
+    # is not re-planned.
     decision = triage_tick(
         _observation(
             plans=[_plan(path="plans/todo/alpha.md")],
             issues=[_issue(number=7)],
+            plan_documents={
+                "plans/todo/alpha.md": (
+                    "Source: https://github.com/owner/repo/issues/7\n"
+                    "- [x] planned"
+                )
+            },
         )
     )
-    assert decision.action == "start"
-    assert decision.plan_path == "plans/todo/alpha.md"
+    assert decision.action == "idle"
+    assert decision.reason == "no_eligible_work"
     assert decision.issue_number is None
 
     # A non-launchable plan whose document references the issue blocks a
@@ -1474,20 +1840,22 @@ def test_triage_avoids_duplicate_plan_for_owner_issue() -> None:
 
 
 def test_triage_duplicate_detection_covers_all_evidence_statuses() -> None:
-    # A launchable todo plan mapped to the issue is started, never re-planned.
+    # A planned todo document mapped to the issue is never started directly or
+    # re-planned.
     decision = triage_tick(
         _observation(
             plans=[_plan(path="plans/todo/alpha.md", status="todo")],
             issues=[_issue(number=7)],
             plan_documents={
                 "plans/todo/alpha.md": (
-                    "Source: https://github.com/owner/repo/issues/7"
+                    "Source: https://github.com/owner/repo/issues/7\n"
+                    "- [x] planned"
                 )
             },
         )
     )
-    assert decision.action == "start"
-    assert decision.plan_path == "plans/todo/alpha.md"
+    assert decision.action == "idle"
+    assert decision.reason == "no_eligible_work"
 
     for directory, status in (
         ("in-progress", "in_progress"),
@@ -1576,16 +1944,38 @@ def test_triage_prefers_failed_lineage_over_plan_over_issue() -> None:
                 _plan(path="plans/todo/beta.md", status="todo"),
             ],
             issues=[_issue()],
+            plan_documents={"plans/in-progress/alpha.md": "### [ ] Checkpoint 1: finish"},
+            run_details={
+                "run-failed": _run_detail(
+                    run_id="run-failed",
+                    status="failed",
+                    plan_path="plans/in-progress/alpha.md",
+                )
+            },
+            run_contexts={"run-failed": _run_context()},
         )
     )
     assert decision.action == "resume"
     assert decision.run_id == "run-failed"
 
 
-def test_triage_prefers_launchable_plan_over_issue() -> None:
-    decision = triage_tick(_observation(plans=[_plan()], issues=[_issue()]))
+def test_triage_prefers_ready_plan_over_issue() -> None:
+    decision = triage_tick(
+        _observation(
+            plans=[
+                _plan(
+                    path="plans/in-progress/alpha.md",
+                    status="in_progress",
+                )
+            ],
+            issues=[_issue()],
+            plan_documents={"plans/in-progress/alpha.md": "### [ ] Checkpoint 1: finish"},
+            queue=_queue(_queue_row(path="plans/in-progress/alpha.md")),
+        )
+    )
     assert decision.action == "start"
-    assert decision.plan_path == "plans/todo/alpha.md"
+    assert decision.reason == "ready_plan"
+    assert decision.plan_path == "plans/in-progress/alpha.md"
 
 
 def test_triage_idle_when_nothing_is_eligible() -> None:
@@ -1617,6 +2007,996 @@ def test_triage_decision_fields_are_bounded() -> None:
     assert decision.workflow_name is None
     assert decision.team is None
     assert decision.mutating is False
+
+
+def test_triage_selects_unique_lineage_leaf_across_shuffled_rows() -> None:
+    rows = [
+        _run(
+            run_id="run-1",
+            status="completed",
+            plan_path="plans/in-progress/alpha.md",
+        ),
+        _run(
+            run_id="run-2",
+            status="failed",
+            plan_path="plans/in-progress/alpha.md",
+            restarted_from_run_id="run-1",
+        ),
+        _run(
+            run_id="run-3",
+            status="failed",
+            plan_path="plans/in-progress/alpha.md",
+            restarted_from_run_id="run-2",
+        ),
+    ]
+    observation = _observation(
+        runs=[rows[2], rows[0], rows[1]],
+        plans=[_plan(path="plans/in-progress/alpha.md", status="in_progress")],
+        plan_documents={"plans/in-progress/alpha.md": "### [ ] Checkpoint 1: finish"},
+        run_details={
+            "run-3": _run_detail(
+                run_id="run-3",
+                status="failed",
+                plan_path="plans/in-progress/alpha.md",
+            )
+        },
+        run_contexts={"run-3": _run_context()},
+    )
+    decision = triage_tick(observation)
+    assert decision.action == "resume"
+    assert decision.run_id == "run-3"
+    assert decision.plan_path == "plans/in-progress/alpha.md"
+
+
+def test_triage_uses_real_queue_readiness_for_ready_plans() -> None:
+    queue = {
+        "settings": {
+            "max_concurrent_implementations": 1,
+            "auto_consume_plans": False,
+        },
+        "capacity": {"available_slots": 1},
+        "plans": [
+            {
+                "path": "plans/in-progress/alpha.md",
+                "run_id": None,
+                "outcome": "automatic_disabled",
+                "dependency": None,
+                "revision": "3",
+            }
+        ],
+    }
+    decision = triage_tick(
+        _observation(
+            plans=[
+                _plan(
+                    path="plans/in-progress/alpha.md",
+                    status="in_progress",
+                    revision="3",
+                )
+            ],
+            plan_documents={"plans/in-progress/alpha.md": "### [ ] Checkpoint 1: finish"},
+            queue=queue,
+        )
+    )
+    assert decision.action == "start"
+    assert decision.plan_path == "plans/in-progress/alpha.md"
+
+    claimed_queue = dict(queue)
+    claimed_queue["plans"] = [
+        {
+            "path": "plans/in-progress/alpha.md",
+            "run_id": "run-claimed",
+            "outcome": "queued",
+            "dependency": None,
+            "revision": "3",
+        }
+    ]
+    decision = triage_tick(
+        _observation(
+            plans=[
+                _plan(
+                    path="plans/in-progress/alpha.md",
+                    status="in_progress",
+                    revision="3",
+                )
+            ],
+            plan_documents={"plans/in-progress/alpha.md": "### [ ] Checkpoint 1: finish"},
+            queue=claimed_queue,
+        )
+    )
+    assert decision.action == "report"
+    assert decision.reason == "queue_row_claimed"
+
+
+def test_triage_delivery_failure_admits_only_matching_repair() -> None:
+    sha = "a" * 40
+    delivery = {"state": "failed", "ci": "red", "live": "missing", "sha": sha}
+    observation = _observation(
+        runs=[
+            _run(
+                run_id="run-repair",
+                status="failed",
+                plan_path="plans/in-progress/alpha.md",
+            )
+        ],
+        plans=[
+            _plan(path="plans/in-progress/alpha.md", status="in_progress"),
+            _plan(path="plans/in-progress/beta.md", status="in_progress"),
+        ],
+        plan_documents={
+            "plans/in-progress/alpha.md": f"Repair CI for {sha}\n### [ ] Checkpoint 1: finish",
+            "plans/in-progress/beta.md": "### [ ] Checkpoint 1: finish",
+        },
+        run_details={
+            "run-repair": _run_detail(
+                run_id="run-repair",
+                status="failed",
+                plan_path="plans/in-progress/alpha.md",
+            )
+        },
+        run_contexts={
+            "run-repair": _run_context(
+                delivery=[{"stage": "CI", "status": "failed"}]
+            )
+        },
+        delivery=delivery,
+        delivery_sha=sha,
+    )
+    decision = triage_tick(observation)
+    assert decision.action == "resume"
+    assert decision.run_id == "run-repair"
+    assert decision.plan_path == "plans/in-progress/alpha.md"
+
+    unrelated = _observation(
+        plans=[
+            _plan(path="plans/in-progress/beta.md", status="in_progress"),
+        ],
+        plan_documents={"plans/in-progress/beta.md": "### [ ] Checkpoint 1: finish"},
+        delivery=delivery,
+        delivery_sha=sha,
+    )
+    decision = triage_tick(unrelated)
+    assert decision.action == "report"
+    assert decision.reason == "delivery_gate_failed"
+
+
+def test_triage_delivery_gate_requires_explicit_gate_term_not_substring() -> None:
+    sha = "a" * 40
+    delivery = {"state": "failed", "ci": "red", "live": "missing", "sha": sha}
+    # The exact SHA appears, and "ci" occurs inside "Decision", but no CI,
+    # live, or delivery term is referenced, so this is not a repair plan.
+    unrelated = _observation(
+        plans=[
+            _plan(path="plans/in-progress/beta.md", status="in_progress"),
+        ],
+        plan_documents={
+            "plans/in-progress/beta.md": (
+                f"Baseline SHA {sha}\n"
+                "Decision: implement pagination\n"
+                "### [ ] Checkpoint 1: finish\n"
+            )
+        },
+        delivery=delivery,
+        delivery_sha=sha,
+    )
+    decision = triage_tick(unrelated)
+    assert decision.action == "report"
+    assert decision.reason == "delivery_gate_failed"
+    assert decision.plan_path is None
+
+    # An explicit gate term next to the exact SHA still qualifies the plan.
+    matching = _observation(
+        plans=[
+            _plan(path="plans/in-progress/beta.md", status="in_progress"),
+        ],
+        plan_documents={
+            "plans/in-progress/beta.md": (
+                f"Repair continuous integration at {sha}\n"
+                "### [ ] Checkpoint 1: finish\n"
+            )
+        },
+        queue=_queue(_queue_row(path="plans/in-progress/beta.md")),
+        delivery=delivery,
+        delivery_sha=sha,
+    )
+    decision = triage_tick(matching)
+    assert decision.action == "start"
+    assert decision.reason == "ready_plan"
+    assert decision.plan_path == "plans/in-progress/beta.md"
+
+
+def test_triage_resumes_failed_delivery_lineage_without_sha_in_plan() -> None:
+    # The plan of a failed lineage predates the publication SHA, so it can
+    # never reference it. Structured context evidence of a failed CI stage
+    # plus the exact owned lineage authorizes the resume even while delivery
+    # is failed and the SHA is known.
+    sha = "b" * 40
+    delivery = {"state": "failed", "ci": "red", "live": "missing", "sha": sha}
+    decision = triage_tick(
+        _observation(
+            runs=[
+                _run(
+                    run_id="run-failed",
+                    activity="inactive",
+                    status="failed",
+                    plan_path="plans/in-progress/alpha.md",
+                )
+            ],
+            plans=[_plan(path="plans/in-progress/alpha.md", status="in_progress")],
+            plan_documents={
+                "plans/in-progress/alpha.md": "### [ ] Checkpoint 1: finish\n"
+            },
+            run_details={
+                "run-failed": _run_detail(
+                    run_id="run-failed",
+                    status="failed",
+                    plan_path="plans/in-progress/alpha.md",
+                )
+            },
+            run_contexts={
+                "run-failed": _run_context(
+                    delivery=[{"stage": "CI", "status": "failed"}]
+                )
+            },
+            delivery=delivery,
+            delivery_sha=sha,
+        )
+    )
+    assert decision.action == "resume"
+    assert decision.reason == "failed_lineage_resumable"
+    assert decision.run_id == "run-failed"
+    assert decision.plan_path == "plans/in-progress/alpha.md"
+
+
+def test_triage_delivery_gate_blocks_unrelated_lineage_and_ready_plan() -> None:
+    # The failed lineage has no structured publication/CI/live failure
+    # evidence, and the ready plan does not reference the failed SHA and
+    # gate, so neither is eligible and the tick reports the gate.
+    sha = "b" * 40
+    delivery = {"state": "failed", "ci": "red", "live": "missing", "sha": sha}
+    decision = triage_tick(
+        _observation(
+            runs=[
+                _run(
+                    run_id="run-failed",
+                    activity="inactive",
+                    status="failed",
+                    plan_path="plans/in-progress/alpha.md",
+                )
+            ],
+            plans=[
+                _plan(path="plans/in-progress/alpha.md", status="in_progress"),
+                _plan(path="plans/in-progress/beta.md", status="in_progress"),
+            ],
+            plan_documents={
+                "plans/in-progress/alpha.md": "### [ ] Checkpoint 1: finish\n",
+                "plans/in-progress/beta.md": "### [ ] Checkpoint 1: finish\n",
+            },
+            run_details={
+                "run-failed": _run_detail(
+                    run_id="run-failed",
+                    status="failed",
+                    plan_path="plans/in-progress/alpha.md",
+                )
+            },
+            run_contexts={"run-failed": _run_context()},
+            queue=_queue(_queue_row(path="plans/in-progress/beta.md")),
+            delivery=delivery,
+            delivery_sha=sha,
+        )
+    )
+    assert decision.action == "report"
+    assert decision.reason == "delivery_gate_failed"
+    assert decision.plan_path is None
+
+
+def test_triage_red_ci_gate_rejects_deploy_only_repair_plan() -> None:
+    # Production-shaped evidence: project_delivery reports a red exact-SHA
+    # CI run as state="failed", ci="red", live="missing". A ready plan that
+    # names the SHA but only deployment/publication does not identify the
+    # failed CI gate, so it stays blocked.
+    sha = "c" * 40
+    delivery = {"state": "failed", "ci": "red", "live": "missing", "sha": sha}
+    observation = _observation(
+        plans=[_plan(path="plans/in-progress/beta.md", status="in_progress")],
+        plan_documents={
+            "plans/in-progress/beta.md": (
+                f"Repair deployment and publication at {sha}\n"
+                "### [ ] Checkpoint 1: finish\n"
+            )
+        },
+        queue=_queue(_queue_row(path="plans/in-progress/beta.md")),
+        delivery=delivery,
+        delivery_sha=sha,
+    )
+    decision = triage_tick(observation)
+    assert decision.action == "report"
+    assert decision.reason == "delivery_gate_failed"
+    assert decision.plan_path is None
+
+
+def test_triage_red_ci_gate_admits_explicit_ci_repair_plan() -> None:
+    sha = "c" * 40
+    delivery = {"state": "failed", "ci": "red", "live": "missing", "sha": sha}
+    observation = _observation(
+        plans=[_plan(path="plans/in-progress/beta.md", status="in_progress")],
+        plan_documents={
+            "plans/in-progress/beta.md": (
+                f"Repair CI for {sha}\n"
+                "### [ ] Checkpoint 1: finish\n"
+            )
+        },
+        queue=_queue(_queue_row(path="plans/in-progress/beta.md")),
+        delivery=delivery,
+        delivery_sha=sha,
+    )
+    decision = triage_tick(observation)
+    assert decision.action == "start"
+    assert decision.reason == "ready_plan"
+    assert decision.plan_path == "plans/in-progress/beta.md"
+
+
+def test_triage_failed_deploy_gate_uses_live_gate() -> None:
+    # A failed deploy phase projects as state="failed" with a non-red CI
+    # and live="missing; the failed gate is the live release, so a plan
+    # naming the SHA and the deployment qualifies while a CI-only plan
+    # does not.
+    sha = "d" * 40
+    delivery = {"state": "failed", "ci": "green", "live": "missing", "sha": sha}
+    matching = _observation(
+        plans=[_plan(path="plans/in-progress/beta.md", status="in_progress")],
+        plan_documents={
+            "plans/in-progress/beta.md": (
+                f"Repair the live deployment at {sha}\n"
+                "### [ ] Checkpoint 1: finish\n"
+            )
+        },
+        queue=_queue(_queue_row(path="plans/in-progress/beta.md")),
+        delivery=delivery,
+        delivery_sha=sha,
+    )
+    decision = triage_tick(matching)
+    assert decision.action == "start"
+    assert decision.reason == "ready_plan"
+    assert decision.plan_path == "plans/in-progress/beta.md"
+
+    ci_only = _observation(
+        plans=[_plan(path="plans/in-progress/beta.md", status="in_progress")],
+        plan_documents={
+            "plans/in-progress/beta.md": (
+                f"Repair CI for {sha}\n"
+                "### [ ] Checkpoint 1: finish\n"
+            )
+        },
+        queue=_queue(_queue_row(path="plans/in-progress/beta.md")),
+        delivery=delivery,
+        delivery_sha=sha,
+    )
+    decision = triage_tick(ci_only)
+    assert decision.action == "report"
+    assert decision.reason == "delivery_gate_failed"
+    assert decision.plan_path is None
+
+
+def test_delivery_failure_gate_uses_projected_delivery_values() -> None:
+    assert _delivery_failure_gate(None) is None
+    assert (
+        _delivery_failure_gate(
+            {"state": "pending", "ci": "pending", "live": "missing"}
+        )
+        is None
+    )
+    assert (
+        _delivery_failure_gate({"state": "ok", "ci": "green", "live": "installed"})
+        is None
+    )
+    assert (
+        _delivery_failure_gate({"state": "failed", "ci": "red", "live": "missing"})
+        == "ci"
+    )
+    assert (
+        _delivery_failure_gate({"state": "failed", "ci": "red", "live": "installed"})
+        == "ci"
+    )
+    assert (
+        _delivery_failure_gate(
+            {"state": "failed", "ci": "green", "live": "missing"}
+        )
+        == "live"
+    )
+    assert (
+        _delivery_failure_gate(
+            {"state": "failed", "ci": "pending", "live": "missing"}
+        )
+        == "live"
+    )
+    assert (
+        _delivery_failure_gate(
+            {"state": "failed", "ci": "unknown", "live": "missing"}
+        )
+        == "delivery"
+    )
+
+
+def test_triage_missing_queue_row_cannot_authorize_start() -> None:
+    # A valid queue snapshot whose plans array omits the ready plan is a
+    # candidate-local evidence gap and never authorizes a fresh start.
+    decision = triage_tick(
+        _observation(
+            plans=[_plan(path="plans/in-progress/alpha.md", status="in_progress")],
+            plan_documents={
+                "plans/in-progress/alpha.md": "### [ ] Checkpoint 1: finish\n"
+            },
+            queue=_queue(),
+        )
+    )
+    assert decision.action == "report"
+    assert decision.reason == "queue_row_missing"
+    assert decision.plan_path == "plans/in-progress/alpha.md"
+
+
+def test_triage_missing_queue_row_keeps_independent_candidate_selectable() -> None:
+    # The missing queue row holds only its own candidate; an independent,
+    # complete ready plan remains selectable.
+    decision = triage_tick(
+        _observation(
+            plans=[
+                _plan(
+                    path="plans/in-progress/alpha.md",
+                    status="in_progress",
+                    modified_at="2026-01-01T00:00:00Z",
+                ),
+                _plan(
+                    path="plans/in-progress/beta.md",
+                    status="in_progress",
+                    modified_at="2026-01-02T00:00:00Z",
+                ),
+            ],
+            plan_documents={
+                "plans/in-progress/alpha.md": "### [ ] Checkpoint 1: finish\n",
+                "plans/in-progress/beta.md": "### [ ] Checkpoint 1: finish\n",
+            },
+            queue=_queue(_queue_row(path="plans/in-progress/beta.md")),
+        )
+    )
+    assert decision.action == "start"
+    assert decision.reason == "ready_plan"
+    assert decision.plan_path == "plans/in-progress/beta.md"
+
+
+def test_triage_owner_issue_ranking_is_independent_of_input_order() -> None:
+    issue = _issue(number=7, created_at="2026-09-01T00:00:00Z")
+    plans = [
+        _plan(
+            path="plans/in-progress/beta.md",
+            status="in_progress",
+            modified_at="2026-01-01T00:00:00Z",
+        ),
+        _plan(
+            path="plans/in-progress/alpha.md",
+            status="in_progress",
+            modified_at="2026-01-02T00:00:00Z",
+        ),
+    ]
+    documents = {
+        "plans/in-progress/alpha.md": (
+            "Source: https://github.com/owner/repo/issues/7\n### [ ] Checkpoint 1: finish"
+        ),
+        "plans/in-progress/beta.md": "### [ ] Checkpoint 1: finish",
+    }
+    for plan_order in (plans, list(reversed(plans))):
+        decision = triage_tick(
+            _observation(
+                plans=plan_order,
+                issues=[issue],
+                plan_documents=documents,
+                queue=_queue(
+                    _queue_row(path="plans/in-progress/alpha.md"),
+                    _queue_row(path="plans/in-progress/beta.md"),
+                ),
+            )
+        )
+        assert decision.action == "start"
+        assert decision.plan_path == "plans/in-progress/alpha.md"
+
+
+def test_triage_ready_plan_selection_is_independent_of_input_order() -> None:
+    plans = [
+        _plan(
+            path="plans/in-progress/alpha.md",
+            status="in_progress",
+            modified_at="2026-01-03T00:00:00Z",
+        ),
+        _plan(
+            path="plans/in-progress/beta.md",
+            status="in_progress",
+            modified_at="2026-01-01T00:00:00Z",
+        ),
+        _plan(
+            path="plans/in-progress/gamma.md",
+            status="in_progress",
+            modified_at="2026-01-02T00:00:00Z",
+        ),
+    ]
+    documents = {
+        "plans/in-progress/alpha.md": "### [ ] Checkpoint 1: finish alpha",
+        "plans/in-progress/beta.md": "### [ ] Checkpoint 1: finish beta",
+        "plans/in-progress/gamma.md": "### [ ] Checkpoint 1: finish gamma",
+    }
+    for plan_order in (plans, list(reversed(plans))):
+        decision = triage_tick(
+            _observation(
+                plans=plan_order,
+                plan_documents=documents,
+                queue=_queue(
+                    _queue_row(path="plans/in-progress/alpha.md"),
+                    _queue_row(path="plans/in-progress/beta.md"),
+                    _queue_row(path="plans/in-progress/gamma.md"),
+                ),
+            )
+        )
+        assert decision.action == "start"
+        assert decision.plan_path == "plans/in-progress/beta.md"
+
+
+def test_triage_keeps_safe_candidate_among_many_unsafe_lineages() -> None:
+    runs: list[dict[str, object]] = []
+    plans: list[dict[str, object]] = []
+    documents: dict[str, str] = {}
+    for index in range(30):
+        path = f"plans/in-progress/unsafe-{index:02d}.md"
+        runs.extend(
+            (
+                _run(
+                    run_id=f"unsafe-a-{index}",
+                    status="failed",
+                    plan_path=path,
+                ),
+                _run(
+                    run_id=f"unsafe-b-{index}",
+                    status="failed",
+                    plan_path=path,
+                ),
+            )
+        )
+        plans.append(_plan(path=path, status="in_progress"))
+        documents[path] = "### [ ] Checkpoint 1: finish\n"
+    safe_path = "plans/in-progress/safe.md"
+    plans.append(
+        _plan(
+            path=safe_path,
+            status="in_progress",
+            modified_at="2026-01-01T00:00:00Z",
+        )
+    )
+    documents[safe_path] = "### [ ] Checkpoint 1: finish\n"
+    decision = triage_tick(
+        _observation(
+            runs=list(reversed(runs)),
+            plans=list(reversed(plans)),
+            plan_documents=documents,
+            queue=_queue(_queue_row(path=safe_path)),
+        )
+    )
+    assert decision.action == "start"
+    assert decision.plan_path == safe_path
+
+
+def test_triage_context_lineage_selects_leaf_when_list_rows_omit_parent() -> None:
+    observation = _observation(
+        runs=[
+            _run(
+                run_id="run-child",
+                status="failed",
+                plan_path="plans/in-progress/alpha.md",
+            ),
+            _run(
+                run_id="run-parent",
+                status="completed",
+                plan_path="plans/in-progress/alpha.md",
+            ),
+        ],
+        plans=[_plan(path="plans/in-progress/alpha.md", status="in_progress")],
+        plan_documents={"plans/in-progress/alpha.md": "### [ ] Checkpoint 1: finish"},
+        run_details={
+            "run-child": _run_detail(
+                run_id="run-child",
+                status="failed",
+                plan_path="plans/in-progress/alpha.md",
+            )
+        },
+        run_contexts={
+            "run-child": _run_context(lineage_parent="run-parent")
+        },
+    )
+    decision = triage_tick(observation)
+    assert decision.action == "resume"
+    assert decision.run_id == "run-child"
+    assert decision.plan_path == "plans/in-progress/alpha.md"
+
+
+def test_triage_holds_lineage_with_missing_parent_and_keeps_independent_work() -> None:
+    # The declared parent is absent from the complete inventory, so the
+    # lineage identity cannot be proven; independent ready work stays
+    # selectable.
+    observation = _observation(
+        runs=[
+            _run(
+                run_id="run-child",
+                status="failed",
+                plan_path="plans/in-progress/alpha.md",
+                resumed_from_run_id="run-missing",
+            )
+        ],
+        plans=[
+            _plan(path="plans/in-progress/alpha.md", status="in_progress"),
+            _plan(
+                path="plans/in-progress/beta.md",
+                status="in_progress",
+                modified_at="2026-01-01T00:00:00Z",
+            ),
+        ],
+        plan_documents={
+            "plans/in-progress/alpha.md": "### [ ] Checkpoint 1: finish",
+            "plans/in-progress/beta.md": "### [ ] Checkpoint 1: finish",
+        },
+        run_details={
+            "run-child": _run_detail(
+                run_id="run-child",
+                status="failed",
+                plan_path="plans/in-progress/alpha.md",
+            )
+        },
+        run_contexts={"run-child": _run_context()},
+        queue=_queue(_queue_row(path="plans/in-progress/beta.md")),
+    )
+    decision = triage_tick(observation)
+    assert decision.action == "start"
+    assert decision.reason == "ready_plan"
+    assert decision.plan_path == "plans/in-progress/beta.md"
+    assert decision.run_id is None
+
+    # A parent that exists in the inventory but belongs to a different plan
+    # identity also fails to prove this lineage.
+    mismatched = _observation(
+        runs=[
+            _run(
+                run_id="run-child",
+                status="failed",
+                plan_path="plans/in-progress/alpha.md",
+                resumed_from_run_id="run-other",
+            ),
+            _run(
+                run_id="run-other",
+                status="completed",
+                plan_path="plans/in-progress/other.md",
+            ),
+        ],
+        plans=[
+            _plan(path="plans/in-progress/alpha.md", status="in_progress"),
+            _plan(
+                path="plans/in-progress/beta.md",
+                status="in_progress",
+                modified_at="2026-01-01T00:00:00Z",
+            ),
+        ],
+        plan_documents={
+            "plans/in-progress/alpha.md": "### [ ] Checkpoint 1: finish",
+            "plans/in-progress/beta.md": "### [ ] Checkpoint 1: finish",
+        },
+        run_details={
+            "run-child": _run_detail(
+                run_id="run-child",
+                status="failed",
+                plan_path="plans/in-progress/alpha.md",
+            )
+        },
+        run_contexts={"run-child": _run_context()},
+        queue=_queue(_queue_row(path="plans/in-progress/beta.md")),
+    )
+    decision = triage_tick(mismatched)
+    assert decision.action == "start"
+    assert decision.reason == "ready_plan"
+    assert decision.plan_path == "plans/in-progress/beta.md"
+    assert decision.run_id is None
+
+
+def test_triage_reports_lineage_cycle() -> None:
+    decision = triage_tick(
+        _observation(
+            runs=[
+                _run(
+                    run_id="run-a",
+                    status="failed",
+                    plan_path="plans/in-progress/alpha.md",
+                    restarted_from_run_id="run-b",
+                ),
+                _run(
+                    run_id="run-b",
+                    status="failed",
+                    plan_path="plans/in-progress/alpha.md",
+                    restarted_from_run_id="run-a",
+                ),
+            ],
+            plans=[_plan(path="plans/in-progress/alpha.md", status="in_progress")],
+        )
+    )
+    assert decision.action == "report"
+    assert decision.reason == "ambiguous_run_lineage"
+    assert decision.plan_path == "plans/in-progress/alpha.md"
+    assert decision.mutating is False
+
+
+def test_triage_reports_conflicting_queue_identity_for_recovery() -> None:
+    observation = _observation(
+        runs=[
+            _run(
+                run_id="run-failed",
+                status="failed",
+                plan_path="plans/in-progress/alpha.md",
+            )
+        ],
+        plans=[_plan(path="plans/in-progress/alpha.md", status="in_progress")],
+        plan_documents={"plans/in-progress/alpha.md": "### [ ] Checkpoint 1: finish"},
+        queue={
+            "plans": [
+                {
+                    "path": "plans/in-progress/alpha.md",
+                    "run_id": "run-other",
+                    "outcome": "claimed",
+                    "dependency": None,
+                    "revision": "1",
+                }
+            ]
+        },
+        run_details={
+            "run-failed": _run_detail(
+                run_id="run-failed",
+                status="failed",
+                plan_path="plans/in-progress/alpha.md",
+            )
+        },
+        run_contexts={"run-failed": _run_context()},
+    )
+    decision = triage_tick(observation)
+    assert decision.action == "report"
+    assert decision.reason == "queue_identity_conflict"
+    assert decision.run_id == "run-failed"
+    assert decision.plan_path == "plans/in-progress/alpha.md"
+    assert decision.mutating is False
+
+
+def test_triage_uses_original_plan_identity_for_recovery() -> None:
+    observation = _observation(
+        runs=[
+            _run(
+                run_id="run-failed",
+                status="failed",
+                plan_path="plans/in-progress/current.md",
+                original_plan_path="plans/in-progress/alpha.md",
+            )
+        ],
+        plans=[_plan(path="plans/in-progress/alpha.md", status="in_progress")],
+        plan_documents={"plans/in-progress/alpha.md": "### [ ] Checkpoint 1: finish"},
+        run_details={
+            "run-failed": _run_detail(
+                run_id="run-failed",
+                status="failed",
+                plan_path="plans/in-progress/current.md",
+                original_plan_path="plans/in-progress/alpha.md",
+            )
+        },
+        run_contexts={"run-failed": _run_context()},
+    )
+    decision = triage_tick(observation)
+    assert decision.action == "resume"
+    assert decision.run_id == "run-failed"
+    assert decision.plan_path == "plans/in-progress/alpha.md"
+
+
+def test_triage_does_not_resume_terminal_or_nonresumable_attempts() -> None:
+    runs: list[dict[str, object]] = []
+    plans: list[dict[str, object]] = []
+    documents: dict[str, str] = {}
+    run_details: dict[str, dict[str, object]] = {}
+    run_contexts: dict[str, dict[str, object]] = {}
+    for index, (can_resume, end_reason) in enumerate(
+        (
+            (True, "transition_end"),
+            (True, "transition_end"),
+            (False, None),
+            (False, None),
+        ),
+        start=1,
+    ):
+        path = f"plans/in-progress/attempt-{index}.md"
+        run_id = f"run-attempt-{index}"
+        runs.append(
+            _run(
+                run_id=run_id,
+                status="failed",
+                plan_path=path,
+                evidence={"can_resume": can_resume},
+            )
+        )
+        plans.append(_plan(path=path, status="in_progress"))
+        documents[path] = "### [ ] Checkpoint 1: finish\n"
+        run_details[run_id] = _run_detail(
+            run_id=run_id,
+            status="failed",
+            plan_path=path,
+            can_resume=can_resume,
+        )
+        run_contexts[run_id] = _run_context(end_reason=end_reason)
+    ready_path = "plans/in-progress/ready.md"
+    plans.append(_plan(path=ready_path, status="in_progress"))
+    documents[ready_path] = "### [ ] Checkpoint 1: finish\n"
+    decision = triage_tick(
+        _observation(
+            runs=runs,
+            plans=plans,
+            plan_documents=documents,
+            run_details=run_details,
+            run_contexts=run_contexts,
+            queue=_queue(_queue_row(path=ready_path)),
+        )
+    )
+    assert decision.action == "start"
+    assert decision.reason == "ready_plan"
+    assert decision.plan_path == ready_path
+    assert decision.run_id is None
+
+
+def test_triage_excludes_restart_required_recovery() -> None:
+    decision = triage_tick(
+        _observation(
+            runs=[
+                _run(
+                    run_id="run-restart",
+                    status="failed",
+                    plan_path="plans/in-progress/alpha.md",
+                )
+            ],
+            plans=[_plan(path="plans/in-progress/alpha.md", status="in_progress")],
+            plan_documents={"plans/in-progress/alpha.md": "### [ ] Checkpoint 1: finish"},
+            run_details={
+                "run-restart": _run_detail(
+                    run_id="run-restart",
+                    status="failed",
+                    plan_path="plans/in-progress/alpha.md",
+                )
+            },
+            run_contexts={
+                "run-restart": _run_context(
+                    metadata={"restart_required": True}
+                )
+            },
+        )
+    )
+    assert decision.action == "report"
+    assert decision.reason == "recovery_restart_required"
+    assert decision.run_id == "run-restart"
+    assert decision.mutating is False
+
+
+def test_triage_excludes_requeue_required_recovery() -> None:
+    decision = triage_tick(
+        _observation(
+            runs=[
+                _run(
+                    run_id="run-requeue",
+                    status="failed",
+                    plan_path="plans/in-progress/alpha.md",
+                )
+            ],
+            plans=[_plan(path="plans/in-progress/alpha.md", status="in_progress")],
+            plan_documents={"plans/in-progress/alpha.md": "### [ ] Checkpoint 1: finish"},
+            run_details={
+                "run-requeue": _run_detail(
+                    run_id="run-requeue",
+                    status="failed",
+                    plan_path="plans/in-progress/alpha.md",
+                )
+            },
+            run_contexts={
+                "run-requeue": _run_context(
+                    metadata={
+                        "control_safety": {
+                            "launch": "restart_required"
+                        }
+                    }
+                )
+            },
+        )
+    )
+    assert decision.action == "report"
+    assert decision.reason == "recovery_restart_required"
+    assert decision.run_id == "run-requeue"
+    assert decision.mutating is False
+
+
+def test_triage_excludes_owner_stopped_recovery() -> None:
+    decision = triage_tick(
+        _observation(
+            runs=[
+                _run(
+                    run_id="run-owner-stopped",
+                    status="stopped",
+                    plan_path="plans/in-progress/alpha.md",
+                )
+            ],
+            plans=[_plan(path="plans/in-progress/alpha.md", status="in_progress")],
+            plan_documents={"plans/in-progress/alpha.md": "### [ ] Checkpoint 1: finish"},
+            run_details={
+                "run-owner-stopped": _run_detail(
+                    run_id="run-owner-stopped",
+                    status="stopped",
+                    plan_path="plans/in-progress/alpha.md",
+                )
+            },
+            run_contexts={
+                "run-owner-stopped": _run_context(end_reason="owner_stopped")
+            },
+        )
+    )
+    assert decision.action == "report"
+    assert decision.reason == "recovery_owner_stopped"
+    assert decision.run_id == "run-owner-stopped"
+    assert decision.mutating is False
+
+
+def test_triage_does_not_resume_legacy_or_mismatched_recovery() -> None:
+    legacy = triage_tick(
+        _observation(
+            runs=[
+                _run(
+                    run_id="run-legacy",
+                    status="failed",
+                    plan_path="plans/in-progress/alpha.md",
+                    ownership="legacy",
+                )
+            ],
+            plans=[_plan(path="plans/in-progress/alpha.md", status="in_progress")],
+            plan_documents={"plans/in-progress/alpha.md": "### [ ] Checkpoint 1: finish"},
+            run_details={
+                "run-legacy": _run_detail(
+                    run_id="run-legacy",
+                    status="failed",
+                    plan_path="plans/in-progress/alpha.md",
+                    ownership="legacy",
+                )
+            },
+            run_contexts={"run-legacy": _run_context()},
+        )
+    )
+    assert legacy.action == "report"
+    assert legacy.reason == "recovery_ownership_unverified"
+    assert legacy.run_id == "run-legacy"
+
+    mismatch = triage_tick(
+        _observation(
+            runs=[
+                _run(
+                    run_id="run-mismatch",
+                    status="failed",
+                    plan_path="plans/in-progress/alpha.md",
+                )
+            ],
+            plans=[_plan(path="plans/in-progress/alpha.md", status="in_progress")],
+            plan_documents={"plans/in-progress/alpha.md": "### [ ] Checkpoint 1: finish"},
+            run_details={
+                "run-mismatch": _run_detail(
+                    run_id="run-mismatch",
+                    status="failed",
+                    plan_path="plans/in-progress/beta.md",
+                )
+            },
+            run_contexts={"run-mismatch": _run_context()},
+        )
+    )
+    assert mismatch.action == "report"
+    assert mismatch.reason == "recovery_plan_mismatch"
+    assert mismatch.run_id == "run-mismatch"
 
 
 # ---------------------------------------------------------------------------
@@ -1733,9 +3113,9 @@ def test_executor_defers_on_active_run_without_mutation(
 def test_executor_resumes_failed_lineage_with_idempotency(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    mcp = FakeMcp(
-        project_root=tmp_path,
-        runs=[
+    mcp = _recovery_mcp(
+        tmp_path,
+        [
             {
                 "run_id": "run-failed",
                 "activity": "inactive",
@@ -1744,8 +3124,6 @@ def test_executor_resumes_failed_lineage_with_idempotency(
                 "evidence": {"can_resume": True},
             }
         ],
-        plans=[{"path": "plans/in-progress/alpha.md", "status": "in_progress"}],
-        documents={"plans/in-progress/alpha.md": "# Plan\n"},
     )
     executor = _executor(tmp_path, monkeypatch, mcp=mcp)
     outcome = executor.execute(
@@ -1771,8 +3149,8 @@ def test_executor_start_blocked_without_publication_evidence(
 ) -> None:
     mcp = FakeMcp(
         project_root=tmp_path,
-        plans=[{"path": "plans/todo/alpha.md", "status": "todo"}],
-        documents={"plans/todo/alpha.md": "# Plan\n"},
+        plans=[{"path": "plans/in-progress/alpha.md", "status": "in_progress"}],
+        documents={"plans/in-progress/alpha.md": "### [ ] Checkpoint 1: step\n"},
     )
     executor = _executor(tmp_path, monkeypatch, mcp=mcp)
     outcome = executor.execute(
@@ -1794,8 +3172,8 @@ def test_executor_start_eligible_plan_starts_once(
 ) -> None:
     mcp = FakeMcp(
         project_root=tmp_path,
-        plans=[{"path": "plans/todo/alpha.md", "status": "todo"}],
-        documents={"plans/todo/alpha.md": "# Plan\n"},
+        plans=[{"path": "plans/in-progress/alpha.md", "status": "in_progress"}],
+        documents={"plans/in-progress/alpha.md": "### [ ] Checkpoint 1: step\n"},
         publication=_publication_projection(
             available=True, remote="origin", branch="main"
         ),
@@ -1839,8 +3217,8 @@ def test_executor_start_blocked_with_wrong_publication_values(
 ) -> None:
     mcp = FakeMcp(
         project_root=tmp_path,
-        plans=[{"path": "plans/todo/alpha.md", "status": "todo"}],
-        documents={"plans/todo/alpha.md": "# Plan\n"},
+        plans=[{"path": "plans/in-progress/alpha.md", "status": "in_progress"}],
+        documents={"plans/in-progress/alpha.md": "### [ ] Checkpoint 1: step\n"},
         publication=publication,
     )
     executor = _executor(tmp_path, monkeypatch, mcp=mcp)
@@ -2067,9 +3445,9 @@ def test_executor_aborts_when_duplicate_appears_before_create(
 def test_executor_resume_timeout_reconciles_active_run(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    mcp = FakeMcp(
-        project_root=tmp_path,
-        runs=[
+    mcp = _recovery_mcp(
+        tmp_path,
+        [
             {
                 "run_id": "run-failed",
                 "activity": "inactive",
@@ -2078,13 +3456,17 @@ def test_executor_resume_timeout_reconciles_active_run(
                 "evidence": {"can_resume": True},
             }
         ],
-        plans=[{"path": "plans/in-progress/alpha.md", "status": "in_progress"}],
-        documents={"plans/in-progress/alpha.md": "# Plan\n"},
     )
     mcp.failures["resume_run"] = ConciergeError("mcp_call_failed")
-    mcp.pre_failures["resume_run"] = lambda: mcp.runs[0].update(
-        {"activity": "active", "status": "running"}
-    )
+
+    def activate_run() -> None:
+        mcp.runs[0].update({"activity": "active", "status": "running"})
+        if mcp.get_run_payloads is not None:
+            mcp.get_run_payloads["run-failed"].update(
+                {"activity": "active", "status": "running"}
+            )
+
+    mcp.pre_failures["resume_run"] = activate_run
     executor = _executor(tmp_path, monkeypatch, mcp=mcp)
     outcome = executor.execute(
         state_dir=tmp_path / "state",
@@ -2101,8 +3483,8 @@ def test_executor_start_timeout_reconciles_active_run(
 ) -> None:
     mcp = FakeMcp(
         project_root=tmp_path,
-        plans=[{"path": "plans/todo/alpha.md", "status": "todo"}],
-        documents={"plans/todo/alpha.md": "# Plan\n"},
+        plans=[{"path": "plans/in-progress/alpha.md", "status": "in_progress"}],
+        documents={"plans/in-progress/alpha.md": "### [ ] Checkpoint 1: step\n"},
         publication=_publication_projection(available=True, remote="origin", branch="main"),
     )
     mcp.failures["start_run"] = ConciergeError("mcp_call_failed")
@@ -2111,7 +3493,7 @@ def test_executor_start_timeout_reconciles_active_run(
             "run_id": "run-late",
             "activity": "active",
             "status": "running",
-            "plan_path": "plans/todo/alpha.md",
+            "plan_path": "plans/in-progress/alpha.md",
         }
     )
     executor = _executor(tmp_path, monkeypatch, mcp=mcp)
@@ -2272,8 +3654,8 @@ def test_executor_start_reports_unsafe_preflight(
 ) -> None:
     mcp = FakeMcp(
         project_root=tmp_path,
-        plans=[{"path": "plans/todo/alpha.md", "status": "todo"}],
-        documents={"plans/todo/alpha.md": "# Plan\n"},
+        plans=[{"path": "plans/in-progress/alpha.md", "status": "in_progress"}],
+        documents={"plans/in-progress/alpha.md": "### [ ] Checkpoint 1: step\n"},
         preflight=preflight,
     )
     executor = _executor(tmp_path, monkeypatch, mcp=mcp)
@@ -2295,8 +3677,8 @@ def test_executor_start_reports_startup_question_without_unit(
 ) -> None:
     mcp = FakeMcp(
         project_root=tmp_path,
-        plans=[{"path": "plans/todo/alpha.md", "status": "todo"}],
-        documents={"plans/todo/alpha.md": "# Plan\n"},
+        plans=[{"path": "plans/in-progress/alpha.md", "status": "in_progress"}],
+        documents={"plans/in-progress/alpha.md": "### [ ] Checkpoint 1: step\n"},
         start_payload={
             "startup_question": {
                 "question_id": "q1",
@@ -2329,8 +3711,8 @@ def test_executor_start_reports_invalid_start_result(
 ) -> None:
     mcp = FakeMcp(
         project_root=tmp_path,
-        plans=[{"path": "plans/todo/alpha.md", "status": "todo"}],
-        documents={"plans/todo/alpha.md": "# Plan\n"},
+        plans=[{"path": "plans/in-progress/alpha.md", "status": "in_progress"}],
+        documents={"plans/in-progress/alpha.md": "### [ ] Checkpoint 1: step\n"},
         start_payload={"result": {"created": True}},
         publication=_publication_projection(available=True, remote="origin", branch="main"),
     )
@@ -2351,8 +3733,8 @@ def test_executor_start_reports_missing_capabilities_evidence(
 ) -> None:
     mcp = FakeMcp(
         project_root=tmp_path,
-        plans=[{"path": "plans/todo/alpha.md", "status": "todo"}],
-        documents={"plans/todo/alpha.md": "# Plan\n"},
+        plans=[{"path": "plans/in-progress/alpha.md", "status": "in_progress"}],
+        documents={"plans/in-progress/alpha.md": "### [ ] Checkpoint 1: step\n"},
     )
     mcp.failures["get_project_capabilities"] = ConciergeError("mcp_call_failed")
     executor = _executor(tmp_path, monkeypatch, mcp=mcp)
@@ -2382,8 +3764,8 @@ def test_executor_start_reports_contradictory_scheduling(
 ) -> None:
     mcp = FakeMcp(
         project_root=tmp_path,
-        plans=[{"path": "plans/todo/alpha.md", "status": "todo"}],
-        documents={"plans/todo/alpha.md": "# Plan\n"},
+        plans=[{"path": "plans/in-progress/alpha.md", "status": "in_progress"}],
+        documents={"plans/in-progress/alpha.md": "### [ ] Checkpoint 1: step\n"},
         auto_consume_plans=auto_consume_plans,
         max_concurrent_implementations=max_concurrent_implementations,
     )
@@ -2404,8 +3786,8 @@ def test_executor_start_blocked_when_global_config_unreadable(
 ) -> None:
     mcp = FakeMcp(
         project_root=tmp_path,
-        plans=[{"path": "plans/todo/alpha.md", "status": "todo"}],
-        documents={"plans/todo/alpha.md": "# Plan\n"},
+        plans=[{"path": "plans/in-progress/alpha.md", "status": "in_progress"}],
+        documents={"plans/in-progress/alpha.md": "### [ ] Checkpoint 1: step\n"},
     )
     mcp.failures["get_global_config"] = ConciergeError("mcp_call_failed")
     executor = _executor(tmp_path, monkeypatch, mcp=mcp)
@@ -2468,8 +3850,8 @@ def test_executor_start_blocked_when_workflow_lifecycle_unverified(
 ) -> None:
     mcp = FakeMcp(
         project_root=tmp_path,
-        plans=[{"path": "plans/todo/alpha.md", "status": "todo"}],
-        documents={"plans/todo/alpha.md": "# Plan\n"},
+        plans=[{"path": "plans/in-progress/alpha.md", "status": "in_progress"}],
+        documents={"plans/in-progress/alpha.md": "### [ ] Checkpoint 1: step\n"},
         global_config=global_config,
     )
     executor = _executor(tmp_path, monkeypatch, mcp=mcp)
@@ -2487,9 +3869,9 @@ def test_executor_start_blocked_when_workflow_lifecycle_unverified(
 def test_executor_resume_not_admitted_when_can_resume_false(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    mcp = FakeMcp(
-        project_root=tmp_path,
-        runs=[
+    mcp = _recovery_mcp(
+        tmp_path,
+        [
             {
                 "run_id": "run-failed",
                 "activity": "inactive",
@@ -2498,8 +3880,6 @@ def test_executor_resume_not_admitted_when_can_resume_false(
                 "evidence": {"can_resume": False},
             }
         ],
-        plans=[{"path": "plans/in-progress/alpha.md", "status": "in_progress"}],
-        documents={"plans/in-progress/alpha.md": "# Plan\n"},
     )
     executor = _executor(tmp_path, monkeypatch, mcp=mcp)
     outcome = executor.execute(
@@ -2508,7 +3888,7 @@ def test_executor_resume_not_admitted_when_can_resume_false(
         environment=ENVIRONMENT,
     )
     assert outcome.action == "report"
-    assert outcome.reason == "resume_not_admitted"
+    assert outcome.reason == "recovery_evidence_incomplete"
     assert outcome.mutating is False
     assert "resume_run" not in mcp.call_names()
     assert mcp.runs[0]["activity"] == "inactive"
@@ -2517,9 +3897,9 @@ def test_executor_resume_not_admitted_when_can_resume_false(
 def test_executor_resume_not_admitted_on_lineage_mismatch(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    mcp = FakeMcp(
-        project_root=tmp_path,
-        runs=[
+    mcp = _recovery_mcp(
+        tmp_path,
+        [
             {
                 "run_id": "run-failed",
                 "activity": "inactive",
@@ -2527,16 +3907,12 @@ def test_executor_resume_not_admitted_on_lineage_mismatch(
                 "plan_path": "plans/in-progress/alpha.md",
             }
         ],
-        plans=[{"path": "plans/in-progress/alpha.md", "status": "in_progress"}],
-        documents={"plans/in-progress/alpha.md": "# Plan\n"},
         get_run_payloads={
-            "run-failed": {
-                "run_id": "run-failed",
-                "activity": "inactive",
-                "status": "failed",
-                "plan_path": "plans/in-progress/other.md",
-                "evidence": {"can_resume": True},
-            }
+            "run-failed": _run_detail(
+                run_id="run-failed",
+                status="failed",
+                plan_path="plans/in-progress/other.md",
+            )
         },
     )
     executor = _executor(tmp_path, monkeypatch, mcp=mcp)
@@ -2546,7 +3922,7 @@ def test_executor_resume_not_admitted_on_lineage_mismatch(
         environment=ENVIRONMENT,
     )
     assert outcome.action == "report"
-    assert outcome.reason == "resume_not_admitted"
+    assert outcome.reason == "recovery_plan_mismatch"
     assert outcome.mutating is False
     assert "resume_run" not in mcp.call_names()
 
@@ -2566,7 +3942,7 @@ def test_executor_resume_not_admitted_when_get_run_unavailable(
             }
         ],
         plans=[{"path": "plans/in-progress/alpha.md", "status": "in_progress"}],
-        documents={"plans/in-progress/alpha.md": "# Plan\n"},
+        documents={"plans/in-progress/alpha.md": "### [ ] Checkpoint 1: step\n"},
     )
     mcp.failures["get_run"] = ConciergeError("mcp_call_failed")
     executor = _executor(tmp_path, monkeypatch, mcp=mcp)
@@ -2576,7 +3952,7 @@ def test_executor_resume_not_admitted_when_get_run_unavailable(
         environment=ENVIRONMENT,
     )
     assert outcome.action == "report"
-    assert outcome.reason == "resume_not_admitted"
+    assert outcome.reason == "recovery_detail_unavailable"
     assert outcome.mutating is False
     assert "resume_run" not in mcp.call_names()
 
@@ -2657,6 +4033,112 @@ def test_executor_plan_and_start_aborts_on_claim_during_planning(
     names = mcp.call_names()
     assert "create_plan" not in names
     assert "start_run" not in names
+
+
+def test_executor_start_aborts_when_ready_plan_changes_before_launch(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    mcp = FakeMcp(
+        project_root=tmp_path,
+        plans=[
+            _plan(path="plans/in-progress/alpha.md", status="in_progress")
+        ],
+        documents={"plans/in-progress/alpha.md": "### [ ] Checkpoint 1: step\n"},
+    )
+    original_call_tool = mcp.call_tool
+    queue_calls = 0
+
+    def call_tool(name: str, args: Mapping[str, object]) -> Mapping[str, object]:
+        nonlocal queue_calls
+        payload = original_call_tool(name, args)
+        if name == "get_project_queue":
+            queue_calls += 1
+            if queue_calls == 1:
+                mcp.plans[0]["path"] = "plans/done/alpha.md"
+                mcp.plans[0]["status"] = "done"
+                del mcp.documents["plans/in-progress/alpha.md"]
+                mcp.documents["plans/done/alpha.md"] = "- [x] done\n"
+        return payload
+
+    mcp.call_tool = call_tool
+    executor = _executor(tmp_path, monkeypatch, mcp=mcp)
+    outcome = executor.execute(
+        state_dir=tmp_path / "state",
+        project_root=tmp_path,
+        environment=ENVIRONMENT,
+    )
+    assert outcome.action == "report"
+    assert outcome.reason == "state_changed_before_action"
+    assert outcome.mutating is False
+    assert "start_run" not in mcp.call_names()
+
+
+def test_executor_start_aborts_when_plan_revision_changes_before_launch(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    mcp = FakeMcp(
+        project_root=tmp_path,
+        plans=[
+            _plan(path="plans/in-progress/alpha.md", status="in_progress")
+        ],
+        documents={"plans/in-progress/alpha.md": "### [ ] Checkpoint 1: step\n"},
+    )
+    original_call_tool = mcp.call_tool
+    queue_calls = 0
+
+    def call_tool(name: str, args: Mapping[str, object]) -> Mapping[str, object]:
+        nonlocal queue_calls
+        payload = original_call_tool(name, args)
+        if name == "get_project_queue":
+            queue_calls += 1
+            if queue_calls == 1:
+                mcp.revisions["plans/in-progress/alpha.md"] = "2"
+        return payload
+
+    mcp.call_tool = call_tool
+    executor = _executor(tmp_path, monkeypatch, mcp=mcp)
+    outcome = executor.execute(
+        state_dir=tmp_path / "state",
+        project_root=tmp_path,
+        environment=ENVIRONMENT,
+    )
+    assert outcome.action == "report"
+    assert outcome.reason == "state_changed_before_action"
+    assert outcome.mutating is False
+    assert "start_run" not in mcp.call_names()
+
+
+def test_executor_resume_aborts_when_plan_revision_changes_before_resume(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    mcp = _recovery_mcp(
+        tmp_path,
+        [_failed_run(reason_code="worker_failed")],
+        documents={"plans/in-progress/alpha.md": "### [ ] Checkpoint 1: step\n"},
+    )
+    original_call_tool = mcp.call_tool
+    queue_calls = 0
+
+    def call_tool(name: str, args: Mapping[str, object]) -> Mapping[str, object]:
+        nonlocal queue_calls
+        payload = original_call_tool(name, args)
+        if name == "get_project_queue":
+            queue_calls += 1
+            if queue_calls == 1:
+                mcp.revisions["plans/in-progress/alpha.md"] = "2"
+        return payload
+
+    mcp.call_tool = call_tool
+    executor = _executor(tmp_path, monkeypatch, mcp=mcp)
+    outcome = executor.execute(
+        state_dir=tmp_path / "state",
+        project_root=tmp_path,
+        environment=ENVIRONMENT,
+    )
+    assert outcome.action == "report"
+    assert outcome.reason == "state_changed_before_action"
+    assert outcome.mutating is False
+    assert "resume_run" not in mcp.call_names()
 
 
 def test_executor_reports_github_evidence_gap(
@@ -3025,12 +4507,7 @@ def test_project_delivery_reports_live_release_separately_from_ci() -> None:
 def test_executor_does_not_file_generic_startup_failure(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    mcp = FakeMcp(
-        project_root=tmp_path,
-        runs=[_failed_run(reason_code="startup_failed")],
-        plans=[{"path": "plans/in-progress/alpha.md", "status": "in_progress"}],
-        documents={"plans/in-progress/alpha.md": "# Plan\n"},
-    )
+    mcp = _recovery_mcp(tmp_path, [_failed_run(reason_code="startup_failed")])
     github = FakeGithub()
     executor = _executor(tmp_path, monkeypatch, mcp=mcp, github=github)
     outcome = executor.execute(
@@ -3071,12 +4548,7 @@ def test_executor_files_one_new_confirmed_defect(
 def test_executor_continues_after_an_already_filed_defect(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    mcp = FakeMcp(
-        project_root=tmp_path,
-        runs=[_confirmed_run()],
-        plans=[{"path": "plans/in-progress/alpha.md", "status": "in_progress"}],
-        documents={"plans/in-progress/alpha.md": "# Plan\n"},
-    )
+    mcp = _recovery_mcp(tmp_path, [_confirmed_run()])
     evidence = classify_defect(_confirmed_run())
     assert evidence is not None
     fingerprint = defect_fingerprint(evidence)
@@ -3099,12 +4571,7 @@ def test_executor_continues_after_an_already_filed_defect(
 def test_executor_retained_defect_files_once_then_continues_on_later_tick(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    mcp = FakeMcp(
-        project_root=tmp_path,
-        runs=[_confirmed_run()],
-        plans=[{"path": "plans/in-progress/alpha.md", "status": "in_progress"}],
-        documents={"plans/in-progress/alpha.md": "# Plan\n"},
-    )
+    mcp = _recovery_mcp(tmp_path, [_confirmed_run()])
     github = FakeGithub()
     executor = _executor(tmp_path, monkeypatch, mcp=mcp, github=github)
     first = executor.execute(
@@ -3134,12 +4601,7 @@ def test_executor_files_one_issue_for_same_signature_across_runs(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     # First tick: run-1 confirms the defect and files exactly one issue.
-    mcp = FakeMcp(
-        project_root=tmp_path,
-        runs=[_confirmed_run(run_id="run-1")],
-        plans=[{"path": "plans/in-progress/alpha.md", "status": "in_progress"}],
-        documents={"plans/in-progress/alpha.md": "# Plan\n"},
-    )
+    mcp = _recovery_mcp(tmp_path, [_confirmed_run(run_id="run-1")])
     github = FakeGithub()
     executor = _executor(tmp_path, monkeypatch, mcp=mcp, github=github)
     first = executor.execute(
@@ -3150,12 +4612,7 @@ def test_executor_files_one_issue_for_same_signature_across_runs(
 
     # Second tick: a different run ID with the same trusted signature must
     # not file a duplicate.
-    mcp_later = FakeMcp(
-        project_root=tmp_path,
-        runs=[_confirmed_run(run_id="run-2")],
-        plans=[{"path": "plans/in-progress/alpha.md", "status": "in_progress"}],
-        documents={"plans/in-progress/alpha.md": "# Plan\n"},
-    )
+    mcp_later = _recovery_mcp(tmp_path, [_confirmed_run(run_id="run-2")])
     github.search_results = (
         {"number": 101, "body": github.created_issues[0][2]},
     )
@@ -3222,20 +4679,12 @@ def test_executor_continues_when_all_confirmed_signatures_are_filed(
     late = classify_defect(late_run)
     assert early is not None
     assert late is not None
-    mcp = FakeMcp(
-        project_root=tmp_path,
-        runs=[
+    mcp = _recovery_mcp(
+        tmp_path,
+        [
             _confirmed_run(run_id="run-a", signature="a" * 64),
             late_run,
         ],
-        plans=[
-            {"path": "plans/in-progress/alpha.md", "status": "in_progress"},
-            {"path": "plans/in-progress/beta.md", "status": "in_progress"},
-        ],
-        documents={
-            "plans/in-progress/alpha.md": "# Plan\n",
-            "plans/in-progress/beta.md": "# Plan\n",
-        },
     )
     github = FakeGithub(
         search_results=[
@@ -3331,12 +4780,7 @@ def test_executor_does_not_file_malformed_or_unconfirmed_failures(
     }
     cases.append(broken)
     for run in cases:
-        mcp = FakeMcp(
-            project_root=tmp_path,
-            runs=[run],
-            plans=[{"path": "plans/in-progress/alpha.md", "status": "in_progress"}],
-            documents={"plans/in-progress/alpha.md": "# Plan\n"},
-        )
+        mcp = _recovery_mcp(tmp_path, [run])
         github = FakeGithub()
         executor = _executor(tmp_path, monkeypatch, mcp=mcp, github=github)
         outcome = executor.execute(
@@ -3351,8 +4795,8 @@ def test_delivery_gate_blocks_start_on_failed_release(
 ) -> None:
     mcp = FakeMcp(
         project_root=tmp_path,
-        plans=[{"path": "plans/todo/alpha.md", "status": "todo"}],
-        documents={"plans/todo/alpha.md": "# Plan\n"},
+        plans=[{"path": "plans/in-progress/alpha.md", "status": "in_progress"}],
+        documents={"plans/in-progress/alpha.md": "### [ ] Checkpoint 1: step\n"},
         publication=_publication_projection(available=True, remote="origin", branch="main"),
     )
     gate = FakeDeliveryGate(DeliveryStatus(state="failed", ci="red", live="missing"))
@@ -3394,13 +4838,22 @@ def test_delivery_gate_blocks_plan_and_start_on_failed_release(
 def test_delivery_gate_does_not_block_resume(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    mcp = FakeMcp(
-        project_root=tmp_path,
-        runs=[_failed_run(reason_code="worker_failed")],
-        plans=[{"path": "plans/in-progress/alpha.md", "status": "in_progress"}],
-        documents={"plans/in-progress/alpha.md": "# Plan\n"},
+    sha = "f" * 40
+    mcp = _recovery_mcp(
+        tmp_path,
+        [_failed_run(reason_code="worker_failed")],
+        documents={
+            "plans/in-progress/alpha.md": f"Repair CI for {sha}\n### [ ] Checkpoint 1: step\n"
+        },
+        get_run_context_payloads={
+            "run-defect": _run_context(
+                delivery=[{"stage": "Publish", "status": "failed"}]
+            )
+        },
     )
-    gate = FakeDeliveryGate(DeliveryStatus(state="failed", ci="red", live="missing"))
+    gate = FakeDeliveryGate(
+        DeliveryStatus(state="failed", ci="red", live="missing", sha=sha)
+    )
     executor = _executor(tmp_path, monkeypatch, mcp=mcp, delivery_gate=gate)
     outcome = executor.execute(
         state_dir=tmp_path / "state", project_root=tmp_path, environment=ENVIRONMENT
@@ -3409,13 +4862,162 @@ def test_delivery_gate_does_not_block_resume(
     assert outcome.mutating is True
 
 
+def test_delivery_gate_allows_matching_ready_repair_start(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    sha = "f" * 40
+    mcp = FakeMcp(
+        project_root=tmp_path,
+        plans=[{"path": "plans/in-progress/alpha.md", "status": "in_progress"}],
+        documents={
+            "plans/in-progress/alpha.md": f"Repair CI for {sha}\n### [ ] Checkpoint 1: step\n"
+        },
+        publication=_publication_projection(
+            available=True, remote="origin", branch="main"
+        ),
+    )
+    gate = FakeDeliveryGate(
+        DeliveryStatus(state="failed", ci="red", live="missing", sha=sha)
+    )
+    executor = _executor(tmp_path, monkeypatch, mcp=mcp, delivery_gate=gate)
+    outcome = executor.execute(
+        state_dir=tmp_path / "state", project_root=tmp_path, environment=ENVIRONMENT
+    )
+    assert outcome.action == "start"
+    assert outcome.reason == "started"
+    assert outcome.mutating is True
+    assert mcp.call_names().count("start_run") == 1
+
+
+def test_delivery_gate_still_blocks_unrelated_ready_plan(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    sha = "f" * 40
+    mcp = FakeMcp(
+        project_root=tmp_path,
+        plans=[{"path": "plans/in-progress/alpha.md", "status": "in_progress"}],
+        documents={"plans/in-progress/alpha.md": "### [ ] Checkpoint 1: step\n"},
+        publication=_publication_projection(
+            available=True, remote="origin", branch="main"
+        ),
+    )
+    gate = FakeDeliveryGate(
+        DeliveryStatus(state="failed", ci="red", live="missing", sha=sha)
+    )
+    executor = _executor(tmp_path, monkeypatch, mcp=mcp, delivery_gate=gate)
+    outcome = executor.execute(
+        state_dir=tmp_path / "state", project_root=tmp_path, environment=ENVIRONMENT
+    )
+    assert outcome.action == "report"
+    assert outcome.reason == "delivery_gate_failed"
+    assert outcome.mutating is False
+    assert "start_run" not in mcp.call_names()
+
+
+def test_delivery_gate_red_ci_rejects_deploy_only_repair_plan(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Production-shaped red CI evidence must not admit a ready plan that
+    # names the SHA but only deployment/publication: the tick reports the
+    # failed CI gate and attempts zero start writes.
+    sha = "c" * 40
+    mcp = FakeMcp(
+        project_root=tmp_path,
+        plans=[{"path": "plans/in-progress/alpha.md", "status": "in_progress"}],
+        documents={
+            "plans/in-progress/alpha.md": (
+                f"Repair deployment and publication at {sha}\n"
+                "### [ ] Checkpoint 1: step\n"
+            )
+        },
+        publication=_publication_projection(
+            available=True, remote="origin", branch="main"
+        ),
+    )
+    gate = FakeDeliveryGate(
+        DeliveryStatus(state="failed", ci="red", live="missing", sha=sha)
+    )
+    executor = _executor(tmp_path, monkeypatch, mcp=mcp, delivery_gate=gate)
+    outcome = executor.execute(
+        state_dir=tmp_path / "state", project_root=tmp_path, environment=ENVIRONMENT
+    )
+    assert outcome.action == "report"
+    assert outcome.reason == "delivery_gate_failed"
+    assert outcome.mutating is False
+    assert outcome.details["delivery_ci"] == "red"
+    assert "start_run" not in mcp.call_names()
+
+
+def test_executor_resumes_failed_delivery_predecessor_without_sha_in_plan(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The predecessor's plan predates the publication SHA and never mentions
+    # it, so the exact-SHA document requirement must not block the resume.
+    sha = "f" * 40
+    mcp = _recovery_mcp(
+        tmp_path,
+        [_failed_run(reason_code="worker_failed")],
+        documents={
+            "plans/in-progress/alpha.md": "### [ ] Checkpoint 1: step\n"
+        },
+        get_run_context_payloads={
+            "run-defect": _run_context(
+                delivery=[{"stage": "CI", "status": "failed"}]
+            )
+        },
+    )
+    gate = FakeDeliveryGate(
+        DeliveryStatus(state="failed", ci="red", live="missing", sha=sha)
+    )
+    executor = _executor(tmp_path, monkeypatch, mcp=mcp, delivery_gate=gate)
+    outcome = executor.execute(
+        state_dir=tmp_path / "state", project_root=tmp_path, environment=ENVIRONMENT
+    )
+    assert outcome.action == "resume"
+    assert outcome.reason == "resumed"
+    assert outcome.mutating is True
+
+
+def test_executor_missing_queue_row_cannot_authorize_start(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The plan is present in the lifecycle inventory, but the queue snapshot
+    # omits its row. The executor must report the gap and perform no start
+    # write.
+    mcp = FakeMcp(
+        project_root=tmp_path,
+        plans=[{"path": "plans/in-progress/alpha.md", "status": "in_progress"}],
+        documents={"plans/in-progress/alpha.md": "### [ ] Checkpoint 1: step\n"},
+        publication=_publication_projection(
+            available=True, remote="origin", branch="main"
+        ),
+        queue={
+            "project_id": "p1",
+            "settings": {
+                "auto_consume_plans": False,
+                "max_concurrent_implementations": 1,
+            },
+            "capacity": {"limit": 1, "active_count": 0, "available_slots": 1},
+            "plans": [],
+        },
+    )
+    executor = _executor(tmp_path, monkeypatch, mcp=mcp)
+    outcome = executor.execute(
+        state_dir=tmp_path / "state", project_root=tmp_path, environment=ENVIRONMENT
+    )
+    assert outcome.action == "report"
+    assert outcome.reason == "queue_row_missing"
+    assert outcome.mutating is False
+    assert "start_run" not in mcp.call_names()
+
+
 def test_pending_delivery_gate_allows_start(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     mcp = FakeMcp(
         project_root=tmp_path,
-        plans=[{"path": "plans/todo/alpha.md", "status": "todo"}],
-        documents={"plans/todo/alpha.md": "# Plan\n"},
+        plans=[{"path": "plans/in-progress/alpha.md", "status": "in_progress"}],
+        documents={"plans/in-progress/alpha.md": "### [ ] Checkpoint 1: step\n"},
         publication=_publication_projection(available=True, remote="origin", branch="main"),
     )
     gate = FakeDeliveryGate(DeliveryStatus(state="pending", ci="pending", live="missing"))
@@ -3932,12 +5534,7 @@ def test_live_search_retains_filed_issue_and_blocks_duplicate_filing(
 ) -> None:
     from aflow.concierge import GithubRestClient
 
-    mcp = FakeMcp(
-        project_root=tmp_path,
-        runs=[_confirmed_run()],
-        plans=[{"path": "plans/in-progress/alpha.md", "status": "in_progress"}],
-        documents={"plans/in-progress/alpha.md": "# Plan\n"},
-    )
+    mcp = _recovery_mcp(tmp_path, [_confirmed_run()])
     evidence = classify_defect(_confirmed_run())
     assert evidence is not None
     fingerprint = defect_fingerprint(evidence)
@@ -4314,8 +5911,8 @@ def test_fresh_dispatch_uses_only_qualifying_ci(
     gate._origin_main_sha = lambda: sha  # type: ignore[method-assign]
     mcp = FakeMcp(
         project_root=tmp_path,
-        plans=[{"path": "plans/todo/alpha.md", "status": "todo"}],
-        documents={"plans/todo/alpha.md": "# Plan\n"},
+        plans=[{"path": "plans/in-progress/alpha.md", "status": "in_progress"}],
+        documents={"plans/in-progress/alpha.md": "### [ ] Checkpoint 1: step\n"},
         publication=_publication_projection(available=True, remote="origin", branch="main"),
     )
     executor = _executor(tmp_path, monkeypatch, mcp=mcp, delivery_gate=gate)
@@ -4457,8 +6054,8 @@ def test_executor_pages_exact_multiple_run_inventory(
     mcp = FakeMcp(
         project_root=tmp_path,
         runs=runs,
-        plans=[{"path": "plans/todo/alpha.md", "status": "todo"}],
-        documents={"plans/todo/alpha.md": "# Plan\n"},
+        plans=[{"path": "plans/in-progress/alpha.md", "status": "in_progress"}],
+        documents={"plans/in-progress/alpha.md": "### [ ] Checkpoint 1: step\n"},
         publication=_publication_projection(available=True, remote="origin", branch="main"),
     )
     executor = _executor(tmp_path, monkeypatch, mcp=mcp)
@@ -4657,10 +6254,10 @@ def test_executor_preserves_legacy_draft_rows_in_complete_inventory(
         project_root=tmp_path,
         plans=[
             {"path": "plans/drafts/legacy.md", "status": "draft"},
-            {"path": "plans/todo/independent.md", "status": "todo"},
+            {"path": "plans/in-progress/independent.md", "status": "in_progress"},
         ],
         documents={
-            "plans/todo/independent.md": "# Plan\n",
+            "plans/in-progress/independent.md": "### [ ] Checkpoint 1: step\n",
         },
         publication=_publication_projection(
             available=True, remote="origin", branch="main"
@@ -4678,10 +6275,10 @@ def test_executor_preserves_legacy_draft_rows_in_complete_inventory(
     assert outcome.action == "start"
     assert outcome.reason == "started"
     assert outcome.mutating is True
-    assert outcome.details["plan_path"] == "plans/todo/independent.md"
+    assert outcome.details["plan_path"] == "plans/in-progress/independent.md"
     start_calls = [args for name, args in mcp.calls if name == "start_run"]
     assert len(start_calls) == 1
-    assert start_calls[0]["plan_path"] == "plans/todo/independent.md"
+    assert start_calls[0]["plan_path"] == "plans/in-progress/independent.md"
 
 
 def test_executor_lone_legacy_draft_is_held_not_started(
@@ -4735,8 +6332,8 @@ def test_executor_incomplete_github_inventory_blocks_start(
 ) -> None:
     mcp = FakeMcp(
         project_root=tmp_path,
-        plans=[{"path": "plans/todo/alpha.md", "status": "todo"}],
-        documents={"plans/todo/alpha.md": "# Plan\n"},
+        plans=[{"path": "plans/in-progress/alpha.md", "status": "in_progress"}],
+        documents={"plans/in-progress/alpha.md": "### [ ] Checkpoint 1: step\n"},
         publication=_publication_projection(
             available=True, remote="origin", branch="main"
         ),
@@ -4800,8 +6397,8 @@ def test_executor_github_read_error_blocks_start(
 ) -> None:
     mcp = FakeMcp(
         project_root=tmp_path,
-        plans=[{"path": "plans/todo/alpha.md", "status": "todo"}],
-        documents={"plans/todo/alpha.md": "# Plan\n"},
+        plans=[{"path": "plans/in-progress/alpha.md", "status": "in_progress"}],
+        documents={"plans/in-progress/alpha.md": "### [ ] Checkpoint 1: step\n"},
         publication=_publication_projection(
             available=True, remote="origin", branch="main"
         ),
@@ -4900,8 +6497,8 @@ def test_executor_terminal_malformed_activity_resolves_from_fresh_detail(
     mcp = FakeMcp(
         project_root=tmp_path,
         runs=[_run(activity="malformed", status="completed")],
-        plans=[_plan(path="plans/todo/independent.md")],
-        documents={"plans/todo/independent.md": "# Plan\n"},
+        plans=[_plan(path="plans/in-progress/independent.md", status="in_progress")],
+        documents={"plans/in-progress/independent.md": "### [ ] Checkpoint 1: step\n"},
         get_run_payloads={
             "run-1": {
                 "run_id": "run-1",
@@ -4922,7 +6519,7 @@ def test_executor_terminal_malformed_activity_resolves_from_fresh_detail(
     assert outcome.action == "start"
     assert outcome.reason == "started"
     assert outcome.mutating is True
-    assert outcome.details["plan_path"] == "plans/todo/independent.md"
+    assert outcome.details["plan_path"] == "plans/in-progress/independent.md"
     assert mcp.call_names().count("start_run") == 1
 
 
@@ -4932,8 +6529,8 @@ def test_executor_terminal_malformed_activity_blocks_when_detail_still_malformed
     mcp = FakeMcp(
         project_root=tmp_path,
         runs=[_run(activity="malformed", status="completed")],
-        plans=[_plan(path="plans/todo/independent.md")],
-        documents={"plans/todo/independent.md": "# Plan\n"},
+        plans=[_plan(path="plans/in-progress/independent.md", status="in_progress")],
+        documents={"plans/in-progress/independent.md": "### [ ] Checkpoint 1: step\n"},
         get_run_payloads={
             "run-1": {
                 "run_id": "run-1",
@@ -4964,8 +6561,8 @@ def test_executor_terminal_malformed_activity_blocks_when_detail_unavailable(
     mcp = FakeMcp(
         project_root=tmp_path,
         runs=[_run(activity="malformed", status="completed")],
-        plans=[_plan(path="plans/todo/independent.md")],
-        documents={"plans/todo/independent.md": "# Plan\n"},
+        plans=[_plan(path="plans/in-progress/independent.md", status="in_progress")],
+        documents={"plans/in-progress/independent.md": "### [ ] Checkpoint 1: step\n"},
         get_run_payloads={},
         publication=_publication_projection(
             available=True, remote="origin", branch="main"
@@ -4988,8 +6585,8 @@ def _startup_hold_fixture(
     *,
     unit_observation: str = "missing",
     status: str = "needs_attention",
-    row_plan_path: str | None = "plans/todo/held.md",
-    detail_plan_path: str | None = "plans/todo/held.md",
+    row_plan_path: str | None = "plans/in-progress/held.md",
+    detail_plan_path: str | None = "plans/in-progress/held.md",
 ) -> tuple[
     list[dict[str, object]],
     list[dict[str, object]],
@@ -5023,12 +6620,12 @@ def _startup_hold_fixture(
     if status_reason_code is not None:
         detail["status_reason_code"] = status_reason_code
     plans = [
-        {"path": "plans/todo/held.md", "status": "todo"},
-        {"path": "plans/todo/independent.md", "status": "todo"},
+        {"path": "plans/in-progress/held.md", "status": "in_progress"},
+        {"path": "plans/in-progress/independent.md", "status": "in_progress"},
     ]
     documents = {
-        "plans/todo/held.md": "# Plan\n",
-        "plans/todo/independent.md": "# Plan\n",
+        "plans/in-progress/held.md": "# Plan\n",
+        "plans/in-progress/independent.md": "### [ ] Checkpoint 1: step\n",
     }
     return [run_row], plans, documents, {"run-hold": detail}
 
@@ -5054,11 +6651,11 @@ def test_executor_verified_startup_failure_holds_only_its_plan(
     assert outcome.action == "start"
     assert outcome.reason == "started"
     assert outcome.mutating is True
-    assert outcome.details["plan_path"] == "plans/todo/independent.md"
+    assert outcome.details["plan_path"] == "plans/in-progress/independent.md"
     started = next(
         args for name, args in mcp.calls if name == "start_run"
     )
-    assert started.get("plan_path") == "plans/todo/independent.md"
+    assert started.get("plan_path") == "plans/in-progress/independent.md"
     assert mcp.created_plans == []
 
 
@@ -5083,11 +6680,11 @@ def test_executor_verified_startup_question_holds_only_its_plan(
         environment=ENVIRONMENT,
     )
     assert outcome.action == "start"
-    assert outcome.details["plan_path"] == "plans/todo/independent.md"
+    assert outcome.details["plan_path"] == "plans/in-progress/independent.md"
     started = next(
         args for name, args in mcp.calls if name == "start_run"
     )
-    assert started.get("plan_path") == "plans/todo/independent.md"
+    assert started.get("plan_path") == "plans/in-progress/independent.md"
 
 
 def test_executor_startup_hold_without_detail_path_blocks(
@@ -5131,7 +6728,7 @@ def test_executor_startup_hold_list_detail_path_mismatch_blocks(
     # contradictory identity evidence and blocks all dispatch.
     for status in ("needs_attention", "awaiting_startup_answer"):
         runs, plans, documents, details = _startup_hold_fixture(
-            status=status, detail_plan_path="plans/todo/other.md"
+            status=status, detail_plan_path="plans/in-progress/other.md"
         )
         mcp = FakeMcp(
             project_root=tmp_path,
