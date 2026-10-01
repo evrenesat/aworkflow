@@ -78,8 +78,23 @@ ACTIVE_RUN_ACTIVITY = "active"
 UNCERTAIN_RUN_ACTIVITY = "unknown"
 INACTIVE_RUN_ACTIVITY = "inactive"
 TERMINAL_FAILED_RUN_STATUSES = frozenset({"failed", "stopped"})
-LAUNCHABLE_PLAN_STATUSES = frozenset({"todo", "draft"})
-PLANNED_EVIDENCE_STATUSES = frozenset({"todo", "in-progress", "failed", "done"})
+TERMINAL_RUN_STATUSES = frozenset({"completed", "failed", "interrupted", "owner_stopped"})
+STARTUP_QUESTION_RUN_STATUS = "awaiting_startup_answer"
+STARTUP_FAILED_RUN_CODE = "startup_failed"
+OCCUPANCY_ACTIVE = "active"
+OCCUPANCY_TERMINAL = "terminal"
+OCCUPANCY_STARTUP_HOLD = "startup_hold"
+OCCUPANCY_BLOCKED = "blocked"
+LAUNCHABLE_PLAN_STATUSES = frozenset({"todo"})
+CANONICAL_PLAN_STATUSES = frozenset(
+    {"draft", "todo", "in_progress", "done", "failed", "needs_plan_change"}
+)
+PLAN_DOCUMENT_STATUSES = frozenset(
+    {"todo", "in_progress", "done", "failed", "needs_plan_change"}
+)
+PLANNED_EVIDENCE_STATUSES = frozenset(
+    {"todo", "in_progress", "done", "failed", "needs_plan_change"}
+)
 MUTATING_TICK_ACTIONS = frozenset({"resume", "start", "plan_and_start"})
 DEFECT_FINGERPRINT_MARKER_PREFIX = "aflow-concierge-defect-fingerprint:"
 DEPLOY_STATUS_PATH_DEFAULT = Path("/var/lib/aflowd/deploy/status.json")
@@ -150,11 +165,17 @@ class ProcessRunner(Protocol):
 class TickObservation:
     """Bounded MCP/GitHub snapshot for one triage decision.
 
-    ``runs`` and ``plans`` entries are the MCP ``list_runs``/``list_plans``
-    mappings; ``issues`` entries carry ``number``, ``author_id``,
-    ``full_name``, ``created_at``, and ``state``.  ``plan_documents`` maps
-    every relevant plan path to its read document content; duplicate
-    detection matches canonical source issue URLs inside that content.
+    ``runs`` entries are the MCP ``list_runs`` mappings.  ``plans`` is the
+    joined complete-lifecycle inventory: one row per exact plan path with the
+    canonical ``status``, ``revision``, and ``modified_at`` projected from
+    ``list_plans`` plus ``list_plan_documents``/``read_plan``.  ``issues``
+    entries carry ``number``, ``author_id``, ``full_name``, ``created_at``,
+    and ``state``.  ``plan_documents`` maps every lifecycle plan path to its
+    read document content; duplicate detection matches canonical source issue
+    URLs inside that content.  ``occupancy`` carries the shared run-occupancy
+    classification: ``blocks`` (bool), ``blocking_run_id``/
+    ``blocking_reason`` (str), and ``startup_holds`` ((run_id, plan_path)
+    pairs that may hold only their own plan).
     """
 
     project: Mapping[str, object]
@@ -162,14 +183,22 @@ class TickObservation:
     plans: tuple[Mapping[str, object], ...] = ()
     issues: tuple[Mapping[str, object], ...] = ()
     plan_documents: Mapping[str, str] = field(default_factory=dict)
+    occupancy: Mapping[str, object] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
 class GithubIssuePage:
-    """Bounded open-issue evidence for one repository."""
+    """Bounded open-issue evidence for one repository.
+
+    ``complete`` is False when the bounded page cap was reached with an
+    unconsumed continuation, or a repeated page failed to advance the
+    inventory; callers must report the gap instead of selecting from a
+    partial inventory.
+    """
 
     repository_id: int
     issues: tuple[Mapping[str, object], ...]
+    complete: bool = True
 
 
 @dataclass(frozen=True)
@@ -364,6 +393,85 @@ def _run_activity(run: Mapping[str, object]) -> str:
     return UNCERTAIN_RUN_ACTIVITY
 
 
+def classify_run_occupancy(run: Mapping[str, object]) -> str:
+    """Classify one canonical run row for dispatch occupancy.
+
+    Any active activity, unit, or preparation evidence is ``OCCUPANCY_ACTIVE``
+    and blocks all dispatch.  Canonical terminal statuses with a canonical
+    ``unknown`` or ``inactive`` activity and no conflicting active evidence
+    are ``OCCUPANCY_TERMINAL`` history and never grant a resume; a terminal
+    row whose activity is missing or malformed is not provably historical and
+    stays ``OCCUPANCY_BLOCKED`` until fresh canonical detail resolves it.
+    A pre-execution startup question or startup failure may be
+    ``OCCUPANCY_STARTUP_HOLD``, holding only its own plan once the shared
+    occupancy report verifies it.  Everything else is ``OCCUPANCY_BLOCKED``.
+    """
+    evidence = run.get("evidence")
+    evidence = evidence if isinstance(evidence, Mapping) else {}
+    if (
+        _run_activity(run) == ACTIVE_RUN_ACTIVITY
+        or evidence.get("unit_active") is True
+        or evidence.get("preparation_active") is True
+    ):
+        return OCCUPANCY_ACTIVE
+    status = run.get("status")
+    if isinstance(status, str) and status in TERMINAL_RUN_STATUSES:
+        if run.get("activity") in (
+            UNCERTAIN_RUN_ACTIVITY,
+            INACTIVE_RUN_ACTIVITY,
+        ):
+            return OCCUPANCY_TERMINAL
+        return OCCUPANCY_BLOCKED
+    if status == STARTUP_QUESTION_RUN_STATUS or (
+        status == "needs_attention"
+        and run.get("status_reason_code") == STARTUP_FAILED_RUN_CODE
+    ):
+        return OCCUPANCY_STARTUP_HOLD
+    return OCCUPANCY_BLOCKED
+
+
+def _occupancy_from_runs(
+    runs: Sequence[Mapping[str, object]],
+) -> dict[str, object]:
+    """Derive a conservative occupancy summary from raw list rows.
+
+    Unlike the executor's report, this cannot refresh a row through
+    ``get_run`` or check queue capacity, so a pre-execution startup hold is
+    never verified here and any non-terminal, non-active row conservatively
+    blocks the tick.  The executor always supplies a verified report; this
+    fallback keeps the pure triage decision consistent with the classifier.
+    """
+    blocking_run_id: str | None = None
+    blocking_reason: str | None = None
+    for run in runs:
+        classification = classify_run_occupancy(run)
+        if classification == OCCUPANCY_ACTIVE:
+            return {
+                "blocks": True,
+                "blocking_run_id": str(run.get("run_id")),
+                "blocking_reason": OCCUPANCY_ACTIVE,
+                "startup_holds": [],
+            }
+        if classification == OCCUPANCY_TERMINAL:
+            continue
+        if blocking_run_id is None:
+            blocking_run_id = str(run.get("run_id"))
+            blocking_reason = OCCUPANCY_BLOCKED
+    if blocking_run_id is None:
+        return {
+            "blocks": False,
+            "blocking_run_id": None,
+            "blocking_reason": None,
+            "startup_holds": [],
+        }
+    return {
+        "blocks": True,
+        "blocking_run_id": blocking_run_id,
+        "blocking_reason": blocking_reason,
+        "startup_holds": [],
+    }
+
+
 def classify_defect(run: Mapping[str, object]) -> DefectEvidence | None:
     """Return bounded defect evidence for one strictly validated confirmation.
 
@@ -510,8 +618,43 @@ def _validate_observation(observation: TickObservation) -> None:
             not isinstance(plan, Mapping)
             or not isinstance(plan.get("path"), str)
             or not plan.get("path")
+            or not isinstance(plan.get("status"), str)
+            or not plan.get("status")
         ):
             raise ConciergeError("observation_plan_invalid")
+    occupancy = observation.occupancy
+    if not isinstance(occupancy, Mapping):
+        raise ConciergeError("observation_occupancy_invalid")
+    if occupancy.get("blocks") is not None and not isinstance(
+        occupancy.get("blocks"), bool
+    ):
+        raise ConciergeError("observation_occupancy_invalid")
+    blocking_run_id = occupancy.get("blocking_run_id")
+    if blocking_run_id is not None and (
+        not isinstance(blocking_run_id, str) or not blocking_run_id
+    ):
+        raise ConciergeError("observation_occupancy_invalid")
+    blocking_reason = occupancy.get("blocking_reason")
+    if blocking_reason is not None and (
+        not isinstance(blocking_reason, str) or not blocking_reason
+    ):
+        raise ConciergeError("observation_occupancy_invalid")
+    startup_holds = occupancy.get("startup_holds")
+    if startup_holds is not None:
+        if not isinstance(startup_holds, (list, tuple)):
+            raise ConciergeError("observation_occupancy_invalid")
+        for hold in startup_holds:
+            if (
+                not isinstance(hold, (list, tuple))
+                or len(hold) != 2
+                or not isinstance(hold[0], str)
+                or not hold[0]
+                or (
+                    hold[1] is not None
+                    and (not isinstance(hold[1], str) or not hold[1])
+                )
+            ):
+                raise ConciergeError("observation_occupancy_invalid")
     for issue in observation.issues:
         if (
             not isinstance(issue, Mapping)
@@ -531,10 +674,11 @@ def _validate_observation(observation: TickObservation) -> None:
             raise ConciergeError("observation_plan_documents_invalid")
 
 
-def _normalized_plan_status(value: object) -> str:
+def _canonical_plan_status(value: object) -> str:
+    """Normalize one plan status spelling to the canonical underscore form."""
     if not isinstance(value, str):
         return ""
-    return value.replace("_", "-")
+    return value.replace("-", "_")
 
 
 def _issue_urls_in(text: str) -> frozenset[str]:
@@ -666,33 +810,44 @@ def _publication_settings_evidence(
 def triage_tick(observation: TickObservation) -> TriageDecision:
     """Choose at most one bounded action for the observed queue state.
 
-    Priority order: defer on active/uncertain runs, resume a verified
-    inactive failed lineage, start exactly one launchable plan, then plan
-    and start the oldest eligible owner issue.  Ambiguity reports without a
-    guessed action.
+    Priority order: defer on the shared run-occupancy classification, resume
+    a verified inactive failed lineage, start exactly one launchable plan
+    not held by a verified pre-execution startup hold, then plan and start
+    the oldest eligible owner issue.  Ambiguity reports without a guessed
+    action.
     """
     _validate_observation(observation)
     runs = observation.runs
+    occupancy = (
+        observation.occupancy
+        if observation.occupancy
+        else _occupancy_from_runs(runs)
+    )
 
-    active = [run for run in runs if _run_activity(run) == ACTIVE_RUN_ACTIVITY]
-    if active:
-        return TriageDecision(
-            action="defer",
-            reason="active_run_present",
-            run_id=str(active[0]["run_id"]),
+    if occupancy.get("blocks") is True:
+        blocking_run_id = occupancy.get("blocking_run_id")
+        reason = (
+            "active_run_present"
+            if occupancy.get("blocking_reason") == OCCUPANCY_ACTIVE
+            else "uncertain_run_present"
         )
-    uncertain = [
-        run for run in runs if _run_activity(run) == UNCERTAIN_RUN_ACTIVITY
-    ]
-    if uncertain:
         return TriageDecision(
             action="defer",
-            reason="uncertain_run_present",
-            run_id=str(uncertain[0]["run_id"]),
+            reason=reason,
+            run_id=(
+                str(blocking_run_id)
+                if isinstance(blocking_run_id, str) and blocking_run_id
+                else None
+            ),
         )
 
     plans = observation.plans
     plan_paths = {plan.get("path") for plan in plans}
+    held_paths = {
+        path
+        for _run_id, path in occupancy.get("startup_holds", ())
+        if isinstance(path, str) and path
+    }
 
     failed = [
         run
@@ -757,6 +912,7 @@ def triage_tick(observation: TickObservation) -> TriageDecision:
         for plan in plans
         if plan.get("status") in LAUNCHABLE_PLAN_STATUSES
         and plan.get("path") not in referenced
+        and plan.get("path") not in held_paths
     ]
     if len(launchable) > 1:
         return TriageDecision(
@@ -785,7 +941,7 @@ def triage_tick(observation: TickObservation) -> TriageDecision:
         return TriageDecision(action="idle", reason="no_eligible_work")
     planned_urls: set[str] = set()
     for plan in plans:
-        if _normalized_plan_status(plan.get("status")) not in PLANNED_EVIDENCE_STATUSES:
+        if _canonical_plan_status(plan.get("status")) not in PLANNED_EVIDENCE_STATUSES:
             continue
         path = str(plan["path"])
         content = observation.plan_documents.get(path)
@@ -995,20 +1151,37 @@ class GithubRestClient:
         if type(repository_id) is not int or repository_id <= 0:
             raise ConciergeError("github_repository_invalid")
         issues: list[Mapping[str, object]] = []
+        seen_numbers: set[int] = set()
+        complete = True
         path = f"/repos/{quoted}/issues?state=open&per_page={CONCIERGE_PAGE_LIMIT}"
         for _ in range(self._max_pages):
             payload, headers = self._request(path)
             if not isinstance(payload, list):
                 raise ConciergeError("github_issues_invalid")
+            fresh: list[Mapping[str, object]] = []
             for item in payload:
                 issue = self._issue_mapping(item, full_name)
-                if issue is not None:
-                    issues.append(issue)
+                if issue is None:
+                    continue
+                number = int(issue["number"])
+                if number in seen_numbers:
+                    continue
+                seen_numbers.add(number)
+                fresh.append(issue)
             path = self._next_path(headers)
+            if path is not None and not fresh:
+                # A repeated page failed to advance the inventory; the
+                # remaining open issues are not covered by this read.
+                complete = False
+                break
+            issues.extend(fresh)
             if path is None:
                 break
+        else:
+            # The page cap was reached with an unconsumed continuation.
+            complete = path is None
         return GithubIssuePage(
-            repository_id=repository_id, issues=tuple(issues)
+            repository_id=repository_id, issues=tuple(issues), complete=complete
         )
 
     def _issue_mapping(
@@ -1418,15 +1591,21 @@ class ConciergeTickExecutor:
         github_gap = full_name is None
         if full_name is not None:
             try:
-                issues = self._github.open_issues(full_name).issues
+                page = self._github.open_issues(full_name)
             except ConciergeError:
+                page = None
+            if page is None or not page.complete:
                 github_gap = True
+            else:
+                issues = page.issues
+        occupancy = self._occupancy_report(project_id, runs)
         observation = TickObservation(
             project=project,
             runs=runs,
             plans=plans,
             issues=issues,
             plan_documents=plan_documents,
+            occupancy=occupancy,
         )
         try:
             decision = triage_tick(observation)
@@ -1437,8 +1616,20 @@ class ConciergeTickExecutor:
                 decision.action, decision.reason,
                 details=self._decision_details(decision=decision),
             )
+        if github_gap:
+            # Incomplete GitHub evidence is a global gap: report it before
+            # defect filing, resume, start, or plan authoring, and never
+            # select from partial issue rows.
+            details = self._decision_details(decision=decision)
+            details.update(
+                self._delivery_details(self._delivery_status(full_name))
+            )
+            return TickOutcome(
+                "report", "github_evidence_unavailable",
+                details=details,
+            )
         defects = defect_signatures(observation.runs)
-        if defects and full_name is not None:
+        if defects:
             outcome = self._report_defects(full_name, defects)
             if outcome is not None:
                 return outcome
@@ -1446,11 +1637,6 @@ class ConciergeTickExecutor:
         if not decision.mutating:
             details = self._decision_details(decision=decision)
             details.update(self._delivery_details(delivery))
-            if github_gap and decision.action == "idle":
-                return TickOutcome(
-                    "report", "github_evidence_unavailable",
-                    details=details,
-                )
             return TickOutcome(decision.action, decision.reason, details=details)
         if decision.action == "resume":
             return self._execute_resume(project_id, decision)
@@ -1461,8 +1647,6 @@ class ConciergeTickExecutor:
                 return TickOutcome("report", "delivery_gate_failed", details=details)
             if decision.action == "start":
                 return self._execute_start(project_id, decision)
-            if full_name is None:
-                return TickOutcome("report", "repository_full_name_unavailable")
             return self._execute_plan_and_start(
                 project_id, decision, state_dir, full_name
             )
@@ -1580,72 +1764,245 @@ class ConciergeTickExecutor:
         tuple[Mapping[str, object], ...],
         dict[str, str],
     ]:
+        """Gather the complete bounded inventory: runs, joined plan lifecycle
+        inventory, and per-path document content.
+
+        The plan inventory joins the lifecycle ``list_plans`` rows (which
+        cover the draft/todo/in-progress/done directories) with
+        ``list_plan_documents`` (which covers the full lifecycle including
+        ``failed`` and ``needs_plan_change``) on the exact canonical path.
+        Both sources must agree on status where they overlap; content comes
+        from one ``read_plan`` per document.  Legacy ``draft`` rows have no
+        document projection by design and are preserved as held inventory
+        rows.  Any other gap raises a bounded :class:`ConciergeError` so the
+        caller reports instead of acting on a partial inventory.
+        """
         runs = self._list_runs(project_id)
-        plans = self._list_plans(project_id)
-        documents: dict[str, str] = {}
-        for plan in plans:
-            status = _normalized_plan_status(plan.get("status"))
-            if status not in PLANNED_EVIDENCE_STATUSES:
+        lifecycle_rows = self._list_plans(project_id)
+        documents = self._plan_documents(project_id)
+        for row in lifecycle_rows:
+            if _canonical_plan_status(row.get("status")) == "draft":
                 continue
-            path = str(plan.get("path") or "")
-            parts = path.split("/")
-            if len(parts) != 3 or parts[0] != "plans":
-                raise ConciergeError("plan_path_invalid")
-            plan_status = _PLAN_STATUS_BY_DIRECTORY.get(parts[1])
-            if plan_status is None:
-                continue
-            payload = self._mcp.call_tool(
-                "read_plan",
-                {"project_id": project_id, "plan_status": plan_status, "name": parts[2]},
-            )
-            content = payload.get("content")
-            if not isinstance(content, str):
+            if str(row["path"]) not in documents:
                 raise ConciergeError("plan_document_unavailable")
-            documents[path] = content
-        return runs, plans, documents
+        inventory: dict[str, dict[str, str]] = {}
+        for row in lifecycle_rows:
+            path = str(row["path"])
+            entry = inventory.setdefault(
+                path,
+                {"path": path, "status": "", "revision": "", "modified_at": ""},
+            )
+            entry["status"] = _canonical_plan_status(row.get("status"))
+            entry["modified_at"] = str(row.get("modified_at") or "")
+        for path in sorted(documents):
+            document = documents[path]
+            entry = inventory.setdefault(
+                path,
+                {"path": path, "status": "", "revision": "", "modified_at": ""},
+            )
+            if entry["status"] and entry["status"] != document["status"]:
+                raise ConciergeError("plan_status_conflict")
+            entry["status"] = document["status"]
+            entry["revision"] = document["revision"]
+        plans = tuple(inventory[path] for path in sorted(inventory))
+        content_by_path = {
+            path: documents[path]["content"] for path in documents
+        }
+        return runs, plans, content_by_path
 
     def _list_runs(self, project_id: str) -> tuple[Mapping[str, object], ...]:
+        """Page the complete run inventory through the opaque ``next_cursor``.
+
+        Every row must carry a unique, non-empty run identity.  A page that
+        is empty while a continuation is offered, repeats an already used
+        cursor, or repeats a run identity is malformed; the page cap bounds
+        the walk.  The final page carries no continuation.
+        """
         runs: list[Mapping[str, object]] = []
+        seen_ids: set[str] = set()
+        used_cursors: set[str] = set()
         cursor: str | None = None
         for _ in range(CONCIERGE_MAX_PAGES):
             payload = self._mcp.call_tool(
                 "list_runs",
                 {"project_id": project_id, "limit": CONCIERGE_PAGE_LIMIT, "cursor": cursor},
             )
+            if not isinstance(payload, Mapping):
+                raise ConciergeError("run_page_invalid")
             page = payload.get("runs")
             if not isinstance(page, list):
                 raise ConciergeError("run_page_invalid")
-            runs.extend(item for item in page if isinstance(item, Mapping))
+            for item in page:
+                if not isinstance(item, Mapping):
+                    raise ConciergeError("run_row_invalid")
+                run_id = item.get("run_id")
+                if not isinstance(run_id, str) or not run_id:
+                    raise ConciergeError("run_row_invalid")
+                if run_id in seen_ids:
+                    raise ConciergeError("run_row_duplicate")
+                seen_ids.add(run_id)
+                runs.append(item)
             next_cursor = payload.get("next_cursor")
-            if not isinstance(next_cursor, str) or not next_cursor:
+            if next_cursor is None:
                 return tuple(runs)
+            if (
+                not isinstance(next_cursor, str)
+                or not next_cursor
+                or next_cursor in used_cursors
+            ):
+                raise ConciergeError("run_page_invalid")
+            used_cursors.add(next_cursor)
+            if not page:
+                raise ConciergeError("run_page_invalid")
             cursor = next_cursor
         raise ConciergeError("run_page_overflow")
 
     def _list_plans(self, project_id: str) -> tuple[Mapping[str, object], ...]:
+        """Page the lifecycle plan rows to the final empty page.
+
+        The control plane answers ``list_plans`` with lexicographically
+        ordered ``(path, status)`` rows and no continuation field, so the
+        walk is complete only after an empty page.  Rows must carry a unique,
+        non-empty path and a known status; a page whose first path does not
+        advance past the cursor is malformed; the page cap bounds the walk.
+        """
         plans: list[Mapping[str, object]] = []
+        seen_paths: set[str] = set()
         cursor: str | None = None
         for _ in range(CONCIERGE_MAX_PAGES):
             payload = self._mcp.call_tool(
                 "list_plans",
                 {"project_id": project_id, "limit": CONCIERGE_PAGE_LIMIT, "cursor": cursor},
             )
+            if not isinstance(payload, Mapping):
+                raise ConciergeError("plan_page_invalid")
             page = payload.get("plans")
             if not isinstance(page, list):
                 raise ConciergeError("plan_page_invalid")
             if not page:
                 return tuple(plans)
-            plans.extend(item for item in page if isinstance(item, Mapping))
-            last_path = page[-1].get("path") if isinstance(page[-1], Mapping) else None
-            if (
-                len(page) < CONCIERGE_PAGE_LIMIT
-                or not isinstance(last_path, str)
-                or not last_path
-                or last_path == cursor
-            ):
+            for item in page:
+                if not isinstance(item, Mapping):
+                    raise ConciergeError("plan_row_invalid")
+                path = item.get("path")
+                status = _canonical_plan_status(item.get("status"))
+                if (
+                    not isinstance(path, str)
+                    or not path
+                    or status not in CANONICAL_PLAN_STATUSES
+                    or not isinstance(item.get("modified_at"), str)
+                    or not item.get("modified_at")
+                ):
+                    raise ConciergeError("plan_row_invalid")
+                if path in seen_paths:
+                    raise ConciergeError("plan_row_duplicate")
+                if cursor is not None and path <= cursor:
+                    raise ConciergeError("plan_page_invalid")
+                seen_paths.add(path)
+                plans.append(item)
+            last_path = str(page[-1]["path"])
+            if len(page) < CONCIERGE_PAGE_LIMIT:
+                # A short page is final only when the follow-up read confirms
+                # it; fetch the terminating empty page.
+                follow_up = self._mcp.call_tool(
+                    "list_plans",
+                    {
+                        "project_id": project_id,
+                        "limit": CONCIERGE_PAGE_LIMIT,
+                        "cursor": last_path,
+                    },
+                )
+                if (
+                    not isinstance(follow_up, Mapping)
+                    or follow_up.get("plans") != []
+                ):
+                    raise ConciergeError("plan_page_invalid")
                 return tuple(plans)
             cursor = last_path
         raise ConciergeError("plan_page_overflow")
+
+    def _plan_documents(self, project_id: str) -> dict[str, dict[str, str]]:
+        """Read the full-lifecycle plan document coverage for one project.
+
+        ``list_plan_documents`` supplies every lifecycle status (including
+        ``failed`` and ``needs_plan_change``) with name, path, status, and
+        revision; one ``read_plan`` per document supplies the content.
+        Conflicting duplicates for one path are malformed.
+        """
+        try:
+            payload = self._mcp.call_tool(
+                "list_plan_documents", {"project_id": project_id}
+            )
+        except ConciergeError as exc:
+            raise ConciergeError("plan_document_list_invalid") from exc
+        if not isinstance(payload, Mapping):
+            raise ConciergeError("plan_document_list_invalid")
+        rows = payload.get("plans")
+        if not isinstance(rows, list):
+            raise ConciergeError("plan_document_list_invalid")
+        documents: dict[str, dict[str, str]] = {}
+        for item in rows:
+            if not isinstance(item, Mapping):
+                raise ConciergeError("plan_document_row_invalid")
+            name = item.get("name")
+            path = item.get("path")
+            status = item.get("status")
+            revision = item.get("revision")
+            if (
+                not isinstance(name, str)
+                or not name
+                or not isinstance(path, str)
+                or not path
+                or status not in PLAN_DOCUMENT_STATUSES
+                or not isinstance(revision, str)
+                or not revision
+            ):
+                raise ConciergeError("plan_document_row_invalid")
+            existing = documents.get(path)
+            if existing is not None:
+                if (
+                    existing["name"] != name
+                    or existing["status"] != status
+                    or existing["revision"] != revision
+                ):
+                    raise ConciergeError("plan_document_conflict")
+                continue
+            content = self._read_plan_content(project_id, str(status), name)
+            documents[path] = {
+                "name": name,
+                "status": str(status),
+                "revision": revision,
+                "content": content,
+            }
+        return documents
+
+    def _read_plan_content(
+        self, project_id: str, plan_status: str, name: str
+    ) -> str:
+        try:
+            payload = self._mcp.call_tool(
+                "read_plan",
+                {
+                    "project_id": project_id,
+                    "plan_status": plan_status,
+                    "name": name,
+                },
+            )
+        except ConciergeError as exc:
+            raise ConciergeError("plan_document_unavailable") from exc
+        if not isinstance(payload, Mapping):
+            raise ConciergeError("plan_document_unavailable")
+        content = payload.get("content")
+        if not isinstance(content, str):
+            raise ConciergeError("plan_document_unavailable")
+        path = payload.get("path")
+        if isinstance(path, str) and path:
+            parts = path.split("/")
+            if len(parts) == 3 and parts[0] == "plans":
+                expected = _PLAN_STATUS_BY_DIRECTORY.get(parts[1])
+                if expected is not None and expected != plan_status:
+                    raise ConciergeError("plan_document_conflict")
+        return content
 
     @staticmethod
     def _preflight_admits_launch(preflight: object) -> bool:
@@ -1666,19 +2023,17 @@ class ConciergeTickExecutor:
         return scheduling.get("auto_consume_plans") is False
 
     @staticmethod
-    def _runs_block_launch(runs: Sequence[Mapping[str, object]]) -> bool:
-        return any(
-            _run_activity(run) in (ACTIVE_RUN_ACTIVITY, UNCERTAIN_RUN_ACTIVITY)
-            for run in runs
-        )
+    def _queue_permits_new_implementation(queue: object) -> bool:
+        """Require the canonical queue to admit one new implementation now.
 
-    @classmethod
-    def _queue_admits_single_launch(cls, queue: object, plan_path: str) -> bool:
+        The project must keep the exactly-one-slot setting with
+        auto-consumption disabled and expose at least one available slot.
+        """
         if not isinstance(queue, Mapping):
             return False
         settings = queue.get("settings")
-        if not isinstance(settings, Mapping) or not cls._scheduling_keeps_single_slot(
-            settings
+        if not isinstance(settings, Mapping) or not (
+            ConciergeTickExecutor._scheduling_keeps_single_slot(settings)
         ):
             return False
         capacity = queue.get("capacity")
@@ -1686,6 +2041,12 @@ class ConciergeTickExecutor:
             return False
         available = capacity.get("available_slots")
         if type(available) is not int or available < 1:
+            return False
+        return True
+
+    @classmethod
+    def _queue_admits_single_launch(cls, queue: object, plan_path: str) -> bool:
+        if not cls._queue_permits_new_implementation(queue):
             return False
         plans = queue.get("plans")
         if not isinstance(plans, (list, tuple)):
@@ -1696,6 +2057,133 @@ class ConciergeTickExecutor:
             if plan.get("path") == plan_path and plan.get("run_id"):
                 return False
         return True
+
+    def _project_queue(self, project_id: str) -> Mapping[str, object] | None:
+        try:
+            payload = self._mcp.call_tool(
+                "get_project_queue", {"project_id": project_id}
+            )
+        except ConciergeError:
+            return None
+        return payload if isinstance(payload, Mapping) else None
+
+    def _run_detail(
+        self, project_id: str, run_id: str
+    ) -> Mapping[str, object] | None:
+        try:
+            payload = self._mcp.call_tool(
+                "get_run", {"project_id": project_id, "run_id": run_id}
+            )
+        except ConciergeError:
+            return None
+        if not isinstance(payload, Mapping) or payload.get("run_id") != run_id:
+            return None
+        return payload
+
+    def _startup_hold_verified(
+        self, detail: Mapping[str, object], queue_permits: bool
+    ) -> bool:
+        """Verify one candidate-local startup hold from fresh canonical data.
+
+        The run must still be pre-execution: manifest-only launch phase, no
+        agent started, no observed unit, no active preparation, and the
+        canonical queue must permit one new implementation.  Anything less
+        certain keeps the run blocking.
+        """
+        if not queue_permits:
+            return False
+        if detail.get("launch_phase") != "manifest_only":
+            return False
+        evidence = detail.get("evidence")
+        evidence = evidence if isinstance(evidence, Mapping) else {}
+        if evidence.get("no_agent_started") is not True:
+            return False
+        if evidence.get("unit_observation") != "missing":
+            return False
+        if _run_activity(detail) != INACTIVE_RUN_ACTIVITY:
+            return False
+        if evidence.get("unit_active") is True:
+            return False
+        if evidence.get("preparation_active") is True:
+            return False
+        return True
+
+    def _occupancy_report(
+        self, project_id: str, runs: Sequence[Mapping[str, object]]
+    ) -> Mapping[str, object]:
+        """Produce the bounded shared run-occupancy report for one project.
+
+        Every row is classified with :func:`classify_run_occupancy`.  Rows
+        that are neither provably active nor terminal history are refreshed
+        through the corresponding ``get_run``; a verified pre-execution
+        startup question or startup failure holds only its own plan when the
+        fresh detail carries a nonempty plan path that exactly matches the
+        list row's plan path.  A missing or mismatched identity cannot
+        establish which plan the startup record holds, so the run blocks all
+        dispatch like every other uncertain row.  The report carries no
+        mutations and bounds the reasons to fixed codes.
+        """
+        queue = self._project_queue(project_id)
+        queue_permits = self._queue_permits_new_implementation(queue)
+        blocks = False
+        blocking_run_id: str | None = None
+        blocking_reason: str | None = None
+        holds: list[tuple[str, str]] = []
+
+        def note_blocked(run_id: str, reason: str) -> None:
+            nonlocal blocks, blocking_run_id, blocking_reason
+            blocks = True
+            if blocking_run_id is None:
+                blocking_run_id, blocking_reason = run_id, reason
+
+        for run in sorted(runs, key=lambda item: str(item.get("run_id") or "")):
+            run_id = str(run.get("run_id") or "")
+            classification = classify_run_occupancy(run)
+            if classification == OCCUPANCY_ACTIVE:
+                note_blocked(run_id, OCCUPANCY_ACTIVE)
+                continue
+            if classification == OCCUPANCY_TERMINAL:
+                continue
+            detail = self._run_detail(project_id, run_id)
+            if detail is None:
+                note_blocked(run_id, OCCUPANCY_BLOCKED)
+                continue
+            detail_classification = classify_run_occupancy(detail)
+            if detail_classification == OCCUPANCY_ACTIVE:
+                note_blocked(run_id, OCCUPANCY_ACTIVE)
+                continue
+            if detail_classification == OCCUPANCY_TERMINAL:
+                continue
+            if (
+                detail_classification == OCCUPANCY_STARTUP_HOLD
+                and self._startup_hold_verified(detail, queue_permits)
+            ):
+                list_path = run.get("plan_path")
+                detail_path = detail.get("plan_path")
+                if (
+                    isinstance(list_path, str)
+                    and list_path
+                    and isinstance(detail_path, str)
+                    and detail_path == list_path
+                ):
+                    holds.append(
+                        (str(detail.get("run_id") or run_id), detail_path)
+                    )
+                    continue
+            note_blocked(run_id, OCCUPANCY_BLOCKED)
+        return {
+            "blocks": blocks,
+            "blocking_run_id": blocking_run_id,
+            "blocking_reason": blocking_reason,
+            "startup_holds": tuple(holds),
+        }
+
+    def _occupancy_blocks(
+        self, project_id: str, runs: Sequence[Mapping[str, object]]
+    ) -> bool:
+        return (
+            self._occupancy_report(project_id, runs).get("blocks") is True
+        )
 
     def _verify_launch_evidence(
         self,
@@ -1878,15 +2366,19 @@ class ConciergeTickExecutor:
         issues: tuple[Mapping[str, object], ...] = ()
         if full_name is not None:
             try:
-                issues = self._github.open_issues(full_name).issues
+                page = self._github.open_issues(full_name)
             except ConciergeError:
                 return None
+            if not page.complete:
+                return None
+            issues = page.issues
         observation = TickObservation(
             project={"project_id": project_id},
             runs=runs,
             plans=plans,
             issues=issues,
             plan_documents=plan_documents,
+            occupancy=self._occupancy_report(project_id, runs),
         )
         try:
             fresh = triage_tick(observation)
@@ -1916,6 +2408,13 @@ class ConciergeTickExecutor:
                 details=self._decision_details(decision=decision),
             )
         if not self._resume_admits(project_id, decision):
+            return TickOutcome(
+                "report", "resume_not_admitted",
+                details=self._decision_details(decision=decision),
+            )
+        if not self._queue_permits_new_implementation(
+            self._project_queue(project_id)
+        ):
             return TickOutcome(
                 "report", "resume_not_admitted",
                 details=self._decision_details(decision=decision),
@@ -1980,6 +2479,12 @@ class ConciergeTickExecutor:
             )
         except ConciergeError as exc:
             return TickOutcome("report", exc.reason, details=details)
+        if not self._queue_permits_new_implementation(
+            self._project_queue(project_id)
+        ):
+            return TickOutcome(
+                "report", "state_changed_before_action", details=details
+            )
         return self._start_with_evidence(project_id, plan_path, decision, details)
 
     def _execute_plan_and_start(
@@ -2004,6 +2509,10 @@ class ConciergeTickExecutor:
         try:
             page = self._github.open_issues(full_name)
         except ConciergeError:
+            return TickOutcome(
+                "report", "github_evidence_unavailable", details=details
+            )
+        if page is None or not page.complete:
             return TickOutcome(
                 "report", "github_evidence_unavailable", details=details
             )
@@ -2096,13 +2605,17 @@ class ConciergeTickExecutor:
             runs, plans, plan_documents = self._gather_evidence(project_id)
         except ConciergeError:
             return TickOutcome("report", "evidence_unavailable", details=details)
-        if self._runs_block_launch(runs):
+        if self._occupancy_blocks(project_id, runs):
             return TickOutcome(
                 "report", "state_changed_before_action", details=details
             )
         try:
             fresh_page = self._github.open_issues(full_name)
         except ConciergeError:
+            return TickOutcome(
+                "report", "github_evidence_unavailable", details=details
+            )
+        if not fresh_page.complete:
             return TickOutcome(
                 "report", "github_evidence_unavailable", details=details
             )
@@ -2140,7 +2653,7 @@ class ConciergeTickExecutor:
             )
         planned_urls: set[str] = set()
         for plan in plans:
-            if _normalized_plan_status(plan.get("status")) not in PLANNED_EVIDENCE_STATUSES:
+            if _canonical_plan_status(plan.get("status")) not in PLANNED_EVIDENCE_STATUSES:
                 continue
             content = plan_documents.get(str(plan.get("path") or ""))
             if not isinstance(content, str):
@@ -2164,8 +2677,8 @@ class ConciergeTickExecutor:
             )
         except ConciergeError:
             return TickOutcome("report", "evidence_unavailable", details=details)
-        if self._runs_block_launch(runs) or not self._queue_admits_single_launch(
-            queue, plan_path
+        if self._occupancy_blocks(project_id, runs) or not (
+            self._queue_admits_single_launch(queue, plan_path)
         ):
             return TickOutcome(
                 "report", "state_changed_before_action", details=details
@@ -2179,13 +2692,10 @@ class ConciergeTickExecutor:
         return self._start_with_evidence(project_id, plan_path, decision, details)
 
     def _run_is_active(self, project_id: str, run_id: str) -> bool:
-        try:
-            payload = self._mcp.call_tool(
-                "get_run", {"project_id": project_id, "run_id": run_id}
-            )
-        except ConciergeError:
+        detail = self._run_detail(project_id, run_id)
+        if detail is None:
             return False
-        return payload.get("activity") == ACTIVE_RUN_ACTIVITY
+        return classify_run_occupancy(detail) == OCCUPANCY_ACTIVE
 
     def _plan_has_active_run(self, project_id: str, plan_path: str) -> bool:
         try:
@@ -2194,7 +2704,7 @@ class ConciergeTickExecutor:
             return False
         return any(
             run.get("plan_path") == plan_path
-            and run.get("activity") == ACTIVE_RUN_ACTIVITY
+            and classify_run_occupancy(run) == OCCUPANCY_ACTIVE
             for run in runs
         )
 

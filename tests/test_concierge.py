@@ -32,16 +32,21 @@ from aflow.concierge import (
     GithubIssuePage,
     LocalDeliveryGate,
     McpRegistryClient,
+    OCCUPANCY_ACTIVE,
+    OCCUPANCY_BLOCKED,
+    OCCUPANCY_TERMINAL,
     TickDeferral,
     TickObservation,
     TickOutcome,
     TickProcessResult,
     TriageDecision,
+    _PLAN_STATUS_BY_DIRECTORY,
     _build_concierge_planner,
     _run_tick_process,
     build_codex_argv,
     build_tick_prompt,
     classify_defect,
+    classify_run_occupancy,
     defect_evidence,
     defect_fingerprint,
     defect_fingerprint_marker,
@@ -178,6 +183,7 @@ class FakeMcp:
         runs: Sequence[Mapping[str, object]] = (),
         plans: Sequence[Mapping[str, object]] = (),
         documents: Mapping[str, str] | None = None,
+        revisions: Mapping[str, str] | None = None,
         auto_consume_plans: bool = False,
         max_concurrent_implementations: int = 1,
         preflight: Mapping[str, object] | None = None,
@@ -190,8 +196,13 @@ class FakeMcp:
         self.project_id = project_id
         self.registered = registered
         self.runs: list[dict[str, object]] = [dict(run) for run in runs]
-        self.plans: list[dict[str, object]] = [dict(plan) for plan in plans]
+        self.plans: list[dict[str, object]] = []
+        for index, plan in enumerate(plans):
+            row = dict(plan)
+            row.setdefault("modified_at", f"2026-01-0{index % 9 + 1}T00:00:00Z")
+            self.plans.append(row)
         self.documents: dict[str, str] = dict(documents or {})
+        self.revisions: dict[str, str] = dict(revisions or {})
         self.calls: list[tuple[str, dict[str, object]]] = []
         self.failures: dict[str, Exception] = {}
         self.pre_failures: dict[str, object] = {}
@@ -244,39 +255,98 @@ class FakeMcp:
         }
 
     def _tool_list_runs(self, args: dict[str, object]) -> dict[str, object]:
+        # Models the control-plane contract: lexicographic run_id ordering,
+        # an opaque next_cursor equal to the last returned run id, and a
+        # null continuation on the final page.
         limit = int(args.get("limit", CONCIERGE_PAGE_LIMIT))
         cursor = args.get("cursor")
-        start = int(cursor) if isinstance(cursor, str) and cursor else 0
-        page = self.runs[start : start + limit]
-        next_cursor = str(start + limit) if start + limit < len(self.runs) else None
+        rows = sorted(self.runs, key=lambda run: str(run.get("run_id")))
+        if isinstance(cursor, str) and cursor:
+            rows = [
+                run for run in rows if str(run.get("run_id")) > cursor
+            ]
+        page = rows[:limit]
+        next_cursor = (
+            str(page[-1].get("run_id")) if len(rows) > len(page) and page else None
+        )
         return {"runs": page, "next_cursor": next_cursor, "schema_version": 1}
 
+    # The lifecycle list only walks these directories; failed and
+    # needs-plan-change documents surface through list_plan_documents only.
+    _LIFECYCLE_DIRECTORIES = ("drafts", "todo", "in-progress", "done")
+
     def _tool_list_plans(self, args: dict[str, object]) -> dict[str, object]:
+        # Models the lifecycle contract: lexicographic (path, status) rows
+        # from the lifecycle directories only, filtered by exact last-path
+        # cursor, with no continuation field; the walk ends on an empty page.
         limit = int(args.get("limit", CONCIERGE_PAGE_LIMIT))
         cursor = args.get("cursor")
-        start = 0
+        rows = sorted(
+            self.plans,
+            key=lambda plan: (
+                str(plan.get("path")),
+                str(plan.get("status") or ""),
+            ),
+        )
+        rows = [
+            plan
+            for plan in rows
+            if str(plan.get("path", "")).split("/")[1:2]
+            and str(plan.get("path", "")).split("/")[1]
+            in self._LIFECYCLE_DIRECTORIES
+        ]
         if isinstance(cursor, str) and cursor:
-            for index, plan in enumerate(self.plans):
-                if plan.get("path") == cursor:
-                    start = index + 1
-                    break
-        page = self.plans[start : start + limit]
-        return {"plans": page}
+            rows = [plan for plan in rows if str(plan.get("path")) > cursor]
+        return {"plans": rows[:limit]}
+
+    def _tool_list_plan_documents(
+        self, args: dict[str, object]
+    ) -> dict[str, object]:
+        # Full-lifecycle document coverage (todo, in-progress, done, failed,
+        # needs-plan-change), unlike the list_plans lifecycle directories.
+        rows: list[dict[str, object]] = []
+        for path in sorted(self.documents):
+            parts = path.split("/")
+            if len(parts) != 3 or parts[0] != "plans":
+                continue
+            status = _PLAN_STATUS_BY_DIRECTORY.get(parts[1])
+            if status is None:
+                continue
+            rows.append(
+                {
+                    "project_id": self.project_id,
+                    "name": parts[2],
+                    "path": path,
+                    "status": status,
+                    "revision": self.revisions.get(path, "1"),
+                    "size_bytes": len(self.documents[path].encode("utf-8")),
+                }
+            )
+        return {"plans": rows}
 
     def _tool_read_plan(self, args: dict[str, object]) -> dict[str, object]:
         directory = {
-            "todo": "todo",
-            "in_progress": "in-progress",
-            "failed": "failed",
-            "done": "done",
-            "needs_plan_change": "needs-plan-change",
+            status: name
+            for name, status in _PLAN_STATUS_BY_DIRECTORY.items()
         }.get(str(args.get("plan_status")))
         if directory is None:
             raise ConciergeError("mcp_tool_rejected")
-        path = f"plans/{directory}/{args.get('name')}"
+        name = args.get("name")
+        if not isinstance(name, str) or not name:
+            raise ConciergeError("mcp_tool_rejected")
+        path = f"plans/{directory}/{name}"
         if path not in self.documents:
             raise ConciergeError("mcp_tool_rejected")
-        return {"path": path, "content": self.documents[path]}
+        content = self.documents[path]
+        return {
+            "project_id": self.project_id,
+            "name": name,
+            "path": path,
+            "status": _PLAN_STATUS_BY_DIRECTORY[directory],
+            "revision": self.revisions.get(path, "1"),
+            "size_bytes": len(content.encode("utf-8")),
+            "content": content,
+        }
 
     def _tool_get_run(self, args: dict[str, object]) -> dict[str, object]:
         if self.get_run_payloads is not None:
@@ -409,7 +479,13 @@ class FakeMcp:
     def _tool_create_plan(self, args: dict[str, object]) -> dict[str, object]:
         name = str(args.get("name"))
         path = f"plans/todo/{name}"
-        self.plans.append({"path": path, "status": "todo"})
+        self.plans.append(
+            {
+                "path": path,
+                "status": "todo",
+                "modified_at": "2026-01-01T00:00:00Z",
+            }
+        )
         self.documents[path] = str(args.get("content") or "")
         self.created_plans.append(dict(args))
         return {"path": path, "status": "todo"}
@@ -426,6 +502,7 @@ class FakeGithub:
         search_results: Sequence[Mapping[str, object]] = (),
         workflow_runs: Sequence[tuple[int, int, str, str]] = (),
         create_error: ConciergeError | None = None,
+        search_error: ConciergeError | None = None,
     ) -> None:
         self.page = (
             page
@@ -436,6 +513,7 @@ class FakeGithub:
         self.search_results = tuple(search_results)
         self._workflow_run_data = tuple(workflow_runs)
         self.create_error = create_error
+        self.search_error = search_error
         self.calls: list[str] = []
         self.search_queries: list[tuple[str, str]] = []
         self.workflow_sha_queries: list[tuple[str, str]] = []
@@ -461,6 +539,8 @@ class FakeGithub:
         self.search_queries.append((full_name, query))
         if self.error is not None:
             raise self.error
+        if self.search_error is not None:
+            raise self.search_error
         return self.search_results
 
     def create_issue(
@@ -1106,6 +1186,7 @@ def _observation(
     plans: Sequence[Mapping[str, object]] = (),
     issues: Sequence[Mapping[str, object]] = (),
     plan_documents: Mapping[str, str] | None = None,
+    occupancy: Mapping[str, object] | None = None,
 ) -> TickObservation:
     return TickObservation(
         project={"project_id": "agent-flow-test", "root": "/root/code/agent-flow"},
@@ -1113,6 +1194,7 @@ def _observation(
         plans=tuple(plans),
         issues=tuple(issues),
         plan_documents=dict(plan_documents or {}),
+        occupancy=dict(occupancy or {}),
     )
 
 
@@ -1120,23 +1202,34 @@ def _run(
     *,
     run_id: str = "run-1",
     activity: str = "inactive",
-    status: str = "succeeded",
+    status: str = "completed",
     plan_path: str | None = None,
+    evidence: Mapping[str, object] | None = None,
 ) -> dict[str, object]:
-    return {
+    row: dict[str, object] = {
         "run_id": run_id,
         "activity": activity,
         "status": status,
         "plan_path": plan_path,
     }
+    if evidence is not None:
+        row["evidence"] = dict(evidence)
+    return row
 
 
 def _plan(
     *,
     path: str = "plans/todo/alpha.md",
     status: str = "todo",
+    revision: str = "1",
+    modified_at: str = "2026-01-01T00:00:00Z",
 ) -> dict[str, object]:
-    return {"path": path, "status": status}
+    return {
+        "path": path,
+        "status": status,
+        "revision": revision,
+        "modified_at": modified_at,
+    }
 
 
 def _issue(
@@ -1168,14 +1261,16 @@ def test_triage_defers_on_active_run_even_with_eligible_issue() -> None:
 
 
 def test_triage_defers_on_uncertain_run() -> None:
-    decision = triage_tick(_observation(runs=[_run(activity="unknown")]))
+    decision = triage_tick(
+        _observation(runs=[_run(activity="unknown", status="running")])
+    )
     assert decision.action == "defer"
     assert decision.reason == "uncertain_run_present"
     assert decision.mutating is False
 
 
 def test_triage_defers_when_run_activity_is_missing() -> None:
-    run = _run()
+    run = _run(status="running")
     del run["activity"]
     decision = triage_tick(_observation(runs=[run]))
     assert decision.action == "defer"
@@ -1268,7 +1363,7 @@ def test_triage_reports_competing_run_ownership() -> None:
                 ),
                 _run(
                     run_id="run-other",
-                    status="succeeded",
+                    status="completed",
                     plan_path="plans/in-progress/alpha.md",
                 ),
             ],
@@ -1312,7 +1407,7 @@ def test_triage_reports_multiple_launchable_plans() -> None:
 def test_triage_does_not_start_a_plan_already_referenced_by_a_run() -> None:
     decision = triage_tick(
         _observation(
-            runs=[_run(status="succeeded", plan_path="plans/todo/alpha.md")],
+            runs=[_run(status="completed", plan_path="plans/todo/alpha.md")],
             plans=[_plan()],
         )
     )
@@ -1398,6 +1493,7 @@ def test_triage_duplicate_detection_covers_all_evidence_statuses() -> None:
         ("in-progress", "in_progress"),
         ("failed", "failed"),
         ("done", "done"),
+        ("needs-plan-change", "needs_plan_change"),
     ):
         decision = triage_tick(
             _observation(
@@ -1944,7 +2040,13 @@ def test_executor_aborts_when_duplicate_appears_before_create(
     )
 
     def inject_duplicate() -> None:
-        mcp.plans.append({"path": "plans/todo/rival.md", "status": "todo"})
+        mcp.plans.append(
+            {
+                "path": "plans/todo/rival.md",
+                "status": "todo",
+                "modified_at": "2026-01-01T00:00:00Z",
+            }
+        )
         mcp.documents["plans/todo/rival.md"] = (
             "Source: https://github.com/owner/repo/issues/7"
         )
@@ -2523,13 +2625,19 @@ def test_executor_plan_and_start_aborts_on_claim_during_planning(
     )
 
     def inject_claim() -> None:
-        mcp.plans.append({"path": "plans/todo/owner-issue-7.md", "status": "todo"})
+        mcp.plans.append(
+            {
+                "path": "plans/todo/owner-issue-7.md",
+                "status": "todo",
+                "modified_at": "2026-01-01T00:00:00Z",
+            }
+        )
         mcp.documents["plans/todo/owner-issue-7.md"] = "# Plan\n"
         mcp.runs.append(
             {
                 "run_id": "run-claim",
-                "activity": "inactive",
-                "status": "succeeded",
+                "activity": "active",
+                "status": "running",
                 "plan_path": "plans/todo/owner-issue-7.md",
             }
         )
@@ -3165,7 +3273,9 @@ def test_executor_defect_search_failure_is_report_only(
         plans=[{"path": "plans/in-progress/alpha.md", "status": "in_progress"}],
         documents={"plans/in-progress/alpha.md": "# Plan\n"},
     )
-    github = FakeGithub(error=ConciergeError("github_unavailable"))
+    # The open-issue inventory is complete; only the defect deduplication
+    # search fails, so the tick reaches the filing gate and stops there.
+    github = FakeGithub(search_error=ConciergeError("github_unavailable"))
     executor = _executor(tmp_path, monkeypatch, mcp=mcp, github=github)
     outcome = executor.execute(
         state_dir=tmp_path / "state", project_root=tmp_path, environment=ENVIRONMENT
@@ -3189,8 +3299,10 @@ def test_executor_partial_search_envelope_is_report_only(
         documents={"plans/in-progress/alpha.md": "# Plan\n"},
     )
     # A partial (incomplete_results: true) or malformed search envelope makes
-    # the REST client raise, exactly like an unavailable search.
-    github = FakeGithub(error=ConciergeError("github_search_invalid"))
+    # the REST client raise, exactly like an unavailable search.  The
+    # open-issue inventory itself stays complete so the tick reaches the
+    # filing gate.
+    github = FakeGithub(search_error=ConciergeError("github_search_invalid"))
     executor = _executor(tmp_path, monkeypatch, mcp=mcp, github=github)
     outcome = executor.execute(
         state_dir=tmp_path / "state", project_root=tmp_path, environment=ENVIRONMENT
@@ -4213,3 +4325,894 @@ def test_fresh_dispatch_uses_only_qualifying_ci(
     # The unrelated workflow's failure must not block the fresh dispatch.
     assert outcome.action == "start"
     assert outcome.mutating is True
+
+
+# ---------------------------------------------------------------------------
+# Checkpoint 2: complete bounded inventory + conservative occupancy
+# ---------------------------------------------------------------------------
+
+
+def _large_inventory_runs() -> list[dict[str, object]]:
+    runs: list[dict[str, object]] = []
+    for index in range(216):
+        runs.append(
+            _run(
+                run_id=f"run-stopped-unknown-{index:03d}",
+                activity="unknown",
+                status="owner_stopped",
+            )
+        )
+    for index in range(2):
+        runs.append(
+            _run(
+                run_id=f"run-stopped-inactive-{index:03d}",
+                activity="inactive",
+                status="owner_stopped",
+            )
+        )
+    for index in range(9):
+        runs.append(
+            _run(
+                run_id=f"run-completed-unknown-{index:03d}",
+                activity="unknown",
+                status="completed",
+            )
+        )
+    for index in range(6):
+        runs.append(
+            _run(
+                run_id=f"run-completed-inactive-{index:03d}",
+                activity="inactive",
+                status="completed",
+            )
+        )
+    for index in range(5):
+        runs.append(
+            _run(
+                run_id=f"run-attention-{index:03d}",
+                activity="unknown",
+                status="needs_attention",
+            )
+        )
+    for index in range(4):
+        runs.append(
+            _run(
+                run_id=f"run-question-{index:03d}",
+                activity="unknown",
+                status="awaiting_startup_answer",
+            )
+        )
+    for index in range(15):
+        runs.append(
+            _run(
+                run_id=f"run-failed-{index:03d}",
+                activity="inactive",
+                status="failed",
+            )
+        )
+    runs.append(_run(run_id="run-active", activity="active", status="running"))
+    return runs
+
+
+def _large_inventory_plans() -> tuple[list[dict[str, object]], dict[str, str]]:
+    plans: list[dict[str, object]] = []
+    documents: dict[str, str] = {}
+    for index in range(182):
+        path = f"plans/done/done-{index:03d}.md"
+        plans.append({"path": path, "status": "done"})
+        documents[path] = "# Plan\n"
+    for index in range(46):
+        path = f"plans/in-progress/active-{index:03d}.md"
+        plans.append({"path": path, "status": "in_progress"})
+        documents[path] = "# Plan\n"
+    for index in range(4):
+        path = f"plans/needs-plan-change/change-{index:03d}.md"
+        plans.append({"path": path, "status": "needs_plan_change"})
+        documents[path] = "# Plan\n"
+    for index in range(3):
+        path = f"plans/todo/todo-{index:03d}.md"
+        plans.append({"path": path, "status": "todo"})
+        documents[path] = "# Plan\n"
+    return plans, documents
+
+
+def test_executor_defers_large_mixed_inventory_with_zero_writes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    plans, documents = _large_inventory_plans()
+    mcp = FakeMcp(
+        project_root=tmp_path,
+        runs=_large_inventory_runs(),
+        plans=plans,
+        documents=documents,
+    )
+    executor = _executor(tmp_path, monkeypatch, mcp=mcp)
+    outcome = executor.execute(
+        state_dir=tmp_path / "state",
+        project_root=tmp_path,
+        environment=ENVIRONMENT,
+    )
+    assert outcome.action == "defer"
+    assert outcome.reason == "active_run_present"
+    assert outcome.mutating is False
+    assert mcp.created_plans == []
+    assert not set(mcp.call_names()) & {
+        "resume_run",
+        "start_run",
+        "create_plan",
+    }
+
+
+def test_executor_pages_exact_multiple_run_inventory(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    runs = [
+        _run(
+            run_id=f"run-{index:03d}",
+            activity="inactive",
+            status="completed",
+        )
+        for index in range(2 * CONCIERGE_PAGE_LIMIT)
+    ]
+    mcp = FakeMcp(
+        project_root=tmp_path,
+        runs=runs,
+        plans=[{"path": "plans/todo/alpha.md", "status": "todo"}],
+        documents={"plans/todo/alpha.md": "# Plan\n"},
+        publication=_publication_projection(available=True, remote="origin", branch="main"),
+    )
+    executor = _executor(tmp_path, monkeypatch, mcp=mcp)
+    outcome = executor.execute(
+        state_dir=tmp_path / "state",
+        project_root=tmp_path,
+        environment=ENVIRONMENT,
+    )
+    assert outcome.action == "start"
+    assert outcome.mutating is True
+
+
+def test_executor_pages_plan_inventory_to_final_empty_page(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    plans: list[dict[str, object]] = []
+    documents: dict[str, str] = {}
+    for index in range(2 * CONCIERGE_PAGE_LIMIT + 50):
+        path = f"plans/done/done-{index:03d}.md"
+        plans.append({"path": path, "status": "done"})
+        documents[path] = "# Plan\n"
+    mcp = FakeMcp(
+        project_root=tmp_path, plans=plans, documents=documents
+    )
+    executor = _executor(tmp_path, monkeypatch, mcp=mcp)
+    outcome = executor.execute(
+        state_dir=tmp_path / "state",
+        project_root=tmp_path,
+        environment=ENVIRONMENT,
+    )
+    assert outcome.action == "idle"
+    assert outcome.reason == "no_eligible_work"
+
+
+def test_executor_rejects_run_row_without_identity(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    class MalformedRunRowMcp(FakeMcp):
+        def _tool_list_runs(
+            self, args: dict[str, object]
+        ) -> dict[str, object]:
+            return {
+                "runs": [{"activity": "inactive", "status": "completed"}],
+                "next_cursor": None,
+                "schema_version": 1,
+            }
+
+    mcp = MalformedRunRowMcp(project_root=tmp_path)
+    executor = _executor(tmp_path, monkeypatch, mcp=mcp)
+    outcome = executor.execute(
+        state_dir=tmp_path / "state",
+        project_root=tmp_path,
+        environment=ENVIRONMENT,
+    )
+    assert outcome.action == "report"
+    assert outcome.reason == "evidence_unavailable"
+    assert outcome.mutating is False
+
+
+def test_executor_rejects_duplicate_run_identity(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    class DuplicateRunIdMcp(FakeMcp):
+        def _tool_list_runs(
+            self, args: dict[str, object]
+        ) -> dict[str, object]:
+            return {
+                "runs": [
+                    {"run_id": "run-a", "activity": "inactive"},
+                    {"run_id": "run-a", "activity": "inactive"},
+                ],
+                "next_cursor": None,
+                "schema_version": 1,
+            }
+
+    mcp = DuplicateRunIdMcp(project_root=tmp_path)
+    executor = _executor(tmp_path, monkeypatch, mcp=mcp)
+    outcome = executor.execute(
+        state_dir=tmp_path / "state",
+        project_root=tmp_path,
+        environment=ENVIRONMENT,
+    )
+    assert outcome.action == "report"
+    assert outcome.reason == "evidence_unavailable"
+    assert outcome.mutating is False
+
+
+def test_executor_rejects_repeated_run_cursor(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    class RepeatingRunCursorMcp(FakeMcp):
+        def _tool_list_runs(
+            self, args: dict[str, object]
+        ) -> dict[str, object]:
+            rows = sorted(self.runs, key=lambda run: str(run.get("run_id")))
+            cursor = args.get("cursor")
+            if isinstance(cursor, str) and cursor:
+                rows = [
+                    run for run in rows if str(run.get("run_id")) > cursor
+                ]
+            return {
+                "runs": rows[:1],
+                "next_cursor": "run-b",
+                "schema_version": 1,
+            }
+
+    mcp = RepeatingRunCursorMcp(
+        project_root=tmp_path,
+        runs=[
+            _run(run_id="run-a"),
+            _run(run_id="run-b"),
+            _run(run_id="run-c"),
+        ],
+    )
+    executor = _executor(tmp_path, monkeypatch, mcp=mcp)
+    outcome = executor.execute(
+        state_dir=tmp_path / "state",
+        project_root=tmp_path,
+        environment=ENVIRONMENT,
+    )
+    assert outcome.action == "report"
+    assert outcome.reason == "evidence_unavailable"
+    assert outcome.mutating is False
+
+
+def test_executor_rejects_non_advancing_plan_page(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    class StuckPlanPageMcp(FakeMcp):
+        def _tool_list_plans(
+            self, args: dict[str, object]
+        ) -> dict[str, object]:
+            rows = sorted(self.plans, key=lambda plan: str(plan.get("path")))
+            return {"plans": rows[:1]}
+
+    mcp = StuckPlanPageMcp(
+        project_root=tmp_path,
+        plans=[
+            {"path": "plans/done/a.md", "status": "done"},
+            {"path": "plans/done/b.md", "status": "done"},
+        ],
+        documents={
+            "plans/done/a.md": "# Plan\n",
+            "plans/done/b.md": "# Plan\n",
+        },
+    )
+    executor = _executor(tmp_path, monkeypatch, mcp=mcp)
+    outcome = executor.execute(
+        state_dir=tmp_path / "state",
+        project_root=tmp_path,
+        environment=ENVIRONMENT,
+    )
+    assert outcome.action == "report"
+    assert outcome.reason == "evidence_unavailable"
+    assert outcome.mutating is False
+
+
+def test_executor_rejects_run_page_overflow(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    class EndlessRunPagesMcp(FakeMcp):
+        def _tool_list_runs(
+            self, args: dict[str, object]
+        ) -> dict[str, object]:
+            cursor = args.get("cursor")
+            offset = int(str(cursor).rsplit("-", 1)[-1]) if cursor else 0
+            return {
+                "runs": [
+                    {
+                        "run_id": f"run-{offset}-{index:03d}",
+                        "activity": "inactive",
+                        "status": "completed",
+                    }
+                    for index in range(CONCIERGE_PAGE_LIMIT)
+                ],
+                "next_cursor": f"cursor-{offset + 1}",
+                "schema_version": 1,
+            }
+
+    mcp = EndlessRunPagesMcp(project_root=tmp_path)
+    executor = _executor(tmp_path, monkeypatch, mcp=mcp)
+    outcome = executor.execute(
+        state_dir=tmp_path / "state",
+        project_root=tmp_path,
+        environment=ENVIRONMENT,
+    )
+    assert outcome.action == "report"
+    assert outcome.reason == "evidence_unavailable"
+    assert outcome.mutating is False
+
+
+def test_executor_preserves_legacy_draft_rows_in_complete_inventory(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    mcp = FakeMcp(
+        project_root=tmp_path,
+        plans=[
+            {"path": "plans/drafts/legacy.md", "status": "draft"},
+            {"path": "plans/todo/independent.md", "status": "todo"},
+        ],
+        documents={
+            "plans/todo/independent.md": "# Plan\n",
+        },
+        publication=_publication_projection(
+            available=True, remote="origin", branch="main"
+        ),
+    )
+    executor = _executor(tmp_path, monkeypatch, mcp=mcp)
+    outcome = executor.execute(
+        state_dir=tmp_path / "state",
+        project_root=tmp_path,
+        environment=ENVIRONMENT,
+    )
+    # Legacy draft rows have no list_plan_documents projection by design;
+    # they stay in the inventory as held rows, never as launchable targets,
+    # and never suppress an independent admissible todo plan.
+    assert outcome.action == "start"
+    assert outcome.reason == "started"
+    assert outcome.mutating is True
+    assert outcome.details["plan_path"] == "plans/todo/independent.md"
+    start_calls = [args for name, args in mcp.calls if name == "start_run"]
+    assert len(start_calls) == 1
+    assert start_calls[0]["plan_path"] == "plans/todo/independent.md"
+
+
+def test_executor_lone_legacy_draft_is_held_not_started(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    mcp = FakeMcp(
+        project_root=tmp_path,
+        plans=[{"path": "plans/drafts/legacy.md", "status": "draft"}],
+    )
+    executor = _executor(tmp_path, monkeypatch, mcp=mcp)
+    outcome = executor.execute(
+        state_dir=tmp_path / "state",
+        project_root=tmp_path,
+        environment=ENVIRONMENT,
+    )
+    # A lone legacy draft row is held inventory, not launchable work.
+    assert outcome.action == "idle"
+    assert outcome.reason == "no_eligible_work"
+    assert outcome.mutating is False
+    assert not set(mcp.call_names()) & {
+        "resume_run",
+        "start_run",
+        "create_plan",
+    }
+
+
+def test_executor_reports_incomplete_github_inventory(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    mcp = FakeMcp(project_root=tmp_path)
+    github = FakeGithub(
+        page=GithubIssuePage(
+            repository_id=42, issues=(_github_issue(),), complete=False
+        )
+    )
+    executor = _executor(tmp_path, monkeypatch, mcp=mcp, github=github)
+    outcome = executor.execute(
+        state_dir=tmp_path / "state",
+        project_root=tmp_path,
+        environment=ENVIRONMENT,
+    )
+    assert outcome.action == "report"
+    assert outcome.reason == "github_evidence_unavailable"
+    assert outcome.mutating is False
+    assert mcp.created_plans == []
+    assert not set(mcp.call_names()) & {"resume_run", "start_run", "create_plan"}
+
+
+def test_executor_incomplete_github_inventory_blocks_start(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    mcp = FakeMcp(
+        project_root=tmp_path,
+        plans=[{"path": "plans/todo/alpha.md", "status": "todo"}],
+        documents={"plans/todo/alpha.md": "# Plan\n"},
+        publication=_publication_projection(
+            available=True, remote="origin", branch="main"
+        ),
+    )
+    github = FakeGithub(
+        page=GithubIssuePage(
+            repository_id=42, issues=(_github_issue(),), complete=False
+        )
+    )
+    executor = _executor(tmp_path, monkeypatch, mcp=mcp, github=github)
+    outcome = executor.execute(
+        state_dir=tmp_path / "state",
+        project_root=tmp_path,
+        environment=ENVIRONMENT,
+    )
+    assert outcome.action == "report"
+    assert outcome.reason == "github_evidence_unavailable"
+    assert outcome.mutating is False
+    assert mcp.created_plans == []
+    assert not set(mcp.call_names()) & {"resume_run", "start_run", "create_plan"}
+    assert github.created_issues == []
+
+
+def test_executor_incomplete_github_inventory_blocks_resume(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    mcp = FakeMcp(
+        project_root=tmp_path,
+        runs=[
+            {
+                "run_id": "run-failed",
+                "activity": "inactive",
+                "status": "failed",
+                "plan_path": "plans/in-progress/alpha.md",
+                "evidence": {"can_resume": True},
+            }
+        ],
+        plans=[{"path": "plans/in-progress/alpha.md", "status": "in_progress"}],
+        documents={"plans/in-progress/alpha.md": "# Plan\n"},
+    )
+    github = FakeGithub(
+        page=GithubIssuePage(
+            repository_id=42, issues=(_github_issue(),), complete=False
+        )
+    )
+    executor = _executor(tmp_path, monkeypatch, mcp=mcp, github=github)
+    outcome = executor.execute(
+        state_dir=tmp_path / "state",
+        project_root=tmp_path,
+        environment=ENVIRONMENT,
+    )
+    assert outcome.action == "report"
+    assert outcome.reason == "github_evidence_unavailable"
+    assert outcome.mutating is False
+    assert not set(mcp.call_names()) & {"resume_run", "start_run", "create_plan"}
+    assert github.created_issues == []
+
+
+def test_executor_github_read_error_blocks_start(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    mcp = FakeMcp(
+        project_root=tmp_path,
+        plans=[{"path": "plans/todo/alpha.md", "status": "todo"}],
+        documents={"plans/todo/alpha.md": "# Plan\n"},
+        publication=_publication_projection(
+            available=True, remote="origin", branch="main"
+        ),
+    )
+    github = FakeGithub(error=ConciergeError("github_unavailable"))
+    executor = _executor(tmp_path, monkeypatch, mcp=mcp, github=github)
+    outcome = executor.execute(
+        state_dir=tmp_path / "state",
+        project_root=tmp_path,
+        environment=ENVIRONMENT,
+    )
+    assert outcome.action == "report"
+    assert outcome.reason == "github_evidence_unavailable"
+    assert outcome.mutating is False
+    assert mcp.created_plans == []
+    assert not set(mcp.call_names()) & {"resume_run", "start_run", "create_plan"}
+    assert github.created_issues == []
+
+
+def test_triage_active_activity_overrides_terminal_label() -> None:
+    decision = triage_tick(
+        _observation(runs=[_run(activity="active", status="completed")])
+    )
+    assert decision.action == "defer"
+    assert decision.reason == "active_run_present"
+    assert decision.run_id == "run-1"
+
+
+def test_triage_active_unit_or_preparation_overrides_terminal_label() -> None:
+    for evidence in (
+        {"unit_active": True},
+        {"preparation_active": True},
+    ):
+        decision = triage_tick(
+            _observation(
+                runs=[
+                    _run(
+                        activity="inactive",
+                        status="completed",
+                        evidence=evidence,
+                    )
+                ]
+            )
+        )
+        assert decision.action == "defer"
+        assert decision.reason == "active_run_present"
+
+
+def test_triage_noncanonical_activity_is_never_history() -> None:
+    for activity in ("paused", "waiting", "malformed"):
+        decision = triage_tick(
+            _observation(runs=[_run(activity=activity, status="running")])
+        )
+        assert decision.action == "defer"
+        assert decision.reason == "uncertain_run_present"
+
+
+def test_classify_terminal_row_with_malformed_activity_blocks() -> None:
+    # A terminal row whose activity is missing or malformed is not provably
+    # historical and stays blocking until fresh canonical detail resolves it.
+    for activity in ("paused", "waiting", "malformed"):
+        assert classify_run_occupancy(
+            {"run_id": "run-1", "status": "completed", "activity": activity}
+        ) == OCCUPANCY_BLOCKED
+    assert (
+        classify_run_occupancy({"run_id": "run-1", "status": "completed"})
+        == OCCUPANCY_BLOCKED
+    )
+
+
+def test_classify_terminal_row_with_canonical_activity_is_history() -> None:
+    for activity in ("unknown", "inactive"):
+        assert classify_run_occupancy(
+            {"run_id": "run-1", "status": "completed", "activity": activity}
+        ) == OCCUPANCY_TERMINAL
+    # Active evidence keeps priority over any terminal label.
+    assert (
+        classify_run_occupancy(
+            {"run_id": "run-1", "status": "completed", "activity": "active"}
+        )
+        == OCCUPANCY_ACTIVE
+    )
+    assert classify_run_occupancy(
+        {
+            "run_id": "run-1",
+            "status": "completed",
+            "activity": "inactive",
+            "evidence": {"unit_active": True},
+        }
+    ) == OCCUPANCY_ACTIVE
+
+
+def test_executor_terminal_malformed_activity_resolves_from_fresh_detail(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    mcp = FakeMcp(
+        project_root=tmp_path,
+        runs=[_run(activity="malformed", status="completed")],
+        plans=[_plan(path="plans/todo/independent.md")],
+        documents={"plans/todo/independent.md": "# Plan\n"},
+        get_run_payloads={
+            "run-1": {
+                "run_id": "run-1",
+                "activity": "unknown",
+                "status": "completed",
+            }
+        },
+        publication=_publication_projection(
+            available=True, remote="origin", branch="main"
+        ),
+    )
+    executor = _executor(tmp_path, monkeypatch, mcp=mcp)
+    outcome = executor.execute(
+        state_dir=tmp_path / "state",
+        project_root=tmp_path,
+        environment=ENVIRONMENT,
+    )
+    assert outcome.action == "start"
+    assert outcome.reason == "started"
+    assert outcome.mutating is True
+    assert outcome.details["plan_path"] == "plans/todo/independent.md"
+    assert mcp.call_names().count("start_run") == 1
+
+
+def test_executor_terminal_malformed_activity_blocks_when_detail_still_malformed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    mcp = FakeMcp(
+        project_root=tmp_path,
+        runs=[_run(activity="malformed", status="completed")],
+        plans=[_plan(path="plans/todo/independent.md")],
+        documents={"plans/todo/independent.md": "# Plan\n"},
+        get_run_payloads={
+            "run-1": {
+                "run_id": "run-1",
+                "activity": "malformed",
+                "status": "completed",
+            }
+        },
+        publication=_publication_projection(
+            available=True, remote="origin", branch="main"
+        ),
+    )
+    executor = _executor(tmp_path, monkeypatch, mcp=mcp)
+    outcome = executor.execute(
+        state_dir=tmp_path / "state",
+        project_root=tmp_path,
+        environment=ENVIRONMENT,
+    )
+    assert outcome.action == "defer"
+    assert outcome.reason == "uncertain_run_present"
+    assert outcome.mutating is False
+    assert outcome.details["run_id"] == "run-1"
+    assert not set(mcp.call_names()) & {"resume_run", "start_run", "create_plan"}
+
+
+def test_executor_terminal_malformed_activity_blocks_when_detail_unavailable(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    mcp = FakeMcp(
+        project_root=tmp_path,
+        runs=[_run(activity="malformed", status="completed")],
+        plans=[_plan(path="plans/todo/independent.md")],
+        documents={"plans/todo/independent.md": "# Plan\n"},
+        get_run_payloads={},
+        publication=_publication_projection(
+            available=True, remote="origin", branch="main"
+        ),
+    )
+    executor = _executor(tmp_path, monkeypatch, mcp=mcp)
+    outcome = executor.execute(
+        state_dir=tmp_path / "state",
+        project_root=tmp_path,
+        environment=ENVIRONMENT,
+    )
+    assert outcome.action == "defer"
+    assert outcome.reason == "uncertain_run_present"
+    assert outcome.mutating is False
+    assert outcome.details["run_id"] == "run-1"
+    assert not set(mcp.call_names()) & {"resume_run", "start_run", "create_plan"}
+
+
+def _startup_hold_fixture(
+    *,
+    unit_observation: str = "missing",
+    status: str = "needs_attention",
+    row_plan_path: str | None = "plans/todo/held.md",
+    detail_plan_path: str | None = "plans/todo/held.md",
+) -> tuple[
+    list[dict[str, object]],
+    list[dict[str, object]],
+    dict[str, str],
+    dict[str, dict[str, object]],
+]:
+    status_reason_code = (
+        "startup_failed" if status == "needs_attention" else None
+    )
+    run_row: dict[str, object] = {
+        "run_id": "run-hold",
+        "activity": "inactive",
+        "status": status,
+    }
+    if row_plan_path is not None:
+        run_row["plan_path"] = row_plan_path
+    if status_reason_code is not None:
+        run_row["status_reason_code"] = status_reason_code
+    detail: dict[str, object] = {
+        "run_id": "run-hold",
+        "activity": "inactive",
+        "status": status,
+        "launch_phase": "manifest_only",
+        "evidence": {
+            "no_agent_started": True,
+            "unit_observation": unit_observation,
+        },
+    }
+    if detail_plan_path is not None:
+        detail["plan_path"] = detail_plan_path
+    if status_reason_code is not None:
+        detail["status_reason_code"] = status_reason_code
+    plans = [
+        {"path": "plans/todo/held.md", "status": "todo"},
+        {"path": "plans/todo/independent.md", "status": "todo"},
+    ]
+    documents = {
+        "plans/todo/held.md": "# Plan\n",
+        "plans/todo/independent.md": "# Plan\n",
+    }
+    return [run_row], plans, documents, {"run-hold": detail}
+
+
+def test_executor_verified_startup_failure_holds_only_its_plan(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    runs, plans, documents, details = _startup_hold_fixture()
+    mcp = FakeMcp(
+        project_root=tmp_path,
+        runs=runs,
+        plans=plans,
+        documents=documents,
+        get_run_payloads=details,
+        publication=_publication_projection(available=True, remote="origin", branch="main"),
+    )
+    executor = _executor(tmp_path, monkeypatch, mcp=mcp)
+    outcome = executor.execute(
+        state_dir=tmp_path / "state",
+        project_root=tmp_path,
+        environment=ENVIRONMENT,
+    )
+    assert outcome.action == "start"
+    assert outcome.reason == "started"
+    assert outcome.mutating is True
+    assert outcome.details["plan_path"] == "plans/todo/independent.md"
+    started = next(
+        args for name, args in mcp.calls if name == "start_run"
+    )
+    assert started.get("plan_path") == "plans/todo/independent.md"
+    assert mcp.created_plans == []
+
+
+def test_executor_verified_startup_question_holds_only_its_plan(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    runs, plans, documents, details = _startup_hold_fixture(
+        status="awaiting_startup_answer"
+    )
+    mcp = FakeMcp(
+        project_root=tmp_path,
+        runs=runs,
+        plans=plans,
+        documents=documents,
+        get_run_payloads=details,
+        publication=_publication_projection(available=True, remote="origin", branch="main"),
+    )
+    executor = _executor(tmp_path, monkeypatch, mcp=mcp)
+    outcome = executor.execute(
+        state_dir=tmp_path / "state",
+        project_root=tmp_path,
+        environment=ENVIRONMENT,
+    )
+    assert outcome.action == "start"
+    assert outcome.details["plan_path"] == "plans/todo/independent.md"
+    started = next(
+        args for name, args in mcp.calls if name == "start_run"
+    )
+    assert started.get("plan_path") == "plans/todo/independent.md"
+
+
+def test_executor_startup_hold_without_detail_path_blocks(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # A manifest-only startup record whose fresh detail carries no plan path
+    # cannot establish which plan it holds, so it blocks all dispatch.
+    for status in ("needs_attention", "awaiting_startup_answer"):
+        runs, plans, documents, details = _startup_hold_fixture(
+            status=status, detail_plan_path=None
+        )
+        mcp = FakeMcp(
+            project_root=tmp_path,
+            runs=runs,
+            plans=plans,
+            documents=documents,
+            get_run_payloads=details,
+            publication=_publication_projection(available=True, remote="origin", branch="main"),
+        )
+        executor = _executor(tmp_path, monkeypatch, mcp=mcp)
+        outcome = executor.execute(
+            state_dir=tmp_path / "state",
+            project_root=tmp_path,
+            environment=ENVIRONMENT,
+        )
+        assert outcome.action == "defer"
+        assert outcome.reason == "uncertain_run_present"
+        assert outcome.mutating is False
+        assert mcp.created_plans == []
+        assert not set(mcp.call_names()) & {
+            "resume_run",
+            "start_run",
+            "create_plan",
+        }
+
+
+def test_executor_startup_hold_list_detail_path_mismatch_blocks(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # A fresh detail that names a different plan than the list row is
+    # contradictory identity evidence and blocks all dispatch.
+    for status in ("needs_attention", "awaiting_startup_answer"):
+        runs, plans, documents, details = _startup_hold_fixture(
+            status=status, detail_plan_path="plans/todo/other.md"
+        )
+        mcp = FakeMcp(
+            project_root=tmp_path,
+            runs=runs,
+            plans=plans,
+            documents=documents,
+            get_run_payloads=details,
+            publication=_publication_projection(available=True, remote="origin", branch="main"),
+        )
+        executor = _executor(tmp_path, monkeypatch, mcp=mcp)
+        outcome = executor.execute(
+            state_dir=tmp_path / "state",
+            project_root=tmp_path,
+            environment=ENVIRONMENT,
+        )
+        assert outcome.action == "defer"
+        assert outcome.reason == "uncertain_run_present"
+        assert outcome.mutating is False
+        assert mcp.created_plans == []
+        assert not set(mcp.call_names()) & {
+            "resume_run",
+            "start_run",
+            "create_plan",
+        }
+
+
+def test_executor_unverified_startup_candidate_still_blocks(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    for unit_observation in ("observed", "identity_mismatch", "unavailable"):
+        runs, plans, documents, details = _startup_hold_fixture(
+            unit_observation=unit_observation
+        )
+        mcp = FakeMcp(
+            project_root=tmp_path,
+            runs=runs,
+            plans=plans,
+            documents=documents,
+            get_run_payloads=details,
+        )
+        executor = _executor(tmp_path, monkeypatch, mcp=mcp)
+        outcome = executor.execute(
+            state_dir=tmp_path / "state",
+            project_root=tmp_path,
+            environment=ENVIRONMENT,
+        )
+        assert outcome.action == "defer"
+        assert outcome.reason == "uncertain_run_present"
+        assert outcome.mutating is False
+        assert mcp.created_plans == []
+        assert not set(mcp.call_names()) & {
+            "resume_run",
+            "start_run",
+            "create_plan",
+        }
+
+
+def test_executor_attention_run_with_possible_execution_still_blocks(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    runs, plans, documents, details = _startup_hold_fixture()
+    # The fresh detail no longer proves pre-execution inactivity.
+    details["run-hold"]["launch_phase"] = "unit_started"
+    mcp = FakeMcp(
+        project_root=tmp_path,
+        runs=runs,
+        plans=plans,
+        documents=documents,
+        get_run_payloads=details,
+    )
+    executor = _executor(tmp_path, monkeypatch, mcp=mcp)
+    outcome = executor.execute(
+        state_dir=tmp_path / "state",
+        project_root=tmp_path,
+        environment=ENVIRONMENT,
+    )
+    assert outcome.action == "defer"
+    assert outcome.reason == "uncertain_run_present"
+    assert outcome.mutating is False
+    assert not set(mcp.call_names()) & {
+        "resume_run",
+        "start_run",
+        "create_plan",
+    }

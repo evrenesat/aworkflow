@@ -1,5 +1,71 @@
 # DEVLOG
 
+## 2026-09-30 — Complete bounded concierge inventory and conservative occupancy (Checkpoint 2)
+
+- The recovered concierge blocked on any unknown run activity and read an
+  incomplete inventory: `list_plans` omits `failed` and `needs-plan-change`
+  documents, and list rows deliberately carry no admission preview.
+  `aflow/concierge.py` now builds a complete bounded inventory before
+  triage: it pages `list_runs` with the opaque `next_cursor`, pages
+  `list_plans` by exact last path until the final empty page (including an
+  exact page-size multiple), joins lifecycle rows with `list_plan_documents`
+  by exact canonical path (normalizing underscore/hyphen status spellings
+  once, preserving legacy `draft` as held), and reads every document with
+  `read_plan`, retaining exact path, normalized status, revision, content,
+  and modification timestamp. Missing or malformed pages/rows, duplicate
+  identities, repeated or non-advancing cursors, and an unconsumed
+  continuation at the page cap produce a bounded `evidence_unavailable`
+  report with zero mutations; a partial inventory is never treated as
+  complete.
+- One conservative occupancy classifier
+  (`classify_run_occupancy`/`_occupancy_report`) now serves initial triage,
+  fresh selection, post-planner checks, and timeout reconciliation. Active
+  activity, `unit_active=true`, or `preparation_active=true` blocks all
+   dispatch even over a terminal label. Canonical terminal statuses
+   (`completed`, `failed`, `interrupted`, `owner_stopped`) with a canonical
+   `unknown` or `inactive` activity and no contradictory active evidence are
+   historical and never grant resume; a terminal row whose activity is
+   missing or malformed is not provably historical and stays blocking until
+   fresh canonical `get_run` detail resolves it. Nonterminal unknown rows are
+   refreshed through matching `get_run` detail,
+  and a still-uncertain unit blocks regardless of age. A validated
+  pre-execution startup question or preparation-stage startup failure
+   (manifest-only phase, `no_agent_started=true`,
+   `unit_observation=missing`, no active preparation/unit) holds only its own
+   plan while fresh canonical queue capacity permits another implementation,
+   and only when the fresh `get_run` detail carries a nonempty plan path
+   that exactly matches the list row's plan path; a missing or mismatched
+   identity cannot establish which plan the startup record holds and keeps
+   the run blocking. A validated startup hold is never answered, discarded,
+   or retried. Paused, waiting, malformed,
+  or missing-evidence rows remain blocking. Every mutation path re-checks
+  fresh canonical queue capacity (one slot, automatic consumption disabled)
+  before advancing work.
+- GitHub issue evidence completeness is a global fail-closed gate: a
+  missing repository identity, a feed read error, a repeated page, or an
+  unconsumed continuation at the preserved five-page cap reports
+  `github_evidence_unavailable` with zero mutations before defect filing,
+  resume, start, or plan authoring, and never permits selection from
+  partial issue evidence.
+- `FakeMcp` now models lexical run/path ordering, opaque returned run
+  continuations, list rows without `can_resume`, full lifecycle document
+  coverage, revisioned plan reads, matching detail reads, and real queue
+  outcomes. New regressions cover the observed 258-run/235-document
+  inventory (complete, initially defers with zero writes), exact page-size
+  multiples, malformed rows, duplicate identities, repeated cursors,
+   non-advancing plan pages, page-limit exhaustion, terminal history with a
+   verified startup hold permitting one independent action, unverified
+   startup candidates, startup holds whose detail plan path is missing or
+   mismatches the list row, active-evidence precedence over terminal
+   labels, and incomplete GitHub inventories (partial page and feed read
+   error) that report with zero writes for otherwise admissible `start`
+   and `resume` candidates.
+- Verification: from the repository root, `uv run pytest
+  tests/test_concierge.py -q` (192 passed) and `uv run ruff check
+  aflow/concierge.py` (clean); from `apps/aflow_app/server`, `uv run pytest
+  tests/test_mcp.py tests/test_plan_store.py -q` (95 passed); `git diff
+  --check` is clean. No UI change is included.
+
 ## 2026-09-30 — Accept bounded full-path plan cursors in mounted MCP (Checkpoint 1)
 
 - The mounted MCP `list_plans` tool shared the run cursor's 64-character

@@ -60,17 +60,22 @@ if the login preflight fails.
 
 ## Tick policy (one-plan triage)
 
-Each tick reads the queue through MCP (`list_projects` by exact Git root,
-paginated `list_runs`, `list_plans`, `read_plan` for every `todo`,
-`in-progress`, `failed`, and `done` plan document, then `get_run` for
-reconciliation) plus read-only GitHub open-issue evidence, and chooses at
-most one action, in priority order:
+Each tick builds a complete bounded inventory through MCP (`list_projects`
+by exact Git root, `list_runs` paged with the opaque `next_cursor`,
+`list_plans` paged by exact last path until the final empty page,
+`list_plan_documents` joined to the lifecycle rows by exact canonical path,
+and `read_plan` for every plan document, including `failed` and
+`needs-plan-change`), then reads `get_run` for reconciliation and reads
+read-only GitHub open-issue evidence, and chooses at most one action, in
+priority order:
 
 1. Resume a confirmed-inactive failed run whose exact plan lineage is
    verified, reusing the same idempotency key.
-2. Start exactly one launchable `todo`/`draft` plan with the
+2. Start exactly one launchable `todo` plan with the
    `checkpoint_delivery` workflow and the explicit `xtx-mtp` team, after an
-   exact-path preflight.
+   exact-path preflight. Legacy `draft` rows remain in the joined inventory
+   as held rows; they are never launchable and never suppress an independent
+   admissible `todo` plan.
 3. For the oldest open issue authored by GitHub user ID `591691` that no
    plan document already covers, author one plan with the read-only
    `gpt-6-astra` high-effort planner following `aflow-plan`. The plan must
@@ -83,7 +88,12 @@ document references the canonical issue URL
 (`https://github.com/<owner>/<repo>/issues/<number>`). A plan whose
 document cannot be read while owner issues are pending reports
 `plan_evidence_unavailable` instead of guessing, and a duplicate detected
-again immediately before `create_plan` aborts without authoring.
+again immediately before `create_plan` aborts without authoring. The
+open-issue feed is paged with a five-page cap; a missing repository
+identity, a feed read error, a repeated page, or an unconsumed
+continuation at that cap reports `github_evidence_unavailable` with zero
+mutations before defect filing, resume, start, or plan authoring, and
+never permits selection from partial issue evidence.
 
 Before any mutating action the tick re-reads fresh evidence and re-runs the
 triage decision; a changed state aborts the action as
@@ -101,10 +111,31 @@ is present but not exactly `origin`/`main` it reports
 global workflow config is still read, but only for resolved lifecycle
 validation.
 
-Any active or uncertain run defers the tick without mutation. Historical
-`in-progress` plan files are not launch-ready. Issues from any other
-account, including issue 50, are ignored. Ambiguous ownership or uncertain
-provider outcomes are reported without a guessed action.
+Occupancy is one conservative classifier applied at initial triage, fresh
+selection, post-planning, and timeout reconciliation. Any active run
+(active activity, active unit, or active preparation) defers the tick
+without mutation. Canonical terminal runs (`completed`, `failed`,
+`interrupted`, `owner_stopped`) whose activity is canonical (`unknown` or
+`inactive`) and which have no conflicting active evidence are history and
+never grant resume. A terminal row whose activity is missing or malformed is
+not provably historical and remains blocking until fresh canonical `get_run`
+detail resolves it. Uncertain, paused, waiting, malformed, or
+missing-evidence runs remain blocking. A run that verifiably failed before
+any agent started (manifest-only launch phase, no agent started, unit
+observation missing, no active preparation, and canonical queue capacity
+available) holds only its own plan and does not block independent work, but
+only when the fresh `get_run` detail carries a nonempty plan path that
+exactly matches the list row's plan path; a missing or mismatched identity
+cannot establish which plan the startup record holds and keeps the run
+blocking. A verified startup hold is never answered, discarded, or retried
+by the tick. A missing,
+malformed, or conflicting inventory page, a duplicate identity, a repeated
+or non-advancing cursor, or an unconsumed continuation at the page cap
+reports a bounded evidence gap with zero mutations, and a partial inventory
+is never treated as complete. Historical `in-progress` plan files are not
+launch-ready. Issues from any other account, including issue 50, are
+ignored. Ambiguous ownership or uncertain provider outcomes are reported
+without a guessed action.
 
 ## Delivery gate and defect reporting
 
