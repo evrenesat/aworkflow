@@ -92,12 +92,21 @@ priority order:
    `draft`, `failed`, `needs_plan_change`, or `done` plans. Legacy `draft`
    rows remain in the joined inventory as held rows and never suppress an
    independent admissible ready plan.
-5. For the oldest open issue authored by GitHub user ID `591691` that no
-   plan document already covers, author one plan with the read-only
-   `gpt-6-astra` high-effort planner following `aflow-plan`. The plan must
-   contain the issue URL, an acceptance mapping, exact verification
-   commands, and safe defaults, and is validated before MCP plan create,
-   update, or promote; the tick then preflights and starts once.
+  5. Promote one proven concierge-created `todo` draft to `in_progress` using
+     `promote_plan` with its current `expected_revision`. The draft must have
+     a private `created` provenance record, unchanged document content, a
+     nonempty stored plan revision equal to the current document revision,
+     no other covering document, and a still-open owner issue whose current
+     title and body hash to the record's stored source hash. Identical
+     content at a newer revision is a lost-revision hold, not a promotion.
+     A `create_pending` record is not promotable.
+ 6. For the oldest open issue authored by GitHub user ID `591691` that no
+    plan document and no private concierge provenance record already covers,
+    author one plan with the read-only `gpt-6-astra` high-effort planner
+    following `aflow-plan` and call only `create_plan`. The plan must contain
+    the issue URL, an acceptance mapping, exact verification commands, and
+    safe defaults. A later tick promotes the draft, and a subsequent tick
+    starts the now-ready plan.
 
 Candidates are ranked deterministically: plans referencing open owner issues
 rank before operator-promoted plans, then by eligible issue
@@ -107,8 +116,10 @@ reported without blocking independent safe candidates.
 
 Duplicate detection is content-based: a plan covers an issue when its
 document references the canonical issue URL
-(`https://github.com/<owner>/<repo>/issues/<number>`). A plan whose
-document cannot be read while owner issues are pending reports
+(`https://github.com/<owner>/<repo>/issues/<number>`). Private concierge
+provenance records, including `create_pending` records, also mark their
+canonical issue as covered so an ambiguous create is not retried. A plan
+whose document cannot be read while owner issues are pending reports
 `plan_evidence_unavailable` instead of guessing, and a duplicate detected
 again immediately before `create_plan` aborts without authoring. The
 open-issue feed is paged with a five-page cap; a missing repository
@@ -117,11 +128,30 @@ continuation at that cap reports `github_evidence_unavailable` with zero
 mutations before defect filing, resume, start, or plan authoring, and
 never permits selection from partial issue evidence.
 
+The tick enforces a single external mutation budget: at most one MCP write
+(`create_plan`, `promote_plan`, `start_run`, `resume_run`) or one GitHub
+issue creation per tick. The budget is consumed immediately before issuing
+the request; timeouts, rejections, startup questions, malformed responses,
+and other failures consume it. Subsequent reconciliation within the same
+tick is read-only; no second candidate or second mutation is attempted.
+Private concierge state and bookkeeping do not grant an additional external
+write.
+
 Before any mutating action the tick re-reads fresh evidence and re-runs the
 triage decision; a changed state aborts the action as
-`state_changed_before_action`. A mutating call whose outcome is uncertain
-(timeout or transport failure) is reconciled by read-back (`get_run` /
-paginated `list_runs`) before reporting failure.
+`state_changed_before_action`. For `create_plan`, the tick first persists a
+private `create_pending` record carrying the exact claim, canonical issue
+identity, expected plan name/path, and generated document hash. A mutating
+call whose outcome is uncertain (timeout, transport failure, rejection, or
+malformed response) is then reconciled read-only: runs by `get_run` /
+paginated `list_runs`, and plan create/promote by
+`list_plan_documents` / `read_plan` read-back. A `create_pending` record
+becomes `created` only when read-back proves the exact document identity,
+content, and revision. A missing, unreadable, or conflicting document
+preserves `create_pending` and reports `creation_unverified`; later ticks
+repeat this read-only reconciliation before that issue can be promoted. A
+promotion whose outcome is unverified preserves the `created` record and
+reports `promotion_unverified` without a second write.
 
 Before `start_run`, the tick reads the project's MCP capabilities projection
 and requires the project-local Git config to grant exactly

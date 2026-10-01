@@ -20,46 +20,46 @@ only review and report.
   fresh `get_run` / `get_run_context`, and `read_plan` evidence to
   completion. Malformed, duplicate, stale, conflicting, or partial evidence
   reports a bounded gap with zero mutations; never do blind recovery.
-- Selection priority is: (1) defer on active or uncertain occupancy;
-  (2) repair a failed exact-SHA delivery with a matching admissible repair;
-  (3) resume one safe failed lineage; (4) start one ready `in_progress` plan
-  with an unchecked checkpoint; (5) `plan_and_start` the oldest uncovered
-  open owner issue. Never directly start `todo`, `draft`, `failed`,
+- Selection priority: (1) defer on occupancy; (2) repair failed delivery;
+  (3) resume safe failed lineage; (4) start ready `in_progress` plan;
+  (5) `promote_plan` proven concierge `todo` draft; (6) `create_plan` oldest
+  uncovered owner issue. Never start `todo`, `draft`, `failed`,
   `needs_plan_change`, or `done` plans.
-- Safe recovery requires a matching inactive control-plane run with status
-  `failed`, `interrupted`, or `stopped`; exact canonical plan identity; a
-  unique lineage leaf; and `evidence.can_resume=true`. Missing, ambiguous,
-  or conflicting detail is a hold. Owner stops, restart/requeue-required
-  metadata, and `transition_end` runs with unchecked checkpoints are not
-  resumed. Lineage parents come from list rows or lite context;
-  original-plan identity is respected.
+- Safe recovery requires an inactive control-plane run with status
+  `failed`/`interrupted`/`stopped`; exact canonical plan identity; a unique
+  lineage leaf; and `evidence.can_resume=true`. Ambiguous detail is a hold.
+  Owner stops, restart/requeue metadata, and `transition_end` runs with
+  unchecked checkpoints are not resumed.
 - Ready plans must be `in_progress`, have an unchecked strict checkpoint, a
-  readable document, exactly one admissible canonical queue row, satisfied
-  `done` prerequisites, and valid owner-issue references. A missing or
-  non-admissible queue row is a hold. Plans referencing open
-  owner issues rank before operator-promoted plans; then use issue age, plan
-  `modified_at`, path, and run ID. Input order never selects work.
+  readable document, exactly one admissible queue row, satisfied `done`
+  prerequisites, and valid owner-issue references. Plans referencing open
+  owner issues rank first; then issue age, plan `modified_at`, path, run ID.
 - Duplicate prevention is content-based: an owner issue referenced by any
-  planned plan document is already planned. Never recommend a second plan
-  for it.
+  planned plan document is already planned. Private concierge provenance
+  records, including `create_pending` records, also mark their issue as
+  covered. Never recommend a second plan for a covered issue.
 - Execution identity uses workflow `checkpoint_delivery`, team `xtx-mtp`,
   and one stable idempotency key per action so retried ticks never
   double-start a run.
-- Planner expectations: read-only `gpt-6-astra` at `high` effort, effective
-  `aflow-plan` skill, and the canonical issue URL in the plan document. A
-  plan failing validation is report-only, never started.
-- The exact-SHA delivery gate reports CI and the live release separately for
-  the `origin/main` SHA. A failed exact-SHA delivery admits a matching
-  admissible repair resume backed by structured publication-failure evidence
-  (its plan predates the SHA) or a ready repair plan that names the SHA and
-  the failed gate; all unrelated dispatch reports `delivery_gate_failed`.
-  Missing delivery evidence is `pending`.
+- Planner: read-only `gpt-6-astra` at `high` effort, effective `aflow-plan`
+  skill, canonical issue URL in the plan. A plan failing validation is
+  report-only, never started.
+- The exact-SHA delivery gate reports CI and live release separately for the
+  `origin/main` SHA. A failed delivery admits a matching admissible repair
+  resume or a ready repair plan naming the SHA and failed gate; unrelated
+  dispatch reports `delivery_gate_failed`. Missing evidence is `pending`.
 - Bounded defect reporting files only from validated
   `get_run.defect_confirmation` evidence (schema 1,
   `engine_internal_assertion`, `controller`, bounded component/site,
   64-hex signature). Missing, malformed, unconfirmed, or generic failures
   file nothing. Deduplication searches repository issues, files the first
   unfiled distinct signature, and stops for the tick.
+- The tick enforces a single external mutation budget: at most one MCP write
+  or GitHub issue creation per tick. Failures consume the budget;
+  subsequent reconciliation is read-only. An ambiguous `create_plan`
+  preserves a private `create_pending` intent for later read-only
+  reconciliation and is never retried as a second `create_plan`.
 - Keep output short: name the observed state, the single action (resume,
-  start, plan_and_start, idle, or report), skipped-candidate reasons, and
-  CI/live facts. Do not paste transcripts, tokens, or full plan documents.
+  start, create_plan, promote_plan, idle, or report), skipped-candidate
+  reasons, and CI/live facts. Do not paste transcripts, tokens, or full
+  plan documents.

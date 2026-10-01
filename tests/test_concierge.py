@@ -24,6 +24,7 @@ from aflow.concierge import (
     CONCIERGE_TOKEN_ENV,
     CONCIERGE_WORKFLOW_NAME,
     DEFAULT_WORK_DIR,
+    ConciergeDraftRecord,
     ConciergeError,
     ConciergeTickExecutor,
     DefectEvidence,
@@ -32,6 +33,7 @@ from aflow.concierge import (
     GithubIssuePage,
     LocalDeliveryGate,
     McpRegistryClient,
+    MutationBudget,
     OCCUPANCY_ACTIVE,
     OCCUPANCY_BLOCKED,
     OCCUPANCY_TERMINAL,
@@ -196,6 +198,8 @@ class FakeMcp:
             Mapping[str, Mapping[str, object]] | None
         ) = None,
         queue: Mapping[str, object] | None = None,
+        create_payload: Mapping[str, object] | None = None,
+        pre_calls: Mapping[str, object] | None = None,
     ) -> None:
         self.project_root = project_root
         self.queue_override = (
@@ -240,6 +244,10 @@ class FakeMcp:
             if get_run_context_payloads is not None
             else None
         )
+        self.create_payload = (
+            dict(create_payload) if create_payload is not None else None
+        )
+        self.pre_calls = dict(pre_calls or {})
 
     def call_tool(
         self, name: str, arguments: Mapping[str, object]
@@ -250,6 +258,9 @@ class FakeMcp:
             if side_effect is not None:
                 side_effect()
             raise self.failures[name]
+        pre_call = self.pre_calls.get(name)
+        if pre_call is not None:
+            pre_call()
         handler = getattr(self, f"_tool_{name}", None)
         if handler is None:
             raise ConciergeError("mcp_tool_unknown")
@@ -513,8 +524,17 @@ class FakeMcp:
         }
 
     def _tool_create_plan(self, args: dict[str, object]) -> dict[str, object]:
-        name = str(args.get("name"))
+        # Models the real web MCP contract: create_plan takes project_id,
+        # name, and optional content and returns the full PlanDocument.
+        if args.get("project_id") != self.project_id:
+            raise ConciergeError("mcp_tool_rejected")
+        name = args.get("name")
+        if not isinstance(name, str) or not name:
+            raise ConciergeError("mcp_tool_rejected")
         path = f"plans/todo/{name}"
+        if path in self.documents:
+            raise ConciergeError("mcp_tool_rejected")
+        content = str(args.get("content") or "")
         self.plans.append(
             {
                 "path": path,
@@ -522,12 +542,73 @@ class FakeMcp:
                 "modified_at": "2026-01-01T00:00:00Z",
             }
         )
-        self.documents[path] = str(args.get("content") or "")
+        self.documents[path] = content
         self.created_plans.append(dict(args))
-        return {"path": path, "status": "todo"}
+        if self.create_payload is not None:
+            return dict(self.create_payload)
+        return {
+            "project_id": self.project_id,
+            "name": name,
+            "path": path,
+            "status": "todo",
+            "revision": self.revisions.get(path, "1"),
+            "size_bytes": len(content.encode("utf-8")),
+            "content": content,
+        }
+
+    def _tool_promote_plan(self, args: dict[str, object]) -> dict[str, object]:
+        # Models the real web MCP contract: promote_plan takes project_id,
+        # plan_status, name, and expected_revision and returns the target
+        # status PlanDocument.
+        if args.get("project_id") != self.project_id:
+            raise ConciergeError("mcp_tool_rejected")
+        if args.get("plan_status") != "todo":
+            raise ConciergeError("mcp_tool_rejected")
+        name = args.get("name")
+        if not isinstance(name, str) or not name:
+            raise ConciergeError("mcp_tool_rejected")
+        expected_revision = args.get("expected_revision")
+        if not isinstance(expected_revision, str) or not expected_revision:
+            raise ConciergeError("mcp_tool_rejected")
+        path = f"plans/todo/{name}"
+        for i, plan in enumerate(self.plans):
+            if str(plan.get("path")) != path:
+                continue
+            if plan.get("status") != "todo":
+                raise ConciergeError("mcp_tool_rejected")
+            if self.revisions.get(path, "1") != expected_revision:
+                raise ConciergeError("mcp_tool_rejected")
+            new_path = f"plans/in-progress/{name}"
+            if path in self.documents:
+                self.documents[new_path] = self.documents.pop(path)
+            self.plans[i]["path"] = new_path
+            self.plans[i]["status"] = "in_progress"
+            if path in self.revisions:
+                self.revisions[new_path] = self.revisions.pop(path)
+            content = self.documents.get(new_path, "")
+            return {
+                "project_id": self.project_id,
+                "name": name,
+                "path": new_path,
+                "status": "in_progress",
+                "revision": expected_revision,
+                "size_bytes": len(content.encode("utf-8")),
+                "content": content,
+            }
+        raise ConciergeError("mcp_tool_rejected")
 
     def call_names(self) -> list[str]:
         return [name for name, _ in self.calls]
+
+    @property
+    def write_count(self) -> int:
+        """Count of mutation tool calls (create_plan, promote_plan, start_run, resume_run)."""
+        mutating_tools = frozenset(
+            {"create_plan", "promote_plan", "start_run", "resume_run"}
+        )
+        return sum(
+            1 for name, _ in self.calls if name in mutating_tools
+        )
 
 
 class FakeGithub:
@@ -827,9 +908,9 @@ def test_run_tick_end_to_end_blocks_start_without_publication_evidence(
     assert exit_code == 0
     status = _read_status(tmp_path)
     assert status["phase"] == "completed"
-    assert status["action"] == "report"
-    assert status["outcome"] == "launch_evidence_unavailable"
-    assert status["mutating"] is False
+    assert status["action"] == "create_plan"
+    assert status["outcome"] == "plan_created"
+    assert status["mutating"] is True
     assert status["planner_model"] == CONCIERGE_PLANNER_MODEL
     assert status["planner_effort"] == CONCIERGE_PLANNER_EFFORT
     assert len(mcp.created_plans) == 1
@@ -1226,6 +1307,7 @@ def _observation(
     run_contexts: Mapping[str, Mapping[str, object]] | None = None,
     delivery: Mapping[str, object] | None = None,
     delivery_sha: str | None = None,
+    concierge_drafts: Mapping[str, ConciergeDraftRecord] | None = None,
 ) -> TickObservation:
     return TickObservation(
         project={"project_id": "agent-flow-test", "root": "/root/code/agent-flow"},
@@ -1239,6 +1321,7 @@ def _observation(
         run_contexts=run_contexts,
         delivery=delivery,
         delivery_sha=delivery_sha,
+        concierge_drafts=dict(concierge_drafts or {}),
     )
 
 
@@ -1432,6 +1515,8 @@ def _issue(
     full_name: str = "owner/repo",
     created_at: str = "2026-09-01T00:00:00Z",
     state: str = "open",
+    title: str | None = "Issue title",
+    body: str | None = "Issue body",
 ) -> dict[str, object]:
     return {
         "number": number,
@@ -1439,6 +1524,8 @@ def _issue(
         "full_name": full_name,
         "created_at": created_at,
         "state": state,
+        "title": title,
+        "body": body,
     }
 
 
@@ -1907,7 +1994,7 @@ def test_triage_ignores_unrelated_issue_urls_in_plan_documents() -> None:
             },
         )
     )
-    assert decision.action == "plan_and_start"
+    assert decision.action == "create_plan"
     assert decision.issue_number == 7
 
 
@@ -1915,7 +2002,7 @@ def test_triage_selects_oldest_owner_issue() -> None:
     older = _issue(number=6, created_at="2026-08-01T00:00:00Z")
     newer = _issue(number=9, created_at="2026-09-01T00:00:00Z")
     decision = triage_tick(_observation(issues=[newer, older]))
-    assert decision.action == "plan_and_start"
+    assert decision.action == "create_plan"
     assert decision.reason == "oldest_owner_issue"
     assert decision.issue_number == 6
     assert decision.issue_url == "https://github.com/owner/repo/issues/6"
@@ -1927,6 +2014,347 @@ def test_triage_selects_oldest_owner_issue() -> None:
         _observation(issues=[newer, older])
     ).idempotency_key
     assert decision.mutating is True
+
+
+def test_triage_create_plan_action_is_mutating() -> None:
+    decision = triage_tick(_observation(issues=[_issue()]))
+    assert decision.action == "create_plan"
+    assert decision.mutating is True
+
+
+def test_triage_promote_plan_for_proven_concierge_draft() -> None:
+    import hashlib
+
+    content = "### [ ] Checkpoint 1: step\n"
+    content_hash = hashlib.sha256(content.encode("utf-8")).hexdigest()
+    draft = ConciergeDraftRecord(
+        claim_sha256="claim-1",
+        issue_number=7,
+        repository_full_name="owner/repo",
+        source_sha256=source_hash("Issue title", "Issue body"),
+        plan_name="owner-issue-7.md",
+        plan_path="plans/todo/owner-issue-7.md",
+        plan_revision="1",
+        document_sha256=content_hash,
+        status="created",
+    )
+    decision = triage_tick(
+        _observation(
+            plans=[
+                _plan(
+                    path="plans/todo/owner-issue-7.md",
+                    status="todo",
+                    revision="1",
+                )
+            ],
+            issues=[_issue(number=7)],
+            plan_documents={
+                "plans/todo/owner-issue-7.md": content,
+            },
+            concierge_drafts={"plans/todo/owner-issue-7.md": draft},
+        )
+    )
+    assert decision.action == "promote_plan"
+    assert decision.reason == "concierge_draft_promotable"
+    assert decision.plan_path == "plans/todo/owner-issue-7.md"
+    assert decision.mutating is True
+
+
+def test_triage_promote_plan_requires_unchanged_content() -> None:
+    import hashlib
+
+    original_content = "### [ ] Checkpoint 1: step\n"
+    original_hash = hashlib.sha256(original_content.encode("utf-8")).hexdigest()
+    modified_content = "### [ ] Checkpoint 1: modified\n"
+    draft = ConciergeDraftRecord(
+        claim_sha256="claim-1",
+        issue_number=7,
+        repository_full_name="owner/repo",
+        source_sha256=source_hash("Issue title", "Issue body"),
+        plan_name="owner-issue-7.md",
+        plan_path="plans/todo/owner-issue-7.md",
+        plan_revision="1",
+        document_sha256=original_hash,
+        status="created",
+    )
+    decision = triage_tick(
+        _observation(
+            plans=[
+                _plan(
+                    path="plans/todo/owner-issue-7.md",
+                    status="todo",
+                    revision="1",
+                )
+            ],
+            issues=[_issue(number=7)],
+            plan_documents={
+                "plans/todo/owner-issue-7.md": modified_content,
+            },
+            concierge_drafts={"plans/todo/owner-issue-7.md": draft},
+        )
+    )
+    # Content changed, so the draft is not promotable; fall through to
+    # create_plan for the uncovered issue (if not covered by the draft).
+    assert decision.action in ("create_plan", "report", "idle")
+
+
+def test_triage_promote_plan_requires_todo_status() -> None:
+    import hashlib
+
+    content = "### [ ] Checkpoint 1: step\n"
+    content_hash = hashlib.sha256(content.encode("utf-8")).hexdigest()
+    draft = ConciergeDraftRecord(
+        claim_sha256="claim-1",
+        issue_number=7,
+        repository_full_name="owner/repo",
+        source_sha256=source_hash("Issue title", "Issue body"),
+        plan_name="owner-issue-7.md",
+        plan_path="plans/todo/owner-issue-7.md",
+        plan_revision="1",
+        document_sha256=content_hash,
+        status="created",
+    )
+    decision = triage_tick(
+        _observation(
+            plans=[
+                _plan(
+                    path="plans/in-progress/owner-issue-7.md",
+                    status="in_progress",
+                    revision="1",
+                )
+            ],
+            issues=[_issue(number=7)],
+            plan_documents={
+                "plans/in-progress/owner-issue-7.md": content,
+            },
+            concierge_drafts={"plans/todo/owner-issue-7.md": draft},
+        )
+    )
+    # Plan is no longer todo, so the draft is not promotable.
+    assert decision.action != "promote_plan"
+
+
+def test_triage_promote_plan_blocked_by_other_covering_document() -> None:
+    import hashlib
+
+    content = "Source: https://github.com/owner/repo/issues/7\n### [ ] Checkpoint 1: step\n"
+    content_hash = hashlib.sha256(content.encode("utf-8")).hexdigest()
+    draft = ConciergeDraftRecord(
+        claim_sha256="claim-1",
+        issue_number=7,
+        repository_full_name="owner/repo",
+        source_sha256=source_hash("Issue title", "Issue body"),
+        plan_name="owner-issue-7.md",
+        plan_path="plans/todo/owner-issue-7.md",
+        plan_revision="1",
+        document_sha256=content_hash,
+        status="created",
+    )
+    other_content = "Related: https://github.com/owner/repo/issues/7\n"
+    decision = triage_tick(
+        _observation(
+            plans=[
+                _plan(
+                    path="plans/todo/owner-issue-7.md",
+                    status="todo",
+                    revision="1",
+                ),
+                _plan(
+                    path="plans/in-progress/other.md",
+                    status="in_progress",
+                    revision="1",
+                ),
+            ],
+            issues=[_issue(number=7)],
+            plan_documents={
+                "plans/todo/owner-issue-7.md": content,
+                "plans/in-progress/other.md": other_content,
+            },
+            concierge_drafts={"plans/todo/owner-issue-7.md": draft},
+        )
+    )
+    # Another document covers the same issue, blocking promotion.
+    assert decision.action != "promote_plan"
+
+
+def test_triage_promote_plan_held_when_source_changed() -> None:
+    import hashlib
+
+    content = (
+        "Source: https://github.com/owner/repo/issues/7\n"
+        "### [ ] Checkpoint 1: step\n"
+    )
+    content_hash = hashlib.sha256(content.encode("utf-8")).hexdigest()
+    draft = ConciergeDraftRecord(
+        claim_sha256="claim-1",
+        issue_number=7,
+        repository_full_name="owner/repo",
+        source_sha256=source_hash("Issue title", "Issue body"),
+        plan_name="owner-issue-7.md",
+        plan_path="plans/todo/owner-issue-7.md",
+        plan_revision="1",
+        document_sha256=content_hash,
+        status="created",
+    )
+    decision = triage_tick(
+        _observation(
+            plans=[
+                _plan(
+                    path="plans/todo/owner-issue-7.md",
+                    status="todo",
+                    revision="1",
+                )
+            ],
+            issues=[_issue(number=7, body="Edited body")],
+            plan_documents={
+                "plans/todo/owner-issue-7.md": content,
+            },
+            concierge_drafts={"plans/todo/owner-issue-7.md": draft},
+        )
+    )
+    # The issue source changed since planning; the draft stays a local hold
+    # and the covering document blocks a fresh create.
+    assert decision.action == "idle"
+    assert decision.reason == "no_eligible_work"
+
+
+def test_triage_promote_plan_held_when_issue_text_missing() -> None:
+    import hashlib
+
+    content = (
+        "Source: https://github.com/owner/repo/issues/7\n"
+        "### [ ] Checkpoint 1: step\n"
+    )
+    content_hash = hashlib.sha256(content.encode("utf-8")).hexdigest()
+    draft = ConciergeDraftRecord(
+        claim_sha256="claim-1",
+        issue_number=7,
+        repository_full_name="owner/repo",
+        source_sha256=source_hash("Issue title", "Issue body"),
+        plan_name="owner-issue-7.md",
+        plan_path="plans/todo/owner-issue-7.md",
+        plan_revision="1",
+        document_sha256=content_hash,
+        status="created",
+    )
+    decision = triage_tick(
+        _observation(
+            plans=[
+                _plan(
+                    path="plans/todo/owner-issue-7.md",
+                    status="todo",
+                    revision="1",
+                )
+            ],
+            issues=[_issue(number=7, title=None)],
+            plan_documents={
+                "plans/todo/owner-issue-7.md": content,
+            },
+            concierge_drafts={"plans/todo/owner-issue-7.md": draft},
+        )
+    )
+    assert decision.action == "idle"
+    assert decision.reason == "no_eligible_work"
+
+
+def test_triage_promote_plan_held_when_repository_mismatches() -> None:
+    import hashlib
+
+    content = (
+        "Source: https://github.com/owner/repo/issues/7\n"
+        "### [ ] Checkpoint 1: step\n"
+    )
+    content_hash = hashlib.sha256(content.encode("utf-8")).hexdigest()
+    draft = ConciergeDraftRecord(
+        claim_sha256="claim-1",
+        issue_number=7,
+        repository_full_name="owner/repo",
+        source_sha256=source_hash("Issue title", "Issue body"),
+        plan_name="owner-issue-7.md",
+        plan_path="plans/todo/owner-issue-7.md",
+        plan_revision="1",
+        document_sha256=content_hash,
+        status="created",
+    )
+    decision = triage_tick(
+        _observation(
+            plans=[
+                _plan(
+                    path="plans/todo/owner-issue-7.md",
+                    status="todo",
+                    revision="1",
+                )
+            ],
+            issues=[_issue(number=7, full_name="other/repo")],
+            plan_documents={
+                "plans/todo/owner-issue-7.md": content,
+            },
+            concierge_drafts={"plans/todo/owner-issue-7.md": draft},
+        )
+    )
+    # The open issue is in a different repository than the recorded one, so
+    # the draft is not promotable.
+    assert decision.action != "promote_plan"
+
+
+def test_triage_promote_plan_held_when_saved_revision_lost() -> None:
+    import hashlib
+
+    content = (
+        "Source: https://github.com/owner/repo/issues/7\n"
+        "### [ ] Checkpoint 1: step\n"
+    )
+    content_hash = hashlib.sha256(content.encode("utf-8")).hexdigest()
+    draft = ConciergeDraftRecord(
+        claim_sha256="claim-1",
+        issue_number=7,
+        repository_full_name="owner/repo",
+        source_sha256=source_hash("Issue title", "Issue body"),
+        plan_name="owner-issue-7.md",
+        plan_path="plans/todo/owner-issue-7.md",
+        plan_revision="1",
+        document_sha256=content_hash,
+        status="created",
+    )
+    decision = triage_tick(
+        _observation(
+            plans=[
+                _plan(
+                    path="plans/todo/owner-issue-7.md",
+                    status="todo",
+                    revision="2",
+                )
+            ],
+            issues=[_issue(number=7)],
+            plan_documents={
+                "plans/todo/owner-issue-7.md": content,
+            },
+            concierge_drafts={"plans/todo/owner-issue-7.md": draft},
+        )
+    )
+    # Identical content at a newer revision is a lost-revision hold: the
+    # saved revision 1 no longer proves the document, so the draft stays
+    # held and the covered issue blocks a fresh create.
+    assert decision.action == "idle"
+    assert decision.reason == "no_eligible_work"
+
+
+def test_mutation_budget_allows_one_write() -> None:
+    budget = MutationBudget()
+    assert budget.available is True
+    budget.consume()
+    assert budget.available is False
+    with pytest.raises(ConciergeError, match="mutation_budget_exhausted"):
+        budget.consume()
+
+
+def test_mutation_budget_exhausted_after_failed_write() -> None:
+    budget = MutationBudget()
+    budget.consume()
+    assert budget.available is False
+    # Simulate a failed write: budget is already consumed.
+    with pytest.raises(ConciergeError, match="mutation_budget_exhausted"):
+        budget.consume()
 
 
 def test_triage_prefers_failed_lineage_over_plan_over_issue() -> None:
@@ -3009,6 +3437,7 @@ def _github_issue(
     number: int = 7,
     title: str = "Fix it",
     body: str = "Details",
+    state: str = "open",
 ) -> dict[str, object]:
     return {
         "number": number,
@@ -3016,7 +3445,7 @@ def _github_issue(
         "full_name": "owner/repo",
         "title": title,
         "body": body,
-        "state": "open",
+        "state": state,
         "created_at": "2026-09-01T00:00:00Z",
     }
 
@@ -3248,9 +3677,9 @@ def test_executor_plans_but_blocks_start_without_publication_evidence(
         project_root=tmp_path,
         environment=ENVIRONMENT,
     )
-    assert outcome.action == "report"
-    assert outcome.reason == "launch_evidence_unavailable"
-    assert outcome.mutating is False
+    assert outcome.action == "create_plan"
+    assert outcome.reason == "plan_created"
+    assert outcome.mutating is True
     assert outcome.details["planner_model"] == CONCIERGE_PLANNER_MODEL
     assert outcome.details["planner_effort"] == CONCIERGE_PLANNER_EFFORT
 
@@ -3276,9 +3705,10 @@ def test_executor_plans_but_blocks_start_without_publication_evidence(
     assert created["name"] == "owner-issue-7.md"
     assert "https://github.com/owner/repo/issues/7" in created["content"]
     names = mcp.call_names()
-    assert names.count("get_global_config") == 1
-    assert names.count("preflight_run") == 1
+    assert "get_global_config" not in names
+    assert "preflight_run" not in names
     assert "start_run" not in names
+    assert "promote_plan" not in names
 
 
 def test_executor_plans_and_starts_new_owner_issue_once(
@@ -3300,15 +3730,13 @@ def test_executor_plans_and_starts_new_owner_issue_once(
         project_root=tmp_path,
         environment=ENVIRONMENT,
     )
-    assert outcome.action == "plan_and_start"
-    assert outcome.reason == "planned_and_started"
+    assert outcome.action == "create_plan"
+    assert outcome.reason == "plan_created"
     assert outcome.mutating is True
-    assert outcome.details["publish_remote"] == "origin"
-    assert outcome.details["publish_branch"] == "main"
     assert len(mcp.created_plans) == 1
     assert mcp.created_plans[0]["name"] == "owner-issue-7.md"
-    assert mcp.call_names().count("start_run") == 1
-    assert len(mcp.runs) == 1
+    assert mcp.call_names().count("start_run") == 0
+    assert len(mcp.runs) == 0
 
 
 def test_executor_no_duplicate_when_issue_planned_on_later_page(
@@ -3440,6 +3868,582 @@ def test_executor_aborts_when_duplicate_appears_before_create(
     assert outcome.action == "report"
     assert outcome.reason == "duplicate_detected_before_authoring"
     assert mcp.created_plans == []
+
+
+def _promote_setup(tmp_path: Path, *, body: str = "Details") -> tuple[
+    FakeMcp, FakeGithub, str
+]:
+    """Seed a proven concierge draft: todo plan, document, and record."""
+    content = (
+        "# Plan\n\n"
+        "Issue: https://github.com/owner/repo/issues/7\n\n"
+        "### [ ] Checkpoint 1: step\n"
+    )
+    content_hash = hashlib.sha256(content.encode("utf-8")).hexdigest()
+    source_sha = source_hash("Fix it", body)
+    claim = hashlib.sha256(
+        f"concierge-plan:owner/repo:7:{source_sha}".encode("utf-8")
+    ).hexdigest()
+    mcp = FakeMcp(
+        project_root=tmp_path,
+        plans=[{"path": "plans/todo/owner-issue-7.md", "status": "todo"}],
+        documents={"plans/todo/owner-issue-7.md": content},
+        revisions={"plans/todo/owner-issue-7.md": "1"},
+    )
+    github = FakeGithub(
+        page=GithubIssuePage(
+            repository_id=42,
+            issues=(_github_issue(title="Fix it", body=body),),
+        )
+    )
+    record = {
+        "claim_sha256": claim,
+        "issue_number": 7,
+        "repository_full_name": "owner/repo",
+        "source_sha256": source_sha,
+        "plan_name": "owner-issue-7.md",
+        "plan_path": "plans/todo/owner-issue-7.md",
+        "plan_revision": "1",
+        "document_sha256": content_hash,
+        "status": "created",
+    }
+    records_dir = tmp_path / "state" / "planner-records"
+    records_dir.mkdir(parents=True, exist_ok=True)
+    (records_dir / f"{claim}.json").write_text(
+        json.dumps(record, sort_keys=True) + "\n", encoding="utf-8"
+    )
+    return mcp, github, claim
+
+
+def test_executor_promotes_proven_draft_with_real_contract(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    mcp, github, claim = _promote_setup(tmp_path)
+    executor = _executor(tmp_path, monkeypatch, mcp=mcp, github=github)
+    state_dir = tmp_path / "state"
+    outcome = executor.execute(
+        state_dir=state_dir,
+        project_root=tmp_path,
+        environment=ENVIRONMENT,
+    )
+    assert outcome.action == "promote_plan"
+    assert outcome.reason == "plan_promoted"
+    assert outcome.mutating is True
+    promote_calls = [
+        args for name, args in mcp.calls if name == "promote_plan"
+    ]
+    assert promote_calls == [
+        {
+            "project_id": "p1",
+            "plan_status": "todo",
+            "name": "owner-issue-7.md",
+            "expected_revision": "1",
+        }
+    ]
+    assert "plans/in-progress/owner-issue-7.md" in mcp.documents
+    assert "plans/todo/owner-issue-7.md" not in mcp.documents
+    record = json.loads(
+        (state_dir / "planner-records" / f"{claim}.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert record["status"] == "promoted"
+    assert record["plan_path"] == "plans/in-progress/owner-issue-7.md"
+    assert record["plan_revision"] == "1"
+
+
+def test_executor_staged_lifecycle_create_promote_start(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    markdown = (
+        "# Plan\n\n"
+        "Issue: https://github.com/owner/repo/issues/7\n\n"
+        "### [ ] Checkpoint 1: step\n"
+    )
+    mcp = FakeMcp(
+        project_root=tmp_path,
+        publication=_publication_projection(
+            available=True, remote="origin", branch="main"
+        ),
+    )
+    github = FakeGithub(
+        page=GithubIssuePage(repository_id=42, issues=(_github_issue(),))
+    )
+    planner = FakePlanner(result=_plan_result(markdown=markdown))
+    executor = _executor(tmp_path, monkeypatch, mcp=mcp, github=github, planner=planner)
+    state_dir = tmp_path / "state"
+
+    first = executor.execute(
+        state_dir=state_dir,
+        project_root=tmp_path,
+        environment=ENVIRONMENT,
+    )
+    assert first.action == "create_plan"
+    assert first.reason == "plan_created"
+    assert first.mutating is True
+
+    second = executor.execute(
+        state_dir=state_dir,
+        project_root=tmp_path,
+        environment=ENVIRONMENT,
+    )
+    assert second.action == "promote_plan"
+    assert second.reason == "plan_promoted"
+    assert second.mutating is True
+    assert "plans/in-progress/owner-issue-7.md" in mcp.documents
+
+    third = executor.execute(
+        state_dir=state_dir,
+        project_root=tmp_path,
+        environment=ENVIRONMENT,
+    )
+    assert third.action == "start"
+    assert third.reason == "started"
+    assert third.mutating is True
+    assert mcp.call_names().count("start_run") == 1
+    assert len(mcp.runs) == 1
+
+
+def test_executor_promote_holds_when_issue_closed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    mcp, github, claim = _promote_setup(tmp_path)
+    github.page = GithubIssuePage(
+        repository_id=42, issues=(_github_issue(state="closed"),)
+    )
+    executor = _executor(tmp_path, monkeypatch, mcp=mcp, github=github)
+    state_dir = tmp_path / "state"
+    outcome = executor.execute(
+        state_dir=state_dir,
+        project_root=tmp_path,
+        environment=ENVIRONMENT,
+    )
+    assert outcome.action == "idle"
+    assert outcome.reason == "no_eligible_work"
+    assert "promote_plan" not in mcp.call_names()
+    assert mcp.write_count == 0
+    record = json.loads(
+        (state_dir / "planner-records" / f"{claim}.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert record["status"] == "created"
+
+
+def test_executor_promote_holds_when_source_changed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    mcp, github, claim = _promote_setup(tmp_path)
+    github.page = GithubIssuePage(
+        repository_id=42, issues=(_github_issue(body="Edited"),)
+    )
+    executor = _executor(tmp_path, monkeypatch, mcp=mcp, github=github)
+    state_dir = tmp_path / "state"
+    outcome = executor.execute(
+        state_dir=state_dir,
+        project_root=tmp_path,
+        environment=ENVIRONMENT,
+    )
+    assert outcome.action == "idle"
+    assert outcome.reason == "no_eligible_work"
+    assert "promote_plan" not in mcp.call_names()
+    assert mcp.write_count == 0
+    record = json.loads(
+        (state_dir / "planner-records" / f"{claim}.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert record["status"] == "created"
+
+
+def test_executor_promote_stale_revision_reports_unverified(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    mcp, github, claim = _promote_setup(tmp_path)
+
+    def bump_revision() -> None:
+        mcp.revisions["plans/todo/owner-issue-7.md"] = "2"
+
+    mcp.pre_calls["promote_plan"] = bump_revision
+    executor = _executor(tmp_path, monkeypatch, mcp=mcp, github=github)
+    state_dir = tmp_path / "state"
+    outcome = executor.execute(
+        state_dir=state_dir,
+        project_root=tmp_path,
+        environment=ENVIRONMENT,
+    )
+    assert outcome.action == "report"
+    assert outcome.reason == "promotion_unverified"
+    assert mcp.write_count == 1
+    assert "plans/in-progress/owner-issue-7.md" not in mcp.documents
+    record = json.loads(
+        (state_dir / "planner-records" / f"{claim}.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert record["status"] == "created"
+
+
+def test_executor_promote_held_when_saved_revision_lost(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    mcp, github, claim = _promote_setup(tmp_path)
+    # The document was re-saved at revision 2 with identical content; the
+    # provenance record still proves only revision 1.
+    mcp.revisions["plans/todo/owner-issue-7.md"] = "2"
+    executor = _executor(tmp_path, monkeypatch, mcp=mcp, github=github)
+    state_dir = tmp_path / "state"
+    outcome = executor.execute(
+        state_dir=state_dir,
+        project_root=tmp_path,
+        environment=ENVIRONMENT,
+    )
+    assert outcome.action == "idle"
+    assert outcome.reason == "no_eligible_work"
+    assert "promote_plan" not in mcp.call_names()
+    assert mcp.write_count == 0
+    assert "plans/in-progress/owner-issue-7.md" not in mcp.documents
+    record = json.loads(
+        (state_dir / "planner-records" / f"{claim}.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert record["status"] == "created"
+    assert record["plan_revision"] == "1"
+
+
+def test_executor_create_timeout_reconciles_created_document(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    mcp = FakeMcp(project_root=tmp_path)
+    github = FakeGithub(
+        page=GithubIssuePage(repository_id=42, issues=(_github_issue(),))
+    )
+    result = _plan_result()
+    planner = FakePlanner(result=result)
+
+    def create_server_side() -> None:
+        path = "plans/todo/owner-issue-7.md"
+        mcp.plans.append(
+            {
+                "path": path,
+                "status": "todo",
+                "modified_at": "2026-01-01T00:00:00Z",
+            }
+        )
+        mcp.documents[path] = str(result.markdown)
+        mcp.revisions[path] = "rev-srv"
+
+    mcp.failures["create_plan"] = ConciergeError("mcp_call_failed")
+    mcp.pre_failures["create_plan"] = create_server_side
+    executor = _executor(tmp_path, monkeypatch, mcp=mcp, github=github, planner=planner)
+    state_dir = tmp_path / "state"
+    outcome = executor.execute(
+        state_dir=state_dir,
+        project_root=tmp_path,
+        environment=ENVIRONMENT,
+    )
+    assert outcome.action == "create_plan"
+    assert outcome.reason == "plan_created"
+    assert outcome.mutating is True
+    assert mcp.write_count == 1
+    created_records = [
+        json.loads(path.read_text(encoding="utf-8"))
+        for path in (state_dir / "planner-records").glob("*.json")
+        if json.loads(path.read_text(encoding="utf-8")).get("status")
+        == "created"
+    ]
+    assert len(created_records) == 1
+    assert created_records[0]["plan_path"] == "plans/todo/owner-issue-7.md"
+    assert created_records[0]["plan_revision"] == "rev-srv"
+
+
+def test_executor_create_timeout_reconciles_missing_document(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    mcp = FakeMcp(project_root=tmp_path)
+    github = FakeGithub(
+        page=GithubIssuePage(repository_id=42, issues=(_github_issue(),))
+    )
+    planner = FakePlanner(result=_plan_result())
+    mcp.failures["create_plan"] = ConciergeError("mcp_call_failed")
+    executor = _executor(tmp_path, monkeypatch, mcp=mcp, github=github, planner=planner)
+    state_dir = tmp_path / "state"
+    outcome = executor.execute(
+        state_dir=state_dir,
+        project_root=tmp_path,
+        environment=ENVIRONMENT,
+    )
+    assert outcome.action == "report"
+    assert outcome.reason == "creation_unverified"
+    assert outcome.mutating is False
+    assert mcp.write_count == 1
+    created_records = [
+        path
+        for path in (state_dir / "planner-records").glob("*.json")
+        if json.loads(path.read_text(encoding="utf-8")).get("status")
+        == "created"
+    ]
+    assert created_records == []
+    pending_records = [
+        json.loads(path.read_text(encoding="utf-8"))
+        for path in (state_dir / "planner-records").glob("*.json")
+        if json.loads(path.read_text(encoding="utf-8")).get("status")
+        == "create_pending"
+    ]
+    assert len(pending_records) == 1
+    assert pending_records[0]["plan_path"] == "plans/todo/owner-issue-7.md"
+    assert pending_records[0]["plan_revision"] == ""
+
+
+def test_executor_create_timeout_later_tick_recovers_and_promotes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    mcp = FakeMcp(project_root=tmp_path)
+    github = FakeGithub(
+        page=GithubIssuePage(repository_id=42, issues=(_github_issue(),))
+    )
+    result = _plan_result()
+    planner = FakePlanner(result=result)
+    mcp.failures["create_plan"] = ConciergeError("mcp_call_failed")
+    executor = _executor(tmp_path, monkeypatch, mcp=mcp, github=github, planner=planner)
+    state_dir = tmp_path / "state"
+    first = executor.execute(
+        state_dir=state_dir,
+        project_root=tmp_path,
+        environment=ENVIRONMENT,
+    )
+    assert first.action == "report"
+    assert first.reason == "creation_unverified"
+    assert first.mutating is False
+    assert mcp.write_count == 1
+    assert mcp.created_plans == []
+
+    path = "plans/todo/owner-issue-7.md"
+    mcp.plans.append(
+        {
+            "path": path,
+            "status": "todo",
+            "modified_at": "2026-01-01T00:00:00Z",
+        }
+    )
+    mcp.documents[path] = str(result.markdown)
+    mcp.revisions[path] = "rev-late"
+    del mcp.failures["create_plan"]
+    writes_before_second = mcp.write_count
+    second = executor.execute(
+        state_dir=state_dir,
+        project_root=tmp_path,
+        environment=ENVIRONMENT,
+    )
+    assert second.action == "promote_plan"
+    assert second.reason == "plan_promoted"
+    assert second.mutating is True
+    assert mcp.write_count - writes_before_second == 1
+    assert mcp.call_names().count("create_plan") == 1
+    records = [
+        json.loads(path.read_text(encoding="utf-8"))
+        for path in (state_dir / "planner-records").glob("*.json")
+    ]
+    assert len(records) == 1
+    assert records[0]["status"] == "promoted"
+    assert records[0]["plan_path"] == "plans/in-progress/owner-issue-7.md"
+    assert records[0]["plan_revision"] == "rev-late"
+
+
+def test_executor_create_timeout_conflicting_document_stays_held(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    mcp = FakeMcp(project_root=tmp_path)
+    github = FakeGithub(
+        page=GithubIssuePage(repository_id=42, issues=(_github_issue(),))
+    )
+    planner = FakePlanner(result=_plan_result())
+    mcp.failures["create_plan"] = ConciergeError("mcp_call_failed")
+    executor = _executor(tmp_path, monkeypatch, mcp=mcp, github=github, planner=planner)
+    state_dir = tmp_path / "state"
+    first = executor.execute(
+        state_dir=state_dir,
+        project_root=tmp_path,
+        environment=ENVIRONMENT,
+    )
+    assert first.action == "report"
+    assert first.reason == "creation_unverified"
+
+    path = "plans/todo/owner-issue-7.md"
+    mcp.plans.append(
+        {
+            "path": path,
+            "status": "todo",
+            "modified_at": "2026-01-01T00:00:00Z",
+        }
+    )
+    mcp.documents[path] = "changed content"
+    mcp.revisions[path] = "rev-late"
+    del mcp.failures["create_plan"]
+    second = executor.execute(
+        state_dir=state_dir,
+        project_root=tmp_path,
+        environment=ENVIRONMENT,
+    )
+    assert second.action == "report"
+    assert second.reason == "create_pending_unresolved"
+    assert second.mutating is False
+    assert mcp.call_names().count("create_plan") == 1
+    records = [
+        json.loads(path.read_text(encoding="utf-8"))
+        for path in (state_dir / "planner-records").glob("*.json")
+    ]
+    assert len(records) == 1
+    assert records[0]["status"] == "create_pending"
+
+
+def test_executor_create_timeout_preserves_independent_safe_work(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    mcp = FakeMcp(project_root=tmp_path)
+    github = FakeGithub(
+        page=GithubIssuePage(repository_id=42, issues=(_github_issue(),))
+    )
+    planner = FakePlanner(result=_plan_result())
+    mcp.failures["create_plan"] = ConciergeError("mcp_call_failed")
+    executor = _executor(tmp_path, monkeypatch, mcp=mcp, github=github, planner=planner)
+    state_dir = tmp_path / "state"
+    first = executor.execute(
+        state_dir=state_dir,
+        project_root=tmp_path,
+        environment=ENVIRONMENT,
+    )
+    assert first.action == "report"
+    assert first.reason == "creation_unverified"
+
+    github.page = GithubIssuePage(
+        repository_id=42,
+        issues=(
+            _github_issue(),
+            _github_issue(
+                number=8, title="Fix other", body="Other details"
+            ),
+        ),
+    )
+    planner.result = _plan_result(
+        markdown="# Plan\n\nIssue: https://github.com/owner/repo/issues/8\n"
+    )
+    del mcp.failures["create_plan"]
+    second = executor.execute(
+        state_dir=state_dir,
+        project_root=tmp_path,
+        environment=ENVIRONMENT,
+    )
+    assert second.action == "create_plan"
+    assert second.reason == "plan_created"
+    assert second.mutating is True
+    assert mcp.call_names().count("create_plan") == 2
+    records = {
+        record["plan_path"]: record
+        for record in (
+            json.loads(path.read_text(encoding="utf-8"))
+            for path in (state_dir / "planner-records").glob("*.json")
+        )
+    }
+    assert records["plans/todo/owner-issue-7.md"]["status"] == "create_pending"
+    assert records["plans/todo/owner-issue-8.md"]["status"] == "created"
+
+
+def test_executor_create_malformed_response_reconciles_created_document(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    mcp = FakeMcp(
+        project_root=tmp_path,
+        create_payload={
+            "path": "plans/todo/owner-issue-7.md",
+            "status": "todo",
+        },
+    )
+    github = FakeGithub(
+        page=GithubIssuePage(repository_id=42, issues=(_github_issue(),))
+    )
+    planner = FakePlanner(result=_plan_result())
+    executor = _executor(tmp_path, monkeypatch, mcp=mcp, github=github, planner=planner)
+    state_dir = tmp_path / "state"
+    outcome = executor.execute(
+        state_dir=state_dir,
+        project_root=tmp_path,
+        environment=ENVIRONMENT,
+    )
+    assert outcome.action == "create_plan"
+    assert outcome.reason == "plan_created"
+    assert outcome.mutating is True
+    assert mcp.write_count == 1
+    created_records = [
+        json.loads(path.read_text(encoding="utf-8"))
+        for path in (state_dir / "planner-records").glob("*.json")
+        if json.loads(path.read_text(encoding="utf-8")).get("status")
+        == "created"
+    ]
+    assert len(created_records) == 1
+    assert created_records[0]["plan_revision"] == "1"
+
+
+def test_executor_create_holds_when_source_changes_during_planning(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    mcp = FakeMcp(project_root=tmp_path)
+    github = FakeGithub(
+        page=GithubIssuePage(repository_id=42, issues=(_github_issue(),))
+    )
+    planner = FakePlanner(result=_plan_result())
+
+    def edit_issue() -> None:
+        github.page = GithubIssuePage(
+            repository_id=42, issues=(_github_issue(body="Edited"),)
+        )
+
+    planner.side_effect = edit_issue
+    executor = _executor(tmp_path, monkeypatch, mcp=mcp, github=github, planner=planner)
+    outcome = executor.execute(
+        state_dir=tmp_path / "state",
+        project_root=tmp_path,
+        environment=ENVIRONMENT,
+    )
+    assert outcome.action == "report"
+    assert outcome.reason == "state_changed_before_action"
+    assert mcp.created_plans == []
+    assert mcp.write_count == 0
+
+
+def test_executor_create_holds_when_ready_plan_appears_during_planning(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    mcp = FakeMcp(project_root=tmp_path)
+    github = FakeGithub(
+        page=GithubIssuePage(repository_id=42, issues=(_github_issue(),))
+    )
+    planner = FakePlanner(result=_plan_result())
+
+    def inject_ready_plan() -> None:
+        mcp.plans.append(
+            {
+                "path": "plans/in-progress/ready.md",
+                "status": "in_progress",
+                "modified_at": "2026-01-01T00:00:00Z",
+            }
+        )
+        mcp.documents["plans/in-progress/ready.md"] = (
+            "### [ ] Checkpoint 1: step\n"
+        )
+
+    planner.side_effect = inject_ready_plan
+    executor = _executor(tmp_path, monkeypatch, mcp=mcp, github=github, planner=planner)
+    outcome = executor.execute(
+        state_dir=tmp_path / "state",
+        project_root=tmp_path,
+        environment=ENVIRONMENT,
+    )
+    assert outcome.action == "report"
+    assert outcome.reason == "state_changed_before_action"
+    assert mcp.created_plans == []
+    assert mcp.write_count == 0
 
 
 def test_executor_resume_timeout_reconciles_active_run(

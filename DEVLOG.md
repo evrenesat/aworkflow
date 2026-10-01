@@ -1,5 +1,41 @@
 # DEVLOG
 
+## 2026-10-01 — Preserve ambiguous concierge create intent (Checkpoint 4 review fix)
+
+- A local `create_plan` timeout did not cancel the server request, but the
+  concierge treated a missing target path as proof that creation failed and
+  left no durable intent. A late server-side create could therefore appear as
+  a covering `todo` draft that no later tick could safely promote.
+- `aflow/concierge.py` now persists a private `create_pending` record before
+  consuming the one-attempt mutation budget and issuing `create_plan`. The
+  record binds the exact claim, canonical issue identity/source hash,
+  expected plan name/path, and generated document hash without asserting
+  creation or ownership. A missing, unreadable, or conflicting immediate
+  read-back reports `creation_unverified` and preserves the pending intent
+  instead of claiming the create failed.
+- Later ticks reconcile `create_pending` records read-only from complete MCP
+  evidence. A record becomes `created` only after exact canonical path,
+  `todo` status, document content hash, current revision, owner-issue
+  identity/source, and duplicate-evidence checks match. Triage marks issues
+  covered by private concierge provenance records, including pending records,
+  so the same ambiguous claim is never created again while independent safe
+  work remains eligible. `create_pending` drafts are not promotable.
+- Added focused executor tests covering deferred server-side creation
+  recovered and promoted on a later tick with only one `create_plan`,
+  conflicting document evidence staying held, and independent safe work
+  proceeding while a pending claim remains unresolved.
+- Updated `ARCHITECTURE.md`, `aflow/concierge_prompt.md`, and
+  `deploy/concierge/README.md` where the durable pending-create behavior
+  differs from the previous failure interpretation.
+- Verification: from the repository root, `uv run pytest
+  tests/test_concierge.py tests/test_issue_intake_planner.py
+  tests/test_publication.py tests/test_control_plane_capabilities.py -q`
+  (331 passed) and `uv run ruff check aflow apps/aflow_app/server/src`
+  (clean); `git diff --check` is clean. From `apps/aflow_app/server`,
+  `uv run pytest tests/test_mcp.py tests/test_plan_store.py
+  tests/test_control_plane_api.py -q` (189 passed). No UI change is included.
+  Changes are left uncommitted for review.
+
 ## 2026-09-30 — Complete bounded concierge inventory and conservative occupancy (Checkpoint 2)
 
 - The recovered concierge blocked on any unknown run activity and read an
@@ -5002,3 +5038,25 @@ HISTORY: Published clipboard history `c14f1f2`/`cd78d53` remains separate and mu
   the existing thread pool. Explicit run-detail admission hints remain intact.
 - Regression checks cover skipped previews, unchanged event delivery, deleted
   run visibility, and health responses while either SSE read is blocked.
+
+## 2026-10-01 — Concierge staged plan lifecycle and mutation budget
+
+- Replaced the combined `plan_and_start` tick action with separate
+  `create_plan` and `promote_plan` actions so owner-issue plan work stages
+  across ticks: first tick authors and creates a `todo` plan, a subsequent
+  tick promotes the proven draft to `in_progress`, and a later tick starts
+  the now-ready plan through normal selection and preflight.
+- Added a tick-local `MutationBudget` that enforces at most one external
+  mutation (MCP write or GitHub issue creation) per concierge tick. The
+  budget is consumed immediately before issuing the request; timeouts,
+  rejections, and failures consume it, and subsequent reconciliation is
+  read-only.
+- Added `ConciergeDraftRecord` private provenance records under
+  `planner-records/` that preserve canonical issue identity, source hash,
+  generated document hash, and plan identity/revision for safe promotion.
+- Updated triage selection priority to: (1) defer on occupancy, (2) repair
+  failed delivery, (3) resume safe failed lineage, (4) start ready
+  `in_progress` plan, (5) promote proven concierge draft, (6) create plan
+  for oldest uncovered owner issue.
+- Updated `concierge_prompt.md`, `deploy/concierge/README.md`, and
+  `ARCHITECTURE.md` to describe the staged lifecycle and mutation budget.

@@ -22,6 +22,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from importlib import resources
+from aflow.issue_intake import source_hash
 import argparse
 import asyncio
 import fcntl
@@ -102,7 +103,9 @@ PLAN_DOCUMENT_STATUSES = frozenset(
 PLANNED_EVIDENCE_STATUSES = frozenset(
     {"todo", "in_progress", "done", "failed", "needs_plan_change"}
 )
-MUTATING_TICK_ACTIONS = frozenset({"resume", "start", "plan_and_start"})
+MUTATING_TICK_ACTIONS = frozenset(
+    {"resume", "start", "create_plan", "promote_plan"}
+)
 DEFECT_FINGERPRINT_MARKER_PREFIX = "aflow-concierge-defect-fingerprint:"
 DEPLOY_STATUS_PATH_DEFAULT = Path("/var/lib/aflowd/deploy/status.json")
 LIVE_RELEASE_ROOT_DEFAULT = Path("/opt/aflowd")
@@ -196,6 +199,9 @@ class TickObservation:
     run_contexts: Mapping[str, Mapping[str, object]] | None = None
     delivery: Mapping[str, object] | None = None
     delivery_sha: str | None = None
+    concierge_drafts: Mapping[str, ConciergeDraftRecord] = field(
+        default_factory=dict
+    )
 
 
 @dataclass(frozen=True)
@@ -230,6 +236,52 @@ class TickOutcome:
     reason: str
     mutating: bool = False
     details: Mapping[str, object] = field(default_factory=dict)
+
+
+class MutationBudget:
+    """Tick-local single mutation-attempt budget.
+
+    One external write (MCP tool call or GitHub issue creation) is allowed
+    per tick.  The budget is consumed immediately before the request is
+    issued; timeouts, rejections, and other failures consume it.  Subsequent
+    reconciliation in the same tick must be read-only.
+    """
+
+    __slots__ = ("_consumed",)
+
+    def __init__(self) -> None:
+        self._consumed = False
+
+    @property
+    def available(self) -> bool:
+        return not self._consumed
+
+    def consume(self) -> None:
+        if self._consumed:
+            raise ConciergeError("mutation_budget_exhausted")
+        self._consumed = True
+
+
+@dataclass(frozen=True)
+class ConciergeDraftRecord:
+    """Private provenance record for one concierge-created plan draft.
+
+    Written as ``create_pending`` before an ambiguous ``create_plan``
+    attempt, then as ``created`` or ``promoted`` once the exact plan
+    document or promotion is proven.  Later ticks use the record to verify
+    that a ``todo`` document was created by the concierge and has not been
+    modified.
+    """
+
+    claim_sha256: str
+    issue_number: int
+    repository_full_name: str
+    source_sha256: str
+    plan_name: str
+    plan_path: str
+    plan_revision: str
+    document_sha256: str
+    status: str
 
 
 @dataclass(frozen=True)
@@ -1620,6 +1672,123 @@ def triage_tick(observation: TickObservation) -> TriageDecision:
         if issue.get("author_id") == CONCIERGE_OWNER_ID
         and issue.get("state", "open") == "open"
     ]
+    issues_by_number: dict[int, Mapping[str, object]] = {
+        int(issue["number"]): issue for issue in owner_issues
+    }
+
+    # Staged lifecycle: first check for promotable concierge-created drafts.
+    # A draft is promotable when its provenance record is "created", the plan
+    # still exists as "todo", its content is unchanged, the owner issue is
+    # still open in the recorded repository with the exact recorded source
+    # text, and no other document covers the same issue.
+    draft_candidates: list[dict[str, object]] = []
+    if observation.concierge_drafts:
+        for draft_path, record in sorted(
+            observation.concierge_drafts.items(),
+            key=lambda item: str(item[0]),
+        ):
+            if record.status != "created":
+                continue
+            identity = _canonical_plan_identity(draft_path, project_root)
+            if identity is None:
+                continue
+            plan = plan_inventory.get(identity)
+            if plan is None:
+                continue
+            if _canonical_plan_status(plan.get("status")) != "todo":
+                continue
+            plan_display_path = str(plan.get("path"))
+            content = observation.plan_documents.get(plan_display_path)
+            if not isinstance(content, str):
+                continue
+            content_hash = hashlib.sha256(
+                content.encode("utf-8")
+            ).hexdigest()
+            if content_hash != record.document_sha256:
+                continue
+            # The saved revision proven at create (or reconciliation) time
+            # must still be the current document revision.  Identical content
+            # at a newer revision is a lost-revision hold, not a promotion:
+            # the provenance record only proves the revision it stored.
+            current_revision = plan.get("revision")
+            if (
+                not record.plan_revision
+                or not isinstance(current_revision, str)
+                or not current_revision
+                or record.plan_revision != current_revision
+            ):
+                continue
+            issue = issues_by_number.get(record.issue_number)
+            if issue is None:
+                continue
+            if str(issue.get("full_name")) != record.repository_full_name:
+                continue
+            issue_title = issue.get("title")
+            issue_body = issue.get("body")
+            if not isinstance(issue_title, str) or not isinstance(
+                issue_body, str
+            ):
+                continue
+            try:
+                current_source = source_hash(issue_title, issue_body)
+            except ValueError:
+                continue
+            if current_source != record.source_sha256:
+                continue
+            # The draft itself is expected coverage; any *other* document
+            # covering the same issue blocks promotion.
+            issue_url = _issue_url(issue)
+            other_covers = False
+            for other_identity in sorted(plan_inventory):
+                if other_identity == identity:
+                    continue
+                other_plan = plan_inventory[other_identity]
+                if (
+                    _canonical_plan_status(other_plan.get("status"))
+                    not in PLANNED_EVIDENCE_STATUSES
+                ):
+                    continue
+                other_content = document_for(other_identity)
+                if other_content is None:
+                    continue
+                if issue_url in _issue_urls_in(other_content):
+                    other_covers = True
+                    break
+            if other_covers:
+                continue
+            issue_created = _timestamp_sort_key(issue.get("created_at"))
+            draft_candidates.append(
+                {
+                    "kind": "promote",
+                    "record": record,
+                    "plan_path": plan_display_path,
+                    "revision": plan.get("revision"),
+                    "issue": issue,
+                    "sort_key": (
+                        issue_created,
+                        record.issue_number,
+                        draft_path,
+                    ),
+                }
+            )
+    if draft_candidates:
+        best = min(draft_candidates, key=lambda c: c["sort_key"])
+        record = best["record"]  # type: ignore[assignment]
+        plan_path = str(best["plan_path"])
+        revision = best["revision"]
+        plan_revision = (
+            str(revision) if isinstance(revision, str) and revision else None
+        )
+        return TriageDecision(
+            action="promote_plan",
+            reason="concierge_draft_promotable",
+            plan_path=plan_path,
+            plan_revision=plan_revision,
+            idempotency_key=_start_key(f"promote:{plan_path}"),
+        )
+
+    # No promotable drafts: select the oldest uncovered owner issue for
+    # initial plan creation.
     if owner_issues:
         planned_urls: set[str] = set()
         missing_document_identities: list[str] = []
@@ -1635,10 +1804,24 @@ def triage_tick(observation: TickObservation) -> TriageDecision:
                 missing_document_identities.append(identity)
             else:
                 planned_urls.update(_issue_urls_in(content))
+        concierge_covered_urls = {
+            f"https://github.com/{record.repository_full_name}/issues/{record.issue_number}"
+            for record in observation.concierge_drafts.values()
+        }
+        for record in observation.concierge_drafts.values():
+            if record.status == "create_pending":
+                holds.append(
+                    (
+                        "create_pending_unresolved",
+                        record.plan_path,
+                        None,
+                    )
+                )
         unplanned = [
             issue
             for issue in owner_issues
             if _issue_url(issue) not in planned_urls
+            and _issue_url(issue) not in concierge_covered_urls
         ]
         if unplanned:
             if missing_document_identities:
@@ -1658,7 +1841,7 @@ def triage_tick(observation: TickObservation) -> TriageDecision:
             number = int(issue["number"])
             full_name = str(issue["full_name"])
             return TriageDecision(
-                action="plan_and_start",
+                action="create_plan",
                 reason="oldest_owner_issue",
                 issue_number=number,
                 issue_url=f"https://github.com/{full_name}/issues/{number}",
@@ -2315,6 +2498,7 @@ class ConciergeTickExecutor:
             else:
                 issues = page.issues
         occupancy = self._occupancy_report(project_id, runs)
+        concierge_drafts = self._load_concierge_drafts(state_dir)
         observation = TickObservation(
             project=project,
             runs=runs,
@@ -2332,7 +2516,9 @@ class ConciergeTickExecutor:
                 "sha": delivery.sha,
             },
             delivery_sha=delivery.sha,
+            concierge_drafts=concierge_drafts,
         )
+        self._reconcile_pending_creates(state_dir, observation)
         try:
             decision = triage_tick(observation)
         except ConciergeError as exc:
@@ -2354,9 +2540,10 @@ class ConciergeTickExecutor:
                 "report", "github_evidence_unavailable",
                 details=details,
             )
+        budget = MutationBudget()
         defects = defect_signatures(observation.runs)
         if defects:
-            outcome = self._report_defects(full_name, defects)
+            outcome = self._report_defects(full_name, defects, budget)
             if outcome is not None:
                 return outcome
         if not decision.mutating:
@@ -2365,15 +2552,23 @@ class ConciergeTickExecutor:
             return TickOutcome(decision.action, decision.reason, details=details)
         if decision.action == "resume":
             return self._execute_resume(
-                project_id, decision, project, project_root, full_name
+                project_id, decision, project, project_root, full_name, budget
             )
-        if decision.action == "plan_and_start":
+        if decision.action == "create_plan":
             if delivery.state == "failed":
                 details = self._decision_details(decision=decision)
                 details.update(self._delivery_details(delivery))
                 return TickOutcome("report", "delivery_gate_failed", details=details)
-            return self._execute_plan_and_start(
-                project_id, decision, state_dir, full_name, project
+            return self._execute_create_plan(
+                project_id, decision, state_dir, full_name, project, budget
+            )
+        if decision.action == "promote_plan":
+            if delivery.state == "failed":
+                details = self._decision_details(decision=decision)
+                details.update(self._delivery_details(delivery))
+                return TickOutcome("report", "delivery_gate_failed", details=details)
+            return self._execute_promote_plan(
+                project_id, decision, state_dir, project, full_name, budget
             )
         if decision.action == "start":
             # A start decision reaches this point only after triage_tick
@@ -2381,7 +2576,9 @@ class ConciergeTickExecutor:
             # ready repair plans referencing the failed SHA and gate are
             # selected, and unrelated work reports delivery_gate_failed
             # before the executor runs.
-            return self._execute_start(project_id, decision, project, full_name)
+            return self._execute_start(
+                project_id, decision, project, full_name, budget
+            )
         return TickOutcome("report", "unrecognized_decision")
 
     def close(self) -> None:
@@ -2405,7 +2602,10 @@ class ConciergeTickExecutor:
         }
 
     def _report_defects(
-        self, full_name: str, defects: tuple[DefectEvidence, ...]
+        self,
+        full_name: str,
+        defects: tuple[DefectEvidence, ...],
+        budget: MutationBudget,
     ) -> TickOutcome | None:
         # Process each distinct validated signature in stable order.  File the
         # first signature not already filed in this repository, then stop for
@@ -2426,9 +2626,14 @@ class ConciergeTickExecutor:
                 for issue in existing
             ):
                 continue
+            if not budget.available:
+                return TickOutcome(
+                    "report", "mutation_budget_exhausted"
+                )
             title = defect_issue_title(defect)
             body = defect_issue_body(defect, fingerprint)
             try:
+                budget.consume()
                 created = self._github.create_issue(full_name, title, body)
             except ConciergeError:
                 return TickOutcome("report", "defect_filing_failed")
@@ -2446,6 +2651,848 @@ class ConciergeTickExecutor:
                 },
             )
         return None
+
+    def _load_concierge_drafts(
+        self, state_dir: Path
+    ) -> Mapping[str, ConciergeDraftRecord]:
+        """Load private planner provenance records from the state directory."""
+        records_dir = state_dir / "planner-records"
+        if not records_dir.is_dir():
+            return {}
+        drafts: dict[str, ConciergeDraftRecord] = {}
+        for path in sorted(records_dir.iterdir()):
+            if not path.is_file() or path.suffix != ".json":
+                continue
+            try:
+                data = json.loads(path.read_text(encoding="utf-8"))
+            except (OSError, UnicodeError, json.JSONDecodeError):
+                continue
+            if not isinstance(data, Mapping):
+                continue
+            plan_path = data.get("plan_path")
+            if not isinstance(plan_path, str) or not plan_path:
+                continue
+            document_sha256 = data.get("document_sha256")
+            if not isinstance(document_sha256, str):
+                continue
+            status = data.get("status")
+            if not isinstance(status, str) or status not in (
+                "created",
+                "create_pending",
+                "promoted",
+            ):
+                continue
+            revision = data.get("plan_revision")
+            if revision is not None and not isinstance(revision, str):
+                continue
+            try:
+                record = ConciergeDraftRecord(
+                    claim_sha256=str(data.get("claim_sha256", "")),
+                    issue_number=int(data.get("issue_number", 0)),
+                    repository_full_name=str(
+                        data.get("repository_full_name", "")
+                    ),
+                    source_sha256=str(data.get("source_sha256", "")),
+                    plan_name=str(data.get("plan_name", "")),
+                    plan_path=plan_path,
+                    plan_revision=revision or "",
+                    document_sha256=document_sha256,
+                    status=status,
+                )
+            except (TypeError, ValueError):
+                continue
+            drafts[plan_path] = record
+        return drafts
+
+    def _persist_concierge_draft(
+        self, state_dir: Path, record: ConciergeDraftRecord
+    ) -> None:
+        """Atomically write a private planner provenance record."""
+        records_dir = state_dir / "planner-records"
+        records_dir.mkdir(parents=True, exist_ok=True)
+        record_path = records_dir / f"{record.claim_sha256}.json"
+        payload = {
+            "claim_sha256": record.claim_sha256,
+            "issue_number": record.issue_number,
+            "repository_full_name": record.repository_full_name,
+            "source_sha256": record.source_sha256,
+            "plan_name": record.plan_name,
+            "plan_path": record.plan_path,
+            "plan_revision": record.plan_revision,
+            "document_sha256": record.document_sha256,
+            "status": record.status,
+        }
+        _atomic_write(
+            record_path,
+            (json.dumps(payload, sort_keys=True) + "\n").encode("utf-8"),
+            label="concierge_draft",
+        )
+
+    def _execute_create_plan(
+        self,
+        project_id: str,
+        decision: TriageDecision,
+        state_dir: Path,
+        full_name: str,
+        project: Mapping[str, object],
+        budget: MutationBudget,
+    ) -> TickOutcome:
+        """Plan one eligible owner issue and create the plan document only."""
+        if self._fresh_decision(
+            project_id,
+            decision,
+            full_name,
+            project,
+            concierge_drafts=self._load_concierge_drafts(state_dir),
+        ) is None:
+            return TickOutcome(
+                "report", "state_changed_before_action",
+                details=self._decision_details(decision=decision),
+            )
+        number = int(decision.issue_number)
+        details: dict[str, object] = {
+            **self._decision_details(decision=decision),
+            "planner_model": CONCIERGE_PLANNER_MODEL,
+            "planner_effort": CONCIERGE_PLANNER_EFFORT,
+        }
+        page: GithubIssuePage | None
+        try:
+            page = self._github.open_issues(full_name)
+        except ConciergeError:
+            return TickOutcome(
+                "report", "github_evidence_unavailable", details=details
+            )
+        if page is None or not page.complete:
+            return TickOutcome(
+                "report", "github_evidence_unavailable", details=details
+            )
+        issue = next(
+            (
+                candidate
+                for candidate in page.issues
+                if int(candidate["number"]) == number
+            ),
+            None,
+        )
+        if issue is None:
+            return TickOutcome(
+                "report", "state_changed_before_action", details=details
+            )
+        title = str(issue["title"])
+        body = str(issue["body"])
+        try:
+            source_sha256 = source_hash(title, body)
+        except (TypeError, ValueError) as exc:
+            raise ConciergeError("canonical_source_invalid") from exc
+        canonical = ConciergeCanonicalIssue(
+            title=title, body=body, title_body_sha256=source_sha256
+        )
+        claim_sha256 = hashlib.sha256(
+            f"concierge-plan:{full_name}:{number}:{source_sha256}".encode(
+                "utf-8"
+            )
+        ).hexdigest()
+        record_path = state_dir / "planner-records" / f"{claim_sha256}.json"
+        record: Mapping[str, object] | None
+        if record_path.is_file():
+            try:
+                loaded = json.loads(record_path.read_text(encoding="utf-8"))
+            except (OSError, UnicodeError, json.JSONDecodeError):
+                loaded = None
+            record = loaded if isinstance(loaded, Mapping) else None
+        else:
+            record = None
+        if (
+            isinstance(record, Mapping)
+            and record.get("status")
+            in {"create_pending", "created", "promoted"}
+        ):
+            reason = (
+                "create_pending_unresolved"
+                if record.get("status") == "create_pending"
+                else "state_changed_before_action"
+            )
+            return TickOutcome("report", reason, details=details)
+
+        def persist_workspace(workspace_record: Mapping[str, object]) -> None:
+            _atomic_write(
+                record_path,
+                (json.dumps(dict(workspace_record), sort_keys=True) + "\n").encode(
+                    "utf-8"
+                ),
+                label="planner_workspace",
+            )
+
+        factory = self._planner_factory or _build_concierge_planner
+        planner = factory(state_dir, self._mcp)
+        try:
+            if record is not None:
+                result = planner.recover(
+                    record=record,
+                    repository_id=page.repository_id,
+                    issue_number=number,
+                    project_id=project_id,
+                    claim_sha256=claim_sha256,
+                )
+                details["planner_recovered"] = True
+            else:
+                result = planner.plan(
+                    repository_id=page.repository_id,
+                    repository_full_name=full_name,
+                    issue_number=number,
+                    project_id=project_id,
+                    claim_sha256=claim_sha256,
+                    canonical=canonical,
+                    persist_workspace=persist_workspace,
+                )
+        except Exception as exc:
+            reason = getattr(exc, "reason", None)
+            return TickOutcome(
+                "report",
+                "planner_failed",
+                details={
+                    **details,
+                    "planner_reason": str(reason or "planner_failure")[:128],
+                },
+            )
+        if result.status == "needs_attention":
+            question = str(result.question or "")[
+                :CONCIERGE_PLANNER_QUESTION_MAX_CHARS
+            ]
+            return TickOutcome(
+                "report",
+                "planner_needs_attention",
+                details={**details, "question": question},
+            )
+        if result.status != "plan" or not isinstance(result.markdown, str):
+            return TickOutcome(
+                "report", "planner_result_invalid", details=details
+            )
+        try:
+            runs, plans, plan_documents, *_ = self._gather_evidence(
+                project_id, full_name
+            )
+        except ConciergeError:
+            return TickOutcome(
+                "report", "evidence_unavailable", details=details
+            )
+        if self._occupancy_blocks(project_id, runs):
+            return TickOutcome(
+                "report", "state_changed_before_action", details=details
+            )
+        try:
+            fresh_page = self._github.open_issues(full_name)
+        except ConciergeError:
+            return TickOutcome(
+                "report", "github_evidence_unavailable", details=details
+            )
+        if not fresh_page.complete:
+            return TickOutcome(
+                "report", "github_evidence_unavailable", details=details
+            )
+        fresh_issue = next(
+            (
+                candidate
+                for candidate in fresh_page.issues
+                if int(candidate["number"]) == number
+            ),
+            None,
+        )
+        fresh_author = fresh_issue.get("author_id") if fresh_issue else None
+        if (
+            fresh_issue is None
+            or type(fresh_author) is not int
+            or fresh_author != CONCIERGE_OWNER_ID
+            or fresh_issue.get("state", "open") != "open"
+        ):
+            return TickOutcome(
+                "report", "state_changed_before_action", details=details
+            )
+        plan_name = f"owner-issue-{number}.md"
+        plan_path = f"plans/todo/{plan_name}"
+        planned_urls: set[str] = set()
+        for plan in plans:
+            if _canonical_plan_status(plan.get("status")) not in (
+                PLANNED_EVIDENCE_STATUSES
+            ):
+                continue
+            content = plan_documents.get(str(plan.get("path") or ""))
+            if not isinstance(content, str):
+                return TickOutcome(
+                    "report", "evidence_unavailable", details=details
+                )
+            planned_urls.update(_issue_urls_in(content))
+        if decision.issue_url in planned_urls:
+            return TickOutcome(
+                "report",
+                "duplicate_detected_before_authoring",
+                details=details,
+            )
+        # After planning, reselect from the full current evidence, including
+        # private draft records, the queue, delivery, and the GitHub
+        # inventory.  A higher-priority action, a changed selection, or a
+        # changed source stops the tick before any write.
+        if self._fresh_decision(
+            project_id,
+            decision,
+            full_name,
+            project,
+            concierge_drafts=self._load_concierge_drafts(state_dir),
+        ) is None:
+            return TickOutcome(
+                "report", "state_changed_before_action", details=details
+            )
+        fresh_title = fresh_issue.get("title")
+        fresh_body = fresh_issue.get("body")
+        if not isinstance(fresh_title, str) or not isinstance(
+            fresh_body, str
+        ):
+            return TickOutcome(
+                "report", "state_changed_before_action", details=details
+            )
+        try:
+            fresh_source = source_hash(fresh_title, fresh_body)
+        except (TypeError, ValueError):
+            return TickOutcome(
+                "report", "state_changed_before_action", details=details
+            )
+        if fresh_source != source_sha256:
+            return TickOutcome(
+                "report", "state_changed_before_action", details=details
+            )
+        document_sha256 = hashlib.sha256(
+            result.markdown.encode("utf-8")
+        ).hexdigest()
+        if not budget.available:
+            return TickOutcome(
+                "report", "mutation_budget_exhausted", details=details
+            )
+        self._persist_concierge_draft(
+            state_dir,
+            ConciergeDraftRecord(
+                claim_sha256=claim_sha256,
+                issue_number=number,
+                repository_full_name=full_name,
+                source_sha256=source_sha256,
+                plan_name=plan_name,
+                plan_path=plan_path,
+                plan_revision="",
+                document_sha256=document_sha256,
+                status="create_pending",
+            ),
+        )
+        budget.consume()
+        created: Mapping[str, object] | None
+        try:
+            created = self._mcp.call_tool(
+                "create_plan",
+                {
+                    "project_id": project_id,
+                    "name": plan_name,
+                    "content": result.markdown,
+                },
+            )
+        except ConciergeError:
+            return self._reconcile_created_plan(
+                state_dir,
+                project_id=project_id,
+                plan_name=plan_name,
+                plan_path=plan_path,
+                expected_content=result.markdown,
+                claim_sha256=claim_sha256,
+                issue_number=number,
+                full_name=full_name,
+                source_sha256=source_sha256,
+                document_sha256=document_sha256,
+                details=details,
+            )
+        if (
+            not isinstance(created, Mapping)
+            or created.get("project_id") != project_id
+            or created.get("name") != plan_name
+            or created.get("path") != plan_path
+            or created.get("status") != "todo"
+            or not isinstance(created.get("revision"), str)
+            or not str(created.get("revision"))
+            or created.get("content") != result.markdown
+        ):
+            return self._reconcile_created_plan(
+                state_dir,
+                project_id=project_id,
+                plan_name=plan_name,
+                plan_path=plan_path,
+                expected_content=result.markdown,
+                claim_sha256=claim_sha256,
+                issue_number=number,
+                full_name=full_name,
+                source_sha256=source_sha256,
+                document_sha256=document_sha256,
+                details=details,
+            )
+        draft_record = ConciergeDraftRecord(
+            claim_sha256=claim_sha256,
+            issue_number=number,
+            repository_full_name=full_name,
+            source_sha256=source_sha256,
+            plan_name=plan_name,
+            plan_path=str(created["path"]),
+            plan_revision=str(created["revision"]),
+            document_sha256=document_sha256,
+            status="created",
+        )
+        self._persist_concierge_draft(state_dir, draft_record)
+        details["plan_path"] = str(created["path"])
+        details["plan_created"] = True
+        return TickOutcome(
+            "create_plan", "plan_created", mutating=True, details=details
+        )
+
+    def _reconcile_created_plan(
+        self,
+        state_dir: Path,
+        *,
+        project_id: str,
+        plan_name: str,
+        plan_path: str,
+        expected_content: str,
+        claim_sha256: str,
+        issue_number: int,
+        full_name: str,
+        source_sha256: str,
+        document_sha256: str,
+        details: dict[str, object],
+    ) -> TickOutcome:
+        """Read-only reconciliation after an ambiguous create_plan result.
+
+        The mutation budget is already consumed, so only reads are used.  A
+        proven creation (exact path, todo status, exact content) persists the
+        private record with the read-back revision; a missing, unreadable, or
+        conflicting document preserves the pending intent as unverified.
+        """
+        rows: list[Mapping[str, object]] | None = None
+        try:
+            payload = self._mcp.call_tool(
+                "list_plan_documents", {"project_id": project_id}
+            )
+        except ConciergeError:
+            payload = None
+        if isinstance(payload, Mapping):
+            candidate = payload.get("plans")
+            if isinstance(candidate, list):
+                rows = [row for row in candidate if isinstance(row, Mapping)]
+        if rows is None:
+            return TickOutcome(
+                "report", "creation_unverified", details=details
+            )
+        if not any(row.get("path") == plan_path for row in rows):
+            return TickOutcome(
+                "report", "creation_unverified", details=details
+            )
+        try:
+            document = self._mcp.call_tool(
+                "read_plan",
+                {
+                    "project_id": project_id,
+                    "plan_status": "todo",
+                    "name": plan_name,
+                },
+            )
+        except ConciergeError:
+            return TickOutcome(
+                "report", "creation_unverified", details=details
+            )
+        if not self._plan_document_proven(
+            document,
+            project_id=project_id,
+            plan_name=plan_name,
+            path=plan_path,
+            status="todo",
+            expected_revision=None,
+            expected_content=expected_content,
+        ):
+            return TickOutcome(
+                "report", "creation_unverified", details=details
+            )
+        revision = document.get("revision")
+        if not isinstance(revision, str) or not revision:
+            return TickOutcome(
+                "report", "creation_unverified", details=details
+            )
+        record = ConciergeDraftRecord(
+            claim_sha256=claim_sha256,
+            issue_number=issue_number,
+            repository_full_name=full_name,
+            source_sha256=source_sha256,
+            plan_name=plan_name,
+            plan_path=plan_path,
+            plan_revision=revision,
+            document_sha256=document_sha256,
+            status="created",
+        )
+        self._persist_concierge_draft(state_dir, record)
+        details["plan_path"] = plan_path
+        details["plan_created"] = True
+        return TickOutcome(
+            "create_plan", "plan_created", mutating=True, details=details
+        )
+
+    def _reconcile_pending_creates(
+        self,
+        state_dir: Path,
+        observation: TickObservation,
+    ) -> None:
+        """Reconcile durable create intents from complete current evidence."""
+        for record in sorted(
+            observation.concierge_drafts.values(),
+            key=lambda item: (item.plan_path, item.claim_sha256),
+        ):
+            if record.status != "create_pending":
+                continue
+            updated = self._reconcile_pending_create(
+                state_dir, record, observation
+            )
+            if updated is not None:
+                observation.concierge_drafts[record.plan_path] = updated
+
+    def _reconcile_pending_create(
+        self,
+        state_dir: Path,
+        record: ConciergeDraftRecord,
+        observation: TickObservation,
+    ) -> ConciergeDraftRecord | None:
+        project_root = str(observation.project.get("root") or "")
+        identity = _canonical_plan_identity(record.plan_path, project_root)
+        if identity is None:
+            return None
+        plan = next(
+            (
+                candidate
+                for candidate in observation.plans
+                if (
+                    _canonical_plan_identity(
+                        candidate.get("path"), project_root
+                    )
+                    == identity
+                )
+            ),
+            None,
+        )
+        if plan is None:
+            return None
+        if _canonical_plan_status(plan.get("status")) != "todo":
+            return None
+        plan_path = str(plan.get("path"))
+        content = observation.plan_documents.get(plan_path)
+        if not isinstance(content, str):
+            return None
+        if (
+            hashlib.sha256(content.encode("utf-8")).hexdigest()
+            != record.document_sha256
+        ):
+            return None
+        revision = plan.get("revision")
+        if not isinstance(revision, str) or not revision:
+            return None
+        issue = next(
+            (
+                candidate
+                for candidate in observation.issues
+                if type(candidate.get("number")) is int
+                and int(candidate["number"]) == record.issue_number
+                and str(candidate.get("full_name") or "")
+                == record.repository_full_name
+                and candidate.get("state", "open") == "open"
+                and candidate.get("author_id") == CONCIERGE_OWNER_ID
+            ),
+            None,
+        )
+        if issue is None:
+            return None
+        title = issue.get("title")
+        body = issue.get("body")
+        if not isinstance(title, str) or not isinstance(body, str):
+            return None
+        try:
+            current_source = source_hash(title, body)
+        except ValueError:
+            return None
+        if current_source != record.source_sha256:
+            return None
+        issue_url = _issue_url(issue)
+        plan_status_by_path = {
+            str(plan_candidate.get("path")): _canonical_plan_status(
+                plan_candidate.get("status")
+            )
+            for plan_candidate in observation.plans
+        }
+        for other_path in sorted(plan_status_by_path):
+            if other_path == plan_path:
+                continue
+            if plan_status_by_path[other_path] not in PLANNED_EVIDENCE_STATUSES:
+                continue
+            other_content = observation.plan_documents.get(other_path)
+            if not isinstance(other_content, str):
+                continue
+            if issue_url in _issue_urls_in(other_content):
+                return None
+        updated = ConciergeDraftRecord(
+            claim_sha256=record.claim_sha256,
+            issue_number=record.issue_number,
+            repository_full_name=record.repository_full_name,
+            source_sha256=record.source_sha256,
+            plan_name=record.plan_name,
+            plan_path=plan_path,
+            plan_revision=revision,
+            document_sha256=record.document_sha256,
+            status="created",
+        )
+        self._persist_concierge_draft(state_dir, updated)
+        return updated
+
+    @staticmethod
+    def _plan_document_proven(
+        payload: Mapping[str, object] | None,
+        *,
+        project_id: str,
+        plan_name: str,
+        path: str,
+        status: str,
+        expected_revision: str | None,
+        expected_content: str | None = None,
+        expected_document_sha256: str | None = None,
+    ) -> bool:
+        """Require a read_plan payload to prove one exact document identity."""
+        if not isinstance(payload, Mapping):
+            return False
+        if payload.get("project_id") != project_id:
+            return False
+        if payload.get("name") != plan_name:
+            return False
+        if payload.get("path") != path:
+            return False
+        if payload.get("status") != status:
+            return False
+        revision = payload.get("revision")
+        if not isinstance(revision, str) or not revision:
+            return False
+        if expected_revision is not None and revision != expected_revision:
+            return False
+        content = payload.get("content")
+        if not isinstance(content, str):
+            return False
+        if expected_content is not None and content != expected_content:
+            return False
+        if expected_document_sha256 is not None:
+            digest = hashlib.sha256(content.encode("utf-8")).hexdigest()
+            if digest != expected_document_sha256:
+                return False
+        return True
+
+    def _execute_promote_plan(
+        self,
+        project_id: str,
+        decision: TriageDecision,
+        state_dir: Path,
+        project: Mapping[str, object],
+        full_name: str | None,
+        budget: MutationBudget,
+    ) -> TickOutcome:
+        """Promote a proven concierge-created todo draft to in_progress."""
+        plan_path = str(decision.plan_path)
+        details: dict[str, object] = {
+            **self._decision_details(decision=decision),
+        }
+        drafts = self._load_concierge_drafts(state_dir)
+        draft = drafts.get(plan_path)
+        if draft is None:
+            return TickOutcome(
+                "report", "draft_provenance_missing", details=details
+            )
+        if draft.status == "promoted":
+            return TickOutcome(
+                "report", "draft_already_promoted", details=details
+            )
+        if draft.status != "created":
+            return TickOutcome(
+                "report", "draft_not_created", details=details
+            )
+        # Recompute the complete fresh decision from the loaded private draft
+        # records and the full GitHub evidence.  The re-triaged decision must
+        # be the same promotion of the same path and revision; it re-verifies
+        # the todo status, the unchanged document hash, the open owner issue
+        # in the recorded repository, the exact current source hash, the sole
+        # duplicate coverage, delivery, scheduling, and the absence of any
+        # higher-priority candidate.
+        if self._fresh_decision(
+            project_id,
+            decision,
+            full_name,
+            project,
+            concierge_drafts=drafts,
+        ) is None:
+            return TickOutcome(
+                "report", "state_changed_before_action", details=details
+            )
+        project_root = str(project.get("root", ""))
+        identity = _canonical_plan_identity(plan_path, project_root)
+        if identity is None:
+            return TickOutcome(
+                "report", "plan_identity_invalid", details=details
+            )
+        plan_name = draft.plan_name
+        if plan_path != f"plans/todo/{plan_name}":
+            return TickOutcome(
+                "report", "draft_provenance_invalid", details=details
+            )
+        plan_revision = decision.plan_revision
+        if not isinstance(plan_revision, str) or not plan_revision:
+            return TickOutcome(
+                "report", "plan_revision_unavailable", details=details
+            )
+        if not budget.available:
+            return TickOutcome(
+                "report", "mutation_budget_exhausted", details=details
+            )
+        budget.consume()
+        promoted: Mapping[str, object] | None
+        try:
+            promoted = self._mcp.call_tool(
+                "promote_plan",
+                {
+                    "project_id": project_id,
+                    "plan_status": "todo",
+                    "name": plan_name,
+                    "expected_revision": plan_revision,
+                },
+            )
+        except ConciergeError as exc:
+            return self._reconcile_promoted_plan(
+                state_dir,
+                project_id=project_id,
+                plan_name=plan_name,
+                expected_revision=plan_revision,
+                draft=draft,
+                failure_reason=exc.reason,
+                details=details,
+            )
+        expected_path = f"plans/in-progress/{plan_name}"
+        if (
+            not isinstance(promoted, Mapping)
+            or promoted.get("project_id") != project_id
+            or promoted.get("name") != plan_name
+            or promoted.get("path") != expected_path
+            or promoted.get("status") != "in_progress"
+            or promoted.get("revision") != plan_revision
+        ):
+            return self._reconcile_promoted_plan(
+                state_dir,
+                project_id=project_id,
+                plan_name=plan_name,
+                expected_revision=plan_revision,
+                draft=draft,
+                failure_reason="promotion_unverified",
+                details=details,
+            )
+        promoted_record = ConciergeDraftRecord(
+            claim_sha256=draft.claim_sha256,
+            issue_number=draft.issue_number,
+            repository_full_name=draft.repository_full_name,
+            source_sha256=draft.source_sha256,
+            plan_name=plan_name,
+            plan_path=expected_path,
+            plan_revision=plan_revision,
+            document_sha256=draft.document_sha256,
+            status="promoted",
+        )
+        self._persist_concierge_draft(state_dir, promoted_record)
+        details["plan_promoted"] = True
+        return TickOutcome(
+            "promote_plan", "plan_promoted", mutating=True, details=details
+        )
+
+    def _reconcile_promoted_plan(
+        self,
+        state_dir: Path,
+        *,
+        project_id: str,
+        plan_name: str,
+        expected_revision: str,
+        draft: ConciergeDraftRecord,
+        failure_reason: str,
+        details: dict[str, object],
+    ) -> TickOutcome:
+        """Read-only reconciliation after an ambiguous promote_plan result.
+
+        The mutation budget is already consumed, so only reads are used.  A
+        proven promotion (exact in-progress identity, revision, and content)
+        persists the promoted record; a proven still-todo document reports
+        the original failure so a later tick may retry; anything else stays
+        unverified without a persisted record.
+        """
+        todo_path = f"plans/todo/{plan_name}"
+        promoted_path = f"plans/in-progress/{plan_name}"
+        try:
+            promoted_payload = self._mcp.call_tool(
+                "read_plan",
+                {
+                    "project_id": project_id,
+                    "plan_status": "in_progress",
+                    "name": plan_name,
+                },
+            )
+        except ConciergeError:
+            promoted_payload = None
+        if self._plan_document_proven(
+            promoted_payload,
+            project_id=project_id,
+            plan_name=plan_name,
+            path=promoted_path,
+            status="in_progress",
+            expected_revision=expected_revision,
+            expected_document_sha256=draft.document_sha256,
+        ):
+            promoted_record = ConciergeDraftRecord(
+                claim_sha256=draft.claim_sha256,
+                issue_number=draft.issue_number,
+                repository_full_name=draft.repository_full_name,
+                source_sha256=draft.source_sha256,
+                plan_name=plan_name,
+                plan_path=promoted_path,
+                plan_revision=expected_revision,
+                document_sha256=draft.document_sha256,
+                status="promoted",
+            )
+            self._persist_concierge_draft(state_dir, promoted_record)
+            details["plan_promoted"] = True
+            return TickOutcome(
+                "promote_plan", "plan_promoted", mutating=True,
+                details=details,
+            )
+        try:
+            todo_payload = self._mcp.call_tool(
+                "read_plan",
+                {
+                    "project_id": project_id,
+                    "plan_status": "todo",
+                    "name": plan_name,
+                },
+            )
+        except ConciergeError:
+            todo_payload = None
+        if self._plan_document_proven(
+            todo_payload,
+            project_id=project_id,
+            plan_name=plan_name,
+            path=todo_path,
+            status="todo",
+            expected_revision=expected_revision,
+            expected_document_sha256=draft.document_sha256,
+        ):
+            # The document is provably untouched; the promotion did not land.
+            return TickOutcome("report", failure_reason, details=details)
+        return TickOutcome(
+            "report", "promotion_unverified", details=details
+        )
 
     @staticmethod
     def _decision_details(
@@ -3140,6 +4187,7 @@ class ConciergeTickExecutor:
         decision: TriageDecision,
         full_name: str | None,
         project: Mapping[str, object],
+        concierge_drafts: Mapping[str, ConciergeDraftRecord] | None = None,
     ) -> TriageDecision | None:
         try:
             (
@@ -3179,6 +4227,7 @@ class ConciergeTickExecutor:
                 "sha": delivery.sha,
             },
             delivery_sha=delivery.sha,
+            concierge_drafts=dict(concierge_drafts or {}),
         )
         try:
             fresh = triage_tick(observation)
@@ -3199,7 +4248,20 @@ class ConciergeTickExecutor:
             and fresh.issue_number != decision.issue_number
         ):
             return None
-        if decision.action in ("start", "resume"):
+        if (
+            decision.action == "create_plan"
+            and (
+                fresh.issue_number != decision.issue_number
+                or fresh.issue_url != decision.issue_url
+            )
+        ):
+            return None
+        if (
+            decision.action == "promote_plan"
+            and fresh.plan_path != decision.plan_path
+        ):
+            return None
+        if decision.action in ("start", "resume", "promote_plan"):
             fresh_revision = fresh.plan_revision
             if (
                 not isinstance(fresh_revision, str)
@@ -3216,6 +4278,7 @@ class ConciergeTickExecutor:
         project: Mapping[str, object],
         project_root: Path,
         full_name: str | None,
+        budget: MutationBudget,
     ) -> TickOutcome:
         if (
             self._fresh_decision(project_id, decision, full_name, project)
@@ -3237,7 +4300,13 @@ class ConciergeTickExecutor:
                 "report", "resume_not_admitted",
                 details=self._decision_details(decision=decision),
             )
+        if not budget.available:
+            return TickOutcome(
+                "report", "mutation_budget_exhausted",
+                details=self._decision_details(decision=decision),
+            )
         try:
+            budget.consume()
             self._mcp.call_tool(
                 "resume_run",
                 {
@@ -3298,6 +4367,7 @@ class ConciergeTickExecutor:
         decision: TriageDecision,
         project: Mapping[str, object],
         full_name: str | None,
+        budget: MutationBudget,
     ) -> TickOutcome:
         if (
             self._fresh_decision(project_id, decision, full_name, project)
@@ -3321,6 +4391,11 @@ class ConciergeTickExecutor:
             return TickOutcome(
                 "report", "state_changed_before_action", details=details
             )
+        if not budget.available:
+            return TickOutcome(
+                "report", "mutation_budget_exhausted", details=details
+            )
+        budget.consume()
         return self._start_with_evidence(project_id, plan_path, decision, details)
 
     def _execute_plan_and_start(
@@ -3370,8 +4445,6 @@ class ConciergeTickExecutor:
             )
         title = str(issue["title"])
         body = str(issue["body"])
-        from aflow.issue_intake import source_hash
-
         try:
             source_sha256 = source_hash(title, body)
         except (TypeError, ValueError) as exc:

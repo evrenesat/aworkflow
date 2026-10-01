@@ -1514,15 +1514,18 @@ qualifying CI workflow runs for that SHA, with the latest attempt by
 `/var/lib/aflowd/deploy/status.json`, and the live release
 (`installed`/`stale`/`missing`) from the `/opt/aflowd/current` release name.
 Missing evidence projects to `pending`, never success. A failed exact-SHA
-delivery blocks fresh `start`/`plan_and_start` (not a verified `resume`)
-until repaired. Defect filing is driven only by the control plane's
+delivery blocks fresh `start`/`create_plan`/`promote_plan` (not a verified
+`resume`) until repaired. Defect filing is driven only by the control plane's
 validated `defect_confirmation` projection (strict six-field contract);
 missing, malformed, or unconfirmed runs file nothing, filing deduplicates
 by trusted defect signature across run IDs against the target
 repository's issues (including closed ones), files the first unfiled
-distinct signature per tick, and an already-filed signature does not
-displace a later eligible safe action. The concierge process is the
-authoritative boundary; see [deploy/concierge/README.md](deploy/concierge/README.md).
+ distinct signature per tick, and an already-filed signature does not
+ displace a later eligible safe action. An ambiguous concierge `create_plan`
+ preserves a durable `create_pending` intent, marks the issue covered, and is
+ reconciled read-only on later ticks without a second `create_plan`. The
+ concierge process is the authoritative boundary; see
+ [deploy/concierge/README.md](deploy/concierge/README.md).
 
 The versioned project registry is the sole project authority beneath one
 managed root. `project_service.py` creates, registers, renames, and safely
