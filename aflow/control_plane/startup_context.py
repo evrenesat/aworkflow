@@ -20,7 +20,12 @@ from aflow.plan import (
     parse_git_tracking_metadata,
     unchecked_step_texts,
 )
-from aflow.plan_backups import BackupProvenanceError, plan_identity_for_path, plan_identity_for_path_strict
+from aflow.plan_backups import (
+    BackupProvenanceError,
+    plan_identity_alias_owners,
+    plan_identity_for_path,
+    plan_identity_for_path_strict,
+)
 from aflow.git_status import classify_status_items_by_prefix, parse_porcelain_status
 from aflow.project_admission import ProjectAdmission, ProjectAdmissionSafetyError
 from aflow.project_settings import ProjectSettingsError
@@ -346,7 +351,21 @@ def _candidate_match(
     plan: StartupContextSummary, roots: tuple[Path, ...], primary_root: Path,
     tracking: object, base_ref: str | None,
 ) -> tuple[bool, bool]:
-    """Return (related, identity uncertain); names never establish a match."""
+    """Return (related, identity uncertain); names never establish a match.
+
+    Identity authority rule: an explicit valid run identity equal to the
+    current plan identity is an exact match. An explicit conflicting (or
+    malformed) identity is related but uncertain and can never become a
+    certain match through path or Git Tracking. For ordinary run metadata
+    without identity fields, the recorded path is a certain match only when
+    its durable ownership is unique to the current plan identity, whether
+    that path is equal to or different from the current plan path; exactly
+    one durable owner different from the current plan identity makes the
+    record unrelated. Shared aliases, missing ownership evidence, and paths
+    outside the current identity's history are reported ambiguous (related
+    but uncertain). Genuinely identity-free plans keep the exact-path plus
+    Git Tracking fallback.
+    """
     raw_ids = tuple(
         value for value in (metadata.get("original_plan_identity"), metadata.get("plan_identity"))
         if value is not None
@@ -362,10 +381,28 @@ def _candidate_match(
     if source is None:
         source = getattr(manifest, "plan_path", None)
     path = _original_path(source, roots=roots)
-    if path is None or path != plan.plan_path:
+    if path is None:
         return False, False
-    if plan.plan_identity and explicit and explicit != plan.plan_identity:
-        return True, True
+    if plan.plan_identity:
+        # Explicit conflicting or malformed identity fields block a certain
+        # match before any provenance lookup can run.
+        if explicit is not None or invalid_identity:
+            return True, True
+        # Ordinary records: the recorded path is a certain match only when
+        # exactly one durable owner exists and it is the current identity;
+        # exactly one different durable owner is unrelated. Path equality
+        # and Git Tracking never resolve reused or shared ownership.
+        recorded = Path(path)
+        if not recorded.is_absolute():
+            recorded = primary_root / recorded
+        owners = plan_identity_alias_owners(primary_root, recorded)
+        if owners is None or len(owners) != 1:
+            return True, True
+        if owners != {plan.plan_identity}:
+            return False, False
+        return True, False
+    if path != plan.plan_path:
+        return False, False
     if tracking is None or invalid_identity:
         return True, True
     branch = getattr(tracking, "plan_branch", None)

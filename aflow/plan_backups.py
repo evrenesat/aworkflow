@@ -714,6 +714,27 @@ def plan_identity_for_path_strict(repo_root: Path, plan_path: Path) -> str | Non
     return str(matches[0]["plan_identity_id"]) if matches else None
 
 
+def plan_identity_alias_owners(repo_root: Path, alias_path: Path) -> frozenset[str] | None:
+    """Return the plan identities that own one recorded path alias.
+
+    This is a read-only projection across every valid owner record. It returns
+    ``None`` when the provenance store is missing, malformed, or the alias
+    cannot be resolved, so callers treat the association as unknown instead of
+    guessing. An alias owned by more than one identity is returned as a set of
+    owners so callers can report the association as ambiguous.
+    """
+    try:
+        identities = _plan_identities(Path(repo_root), strict=True)
+        alias = _path_value(Path(alias_path), require_file=False)
+    except (BackupProvenanceError, OSError):
+        return None
+    return frozenset(
+        str(identity["plan_identity_id"])
+        for identity in identities
+        if alias in identity["owned_paths"]
+    )
+
+
 def create_plan_identity(repo_root: Path, plan_path: Path) -> str:
     """Create a fresh current owner for a newly created plan file."""
     plan_value = _path_value(Path(plan_path), require_file=True)

@@ -17,7 +17,7 @@ from aflow.control_plane import LaunchManifest, RunRepository, create_launch_man
 from aflow.control_plane import startup_context as startup_module
 from aflow.control_plane.models import RunPage
 from aflow.control_plane.run_history import RunHistory
-from aflow.plan_backups import create_plan_identity
+from aflow.plan_backups import create_plan_identity, move_plan_identity, plan_identity_for_path
 from aflow.project_admission import ProjectAdmission
 from aflow.api.startup import PriorWorkStartupError, require_safe_fresh_worktree
 
@@ -462,6 +462,194 @@ def test_stable_identity_matches_moved_plan_and_rejects_conflicts(tmp_path: Path
     assert mismatched.related_runs[0].run_id == "previous-run"
     assert mismatched.recommendation == "inspect_previous_runs"
     assert mismatched.availability == "partial"
+
+
+def test_moved_plan_keeps_prior_work_evidence(tmp_path: Path) -> None:
+    repo, plan, worktree, _, workflow = _related_fixture(tmp_path)
+    identity = create_plan_identity(repo, plan)
+    # Ordinary run metadata: the original path is recorded, no identity fields.
+    _record_previous(repo, plan, worktree)
+    (worktree / "implementation.py").write_text("work = True\n")
+    failed_path = repo / "plans" / "failed" / "plan.md"
+    failed_path.parent.mkdir(parents=True)
+    failed_path.write_text(plan.read_text())
+    plan.unlink()
+    assert move_plan_identity(repo, source_plan_path=plan, destination_plan_path=failed_path)
+    assert plan_identity_for_path(repo, failed_path) == identity
+
+    # The moved plan's dirty retained work still blocks a fresh start.
+    moved = _project_related(repo, failed_path, workflow)
+    assert moved.recommendation == "review_previous_run"
+    assert moved.related_runs[0].run_id == "previous-run"
+    assert moved.related_runs[0].uncommitted_work is True
+
+    # Clean, fully integrated work for the same moved plan allows a start.
+    _git("add", "implementation.py", cwd=worktree)
+    _git("commit", "-m", "implementation", cwd=worktree)
+    _git("merge", "--ff-only", "previous-branch", cwd=repo)
+    integrated = _project_related(repo, failed_path, workflow)
+    assert integrated.recommendation == "start"
+    assert integrated.related_runs[0].unmerged_work is False
+    assert integrated.related_runs[0].uncommitted_work is False
+
+
+def test_shared_alias_blocks_even_when_clean_and_integrated(tmp_path: Path) -> None:
+    repo, plan, worktree, _, workflow = _related_fixture(tmp_path)
+    # Identity A owns the path, then moves away.
+    create_plan_identity(repo, plan)
+    a_failed = repo / "plans" / "failed" / "a-plan.md"
+    a_failed.parent.mkdir(parents=True)
+    a_failed.write_text(plan.read_text())
+    plan.unlink()
+    assert move_plan_identity(repo, source_plan_path=plan, destination_plan_path=a_failed)
+    # Identity B reuses A's former path and also moves away.
+    b_plan = repo / "plans" / "in-progress" / "plan.md"
+    b_plan.write_text(a_failed.read_text().replace("# Plan", "# Plan B"))
+    identity_b = create_plan_identity(repo, b_plan)
+    b_failed = repo / "plans" / "failed" / "b-plan.md"
+    b_failed.write_text(b_plan.read_text())
+    b_plan.unlink()
+    assert move_plan_identity(repo, source_plan_path=b_plan, destination_plan_path=b_failed)
+    assert plan_identity_for_path(repo, b_failed) == identity_b
+
+    # Ordinary A-era run metadata records the alias now shared by A and B.
+    _record_previous(repo, b_plan, worktree)
+    (worktree / "implementation.py").write_text("work = True\n")
+    dirty = _project_related(repo, b_failed, workflow)
+    assert dirty.related_runs[0].run_id == "previous-run"
+    assert dirty.recommendation == "inspect_previous_runs"
+    assert dirty.availability == "partial"
+
+    # Even clean, fully integrated work cannot make the shared alias certain.
+    _git("add", "implementation.py", cwd=worktree)
+    _git("commit", "-m", "implementation", cwd=worktree)
+    _git("merge", "--ff-only", "previous-branch", cwd=repo)
+    integrated = _project_related(repo, b_failed, workflow)
+    assert integrated.related_runs[0].run_id == "previous-run"
+    assert integrated.recommendation == "inspect_previous_runs"
+    assert integrated.availability == "partial"
+
+
+def test_reused_same_path_blocks_while_new_owner_remains(tmp_path: Path) -> None:
+    repo, plan, worktree, _, workflow = _related_fixture(tmp_path)
+    # Identity A owns plans/in-progress/plan.md, records an ordinary run
+    # there, then moves away.
+    create_plan_identity(repo, plan)
+    _record_previous(repo, plan, worktree, run_id="a-era-run")
+    a_failed = repo / "plans" / "failed" / "a-plan.md"
+    a_failed.parent.mkdir(parents=True)
+    a_failed.write_text(plan.read_text())
+    plan.unlink()
+    assert move_plan_identity(repo, source_plan_path=plan, destination_plan_path=a_failed)
+
+    # Identity B is created at that same path and previewed while still there.
+    b_plan = repo / "plans" / "in-progress" / "plan.md"
+    b_plan.write_text(a_failed.read_text().replace("# Plan", "# Plan B"))
+    create_plan_identity(repo, b_plan)
+
+    # A-era dirty retained work blocks B's fresh start.
+    (worktree / "implementation.py").write_text("work = True\n")
+    dirty = _project_related(repo, b_plan, workflow)
+    assert dirty.related_runs[0].run_id == "a-era-run"
+    assert dirty.availability == "partial"
+    assert dirty.recommendation == "inspect_previous_runs"
+    with pytest.raises(PriorWorkStartupError) as dirty_guard:
+        require_safe_fresh_worktree(repo, b_plan, workflow)
+    assert dirty_guard.value.code == "prior_work_unverified"
+
+    # Even clean, fully integrated A-era work stays uncertain: the recorded
+    # path is owned by both identities, and Git Tracking cannot resolve that.
+    _git("add", "implementation.py", cwd=worktree)
+    _git("commit", "-m", "implementation", cwd=worktree)
+    _git("merge", "--ff-only", "previous-branch", cwd=repo)
+    integrated = _project_related(repo, b_plan, workflow)
+    assert integrated.related_runs[0].run_id == "a-era-run"
+    assert integrated.availability == "partial"
+    assert integrated.recommendation == "inspect_previous_runs"
+    with pytest.raises(PriorWorkStartupError) as integrated_guard:
+        require_safe_fresh_worktree(repo, b_plan, workflow)
+    assert integrated_guard.value.code == "prior_work_unverified"
+
+
+def test_distinct_owner_run_is_excluded_from_other_plan_preview(tmp_path: Path) -> None:
+    repo, plan, worktree, _, workflow = _related_fixture(tmp_path)
+    # Identity A owns plans/in-progress/plan.md and records an ordinary run
+    # there, then moves through the lifecycle; identity B owns a distinct
+    # current path in the same repository. Neither path is reused.
+    create_plan_identity(repo, plan)
+    _record_previous(repo, plan, worktree)
+    a_failed = repo / "plans" / "failed" / "a-plan.md"
+    a_failed.parent.mkdir(parents=True)
+    a_failed.write_text(plan.read_text())
+    plan.unlink()
+    assert move_plan_identity(repo, source_plan_path=plan, destination_plan_path=a_failed)
+
+    # B's plan keeps A's Git Tracking section, so its metadata matches the
+    # A-era run; matching Git Tracking must not create a related run.
+    b_plan = repo / "plans" / "in-progress" / "b-plan.md"
+    b_plan.write_text(a_failed.read_text())
+    create_plan_identity(repo, b_plan)
+
+    # A's dirty retained work must not block B: the recorded A-era path is
+    # uniquely owned by A, so that run is unrelated to B's prior-work decision.
+    (worktree / "implementation.py").write_text("work = True\n")
+    dirty = _project_related(repo, b_plan, workflow)
+    assert dirty.related_runs == ()
+    assert dirty.recommendation == "start"
+    require_safe_fresh_worktree(repo, b_plan, workflow)
+
+    # Clean, fully integrated A work is likewise unrelated to B.
+    _git("add", "implementation.py", cwd=worktree)
+    _git("commit", "-m", "implementation", cwd=worktree)
+    _git("merge", "--ff-only", "previous-branch", cwd=repo)
+    integrated = _project_related(repo, b_plan, workflow)
+    assert integrated.related_runs == ()
+    assert integrated.recommendation == "start"
+
+
+def test_explicit_conflicting_identity_over_shared_alias_blocks(tmp_path: Path) -> None:
+    repo, plan, worktree, _, workflow = _related_fixture(tmp_path)
+    identity_a = create_plan_identity(repo, plan)
+    a_failed = repo / "plans" / "failed" / "a-plan.md"
+    a_failed.parent.mkdir(parents=True)
+    a_failed.write_text(plan.read_text())
+    plan.unlink()
+    assert move_plan_identity(repo, source_plan_path=plan, destination_plan_path=a_failed)
+    b_plan = repo / "plans" / "in-progress" / "plan.md"
+    b_plan.write_text(a_failed.read_text().replace("# Plan", "# Plan B"))
+    create_plan_identity(repo, b_plan)
+    b_failed = repo / "plans" / "failed" / "b-plan.md"
+    b_failed.write_text(b_plan.read_text())
+    b_plan.unlink()
+    assert move_plan_identity(repo, source_plan_path=b_plan, destination_plan_path=b_failed)
+
+    # A's explicit identity conflicts with B's current identity.
+    _record_previous(repo, b_plan, worktree, identity=identity_a)
+    (worktree / "implementation.py").write_text("work = True\n")
+    blocked = _project_related(repo, b_failed, workflow)
+    assert blocked.related_runs[0].run_id == "previous-run"
+    assert blocked.recommendation == "inspect_previous_runs"
+    assert blocked.availability == "partial"
+
+
+def test_reused_alias_without_distinguishing_provenance_blocks(tmp_path: Path) -> None:
+    repo, plan, worktree, _, workflow = _related_fixture(tmp_path)
+    create_plan_identity(repo, plan)
+    # A recorded path that is not part of the current plan's owned history.
+    reused = repo / "plans" / "todo" / "plan.md"
+    reused.parent.mkdir(parents=True)
+    _record_previous(repo, plan, worktree, original_path=reused)
+    (worktree / "implementation.py").write_text("work = True\n")
+    failed_path = repo / "plans" / "failed" / "plan.md"
+    failed_path.parent.mkdir(parents=True)
+    failed_path.write_text(plan.read_text())
+    plan.unlink()
+    move_plan_identity(repo, source_plan_path=plan, destination_plan_path=failed_path)
+
+    ambiguous = _project_related(repo, failed_path, workflow)
+    assert ambiguous.related_runs[0].run_id == "previous-run"
+    assert ambiguous.recommendation == "inspect_previous_runs"
+    assert ambiguous.availability == "partial"
 
 
 def test_same_name_different_plan_and_project_are_excluded(tmp_path: Path) -> None:

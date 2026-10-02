@@ -28,6 +28,21 @@ At run start, `aflow` prints the new run ID immediately. Resumed runs also show 
 Before a fresh worktree executes, AFlow checks related run and Git evidence
 against the configured starting branch. Preserved earlier implementation or
 uncertain evidence blocks a new worktree with a recovery or inspection reason.
+A recorded run stays associated with its plan after the plan moves through its
+lifecycle (for example in-progress to failed). Identity authority: an explicit
+valid run identity equal to the current plan identity is an exact match; an
+explicit conflicting (or malformed) identity is related but uncertain and can
+never become a certain match through path or Git Tracking. For ordinary run
+metadata without identity fields, the recorded path is a certain match only
+when its durable ownership is unique to the current plan identity, whether
+that path is equal to or different from the current plan path. A path owned
+by more than one identity, a path with no owner, or missing or malformed
+ownership evidence is reported ambiguous and blocks a fresh start, even when
+the old work is clean and integrated. A path whose exactly one durable owner
+is a different plan identity is unrelated: that run is excluded from this
+plan's prior-work decision, whether its work is dirty or integrated. Matching
+Git Tracking does not resolve reused or shared ownership. Genuinely
+identity-free plans keep the exact-path plus Git Tracking fallback.
 
 Authenticated preflight and pending-run detail expose bounded startup context
 before an agent starts. The UI shows the next checkpoint and pending tasks from
