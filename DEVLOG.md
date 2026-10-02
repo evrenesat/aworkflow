@@ -1,5 +1,47 @@
 # DEVLOG
 
+## 2026-10-02 — Measure launch-review refresh stability independently of screenshot restore
+
+- The `test_ui_demo_new_run_background_preflight_preserves_review` helper
+  restored every full-page screenshot to the initial review's `scrollY` and
+  waited for exact equality. The intentionally changed and failed preflight
+  phases add height and can clamp the document, so the original offset became
+  unattainable and the exact `scrollY ===` wait timed out in CI (observed on the
+  1280x720-light case: initial `scrollY` 1451 versus the failure phase's
+  document maximum 1215). The measurement also conflated screenshot side
+  effects with the product refresh.
+- The test now captures three distinct bounded samples (phase, current
+  scroll, document maximum scroll, and focus token) for every full-page
+  capture: immediately before the screenshot, immediately after it returns
+  and before any restoration, and after the clamped restore. All three
+  samples plus the capture's own target are stored in the artifact manifest
+  as `capture_diagnostics`, so screenshot composition movement is visible
+  instead of being hidden by restoration. Restore belongs only to screenshot
+  handling: it instant-scrolls back to that capture's own position clamped to
+  the current document range with a one CSS pixel tolerance, and verifies
+  focus was not stolen (never refocusing to hide a refresh regression).
+  Every held background read — including the unchanged phase — establishes a
+  real settled baseline after prior screenshot handling and immediately before
+  the held request; the pre-screenshot `before` snapshot remains in the
+  manifest only for diagnostic comparison. The unchanged phase keeps exact
+  before/after scroll and focus, stable review geometry, unchanged visible text,
+  no replacement/visibility/subtree mutations, and unchanged inputs, while
+  changed/failed phases keep their warning, disabled-start, retained
+  last-inspection/height, mounted-node, focus and draft assertions and allow
+  the intentional changed-content geometry. No scroll is clamped or reset
+  during the measured refresh interval.
+- Both Chromium and WebKit pass all three viewport/theme cases. In every
+  captured manifest the three samples agree for the unchanged phase, and the
+  equal phase's baseline matches the state its own screenshot restore left
+  behind (desktop light: baseline/held/settled `scrollY` 1451); the failure
+  phase target is clamped to the document maximum (1216 desktop light, where
+  the document shrank after the blocking warning). Focus is preserved across
+  every capture, exactly one start request was intercepted with no started
+  unit, and page errors are empty. The before/equal/changed/failure captures
+  keep the same populated review node mounted; the preflight root grows with
+  the changed and failed cues (304, 402, 476 px desktop light) and the
+  reviewed draft text is unchanged in all phases.
+
 ## 2026-10-02 — Keep historically owned recorded paths related after a later symlink
 
 - The `cp02-v01` repair review found that the checkpoint 1 symlink rule

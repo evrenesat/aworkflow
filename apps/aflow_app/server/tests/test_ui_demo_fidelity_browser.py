@@ -3236,23 +3236,84 @@ def test_ui_demo_new_run_background_preflight_preserves_review(
             install_refresh_probe(page, {"form": "section.card.start-run-form", "review": ".launch-review", "preflight": ".worktree-preflight", "instructions": "textarea[aria-label='Run extra instructions']"})
             before = capture_refresh_probe(page)
             choices = {"plan": plan.input_value(), "workflow": workflow.input_value(), "team": team.input_value(), "stage": stage.input_value(), "turns": turns.input_value(), "step": page.get_by_label("Run start step", exact=True).input_value(), "instructions": instructions.input_value()}
-
-            def restore_after_full_page_capture() -> None:
-                # Playwright's full-page capture can move the document while
-                # composing a sticky action row. Reset only that capture side
-                # effect before the next read begins.
-                page.evaluate("target => window.scrollTo(0, target)", before["scrollY"])
-                page.wait_for_function("target => window.scrollY === target", arg=before["scrollY"])
-                read_refresh_probe_mutations(page)
-
-            page.screenshot(path=str(artifact_dir / f"{stem}-before.png"), full_page=True)
-            restore_after_full_page_capture()
             captures: dict[str, object] = {}
+            capture_diagnostics: list[dict[str, object]] = []
+
+            def settle_scroll() -> None:
+                page.evaluate("window.__aflowCp2ScrollSample = {last: null, stable: 0}")
+                page.wait_for_function("""() => {
+                    const sample = window.__aflowCp2ScrollSample;
+                    const current = window.scrollY;
+                    sample.stable = sample.last === current ? sample.stable + 1 : 0;
+                    sample.last = current;
+                    return sample.stable >= 6;
+                }""", polling=50)
+
+            def settled_baseline() -> dict[str, object]:
+                # A real, settled baseline captured after prior screenshot
+                # handling and immediately before the next held background read.
+                settle_scroll()
+                return capture_refresh_probe(page)
+
+            def capture_sample() -> dict[str, object]:
+                return page.evaluate("""() => {
+                    const active = document.activeElement;
+                    const max = Math.max(0, (document.scrollingElement?.scrollHeight ?? document.body.scrollHeight) - window.innerHeight);
+                    return {scrollY: window.scrollY, maxScrollY: max,
+                      focused: (window.__aflowRefreshProbe && active instanceof Element) ? window.__aflowRefreshProbe.token(active) : null};
+                }""")
+
+            def capture_full_page(name: str) -> dict[str, object]:
+                # Bounded samples immediately before and after the full-page
+                # capture distinguish Playwright's composition movement from
+                # product refresh; Playwright's full-page composition can move
+                # the document while assembling a sticky action row.
+                pre = capture_sample()
+                pre["phase"] = phase["value"]
+                target = pre["scrollY"]
+                page.screenshot(path=str(artifact_dir / f"{stem}-{name}.png"), full_page=True)
+                # Read the document exactly as the capture left it, before any
+                # restoration, so composition movement cannot be hidden.
+                post = capture_sample()
+                post["phase"] = phase["value"]
+                # Restore only the capture side effect: an instant scroll back
+                # to this capture's own position, clamped to the document's
+                # current range so a changed page cannot make the original
+                # offset unattainable. One CSS pixel absorbs browser rounding.
+                page.evaluate("""target => {
+                    const max = Math.max(0, (document.scrollingElement?.scrollHeight ?? document.body.scrollHeight) - window.innerHeight);
+                    window.scrollTo(0, Math.min(target, max));
+                }""", target)
+                page.wait_for_function("""target => {
+                    const max = Math.max(0, (document.scrollingElement?.scrollHeight ?? document.body.scrollHeight) - window.innerHeight);
+                    return Math.abs(window.scrollY - Math.min(target, max)) <= 1;
+                }""", arg=target)
+                # Verify the capture did not steal focus; a refresh regression
+                # would surface here, so we never refocus to hide one.
+                restored = capture_sample()
+                restored["phase"] = phase["value"]
+                assert restored["focused"] == pre["focused"], (name, pre, restored)
+                # Screenshot-only mutation noise is cleared only after the
+                # refresh mutations for this phase were read and preserved.
+                read_refresh_probe_mutations(page)
+                capture_diagnostics.append({"name": name, "phase": pre["phase"], "target": target,
+                                            "pre": pre, "post": post, "restored": restored})
+                return pre
+
+            capture_full_page("before")
 
             def assert_choices() -> None:
                 assert choices == {"plan": plan.input_value(), "workflow": workflow.input_value(), "team": team.input_value(), "stage": stage.input_value(), "turns": turns.input_value(), "step": page.get_by_label("Run start step", exact=True).input_value(), "instructions": instructions.input_value()}
 
             for current in ("equal", "changed", "failure"):
+                # Establish a real settled baseline after prior screenshot
+                # handling and immediately before this held background read.
+                # The unchanged phase therefore measures against the state
+                # its own screenshot left behind, not the pre-screenshot
+                # snapshot; later phases reflect the geometry the previous
+                # phase legitimately left behind, so a later baseline never
+                # erases an earlier phase's assertions.
+                baseline = settled_baseline()
                 phase["value"] = current
                 page.evaluate("window.dispatchEvent(new Event('aflow-history-changed'))")
                 for _ in range(200):
@@ -3262,13 +3323,13 @@ def test_ui_demo_new_run_background_preflight_preserves_review(
                 assert held and preflight_requests[-1]["phase"] == current, preflight_requests
                 during = capture_refresh_probe(page)
                 assert all(root["sameNode"] for root in during["roots"].values()), (current, during)
-                assert during["scrollY"] == before["scrollY"], (current, before, during)
-                assert during["focused"] == before["focused"]
+                assert during["scrollY"] == baseline["scrollY"], (current, baseline, during)
+                assert during["focused"] == baseline["focused"]
                 assert_choices()
                 if current == "equal":
                     assert preflight.get_attribute("data-preflight-status") == "ready"
                     assert review.is_visible()
-                    assert during["roots"]["form"]["text"] == before["roots"]["form"]["text"]
+                    assert during["roots"]["form"]["text"] == baseline["roots"]["form"]["text"]
                 route, status, body, headers = held.pop(0)
                 route.fulfill(status=status, headers=headers, body=body)
                 if current == "changed":
@@ -3286,22 +3347,24 @@ def test_ui_demo_new_run_background_preflight_preserves_review(
                     expect(preflight).to_have_attribute("data-preflight-status", "ready")
                 after = capture_refresh_probe(page)
                 assert all(root["sameNode"] for root in after["roots"].values()), (current, after)
+                assert after["focused"] == baseline["focused"]
                 if current == "equal":
-                    assert after["scrollY"] == before["scrollY"], (current, before, after)
-                    assert abs(after["roots"]["review"]["box"]["y"] - before["roots"]["review"]["box"]["y"]) <= 2
+                    # Unchanged read: exact scroll and focus, stable review
+                    # geometry, and unchanged visible content.
+                    assert after["scrollY"] == baseline["scrollY"], (current, baseline, after)
+                    assert abs(after["roots"]["review"]["box"]["y"] - baseline["roots"]["review"]["box"]["y"]) <= 2
+                    assert after["roots"]["form"]["text"] == baseline["roots"]["form"]["text"]
                 if current == "failure":
                     # The warning can add height, but the last inspection and
                     # its space must remain instead of collapsing the page.
-                    assert after["roots"]["preflight"]["box"]["height"] >= before["roots"]["preflight"]["box"]["height"]
-                assert after["focused"] == before["focused"]
+                    assert after["roots"]["preflight"]["box"]["height"] >= baseline["roots"]["preflight"]["box"]["height"]
                 assert_choices()
                 mutations = read_refresh_probe_mutations(page)
                 assert not [item for item in mutations if item["root"] == "instructions" and item["classification"] in {"subtree", "root-replacement", "value", "visibility"}], mutations
                 if current == "equal":
                     assert not [item for item in mutations if item["root"] in {"form", "review"} and item["classification"] in {"subtree", "root-replacement", "visibility"}], mutations
-                page.screenshot(path=str(artifact_dir / f"{stem}-{current}.png"), full_page=True)
-                restore_after_full_page_capture()
-                captures[current] = {"held": during, "settled": after, "mutations": mutations}
+                capture_full_page(current)
+                captures[current] = {"held": during, "settled": after, "baseline": baseline, "mutations": mutations}
 
             # A user-requested inspection may show local pending feedback.
             phase["value"] = "explicit"
@@ -3334,8 +3397,7 @@ def test_ui_demo_new_run_background_preflight_preserves_review(
             assert all(root["sameNode"] for root in capture_refresh_probe(page)["roots"].values())
             assert_choices()
             assert review.is_visible() and start_requests == []
-            page.screenshot(path=str(artifact_dir / f"{stem}-capabilities-failure.png"), full_page=True)
-            restore_after_full_page_capture()
+            capture_full_page("capabilities-failure")
             page.unroute(f"**{capabilities_path}", fail_capabilities)
             def change_capabilities(route) -> None:
                 payload = route.fetch().json()
@@ -3350,8 +3412,7 @@ def test_ui_demo_new_run_background_preflight_preserves_review(
             assert all(root["sameNode"] for root in capture_refresh_probe(page)["roots"].values())
             assert_choices()
             assert review.is_visible() and start_requests == []
-            page.screenshot(path=str(artifact_dir / f"{stem}-capabilities-changed.png"), full_page=True)
-            restore_after_full_page_capture()
+            capture_full_page("capabilities-changed")
             page.unroute(f"**{capabilities_path}", change_capabilities)
             # Reopen the review after the changed and failed inspection cues.
             page.get_by_role("button", name="Cancel review", exact=True).click()
@@ -3375,7 +3436,7 @@ def test_ui_demo_new_run_background_preflight_preserves_review(
             route, status, body, headers = held.pop(0)
             route.fulfill(status=status, headers=headers, body=body)
             assert page_errors == [] and units.start_calls == []
-            _write_artifact_manifest(artifact_dir / f"{stem}.json", {"before": before, "choices": choices, "captures": captures, "preflight_requests": preflight_requests, "start_requests": start_requests, "page_errors": page_errors})
+            _write_artifact_manifest(artifact_dir / f"{stem}.json", {"before": before, "choices": choices, "captures": captures, "capture_diagnostics": capture_diagnostics, "preflight_requests": preflight_requests, "start_requests": start_requests, "page_errors": page_errors})
         finally:
             for route, status, body, headers in held:
                 try:
