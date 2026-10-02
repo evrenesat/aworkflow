@@ -25,6 +25,7 @@ from aflow.plan_backups import (
     plan_identity_alias_owners,
     plan_identity_for_path,
     plan_identity_for_path_strict,
+    plan_identity_lexical_owners,
 )
 from aflow.git_status import classify_status_items_by_prefix, parse_porcelain_status
 from aflow.project_admission import ProjectAdmission, ProjectAdmissionSafetyError
@@ -342,6 +343,22 @@ def _ancestor(root: Path, ancestor: str, descendant: str) -> bool | None:
     return True if code == 0 else False if code == 1 else None
 
 
+def _canonical_directory_identity(path: Path) -> Path | None:
+    """Return a path's resolved directory identity, or None when unverifiable.
+
+    A missing directory, a non-directory, or a resolution failure/loop keeps
+    the caller on its conservative incomplete-evidence behavior; this helper
+    never invents an identity.
+    """
+    try:
+        resolved = path.resolve()
+    except (OSError, RuntimeError, ValueError):
+        return None
+    if not resolved.is_dir():
+        return None
+    return resolved
+
+
 def _original_path(
     value: object, *, roots: tuple[Path, ...]
 ) -> str | None:
@@ -349,17 +366,60 @@ def _original_path(
         return None
     path = Path(value)
     if path.is_absolute():
+        parts = path.parts
+        if any(part in {"", ".", ".."} for part in parts):
+            return None
         for root in roots:
             try:
                 relative = path.relative_to(root)
             except ValueError:
                 continue
-            if relative.parts and ".." not in relative.parts:
+            if relative.parts:
                 return relative.as_posix()
+        # Equivalent verified root aliases (for example the macOS /var and
+        # /private/var spellings of one checkout): walking from the
+        # filesystem root toward the path, find the first directory-ancestor
+        # prefix whose canonical identity equals a verified root, then retain
+        # the entire remaining suffix verbatim, including any symlinked
+        # directory below that prefix. A later root-equivalent prefix never
+        # replaces that suffix, so a descendant symlink cannot become a new
+        # root spelling. The plan file and its descendants are never
+        # resolved, a historical file need not still exist, and a resolution
+        # failure stays unrecognized.
+        canonical_roots = {
+            identity
+            for identity in (_canonical_directory_identity(root) for root in roots)
+            if identity is not None
+        }
+        for index in range(1, len(parts)):
+            identity = _canonical_directory_identity(Path(*parts[:index]))
+            if identity is not None and identity in canonical_roots:
+                relative = parts[index:]
+                if relative:
+                    return Path(*relative).as_posix()
         return None
     if path.parts and ".." not in path.parts and path.parts[0] != ".":
         return path.as_posix()
     return None
+
+
+def _recorded_suffix_crosses_symlink(root: Path, recorded: Path) -> bool:
+    """True when a recorded suffix uses a symlink component below the root.
+
+    The suffix is compared by its verbatim spelling; a symlinked component
+    never borrows its target's durable plan ownership for a different
+    recorded path.
+    """
+    try:
+        relative = recorded.relative_to(root)
+    except ValueError:
+        return False
+    prefix = root
+    for part in relative.parts:
+        prefix = prefix / part
+        if prefix.is_symlink():
+            return True
+    return False
 
 
 def _candidate_match(
@@ -379,7 +439,11 @@ def _candidate_match(
     one durable owner different from the current plan identity makes the
     record unrelated. Shared aliases, missing ownership evidence, and paths
     outside the current identity's history are reported ambiguous (related
-    but uncertain). Genuinely identity-free plans keep the exact-path plus
+    but uncertain). A recorded suffix that crosses a symlink component below
+    the root never borrows its target's durable ownership: a spelling the
+    durable identity history owned stays related but identity-uncertain,
+    while a fresh descendant symlink spelling with no owned history stays
+    unrelated. Genuinely identity-free plans keep the exact-path plus
     Git Tracking fallback.
     """
     raw_ids = tuple(
@@ -411,12 +475,29 @@ def _candidate_match(
         recorded = Path(path)
         if not recorded.is_absolute():
             recorded = primary_root / recorded
-        owners = plan_identity_alias_owners(primary_root, recorded)
-        if owners is None or len(owners) != 1:
+        if not _recorded_suffix_crosses_symlink(primary_root, recorded):
+            owners = plan_identity_alias_owners(primary_root, recorded)
+            if owners is None or len(owners) != 1:
+                return True, True
+            if owners != {plan.plan_identity}:
+                return False, False
+            return True, False
+        # The verbatim suffix crosses a symlink below the root, so the
+        # symlink target never gains exact-match authority for this recorded
+        # path. The recorded spelling keeps its durable history: a path the
+        # identity history owned before the symlink was installed stays
+        # related but identity-uncertain, and a fresh descendant symlink
+        # spelling with no owned history stays unrelated. Only the verified
+        # root prefix is canonicalized; the suffix is never resolved.
+        canonical_root = _canonical_directory_identity(primary_root)
+        historical = (
+            plan_identity_lexical_owners(primary_root, str(canonical_root / path))
+            if canonical_root is not None
+            else None
+        )
+        if historical is None or plan.plan_identity in historical:
             return True, True
-        if owners != {plan.plan_identity}:
-            return False, False
-        return True, False
+        return False, False
     if path != plan.plan_path:
         return False, False
     if tracking is None or invalid_identity:
@@ -485,6 +566,13 @@ def _preserved_work(
         (root for root in roots if isinstance(raw_worktree, str) and str(root) == raw_worktree),
         None,
     )
+    if worktree is None and isinstance(raw_worktree, str):
+        target = _canonical_directory_identity(Path(raw_worktree))
+        if target is not None:
+            worktree = next(
+                (root for root in roots if _canonical_directory_identity(root) == target),
+                None,
+            )
     branch = raw_branch if isinstance(raw_branch, str) and len(raw_branch) <= 256 else None
     if worktree is None:
         if branch is None:
@@ -586,8 +674,20 @@ def project_startup_context(
                        recommendation="blocked", recommendation_reason="The configured starting branch cannot be verified.",
                        reason_codes=(*summary.reason_codes, "starting_ref_unavailable"))
     base_ref = _commit(primary_root, f"refs/heads/{getattr(tracking, 'plan_branch', '')}^{{commit}}") if tracking else None
+    # Recorded roots are compared by canonical directory identity so
+    # equivalent filesystem spellings of the same verified checkout (for
+    # example the macOS /var and /private/var aliases) stay recognized. A
+    # verified root that cannot be canonicalized keeps the scan incomplete
+    # rather than silently narrowing the evidence set.
     candidates: dict[str, _RelatedCandidate] = {}
     complete = True
+    canonical_verified_roots: set[Path] = set()
+    for root in roots:
+        identity = _canonical_directory_identity(root)
+        if identity is None:
+            complete = False
+        else:
+            canonical_verified_roots.add(identity)
     uncertain_lineage = False
     seen = 0
     for root, repository in repositories.items():
@@ -610,8 +710,16 @@ def project_startup_context(
                 if not metadata:
                     continue
                 recorded_root = getattr(manifest, "project_root", None) if manifest else metadata.get("repo_root")
-                if isinstance(recorded_root, str) and recorded_root not in {str(item) for item in roots}:
-                    continue
+                if isinstance(recorded_root, str):
+                    recorded_identity = _canonical_directory_identity(Path(recorded_root))
+                    if recorded_identity is None:
+                        # A recorded root that cannot be canonicalized (moved,
+                        # deleted, or a symlink loop) must not prove a clean
+                        # scan; the evidence stays unresolved.
+                        complete = False
+                        continue
+                    if recorded_identity not in canonical_verified_roots:
+                        continue
                 related, uncertain = _candidate_match(
                     metadata, manifest, plan=summary, roots=roots,
                     primary_root=primary_root, tracking=tracking, base_ref=base_ref,

@@ -34,7 +34,12 @@ still runs before initialization and fails closed on unresolved or unreadable
 evidence, and the full Git-dependent decision re-runs after the verified
 initial commit and before a feature worktree is created. An established
 repository with a missing configured starting branch keeps the strict
-rejection.
+rejection. Recorded run roots, worktree paths, and historical plan paths are
+compared against the verified project roots by canonical directory identity,
+so equivalent filesystem spellings of the same verified checkout (for example
+the macOS `/var` and `/private/var` aliases) remain recognized; a recorded
+root that cannot be canonicalized keeps the scan incomplete and never proves
+a clean start. Explicitly different project roots stay excluded.
 A recorded run stays associated with its plan after the plan moves through its
 lifecycle (for example in-progress to failed). Identity authority: an explicit
 valid run identity equal to the current plan identity is an exact match; an

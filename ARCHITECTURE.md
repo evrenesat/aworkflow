@@ -819,7 +819,12 @@ unreadable evidence before initialization; after the verified initial commit the
 lifecycle boundary re-runs the full Git-dependent prior-work decision before the
 feature worktree is created or a normal worker executes. An established
 repository with a missing configured starting branch keeps the strict
-rejection. An explicit step or dirty-worktree
+rejection. Recorded run roots and historical plan paths are compared against
+the verified project roots by canonical directory identity, so equivalent
+filesystem spellings of the same verified checkout (for example the macOS
+`/var` and `/private/var` aliases) remain recognized, while a recorded root
+that cannot be canonicalized keeps the scan incomplete instead of proving a
+clean start. An explicit step or dirty-worktree
 acknowledgement does not override this check; validated resumes and explicit
 current-checkout continuations retain their existing ownership paths.
 

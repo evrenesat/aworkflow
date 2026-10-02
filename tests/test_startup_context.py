@@ -4,6 +4,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import shutil
 import subprocess
 from dataclasses import replace
 from types import SimpleNamespace
@@ -925,3 +926,308 @@ def test_existing_checkout_workflow_keeps_normal_startup_path(tmp_path: Path) ->
     context = _project_related(repo, plan, WorkflowConfig(setup=()))
     assert context.recommendation == "start"
     assert context.related_runs_complete is None
+
+
+def _alias_related_fixture(tmp_path: Path) -> tuple[Path, Path, Path, Path, str, WorkflowConfig]:
+    """A repository under a regular directory plus a symlinked parent alias.
+
+    The repository itself is not a symlink; only the parent directory has an
+    alias spelling, reproducing the macOS ``/var`` versus ``/private/var``
+    difference on Linux.
+    """
+    real_root = tmp_path / "real"
+    real_root.mkdir()
+    repo = real_root / "repo"
+    repo.mkdir()
+    _git("init", "-b", "main", cwd=repo)
+    _git("config", "user.email", "test@example.com", cwd=repo)
+    _git("config", "user.name", "Test", cwd=repo)
+    (repo / "README.md").write_text("base\n")
+    _git("add", "README.md", cwd=repo)
+    _git("commit", "-m", "base", cwd=repo)
+    base = _git("rev-parse", "HEAD", cwd=repo)
+    worktree = real_root / "previous-worktree"
+    _git("worktree", "add", "-b", "previous-branch", str(worktree), "main", cwd=repo)
+    body = (
+        "# Plan\n## Git Tracking\n"
+        "- Plan Branch: `previous-branch`\n"
+        f"- Pre-Handoff Base HEAD: `{base}`\n"
+        + "".join(f"### [x] Checkpoint {i}: Done\n- [x] task\n" for i in range(1, 4))
+        + "### [ ] Checkpoint 4: Finish\n- [x] started\n- [ ] remaining\n"
+    )
+    plan = _plan(repo, body)
+    workflow = WorkflowConfig(setup=("worktree", "branch"), main_branch="main")
+    alias_parent = tmp_path / "alias"
+    alias_parent.symlink_to(real_root, target_is_directory=True)
+    alias_repo = alias_parent / "repo"
+    # A directory symlink below the project root that points back to the
+    # root itself. It is a descendant of the root, never a root spelling.
+    (repo / "return-to-root").symlink_to(repo, target_is_directory=True)
+    return repo, plan, worktree, alias_repo, base, workflow
+
+
+def _write_run_metadata(
+    repo: Path, *, run_id: str = "previous-run", repo_root: Path, plan: Path,
+    worktree: Path, branch: str = "previous-branch", identity: str | None = None,
+) -> None:
+    run_dir = repo / ".aflow" / "runs" / run_id
+    run_dir.mkdir(parents=True, exist_ok=True)
+    metadata = {
+        "schema_version": 1, "status": "failed", "repo_root": str(repo_root),
+        "original_plan_path": str(plan), "current_step_name": "implement_plan",
+        "feature_branch": branch, "main_branch": "main",
+        "worktree_path": str(worktree), "execution_repo_root": str(worktree),
+        "failure_reason": "Earlier work could not be located.",
+    }
+    if identity:
+        metadata["original_plan_identity"] = identity
+    (run_dir / "run.json").write_text(json.dumps(metadata))
+
+
+def test_alias_spelled_manifest_recorded_run_stays_related(tmp_path: Path) -> None:
+    repo, plan, worktree, alias_repo, _, workflow = _alias_related_fixture(tmp_path)
+    alias_plan = alias_repo / "plans" / "in-progress" / "plan.md"
+    alias_worktree = alias_repo.parent / "previous-worktree"
+    # Manifest-backed run: manifest uses the alias project root, the metadata
+    # mixes canonical root with alias plan and worktree spellings.
+    create_launch_manifest(repo, LaunchManifest(
+        run_id="previous-run", project_root=str(alias_repo), plan_path=str(alias_plan),
+        workflow_name="checkpoint_delivery", max_turns=5,
+    ))
+    _write_run_metadata(repo, repo_root=repo, plan=alias_plan, worktree=alias_worktree)
+    (worktree / "implementation.py").write_text("work = True\n")
+    context = _project_related(repo, plan, workflow)
+    assert context.recommendation == "review_previous_run"
+    assert context.related_runs_complete
+    previous = context.related_runs[0]
+    assert previous.run_id == "previous-run"
+    assert previous.uncommitted_work is True
+    assert previous.unmerged_work is False
+    assert previous.worktree_verified and previous.branch_verified
+
+
+def test_metadata_only_alias_recorded_run_stays_related(tmp_path: Path) -> None:
+    repo, plan, worktree, alias_repo, _, workflow = _alias_related_fixture(tmp_path)
+    alias_plan = alias_repo / "plans" / "in-progress" / "plan.md"
+    alias_worktree = alias_repo.parent / "previous-worktree"
+    # Metadata-only retained run: no launch manifest, every recorded path uses
+    # the alias spelling.
+    _write_run_metadata(repo, repo_root=alias_repo, plan=alias_plan, worktree=alias_worktree)
+    (worktree / "implementation.py").write_text("work = True\n")
+    context = _project_related(repo, plan, workflow)
+    assert context.recommendation == "review_previous_run"
+    assert context.related_runs_complete
+    previous = context.related_runs[0]
+    assert previous.run_id == "previous-run"
+    assert previous.uncommitted_work is True
+    assert previous.worktree_verified and previous.branch_verified
+
+
+def test_alias_recorded_run_mixed_canonical_manifest_stays_related(tmp_path: Path) -> None:
+    repo, plan, worktree, alias_repo, _, workflow = _alias_related_fixture(tmp_path)
+    alias_plan = alias_repo / "plans" / "in-progress" / "plan.md"
+    # Canonical manifest project root with alias-spelled metadata paths.
+    create_launch_manifest(repo, LaunchManifest(
+        run_id="previous-run", project_root=str(repo), plan_path=str(alias_plan),
+        workflow_name="checkpoint_delivery", max_turns=5,
+    ))
+    _write_run_metadata(repo, repo_root=alias_repo, plan=alias_plan, worktree=alias_repo.parent / "previous-worktree")
+    (worktree / "implementation.py").write_text("work = True\n")
+    context = _project_related(repo, plan, workflow)
+    assert context.recommendation == "review_previous_run"
+    assert context.related_runs[0].run_id == "previous-run"
+    assert context.related_runs[0].uncommitted_work is True
+
+
+def test_alias_normalization_excludes_distinct_projects_and_paths(tmp_path: Path) -> None:
+    repo, plan, worktree, alias_repo, _, workflow = _alias_related_fixture(tmp_path)
+    # A different project with the same basename must not match by name or by
+    # alias normalization.
+    other_real = tmp_path / "other"
+    other_real.mkdir()
+    other = other_real / "repo"
+    other.mkdir()
+    _write_run_metadata(repo, repo_root=other, plan=plan, worktree=worktree)
+    context = _project_related(repo, plan, workflow)
+    assert context.related_runs == ()
+    assert context.recommendation == "start"
+
+    # A sibling path sharing a textual prefix of the verified root is a
+    # distinct directory identity, not an alias.
+    (repo / ".aflow" / "runs" / "previous-run" / "run.json").unlink()
+    sibling = repo.parent / "repo-two"
+    sibling.mkdir()
+    _write_run_metadata(repo, repo_root=sibling, plan=plan, worktree=worktree)
+    context = _project_related(repo, plan, workflow)
+    assert context.related_runs == ()
+    assert context.recommendation == "start"
+
+    # Traversal components are rejected before any normalization.
+    (repo / ".aflow" / "runs" / "previous-run" / "run.json").unlink()
+    sibling.rmdir()
+    other.rmdir()
+    other_real.rmdir()
+    _write_run_metadata(
+        repo, repo_root=repo, plan=alias_repo / "plans" / ".." / "in-progress" / "plan.md",
+        worktree=worktree,
+    )
+    context = _project_related(repo, plan, workflow)
+    assert context.related_runs == ()
+    assert context.recommendation == "start"
+
+
+def test_descendant_symlinks_do_not_gain_exact_match_authority(tmp_path: Path) -> None:
+    repo, plan, worktree, alias_repo, _, workflow = _alias_related_fixture(tmp_path)
+    # A symlinked plan file beneath the root keeps its recorded name; the
+    # target never gains exact-match authority for the current plan path.
+    link = repo / "plans" / "in-progress" / "alt.md"
+    link.symlink_to(plan)
+    _write_run_metadata(repo, repo_root=repo, plan=alias_repo / "plans" / "in-progress" / "alt.md", worktree=worktree)
+    context = _project_related(repo, plan, workflow)
+    assert context.related_runs == ()
+    assert context.recommendation == "start"
+    link.unlink()
+    (repo / ".aflow" / "runs" / "previous-run" / "run.json").unlink()
+
+    # A symlinked directory below the root is compared by its recorded
+    # spelling, not by its target.
+    (repo / "plans-linked").symlink_to(repo / "plans", target_is_directory=True)
+    _write_run_metadata(repo, repo_root=repo, plan=alias_repo / "plans-linked" / "in-progress" / "plan.md", worktree=worktree)
+    context = _project_related(repo, plan, workflow)
+    assert context.related_runs == ()
+    assert context.recommendation == "start"
+
+
+def test_descendant_root_symlink_cannot_match_current_plan(tmp_path: Path) -> None:
+    repo, plan, worktree, alias_repo, _, workflow = _alias_related_fixture(tmp_path)
+    assert (repo / "return-to-root").is_symlink()
+    # The current plan has a durable identity, so a recorded path that
+    # borrows the descendant symlink's target could otherwise become an
+    # exact match for it.
+    identity = create_plan_identity(repo, plan)
+    assert identity is not None
+    # No explicit plan identity is recorded; the original path crosses the
+    # parent alias and the descendant root symlink.
+    _write_run_metadata(
+        repo, repo_root=repo,
+        plan=alias_repo / "return-to-root" / "plans" / "in-progress" / "plan.md",
+        worktree=worktree,
+    )
+    alias_context = _project_related(repo, plan, workflow)
+    # The descendant symlink must not gain exact-match authority for the
+    # current plan's durable identity.
+    assert alias_context.related_runs == ()
+    assert alias_context.recommendation == "start"
+
+    # The canonical-spelled equivalent is unrelated because its verbatim
+    # suffix has no durable owner; the alias spelling makes that same
+    # decision.
+    (repo / ".aflow" / "runs" / "previous-run" / "run.json").unlink()
+    _write_run_metadata(
+        repo, repo_root=repo,
+        plan=repo / "return-to-root" / "plans" / "in-progress" / "plan.md",
+        worktree=worktree,
+    )
+    canonical_context = _project_related(repo, plan, workflow)
+    assert canonical_context.related_runs == ()
+    assert canonical_context.recommendation == "start"
+    assert canonical_context.recommendation == alias_context.recommendation
+
+
+def test_alias_path_preserves_identity_decisions_and_missing_history(tmp_path: Path) -> None:
+    repo, plan, worktree, alias_repo, _, workflow = _alias_related_fixture(tmp_path)
+    alias_plan = alias_repo / "plans" / "in-progress" / "plan.md"
+    identity = create_plan_identity(repo, plan)
+    metadata_path = repo / ".aflow" / "runs" / "previous-run" / "run.json"
+
+    # An explicit identity equal to the current plan identity is a definite
+    # match through the alias spelling exactly as through the canonical one.
+    _write_run_metadata(repo, repo_root=repo, plan=alias_plan, worktree=worktree, identity=identity)
+    (worktree / "implementation.py").write_text("work = True\n")
+    alias_context = _project_related(repo, plan, workflow)
+    metadata_path.unlink()
+    _write_run_metadata(repo, repo_root=repo, plan=plan, worktree=worktree, identity=identity)
+    canonical_context = _project_related(repo, plan, workflow)
+    assert alias_context.recommendation == canonical_context.recommendation == "review_previous_run"
+    assert alias_context.availability == canonical_context.availability == "available"
+
+    # An explicit conflicting identity produces the same decision through
+    # the alias spelling as through the canonical one.
+    metadata_path.unlink()
+    _write_run_metadata(repo, repo_root=repo, plan=alias_plan, worktree=worktree, identity="f" * 32)
+    alias_conflict = _project_related(repo, plan, workflow)
+    metadata_path.unlink()
+    _write_run_metadata(repo, repo_root=repo, plan=plan, worktree=worktree, identity="f" * 32)
+    canonical_conflict = _project_related(repo, plan, workflow)
+    assert alias_conflict.recommendation == canonical_conflict.recommendation
+    assert alias_conflict.availability == canonical_conflict.availability
+
+    # A historical alias-spelled original path whose file no longer exists
+    # still matches through the durable identity history.
+    metadata_path.unlink()
+    _write_run_metadata(
+        repo, repo_root=alias_repo, plan=alias_repo / "plans" / "in-progress" / "plan.md",
+        worktree=worktree, identity=identity,
+    )
+    failed_path = repo / "plans" / "failed" / "plan.md"
+    failed_path.parent.mkdir(parents=True)
+    failed_path.write_text(plan.read_text())
+    plan.unlink()
+    assert move_plan_identity(repo, source_plan_path=plan, destination_plan_path=failed_path)
+    assert plan_identity_for_path(repo, failed_path) == identity
+    moved = _project_related(repo, failed_path, workflow)
+    assert moved.recommendation == "review_previous_run"
+    assert moved.related_runs[0].run_id == "previous-run"
+    assert moved.related_runs[0].uncommitted_work is True
+
+
+def test_historically_owned_symlinked_path_keeps_prior_run_related(tmp_path: Path) -> None:
+    """A run recorded before the old plan path became a symlink stays a blocker.
+
+    The plan moves through its lifecycle and the old path is later replaced
+    by a symlink to the moved file. That symlink cannot erase the durable
+    ownership of the recorded historical spelling, so the run stays related
+    but identity-uncertain — with dirty or missing prior work — in both the
+    canonical and the parent-alias spelling, and startup cannot prove a
+    clean scan from the symlink.
+    """
+    repo, plan, worktree, alias_repo, _, workflow = _alias_related_fixture(tmp_path)
+    alias_plan = alias_repo / "plans" / "in-progress" / "plan.md"
+    alias_worktree = alias_repo.parent / "previous-worktree"
+    create_plan_identity(repo, plan)
+    # The prior run is recorded while the plan still lives at its original
+    # regular path, with a dirty feature worktree and no explicit identity.
+    (worktree / "implementation.py").write_text("work = True\n")
+    _write_run_metadata(repo, repo_root=repo, plan=plan, worktree=worktree)
+    failed_path = repo / "plans" / "failed" / "plan.md"
+    failed_path.parent.mkdir(parents=True)
+    failed_path.write_text(plan.read_text())
+    plan.unlink()
+    assert move_plan_identity(repo, source_plan_path=plan, destination_plan_path=failed_path)
+    plan.symlink_to(failed_path)
+
+    context = _project_related(repo, failed_path, workflow)
+    assert context.recommendation != "start"
+    assert context.related_runs_complete is False
+    previous = context.related_runs[0]
+    assert previous.run_id == "previous-run"
+    assert previous.uncommitted_work is True
+
+    # The parent-alias spelling of the same historical recorded path makes
+    # the same decision.
+    metadata_path = repo / ".aflow" / "runs" / "previous-run" / "run.json"
+    metadata_path.unlink()
+    _write_run_metadata(repo, repo_root=alias_repo, plan=alias_plan, worktree=alias_worktree)
+    alias_context = _project_related(repo, failed_path, workflow)
+    assert alias_context.recommendation != "start"
+    assert alias_context.related_runs_complete is False
+    assert alias_context.related_runs[0].run_id == "previous-run"
+    assert alias_context.related_runs[0].uncommitted_work is True
+
+    # Missing prior work keeps the same retained-run blocker.
+    shutil.rmtree(worktree)
+    missing_context = _project_related(repo, failed_path, workflow)
+    assert missing_context.recommendation != "start"
+    assert missing_context.related_runs_complete is False
+    assert missing_context.related_runs[0].run_id == "previous-run"
+    assert "prior_work_unverified" in missing_context.reason_codes

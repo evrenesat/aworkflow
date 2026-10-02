@@ -735,6 +735,31 @@ def plan_identity_alias_owners(repo_root: Path, alias_path: Path) -> frozenset[s
     )
 
 
+def plan_identity_lexical_owners(repo_root: Path, alias_value: str) -> frozenset[str] | None:
+    """Return the identities whose history owns one exact path spelling.
+
+    Unlike :func:`plan_identity_alias_owners`, the candidate is compared
+    verbatim against stored ``owned_paths`` values and is never resolved
+    through the filesystem, so a recorded path that later became a symlink
+    keeps its historical ownership. The caller supplies the absolute path
+    spelled under the verified root's canonical identity with the recorded
+    suffix verbatim. Returns ``None`` when the provenance metadata is
+    malformed or the value is invalid, so callers treat ownership as
+    unknown; an empty result means no identity owns that spelling.
+    """
+    if not _valid_alias(alias_value):
+        return None
+    try:
+        identities = _plan_identities(Path(repo_root), strict=True)
+    except (BackupProvenanceError, OSError):
+        return None
+    return frozenset(
+        str(identity["plan_identity_id"])
+        for identity in identities
+        if alias_value in identity["owned_paths"]
+    )
+
+
 def create_plan_identity(repo_root: Path, plan_path: Path) -> str:
     """Create a fresh current owner for a newly created plan file."""
     plan_value = _path_value(Path(plan_path), require_file=True)

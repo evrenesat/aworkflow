@@ -1,5 +1,72 @@
 # DEVLOG
 
+## 2026-10-02 — Keep historically owned recorded paths related after a later symlink
+
+- The `cp02-v01` repair review found that the checkpoint 1 symlink rule
+  discarded durable evidence: when a recorded historical plan path was
+  already owned by the durable identity history and the plan later moved
+  (`move_plan_identity` retains every owned path) and the old path was
+  replaced by a symlink, `_recorded_suffix_crosses_symlink` made the record
+  unrelated, so startup reported a complete scan and a clean start over
+  retained prior work.
+- `aflow/control_plane/startup_context.py` now distinguishes the two cases:
+  a recorded suffix that crosses a symlink below the root never borrows its
+  target's ownership, but the recorded spelling itself is checked with a new
+  read-only lexical projection (`aflow/plan_backups.py::
+  plan_identity_lexical_owners`, exact `owned_paths` membership with no
+  filesystem resolution) against the verified root's canonical identity plus
+  the verbatim suffix. A spelling the current identity owned stays related
+  but identity-uncertain, so startup still cannot prove a clean scan; a
+  fresh descendant symlink spelling with no owned history stays unrelated,
+  preserving every descendant-symlink decision, and current-plan no-follow
+  containment is untouched.
+- A Linux fixture records a prior run before the old path becomes a symlink,
+  moves the plan with `move_plan_identity`, installs the symlink, and
+  confirms the run stays a retained blocker with dirty and with missing
+  prior work, in both the canonical and the parent-alias spelling of that
+  historical path; the test fails on the pre-repair tree and passes after.
+
+## 2026-10-02 — Match recorded startup roots by canonical directory identity
+
+- The fresh-worktree prior-work guard compared recorded run roots, worktree
+  paths, and historical plan paths against verified project roots using
+  lexicographic string comparisons, so equivalent filesystem spellings of the
+  same checkout (for example the macOS `/var` and `/private/var` aliases)
+  were dropped as unrelated. Manifest-backed runs left the scan complete and
+  the guard admitted a clean start; metadata-only runs left an unverifiable
+  scan; post-bootstrap starts created a feature worktree over an existing
+  alias-spelled worktree.
+- `aflow/control_plane/startup_context.py` now compares recorded roots and
+  verified roots by canonical directory identity (`Path.resolve()` plus a
+  directory check), matches recorded worktree paths the same way, and
+  resolves historical absolute plan paths by finding the first
+  directory-ancestor prefix, walking from the filesystem root toward the
+  path, that canonicalizes to a verified root while retaining the entire
+  remaining suffix verbatim; a later root-equivalent prefix (for example a
+  descendant directory symlink pointing back at the root) never replaces that
+  suffix, and a recorded suffix that crosses a symlink below the root never
+  borrows its target's durable ownership: a spelling the durable identity
+  history owned stays related but identity-uncertain, and a fresh descendant
+  symlink spelling with no owned history stays unrelated. The plan file and
+  its descendants are never resolved, a missing historical file still
+  matches through identity history, descendant symlinks gain no exact-match
+  authority, traversal components are rejected, and a recorded root that
+  cannot be canonicalized keeps the scan incomplete (fail-closed) instead of
+  proving a clean start. Identity authority, uncertain decisions, unrelated
+  different-project roots, and the unchanged-refresh evidence are untouched.
+- Linux-reproducible tests use a symlinked parent directory as the alias:
+  manifest-backed and metadata-only alias-spelled runs stay related with
+  mixed canonical/alias spellings, same-basename/sibling-prefix/traversal
+  paths stay unrelated, descendant symlinks gain no authority, a directory
+  symlink below the root pointing back at the root cannot become an exact
+  current-plan match in either alias or canonical spelling, alias paths
+  keep conflicting-identity uncertainty and missing-history matching, and a
+  post-bootstrap lifecycle start with alias-spelled unresolved evidence fails
+  with `prior_work_unverified` before any feature worktree, feature branch,
+  or worker execution.
+- The canonicalization rule is documented in `ARCHITECTURE.md` and
+  `docs/runtime-behavior.md`.
+
 ## 2026-10-02 — Preserve bootstrap ordering and verify the complete startup journey
 
 - The fresh-worktree prior-work guard now defers only the Git-dependent
