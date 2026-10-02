@@ -2,7 +2,7 @@ import { act, fireEvent, render, screen, waitFor, within } from '@testing-librar
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { ApiError } from '../api'
 import * as api from '../api'
-import type { RunContext, RunProgress, RunProgressDetail, RunProgressSummary, StartRunResponse, WorktreePreflight } from '../types'
+import type { RunContext, RunProgress, RunProgressDetail, RunProgressSummary, StartRunResponse, StartupContext, WorktreePreflight } from '../types'
 import { RunDashboard, type RunSelectionChange } from './RunDashboard'
 import { App } from '../App'
 
@@ -20,6 +20,18 @@ vi.mock('../api', async () => {
 })
 
 const project = { project_id: 'control-project', root: '/workspace/alpha', schema_version: 1 }
+function startupPlan(overrides: Partial<StartupContext> = {}): StartupContext {
+  return {
+    schema_version: 1, availability: 'available', reason_codes: [], reason: null,
+    observed_at: '2026-09-27T00:00:00Z', plan_path: 'plans/in-progress/demo.md', plan_identity: 'plan-1', plan_revision: 'revision-1',
+    total_checkpoints: 6, recorded_complete_checkpoints: 3,
+    next_checkpoint: { ordinal: 4, title: 'Checkpoint 4: Build feature', heading_checked: false, checked_tasks: 0, total_tasks: 2 },
+    checkpoints: [], pending_tasks: ['Implement the feature'], checkpoint_outline_truncated: false,
+    pending_tasks_truncated: false, text_truncated: false, workflow_name: 'managed',
+    selected_step: 'plan', step_source: 'workflow_default', recommendation: 'start', recommendation_reason: null,
+    related_runs: [], related_runs_complete: true, related_runs_truncated: false, ...overrides,
+  }
+}
 const capabilities = {
   schema_version: 1,
   workflows: ['managed', 'other'],
@@ -1115,9 +1127,13 @@ describe('RunDashboard', () => {
 
   it('keeps startup questions distinct from a running workflow and sends an answer idempotently', async () => {
     vi.mocked(api.listControlPlaneRuns).mockResolvedValue({ runs: [], next_cursor: null, schema_version: 1 })
+    const question = { question_id: 'question-1', kind: 'pick_step', message: 'Choose a step', options: {}, choices: ['implement'], run_id: 'pending-run', schema_version: 1 }
+    vi.mocked(api.getControlPlaneRun).mockImplementation(async (_projectId, runId) => runId === 'pending-run'
+      ? { ...ownedRun, run_id: 'pending-run', status: 'awaiting_startup_answer', evidence: { startup_question: question, no_agent_started: true } }
+      : ownedRun)
     vi.mocked(api.startControlPlaneRun).mockResolvedValue({
       result: null,
-      startup_question: { question_id: 'question-1', kind: 'pick_step', message: 'Choose a step', options: {}, choices: ['implement'], run_id: 'pending-run', schema_version: 1 },
+      startup_question: question,
     })
     vi.mocked(api.answerStartupQuestion).mockResolvedValue({
       result: { run_id: 'run-started', created: true, status: 'running', schema_version: 1, manifest_path: null, reason: null, restarted_from_run_id: null },
@@ -1139,6 +1155,133 @@ describe('RunDashboard', () => {
     await waitFor(() => expect(api.answerStartupQuestion).toHaveBeenCalledWith(
       'control-project', 'question-1', 'implement', expect.stringMatching(/^startup-answer-/),
     ))
+  })
+
+  it('shows the next partial-plan checkpoint in preparation and review while omitting the default step from start', async () => {
+    vi.mocked(api.listControlPlaneRuns).mockResolvedValue({ runs: [], next_cursor: null, schema_version: 1 })
+    vi.mocked(api.preflightControlPlaneRun).mockResolvedValue(preflightResult({ startup_context: startupPlan() }))
+    vi.mocked(api.startControlPlaneRun).mockResolvedValue({ result: { run_id: 'started', created: true, status: 'running', schema_version: 1, manifest_path: null, reason: null, restarted_from_run_id: null }, startup_question: null })
+    const onOpenPlan = vi.fn()
+    renderDashboard({ onOpenPlan })
+    await openNewRun()
+    choose('Run plan', 'plans/in-progress/demo.md')
+    choose('Run workflow', 'managed')
+    await screen.findByRole('region', { name: 'Startup context preparation' })
+    expect(screen.getByText('Next in plan: Checkpoint 4 of 6 — Build feature')).toBeDefined()
+    expect(screen.getByText('3 checkpoints marked complete in the plan.')).toBeDefined()
+    expect(within(screen.getByRole('region', { name: 'Startup context preparation' })).getByText(/Configured starting step/)).toBeDefined()
+    fireEvent.click(within(screen.getByRole('region', { name: 'Startup context preparation' })).getByRole('button', { name: 'Open plan' }))
+    expect(onOpenPlan).toHaveBeenCalledWith('plans/in-progress/demo.md')
+    fireEvent.click(screen.getByRole('button', { name: 'Review start…', exact: true }))
+    const review = await screen.findByRole('region', { name: 'Review start' })
+    expect(within(review).getByText('Next in plan: Checkpoint 4 of 6 — Build feature')).toBeDefined()
+    fireEvent.click(within(review).getByRole('button', { name: 'Start run', exact: true }))
+    await waitFor(() => expect(api.startControlPlaneRun).toHaveBeenCalled())
+    expect(vi.mocked(api.startControlPlaneRun).mock.calls[0][1]).not.toHaveProperty('start_step')
+  })
+
+  it('blocks a fresh start with preserved work and opens the exact prior run without writing', async () => {
+    const previous = { ...ownedRun, run_id: 'prior-work', status: 'failed' }
+    const context = startupPlan({ recommendation: 'review_previous_run', recommendation_reason: 'Earlier implementation work is preserved.', related_runs: [{ run_id: 'prior-work', status: 'failed', step: 'implement', activity: 'inactive', history_state: 'visible', failure_reason: 'Provider stopped', worktree_path: '/worktree/prior', worktree_verified: true, branch: 'feature/prior', branch_verified: true, unmerged_work: true, uncommitted_work: true, can_resume: true }] })
+    vi.mocked(api.listControlPlaneRuns).mockResolvedValue({ runs: [], next_cursor: null, schema_version: 1 })
+    vi.mocked(api.preflightControlPlaneRun).mockResolvedValue(preflightResult({ startup_context: context }))
+    vi.mocked(api.getControlPlaneRun).mockResolvedValue(previous)
+    const onSelection = vi.fn()
+    renderDashboard({ onRunSelectionChange: onSelection })
+    await openNewRun()
+    choose('Run plan', 'plans/in-progress/demo.md')
+    choose('Run workflow', 'managed')
+    await screen.findByText('Previous work needs recovery')
+    expect((screen.getByRole('button', { name: 'Review start…', exact: true }) as HTMLButtonElement).disabled).toBe(true)
+    fireEvent.click(screen.getByRole('button', { name: 'Review previous run…' }))
+    await waitFor(() => expect(onSelection).toHaveBeenCalledWith({ runId: 'prior-work', userInitiated: true }))
+    expect(api.startControlPlaneRun).not.toHaveBeenCalled()
+    expect(api.resumeControlPlaneRun).not.toHaveBeenCalled()
+    fireEvent.click(screen.getByRole('button', { name: 'New run' }))
+    expect((await screen.findByLabelText('Run plan') as HTMLInputElement).value).toBe('plans/in-progress/demo.md')
+  })
+
+  it('rechecks a legacy step answer against the current default and never answers stale context', async () => {
+    const question = { question_id: 'legacy-step', kind: 'pick_step', message: 'Choose a step', options: {}, choices: ['plan', 'implement'], run_id: 'pending-step', schema_version: 1 }
+    const initial = { ...ownedRun, run_id: 'pending-step', status: 'awaiting_startup_answer', startup_context: startupPlan(), evidence: { startup_question: question, no_agent_started: true, has_run_metadata: false } }
+    const changed = { ...initial, startup_context: startupPlan({ selected_step: 'implement', plan_revision: 'revision-2' }) }
+    let changedDefault = false
+    vi.mocked(api.listControlPlaneRuns).mockResolvedValue({ runs: [initial], next_cursor: null, schema_version: 1 })
+    vi.mocked(api.getControlPlaneRun).mockImplementation(async () => changedDefault ? changed : initial)
+    const pendingAnswer = deferred<StartRunResponse>()
+    vi.mocked(api.answerStartupQuestion).mockReturnValue(pendingAnswer.promise)
+    renderDashboard({ requestedRunId: 'pending-step' })
+    await screen.findByRole('button', { name: 'Continue from checkpoint 4' })
+    expect(screen.queryByRole('button', { name: 'plan', exact: true })).toBeNull()
+    changedDefault = true
+    fireEvent.click(screen.getByRole('button', { name: 'Continue from checkpoint 4' }))
+    await screen.findByText(/plan, workflow default, or pending question changed/)
+    expect(api.answerStartupQuestion).not.toHaveBeenCalled()
+    fireEvent.click(screen.getByRole('button', { name: 'Continue from checkpoint 4' }))
+    fireEvent.click(screen.getByRole('button', { name: 'Continue from checkpoint 4' }))
+    await waitFor(() => expect(api.answerStartupQuestion).toHaveBeenCalledWith('control-project', 'legacy-step', 'implement', expect.stringMatching(/^startup-answer-/)))
+    expect(api.answerStartupQuestion).toHaveBeenCalledTimes(1)
+    await act(async () => pendingAnswer.resolve({ result: null, startup_question: null }))
+  })
+
+  it('reviews and cancels only the exact manifest-only reservation before opening preserved work', async () => {
+    const previous = { ...ownedRun, run_id: 'prior-work', status: 'failed' }
+    const pending = { ...ownedRun, run_id: 'pending-start', status: 'manifest_only', revision: 7,
+      startup_context: startupPlan({ recommendation: 'review_previous_run', recommendation_reason: 'Preserved code requires review.', related_runs: [{ run_id: 'prior-work', status: 'failed', step: 'implement', activity: 'inactive', history_state: 'visible', failure_reason: 'Provider stopped', worktree_path: '/worktree/prior', worktree_verified: true, branch: 'feature/prior', branch_verified: true, unmerged_work: true, uncommitted_work: true, can_resume: true }] }),
+      evidence: { no_agent_started: true, has_run_metadata: false } }
+    vi.mocked(api.listControlPlaneRuns).mockResolvedValue({ runs: [pending, previous], next_cursor: null, schema_version: 1 })
+    vi.mocked(api.getControlPlaneRun).mockImplementation(async (_projectId, runId) => runId === 'prior-work' ? previous : pending)
+    vi.mocked(api.ownerStopControlPlaneRun).mockResolvedValue({ ...pending, status: 'owner_stopped' })
+    const onSelection = vi.fn()
+    renderDashboard({ requestedRunId: 'pending-start', onRunSelectionChange: onSelection })
+    fireEvent.click(await screen.findByRole('button', { name: 'Cancel pending start and open previous run…' }))
+    expect(api.ownerStopControlPlaneRun).not.toHaveBeenCalled()
+    const review = screen.getByRole('region', { name: 'Review pending start cancellation' })
+    expect(review.textContent).toContain('does not resume the previous run')
+    fireEvent.click(within(review).getByRole('button', { name: 'Confirm cancel pending start' }))
+    await waitFor(() => expect(api.ownerStopControlPlaneRun).toHaveBeenCalledWith('control-project', 'pending-start', 7, expect.stringMatching(/^owner-stop-/)))
+    await waitFor(() => expect(onSelection).toHaveBeenCalledWith({ runId: 'prior-work', userInitiated: true }))
+    expect(api.resumeControlPlaneRun).not.toHaveBeenCalled()
+  })
+
+  it('keeps the pending run selected when cancellation races with execution', async () => {
+    const question = { question_id: 'old-question', kind: 'pick_step', message: 'Choose a step', options: {}, choices: ['plan'], run_id: 'pending-start', schema_version: 1 }
+    const related = { run_id: 'prior-work', status: 'failed', step: 'implement', activity: 'inactive' as const, history_state: 'visible' as const, failure_reason: null, worktree_path: null, worktree_verified: false, branch: null, branch_verified: false, unmerged_work: true, uncommitted_work: false, can_resume: true }
+    const pending = { ...ownedRun, run_id: 'pending-start', status: 'awaiting_startup_answer', revision: 7,
+      startup_context: startupPlan({ recommendation: 'review_previous_run', related_runs: [related] }),
+      evidence: { startup_question: question, no_agent_started: true, has_run_metadata: false } }
+    let fresh = pending
+    vi.mocked(api.listControlPlaneRuns).mockResolvedValue({ runs: [pending], next_cursor: null, schema_version: 1 })
+    vi.mocked(api.getControlPlaneRun).mockImplementation(async () => fresh)
+    const onSelection = vi.fn()
+    renderDashboard({ requestedRunId: 'pending-start', onRunSelectionChange: onSelection })
+    fireEvent.click(await screen.findByRole('button', { name: 'Cancel pending start and open previous run…' }))
+    fresh = { ...pending, status: 'running', evidence: { ...pending.evidence, has_run_metadata: true } }
+    fireEvent.click(screen.getByRole('button', { name: 'Confirm cancel pending start' }))
+    await screen.findByText(/pending start changed/)
+    expect(api.ownerStopControlPlaneRun).not.toHaveBeenCalled()
+    expect(onSelection).not.toHaveBeenCalledWith({ runId: 'prior-work', userInitiated: true })
+  })
+
+  it('retains the exact cancellation key after a lost response and never navigates before acknowledgement', async () => {
+    const question = { question_id: 'old-question', kind: 'pick_step', message: 'Choose a step', options: {}, choices: ['plan'], run_id: 'pending-start', schema_version: 1 }
+    const pending = { ...ownedRun, run_id: 'pending-start', status: 'awaiting_startup_answer', revision: 7,
+      startup_context: startupPlan({ recommendation: 'review_previous_run', related_runs: [{ run_id: 'prior-work', status: 'failed', step: 'implement', activity: 'inactive', history_state: 'visible', failure_reason: null, worktree_path: null, worktree_verified: false, branch: null, branch_verified: false, unmerged_work: true, uncommitted_work: false, can_resume: true }] }),
+      evidence: { startup_question: question, no_agent_started: true, has_run_metadata: false } }
+    vi.mocked(api.listControlPlaneRuns).mockResolvedValue({ runs: [pending], next_cursor: null, schema_version: 1 })
+    vi.mocked(api.getControlPlaneRun).mockResolvedValue(pending)
+    vi.mocked(api.ownerStopControlPlaneRun).mockRejectedValueOnce(new Error('response lost')).mockResolvedValueOnce({ ...pending, status: 'owner_stopped' })
+    const onSelection = vi.fn()
+    renderDashboard({ requestedRunId: 'pending-start', onRunSelectionChange: onSelection })
+    fireEvent.click(await screen.findByRole('button', { name: 'Cancel pending start and open previous run…' }))
+    const confirm = screen.getByRole('button', { name: 'Confirm cancel pending start' })
+    fireEvent.click(confirm)
+    await screen.findByText(/Could not cancel the pending start: response lost/)
+    expect(onSelection).not.toHaveBeenCalledWith({ runId: 'prior-work', userInitiated: true })
+    fireEvent.click(confirm)
+    await waitFor(() => expect(api.ownerStopControlPlaneRun).toHaveBeenCalledTimes(2))
+    expect(vi.mocked(api.ownerStopControlPlaneRun).mock.calls[1][3]).toBe(vi.mocked(api.ownerStopControlPlaneRun).mock.calls[0][3])
+    await waitFor(() => expect(onSelection).toHaveBeenCalledWith({ runId: 'prior-work', userInitiated: true }))
   })
 
   it('keeps launch review read-only until the final start action', async () => {

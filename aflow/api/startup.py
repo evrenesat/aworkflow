@@ -192,24 +192,44 @@ def _load_plan_with_recovery(
     return parsed_plan, None
 
 
-def _plan_needs_step_selection(
-    workflow_name: str,
-    parsed_plan: object,
-    request: StartupRequest,
-) -> bool:
-    """Check if the startup flow must prompt for step selection."""
-    workflow = request.workflow_config.workflows[workflow_name]
-    if len(workflow.steps) <= 1:
-        return False
-    if hasattr(parsed_plan, "snapshot") and hasattr(parsed_plan.snapshot, "is_complete"):
-        if parsed_plan.snapshot.is_complete:
-            return False
-    if hasattr(parsed_plan, "sections"):
-        has_completed_checkpoint = any(
-            getattr(section, "heading_checked", False) for section in parsed_plan.sections
+class PriorWorkStartupError(StartupError):
+    """A fresh worktree would lose access to earlier plan work."""
+
+    def __init__(self, code: str, message: str) -> None:
+        self.code = code
+        self.safe_message = message
+        super().__init__(message)
+
+
+def require_safe_fresh_worktree(
+    repo_root: Path,
+    plan_path: Path,
+    workflow: object,
+    *,
+    pending_run_id: str | None = None,
+) -> None:
+    """Recheck prior-run evidence before admitting a fresh worktree."""
+    if tuple(getattr(workflow, "setup", ()) or ()) != ("worktree", "branch"):
+        return
+    from aflow.control_plane.startup_context import project_startup_context
+
+    context = project_startup_context(
+        repo_root, plan_path, workflow=workflow, pending_run_id=pending_run_id
+    )
+    if context.recommendation == "start":
+        return
+    if context.recommendation == "open_existing_run":
+        # The existing plan-claim admission owns active-controller rejection.
+        return
+    if context.recommendation == "review_previous_run":
+        raise PriorWorkStartupError(
+            "prior_work_requires_recovery",
+            "Previous work for this plan needs recovery before a new worktree can start.",
         )
-        return has_completed_checkpoint
-    return False
+    raise PriorWorkStartupError(
+        "prior_work_unverified",
+        "Earlier work or the starting branch could not be verified. Inspect related runs before starting a new worktree.",
+    )
 
 
 def _resolve_effective_max_turns(request: StartupRequest, workflow_name: str) -> int:
@@ -634,15 +654,6 @@ def prepare_startup(request: StartupRequest) -> PreparedRun | StartupQuestion:
     else:
         if resolved_start_step is not None:
             selected_start_step = resolved_start_step
-        elif _plan_needs_step_selection(workflow_name, parsed_plan, request):
-            workflow = request.workflow_config.workflows[workflow_name]
-            step_names = list(workflow.steps.keys())
-            return StartupQuestion(
-                kind=StartupQuestionKind.PICK_STEP,
-                message="Select the workflow step to start from:",
-                choices=step_names,
-                continuation_request=request,
-            )
         else:
             selected_start_step = request.workflow_config.workflows[workflow_name].first_step
 
@@ -717,6 +728,14 @@ def prepare_startup(request: StartupRequest) -> PreparedRun | StartupQuestion:
             kind=StartupQuestionKind.CONFIRM_WORKTREE_DIRTY,
             message=f"Worktree is dirty ({dirty_desc}). Start anyway?",
             continuation_request=request,
+        )
+
+    if not request.resume_requested and not request.continue_from_current:
+        require_safe_fresh_worktree(
+            request.repo_root,
+            request.plan_path,
+            request.workflow_config.workflows[workflow_name],
+            pending_run_id=request.reserved_run_id,
         )
 
     is_complete_plan = (

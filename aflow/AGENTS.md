@@ -4,7 +4,12 @@
 - Harness execution normally runs in a dedicated VM. Prefer each harness's
   YOLO/full-access mode for unattended work; preserve access to the host's
   workflow artifacts and shared external state (including `/tmp`).
-- Startup step picking and startup recovery can require a TTY.
+- Fresh startup uses the live workflow's first executable step unless the user
+  selects a valid override. Inconsistent-plan recovery, dirty-worktree
+  acknowledgement, and legacy pending step questions can still require a TTY.
+- Recheck earlier plan work before fresh worktree lifecycle setup. Preserve the
+  typed recovery blocker across CLI, daemon answers, and worker boot; explicit
+  step selection or dirty acknowledgement cannot bypass it.
 - If a new startup flow would need interactive input, do not invent a non-interactive fallback.
 - Treat the plan file on disk as the source of truth for startup and retry behavior.
 - For AFlow development, install the intended checkout with `uv tool install -e . --force`, then exercise the installed `aflow` entry point. Never use `uv run aflow`; reserve `uv run` for tests, linters, and other project-scoped development commands.

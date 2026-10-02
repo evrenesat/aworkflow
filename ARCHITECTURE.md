@@ -166,6 +166,28 @@ by default. Direct repository status and history callers retain their existing
 progress-bearing defaults, while internal raw reconciliation stays free of
 identity and progress reduction.
 
+Preflight and pre-execution single-run status carry an optional bounded
+`startup_context` built from the same plan projector and validated live workflow
+selection. Pending manifests retain their selection provenance; an omitted step
+uses the current configured default. The context describes plan checkpoints,
+related-run evidence and safe recovery recommendations without answering a
+startup question or changing admission state. Lite/full run context reuses the
+already authorized status projection. Once `run.json` records execution, normal
+progress remains authoritative and startup context is omitted. History rows,
+including `include_progress=false` reads, omit the expensive startup projection.
+REST and MCP share these canonical response shapes and structured startup
+failure codes, including a reserved run ID when one exists.
+
+The Runs client presents this context before execution: the next checkpoint,
+recorded completion, bounded pending tasks, configured or explicitly selected
+step, and any verified earlier run. A recovery recommendation disables fresh
+launch. Opening a related run is navigation; cancelling an empty reservation
+requires a separate review and a fresh exact-run status check before owner stop.
+Cancellation does not resume the earlier run. If an older server omits
+`startup_context`, the client shows the saved startup question and a bounded
+fallback explanation without inventing plan progress. Background refresh keeps
+the selected run and disclosure state mounted.
+
 `ReconciliationService` consumes the inclusive repository union as a bounded raw
 status snapshot: each batch page is classified once under the reconciliation
 lock, and each single-run read requests the same progress-free status form. The
@@ -782,9 +804,16 @@ Entry point. Exposes three subcommands:
 5. Resolve any numeric `--start-step` value to a canonical workflow step name by validating the index against the selected workflow's declared step order. Out-of-range indexes fail with a clear bounds error listing the valid range.
 6. Load the original plan strictly.
 7. If the plan is complete and `--start-step` was given, fail with a clear error.
-8. If the plan is half-done and the workflow has more than one step, require a TTY and prompt for an explicit step unless `--start-step` was given.
+8. A fresh plan, including a partially checked plan, uses the live workflow's configured first executable step unless `--start-step` was given. The omitted choice stays implicit, so worker boot can apply a changed live default. Validated resume state retains its saved step. Existing persisted `pick_step` questions still require an explicit answer.
 9. If strict plan loading fails with `inconsistent_checkpoint_state`, require a TTY and ask whether to recover.
 10. When recovery is accepted, load a tolerant snapshot from the invalid plan, seed startup retry state, and pass both the parsed plan and retry context into `run_workflow()`.
+
+For a fresh worktree start, startup preparation and the final execution boundary
+recheck bounded related-run evidence against the configured starting branch.
+Preserved or unverifiable earlier work returns `prior_work_requires_recovery` or
+`prior_work_unverified` before lifecycle setup. An explicit step or dirty-worktree
+acknowledgement does not override this check; validated resumes and explicit
+current-checkout continuations retain their existing ownership paths.
 
 `run_workflow()` then establishes plan authority before durable run identity:
 it probes repository/bootstrap state, backs up and loads the plan, and

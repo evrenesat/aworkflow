@@ -16,7 +16,7 @@ At a high level:
 
 1. `aflow` loads the selected workflow and reads the original plan file.
 2. If the workflow has lifecycle setup, `aflow` inspects git state, optionally bootstraps an empty repo, runs lifecycle preflight, and creates the execution environment.
-3. The run starts at the workflow's first declared step unless startup selected another step.
+3. A fresh run starts at the live workflow's first executable step unless an explicit override selected another step. A validated resume uses its saved step. Checked plan headings alone do not prompt for a step; old pending step questions still require an answer.
 4. The engine renders prompts, resolves the step role through the selected team and global roles, and runs the harness CLI once.
 5. After the harness returns, it re-reads the original plan, computes the proposed recovery or normal transition, and durably finalizes the turn artifacts.
 6. When manager supervision is enabled, the manager accepts or changes that proposed control action before it is applied, including a proposed `END`.
@@ -24,6 +24,28 @@ At a high level:
 8. If teardown includes `merge`, `aflow` invokes a merge handoff through the configured `team_lead` role and verifies the result.
 
 At run start, `aflow` prints the new run ID immediately. Resumed runs also show which prior run they came from.
+
+Before a fresh worktree executes, AFlow checks related run and Git evidence
+against the configured starting branch. Preserved earlier implementation or
+uncertain evidence blocks a new worktree with a recovery or inspection reason.
+
+Authenticated preflight and pending-run detail expose bounded startup context
+before an agent starts. The UI shows the next checkpoint and pending tasks from
+the current plan, its recorded checked headings, the selected workflow step,
+and verified related-run facts. These are plan records, not approvals or
+executor progress. A valid partial plan with no explicit step begins at the
+live workflow default; an old saved step question still needs an explicit
+answer. Missing, invalid, or changed plan bytes are reported without invented
+checkpoint counts. An older server that omits context leaves the saved startup
+question visible with a fallback explanation.
+
+A related run with unmerged or uncommitted implementation blocks a fresh
+worktree. Runs labels its recorded failure as previously reported and offers
+navigation to that run. For a reservation with no agent or active unit, the
+user may review and cancel that exact pending start before opening the earlier
+run. A current status recheck and revision-bound owner stop guard cancellation;
+failure leaves the pending run selected. Reading, navigating, or cancelling
+does not discard the prior worktree or resume the earlier run.
 
 ## Fresh Review Plan Git Tracking
 

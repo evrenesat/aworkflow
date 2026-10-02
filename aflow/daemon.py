@@ -36,11 +36,14 @@ from aflow.api.startup import (
     PLAN_ADMISSION_CHECKPOINT_KIND,
     PLAN_ADMISSION_TRACKING_KIND,
     PlanAdmissionError,
+    PriorWorkStartupError,
     StartupError,
     prepare_startup,
     prepare_startup_with_answer,
+    require_safe_fresh_worktree,
 )
-from aflow.control_plane.models import startup_failure
+from aflow.control_plane.models import StartupContextSummary, startup_failure
+from aflow.control_plane.startup_context import project_startup_context, with_startup_selection
 from aflow.control_plane.worker_diagnostics import confirmed_inactive
 from aflow.config import ConfigError, WorkflowUserConfig, load_workflow_config
 from aflow.live_config import load_live_config
@@ -759,28 +762,48 @@ class DaemonService:
         or unit operation is performed here.
         """
         with self._lock:
-            self._refresh_workflow_config()
-            normalized = self._normalize_request(
-                request,
-                caller_scope=caller_scope,
-                idempotency_key=None,
-            )
-            candidate = self._initial_manifest_for(
-                run_id="preflight-preview",
-                request=normalized,
-                caller_scope=caller_scope,
-                idempotency_key="preflight-preview",
-            )
-            from aflow.api.startup import _check_worktree_dirtiness
+            result, _, _ = self._preflight_locked(request, caller_scope=caller_scope)
+            return result
 
-            try:
-                return _check_worktree_dirtiness(
-                    normalized,
-                    candidate.workflow_name,
-                    reject_blockers=False,
-                )
-            except StartupError as exc:
-                raise DaemonError(str(exc)) from exc
+    def preflight_with_startup_context(
+        self, request: StartupRequest, *, caller_scope: str = "local",
+    ) -> tuple[WorktreePreflight, StartupContextSummary]:
+        """Use the same normalized live request for dirtiness and plan context."""
+        with self._lock:
+            result, normalized, candidate = self._preflight_locked(
+                request, caller_scope=caller_scope,
+            )
+            workflow = normalized.workflow_config.workflows[candidate.workflow_name]
+            summary = project_startup_context(
+                normalized.repo_root, normalized.plan_path,
+                workflow=workflow, admission=self._admission,
+            )
+            return result, with_startup_selection(
+                summary, workflow_name=candidate.workflow_name,
+                selected_step=candidate.start_step or workflow.first_step,
+                step_source="explicit" if normalized.start_step is not None else "workflow_default",
+            )
+
+    def _preflight_locked(
+        self, request: StartupRequest, *, caller_scope: str,
+    ) -> tuple[WorktreePreflight, StartupRequest, LaunchManifest]:
+        self._refresh_workflow_config()
+        normalized = self._normalize_request(
+            request, caller_scope=caller_scope, idempotency_key=None,
+        )
+        candidate = self._initial_manifest_for(
+            run_id="preflight-preview", request=normalized,
+            caller_scope=caller_scope, idempotency_key="preflight-preview",
+        )
+        from aflow.api.startup import _check_worktree_dirtiness
+
+        try:
+            result = _check_worktree_dirtiness(
+                normalized, candidate.workflow_name, reject_blockers=False,
+            )
+        except StartupError as exc:
+            raise DaemonError(str(exc)) from exc
+        return result, normalized, candidate
 
     def answer_startup(
         self,
@@ -810,6 +833,15 @@ class DaemonService:
                     raise DaemonIdempotencyConflict(
                         "startup answer idempotency key was reused for a different answer"
                     )
+                failure = record.get("startup_failure")
+                if record.get("state") == "needs_attention" and isinstance(failure, Mapping):
+                    message = failure.get("message")
+                    code = failure.get("code")
+                    if isinstance(message, str):
+                        raise DaemonStartupError(
+                            run_id, message,
+                            code=code if isinstance(code, str) else "startup_failed",
+                        )
                 return self._pending_response_locked(record)
             if question_generation != _question_generation(record):
                 raise DaemonError("startup question identity is stale")
@@ -842,6 +874,7 @@ class DaemonService:
                     code=exc.code,
                     kind=exc.kind,
                 )
+                _record_answer(updated, question_generation, answer_digest, idempotency_key)
                 self._write_record(updated)
                 self._release_unbound_admission(
                     run_id,
@@ -857,14 +890,20 @@ class DaemonService:
                 updated = dict(record)
                 updated["state"] = "needs_attention"
                 updated.pop("preparation_owner", None)
-                updated["startup_failure"] = startup_failure("preparation", str(exc))
+                updated["startup_failure"] = startup_failure(
+                    "preparation", str(exc), code=getattr(exc, "code", None)
+                )
+                _record_answer(updated, question_generation, answer_digest, idempotency_key)
                 self._write_record(updated)
                 self._release_unbound_admission(
                     run_id,
                     reservation.nonce,
                     reason="startup_preparation_failed",
                 )
-                raise DaemonStartupError(run_id, updated["startup_failure"]["message"]) from exc
+                raise DaemonStartupError(
+                    run_id, updated["startup_failure"]["message"],
+                    code=getattr(exc, "code", "startup_failed"),
+                ) from exc
             if isinstance(prepared_or_question, StartupQuestion):
                 updated = dict(record)
                 _record_answer(
@@ -1301,6 +1340,7 @@ class DaemonService:
         *,
         include_progress: bool = True,
         include_resume_preview: bool = True,
+        include_startup_context: bool = True,
     ) -> RunStatus:
         """Project a persisted startup question into canonical run status.
 
@@ -1314,7 +1354,14 @@ class DaemonService:
 
         def finalize(candidate: RunStatus) -> RunStatus:
             projected = project_activity(candidate)
-            return repository.with_progress(projected) if include_progress else projected
+            if not include_progress:
+                return projected
+            projected = repository.with_progress(projected)
+            if include_startup_context and not projected.evidence.get("has_run_metadata"):
+                summary = self._startup_context_for_status(projected)
+                if summary is not None:
+                    projected = replace(projected, startup_context=summary)
+            return projected
 
         status = repository.get_run_status(run_id, include_progress=False)
         if not include_resume_preview and "can_resume" in status.evidence:
@@ -1382,6 +1429,74 @@ class DaemonService:
                     skipped_steps=tuple(skipped),
                 ))
         return finalize(status)
+
+    def _startup_context_for_status(
+        self, status: RunStatus,
+    ) -> StartupContextSummary | None:
+        """Project a pre-execution run from its exact persisted launch intent."""
+        if status.ownership != "control_plane":
+            return None
+        manifest = self._application.repository.get_launch_manifest(status.run_id)
+        if manifest is None:
+            return None
+        try:
+            record = self._read_record(status.run_id)
+        except DaemonError:
+            record = {}
+        try:
+            current = load_live_config(
+                self._config.config_path, loader=load_workflow_config,
+            ).workflow_config
+        except (ConfigError, OSError, ValueError):
+            current = None
+        workflow = current.workflows.get(manifest.workflow_name) if current else None
+        summary = project_startup_context(
+            self._config.repo_root, Path(manifest.plan_path),
+            workflow=workflow, admission=self._admission,
+            daemon=self, pending_run_id=status.run_id,
+        )
+        prepared = record.get("prepared")
+        prepared = prepared if isinstance(prepared, Mapping) else {}
+        request = record.get("request")
+        request = request if isinstance(request, Mapping) else {}
+        resumed = record.get("mode") == "resume"
+        explicit = (
+            prepared.get("start_step_explicit") is True
+            or request.get("start_step_explicit") is True
+            or request.get("start_step") is not None
+            or manifest.start_step is not None
+        )
+        source = "resume" if resumed else "explicit" if explicit else "workflow_default"
+        raw_step = (
+            prepared.get("start_step") if resumed or explicit else None
+        ) or request.get("start_step") or manifest.start_step
+        selected: str | None = None
+        invalid_selection = False
+        if workflow is not None:
+            if source == "workflow_default":
+                selected = workflow.first_step
+            elif isinstance(raw_step, str):
+                try:
+                    selected = _resolve_configured_start_step(
+                        raw_step, manifest.workflow_name, workflow.steps,
+                        excluded_steps=workflow.excluded_steps,
+                    )
+                except DaemonError:
+                    selected = raw_step[:256]
+                    invalid_selection = True
+            else:
+                invalid_selection = True
+        summary = with_startup_selection(
+            summary, workflow_name=manifest.workflow_name,
+            selected_step=selected, step_source=source,
+        )
+        if invalid_selection:
+            summary = replace(
+                summary, availability="partial", recommendation="blocked",
+                recommendation_reason="The saved start step is unavailable in the current workflow.",
+                reason_codes=tuple(dict.fromkeys((*summary.reason_codes, "selected_step_unavailable"))),
+            )
+        return summary
 
     def _can_resume(self, status: RunStatus) -> bool:
         """Read-only admission preview; resume rechecks before any reservation."""
@@ -1760,14 +1875,19 @@ class DaemonService:
             updated = dict(record)
             updated["state"] = "needs_attention"
             updated.pop("preparation_owner", None)
-            updated["startup_failure"] = startup_failure("preparation", str(exc))
+            updated["startup_failure"] = startup_failure(
+                "preparation", str(exc), code=getattr(exc, "code", None)
+            )
             self._write_record(updated)
             self._release_unbound_admission(
                 str(record["run_id"]),
                 reservation.nonce,
                 reason="startup_preparation_failed",
             )
-            raise DaemonStartupError(str(record["run_id"]), updated["startup_failure"]["message"]) from exc
+            raise DaemonStartupError(
+                str(record["run_id"]), updated["startup_failure"]["message"],
+                code=getattr(exc, "code", "startup_failed"),
+            ) from exc
         if isinstance(prepared_or_question, StartupQuestion):
             updated = dict(record)
             updated["state"] = "awaiting_startup_answer"
@@ -1855,6 +1975,28 @@ class DaemonService:
             )
         if status.launch_phase not in _REPLAYABLE_PHASES:
             return self._existing_start_result(run_id)
+
+        if record.get("mode") != "resume" and prepared.continuation_mode != "current_branch":
+            self._refresh_workflow_config()
+            workflow = self._workflow_config.workflows.get(prepared.workflow_name)
+            if workflow is None:
+                raise DaemonError("configured workflow is unavailable before launch")
+            try:
+                require_safe_fresh_worktree(
+                    prepared.repo_root, prepared.plan_path, workflow,
+                    pending_run_id=run_id,
+                )
+            except PriorWorkStartupError as exc:
+                updated = dict(record)
+                updated["state"] = "needs_attention"
+                updated["startup_failure"] = startup_failure(
+                    "preparation", exc.safe_message, code=exc.code
+                )
+                self._write_record(updated)
+                self._release_unbound_admission(
+                    run_id, reservation.nonce, reason="prior_work_recovery_required"
+                )
+                raise DaemonStartupError(run_id, exc.safe_message, code=exc.code) from exc
 
         extra_instructions = self._transient_extra_instructions.get(run_id, ())
         expected_extra_digest = _optional_string(record.get("extra_instructions_digest"))
@@ -3369,7 +3511,10 @@ def worker_main(
         from aflow.control_plane.models import startup_failure
         from aflow.control_plane.persistent_units import _receipts_for, _write_receipt
 
-        failure = startup_failure(stage, str(exc))
+        failure = startup_failure(
+            stage, str(exc),
+            code=getattr(exc, "code", getattr(exc, "failure_kind", None)),
+        )
         try:
             receipts = _receipts_for(_unit_name(validate_run_id(run_id)), Path(repo_root).resolve())
             if receipts is not None and receipts.nonce == os.environ.get("AFLOW_WORKER_NONCE"):
@@ -4059,6 +4204,12 @@ def _worker_prepared(
         workflow_config, prepared.workflow_name, prepared.start_step
     ):
         raise DaemonError("daemon worker skipped-step state is invalid")
+    if prepared.continuation_mode != "current_branch":
+        require_safe_fresh_worktree(
+            prepared.repo_root, prepared.plan_path,
+            workflow_config.workflows[prepared.workflow_name],
+            pending_run_id=run_id,
+        )
     return prepared, None
 
 

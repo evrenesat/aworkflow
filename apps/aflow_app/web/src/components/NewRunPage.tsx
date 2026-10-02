@@ -167,6 +167,7 @@ interface NewRunPageProps {
   configuredMaxTurns: number | null
   serverDefaultMaxTurns: number | null
   preview: ReactNode
+  startupContext?: ReactNode
   worktreePreflight: ReactNode
   restartActions: ReactNode
   onCancel: () => void
@@ -197,7 +198,7 @@ interface NewRunPageProps {
 }
 
 /** Presentation only; the workspace retains request and answer identity across navigation. */
-export function NewRunPage({ startPlanPath, setStartPlanPath, planOptions, planBadges, restartDraftFrozen, startWorkflow, changeStartWorkflow, workflowOptions, workflowBadges, workflowPresentation, startTeamFamily, setStartTeamFamily, teamFamilyOptions, teamFamilyBadges, teamFamilyOptionLabel, teamFamilyOptionHint, teamFamilyPresentation, startTeamStage, setStartTeamStage, teamStageOptions, teamStageBadges, teamStageOptionLabel, teamStageOptionHint, teamStagePresentation, startMaxTurns, setStartMaxTurns, startMaxTurnsProblem, configuredMaxTurns, serverDefaultMaxTurns, preview, worktreePreflight, restartActions, onCancel, advancedOpen, setAdvancedOpen, startStep, setStartStep, effectiveWorkflow, runSteps, skippedByDraft, startExtraInstructions, setStartExtraInstructions, extraInstructionProblem, launchBlocker, onOpenSettings, reviewOpen, review, onOpenStartReview, onCancelStartReview, onConfirmStart, startActionLabel, reviewReady, startDisabled, startRevalidationPending, busyAction, hideActions = false }: NewRunPageProps) {
+export function NewRunPage({ startPlanPath, setStartPlanPath, planOptions, planBadges, restartDraftFrozen, startWorkflow, changeStartWorkflow, workflowOptions, workflowBadges, workflowPresentation, startTeamFamily, setStartTeamFamily, teamFamilyOptions, teamFamilyBadges, teamFamilyOptionLabel, teamFamilyOptionHint, teamFamilyPresentation, startTeamStage, setStartTeamStage, teamStageOptions, teamStageBadges, teamStageOptionLabel, teamStageOptionHint, teamStagePresentation, startMaxTurns, setStartMaxTurns, startMaxTurnsProblem, configuredMaxTurns, serverDefaultMaxTurns, preview, startupContext, worktreePreflight, restartActions, onCancel, advancedOpen, setAdvancedOpen, startStep, setStartStep, effectiveWorkflow, runSteps, skippedByDraft, startExtraInstructions, setStartExtraInstructions, extraInstructionProblem, launchBlocker, onOpenSettings, reviewOpen, review, onOpenStartReview, onCancelStartReview, onConfirmStart, startActionLabel, reviewReady, startDisabled, startRevalidationPending, busyAction, hideActions = false }: NewRunPageProps) {
   const advancedId = useId()
   const reviewHeadingRef = useRef<HTMLHeadingElement>(null)
   const advancedIndicators = [
@@ -352,6 +353,7 @@ export function NewRunPage({ startPlanPath, setStartPlanPath, planOptions, planB
                   )}
                 </div>
               )}
+              {startupContext}
               {preview}
               {worktreePreflight}
               {restartActions}

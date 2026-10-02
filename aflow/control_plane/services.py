@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import asdict
+from dataclasses import asdict, replace
 import hashlib
 import json
 from pathlib import Path
@@ -261,7 +261,7 @@ class ContextService:
         action = "context:full" if level == "full" else "context:lite"
         if self._authorizer is not None and self._authorizer(action, status) is False:
             raise ServiceAuthorizationError(f"not authorized for {action}")
-        return build_context_bundle(
+        bundle = build_context_bundle(
             self._repository.run_directory(run_id),
             level=level,
             full_scope=full_scope,
@@ -269,6 +269,12 @@ class ContextService:
             progress_phase=status.launch_phase,
             progress_run_status=status.status,
         )
+        if status.startup_context is not None:
+            return replace(
+                bundle,
+                data={**bundle.data, "startup_context": status.startup_context.to_dict()},
+            )
+        return bundle
 
 
 class StartupQuestionService:

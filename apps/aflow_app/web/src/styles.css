@@ -429,6 +429,23 @@ input::placeholder, textarea::placeholder {
   gap: var(--spacing-sm);
 }
 
+.startup-context-panel {
+  display: grid;
+  gap: 0.45rem;
+  min-width: 0;
+}
+.startup-context-panel > h4,
+.startup-context-panel > p,
+.startup-context-related > p { margin: 0; }
+.startup-context-next { font-size: 1.05rem; }
+.startup-context-tasks,
+.startup-context-outline { margin: 0.15rem 0 0; padding-inline-start: 1.4rem; }
+.startup-context-related { display: grid; gap: 0.35rem; min-width: 0; }
+.startup-context-related .mono,
+.startup-context-panel .mono { overflow-wrap: anywhere; }
+.startup-context-panel > details > summary,
+.startup-question > details > summary { cursor: pointer; min-height: 44px; display: flex; align-items: center; }
+
 .run-overview {
   display: flex;
   flex-direction: column;

@@ -702,6 +702,18 @@ def plan_identity_for_path(repo_root: Path, plan_path: Path) -> str | None:
     return identity if isinstance(identity, str) else None
 
 
+def plan_identity_for_path_strict(repo_root: Path, plan_path: Path) -> str | None:
+    """Read an existing owner without masking malformed or ambiguous metadata."""
+    plan_value = _path_value(Path(plan_path), require_file=False)
+    matches = [
+        identity for identity in _plan_identities(Path(repo_root), strict=True)
+        if identity.get("current_path") == plan_value
+    ]
+    if len(matches) > 1:
+        _raise("plan identity ownership is ambiguous")
+    return str(matches[0]["plan_identity_id"]) if matches else None
+
+
 def create_plan_identity(repo_root: Path, plan_path: Path) -> str:
     """Create a fresh current owner for a newly created plan file."""
     plan_value = _path_value(Path(plan_path), require_file=True)

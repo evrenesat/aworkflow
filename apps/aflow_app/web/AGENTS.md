@@ -61,6 +61,10 @@
   long-content reflow, and disposable light/dark screenshot artifacts. Physical
   mobile keyboard and browser-toolbar behavior remains explicitly unverified
   unless separately exercised on hardware.
+- Pre-execution plan and recovery journeys live in
+  `apps/aflow_app/server/tests/test_startup_context_browser.py`. Keep its
+  disposable Git worktrees and browser artifact matrix when changing launch
+  review, legacy startup questions, or pending-run cancellation.
 
 - Keep history mutation keys by exact project/run/action until acknowledged or
   definitively rejected (including acknowledgement-required validation). Deletion tombstones suppress late rows and

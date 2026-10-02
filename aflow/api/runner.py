@@ -18,6 +18,7 @@ from aflow.harnesses.base import HarnessAdapter
 from aflow.plan import ParsedPlan
 from aflow.run_state import ControllerConfig
 from aflow.workflow import WorkflowError, run_workflow
+from aflow.api.startup import PriorWorkStartupError, require_safe_fresh_worktree
 
 
 @dataclass(frozen=True)
@@ -141,6 +142,17 @@ class WorkflowRunner:
         parsed_plan: ParsedPlan | None = None
         if prepared.parsed_plan is not None:
             parsed_plan = prepared.parsed_plan  # type: ignore[assignment]
+
+        if self._config.resume is None and prepared.continuation_mode != "current_branch":
+            try:
+                require_safe_fresh_worktree(
+                    prepared.repo_root, prepared.plan_path, workflow,
+                    pending_run_id=prepared.reserved_run_id,
+                )
+            except PriorWorkStartupError as exc:
+                raise WorkflowError(
+                    f"{exc.safe_message} [{exc.code}]", failure_kind=exc.code
+                ) from exc
 
         result = run_workflow(
             config=config,

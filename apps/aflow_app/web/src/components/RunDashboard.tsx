@@ -58,6 +58,7 @@ import { formatMachineChoice, formatMachineLabel } from '../label'
 import { RunListItem } from './RunListItem'
 import { CheckpointHistory } from './CheckpointHistory'
 import { RunOverview } from './RunOverview'
+import { StartupContextPanel } from './StartupContextPanel'
 
 const MAX_TIMELINE_EVENTS = 100
 /** Bounded wait for exact source inactivity before a successor start. */
@@ -1085,6 +1086,9 @@ export function RunDashboard({ visible = true, page, onNewRun, onCancelNewRun, o
   const [feedback, setFeedback] = useState<string | null>(null)
   const [handoffError, setHandoffError] = useState<string | null>(null)
   const [startupQuestion, setStartupQuestion] = useState<StartupQuestion | null>(null)
+  const startupAnswerInFlightRef = useRef(false)
+  const [startupQuestionRun, setStartupQuestionRun] = useState<RunStatus | null>(null)
+  const [pendingCancelTarget, setPendingCancelTarget] = useState<string | null>(null)
   const [dirtyWorktreeConfirmed, setDirtyWorktreeConfirmed] = useState(false)
   const [worktreePreflight, setWorktreePreflight] = useState<WorktreePreflightState>({
     status: 'idle',
@@ -1122,7 +1126,13 @@ export function RunDashboard({ visible = true, page, onNewRun, onCancelNewRun, o
   // no runs exist, or when a frozen successor draft needs attention.
   const [localPage, setLocalPage] = useState<'runs' | 'new-run'>(initialPlanPath ? 'new-run' : 'runs')
   const newRunPage = (page ?? localPage) === 'new-run'
-  function openNewRunPage() { setLocalPage('new-run'); onNewRun?.() }
+  function openNewRunPage() {
+    startupQuestionReadRef.current += 1
+    setStartupQuestion(null)
+    setStartupQuestionRun(null)
+    setLocalPage('new-run')
+    onNewRun?.()
+  }
   const [failedRequestId, setFailedRequestId] = useState<string | null>(null)
   const [advancedOpen, setAdvancedOpen] = useState(false)
   const [startReviewIdentity, setStartReviewIdentity] = useState<string | null>(null)
@@ -1169,6 +1179,7 @@ export function RunDashboard({ visible = true, page, onNewRun, onCancelNewRun, o
   const requestAbortRef = useRef(new AbortController())
   const contextAbortRef = useRef(new AbortController())
   const preflightRequestRef = useRef(0)
+  const startupQuestionReadRef = useRef(0)
   const preflightAbortRef = useRef(new AbortController())
   const desiredContextLevelRef = useRef<'lite' | 'full'>('lite')
   const disclosureRunKey = selectedRunId ? `${projectId}/${selectedRunId}` : null
@@ -1183,6 +1194,11 @@ export function RunDashboard({ visible = true, page, onNewRun, onCancelNewRun, o
     preflightRequestRef.current += 1
     preflightAbortRef.current.abort()
   }, [projectId, visible])
+  useEffect(() => {
+    startupQuestionReadRef.current += 1
+    setStartupQuestionRun(null)
+    setPendingCancelTarget(null)
+  }, [projectId])
   const diagnosticsLoadedForRef = useRef<string | null>(null)
   const controlsForRunRef = useRef<string | null>(null)
   const previousStreamStateRef = useRef<api.StreamState>('stopped')
@@ -1213,6 +1229,7 @@ export function RunDashboard({ visible = true, page, onNewRun, onCancelNewRun, o
     followupRequestRef.current += 1
     setFollowupDraft(null)
     setFollowupError(null)
+    setPendingCancelTarget(null)
   }, [projectId, selectedRunId])
 
   useEffect(() => {
@@ -1842,8 +1859,20 @@ export function RunDashboard({ visible = true, page, onNewRun, onCancelNewRun, o
     invalidateCopyFeedback()
     clearActionFeedback()
     setFollowupError(null)
+    setPendingCancelTarget(null)
+    startupQuestionReadRef.current += 1
+    setStartupQuestionRun(null)
+    setStartupQuestion(null)
     setSelectedRunId(runId)
     onRunSelectionChangeRef.current?.({ runId, userInitiated: true })
+  }
+
+  function openRelatedRun(runId: string) {
+    if (newRunPage) {
+      setLocalPage('runs')
+      onRunStarted?.(runId)
+    }
+    selectRun(runId)
   }
 
   async function createFollowupDraft() {
@@ -2097,13 +2126,26 @@ export function RunDashboard({ visible = true, page, onNewRun, onCancelNewRun, o
     const canReconcile = () => submittedToken === undefined || isCurrentSubmittedStartContext(submittedToken)
     if (!canReconcile()) return false
     if (response.startup_question) {
+      const question = response.startup_question
       if (response.startup_question.kind === 'confirm_worktree_dirty') {
         setDirtyWorktreeConfirmed(false)
         await refreshPreflight()
         if (!canReconcile()) return false
       }
       if (!canReconcile()) return false
-      setStartupQuestion(response.startup_question)
+      setStartupQuestion(question)
+      setStartupQuestionRun(null)
+      if (question.kind !== 'confirm_worktree_dirty' && question.run_id) {
+        setSelectedRunId(question.run_id)
+        setLocalPage('runs')
+        onRunStarted?.(question.run_id)
+      }
+      const read = ++startupQuestionReadRef.current
+      if (question.run_id) {
+        void api.getControlPlaneRun(projectId, question.run_id).then(run => {
+          if (read === startupQuestionReadRef.current && canReconcile() && run.run_id === question.run_id) setStartupQuestionRun(run)
+        }).catch(() => { /* The question remains actionable with older servers. */ })
+      }
       setFeedback(`${action} is awaiting a startup answer. No workflow has been started.`)
       return true
     }
@@ -2119,6 +2161,8 @@ export function RunDashboard({ visible = true, page, onNewRun, onCancelNewRun, o
     if (!canReconcile()) return false
     setFailedRequestId(null)
     setStartupQuestion(null)
+    startupQuestionReadRef.current += 1
+    setStartupQuestionRun(null)
     const lineage = result.restarted_from_run_id
       ? ` It records ${result.restarted_from_run_id} as its restart source.`
       : ''
@@ -2137,7 +2181,9 @@ export function RunDashboard({ visible = true, page, onNewRun, onCancelNewRun, o
   }
 
   async function handleStartupAnswer(answer: string | number | boolean) {
-    if (!projectId || !startupQuestion) return
+    if (!projectId || !startupQuestion || startupAnswerInFlightRef.current) return
+    startupAnswerInFlightRef.current = true
+    const questionRead = startupQuestionReadRef.current
     const intent = {
       project_id: projectId,
       question_id: startupQuestion.question_id,
@@ -2146,6 +2192,31 @@ export function RunDashboard({ visible = true, page, onNewRun, onCancelNewRun, o
     try {
       setBusyAction('startup-answer')
       clearActionFeedback()
+      if (startupQuestion.kind === 'pick_step' && startupQuestion.run_id) {
+        const shown = newRunPage
+          ? startupQuestionRun?.startup_context ?? displayedWorktreePreflight.result?.startup_context
+          : selectedRun?.startup_context
+        const fresh = await api.getControlPlaneRun(projectId, startupQuestion.run_id)
+        if (startReviewProjectRef.current !== projectId || questionRead !== startupQuestionReadRef.current
+          || (!newRunPage && selectedRunRef.current !== startupQuestion.run_id)) return
+        const freshQuestion = fresh.evidence.startup_question as StartupQuestion | undefined
+        if (fresh.run_id !== startupQuestion.run_id || fresh.status !== 'awaiting_startup_answer'
+          || freshQuestion?.question_id !== startupQuestion.question_id
+          || (shown?.plan_revision ?? null) !== (fresh.startup_context?.plan_revision ?? null)
+          || (shown?.selected_step ?? null) !== (fresh.startup_context?.selected_step ?? null)
+          || (shown?.recommendation ?? null) !== (fresh.startup_context?.recommendation ?? null)) {
+          if (newRunPage) setStartupQuestionRun(fresh)
+          else setRuns(current => upsertRun(current, fresh))
+          setActionError('The plan, workflow default, or pending question changed. Review the current startup context before continuing.')
+          return
+        }
+        if (fresh.startup_context?.recommendation !== 'start' && fresh.startup_context?.recommendation !== null && fresh.startup_context?.recommendation !== undefined) {
+          if (newRunPage) setStartupQuestionRun(fresh)
+          else setRuns(current => upsertRun(current, fresh))
+          setActionError('Startup now requires a different action. Review the current run before continuing.')
+          return
+        }
+      }
       const response = await api.answerStartupQuestion(
         projectId,
         startupQuestion.question_id,
@@ -2156,12 +2227,15 @@ export function RunDashboard({ visible = true, page, onNewRun, onCancelNewRun, o
       await handleStartResponse(response, 'Startup answer')
     } catch (answerError) {
       setActionError(errorMessage(answerError, 'Failed to answer startup question'))
-      if (answerError instanceof ApiError && answerError.code === 'startup_failed' && typeof answerError.detail.run_id === 'string') {
+      if (answerError instanceof ApiError && ['startup_failed', 'prior_work_requires_recovery', 'prior_work_unverified'].includes(answerError.code ?? '') && typeof answerError.detail.run_id === 'string') {
         setFailedRequestId(answerError.detail.run_id)
         setStartupQuestion(null)
+        startupQuestionReadRef.current += 1
+        setStartupQuestionRun(null)
         clearPendingWriteKey('startup-answer', intent)
       }
     } finally {
+      startupAnswerInFlightRef.current = false
       setBusyAction(null)
     }
   }
@@ -2257,6 +2331,51 @@ export function RunDashboard({ visible = true, page, onNewRun, onCancelNewRun, o
         }
       } else {
         setActionError(errorMessage(stopError, 'Failed to stop run'))
+      }
+    } finally {
+      setBusyAction(null)
+    }
+  }
+
+  async function cancelPendingStartAndOpenPrevious() {
+    if (!projectId || !selectedRun || !pendingCancelTarget || busyAction !== null) return
+    const reservationId = selectedRun.run_id
+    const previousId = pendingCancelTarget
+    clearActionFeedback()
+    setBusyAction('cancel-pending-start')
+    try {
+      const fresh = await api.getControlPlaneRun(projectId, reservationId)
+      if (selectedRunRef.current !== reservationId) return
+      const related = fresh.startup_context?.related_runs
+      if (fresh.ownership !== 'control_plane' || !['awaiting_startup_answer', 'manifest_only'].includes(fresh.status)
+        || fresh.evidence.no_agent_started !== true || fresh.evidence.has_run_metadata === true
+        || fresh.evidence.unit_active === true || fresh.activity === 'active'
+        || fresh.startup_context?.recommendation !== 'review_previous_run'
+        || related?.length !== 1 || related[0].run_id !== previousId) {
+        setRuns(current => upsertRun(current, fresh))
+        setPendingCancelTarget(null)
+        setActionError('The pending start changed. Review its current status before cancelling it.')
+        return
+      }
+      const intent = { project_id: projectId, run_id: reservationId, expected_revision: fresh.revision, previous_run_id: previousId }
+      const stopped = await api.ownerStopControlPlaneRun(projectId, reservationId, fresh.revision, getPendingWriteKey('owner-stop', intent))
+      if (selectedRunRef.current !== reservationId) return
+      if (stopped.run_id !== reservationId || stopped.status !== 'owner_stopped') {
+        setRuns(current => upsertRun(current, stopped))
+        setActionError('Cancellation was not acknowledged. Review the pending run before navigating.')
+        return
+      }
+      clearPendingWriteKey('owner-stop', intent)
+      setRuns(current => upsertRun(current, stopped))
+      setPendingCancelTarget(null)
+      setStartupQuestion(null)
+      setLocalPage('runs')
+      selectRun(previousId)
+      onRunStarted?.(previousId)
+    } catch (cancelError) {
+      if (selectedRunRef.current === reservationId) {
+        setActionError(`Could not cancel the pending start: ${errorMessage(cancelError, 'request failed')}. The previous run was not opened.`)
+        await refreshSelectedRun()
       }
     } finally {
       setBusyAction(null)
@@ -2764,6 +2883,7 @@ export function RunDashboard({ visible = true, page, onNewRun, onCancelNewRun, o
     || displayedWorktreePreflight.result.blockers.length > 0
     || ((displayedWorktreePreflight.result.requires_confirmation || dirtyStartupQuestion) && !dirtyWorktreeConfirmed)
   )
+  const startupRecommendation = displayedWorktreePreflight.result?.startup_context?.recommendation
   const startDisabled = !projectAvailable
     || !startPlanPath
     || busyAction === 'start'
@@ -2773,6 +2893,7 @@ export function RunDashboard({ visible = true, page, onNewRun, onCancelNewRun, o
     || startMaxTurnsProblem !== null
     || launchBlocker !== null
     || worktreeLaunchBlocked
+    || (startupRecommendation !== undefined && startupRecommendation !== null && startupRecommendation !== 'start')
     || (startupQuestion !== null && !dirtyStartupQuestion)
   const selectedStartPlan = runnablePlans.find((plan) => plan.path === startPlanPath.trim()) ?? null
   const currentLaunchIdentity = JSON.stringify([
@@ -2782,6 +2903,8 @@ export function RunDashboard({ visible = true, page, onNewRun, onCancelNewRun, o
     [effectiveWorkflow, effectiveTeam, effectiveMaxTurns],
     startRequestFromDraft(restartSource?.run_id, dirtyWorktreeConfirmed),
     preflightRequestIdentity,
+    displayedWorktreePreflight.result?.startup_context?.plan_revision ?? null,
+    startupRecommendation ?? null,
   ])
   const startReviewReady = startReviewIdentity !== null && startReviewIdentity === currentLaunchIdentity
   const currentLaunchIdentityRef = useRef<string | null>(null)
@@ -2989,6 +3112,8 @@ export function RunDashboard({ visible = true, page, onNewRun, onCancelNewRun, o
 
   useEffect(() => {
     setDirtyWorktreeConfirmed(false)
+    startupQuestionReadRef.current += 1
+    setStartupQuestionRun(null)
     if (startupQuestion?.kind === 'confirm_worktree_dirty') setStartupQuestion(null)
     // The acknowledgement follows only the launch identity, not unrelated
     // draft controls such as max turns, team, or extra instructions.
@@ -3007,6 +3132,39 @@ export function RunDashboard({ visible = true, page, onNewRun, onCancelNewRun, o
     // draft field cannot let a late response update the next launch.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [visible, preflightEligible, preflightRequestIdentity])
+
+  function renderStartupQuestion() {
+    if (!startupQuestion) return null
+    if (!newRunPage && (selectedRun?.run_id !== startupQuestion.run_id || selectedRun.status !== 'awaiting_startup_answer')) return null
+    if (newRunPage && startupQuestion.kind === 'confirm_worktree_dirty') return null
+    const summary = newRunPage
+      ? startupQuestionRun?.startup_context ?? displayedWorktreePreflight.result?.startup_context
+      : selectedRun?.startup_context
+    const isStep = startupQuestion.kind === 'pick_step'
+    const blocked = isStep && summary?.recommendation !== undefined && summary?.recommendation !== null && summary.recommendation !== 'start'
+    const suggested = isStep && summary?.selected_step && startupQuestion.choices.includes(summary.selected_step)
+      ? summary.selected_step : null
+    const canAnswer = busyAction !== 'startup-answer' && busyAction !== 'startup-recheck'
+    return <section className="dashboard-section startup-question" aria-label="Startup question">
+      <span className="status-pill status-awaiting">Input needed</span>
+      <h4>{isStep ? 'Continue this pending start' : startupQuestion.message}</h4>
+      <p className="text-sm text-dim">No agent started. Answer to continue.</p>
+      {isStep && blocked && <p className="notice">Review the earlier work or activity above before answering this legacy question.</p>}
+      {isStep && !blocked && summary && !suggested && <p className="notice">The configured starting step is no longer an allowed answer. Refresh and review this pending run.</p>}
+      {isStep && !summary && <p className="text-sm text-dim">The server did not provide startup context. Choose an allowed step explicitly.</p>}
+      <div className="dashboard-actions">
+        {CONFIRM_QUESTION_KINDS.has(startupQuestion.kind) && <>
+          <button className="btn btn-primary" disabled={!canAnswer} onClick={() => void handleStartupAnswer(true)}>Confirm and continue</button>
+          <button className="btn btn-secondary" disabled={!canAnswer} onClick={() => void handleStartupAnswer(false)}>Decline and stop</button>
+        </>}
+        {isStep && suggested && !blocked && <button className="btn btn-primary" disabled={!canAnswer} onClick={() => void handleStartupAnswer(suggested)}>{summary?.next_checkpoint ? `Continue from checkpoint ${summary.next_checkpoint.ordinal}` : 'Continue with workflow default'}</button>}
+        {isStep && !summary && startupQuestion.choices.map(choice => <button key={choice} className="btn btn-secondary" disabled={!canAnswer} onClick={() => void handleStartupAnswer(choice)}>{choice}</button>)}
+        {!isStep && !CONFIRM_QUESTION_KINDS.has(startupQuestion.kind) && startupQuestion.choices.map(choice => <button key={choice} className="btn btn-secondary" disabled={!canAnswer} onClick={() => void handleStartupAnswer(choice)}>{formatMachineLabel(choice)}</button>)}
+        {!isStep && Object.entries(startupQuestion.options).map(([key, label]) => <button key={key} className="btn btn-secondary" disabled={!canAnswer} onClick={() => void handleStartupAnswer(key)}>{label}</button>)}
+      </div>
+      {isStep && summary && !blocked && <details><summary>Advanced: choose another allowed step</summary><div className="dashboard-actions">{startupQuestion.choices.filter(choice => choice !== suggested).map(choice => <button key={choice} className="btn btn-secondary" disabled={!canAnswer} onClick={() => void handleStartupAnswer(choice)}>{formatMachineLabel(choice)}</button>)}{Object.entries(startupQuestion.options).map(([key, label]) => <button key={key} className="btn btn-secondary" disabled={!canAnswer} onClick={() => void handleStartupAnswer(key)}>{label}</button>)}</div></details>}
+    </section>
+  }
 
   const readinessLabel = readiness === null
     ? 'Readiness unavailable'
@@ -3057,6 +3215,9 @@ export function RunDashboard({ visible = true, page, onNewRun, onCancelNewRun, o
   const postReviewFailure = selectedRun ? postReviewDeliveryFailure(selectedRun, events) : null
   const controllerFailure = selectedRun?.status === 'failed' && selectedRun.worker_exit?.stage === 'controller'
   const selectedRunIssue = selectedRun ? runIssue(selectedRun, postReviewFailure) : null
+  const priorWorkFailure = ['prior_work_requires_recovery', 'prior_work_unverified'].includes(
+    String(contextObject(selectedRun?.evidence.startup_failure)?.code ?? ''),
+  )
   const canCreateFollowup = Boolean(
     selectedRun && ['failed', 'needs_attention'].includes(selectedRun.status),
   )
@@ -3109,10 +3270,34 @@ export function RunDashboard({ visible = true, page, onNewRun, onCancelNewRun, o
   const readableFailure = [selectedRun?.reason, latestResultPresentation?.summary, outcome?.finishedSummary, outcome?.resultText]
     .map(value => conciseRunText(value))
     .find(value => value && !/^exit\s+\d+\.?$/i.test(value) && !/^#|\s#+\s/.test(value) && !/reason unavailable|result unavailable/i.test(value) && !/^harness[-_ ]failed\.?$/i.test(value)) ?? null
+  const pendingStartup = Boolean(selectedRun?.ownership === 'control_plane'
+    && selectedRun.evidence.has_run_metadata !== true
+    && selectedRun.status !== 'running'
+    && (selectedRun.startup_context || selectedRun.evidence.no_agent_started === true || selectedRun.status === 'awaiting_startup_answer'))
   const overviewCurrentWork = selectedRun
-    ? runDisplayProjection(selectedRun).category === 'outcome-unrecorded'
-      ? null
-      : (() => {
+    ? pendingStartup ? <>
+        <StartupContextPanel
+          context={selectedRun.startup_context}
+          mode="pending"
+          fallbackPlanPath={selectedRun.plan_path ?? (typeof selectedRun.evidence.plan_path === 'string' ? selectedRun.evidence.plan_path : null)}
+          planAvailable={plans.some(plan => plan.path === (selectedRun.startup_context?.plan_path ?? selectedRun.plan_path ?? selectedRun.evidence.plan_path))}
+          onOpenPlan={onOpenPlan}
+          onOpenRun={openRelatedRun}
+          pendingCancellationAvailable={['awaiting_startup_answer', 'manifest_only'].includes(selectedRun.status) && canMutate && selectedRun.evidence.no_agent_started === true && selectedRun.evidence.has_run_metadata !== true && selectedRun.evidence.unit_active !== true && selectedRun.activity !== 'active'}
+          onCancelPendingStart={setPendingCancelTarget}
+        />
+        {renderStartupQuestion()}
+        {pendingCancelTarget && <section className="notice" role="region" aria-label="Review pending start cancellation">
+          <p>Cancel pending start <span className="mono">{selectedRun.run_id}</span> and then open previous run <span className="mono">{pendingCancelTarget}</span>? No agent has started for this reservation. Cancellation does not resume the previous run.</p>
+          <div className="dashboard-actions">
+            <button className="btn btn-danger" disabled={busyAction !== null} onClick={() => void cancelPendingStartAndOpenPrevious()}>Confirm cancel pending start</button>
+            <button className="btn btn-secondary" disabled={busyAction !== null} onClick={() => setPendingCancelTarget(null)}>Keep pending start</button>
+          </div>
+        </section>}
+      </>
+      : runDisplayProjection(selectedRun).category === 'outcome-unrecorded'
+        ? null
+        : (() => {
       const currentWork = postReviewFailure
         ? `Review turn finished; delivery blocked${lastReviewStep ? ` · ${lastReviewStep}` : ''}.`
         : failedReview
@@ -3491,6 +3676,10 @@ export function RunDashboard({ visible = true, page, onNewRun, onCancelNewRun, o
     />
   )
   const reviewedPreflight = displayedWorktreePreflight.status === 'ready' ? displayedWorktreePreflight.result : null
+  const preparationContext = startupQuestionRun?.startup_context ?? reviewedPreflight?.startup_context
+  const startupPreparationPanel = startPlanPath.trim() && (reviewedPreflight || startupQuestionRun)
+    ? <StartupContextPanel context={preparationContext} mode="preparation" fallbackPlanPath={startPlanPath.trim()} planAvailable={plans.some(plan => plan.path === (preparationContext?.plan_path ?? startPlanPath.trim()))} onOpenPlan={onOpenPlan} onOpenRun={openRelatedRun} />
+    : null
   const reviewedChangeCount = reviewedPreflight ? Math.max(reviewedPreflight.total_items, reviewedPreflight.items.length) : 0
   const reviewedExecutionMode = reviewedPreflight?.execution_mode === 'new_worktree'
     ? 'New worktree'
@@ -3509,6 +3698,7 @@ export function RunDashboard({ visible = true, page, onNewRun, onCancelNewRun, o
   const launchReview = (
     <div className="launch-review-summary">
       <p className="launch-review-consequence">Review the effective choices and working-tree consequence below. No run is allocated until you choose Start run.</p>
+      <StartupContextPanel context={preparationContext} mode="review" fallbackPlanPath={startPlanPath.trim()} planAvailable={plans.some(plan => plan.path === (preparationContext?.plan_path ?? startPlanPath.trim()))} onOpenPlan={onOpenPlan} onOpenRun={openRelatedRun} />
       <dl className="run-preview-list">
         <div><dt>Plan</dt><dd className="mono">{startPlanPath.trim() || 'Not chosen'}</dd></div>
         <div><dt>Workflow</dt><dd>{effectiveWorkflow ? formatMachineLabel(effectiveWorkflow) : 'Not resolved'}</dd></div>
@@ -3530,7 +3720,9 @@ export function RunDashboard({ visible = true, page, onNewRun, onCancelNewRun, o
           <dd>
             {!startReviewReady
               ? 'Choices changed — close this review and review again.'
-              : launchBlocker ?? (worktreeLaunchBlocked ? 'Complete the working-tree acknowledgement or wait for inspection.' : 'Ready for the final start action.')}
+              : launchBlocker ?? (startupRecommendation && startupRecommendation !== 'start'
+                ? reviewedPreflight?.startup_context?.recommendation_reason ?? 'Review the startup context before continuing.'
+                : worktreeLaunchBlocked ? 'Complete the working-tree acknowledgement or wait for inspection.' : 'Ready for the final start action.')}
           </dd>
         </div>
       </dl>
@@ -3743,25 +3935,7 @@ export function RunDashboard({ visible = true, page, onNewRun, onCancelNewRun, o
         </div>
       )}
 
-      {projectAvailable && startupQuestion && (!dirtyStartupQuestion || !newRunPage) && (newRunPage || selectedRun?.run_id === startupQuestion.run_id) && (
-        <section className="card startup-question" aria-label="Startup question">
-          <div className="status-pill status-awaiting">Input needed</div>
-          <h3>{startupQuestion.message}</h3>
-          <p className="text-sm text-dim">No agent started. Answer to continue.</p>
-          <div className="dashboard-actions">
-            {CONFIRM_QUESTION_KINDS.has(startupQuestion.kind) && <>
-              <button className="btn btn-primary" disabled={busyAction === 'startup-answer'} onClick={() => void handleStartupAnswer(true)}>Confirm and continue</button>
-              <button className="btn btn-secondary" disabled={busyAction === 'startup-answer'} onClick={() => void handleStartupAnswer(false)}>Decline and stop</button>
-            </>}
-            {!CONFIRM_QUESTION_KINDS.has(startupQuestion.kind) && startupQuestion.choices.map((choice) => (
-              <button key={choice} className="btn btn-primary" disabled={busyAction === 'startup-answer'} onClick={() => void handleStartupAnswer(choice)}>{choice}</button>
-            ))}
-            {Object.entries(startupQuestion.options).map(([key, label]) => (
-              <button key={key} className="btn btn-secondary" disabled={busyAction === 'startup-answer'} onClick={() => void handleStartupAnswer(key)}>{label}</button>
-            ))}
-          </div>
-        </section>
-      )}
+      {projectAvailable && newRunPage && startupQuestion && !dirtyStartupQuestion && renderStartupQuestion()}
 
       {projectAvailable && !newRunPage && (
         <SidebarEditorLayout selection={selectedRunId} navigationVersion={navigationVersion} listLabel="Run history" detailEntry={explicitRunNavigation ?? Boolean(requestedRunId)} detailReady={selectedDetailAccepted || Boolean(selectedRunId && deletedIds.has(selectedRunId))} navigation={
@@ -3832,10 +4006,10 @@ export function RunDashboard({ visible = true, page, onNewRun, onCancelNewRun, o
                 notices={<>
                   {selectedRun.ownership === 'legacy' && <div className="notice">Legacy execution record. Workflow controls are unavailable; history controls remain available.</div>}
                   {pendingBoundaryStop && <div className="notice" role="status">Stop requested — finishing current turn. The current worker/reviewer call may finish before the run becomes Stopped; this does not approve the checkpoint.</div>}
-                  {selectedRun.evidence.no_agent_started === true && selectedRun.status !== 'running' && <p>No agent started.</p>}
+                  {selectedRun.evidence.no_agent_started === true && selectedRun.status !== 'running' && !pendingStartup && <p>No agent started.</p>}
                   {streamState === 'reconnecting' && <div className="notice">Updates are stale. Use Refresh to retry.</div>}
                   {deliveryWarning && <div className="notice run-delivery-warning" role="alert">Recorded delivery issue: {deliveryWarning}. Open Delivery evidence for the receipt.</div>}
-                  {selectedRunIssue && <section className={`run-issue-summary run-issue-${selectedRunIssue.kind}`} role={selectedRunIssue.kind === 'failure' ? 'alert' : undefined}>
+                  {selectedRunIssue && !(pendingStartup && priorWorkFailure) && <section className={`run-issue-summary run-issue-${selectedRunIssue.kind}`} role={selectedRunIssue.kind === 'failure' ? 'alert' : undefined}>
                     <div>
                       <strong>{selectedRunIssue.kind === 'failure' ? 'Failure' : 'Needs attention'}</strong>
                       <p>{failedReview ? 'Review stopped before a decision.' : selectedRunIssue.cause}</p>
@@ -3919,7 +4093,7 @@ export function RunDashboard({ visible = true, page, onNewRun, onCancelNewRun, o
                 </>
               </section>}
 
-              {!canResume && selectedRun.evidence.no_agent_started === true && <p className="text-sm">No execution state is available to Resume.</p>}
+              {!canResume && selectedRun.evidence.no_agent_started === true && !pendingStartup && <p className="text-sm">No execution state is available to Resume.</p>}
               <div className="run-progress-evidence">
                 {canonicalProgress
                   ? <CheckpointHistory
@@ -4184,6 +4358,7 @@ export function RunDashboard({ visible = true, page, onNewRun, onCancelNewRun, o
         configuredMaxTurns={configuredMaxTurns}
         serverDefaultMaxTurns={serverDefaultMaxTurns}
         preview={launchPreview}
+        startupContext={startupPreparationPanel}
         worktreePreflight={worktreePreflightPanel}
         restartActions={restartActions}
         onCancel={cancelNewRun}
