@@ -429,22 +429,34 @@ def _candidate_match(
 ) -> tuple[bool, bool]:
     """Return (related, identity uncertain); names never establish a match.
 
-    Identity authority rule: an explicit valid run identity equal to the
-    current plan identity is an exact match. An explicit conflicting (or
-    malformed) identity is related but uncertain and can never become a
-    certain match through path or Git Tracking. For ordinary run metadata
-    without identity fields, the recorded path is a certain match only when
-    its durable ownership is unique to the current plan identity, whether
-    that path is equal to or different from the current plan path; exactly
-    one durable owner different from the current plan identity makes the
-    record unrelated. Shared aliases, missing ownership evidence, and paths
-    outside the current identity's history are reported ambiguous (related
-    but uncertain). A recorded suffix that crosses a symlink component below
-    the root never borrows its target's durable ownership: a spelling the
-    durable identity history owned stays related but identity-uncertain,
-    while a fresh descendant symlink spelling with no owned history stays
-    unrelated. Genuinely identity-free plans keep the exact-path plus
-    Git Tracking fallback.
+    Relevance is established before any ambiguous-history decision, using
+    the existing path/root normalization and ownership APIs. A consistent
+    valid explicit identity equal to the current plan identity is an exact
+    match, including an old/moved original path. Otherwise a record is
+    potentially relevant when the normalized recorded path equals the
+    selected current path, a recorded identity field claims the selected
+    identity (even while other fields conflict), or the durable ownership
+    history contains the selected identity. A record whose normalized path
+    differs, whose identity fields never claim the selected identity, and
+    whose successful ownership lookup excludes it is unrelated - including a
+    verified empty owner set and multiple other owners. A separate valid
+    explicit ID is not globally ambiguous, and malformed unrelated ID fields
+    do not override proven disjointness. A failed lookup (``None``) cannot
+    prove unrelatedness and keeps the conservative related/uncertain
+    decision; empty verified ownership and unavailable ownership are
+    distinct.
+
+    For potentially relevant records, an explicit conflicting (or malformed)
+    identity is related but uncertain and can never become a certain match
+    through path or Git Tracking. With no identity fields, the recorded path
+    is a certain match only when its durable ownership is unique to the
+    current plan identity; shared ownership, unknown ownership, and an
+    unowned same path stay uncertain. A recorded suffix that crosses a
+    symlink component below the root never borrows its target's durable
+    ownership: a spelling the durable identity history owned stays related
+    but identity-uncertain, while a fresh descendant symlink spelling with
+    no owned history stays unrelated. Genuinely identity-free plans keep the
+    exact-path plus Git Tracking fallback.
     """
     raw_ids = tuple(
         value for value in (metadata.get("original_plan_identity"), metadata.get("plan_identity"))
@@ -464,40 +476,60 @@ def _candidate_match(
     if path is None:
         return False, False
     if plan.plan_identity:
-        # Explicit conflicting or malformed identity fields block a certain
-        # match before any provenance lookup can run.
-        if explicit is not None or invalid_identity:
-            return True, True
-        # Ordinary records: the recorded path is a certain match only when
-        # exactly one durable owner exists and it is the current identity;
-        # exactly one different durable owner is unrelated. Path equality
-        # and Git Tracking never resolve reused or shared ownership.
         recorded = Path(path)
         if not recorded.is_absolute():
             recorded = primary_root / recorded
-        if not _recorded_suffix_crosses_symlink(primary_root, recorded):
+        crosses_symlink = _recorded_suffix_crosses_symlink(primary_root, recorded)
+        if not crosses_symlink:
             owners = plan_identity_alias_owners(primary_root, recorded)
-            if owners is None or len(owners) != 1:
+        else:
+            # The verbatim suffix crosses a symlink below the root, so the
+            # symlink target never gains exact-match authority for this
+            # recorded path. The recorded spelling keeps its durable history:
+            # a path the identity history owned before the symlink was
+            # installed stays related but identity-uncertain, and a fresh
+            # descendant symlink spelling with no owned history stays
+            # unrelated. Only the verified root prefix is canonicalized; the
+            # suffix is never resolved.
+            canonical_root = _canonical_directory_identity(primary_root)
+            owners = (
+                plan_identity_lexical_owners(primary_root, str(canonical_root / path))
+                if canonical_root is not None
+                else None
+            )
+        if not (
+            path == plan.plan_path
+            or plan.plan_identity in raw_ids
+            or (owners is not None and plan.plan_identity in owners)
+        ):
+            # Proven disjoint from the selected plan: a different path, no
+            # recorded identity claiming the selected identity, and a
+            # successful ownership lookup that excludes it (including an
+            # empty set and multiple other owners). A separate valid explicit
+            # ID is not globally ambiguous, and malformed unrelated ID fields
+            # do not override this proven disjointness.
+            if owners is None:
+                # A failed ownership read cannot prove unrelatedness.
                 return True, True
-            if owners != {plan.plan_identity}:
-                return False, False
-            return True, False
-        # The verbatim suffix crosses a symlink below the root, so the
-        # symlink target never gains exact-match authority for this recorded
-        # path. The recorded spelling keeps its durable history: a path the
-        # identity history owned before the symlink was installed stays
-        # related but identity-uncertain, and a fresh descendant symlink
-        # spelling with no owned history stays unrelated. Only the verified
-        # root prefix is canonicalized; the suffix is never resolved.
-        canonical_root = _canonical_directory_identity(primary_root)
-        historical = (
-            plan_identity_lexical_owners(primary_root, str(canonical_root / path))
-            if canonical_root is not None
-            else None
-        )
-        if historical is None or plan.plan_identity in historical:
+            return False, False
+        # Potentially relevant: explicit conflicting or malformed identity
+        # fields block a certain match, and a certain match otherwise
+        # requires unique durable ownership by the selected identity. Shared
+        # ownership, unknown ownership, and an unowned same path stay
+        # uncertain; path equality and Git Tracking never resolve reused or
+        # shared ownership.
+        if explicit is not None or invalid_identity:
             return True, True
-        return False, False
+        if crosses_symlink:
+            # A recorded suffix crossing a symlink below the root never
+            # borrows its target's durable ownership, so it can never become
+            # a certain match for the selected identity.
+            return True, True
+        if owners is None:
+            return True, True
+        if owners == {plan.plan_identity}:
+            return True, False
+        return True, True
     if path != plan.plan_path:
         return False, False
     if tracking is None or invalid_identity:

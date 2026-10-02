@@ -16,9 +16,10 @@ from fastapi.testclient import TestClient
 
 from aflow.api.models import StartupQuestion, StartupQuestionKind
 from aflow.api.startup import PriorWorkStartupError
-from aflow.control_plane import ContextBundle, RunStatus
+from aflow.control_plane import ContextBundle, LaunchManifest, RunStatus, create_launch_manifest
 from aflow.control_plane.units import UnitState
 from aflow.daemon import DaemonError, ExtraInstructionsValidationError
+from aflow.plan_backups import create_plan_identity, plan_identity_alias_owners
 from aflow_app_server.main import app
 from test_control_plane_api import (
     PROJECT_ID,
@@ -993,6 +994,354 @@ def test_mcp_and_rest_prior_work_error_share_code_and_reserved_run(mcp_client) -
     assert mcp["result"]["isError"] is True
     assert json.loads(mcp["result"]["content"][0]["text"]) == detail
     assert units.start_calls == []
+
+
+def _seed_disjoint_history_run(
+    repo: Path,
+    *,
+    plan: Path,
+    run_id: str,
+    status: str,
+    identity: str | None = None,
+    worktree: Path | None = None,
+    branch: str | None = None,
+) -> None:
+    """Record one historical control-plane run with explicit seed metadata."""
+    create_launch_manifest(
+        repo,
+        LaunchManifest(
+            run_id=run_id,
+            project_root=str(repo),
+            plan_path=str(plan),
+            workflow_name="managed",
+            max_turns=3,
+        ),
+    )
+    record: dict[str, object] = {
+        "schema_version": 1,
+        "status": status,
+        "repo_root": str(repo),
+        "original_plan_path": str(plan),
+        "current_step_name": "implement",
+        "main_branch": "main",
+        "failure_reason": "earlier run stopped",
+    }
+    if identity is not None:
+        record["original_plan_identity"] = identity
+    if branch is not None:
+        record["feature_branch"] = branch
+    if worktree is not None:
+        record["worktree_path"] = str(worktree)
+        record["execution_repo_root"] = str(worktree)
+    run_dir = repo / ".aflow" / "runs" / run_id
+    run_dir.mkdir(parents=True)
+    (run_dir / "run.json").write_text(json.dumps(record), encoding="utf-8")
+
+
+def _history_evidence(
+    repo: Path, *, run_id: str, worktree: Path, plans: tuple[Path, ...]
+) -> dict[str, bytes]:
+    """Byte snapshot of one plan's durable evidence and repository refs."""
+    state: dict[str, bytes] = {}
+
+    def add(path: Path) -> None:
+        if path.is_file():
+            state[str(path)] = path.read_bytes()
+
+    for path in sorted((repo / ".aflow" / "runs" / run_id).rglob("*")):
+        add(path)
+    for path in sorted((repo / ".aflow" / "launches").glob(f"*{run_id}*")):
+        add(path)
+    owners = repo / "plans" / "backups" / ".provenance" / ".owners"
+    for path in sorted(owners.rglob("*")):
+        add(path)
+    for plan in plans:
+        add(plan)
+    git_dir = repo / ".git"
+    for path in sorted(git_dir.rglob("*")):
+        if not path.is_file():
+            continue
+        relative = path.relative_to(git_dir)
+        if relative.parts[0] == "refs" or path.name in {"HEAD", "packed-refs"}:
+            add(path)
+    for path in sorted(worktree.rglob("*")):
+        add(path)
+    return state
+
+
+def _assert_history_evidence_preserved(
+    repo: Path,
+    *,
+    run_id: str,
+    worktree: Path,
+    plans: tuple[Path, ...],
+    before: dict[str, bytes],
+) -> None:
+    """Byte-compare captured evidence, allowing only deduplicated daemon
+    ``reconciled`` observations appended to the run's event journal."""
+    after = _history_evidence(repo, run_id=run_id, worktree=worktree, plans=plans)
+    journal = str(repo / ".aflow" / "runs" / run_id / "events.jsonl")
+    lock = str(repo / ".aflow" / "runs" / run_id / ".events.lock")
+    assert {
+        key: value for key, value in after.items() if key not in {journal, lock}
+    } == {
+        key: value for key, value in before.items() if key not in {journal, lock}
+    }
+    observed_lock = after.get(lock)
+    assert observed_lock in (None, b"", before.get(lock))
+    prior = before.get(journal, b"")
+    appended = after.get(journal, prior)
+    assert appended.startswith(prior)
+    for line in appended[len(prior):].splitlines():
+        assert json.loads(line)["event_type"] == "reconciled"
+
+
+def _worktree_roots(repo: Path) -> list[str]:
+    output = subprocess.check_output(
+        ("git", "worktree", "list", "--porcelain"), cwd=repo, text=True
+    )
+    return [
+        line.split(" ", 1)[1]
+        for line in output.splitlines()
+        if line.startswith("worktree ")
+    ]
+
+
+def test_mcp_plan_relevance_disjoint_history_real_preflight_start_and_protected_rejection(
+    mcp_client,
+) -> None:
+    client, root, units, _ = mcp_client
+    # Give the managed workflow the real worktree/branch lifecycle so the
+    # unmocked matcher, startup safety guard, and dispatch all run. The
+    # merge teardown requires the configured team lead role.
+    workflow_path = root.parent / "global" / "workflows.toml"
+    config_path = workflow_path.with_name("aflow.toml")
+    config_path.write_text(
+        config_path.read_text(encoding="utf-8").replace(
+            "[aflow]", '[aflow]\nteam_lead = "worker"', 1
+        ),
+        encoding="utf-8",
+    )
+    workflow_path.write_text(
+        "[workflow.managed]\n"
+        'setup = ["worktree", "branch"]\n'
+        'teardown = ["merge", "rm_worktree"]\n'
+        'main_branch = "main"\n' + workflow_path.read_text(),
+        encoding="utf-8",
+    )
+    plan_a = root / "plans" / "todo" / "test-plan.md"
+    plan_b = root / "plans" / "todo" / "second-plan.md"
+    legacy_plan = root / "plans" / "archive" / "legacy-a.md"
+    legacy_plan.parent.mkdir(parents=True)
+    legacy_plan.write_text(
+        "# Legacy A\n\n### [ ] Checkpoint 1: legacy\n- [ ] legacy step\n",
+        encoding="utf-8",
+    )
+    subprocess.run(
+        ("git", "symbolic-ref", "HEAD", "refs/heads/main"),
+        cwd=root,
+        check=True,
+        capture_output=True,
+    )
+    _commit_fixture_repository(root)
+
+    # Seed both disjoint A histories: an explicit other-plan identity with
+    # dirty preserved work, and an identity-free completed legacy run at a
+    # verified unowned path.
+    a_identity = create_plan_identity(root, plan_a)
+    b_identity = create_plan_identity(root, plan_b)
+    assert plan_identity_alias_owners(root, legacy_plan) == frozenset()
+    a_worktree = root.parent / "a-history-worktree"
+    subprocess.run(
+        (
+            "git", "worktree", "add", "-q", "-b", "plan-a-branch",
+            str(a_worktree), "main",
+        ),
+        cwd=root,
+        check=True,
+        capture_output=True,
+    )
+    (a_worktree / "a-work.py").write_text("a = 1\n")
+    _seed_disjoint_history_run(
+        root,
+        plan=plan_a,
+        run_id="a-run",
+        status="failed",
+        identity=a_identity,
+        worktree=a_worktree,
+        branch="plan-a-branch",
+    )
+    _seed_disjoint_history_run(
+        root, plan=legacy_plan, run_id="legacy-run", status="completed",
+    )
+    legacy_record_before = (
+        (root / ".aflow" / "runs" / "legacy-run" / "run.json").read_bytes()
+    )
+    evidence_before = _history_evidence(
+        root, run_id="a-run", worktree=a_worktree,
+        plans=(plan_a, plan_b, legacy_plan),
+    )
+    worktrees_before = _worktree_roots(root)
+
+    # Real preflight: the disjoint selection is startable and neither A
+    # history appears in the related-run evidence.
+    preflight = _mcp_tool(
+        client,
+        "preflight_run",
+        {
+            "project_id": PROJECT_ID,
+            "plan_path": "plans/todo/second-plan.md",
+            "workflow_name": "managed",
+        },
+    )
+    context = preflight["startup_context"]
+    assert context["recommendation"] == "start"
+    assert context["related_runs"] == []
+    assert context["related_runs_complete"] is True
+    assert "prior_work_unverified" not in context["reason_codes"]
+    assert preflight["requires_confirmation"] is False
+    assert preflight["blockers"] == []
+
+    # Real start: exactly one owned unit is dispatched for plan B.
+    started = _mcp_tool(
+        client,
+        "start_run",
+        {
+            "project_id": PROJECT_ID,
+            "plan_path": "plans/todo/second-plan.md",
+            "workflow_name": "managed",
+            "idempotency_key": "mcp-plan-relevance-start-1",
+        },
+    )
+    result = started["result"]
+    assert result["status"] == "running"
+    assert result["created"] is True
+    run_id = result["run_id"]
+    assert len(units.start_calls) == 1
+    assert units.start_calls[0][0] == f"aflow-run-{run_id}.service"
+
+    # The same idempotency key replays the same run without a second unit.
+    replayed = _mcp_tool(
+        client,
+        "start_run",
+        {
+            "project_id": PROJECT_ID,
+            "plan_path": "plans/todo/second-plan.md",
+            "workflow_name": "managed",
+            "idempotency_key": "mcp-plan-relevance-start-1",
+        },
+    )
+    assert replayed["result"]["run_id"] == run_id
+    assert replayed["result"]["created"] is False
+    assert len(units.start_calls) == 1
+
+    # The unrelated successful transport start left A's durable evidence
+    # byte-identical and created no worktree.
+    _assert_history_evidence_preserved(
+        root,
+        run_id="a-run",
+        worktree=a_worktree,
+        plans=(plan_a, plan_b, legacy_plan),
+        before=evidence_before,
+    )
+    assert (
+        root / ".aflow" / "runs" / "legacy-run" / "run.json"
+    ).read_bytes() == legacy_record_before
+    assert _worktree_roots(root) == worktrees_before
+
+    # Turn the first B run into protected same-plan work: its unit stops and
+    # leaves a dirty retained worktree on its own branch.
+    units.stop(f"aflow-run-{run_id}.service")
+    protected_worktree = root.parent / "b-protected-worktree"
+    subprocess.run(
+        (
+            "git", "worktree", "add", "-q", "-b", "plan-b-branch",
+            str(protected_worktree), "main",
+        ),
+        cwd=root,
+        check=True,
+        capture_output=True,
+    )
+    (protected_worktree / "b-work.py").write_text("b = 1\n")
+    run_dir = root / ".aflow" / "runs" / run_id
+    run_dir.mkdir(parents=True, exist_ok=True)
+    (run_dir / "run.json").write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "status": "failed",
+                "repo_root": str(root),
+                "original_plan_path": str(plan_b),
+                "current_step_name": "implement",
+                "main_branch": "main",
+                "original_plan_identity": b_identity,
+                "feature_branch": "plan-b-branch",
+                "worktree_path": str(protected_worktree),
+                "execution_repo_root": str(protected_worktree),
+                "failure_reason": "worker stopped with preserved work",
+            }
+        ),
+        encoding="utf-8",
+    )
+    evidence_protected = _history_evidence(
+        root, run_id="a-run", worktree=a_worktree,
+        plans=(plan_a, plan_b, legacy_plan),
+    )
+
+    # A new preflight now reports the protected work instead of start.
+    blocked_preflight = _mcp_tool(
+        client,
+        "preflight_run",
+        {
+            "project_id": PROJECT_ID,
+            "plan_path": "plans/todo/second-plan.md",
+            "workflow_name": "managed",
+        },
+    )
+    blocked_context = blocked_preflight["startup_context"]
+    assert blocked_context["recommendation"] == "review_previous_run"
+    related = {entry["run_id"]: entry for entry in blocked_context["related_runs"]}
+    assert set(related) == {run_id}
+    assert related[run_id]["uncommitted_work"] is True
+
+    # A new real start rejects before dispatching a unit or creating a
+    # worktree, leaving only bounded failed-preparation bookkeeping.
+    rejection_detail = json.loads(
+        _mcp_tool_error(
+            client,
+            "start_run",
+            {
+                "project_id": PROJECT_ID,
+                "plan_path": "plans/todo/second-plan.md",
+                "workflow_name": "managed",
+                "idempotency_key": "mcp-plan-relevance-start-2",
+            },
+        )
+    )
+    assert rejection_detail["code"] == "prior_work_requires_recovery"
+    assert rejection_detail["run_id"] != run_id
+    assert len(units.start_calls) == 1
+    assert _worktree_roots(root) == worktrees_before + [str(protected_worktree)]
+    records = {
+        json.loads(path.read_text())["run_id"]: json.loads(path.read_text())
+        for path in sorted((root / ".aflow" / "start-requests").glob("*.json"))
+    }
+    assert set(records) == {run_id, rejection_detail["run_id"]}
+    assert records[run_id]["state"] == "unit_started"
+    rejected_record = records[rejection_detail["run_id"]]
+    assert rejected_record["state"] == "needs_attention"
+    assert (
+        rejected_record["startup_failure"]["code"] == "prior_work_requires_recovery"
+    )
+
+    # The disjoint A evidence survived the protected rejection untouched.
+    _assert_history_evidence_preserved(
+        root,
+        run_id="a-run",
+        worktree=a_worktree,
+        plans=(plan_a, plan_b, legacy_plan),
+        before=evidence_protected,
+    )
 
 
 def test_mcp_and_rest_context_ignore_agent_transcript_stop(mcp_client) -> None:

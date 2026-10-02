@@ -1,5 +1,41 @@
 # DEVLOG
 
+## 2026-10-02 — Establish plan relevance before startup ambiguity (issue #63)
+
+- `_candidate_match` in `aflow/control_plane/startup_context.py` now decides
+  relevance before ambiguity. A candidate run is potentially relevant when its
+  normalized recorded plan path equals the selected path, a recorded identity
+  field claims the selected identity, or its durable ownership history
+  contains the selected identity. A different recorded path with no recorded
+  identity claiming the selection and a successful ownership lookup excluding
+  it is unrelated - including an empty owner set and multiple other owners -
+  so it can no longer make every selected plan startup ambiguous, even with a
+  foreign explicit identity, an identity-less legacy run, dirty preserved
+  work, or an active controller on the other plan.
+- Ownership reads distinguish an unavailable lookup from a verified result:
+  `plan_identity_alias_owners` and `plan_identity_lexical_owners` return
+  `None` when ownership cannot be established (missing or malformed
+  provenance, an unresolvable or invalid alias) and an empty `frozenset`
+  after a successful lookup with no owner for that spelling. An unavailable
+  lookup is not proof of disjointness and stays related/uncertain. Ordinary
+  safe paths use alias ownership; the lexical lookup applies to a recorded
+  suffix crossing a symlink below the verified root, and a symlink never
+  borrows its target's durable ownership. For potentially relevant runs the
+  conservative decisions are preserved: conflicting identity fields, shared
+  or reused aliases, symlink-crossing paths, and unavailable ownership all
+  stay `review_previous_run` or `prior_work_unverified`. The identity-less
+  Git Tracking fallback and the bounded scan behavior are unchanged, and the
+  same matching decision feeds both projection and admission.
+- `tests/test_startup_context.py` gained focused regression coverage for the
+  new unrelated decisions and the preserved conservative decisions, and
+  `tests/test_startup_plan_relevance.py` adds end-to-end coverage with a real
+  repository, real multi-plan history, and the real `prepare_startup` /
+  `require_safe_fresh_worktree` path (only the unit/provider boundary is
+  faked): disjoint history stays selectable, protected same-plan work blocks
+  before any provider call or worktree creation, idempotent startup replays
+  the same run, capacity rejection stays separate from history relevance, and
+  unrelated startup never rewrites the protected plan's durable records.
+
 ## 2026-10-02 — Measure launch-review refresh stability independently of screenshot restore
 
 - The `test_ui_demo_new_run_background_preflight_preserves_review` helper

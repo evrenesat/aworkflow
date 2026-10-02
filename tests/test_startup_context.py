@@ -682,6 +682,128 @@ def test_reused_same_path_blocks_while_new_owner_remains(tmp_path: Path) -> None
     assert integrated_guard.value.code == "prior_work_unverified"
 
 
+def test_fresh_identity_with_valid_other_identity_on_other_path_is_unrelated(
+    tmp_path: Path,
+) -> None:
+    repo, plan, worktree, _, workflow = _related_fixture(tmp_path)
+    create_plan_identity(repo, plan)
+    other_plan = repo / "plans" / "todo" / "other.md"
+    other_plan.parent.mkdir(parents=True)
+    other_plan.write_text("other plan\n")
+    other_id = create_plan_identity(repo, other_plan)
+    _record_previous(
+        repo, other_plan, worktree, identity=other_id,
+        original_path=other_plan, status="failed",
+    )
+
+    context = _project_related(repo, plan, workflow)
+    assert context.related_runs == ()
+    assert context.recommendation == "start"
+    assert "prior_work_unverified" not in context.reason_codes
+
+
+def test_identity_less_legacy_run_on_other_unowned_path_is_unrelated(
+    tmp_path: Path,
+) -> None:
+    repo, plan, worktree, _, workflow = _related_fixture(tmp_path)
+    create_plan_identity(repo, plan)
+    other_plan = repo / "plans" / "todo" / "other.md"
+    other_plan.parent.mkdir(parents=True)
+    other_plan.write_text("other plan\n")
+    _record_previous(
+        repo, other_plan, worktree, original_path=other_plan, status="failed",
+    )
+
+    context = _project_related(repo, plan, workflow)
+    assert context.related_runs == ()
+    assert context.recommendation == "start"
+    assert "prior_work_unverified" not in context.reason_codes
+
+
+def test_other_identity_owned_path_with_dirty_work_is_unrelated(tmp_path: Path) -> None:
+    repo, plan, worktree, _, workflow = _related_fixture(tmp_path)
+    create_plan_identity(repo, plan)
+    other_plan = repo / "plans" / "todo" / "other.md"
+    other_plan.parent.mkdir(parents=True)
+    other_plan.write_text("other plan\n")
+    create_plan_identity(repo, other_plan)
+    _record_previous(
+        repo, other_plan, worktree, original_path=other_plan, status="failed",
+    )
+    (worktree / "implementation.py").write_text("work = True\n")
+
+    context = _project_related(repo, plan, workflow)
+    assert context.related_runs == ()
+    assert context.recommendation == "start"
+    assert "prior_work_unverified" not in context.reason_codes
+
+
+def test_disjoint_active_known_plan_does_not_make_selection_related(
+    tmp_path: Path,
+) -> None:
+    repo, plan, worktree, _, workflow = _related_fixture(tmp_path)
+    create_plan_identity(repo, plan)
+    other_plan = repo / "plans" / "todo" / "other.md"
+    other_plan.parent.mkdir(parents=True)
+    other_plan.write_text("other plan\n")
+    other_id = create_plan_identity(repo, other_plan)
+    _record_previous(
+        repo, other_plan, worktree, run_id="other-active", identity=other_id,
+        original_path=other_plan, status="running",
+    )
+    units = SimpleNamespace(
+        get=lambda name: SimpleNamespace(
+            name=name, is_active=name == "aflow-run-other-active.service",
+        )
+    )
+
+    context = _project_related(
+        repo, plan, workflow, admission=ProjectAdmission(repo, unit_manager=units),
+    )
+    # The disjoint active run stays out of the selected history; provider
+    # capacity is enforced separately at admission, not by history matching.
+    assert context.related_runs == ()
+    assert context.recommendation == "start"
+    assert "prior_work_unverified" not in context.reason_codes
+
+
+def test_malformed_identity_at_current_path_stays_uncertain(tmp_path: Path) -> None:
+    repo, plan, worktree, _, workflow = _related_fixture(tmp_path)
+    create_plan_identity(repo, plan)
+    _record_previous(repo, plan, worktree, run_id="bad-id", identity="not-an-identity")
+
+    context = _project_related(repo, plan, workflow)
+    assert context.related_runs[0].run_id == "bad-id"
+    assert context.recommendation == "inspect_previous_runs"
+
+
+def test_conflicting_identity_fields_claiming_selected_identity_stay_uncertain(
+    tmp_path: Path,
+) -> None:
+    repo, plan, worktree, _, workflow = _related_fixture(tmp_path)
+    selected_id = create_plan_identity(repo, plan)
+    other_plan = repo / "plans" / "todo" / "other.md"
+    other_plan.parent.mkdir(parents=True)
+    other_plan.write_text("other plan\n")
+    other_id = create_plan_identity(repo, other_plan)
+    _record_previous(
+        repo, other_plan, worktree, run_id="conflict", identity=other_id,
+        original_path=other_plan, status="failed",
+    )
+    # The second identity field claims the selected identity while the
+    # primary field claims a different one: conflicting, never certain.
+    run_dir = repo / ".aflow" / "runs" / "conflict"
+    metadata = json.loads((run_dir / "run.json").read_text(encoding="utf-8"))
+    metadata["plan_identity"] = selected_id
+    (run_dir / "run.json").write_text(json.dumps(metadata), encoding="utf-8")
+
+    context = _project_related(repo, plan, workflow)
+    assert context.related_runs[0].run_id == "conflict"
+    assert context.recommendation == "inspect_previous_runs"
+    assert context.availability == "partial"
+    assert context.related_runs_complete is False
+
+
 def test_distinct_owner_run_is_excluded_from_other_plan_preview(tmp_path: Path) -> None:
     repo, plan, worktree, _, workflow = _related_fixture(tmp_path)
     # Identity A owns plans/in-progress/plan.md and records an ordinary run
@@ -746,10 +868,12 @@ def test_explicit_conflicting_identity_over_shared_alias_blocks(tmp_path: Path) 
 def test_reused_alias_without_distinguishing_provenance_blocks(tmp_path: Path) -> None:
     repo, plan, worktree, _, workflow = _related_fixture(tmp_path)
     create_plan_identity(repo, plan)
-    # A recorded path that is not part of the current plan's owned history.
-    reused = repo / "plans" / "todo" / "plan.md"
-    reused.parent.mkdir(parents=True)
-    _record_previous(repo, plan, worktree, original_path=reused)
+    # A recorded path that is not part of the current plan's owned history
+    # and has a verified empty owner set is proven disjoint, so it is
+    # unrelated even with dirty retained work at the recorded run.
+    unowned = repo / "plans" / "todo" / "plan.md"
+    unowned.parent.mkdir(parents=True)
+    _record_previous(repo, plan, worktree, original_path=unowned)
     (worktree / "implementation.py").write_text("work = True\n")
     failed_path = repo / "plans" / "failed" / "plan.md"
     failed_path.parent.mkdir(parents=True)
@@ -757,10 +881,19 @@ def test_reused_alias_without_distinguishing_provenance_blocks(tmp_path: Path) -
     plan.unlink()
     move_plan_identity(repo, source_plan_path=plan, destination_plan_path=failed_path)
 
-    ambiguous = _project_related(repo, failed_path, workflow)
-    assert ambiguous.related_runs[0].run_id == "previous-run"
-    assert ambiguous.recommendation == "inspect_previous_runs"
-    assert ambiguous.availability == "partial"
+    unrelated = _project_related(repo, failed_path, workflow)
+    assert unrelated.related_runs == ()
+    assert unrelated.recommendation == "start"
+    assert "prior_work_unverified" not in unrelated.reason_codes
+
+    # A genuinely reused path - one the current plan's identity history owns
+    # - is not proven disjoint and still blocks a fresh start.
+    reused = repo / "plans" / "in-progress" / "plan.md"
+    _record_previous(repo, failed_path, worktree, run_id="reused-run", original_path=reused)
+    blocked = _project_related(repo, failed_path, workflow)
+    assert blocked.related_runs[0].run_id == "reused-run"
+    assert blocked.related_runs[0].uncommitted_work is True
+    assert blocked.recommendation == "review_previous_run"
 
 
 def test_same_name_different_plan_and_project_are_excluded(tmp_path: Path) -> None:

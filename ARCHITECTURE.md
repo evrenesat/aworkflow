@@ -810,7 +810,26 @@ Entry point. Exposes three subcommands:
 
 For a fresh worktree start, startup preparation and the final execution boundary
 recheck bounded related-run evidence against the configured starting branch.
-Preserved or unverifiable earlier work returns `prior_work_requires_recovery` or
+The matching decision establishes relevance before ambiguity: a candidate run
+is potentially relevant when its normalized recorded plan path equals the
+selected path, a recorded identity field claims the selected identity, or its
+durable ownership history contains the selected identity. Ordinary recorded
+paths use owner-store alias ownership; a recorded suffix crossing a symlink
+below the verified root uses the lexical plan-path lookup on the verbatim
+spelling, and such paths never borrow their target's durable ownership. A
+different recorded path with no recorded identity claiming the selection and
+a successful ownership lookup excluding it is unrelated - including an empty
+owner set and multiple other owners - so a proven-unrelated candidate never
+makes the selection ambiguous, even when it carries a foreign explicit
+identity, dirty preserved work, or an active controller. Ownership lookups
+return `None` when ownership cannot be established (missing or malformed
+provenance, an unresolvable or invalid alias) and an empty `frozenset` after
+a successful lookup with no owner for that spelling; an unavailable lookup is
+not proof of disjointness. For potentially relevant runs, conflicting
+identity fields, shared or reused aliases, symlink-crossing paths, and
+unavailable ownership stay conservative and return `review_previous_run` or
+`prior_work_unverified`. Preserved or unverifiable related
+work returns `prior_work_requires_recovery` or
 `prior_work_unverified` before lifecycle setup. In the supported `NOT_A_REPO` or
 `UNBORN` bootstrap state the Git-dependent starting-branch verification cannot
 run yet: the guard scans the same retained run evidence with an unresolved
