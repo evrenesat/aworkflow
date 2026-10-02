@@ -11382,10 +11382,42 @@ def _run_workflow_unchecked(
             ),
         )
         if current_step_name == "END":
-            state.end_reason = "transition_end"
+            replayed_conditions = replayed_boundary.conditions
+            replayed_end_when = matching_transitions[0].when
+            replayed_budget_only_end = (
+                replayed_end_when is not None
+                and not evaluate_condition(
+                    replayed_end_when,
+                    done=replayed_conditions["DONE"],
+                    new_plan_exists=replayed_conditions["NEW_PLAN_EXISTS"],
+                    max_turns_reached=False,
+                )
+            )
+            if (
+                not replayed_boundary.snapshot_after.is_complete
+                and not replayed_budget_only_end
+            ):
+                raise WorkflowError(
+                    "cannot resume finalized END boundary: the saved snapshot "
+                    "is incomplete and its selected transition is not a "
+                    "budget-only edge",
+                    run_dir=run_paths.run_dir,
+                )
+            # An incomplete snapshot can never enter delivery on replay, and a
+            # budget-only END edge is a safe stop, not an approval.  Both keep
+            # merge/teardown and publication out of the replayed terminal.
+            replay_delivery_eligible = not replayed_budget_only_end
+            replay_end_reason: WorkflowEndReason = (
+                "max_turns_reached" if replayed_budget_only_end else "transition_end"
+            )
+            state.end_reason = replay_end_reason
             merge_status: str | None = None
             merge_failure_reason: str | None = None
-            if exec_ctx is not None and "merge" in exec_ctx.teardown:
+            if (
+                replay_delivery_eligible
+                and exec_ctx is not None
+                and "merge" in exec_ctx.teardown
+            ):
                 try:
                     merge_status, merge_failure_reason = _perform_merge_teardown(
                         exec_ctx,
@@ -11406,7 +11438,7 @@ def _run_workflow_unchecked(
                     )
                 except HarnessEnvironmentPreflightError as exc:
                     _handle_environment_preflight_failure(exc)
-            if merge_status != "failed":
+            if replay_delivery_eligible and merge_status != "failed":
                 prior_original_plan_path = original_plan_path
                 try:
                     finalized_original_plan_path = _deliver_completed_plan(
@@ -11467,7 +11499,7 @@ def _run_workflow_unchecked(
                 turns_completed=state.turns_completed,
                 final_snapshot=state.last_snapshot,
                 issues_accumulated=state.issues_accumulated,
-                end_reason="transition_end",
+                end_reason=replay_end_reason,
                 recovery_summary=state.current_harness_recovery,
                 recovery_history=tuple(state.harness_recovery_history),
             )
@@ -11477,7 +11509,7 @@ def _run_workflow_unchecked(
                 execution_context=exec_ctx,
                 last_snapshot=state.last_snapshot,
                 turns_completed=state.turns_completed,
-                end_reason="transition_end",
+                end_reason=replay_end_reason,
                 original_plan_path=original_plan_path,
                 current_step_name=replayed_boundary.step_name,
                 active_plan_path=active_plan_path,
@@ -11493,7 +11525,7 @@ def _run_workflow_unchecked(
                 run_dir=run_paths.run_dir,
                 turns_completed=state.turns_completed,
                 final_snapshot=state.last_snapshot,
-                end_reason="transition_end",
+                end_reason=replay_end_reason,
                 issues_accumulated=state.issues_accumulated,
                 recovery_summary=state.current_harness_recovery,
                 recovery_history=tuple(state.harness_recovery_history),
@@ -12480,8 +12512,14 @@ def _run_workflow_unchecked(
         terminal_step_role: str | None,
         terminal_selector: str | None,
         active_team: str | None,
+        delivery_eligible: bool,
     ) -> ControllerRunResult:
-        """Finalize a normal terminal boundary, including an incomplete cap."""
+        """Finalize a normal terminal boundary, including an incomplete cap.
+
+        Delivery eligibility is decided before merge: an unfinished budget
+        boundary performs no lifecycle teardown, publication, or plan move and
+        preserves branch, worktree, and plan state for explicit continuation.
+        """
         nonlocal original_plan_path, active_plan_path
 
         state.end_reason = end_reason
@@ -12493,7 +12531,7 @@ def _run_workflow_unchecked(
         merge_status: str | None = None
         merge_failure_reason: str | None = None
 
-        if exec_ctx is not None and "merge" in exec_ctx.teardown:
+        if delivery_eligible and exec_ctx is not None and "merge" in exec_ctx.teardown:
             try:
                 merge_status, merge_failure_reason = _perform_merge_teardown(
                     exec_ctx,
@@ -12515,7 +12553,11 @@ def _run_workflow_unchecked(
             except HarnessEnvironmentPreflightError as exc:
                 _handle_environment_preflight_failure(exc)
 
-        if final_snapshot.is_complete and merge_status != "failed":
+        if (
+            delivery_eligible
+            and final_snapshot.is_complete
+            and merge_status != "failed"
+        ):
             prior_original_plan_path = original_plan_path
             try:
                 finalized_original_plan_path = _deliver_completed_plan(
@@ -12713,6 +12755,9 @@ def _run_workflow_unchecked(
         effective_max_turns = state.effective_max_turns or config.max_turns
         if turn_number > effective_max_turns:
             if live_config_source_path is not None:
+                # A pre-turn budget cap can never approve an outstanding
+                # review/repair boundary, so the cap is always a no-delivery
+                # budget exit even when the ledger is already complete.
                 return _finish_normal_terminal(
                     final_snapshot=state.last_snapshot,
                     end_reason="max_turns_reached",
@@ -12720,6 +12765,7 @@ def _run_workflow_unchecked(
                     terminal_step_role=None,
                     terminal_selector=None,
                     active_team=state.current_team,
+                    delivery_eligible=False,
                 )
             break
         retry_ctx = state.pending_retry
@@ -14251,17 +14297,21 @@ def _run_workflow_unchecked(
                 chosen_transition=transition_target,
                 chosen_transition_condition=selected_transition.when,
                 end_reason=(
-                    _normalize_end_reason(
-                        selected_transition=selected_transition,
-                        done=done,
-                        max_turns_reached=max_turns_reached,
+                    "max_turns_reached"
+                    if limit_terminal
+                    else (
+                        _normalize_end_reason(
+                            selected_transition=selected_transition,
+                            done=done,
+                            max_turns_reached=max_turns_reached,
+                        )
+                        if (
+                            transition_target == "END"
+                            and selected_transition is not None
+                            and post_snapshot.is_complete
+                        )
+                        else None
                     )
-                    if (
-                        transition_target == "END"
-                        and selected_transition is not None
-                        and (post_snapshot.is_complete or limit_terminal)
-                    )
-                    else None
                 ),
                 was_retry=True if retry_ctx is not None else None,
                 retry_attempt=retry_ctx.attempt if retry_ctx is not None else None,
@@ -14503,11 +14553,19 @@ def _run_workflow_unchecked(
                     post_snapshot=post_snapshot,
                     turn_dir=turn_dir,
                 )
-            end_reason = _normalize_end_reason(
-                selected_transition=selected_transition,
-                done=done,
-                max_turns_reached=max_turns_reached,
-            )
+            if limit_terminal:
+                # A selected END that only matches because MAX_TURNS_REACHED
+                # is true is a budget exit, including when the worker just
+                # completed the ledger.  It never approves an outstanding
+                # review/repair boundary, so delivery stays withheld and the
+                # end reason stays truthful even at the numerical limit.
+                end_reason = "max_turns_reached"
+            else:
+                end_reason = _normalize_end_reason(
+                    selected_transition=selected_transition,
+                    done=done,
+                    max_turns_reached=max_turns_reached,
+                )
             return _finish_normal_terminal(
                 terminal_step_name=current_step_name,
                 terminal_step_role=step.role,
@@ -14515,6 +14573,7 @@ def _run_workflow_unchecked(
                 active_team=active_team_name,
                 final_snapshot=post_snapshot,
                 end_reason=end_reason,
+                delivery_eligible=not limit_terminal,
             )
 
         if len(wf.steps) > 1:

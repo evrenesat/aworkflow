@@ -1,5 +1,39 @@
 # DEVLOG
 
+## 2026-10-02 — Keep unfinished budget boundaries out of delivery (issue #62)
+
+- `_finish_normal_terminal` in `aflow/workflow.py` now takes an explicit
+  `delivery_eligible` decision and checks it before any merge teardown, so
+  an unfinished budget boundary performs no merge, no publication, and no
+  done-plan move. `_perform_merge_teardown` and `_deliver_completed_plan` are
+  both gated on it; delivery additionally requires a complete snapshot.
+- A pre-turn budget cap always exits with `delivery_eligible=False`: reaching
+  the limit can never approve an outstanding configured review or repair
+  boundary, even when the ledger is already complete. A selected `END` that
+  only matches because `MAX_TURNS_REACHED=true` (re-evaluating the same
+  configured condition with `MAX_TURNS_REACHED=false`) is the same budget
+  exit, including when the worker just completed the ledger; a fully reviewed
+  completion whose ordinary non-budget transition reaches `END` still
+  delivers normally at the numerical limit.
+- The finalized-boundary replay applies the same rule to a saved budget-only
+  `END` receipt and raises on an incomplete non-budget `END` snapshot instead
+  of inferring state, so the replay path cannot merge unfinished work.
+- Terminal accounting is preserved: live budget exits keep `status=completed`
+  with the truthful `end_reason=max_turns_reached` (previously a budget-only
+  `END` with `DONE=true` could be serialized as `done`), original/active/new
+  plan paths, the final snapshot, and the pending review/repair step remain in
+  `run.json`, and merge/publication markers stay absent when no delivery was
+  attempted. Static-run failure contracts (pre-turn cap failure, incomplete
+  non-limit `END` failure) are unchanged.
+- `tests/test_budget_exit_recovery.py` adds fixture-based controller
+  regressions: clean worktree with committed unfinished code, dirty
+  incomplete worktree, reviewer repair overlay at the cap, complete ledger
+  with the configured review still pending at a pre-turn cap, normal reviewed
+  completion at the limit (delivery proceeds), and a finalized replay of an
+  incomplete budget-only `END`. All unfinished cases spy on the lifecycle and
+  publication entrypoints, assert zero calls, and verify files, branch,
+  worktree, and plan locations remain intact.
+
 ## 2026-10-02 — Establish plan relevance before startup ambiguity (issue #63)
 
 - `_candidate_match` in `aflow/control_plane/startup_context.py` now decides
