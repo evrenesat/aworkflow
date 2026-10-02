@@ -2,11 +2,13 @@
 import json
 from pathlib import Path
 import re
+from aflow.api.models import StartupQuestion, StartupQuestionKind
 from aflow.control_plane import LaunchManifest, create_launch_manifest
 from aflow.control_plane.units import UnitState
 from playwright.sync_api import expect, sync_playwright
 from test_control_plane_api import control_client, live_server, TOKEN, PROJECT_ID  # noqa: F401
 from test_responsive_browser import (
+    _assert_action_hit_test,
     _assert_document_moves,
     _assert_global_run_row,
     _assert_header_and_flow,
@@ -664,12 +666,15 @@ def test_remaining_journeys_keep_compact_actions_and_drafts_reachable(control_cl
     """Exercise the remaining authenticated journeys with disposable data.
 
     The launch request is intercepted after the user has selected a real Ready
-    plan and workflow.  That keeps this acceptance check focused on form,
-    startup-question, and responsive presentation behavior without starting a
-    worker, while the plan save and project/run navigation use the disposable
-    server and filesystem fixture normally.
+    plan and workflow.  The intercepted Start reports the startup question of a
+    real disposable pending run reserved through the disposable control client,
+    so the pending detail keeps a real matching read path.  That keeps this
+    acceptance check focused on form, startup-question, and responsive
+    presentation behavior without starting a worker, while the plan save and
+    project/run navigation use the disposable server and filesystem fixture
+    normally.
     """
-    _, root, _, _ = control_client
+    client, root, units, _ = control_client
     (root / 'plans' / 'in-progress').mkdir(parents=True, exist_ok=True)
     (root / 'plans' / 'in-progress' / 'ready-cp5.md').write_text(
         '# Ready CP5\n\n### [ ] Checkpoint 1: Disposable launch fixture\n- [ ] verify\n'
@@ -677,12 +682,37 @@ def test_remaining_journeys_keep_compact_actions_and_drafts_reachable(control_cl
     (root / '.aflow' / 'runs' / 'global-cp5').mkdir(parents=True)
     (root / '.aflow' / 'runs' / 'global-cp5' / 'run.json').write_text(json.dumps({
         'status': 'completed',
-        'plan_path': 'plans/in-progress/ready-cp5.md',
+        'plan_path': str((root / 'plans' / 'in-progress' / 'ready-cp5.md').resolve()),
         'workflow_name': 'managed',
         'max_turns': 5,
     }))
     dist = Path(__file__).resolve().parents[2] / 'web' / 'dist'
     monkeypatch.setenv('AFLOW_APP_WEB_DIST', str(dist))
+
+    # Reserve the real disposable pending run the intercepted browser Start
+    # will report.  The stubbed pick_step question keeps the run pending
+    # without a live unit, and the real server serves its detail, context,
+    # events, and list reads.
+    monkeypatch.setattr(
+        'aflow.daemon.prepare_startup',
+        lambda _request: StartupQuestion(
+            kind=StartupQuestionKind.PICK_STEP,
+            message='Choose a step for this disposable launch',
+            choices=['implement'],
+        ),
+    )
+    reservation = client.post(
+        f'/api/control-plane/projects/{PROJECT_ID}/runs',
+        headers={'Idempotency-Key': 'cp5-pending-reservation'},
+        json={
+            'plan_path': 'plans/in-progress/ready-cp5.md',
+            'workflow_name': 'managed',
+            'dirty_worktree_confirmed': True,
+        },
+    )
+    assert reservation.status_code == 202, reservation.text
+    pending_question = reservation.json()['startup_question']
+    pending_run_id = pending_question['run_id']
 
     def assert_compact_geometry(page, width: int, height: int) -> None:
         metrics = page.evaluate('''() => ({
@@ -792,27 +822,22 @@ def test_remaining_journeys_keep_compact_actions_and_drafts_reachable(control_cl
             assert_compact_geometry(page, 320, 844)
 
             # Launch only through the real form; the disposable interception
-            # returns the server-shaped startup question and never starts a
-            # worker or changes a production run.
+            # returns the exact startup question of the reserved pending run
+            # and never starts a worker or creates a second run.
+            start_requests = []
+
             def launch_route(route):
                 if route.request.method != 'POST':
                     route.continue_()
                     return
+                start_requests.append(route.request.post_data)
                 request = json.loads(route.request.post_data or '{}')
                 assert request['plan_path'] == 'plans/in-progress/ready-cp5.md'
                 assert request['workflow_name'] == 'managed'
                 assert request['dirty_worktree_confirmed'] is True
                 route.fulfill(status=202, content_type='application/json', body=json.dumps({
                     'result': None,
-                    'startup_question': {
-                        'question_id': 'cp5-question',
-                        'kind': 'pick_step',
-                        'message': 'Choose a step for this disposable launch',
-                        'options': {},
-                        'choices': ['implement'],
-                        'run_id': 'cp5-pending',
-                        'schema_version': 1,
-                    },
+                    'startup_question': pending_question,
                 }))
 
             page.route(f'**/api/control-plane/projects/{PROJECT_ID}/runs', launch_route)
@@ -843,25 +868,52 @@ def test_remaining_journeys_keep_compact_actions_and_drafts_reachable(control_cl
             assert_preview_captions_fill_tables(page)
             assert_compact_geometry(page, 320, 568)
             page.screenshot(path=str(tmp_path / 'cp06-compact-launch.png'), full_page=True)
-            _open_start_review(page).click()
-            page.get_by_text('Choose a step for this disposable launch', exact=True).wait_for()
-            answer = page.get_by_role('button', name='implement', exact=True)
-            answer.scroll_into_view_if_needed()
-            answer_box = answer.bounding_box()
-            assert answer_box and 0 <= answer_box['y'] < 844 and answer_box['x'] + answer_box['width'] <= 320
-            assert_compact_geometry(page, 320, 844)
 
             # Short landscape uses the same compact contract and keeps the
-            # launch controls in one natural column.
+            # launch controls in one natural column.  These form-geometry
+            # assertions run on the launch form, before the final Start action
+            # leaves the form screen.
             page.set_viewport_size({'width': 844, 'height': 390})
             page.wait_for_timeout(100)
             assert_preview_captions_fill_tables(page)
             assert page.locator('.dashboard-form-grid').evaluate('(node) => getComputedStyle(node).gridTemplateColumns.split(" ").length === 1')
             assert_compact_geometry(page, 844, 390)
 
+            # Desktop keeps the ordinary table layout while the form is shown.
             page.set_viewport_size({'width': 1280, 'height': 720})
             page.locator('.responsive-data-table caption').first.wait_for()
             assert_desktop_tables_remain_ordinary(page)
+
+            # Return to compact width for the launch action and the pending
+            # start handoff.  The launch preview tables above already proved
+            # form geometry, so the Start action now owns the navigation.
+            page.set_viewport_size({'width': 320, 'height': 568})
+            _open_start_review(page).click()
+
+            # The pick_step response selects the exact reserved pending run and
+            # presents the current legacy question on its detail screen, not
+            # the obsolete raw server message on the launch form.  The detail,
+            # context, and event reads all hit the real disposable server, so
+            # no stale-update or run_not_found notice may appear.
+            page.wait_for_function(f"new URL(location.href).searchParams.get('run') === '{pending_run_id}'")
+            assert len(start_requests) == 1, start_requests
+            startup_region = page.get_by_role('region', name='Startup question', exact=True)
+            expect(startup_region).to_be_visible()
+            expect(page.get_by_role('heading', name='Continue this pending start', exact=True)).to_be_visible()
+            expect(page.get_by_text('No agent started. Answer to continue.', exact=True)).to_be_visible()
+            expect(page.get_by_text('Updates are stale. Use Refresh to retry.', exact=True)).to_have_count(0)
+            assert 'run_not_found' not in page.locator('body').inner_text()
+            # The real startup context names the allowed `implement` step as
+            # the suggested answer, so the enabled answer button submits
+            # exactly that reserved choice.  It must be hit-testable at
+            # compact width; the trial click never submits it, so the run
+            # stays pre-execution.
+            assert 'implement' in pending_question['choices'], pending_question
+            answer = startup_region.get_by_role('button', name='Continue from checkpoint 1', exact=True)
+            expect(answer).to_be_enabled()
+            _assert_action_hit_test(page, answer)
+            assert_compact_geometry(page, 320, 568)
+            page.screenshot(path=str(tmp_path / 'cp06-compact-pending-start.png'), full_page=True)
             page.set_viewport_size({'width': 844, 'height': 390})
 
             # All-runs remains a populated cross-project list and explicit
@@ -904,5 +956,10 @@ def test_remaining_journeys_keep_compact_actions_and_drafts_reachable(control_cl
             assert logout_error.evaluate('(node) => document.activeElement === node')
             assert page.get_by_role('button', name='Retry logout', exact=True).is_visible()
             assert_compact_geometry(page, 844, 390)
+
+            # A broken interception must not silently launch a workflow: the
+            # intercepted start never reached the server and no unit started.
+            assert len(start_requests) == 1, start_requests
+            assert units.start_calls == [], units.start_calls
         finally:
             browser.close()
