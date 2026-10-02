@@ -70,6 +70,28 @@ it('explains partial and missing evidence without offering an automatic continua
   expect(screen.getByText(/startup context is unavailable from this server/)).toBeDefined()
 })
 
+it('keeps the plan facts and shows the explicit consistency warning for an inconsistent plan', () => {
+  const context = startupContext({
+    availability: 'partial',
+    reason_codes: ['inconsistent_checkpoint_state'],
+    reason: 'A completed checkpoint has unchecked tasks. Correct the plan before starting.',
+    recommendation: 'start',
+    recommendation_reason: 'No unresolved earlier work was found in the complete scan.',
+    next_checkpoint: { ordinal: 2, title: 'Checkpoint 2: Broken', heading_checked: true, checked_tasks: 0, total_tasks: 1 },
+    pending_tasks: ['leftover task'],
+  })
+  const view = render(<StartupContextPanel context={context} mode="review" planAvailable onOpenPlan={() => {}} />)
+  const panel = screen.getByRole('region', { name: 'Startup context review' })
+  const alert = within(panel).getByRole('alert')
+  expect(alert.textContent).toContain('A completed checkpoint has unchecked tasks. Correct the plan before starting.')
+  expect(alert.textContent).toContain('Explicit recovery confirmation is required before starting.')
+  // Recorded plan facts stay visible and truthful alongside the warning.
+  expect(within(panel).getByText('Next in plan: Checkpoint 2 of 6 — Broken')).toBeDefined()
+  expect(within(panel).getByText('leftover task')).toBeDefined()
+  view.rerender(<StartupContextPanel context={startupContext({ availability: 'available', reason_codes: [], reason: null, next_checkpoint: { ordinal: 4, title: 'Checkpoint 4: Build feature', heading_checked: false, checked_tasks: 0, total_tasks: 2 } })} mode="review" planAvailable onOpenPlan={() => {}} />)
+  expect(within(panel).queryByRole('alert')).toBeNull()
+})
+
 it('opens an active exact run and never presents it as recoverable', () => {
   const open = vi.fn()
   render(<StartupContextPanel context={startupContext({ recommendation: 'open_existing_run', related_runs: [{ run_id: 'running-9', status: 'running', step: 'implement', activity: 'active', history_state: 'visible', failure_reason: null, worktree_path: null, worktree_verified: false, branch: null, branch_verified: false, unmerged_work: null, uncommitted_work: null, can_resume: false }] })} mode="preparation" onOpenRun={open} />)

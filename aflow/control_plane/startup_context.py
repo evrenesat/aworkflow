@@ -16,8 +16,8 @@ from typing import TYPE_CHECKING, Literal, Mapping
 from aflow.plan import (
     MISSING_CHECKPOINT_SECTIONS,
     PlanParseError,
-    parse_plan_text,
     parse_git_tracking_metadata,
+    parse_plan_text_tolerant,
     unchecked_step_texts,
 )
 from aflow.plan_backups import (
@@ -203,7 +203,7 @@ def project_plan_startup_context(repo_root: Path, plan_path: Path) -> StartupCon
         except UnicodeDecodeError:
             raise _PlanObservationError("invalid_plan_encoding") from None
         try:
-            parsed = parse_plan_text(text, source_path=root / relative_path)
+            tolerant = parse_plan_text_tolerant(text, source_path=root / relative_path)
         except PlanParseError as exc:
             code = (
                 "non_checkpoint_plan"
@@ -218,6 +218,13 @@ def project_plan_startup_context(repo_root: Path, plan_path: Path) -> StartupCon
                 reason_codes=(code,),
                 reason=_REASONS.get(code, _REASONS["invalid_plan"]),
             )
+        # An inconsistent checkpoint state is a display warning, not a
+        # prior-work safety fact. The preview carries the validated tolerant
+        # recovery snapshot forward so the existing explicit recovery
+        # question remains reachable; admission, daemon handoff, and worker
+        # revalidation still perform the strict parse and the prior-work
+        # scan below decides the recommendation.
+        parsed = tolerant.parsed_plan
         next_index = parsed.snapshot.current_checkpoint_index
         next_section = parsed.sections[next_index - 1] if next_index is not None else None
         texts: tuple[str, ...] = ()
@@ -225,7 +232,12 @@ def project_plan_startup_context(repo_root: Path, plan_path: Path) -> StartupCon
         if next_section is not None:
             texts, text_count = unchecked_step_texts(text, next_section, limit=MAX_PENDING_TASKS)
         reliable_text = next_section is None or text_count == next_section.unchecked_step_count
-        reasons = () if reliable_text else ("pending_task_text_unavailable",)
+        inconsistent = tolerant.parse_error is not None
+        reasons = (
+            ("inconsistent_checkpoint_state",)
+            if inconsistent
+            else ()
+        ) + (() if reliable_text else ("pending_task_text_unavailable",))
         pending_tasks = tuple(_bounded_text(item) for item in texts) if reliable_text else ()
 
         def checkpoint(index: int) -> StartupCheckpoint:
@@ -252,7 +264,11 @@ def project_plan_startup_context(repo_root: Path, plan_path: Path) -> StartupCon
         if current_signature != signature:
             raise _PlanObservationError("plan_changed_during_read")
         summary = StartupContextSummary(
-            availability="available" if reliable_text else "partial",
+            availability=(
+                "partial"
+                if inconsistent or not reliable_text
+                else "available"
+            ),
             reason_codes=reasons,
             reason=_REASONS[reasons[0]] if reasons else None,
             observed_at=observed_at,

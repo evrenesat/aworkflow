@@ -644,24 +644,33 @@ def load_plan(path: Path) -> ParsedPlan:
     return parse_plan_text(path.read_text(encoding="utf-8"), source_path=path)
 
 
-def load_plan_tolerant(path: Path) -> TolerantPlanLoadResult:
-    if not path.is_file():
-        raise _build_error(path, "plan file does not exist")
+def parse_plan_text_tolerant(text: str, *, source_path: Path) -> TolerantPlanLoadResult:
+    """Parse plan text, tolerating only inconsistent checkpoint state.
 
-    text = path.read_text(encoding="utf-8")
-    sections = _collect_sections(text, source_path=path)
+    A checked checkpoint with unchecked tasks yields the existing recovery
+    snapshot plus the original parse error so callers can carry the validated
+    tolerant evidence forward. Every other parse failure is re-raised.
+    """
+    sections = _collect_sections(text, source_path=source_path)
     try:
-        _validate_sections(sections, source_path=path)
+        _validate_sections(sections, source_path=source_path)
     except PlanParseError as exc:
         if exc.error_kind != "inconsistent_checkpoint_state":
             raise
         snapshot = _build_recovery_snapshot(exc)
         return TolerantPlanLoadResult(
-            parsed_plan=ParsedPlan(path=path, sections=sections, snapshot=snapshot),
+            parsed_plan=ParsedPlan(path=source_path, sections=sections, snapshot=snapshot),
             parse_error=exc,
         )
 
     return TolerantPlanLoadResult(
-        parsed_plan=ParsedPlan(path=path, sections=sections, snapshot=_build_snapshot_from_sections(sections)),
+        parsed_plan=ParsedPlan(path=source_path, sections=sections, snapshot=_build_snapshot_from_sections(sections)),
         parse_error=None,
     )
+
+
+def load_plan_tolerant(path: Path) -> TolerantPlanLoadResult:
+    if not path.is_file():
+        raise _build_error(path, "plan file does not exist")
+
+    return parse_plan_text_tolerant(path.read_text(encoding="utf-8"), source_path=path)

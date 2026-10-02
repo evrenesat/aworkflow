@@ -52,6 +52,7 @@ export function StartupContextPanel({ context, mode, fallbackPlanPath = null, pl
     </>}
     {hasPlan && !checkpoint && context.total_checkpoints !== null && <p className="text-sm">{context.recorded_complete_checkpoints !== null ? `${context.recorded_complete_checkpoints} of ${context.total_checkpoints} checkpoints are marked complete in the plan.` : `The plan has ${context.total_checkpoints} checkpoints; a completion count is not available.`} Review the plan before starting another run.</p>}
     {!hasPlan && <p className="notice">{context.reason ?? 'The plan could not be read safely.'} {context.availability === 'partial' ? 'The available facts may be incomplete.' : ''}</p>}
+    {hasPlan && context.reason_codes.includes('inconsistent_checkpoint_state') && <p className="notice" role="alert">{context.reason ?? 'A completed checkpoint has unchecked tasks. Correct the plan before starting.'} Explicit recovery confirmation is required before starting.</p>}
     {context.availability === 'partial' && <p className="text-xs text-dim">This summary is partial; inspect the plan and earlier runs before acting.</p>}
     {context.selected_step && <p className="text-sm">{context.step_source === 'workflow_default' ? 'Configured starting step' : context.step_source === 'resume' ? 'Saved resume step' : 'Selected starting step'}: <strong>{formatMachineLabel(context.selected_step)}</strong>.</p>}
     {singleRelated && (recovery || active) && <div className="startup-context-related">

@@ -10,16 +10,22 @@ from types import SimpleNamespace
 
 import pytest
 
-from aflow.config import WorkflowConfig, WorkflowStepConfig, WorkflowUserConfig
-from aflow.api.models import PreparedRun, StartupRequest
-from aflow.api.startup import prepare_startup
+from aflow.config import (
+    HarnessProfileConfig,
+    WorkflowConfig,
+    WorkflowHarnessConfig,
+    WorkflowStepConfig,
+    WorkflowUserConfig,
+)
+from aflow.api.models import PreparedRun, StartupQuestion, StartupQuestionKind, StartupRequest
+from aflow.api.startup import PriorWorkStartupError, prepare_startup, prepare_startup_with_answer, StartupError
 from aflow.control_plane import LaunchManifest, RunRepository, create_launch_manifest, project_plan_startup_context
 from aflow.control_plane import startup_context as startup_module
 from aflow.control_plane.models import RunPage
 from aflow.control_plane.run_history import RunHistory
 from aflow.plan_backups import create_plan_identity, move_plan_identity, plan_identity_for_path
 from aflow.project_admission import ProjectAdmission
-from aflow.api.startup import PriorWorkStartupError, require_safe_fresh_worktree
+from aflow.api.startup import require_safe_fresh_worktree
 
 
 def _plan(repo: Path, body: str) -> Path:
@@ -141,7 +147,7 @@ def test_long_plan_keeps_exact_counts_and_late_next_checkpoint(tmp_path: Path) -
     ("body", "reason", "availability"),
     [
         ("# Notes\n- [ ] something\n", "non_checkpoint_plan", "not_applicable"),
-        ("### [x] Checkpoint 1: Broken\n- [ ] task\n", "inconsistent_checkpoint_state", "unavailable"),
+        ("### [x] Checkpoint 1: Broken\n- [ ] task\n", "inconsistent_checkpoint_state", "partial"),
     ],
 )
 def test_non_checkpoint_and_inconsistent_plan_are_not_invented(
@@ -152,8 +158,20 @@ def test_non_checkpoint_and_inconsistent_plan_are_not_invented(
     context = project_plan_startup_context(repo, path)
     assert context.availability == availability
     assert reason in context.reason_codes
-    assert context.next_checkpoint is None
-    assert context.total_checkpoints is None
+    if reason == "non_checkpoint_plan":
+        assert context.next_checkpoint is None
+        assert context.total_checkpoints is None
+    else:
+        # The inconsistent state is a display warning: the validated tolerant
+        # recovery facts are carried, never invented counts.
+        assert context.total_checkpoints == 1
+        assert context.next_checkpoint is not None
+        assert context.next_checkpoint.ordinal == 1
+        assert context.next_checkpoint.heading_checked is True
+        assert context.next_checkpoint.checked_tasks == 0
+        assert context.next_checkpoint.total_tasks == 1
+        assert context.pending_tasks == ("task",)
+        assert context.recorded_complete_checkpoints == 1
 
 
 def test_blank_task_text_retains_counts_but_omits_unreliable_text(tmp_path: Path) -> None:
@@ -387,6 +405,98 @@ def test_startup_guard_cannot_be_bypassed_by_step_or_dirty_ack(tmp_path: Path) -
     assert isinstance(implicit, PreparedRun)
     assert implicit.start_step == "alpha"
     assert implicit.start_step_explicit is False
+
+
+def test_inconsistent_plan_recovery_question_decline_and_confirm(tmp_path: Path) -> None:
+    repo, plan, worktree, base, workflow = _related_fixture(tmp_path)
+    workflow = replace(
+        workflow,
+        steps={
+            "alpha": WorkflowStepConfig(role="worker", prompts=("p",)),
+        },
+        first_step="alpha",
+    )
+    body = (
+        "# Plan\n## Git Tracking\n"
+        "- Plan Branch: `previous-branch`\n"
+        f"- Pre-Handoff Base HEAD: `{base}`\n"
+        "### [x] Checkpoint 1: Done\n- [x] task\n"
+        "### [x] Checkpoint 2: Broken\n- [ ] leftover task\n"
+    )
+    plan.write_text(body)
+
+    # The preview carries the tolerant recovery facts with the explicit
+    # warning, and with no prior work the recommendation is still start.
+    preview = _project_related(repo, plan, workflow)
+    assert preview.availability == "partial"
+    assert preview.reason_codes[0] == "inconsistent_checkpoint_state"
+    assert preview.recommendation == "start"
+    assert preview.next_checkpoint is not None
+    assert preview.next_checkpoint.ordinal == 2
+    assert preview.next_checkpoint.heading_checked is True
+    assert preview.pending_tasks == ("leftover task",)
+    assert preview.plan_revision is not None
+
+    # The daemon handoff / worker revalidation boundary admits a clean scan.
+    require_safe_fresh_worktree(repo, plan, workflow)
+
+    config = WorkflowUserConfig(
+        workflows={"managed": workflow},
+        harnesses={"test": WorkflowHarnessConfig(profiles={"default": HarnessProfileConfig(model="m")})},
+        roles={"worker": "test.default"},
+        prompts={"p": "do it"},
+    )
+    request = StartupRequest(
+        repo_root=repo, plan_path=plan, config_path=tmp_path / "config.toml",
+        workflow_config=config, workflow_name="managed",
+        start_step=None, max_turns=None, team=None,
+        extra_instructions=(), dirty_worktree_confirmed=True,
+    )
+    # Unconfirmed start reaches the existing explicit recovery question.
+    question = prepare_startup(request)
+    assert isinstance(question, StartupQuestion)
+    assert question.kind == StartupQuestionKind.CONFIRM_RECOVERY
+
+    # Decline stops.
+    with pytest.raises(StartupError) as declined:
+        prepare_startup_with_answer(question, request, False)
+    assert "recovery" in str(declined.value).lower() and "declined" in str(declined.value).lower()
+
+    # Confirmation prepares with retry evidence without rewriting the source.
+    original = plan.read_bytes()
+    prepared = prepare_startup_with_answer(question, request, True)
+    assert isinstance(prepared, PreparedRun)
+    assert prepared.startup_retry is not None
+    assert isinstance(prepared.startup_retry.parse_error_str, str)
+    assert prepared.startup_retry.parse_error_str
+    assert plan.read_bytes() == original
+
+    # Genuine prior dirty work still blocks even with confirmation.
+    (tmp_path / "second").mkdir()
+    second_repo, second_plan, second_worktree, second_base, _ = _related_fixture(
+        tmp_path / "second"
+    )
+    _record_previous(second_repo, second_plan, second_worktree)
+    (second_worktree / "implementation.py").write_text("work = True\n")
+    second_plan.write_text(
+        "# Plan\n## Git Tracking\n"
+        "- Plan Branch: `previous-branch`\n"
+        f"- Pre-Handoff Base HEAD: `{second_base}`\n"
+        "### [x] Checkpoint 1: Broken\n- [ ] leftover task\n"
+    )
+    second_request = StartupRequest(
+        repo_root=second_repo, plan_path=second_plan,
+        config_path=tmp_path / "second" / "config.toml",
+        workflow_config=config,
+        workflow_name="managed",
+        start_step=None, max_turns=None, team=None,
+        extra_instructions=(), dirty_worktree_confirmed=True,
+    )
+    with pytest.raises(PriorWorkStartupError) as blocked:
+        prepare_startup_with_answer(
+            prepare_startup(second_request), second_request, True
+        )
+    assert blocked.value.code == "prior_work_requires_recovery"
 
 
 def test_plan_only_dirt_is_not_implementation_work(tmp_path: Path) -> None:

@@ -51,7 +51,11 @@ and verified related-run facts. These are plan records, not approvals or
 executor progress. A valid partial plan with no explicit step begins at the
 live workflow default; an old saved step question still needs an explicit
 answer. Missing, invalid, or changed plan bytes are reported without invented
-checkpoint counts. An older server that omits context leaves the saved startup
+checkpoint counts. A plan whose checked checkpoint still has unchecked tasks
+is shown as partial with an explicit consistency warning and its recorded
+facts; the startup recommendation stays driven by the prior-work scan, and
+the existing explicit recovery confirmation is required before an agent
+starts. An older server that omits context leaves the saved startup
 question visible with a fallback explanation.
 
 A related run with unmerged or uncommitted implementation blocks a fresh
