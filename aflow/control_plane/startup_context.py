@@ -488,8 +488,17 @@ def project_startup_context(
     admission: ProjectAdmission | None = None,
     daemon: DaemonService | None = None,
     pending_run_id: str | None = None,
+    allow_unverified_starting_ref: bool = False,
 ) -> StartupContextSummary:
-    """Add bounded related-run evidence to the plan observation; never reconcile."""
+    """Add bounded related-run evidence to the plan observation; never reconcile.
+
+    With ``allow_unverified_starting_ref`` the missing configured starting
+    branch of a bootstrap-eligible (non-Git or unborn) checkout no longer
+    short-circuits the related-run scan. The scan then runs with an unresolved
+    starting commit, so every Git-dependent work classification stays unknown
+    and any retained candidate keeps the result blocked; only a scan with no
+    retained candidates at all can recommend starting.
+    """
     summary = project_plan_startup_context(repo_root, plan_path)
     if summary.availability in {"unavailable", "not_applicable"}:
         return replace(summary, recommendation="blocked", recommendation_reason=summary.reason)
@@ -519,7 +528,7 @@ def project_startup_context(
                        reason_codes=(*summary.reason_codes, "related_evidence_unavailable"))
     code, _ = _git(primary_root, "check-ref-format", "--branch", workflow.main_branch)
     starting_commit = _commit(primary_root, f"refs/heads/{workflow.main_branch}^{{commit}}") if code == 0 else None
-    if starting_commit is None:
+    if starting_commit is None and not allow_unverified_starting_ref:
         return replace(summary, availability="partial", related_runs_complete=False,
                        recommendation="blocked", recommendation_reason="The configured starting branch cannot be verified.",
                        reason_codes=(*summary.reason_codes, "starting_ref_unavailable"))

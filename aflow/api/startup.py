@@ -213,8 +213,25 @@ def require_safe_fresh_worktree(
         return
     from aflow.control_plane.startup_context import project_startup_context
 
+    # A supported non-Git directory (NOT_A_REPO) or unborn repository (UNBORN)
+    # has no initialized Git ref yet, so the Git-dependent starting-branch
+    # verification inside the projection cannot complete there. The lifecycle
+    # bootstrap owns the initial commit, so only that verification is deferred:
+    # the deferred projection scans the same retained run evidence and admits
+    # only a provably clean scan, and the lifecycle boundary re-runs the full
+    # Git-dependent prior-work decision after the verified initial commit and
+    # before a feature worktree is created or a normal worker executes. An
+    # established repository (READY) always keeps the strict guard, including
+    # the case where its configured starting branch is absent.
+    bootstrap_deferred = _lifecycle_is_bootstrap_eligible(
+        workflow, probe_repo_state(repo_root)
+    )
     context = project_startup_context(
-        repo_root, plan_path, workflow=workflow, pending_run_id=pending_run_id
+        repo_root,
+        plan_path,
+        workflow=workflow,
+        pending_run_id=pending_run_id,
+        allow_unverified_starting_ref=bootstrap_deferred,
     )
     if context.recommendation == "start":
         return

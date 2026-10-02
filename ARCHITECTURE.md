@@ -811,7 +811,15 @@ Entry point. Exposes three subcommands:
 For a fresh worktree start, startup preparation and the final execution boundary
 recheck bounded related-run evidence against the configured starting branch.
 Preserved or unverifiable earlier work returns `prior_work_requires_recovery` or
-`prior_work_unverified` before lifecycle setup. An explicit step or dirty-worktree
+`prior_work_unverified` before lifecycle setup. In the supported `NOT_A_REPO` or
+`UNBORN` bootstrap state the Git-dependent starting-branch verification cannot
+run yet: the guard scans the same retained run evidence with an unresolved
+starting ref, admits only a provably clean scan, and blocks unresolved or
+unreadable evidence before initialization; after the verified initial commit the
+lifecycle boundary re-runs the full Git-dependent prior-work decision before the
+feature worktree is created or a normal worker executes. An established
+repository with a missing configured starting branch keeps the strict
+rejection. An explicit step or dirty-worktree
 acknowledgement does not override this check; validated resumes and explicit
 current-checkout continuations retain their existing ownership paths.
 
@@ -1170,7 +1178,10 @@ startup/lifecycle preflight is strict and raises `WorktreeInspectionError`,
 because an unavailable status cannot be treated as a clean checkout. A
 lifecycle workflow in the supported `NOT_A_REPO` or `UNBORN` bootstrap state
 defers Git-dependent inspection until bootstrap creates the initial commit;
-the normal strict preflight then runs before lifecycle setup. Non-lifecycle
+retained prior-run evidence is still scanned before initialization and any
+unresolved or unreadable evidence blocks the start. After the verified initial
+commit the full Git-dependent prior-work decision is rechecked, and the normal
+strict preflight then runs before lifecycle setup. Non-lifecycle
 startup retains its established compatibility for directories outside Git.
 
 ### `status.py`

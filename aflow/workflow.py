@@ -6536,6 +6536,34 @@ def _lifecycle_is_bootstrap_eligible(wf: WorkflowConfig, repo_state: RepoState) 
     return bool(wf.setup) and repo_state in (RepoState.NOT_A_REPO, RepoState.UNBORN)
 
 
+def _lifecycle_recheck_prior_work(
+    repo_root: Path,
+    plan_path: Path,
+    wf: WorkflowConfig,
+    *,
+    pending_run_id: str | None,
+) -> None:
+    """Re-run the full Git-dependent prior-work decision after verified bootstrap.
+
+    Startup admission defers only the starting-ref part of the prior-work
+    decision for bootstrap-eligible checkouts. Once bootstrap has produced the
+    verified initial commit, this boundary rechecks the same retained-run
+    evidence against the initialized repository and must pass before the
+    feature worktree is created or a normal worker executes.
+    """
+    from .api.startup import PriorWorkStartupError, require_safe_fresh_worktree
+
+    try:
+        require_safe_fresh_worktree(
+            repo_root, plan_path, wf, pending_run_id=pending_run_id
+        )
+    except PriorWorkStartupError as exc:
+        raise WorkflowError(
+            f"lifecycle preflight: {exc.safe_message} [{exc.code}]",
+            failure_kind=exc.code,
+        ) from exc
+
+
 def _validate_current_branch_execution(
     repo_root: Path,
     wf: WorkflowConfig,
@@ -9100,6 +9128,16 @@ def _run_workflow_unchecked(
                     f"aflow: lifecycle bootstrap succeeded at '{config.repo_root}' "
                     f"on branch '{lifecycle_plan.main_branch}'",
                     file=sys.stderr,
+                )
+                # The bootstrap-eligible checkout deferred its Git-dependent
+                # prior-work decision at startup. Recheck it now, after the
+                # verified initial commit and before the feature worktree is
+                # created or any normal worker executes.
+                _lifecycle_recheck_prior_work(
+                    config.repo_root,
+                    original_plan_path,
+                    wf,
+                    pending_run_id=reserved_run_id,
                 )
             _lifecycle_preflight_git(
                 config.repo_root,

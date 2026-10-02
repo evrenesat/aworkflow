@@ -13346,6 +13346,66 @@ class LifecycleBootstrapTests(unittest.TestCase):
             rc, branches, _ = _run_git_in_test(['branch', '--list', 'aflow-*'], cwd=repo_root)
             assert not branches.strip(), 'no feature branch should be created after bootstrap AFLOW_STOP'
 
+    def test_post_bootstrap_prior_work_failure_prevents_feature_worktree(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repo_root = Path(tmpdir)
+            plan_path = repo_root / 'plan.md'
+            _write_plan(plan_path, _VALID_PLAN)
+            # Retained earlier-run evidence whose worktree no longer exists.
+            # Its pre-bootstrap classification stays unresolved, so after the
+            # verified bootstrap the lifecycle boundary must block the run
+            # before a feature worktree is created or a worker executes.
+            create_launch_manifest(repo_root, LaunchManifest(
+                run_id='previous-run', project_root=str(repo_root),
+                plan_path=str(plan_path), workflow_name='wt_wf', max_turns=3,
+            ))
+            previous_dir = repo_root / '.aflow' / 'runs' / 'previous-run'
+            previous_dir.mkdir(parents=True)
+            missing_worktree = repo_root.parent / 'missing-previous-worktree'
+            (previous_dir / 'run.json').write_text(json.dumps({
+                'schema_version': 1, 'status': 'failed', 'repo_root': str(repo_root),
+                'original_plan_path': str(plan_path), 'current_step_name': 'implement_plan',
+                'feature_branch': 'previous-branch', 'main_branch': 'main',
+                'worktree_path': str(missing_worktree),
+                'execution_repo_root': str(missing_worktree),
+                'failure_reason': 'Earlier work could not be located.',
+            }), encoding='utf-8')
+            wf_config = _make_worktree_wf_config(
+                main_branch='main',
+                worktree_root=str(repo_root.parent / 'worktrees'),
+            )
+            call_count: list[int] = [0]
+
+            def runner(argv, **kwargs):
+                call_count[0] += 1
+                cwd = Path(kwargs['cwd'])
+                subprocess.run(['git', 'init', '-b', 'main'], cwd=str(cwd), check=True, capture_output=True)
+                subprocess.run(['git', 'config', 'user.email', 'test@test.com'], cwd=str(cwd), check=True, capture_output=True)
+                subprocess.run(['git', 'config', 'user.name', 'Test'], cwd=str(cwd), check=True, capture_output=True)
+                (cwd / 'README.md').write_text('# Plan\n\nBootstrapped.\n', encoding='utf-8')
+                subprocess.run(['git', 'add', 'README.md'], cwd=str(cwd), check=True, capture_output=True)
+                subprocess.run(['git', 'commit', '-m', 'Initial commit'], cwd=str(cwd), check=True, capture_output=True)
+                return subprocess.CompletedProcess(argv, 0, 'bootstrap ok', '')
+
+            with pytest.raises(WorkflowError) as ctx:
+                run_workflow(
+                    ControllerConfig(repo_root=repo_root, plan_path=plan_path, max_turns=3),
+                    wf_config, 'wt_wf', config_dir=repo_root,
+                        snapshot_config=False,
+                    adapter=CodexAdapter(), runner=runner,
+                )
+            assert 'prior_work_unverified' in str(ctx.value)
+            assert call_count[0] == 1, 'only the bootstrap may run; no worker may execute'
+            run_dir = ctx.value.run_dir
+            assert run_dir is not None
+            run_json = json.loads((run_dir / 'run.json').read_text(encoding='utf-8'))
+            assert run_json['status'] == 'failed'
+            assert 'prior_work_unverified' in run_json['failure_reason']
+            rc, branches, _ = _run_git_in_test(['branch', '--list', 'aflow-*'], cwd=repo_root)
+            assert not branches.strip(), 'no feature branch may be created after prior-work failure'
+            rc, worktrees, _ = _run_git_in_test(['worktree', 'list', '--porcelain'], cwd=repo_root)
+            assert worktrees.strip().count('worktree ') == 1, 'no feature worktree may be created'
+
     def test_git_missing_lifecycle_fails_with_clear_bootstrap_error(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             repo_root = Path(tmpdir)

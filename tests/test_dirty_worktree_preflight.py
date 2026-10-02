@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import subprocess
 from pathlib import Path
 
@@ -11,8 +12,15 @@ from aflow.api.models import (
     StartupQuestionKind,
     StartupRequest,
 )
-from aflow.api.startup import StartupError, prepare_startup, prepare_startup_with_answer
+from aflow.api.startup import (
+    PriorWorkStartupError,
+    StartupError,
+    prepare_startup,
+    prepare_startup_with_answer,
+    require_safe_fresh_worktree,
+)
 from aflow.config import AflowSection, GoTransition, WorkflowConfig, WorkflowStepConfig, WorkflowUserConfig
+from aflow.control_plane import LaunchManifest, create_launch_manifest
 from aflow.git_status import (
     RepoState,
     WorktreeInspectionError,
@@ -20,12 +28,14 @@ from aflow.git_status import (
     classify_status_items_by_prefix,
     parse_porcelain_status,
     preflight_worktree,
+    probe_repo_state,
 )
 from aflow.workflow import (
     WorkflowError,
     _do_lifecycle_setup,
     _lifecycle_preflight,
     _lifecycle_preflight_git,
+    _lifecycle_recheck_prior_work,
 )
 
 
@@ -378,6 +388,210 @@ def test_lifecycle_startup_defers_git_inspection_for_bootstrap_directory(
     assert prepared.dirty_worktree_confirmed is False
 
 
+def test_lifecycle_startup_defers_git_inspection_for_unborn_repository(
+    tmp_path: Path,
+) -> None:
+    # A git repository that has been initialized but has no commit yet is
+    # bootstrap-eligible: the guard must defer the missing-HEAD rejection so
+    # preparation succeeds and the Git-dependent check runs after bootstrap.
+    repo = tmp_path / "unborn-project"
+    repo.mkdir()
+    _git(repo, "init", "-b", "main")
+    _git(repo, "config", "user.email", "test@example.invalid")
+    _git(repo, "config", "user.name", "AFlow test")
+    _git(repo, "config", "core.excludesFile", "/dev/null")
+    assert probe_repo_state(repo) is RepoState.UNBORN
+
+    plan = repo / "plans" / "in-progress" / "plan.md"
+    plan.parent.mkdir(parents=True)
+    plan.write_text(
+        "# Plan\n\n### [ ] Checkpoint 1: First\n- [ ] step one\n",
+        encoding="utf-8",
+    )
+
+    request = _startup_request(repo, plan, tmp_path / "worktrees")
+    workflow = request.workflow_config.workflows["test"]
+
+    # The fresh-worktree guard admits an unborn repository without a
+    # premature missing-HEAD rejection.
+    require_safe_fresh_worktree(repo, plan, workflow)
+
+    prepared = prepare_startup(request)
+
+    assert isinstance(prepared, PreparedRun)
+    assert prepared.dirty_worktree_confirmed is False
+
+
+def _make_bootstrap_repo(tmp_path: Path, name: str, *, unborn: bool) -> Path:
+    repo = tmp_path / name
+    repo.mkdir()
+    if unborn:
+        _git(repo, "init", "-b", "main")
+        _git(repo, "config", "user.email", "test@example.invalid")
+        _git(repo, "config", "user.name", "AFlow test")
+        _git(repo, "config", "core.excludesFile", "/dev/null")
+        assert probe_repo_state(repo) is RepoState.UNBORN
+    else:
+        assert probe_repo_state(repo) is RepoState.NOT_A_REPO
+    return repo
+
+
+def _bootstrap_plan(repo: Path) -> Path:
+    plan = repo / "plans" / "in-progress" / "plan.md"
+    plan.parent.mkdir(parents=True)
+    plan.write_text(
+        "# Plan\n\n### [ ] Checkpoint 1: First\n- [ ] step one\n",
+        encoding="utf-8",
+    )
+    return plan
+
+
+def _seed_retained_run(repo: Path, plan: Path, *, run_id: str = "previous-run") -> Path:
+    """Seed retained earlier-run evidence whose worktree no longer exists."""
+    missing_worktree = repo.parent / f"{run_id}-worktree"
+    create_launch_manifest(repo, LaunchManifest(
+        run_id=run_id, project_root=str(repo), plan_path=str(plan),
+        workflow_name="checkpoint_delivery", max_turns=5,
+    ))
+    run_dir = repo / ".aflow" / "runs" / run_id
+    run_dir.mkdir(parents=True, exist_ok=True)
+    (run_dir / "run.json").write_text(json.dumps({
+        "schema_version": 1, "status": "failed", "repo_root": str(repo),
+        "original_plan_path": str(plan), "current_step_name": "implement_plan",
+        "feature_branch": "previous-branch", "main_branch": "main",
+        "worktree_path": str(missing_worktree),
+        "execution_repo_root": str(missing_worktree),
+        "failure_reason": "Retained earlier work could not be located.",
+    }), encoding="utf-8")
+    return run_dir
+
+
+def test_fresh_worktree_guard_admits_clean_bootstrap_projects(tmp_path: Path) -> None:
+    workflow = _lifecycle_workflow()
+    for name, unborn in (("plain-project", False), ("unborn-project", True)):
+        repo = _make_bootstrap_repo(tmp_path, name, unborn=unborn)
+        plan = _bootstrap_plan(repo)
+        # No retained run evidence exists, so the deferred scan is provably
+        # clean and the guard admits the project before initialization.
+        require_safe_fresh_worktree(repo, plan, workflow)
+
+
+def test_bootstrap_guard_blocks_retained_evidence_before_initialization(
+    tmp_path: Path,
+) -> None:
+    workflow = _lifecycle_workflow()
+
+    unborn = _make_bootstrap_repo(tmp_path, "unborn-project", unborn=True)
+    unborn_plan = _bootstrap_plan(unborn)
+    _seed_retained_run(unborn, unborn_plan)
+    with pytest.raises(PriorWorkStartupError) as unresolved:
+        require_safe_fresh_worktree(unborn, unborn_plan, workflow)
+    assert unresolved.value.code == "prior_work_unverified"
+
+    # Unreadable retained evidence must also block before initialization.
+    (unborn / ".aflow" / "runs" / "previous-run" / "run.json").write_text(
+        "{invalid", encoding="utf-8"
+    )
+    with pytest.raises(PriorWorkStartupError) as unreadable:
+        require_safe_fresh_worktree(unborn, unborn_plan, workflow)
+    assert unreadable.value.code == "prior_work_unverified"
+    assert probe_repo_state(unborn) is RepoState.UNBORN
+
+    plain = _make_bootstrap_repo(tmp_path, "plain-project", unborn=False)
+    plain_plan = _bootstrap_plan(plain)
+    _seed_retained_run(plain, plain_plan)
+    with pytest.raises(PriorWorkStartupError) as plain_blocked:
+        require_safe_fresh_worktree(plain, plain_plan, workflow)
+    assert plain_blocked.value.code == "prior_work_unverified"
+    assert probe_repo_state(plain) is RepoState.NOT_A_REPO
+
+
+def test_established_missing_starting_ref_still_rejects(tmp_path: Path) -> None:
+    repo = _make_repo(tmp_path)
+    plan = repo / "plans" / "in-progress" / "plan.md"
+    plan.parent.mkdir(parents=True)
+    plan.write_text(
+        "# Plan\n\n### [ ] Checkpoint 1: First\n- [ ] step one\n",
+        encoding="utf-8",
+    )
+    _git(repo, "add", "plans")
+    _git(repo, "commit", "-m", "plan")
+    _git(repo, "branch", "-m", "main", "renamed-main")
+    assert probe_repo_state(repo) is RepoState.READY
+
+    with pytest.raises(PriorWorkStartupError) as missing:
+        require_safe_fresh_worktree(repo, plan, _lifecycle_workflow())
+    assert missing.value.code == "prior_work_unverified"
+
+
+def test_bootstrap_deferred_sequence_admits_clean_project_and_sets_up(
+    tmp_path: Path,
+) -> None:
+    repo = _make_bootstrap_repo(tmp_path, "new-project", unborn=False)
+    plan = _bootstrap_plan(repo)
+    workflow = _lifecycle_workflow()
+    aflow = AflowSection(default_workflow="test", worktree_root=str(tmp_path / "worktrees"))
+
+    require_safe_fresh_worktree(repo, plan, workflow)
+    lifecycle = _lifecycle_preflight(
+        repo, plan, workflow, aflow, RepoState.NOT_A_REPO, skip_phase_b=True
+    )
+    assert lifecycle is not None
+
+    # The lifecycle bootstrap owns exactly one initialization; afterwards the
+    # full Git-dependent prior-work decision passes for a provably clean scan.
+    _git(repo, "init", "-b", "main")
+    _git(repo, "config", "user.email", "test@example.invalid")
+    _git(repo, "config", "user.name", "AFlow test")
+    _git(repo, "config", "core.excludesFile", "/dev/null")
+    (repo / "README.md").write_text("bootstrapped\n", encoding="utf-8")
+    _git(repo, "add", "README.md")
+    _git(repo, "commit", "-m", "initial")
+    assert probe_repo_state(repo) is RepoState.READY
+
+    _lifecycle_recheck_prior_work(repo, plan, workflow, pending_run_id=None)
+    _lifecycle_preflight_git(
+        repo,
+        lifecycle.main_branch,
+        lifecycle.feature_branch,
+        True,
+        lifecycle.worktree_path,
+        allow_untracked=True,
+    )
+    execution = _do_lifecycle_setup(repo, lifecycle)
+    try:
+        assert execution.execution_repo_root == lifecycle.worktree_path
+        assert execution.execution_repo_root.is_dir()
+    finally:
+        _git(repo, "worktree", "remove", "--force", str(execution.execution_repo_root), check=False)
+        _git(repo, "branch", "-D", lifecycle.feature_branch, check=False)
+
+
+def test_post_bootstrap_prior_work_failure_prevents_feature_worktree(
+    tmp_path: Path,
+) -> None:
+    repo = _make_repo(tmp_path)
+    plan = repo / "plans" / "in-progress" / "plan.md"
+    plan.parent.mkdir(parents=True)
+    plan.write_text(
+        "# Plan\n\n### [ ] Checkpoint 1: First\n- [ ] step one\n",
+        encoding="utf-8",
+    )
+    _git(repo, "add", "plans")
+    _git(repo, "commit", "-m", "plan")
+    _seed_retained_run(repo, plan)
+    workflow = _lifecycle_workflow()
+    aflow = AflowSection(default_workflow="test", worktree_root=str(tmp_path / "worktrees"))
+    lifecycle = _lifecycle_preflight(repo, plan, workflow, aflow, RepoState.READY)
+
+    with pytest.raises(WorkflowError, match="prior_work_unverified"):
+        _lifecycle_recheck_prior_work(repo, plan, workflow, pending_run_id=None)
+    registered = _git(repo, "worktree", "list").stdout
+    assert str(lifecycle.worktree_path) not in registered
+    worktree_root = tmp_path / "worktrees"
+    assert not worktree_root.exists() or not any(worktree_root.iterdir())
+
+
 def test_lifecycle_startup_keeps_existing_checkout_inspection_errors_strict(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -424,6 +638,12 @@ def test_acknowledgment_survives_prepared_daemon_and_runner_handoffs(
         extra_instructions=(),
         start_step="step",
         dirty_worktree_confirmed=True,
+    )
+    # A real prepared run passed plan validation, so the handoff guard can
+    # observe the exact plan; only its prior-work evidence decision remains.
+    prepared.plan_path.write_text(
+        "# Plan\n\n### [ ] Checkpoint 1: First\n- [ ] step one\n",
+        encoding="utf-8",
     )
 
     payload = _prepared_payload(prepared)
