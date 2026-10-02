@@ -28,6 +28,13 @@ At run start, `aflow` prints the new run ID immediately. Resumed runs also show 
 Before a fresh worktree executes, AFlow checks related run and Git evidence
 against the configured starting branch. Preserved earlier implementation or
 uncertain evidence blocks a new worktree with a recovery or inspection reason.
+For a supported non-Git directory or unborn repository the guard defers only
+the Git-dependent starting-branch verification: the retained-run evidence scan
+still runs before initialization and fails closed on unresolved or unreadable
+evidence, and the full Git-dependent decision re-runs after the verified
+initial commit and before a feature worktree is created. An established
+repository with a missing configured starting branch keeps the strict
+rejection.
 A recorded run stays associated with its plan after the plan moves through its
 lifecycle (for example in-progress to failed). Identity authority: an explicit
 valid run identity equal to the current plan identity is an exact match; an

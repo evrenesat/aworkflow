@@ -1,5 +1,48 @@
 # DEVLOG
 
+## 2026-10-02 — Preserve bootstrap ordering and verify the complete startup journey
+
+- The fresh-worktree prior-work guard now defers only the Git-dependent
+  starting-branch verification for supported non-Git directories and unborn
+  repositories. The retained-run evidence scan still runs before
+  initialization and fails closed on unresolved or unreadable evidence; the
+  full Git-dependent decision re-runs after the verified initial commit and
+  before a feature worktree is created or a normal worker executes.
+  Established repositories keep the strict guard, including a missing
+  configured starting branch. The boundary is documented in
+  `ARCHITECTURE.md` and `docs/runtime-behavior.md`.
+- Focused bootstrap tests cover a plain non-Git directory and an unborn
+  repository reaching preparation once, retained and unreadable evidence
+  blocking before initialization, the post-bootstrap recheck failing before
+  any feature worktree is created, and the established missing-ref rejection.
+- Added a real-browser decline journey
+  (`test_inconsistent_plan_recovery_decline_stops_without_starting`): the
+  inconsistent-plan warning and recovery question are shown, declining stops
+  with `needs_attention` and the `Startup recovery declined` record, no worker
+  starts, and the plan source bytes stay unchanged. The existing journeys
+  cover the confirmation without rewrite and the preserved-work block.
+- Visual matrix screenshots (desktop/mobile, light/dark, Chromium and WebKit)
+  were captured and the guideline geometry assertions passed: two-row header
+  within 112px with content starting by 128px on desktop, mobile menu and
+  list/detail/Back, no horizontal overflow, no unauthorized scrollers,
+  primary controls at least 43px tall, document scrolling, focus and scroll
+  retention across passive refresh, and text enlargement. Physical-device
+  keyboard/browser-toolbar acceptance remains owner pending.
+- Verification: from the repository root, `uv run pytest -q
+  tests/test_startup_context.py tests/test_plan_backups.py
+  tests/test_plan_lifecycle.py tests/test_dirty_worktree_preflight.py
+  tests/test_library_api.py tests/test_cli.py tests/test_aflowd.py
+  tests/test_project_admission.py tests/test_control_plane_resume.py
+  tests/test_resume_pending_review.py tests/test_live_config_runtime.py`
+  (435 passed, 147 subtests); `npm --prefix apps/aflow_app/web test -- --run`
+  (691 passed) and `npm --prefix apps/aflow_app/web run build` (clean); from
+  `apps/aflow_app/server`, `uv run pytest -q tests/test_control_plane_api.py
+  tests/test_mcp.py tests/test_startup_context_browser.py
+  tests/test_plan_startup_browser.py tests/test_responsive_browser.py`
+  (196 passed, Chromium) and the same with `AFLOW_TEST_BROWSER=webkit` on the
+  three browser modules (53 passed). `git diff --check` is clean. Changes are
+  left uncommitted for review.
+
 ## 2026-10-01 — Preserve ambiguous concierge create intent (Checkpoint 4 review fix)
 
 - A local `create_plan` timeout did not cancel the server request, but the

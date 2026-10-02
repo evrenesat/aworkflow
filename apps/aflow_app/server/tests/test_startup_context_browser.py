@@ -256,6 +256,64 @@ def test_inconsistent_plan_reaches_recovery_question_and_confirms_without_rewrit
             browser.close()
 
 
+def test_inconsistent_plan_recovery_decline_stops_without_starting(
+    control_client, monkeypatch,
+) -> None:
+    client, root, units, _ = control_client
+    plan = root / PLAN_PATH
+    plan.parent.mkdir(parents=True, exist_ok=True)
+    plan.write_text(
+        "# Inconsistent browser plan\n\n"
+        "### [x] Checkpoint 1: Done\n- [x] task\n\n"
+        "### [x] Checkpoint 2: Broken\n- [ ] leftover task\n",
+        encoding="utf-8",
+    )
+    _commit_fixture_repository(root)
+    workflow_path = root.parent / "global" / "workflows.toml"
+    workflow_path.write_text(
+        "[workflow.managed.steps.implement]\nrole = \"worker\"\n"
+        "prompts = [\"p\"]\ngo = [{ to = \"END\", when = \"DONE\" }]\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("AFLOW_APP_WEB_DIST", str(Path(__file__).resolve().parents[2] / "web" / "dist"))
+    original = plan.read_bytes()
+
+    with live_server() as url, sync_playwright() as playwright:
+        browser = _browser(playwright)
+        try:
+            page = browser.new_page(viewport={"width": 1280, "height": 720})
+            _login(page, url)
+            _open_new_run(page, url)
+            panel = page.get_by_role("region", name="Startup context preparation")
+            expect(panel.get_by_role("alert")).to_contain_text(
+                "A completed checkpoint has unchecked tasks. Correct the plan before starting."
+            )
+            page.get_by_role("button", name="Review start\u2026", exact=True).click()
+            page.get_by_role("button", name="Start run", exact=True).click()
+            question = page.get_by_role("region", name="Startup question")
+            expect(question).to_contain_text("Plan checkpoint state is inconsistent")
+            assert units.start_calls == []
+
+            # Decline stops: no worker starts and the plan source is untouched.
+            question.get_by_role("button", name="Decline and stop").click()
+            expect(page.get_by_role("alert").filter(has_text="Startup recovery declined")).to_be_visible()
+            assert units.start_calls == []
+            assert plan.read_bytes() == original
+
+            # The run records the declined recovery as needs_attention.
+            rows = client.get(f"/api/control-plane/projects/{PROJECT_ID}/runs").json()["runs"]
+            declined = [row for row in rows if row["status"] == "needs_attention"]
+            assert len(declined) == 1
+            detail = client.get(
+                f"/api/control-plane/projects/{PROJECT_ID}/runs/{declined[0]['run_id']}"
+            ).json()
+            failure = (detail.get("evidence") or {}).get("startup_failure") or {}
+            assert failure.get("message") == "Startup recovery declined"
+            assert units.start_calls == []
+        finally:
+            browser.close()
+
+
 def test_previous_dirty_work_blocks_start_and_cancel_opens_exact_run(
     control_client, monkeypatch,
 ) -> None:
