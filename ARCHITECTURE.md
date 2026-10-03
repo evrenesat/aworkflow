@@ -1906,7 +1906,30 @@ is selected by the saved conditions and stops matching when only
 authoritative. `NEW_PLAN_EXISTS=true` binds an existing owned repair overlay to
 the recorded new path, which the successor uses as its active plan; the
 before-turn active overlay and after-turn new overlay are separate identities.
-A missing `review_rejection` credit is not an error and is never fabricated.
+Each identity is validated against its own exact boundary evidence: the
+after-turn new path must equal the canonical recorded new plan; the canonical
+terminal active must equal the controller's post-transition selection
+(`NEW_PLAN_EXISTS` overlay, preserve-active, or original fallback) recomputed
+from the finalized receipt; and the finalized turn's starting active must be
+provable from ordered boundary evidence: the canonical original for a fresh
+run's first turn, the exact continuation identity derived from the recorded
+`resumed_from_run_id` predecessor for a resumed run's first turn (the overlay
+its last finalized turn created, otherwise the plan that turn started from —
+the same continuation semantics the bootstrap applies, bound to the same
+original plan, workflow and execution workspace, with the predecessor's own
+terminal active reconciled against its last receipt: a validated
+budget-driven END is a legitimate predecessor-invocation terminal and
+reconciles through the same budget-END edge semantics, while an END never
+qualifies as a previous turn within one invocation and any non-budget or
+contradicted END rejects), or exactly the
+post-transition selection recomputed from the previous turn's receipt (a
+retry-scheduled predecessor replays its own active). Occurrence in recorded
+history never proves a path was active for the finalized turn, so reserved
+new paths and older overlays are admitted only through those derivations,
+and missing, cyclic or contradictory lineage, reserved-new substitution,
+stale-overlay substitution, and unrelated paths reject before any successor
+reservation or provider launch. A missing `review_rejection` credit is not
+an error and is never fabricated.
 
 The validated descriptor rides in `ResumeContext.budget_continuation`, distinct
 from the generic incomplete manager-boundary replay. The successor re-selects only the

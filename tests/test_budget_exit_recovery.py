@@ -704,6 +704,13 @@ _HISTORICAL_MERGE_REASON = (
     + "2 path(s) unclean: plans/in-progress/plan.md, src/app.py"
 )
 
+# The supported budget-driven END predecessor graph: the final reviewer's
+# ordered routing selects the MAX_TURNS_REACHED END first, so a reviewer
+# turn that exhausts the budget exits through that END.  This is the same
+# graph the historical fixtures run, which keeps the historical budget-END
+# evidence and this lineage on one validated shape.
+_FINAL_REVIEW_BUDGET_END_WORKFLOWS = _HISTORICAL_WORKFLOWS
+
 
 class PromptRecordingAdapter(RecordingAdapter):
     """Records each user prompt so successor prompts can be asserted."""
@@ -803,6 +810,219 @@ def _make_source_pre_turn_cap(root: Path, *, plan_text: str = _COMPLETE_PLAN):
     assert result.status == "completed"
     assert result.end_reason == "max_turns_reached"
     return repo_root, plan_path, config_path, result
+
+
+def _make_source_single_step(root: Path):
+    """Run the single-step workflow to a pre-turn budget cap (incomplete).
+
+    The graph is ``work -> END when DONE || MAX_TURNS_REACHED`` followed by an
+    unconditional ``work`` fallback.  An incomplete one-turn budget exit from
+    this graph must be admitted as a budget exit that resumes ``work``.
+    """
+    repo_root, plan_path = _make_repo(root)
+    worktree_root = root / "worktrees"
+    worktree_root.mkdir()
+    config_path = _write_budget_config(
+        root / "config",
+        max_turns=1,
+        worktree_root=worktree_root,
+        workflows_text=_SINGLE_STEP_WORKFLOWS,
+    )
+
+    def source_runner(argv, **kwargs):
+        cwd = Path(kwargs["cwd"])
+        _write_plan(_plan_path_in(cwd), _CHANGED_INCOMPLETE_PLAN)
+        return subprocess.CompletedProcess(argv, 0, "ok", "")
+
+    with _DeliverySpies() as spies:
+        result = _run_budget(
+            config_path, repo_root, plan_path, source_runner, max_turns=1,
+        )
+    spies.assert_no_delivery()
+    assert result.status == "completed"
+    assert result.end_reason == "max_turns_reached"
+    return repo_root, plan_path, config_path, result
+
+
+def _bootstrap_with_args(
+    repo_root: Path, config_path: Path, wf_config, run_id: str,
+    *, max_turns_arg: int | None = None,
+):
+    """The production bootstrap with an optional explicit invocation limit."""
+    return _bootstrap_resume_invocation(
+        repo_root=repo_root,
+        config_path=config_path,
+        default_config_path=config_path,
+        config_path_is_explicit=True,
+        workflow_config=wf_config,
+        requested_run_id=run_id,
+        workflow_arg=None,
+        plan_file_arg=None,
+        team_arg=None,
+        start_step_arg=None,
+        max_turns_arg=max_turns_arg,
+        extra_instructions_arg=(),
+        extra_instructions_provided=False,
+        live_loader=load_workflow_config,
+    )
+
+
+def test_single_step_budget_exit_starts_work(tmp_path: Path) -> None:
+    """An incomplete one-turn budget exit resumes work and then delivers."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        root = Path(tmpdir)
+        repo_root, plan_path, config_path, result = _make_source_single_step(root)
+        source_dir = result.run_dir
+        source_before = _run_dir_bytes(source_dir)
+
+        boundary = _classify(source_dir, config_path, repo_root)
+        assert isinstance(boundary, BudgetBoundary)
+        assert boundary.kind == "budget_exit"
+        assert boundary.next_step_name == "work"
+        assert boundary.saved_max_turns == 1
+
+        bootstrap = _real_bootstrap(
+            repo_root, config_path, load_workflow_config(config_path),
+            source_dir.name,
+        )
+        assert bootstrap.start_step == "work"
+        assert bootstrap.max_turns == 1
+        context = bootstrap.resume_context
+        assert isinstance(context.budget_continuation, BudgetBoundary)
+        assert context.budget_continuation.kind == "budget_exit"
+        assert context.interrupted_step_name == "work"
+
+        def successor_runner(argv, **kwargs):
+            cwd = Path(kwargs["cwd"])
+            _write_plan(_plan_path_in(cwd), _COMPLETE_PLAN)
+            return subprocess.CompletedProcess(argv, 0, "ok", "")
+
+        with _DeliverySpies() as spies:
+            successor = _run_budget(
+                config_path,
+                repo_root,
+                bootstrap.plan_path,
+                successor_runner,
+                max_turns=bootstrap.max_turns,
+                resume=context,
+            )
+
+        # The successor ran the pending work step first and then delivered.
+        assert successor.status == "completed"
+        assert successor.end_reason == "done"
+        assert successor.run_dir != source_dir
+        turn1 = json.loads(
+            (successor.run_dir / "turns" / "turn-001" / "result.json").read_text(encoding="utf-8")
+        )
+        assert turn1["step_name"] == "work"
+        assert spies.merge_calls == 1
+        assert spies.deliver_calls == 1
+        # The source run stayed byte-identical.
+        assert _run_dir_bytes(source_dir) == source_before
+
+
+def test_single_step_incompatible_saved_end_evidence_rejects(tmp_path: Path) -> None:
+    """A saved END condition that does not identify its edge rejects."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        root = Path(tmpdir)
+        repo_root, plan_path, config_path, result = _make_source_single_step(root)
+        source_dir = result.run_dir
+        receipt_path = source_dir / "turns" / "turn-001" / "result.json"
+        original = receipt_path.read_bytes()
+
+        # Baseline: the intact single-step budget exit is admitted.
+        assert _classify(source_dir, config_path, repo_root) is not None
+
+        # A saved END condition no graph edge carries is incompatible evidence:
+        # it must not be admitted as an unordered substitute for the configured
+        # first-match routing contract.
+        receipt = json.loads(original.decode(encoding="utf-8"))
+        receipt["chosen_transition_condition"] = "MAX_TURNS_REACHED"
+        receipt_path.write_text(json.dumps(receipt), encoding="utf-8")
+        try:
+            assert _classify(source_dir, config_path, repo_root) is None
+        finally:
+            receipt_path.write_bytes(original)
+        assert _classify(source_dir, config_path, repo_root) is not None
+
+
+def test_budget_provenance_default_explicit_and_invocation(tmp_path: Path) -> None:
+    """Successor budget provenance follows saved/invocation/default precedence.
+
+    A default-derived saved limit falls through to the current live default
+    (so future default changes keep working); an explicit saved limit and an
+    explicit new invocation limit are honored with explicit provenance.
+    """
+    with tempfile.TemporaryDirectory() as tmpdir:
+        root = Path(tmpdir)
+        repo_root, plan_path, config_path, result = _make_source_single_step(root)
+        source_dir = result.run_dir
+        run_json_path = source_dir / "run.json"
+
+        def set_saved(explicit: bool) -> None:
+            run_json = json.loads(run_json_path.read_text(encoding="utf-8"))
+            run_json["max_turns"] = 1
+            run_json["max_turns_explicit"] = explicit
+            run_json_path.write_text(json.dumps(run_json), encoding="utf-8")
+
+        # Live default changes to 7 for the successor.
+        live_config = _write_budget_config(
+            root / "config",
+            max_turns=7,
+            worktree_root=root / "worktrees",
+            workflows_text=_SINGLE_STEP_WORKFLOWS,
+        )
+
+        # Default-derived saved limit 1 with live default 7 -> successor 7,
+        # default provenance (not explicit).
+        set_saved(False)
+        bootstrap = _real_bootstrap(
+            repo_root, live_config, load_workflow_config(live_config),
+            source_dir.name,
+        )
+        assert bootstrap.max_turns == 7
+        assert bootstrap.max_turns_explicit is False
+
+        # The successor effective limit is the live default, not the saved 1.
+        context = bootstrap.resume_context
+
+        def successor_runner(argv, **kwargs):
+            cwd = Path(kwargs["cwd"])
+            _write_plan(_plan_path_in(cwd), _COMPLETE_PLAN)
+            return subprocess.CompletedProcess(argv, 0, "ok", "")
+
+        with _DeliverySpies():
+            successor = _run_budget(
+                live_config,
+                repo_root,
+                bootstrap.plan_path,
+                successor_runner,
+                max_turns=bootstrap.max_turns,
+                resume=context,
+            )
+        assert json.loads(
+            (successor.run_dir / "run.json").read_text(encoding="utf-8")
+        )["effective_max_turns"] == 7
+        assert successor.status == "completed"
+
+        # Explicit saved limit 1 with live default 7 -> successor stays 1,
+        # explicit provenance preserved (no silent increase).
+        set_saved(True)
+        bootstrap = _real_bootstrap(
+            repo_root, live_config, load_workflow_config(live_config),
+            source_dir.name,
+        )
+        assert bootstrap.max_turns == 1
+        assert bootstrap.max_turns_explicit is True
+
+        # Explicit new invocation limit 5 -> successor 5, explicit provenance.
+        set_saved(False)
+        bootstrap = _bootstrap_with_args(
+            repo_root, live_config, load_workflow_config(live_config),
+            source_dir.name, max_turns_arg=5,
+        )
+        assert bootstrap.max_turns == 5
+        assert bootstrap.max_turns_explicit is True
 
 
 def test_explicit_resume_of_pre_turn_cap_starts_review_first(tmp_path: Path) -> None:
@@ -978,6 +1198,754 @@ def test_explicit_resume_of_reviewer_overlay_starts_repair(tmp_path: Path) -> No
         assert spies2.merge_calls == 1
         assert spies2.deliver_calls == 1
         # The source run stayed byte-identical.
+        assert _run_dir_bytes(source_dir) == source_before
+
+
+def test_cap_on_repair_turn_started_from_overlay_classifies(tmp_path: Path) -> None:
+    """A capped turn that provably started from a prior overlay admits.
+
+    The reviewer turn created the repair overlay (NEW_PLAN_EXISTS), so the
+    next work turn starts from that overlay.  Capping on the repair turn must
+    classify with the overlay as the boundary active plan: the ordered
+    predecessor evidence derives exactly that start identity, while the
+    before-turn/after-turn identities of the preceding reviewer receipt stay
+    distinct (original vs overlay).
+    """
+    with tempfile.TemporaryDirectory() as tmpdir:
+        root = Path(tmpdir)
+        repo_root, plan_path = _make_repo(root)
+        worktree_root = root / "worktrees"
+        worktree_root.mkdir()
+        config_path = _write_budget_config(
+            root / "config",
+            max_turns=3,
+            worktree_root=worktree_root,
+            workflows_text=_FINAL_REVIEW_WORKFLOWS,
+        )
+        turns = 0
+
+        def source_runner(argv, **kwargs):
+            nonlocal turns
+            turns += 1
+            cwd = Path(kwargs["cwd"])
+            if turns == 1:
+                _write_plan(_plan_path_in(cwd), _COMPLETE_PLAN)
+            elif turns == 2:
+                _write_plan(
+                    cwd / "plans" / "in-progress" / "plan-cp01-v01.md",
+                    _REPAIR_PLAN,
+                )
+            return subprocess.CompletedProcess(argv, 0, "ok", "")
+
+        with _DeliverySpies() as spies:
+            result = _run_budget(
+                config_path, repo_root, plan_path, source_runner, max_turns=3,
+            )
+        spies.assert_no_delivery()
+        assert turns == 3
+        assert result.status == "completed"
+        assert result.end_reason == "max_turns_reached"
+
+        source_dir = result.run_dir
+        run_json = json.loads(
+            (source_dir / "run.json").read_text(encoding="utf-8")
+        )
+        overlay = repo_root / "plans" / "in-progress" / "plan-cp01-v01.md"
+        reserved_next = repo_root / "plans" / "in-progress" / "plan-cp01-v02.md"
+        # The finalized work turn started from the reviewer's overlay; with
+        # no new overlay that turn, the terminal record fell back to the
+        # original plan and reserved the next follow-up path.
+        assert run_json["active_plan_path"] == str(plan_path)
+        assert run_json["new_plan_path"] == str(reserved_next)
+        reviewer_receipt = json.loads(
+            (source_dir / "turns" / "turn-002" / "result.json").read_text(
+                encoding="utf-8"
+            )
+        )
+        assert reviewer_receipt["active_plan_path"] == str(plan_path)
+        assert reviewer_receipt["new_plan_path"] == str(overlay)
+        assert reviewer_receipt["conditions"]["NEW_PLAN_EXISTS"] is True
+        repair_receipt = json.loads(
+            (source_dir / "turns" / "turn-003" / "result.json").read_text(
+                encoding="utf-8"
+            )
+        )
+        assert repair_receipt["active_plan_path"] == str(overlay)
+        assert repair_receipt["new_plan_path"] == str(reserved_next)
+        assert repair_receipt["conditions"]["NEW_PLAN_EXISTS"] is False
+
+        boundary = _classify(source_dir, config_path, repo_root)
+        assert isinstance(boundary, BudgetBoundary)
+        assert boundary.kind == "budget_exit"
+        assert boundary.new_plan_exists is False
+        assert boundary.active_plan_path == overlay
+        assert boundary.overlay_path is None
+        assert boundary.original_plan_path == plan_path
+
+        # The full bootstrap admits the same boundary and starts the pending
+        # final review from the overlay the repair turn started from.
+        bootstrap = _real_bootstrap(
+            repo_root, config_path, load_workflow_config(config_path),
+            source_dir.name,
+        )
+        assert bootstrap.start_step == "final_review"
+        assert bootstrap.resume_context.active_plan_path == overlay
+
+
+def _make_inherited_overlay_successor(
+    root: Path, *, budget_end_source: bool = False
+):
+    """Run the two-controller lineage to the blocked inherited-start shape.
+
+    The source run completes the original ledger and its final reviewer
+    creates ``plan-cp01-v01.md`` before capping.  With ``budget_end_source``
+    that reviewer turn exits through the supported budget-driven END edge
+    (ordered MAX_TURNS_REACHED first); otherwise it selects the nonterminal
+    repair edge.  The explicit bootstrap resumes either source with a single
+    repair turn; that successor starts from the inherited overlay, caps, and
+    leaves the pending final review blocked behind the first-turn identity
+    evidence.
+    """
+    repo_root, plan_path = _make_repo(root)
+    worktree_root = root / "worktrees"
+    worktree_root.mkdir()
+    config_path = _write_budget_config(
+        root / "config",
+        max_turns=2,
+        worktree_root=worktree_root,
+        workflows_text=(
+            _FINAL_REVIEW_BUDGET_END_WORKFLOWS
+            if budget_end_source
+            else _FINAL_REVIEW_WORKFLOWS
+        ),
+    )
+    turns = 0
+
+    def source_runner(argv, **kwargs):
+        nonlocal turns
+        turns += 1
+        cwd = Path(kwargs["cwd"])
+        if turns == 1:
+            _write_plan(_plan_path_in(cwd), _COMPLETE_PLAN)
+        else:
+            _write_plan(
+                cwd / "plans" / "in-progress" / "plan-cp01-v01.md",
+                _REPAIR_PLAN,
+            )
+        return subprocess.CompletedProcess(argv, 0, "ok", "")
+
+    with _DeliverySpies() as spies:
+        source = _run_budget(
+            config_path, repo_root, plan_path, source_runner, max_turns=2,
+        )
+    spies.assert_no_delivery()
+    assert source.status == "completed"
+    assert source.end_reason == "max_turns_reached"
+
+    boot = _bootstrap_with_args(
+        repo_root, config_path, load_workflow_config(config_path),
+        source.run_dir.name, max_turns_arg=1,
+    )
+    assert boot.start_step == "work"
+    assert boot.resume_context.active_plan_path.name == "plan-cp01-v01.md"
+
+    def repair_runner(argv, **kwargs):
+        # The repair worker runs once from the overlay and leaves the pending
+        # review in place.
+        return subprocess.CompletedProcess(argv, 0, "ok", "")
+
+    with _DeliverySpies() as repair_spies:
+        successor = _run_budget(
+            config_path, repo_root, boot.plan_path, repair_runner,
+            max_turns=boot.max_turns, resume=boot.resume_context,
+        )
+    repair_spies.assert_no_delivery()
+    assert successor.status == "completed"
+    assert successor.end_reason == "max_turns_reached"
+
+    successor_run = json.loads(
+        (successor.run_dir / "run.json").read_text(encoding="utf-8")
+    )
+    receipt = json.loads(
+        (successor.run_dir / "turns" / "turn-001" / "result.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    overlay = repo_root / "plans" / "in-progress" / "plan-cp01-v01.md"
+    # The untampered reproduction shape: the successor's own fresh budget
+    # (one turn), the repair turn provably started from the inherited
+    # overlay, and the terminal active fell back to the original plan on the
+    # non-preserving final_review edge.
+    assert successor_run["resumed_from_run_id"] == source.run_dir.name
+    assert successor_run["turns_completed"] == 1
+    assert successor_run["effective_max_turns"] == 1
+    assert receipt["active_plan_path"] == str(overlay)
+    assert successor_run["active_plan_path"] == str(plan_path)
+    assert receipt["chosen_transition"] == "final_review"
+    return repo_root, plan_path, config_path, source, successor, overlay
+
+
+def test_inherited_overlay_start_survives_next_budget_exit(tmp_path: Path) -> None:
+    """A successor capped on its first inherited-overlay turn stays resumable.
+
+    The inherited repair overlay is a legitimate exact start: the next
+    budget exit classifies, the real bootstrap admits the pending final
+    reviewer with the validated overlay, and that reviewer completes and
+    delivers normally.  No successor delivers early, accounting restarts
+    fresh, and every predecessor evidence stays byte-identical.
+    """
+    with tempfile.TemporaryDirectory() as tmpdir:
+        root = Path(tmpdir)
+        repo_root, plan_path, config_path, source, successor, overlay = (
+            _make_inherited_overlay_successor(root)
+        )
+        wf_config = load_workflow_config(config_path)
+        source_before = _run_dir_bytes(source.run_dir)
+        successor_before = _run_dir_bytes(successor.run_dir)
+
+        boundary = _classify(successor.run_dir, config_path, repo_root)
+        assert isinstance(boundary, BudgetBoundary)
+        assert boundary.kind == "budget_exit"
+        assert boundary.next_step_name == "final_review"
+        assert boundary.new_plan_exists is False
+        assert boundary.overlay_path is None
+        assert boundary.active_plan_path == overlay
+        assert boundary.original_plan_path == plan_path
+        # Read-only classification: both runs stay byte-identical.
+        assert _run_dir_bytes(successor.run_dir) == successor_before
+        assert _run_dir_bytes(source.run_dir) == source_before
+
+        bootstrap = _real_bootstrap(
+            repo_root, config_path, wf_config, successor.run_dir.name,
+        )
+        assert bootstrap.start_step == "final_review"
+        context = bootstrap.resume_context
+        assert isinstance(context.budget_continuation, BudgetBoundary)
+        assert context.active_plan_path == overlay
+
+        adapter = PromptRecordingAdapter()
+        complete_repair = (
+            "# Repair\n\n"
+            "### [x] Checkpoint 1: Repair\n"
+            "- [x] fix reviewer finding\n"
+        )
+
+        def reviewer_runner(argv, **kwargs):
+            cwd = Path(kwargs["cwd"])
+            _write_plan(
+                cwd / "plans" / "in-progress" / "plan-cp01-v01.md",
+                complete_repair,
+            )
+            return subprocess.CompletedProcess(argv, 0, "ok", "")
+
+        with _DeliverySpies() as spies:
+            final = _run_budget(
+                config_path, repo_root, bootstrap.plan_path, reviewer_runner,
+                max_turns=bootstrap.max_turns, resume=context,
+                adapter=adapter,
+            )
+        assert final.status == "completed"
+        assert final.end_reason == "done"
+        final_turn = json.loads(
+            (final.run_dir / "turns" / "turn-001" / "result.json").read_text(
+                encoding="utf-8"
+            )
+        )
+        assert final_turn["step_name"] == "final_review"
+        assert final_turn["active_plan_path"] == str(overlay)
+        final_worktree = Path(
+            json.loads(
+                (final.run_dir / "run.json").read_text(encoding="utf-8")
+            )["worktree_path"]
+        )
+        assert (
+            final_worktree / "plans" / "in-progress" / "plan-cp01-v01.md"
+        ).is_file()
+        # The pending final reviewer was addressed with the validated
+        # overlay, and the repaired work delivered normally.
+        assert str(final_worktree / "plans" / "in-progress" / "plan-cp01-v01.md") in (
+            adapter.prompts[0]
+        )
+        assert spies.merge_calls == 1
+        assert spies.deliver_calls == 1
+        # The successor spent exactly its own single-turn budget, and both
+        # predecessors kept their immutable evidence.
+        assert _run_dir_bytes(source.run_dir) == source_before
+        assert _run_dir_bytes(successor.run_dir) == successor_before
+
+
+def test_inherited_overlay_start_survives_budget_end_predecessor(
+    tmp_path: Path,
+) -> None:
+    """A successor of a validated budget-driven END stays resumable.
+
+    The source's final reviewer exits through the supported MAX-driven END
+    while creating the repair overlay; its successor runs one repair turn
+    from the inherited overlay and caps on the non-preserving final_review
+    edge.  That successor must still classify: the next bootstrap admits
+    the pending final reviewer with the exact inherited overlay and fresh
+    accounting, nothing delivers early, and the reviewer then completes and
+    delivers normally.
+    """
+    with tempfile.TemporaryDirectory() as tmpdir:
+        root = Path(tmpdir)
+        repo_root, plan_path, config_path, source, successor, overlay = (
+            _make_inherited_overlay_successor(root, budget_end_source=True)
+        )
+        wf_config = load_workflow_config(config_path)
+        source_before = _run_dir_bytes(source.run_dir)
+        successor_before = _run_dir_bytes(successor.run_dir)
+
+        # The predecessor invocation ended through the validated budget END.
+        source_receipt = json.loads(
+            (source.run_dir / "turns" / "turn-002" / "result.json").read_text(
+                encoding="utf-8"
+            )
+        )
+        assert source_receipt["chosen_transition"] == "END"
+        assert (
+            source_receipt["chosen_transition_condition"] == "MAX_TURNS_REACHED"
+        )
+
+        boundary = _classify(successor.run_dir, config_path, repo_root)
+        assert isinstance(boundary, BudgetBoundary)
+        assert boundary.kind == "budget_exit"
+        assert boundary.next_step_name == "final_review"
+        assert boundary.new_plan_exists is False
+        assert boundary.overlay_path is None
+        assert boundary.active_plan_path == overlay
+        assert boundary.original_plan_path == plan_path
+        # Read-only classification: both runs stay byte-identical.
+        assert _run_dir_bytes(successor.run_dir) == successor_before
+        assert _run_dir_bytes(source.run_dir) == source_before
+
+        bootstrap = _real_bootstrap(
+            repo_root, config_path, wf_config, successor.run_dir.name,
+        )
+        assert bootstrap.start_step == "final_review"
+        context = bootstrap.resume_context
+        assert isinstance(context.budget_continuation, BudgetBoundary)
+        assert context.active_plan_path == overlay
+
+        adapter = PromptRecordingAdapter()
+        complete_repair = (
+            "# Repair\n\n"
+            "### [x] Checkpoint 1: Repair\n"
+            "- [x] fix reviewer finding\n"
+        )
+
+        def reviewer_runner(argv, **kwargs):
+            cwd = Path(kwargs["cwd"])
+            _write_plan(
+                cwd / "plans" / "in-progress" / "plan-cp01-v01.md",
+                complete_repair,
+            )
+            return subprocess.CompletedProcess(argv, 0, "ok", "")
+
+        # In the END-first graph the budget END is the first ordered edge, so
+        # a reviewer finishing exactly at its last budget turn would exit as
+        # a budget exit; the explicit invocation grants one spare turn so the
+        # reviewer's DONE edge is the one that delivers.
+        with _DeliverySpies() as spies:
+            final = _run_budget(
+                config_path, repo_root, bootstrap.plan_path, reviewer_runner,
+                max_turns=2, resume=context,
+                adapter=adapter,
+            )
+        assert final.status == "completed"
+        assert final.end_reason == "done"
+        final_run = json.loads(
+            (final.run_dir / "run.json").read_text(encoding="utf-8")
+        )
+        final_turn = json.loads(
+            (final.run_dir / "turns" / "turn-001" / "result.json").read_text(
+                encoding="utf-8"
+            )
+        )
+        # Fresh accounting: the final reviewer spent its own first turn on
+        # the pending review, resumed from the capped successor.
+        assert final_run["turns_completed"] == 1
+        assert final_run["resumed_from_run_id"] == successor.run_dir.name
+        assert final_turn["step_name"] == "final_review"
+        assert final_turn["active_plan_path"] == str(overlay)
+        final_worktree = Path(final_run["worktree_path"])
+        assert (
+            final_worktree / "plans" / "in-progress" / "plan-cp01-v01.md"
+        ).is_file()
+        # The pending final reviewer was addressed with the validated
+        # overlay, and the repaired work delivered normally.
+        assert str(final_worktree / "plans" / "in-progress" / "plan-cp01-v01.md") in (
+            adapter.prompts[0]
+        )
+        assert spies.merge_calls == 1
+        assert spies.deliver_calls == 1
+        # Every predecessor kept its immutable evidence.
+        assert _run_dir_bytes(source.run_dir) == source_before
+        assert _run_dir_bytes(successor.run_dir) == successor_before
+
+
+def test_budget_end_predecessor_surfaces_admit_and_reject(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Every admission surface accepts the budget-END lineage; fakes reject.
+
+    The shared classifier, the daemon preview, the explicit bootstrap, and
+    managed durable replacement admission all accept the successor of a
+    validated budget-driven END, while an arbitrary terminal END (a
+    condition that does not stop matching once the budget is restored), a
+    missing END condition, and contradicted predecessor evidence reject
+    before any successor reservation.
+    """
+    with tempfile.TemporaryDirectory() as tmpdir:
+        root = Path(tmpdir)
+        repo_root, plan_path, config_path, source, successor, overlay = (
+            _make_inherited_overlay_successor(root, budget_end_source=True)
+        )
+        wf_config = load_workflow_config(config_path)
+        successor_dir = successor.run_dir
+        source_dir = source.run_dir
+        source_receipt_path = source_dir / "turns" / "turn-002" / "result.json"
+        original_source_receipt = source_receipt_path.read_bytes()
+        successor_before = _run_dir_bytes(successor_dir)
+        source_before = _run_dir_bytes(source_dir)
+        _attach_launch_evidence(repo_root, successor_dir.name, "completed")
+
+        daemon = _make_daemon(tmp_path, monkeypatch, repo_root, config_path, wf_config)
+        _patch_inactive_worker_evidence(
+            monkeypatch, daemon.application.repository
+        )
+
+        # Baseline: every surface admits the budget-END lineage.
+        assert isinstance(
+            _classify(successor_dir, config_path, repo_root), BudgetBoundary
+        )
+        status = daemon.service.run_status(
+            successor_dir.name, include_resume_preview=True
+        )
+        assert status.evidence.get("can_resume") is True
+        bootstrap = _real_bootstrap(
+            repo_root, config_path, wf_config, successor_dir.name
+        )
+        assert bootstrap.start_step == "final_review"
+        assert bootstrap.resume_context.active_plan_path == overlay
+
+        def reject_case(label: str, *, mutate_source_receipt=None) -> None:
+            receipt = json.loads(
+                original_source_receipt.decode(encoding="utf-8")
+            )
+            if mutate_source_receipt is not None:
+                mutate_source_receipt(receipt)
+            source_receipt_path.write_text(
+                json.dumps(receipt), encoding="utf-8"
+            )
+            try:
+                assert (
+                    _classify(successor_dir, config_path, repo_root) is None
+                ), label
+                tampered_status = daemon.service.run_status(
+                    successor_dir.name, include_resume_preview=True
+                )
+                assert (
+                    tampered_status.evidence.get("can_resume") is False
+                ), label
+                with pytest.raises(ValueError):
+                    _real_bootstrap(
+                        repo_root, config_path, wf_config, successor_dir.name
+                    )
+            finally:
+                source_receipt_path.write_bytes(original_source_receipt)
+
+        # An END condition that keeps matching with the budget restored is
+        # not a budget-driven predecessor: only the budget-only edge
+        # qualifies, and the recorded condition must identify exactly it.
+        reject_case(
+            "non-budget-end-condition",
+            mutate_source_receipt=lambda r: r.__setitem__(
+                "chosen_transition_condition", "DONE"
+            ),
+        )
+        # A missing END condition identifies no edge at all.
+        reject_case(
+            "missing-end-condition",
+            mutate_source_receipt=lambda r: r.__setitem__(
+                "chosen_transition_condition", None
+            ),
+        )
+        # The predecessor's terminal record must keep matching the post-END
+        # selection: the overlay its last turn created.
+        reject_case(
+            "contradicted-terminal-overlay",
+            mutate_source_receipt=lambda r: r["conditions"].__setitem__(
+                "NEW_PLAN_EXISTS", False
+            ),
+        )
+
+        # Restored: admission returns everywhere and nothing was mutated.
+        assert isinstance(
+            _classify(successor_dir, config_path, repo_root), BudgetBoundary
+        )
+        assert _run_dir_bytes(successor_dir) == successor_before
+        assert _run_dir_bytes(source_dir) == source_before
+
+        # Managed durable replacement admission of the intact successor
+        # creates one bound continuation with the successor's own
+        # single-turn budget, and both predecessors keep byte-identical
+        # evidence.
+        continuation = daemon.service.resume(
+            successor_dir.name,
+            caller_scope="local",
+            idempotency_key="recover-budget-end-successor",
+            recovery={
+                "mode": "durable_evidence",
+                "worker_selector": "codex.base",
+            },
+        )
+        assert continuation.created is True
+        assert continuation.run_id != successor_dir.name
+        from aflow.control_plane.recovery import read_recovery_intent
+
+        intent = read_recovery_intent(
+            repo_root / ".aflow" / "runs" / continuation.run_id
+        )
+        assert intent.source_run_id == successor_dir.name
+        assert intent.target_selector == "codex.base"
+        successor_manifest = json.loads(
+            (
+                repo_root / ".aflow" / "launches" / f"{continuation.run_id}.json"
+            ).read_text(encoding="utf-8")
+        )
+        assert successor_manifest["max_turns"] == 1
+        assert _run_dir_bytes(successor_dir) == successor_before
+        assert _run_dir_bytes(source_dir) == source_before
+
+
+def test_inherited_start_contradictions_reject_before_launch(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Wrong inherited-start claims never reach reservation or provider launch.
+
+    The classifier, the daemon preview, the explicit bootstrap, and managed
+    durable recovery all reject substituted, missing, cyclic, or
+    contradicted lineage before any successor reservation, while the intact
+    successor still admits a bound replacement.
+    """
+    with tempfile.TemporaryDirectory() as tmpdir:
+        root = Path(tmpdir)
+        repo_root, plan_path, config_path, source, successor, overlay = (
+            _make_inherited_overlay_successor(root)
+        )
+        wf_config = load_workflow_config(config_path)
+        successor_dir = successor.run_dir
+        source_dir = source.run_dir
+        receipt_path = successor_dir / "turns" / "turn-001" / "result.json"
+        run_json_path = successor_dir / "run.json"
+        original_receipt = receipt_path.read_bytes()
+        original_run_json = run_json_path.read_bytes()
+        _attach_launch_evidence(repo_root, successor_dir.name, "completed")
+
+        daemon = _make_daemon(tmp_path, monkeypatch, repo_root, config_path, wf_config)
+        _patch_inactive_worker_evidence(
+            monkeypatch, daemon.application.repository
+        )
+
+        def surface() -> tuple[list[str], list[str]]:
+            return (
+                sorted(
+                    p.name
+                    for p in (repo_root / ".aflow" / "runs").iterdir()
+                    if p.is_dir()
+                ),
+                sorted(
+                    p.name
+                    for p in (repo_root / ".aflow" / "launches").iterdir()
+                    if p.name.endswith(".json")
+                    and not p.name.endswith(".state.json")
+                ),
+            )
+
+        # Baseline: the intact inherited start admits on every surface.
+        assert isinstance(
+            _classify(successor_dir, config_path, repo_root), BudgetBoundary
+        )
+        status = daemon.service.run_status(
+            successor_dir.name, include_resume_preview=True
+        )
+        assert status.evidence.get("can_resume") is True
+        bootstrap = _real_bootstrap(
+            repo_root, config_path, wf_config, successor_dir.name
+        )
+        assert bootstrap.start_step == "final_review"
+
+        def reject_case(
+            label: str,
+            *,
+            mutate_receipt=None,
+            mutate_run=None,
+        ) -> None:
+            receipt = json.loads(original_receipt.decode(encoding="utf-8"))
+            run = json.loads(original_run_json.decode(encoding="utf-8"))
+            if mutate_receipt is not None:
+                mutate_receipt(receipt)
+            if mutate_run is not None:
+                mutate_run(run)
+            receipt_path.write_text(json.dumps(receipt), encoding="utf-8")
+            run_json_path.write_text(json.dumps(run), encoding="utf-8")
+            try:
+                assert (
+                    _classify(successor_dir, config_path, repo_root) is None
+                ), label
+                tampered_status = daemon.service.run_status(
+                    successor_dir.name, include_resume_preview=True
+                )
+                assert (
+                    tampered_status.evidence.get("can_resume") is False
+                ), label
+                with pytest.raises(ValueError):
+                    _real_bootstrap(
+                        repo_root, config_path, wf_config, successor_dir.name
+                    )
+                before = surface()
+                with pytest.raises(
+                    (DurableRecoveryRejection, DaemonError, ValueError)
+                ):
+                    daemon.service.resume(
+                        successor_dir.name,
+                        caller_scope="local",
+                        idempotency_key=f"inherited-{label}",
+                        recovery={
+                            "mode": "durable_evidence",
+                            "worker_selector": "codex.base",
+                        },
+                    )
+                assert surface() == before, label
+            finally:
+                receipt_path.write_bytes(original_receipt)
+                run_json_path.write_bytes(original_run_json)
+
+        # A reserved-looking future overlay exists in both the primary
+        # checkout and the execution worktree, but it is not the identity the
+        # recorded predecessor derives for this first turn.
+        reserved = repo_root / "plans" / "in-progress" / "plan-cp01-v02.md"
+        reserved.write_text(_REPAIR_PLAN, encoding="utf-8")
+        reserved_mirror = (
+            Path(
+                json.loads(original_run_json.decode(encoding="utf-8"))[
+                    "worktree_path"
+                ]
+            )
+            / "plans" / "in-progress" / "plan-cp01-v02.md"
+        )
+        reserved_mirror.parent.mkdir(parents=True, exist_ok=True)
+        reserved_mirror.write_text(_REPAIR_PLAN, encoding="utf-8")
+        reject_case(
+            "reserved-new-substitute",
+            mutate_receipt=lambda r: r.__setitem__(
+                "active_plan_path", str(reserved)
+            ),
+        )
+
+        # An unrelated existing plan is not an inherited start either.
+        unrelated = repo_root / "plans" / "in-progress" / "unrelated.md"
+        unrelated.write_text(
+            "# Unrelated\n\n### [ ] c\n- [ ] s\n", encoding="utf-8"
+        )
+        unrelated_mirror = (
+            Path(
+                json.loads(original_run_json.decode(encoding="utf-8"))[
+                    "worktree_path"
+                ]
+            )
+            / "plans" / "in-progress" / "unrelated.md"
+        )
+        unrelated_mirror.write_text(
+            "# Unrelated\n\n### [ ] c\n- [ ] s\n", encoding="utf-8"
+        )
+        reject_case(
+            "unrelated-substitute",
+            mutate_receipt=lambda r: r.__setitem__(
+                "active_plan_path", str(unrelated)
+            ),
+        )
+
+        # Missing lineage: the recorded predecessor does not exist.
+        reject_case(
+            "missing-lineage",
+            mutate_run=lambda run: run.__setitem__(
+                "resumed_from_run_id", "missing-predecessor"
+            ),
+        )
+
+        # Cyclic lineage: a self-referential predecessor proves nothing.
+        reject_case(
+            "cyclic-lineage",
+            mutate_run=lambda run: run.__setitem__(
+                "resumed_from_run_id", successor_dir.name
+            ),
+        )
+
+        # Contradictory predecessor evidence: the source's final reviewer
+        # receipt must keep creating the overlay its terminal record names.
+        source_receipt_path = source_dir / "turns" / "turn-002" / "result.json"
+        original_source_receipt = source_receipt_path.read_bytes()
+        source_receipt = json.loads(
+            original_source_receipt.decode(encoding="utf-8")
+        )
+        source_receipt["conditions"]["NEW_PLAN_EXISTS"] = False
+        source_receipt_path.write_text(
+            json.dumps(source_receipt), encoding="utf-8"
+        )
+        try:
+            assert (
+                _classify(successor_dir, config_path, repo_root) is None
+            ), "contradicted-source-overlay"
+            with pytest.raises(ValueError):
+                _real_bootstrap(
+                    repo_root, config_path, wf_config, successor_dir.name
+                )
+        finally:
+            source_receipt_path.write_bytes(original_source_receipt)
+
+        # Restored: admission returns everywhere and nothing was mutated.
+        assert isinstance(
+            _classify(successor_dir, config_path, repo_root), BudgetBoundary
+        )
+        assert receipt_path.read_bytes() == original_receipt
+        assert run_json_path.read_bytes() == original_run_json
+        restored_status = daemon.service.run_status(
+            successor_dir.name, include_resume_preview=True
+        )
+        assert restored_status.evidence.get("can_resume") is True
+
+        # Managed replacement admission of the intact successor creates one
+        # bound continuation with the successor's own single-turn budget,
+        # and both predecessors keep byte-identical evidence.
+        successor_before = _run_dir_bytes(successor_dir)
+        source_before = _run_dir_bytes(source_dir)
+        continuation = daemon.service.resume(
+            successor_dir.name,
+            caller_scope="local",
+            idempotency_key="recover-inherited-successor",
+            recovery={
+                "mode": "durable_evidence",
+                "worker_selector": "codex.base",
+            },
+        )
+        assert continuation.created is True
+        assert continuation.run_id != successor_dir.name
+        from aflow.control_plane.recovery import read_recovery_intent
+
+        intent = read_recovery_intent(
+            repo_root / ".aflow" / "runs" / continuation.run_id
+        )
+        assert intent.source_run_id == successor_dir.name
+        assert intent.target_selector == "codex.base"
+        successor_manifest = json.loads(
+            (
+                repo_root / ".aflow" / "launches" / f"{continuation.run_id}.json"
+            ).read_text(encoding="utf-8")
+        )
+        assert successor_manifest["max_turns"] == 1
+        assert _run_dir_bytes(successor_dir) == successor_before
         assert _run_dir_bytes(source_dir) == source_before
 
 
@@ -1423,6 +2391,96 @@ def test_tampered_receipt_identity_rejects_every_surface(
             lambda r: r["conditions"].__setitem__("MAX_TURNS_REACHED", False),
         )
 
+        # The receipt's plan identities are bound to the canonical run record.
+        # An existing unrelated plan file (present in both the primary checkout
+        # and the execution worktree) must not be admitted as the after-turn
+        # new identity or the before-turn active identity: ownership is not
+        # inferred from filenames or existence alone.
+        unrelated_name = "unrelated.md"
+        unrelated_repo = (
+            repo_root / "plans" / "in-progress" / unrelated_name
+        )
+        unrelated_repo.parent.mkdir(parents=True, exist_ok=True)
+        unrelated_text = "# Unrelated\n\n### [ ] c\n- [ ] s\n"
+        unrelated_repo.write_text(unrelated_text, encoding="utf-8")
+        unrelated_wt = (
+            Path(run_json["worktree_path"])
+            / "plans" / "in-progress" / unrelated_name
+        )
+        unrelated_wt.parent.mkdir(parents=True, exist_ok=True)
+        unrelated_wt.write_text(unrelated_text, encoding="utf-8")
+
+        # After-turn new: substituting an existing unrelated overlay rejects.
+        reject_case(
+            "new-substitute",
+            lambda r: r.__setitem__("new_plan_path", str(unrelated_repo)),
+        )
+        # Before-turn active: substituting an existing unrelated plan rejects.
+        reject_case(
+            "active-substitute",
+            lambda r: r.__setitem__("active_plan_path", str(unrelated_repo)),
+        )
+        # A stale earlier overlay must not qualify as the finalized turn's
+        # starting active merely because earlier receipts recorded it: the
+        # reserved new path of turns 1-3 appears in history, but the finalized
+        # turn provably started from the canonical original plan.
+        stale_overlay = repo_root / "plans" / "in-progress" / "plan-cp01-v01.md"
+        reject_case(
+            "active-stale-overlay",
+            lambda r: r.__setitem__("active_plan_path", str(stale_overlay)),
+        )
+
+        # Separately contradict the canonical record: with the receipt left
+        # intact, a canonical new/active identity that no longer agrees with
+        # the receipt's plan is rejected on every surface too.
+        def reject_canonical_case(label: str, mutate_run) -> None:
+            run = json.loads(original_run_json.decode(encoding="utf-8"))
+            mutate_run(run)
+            run_json_path.write_text(json.dumps(run), encoding="utf-8")
+            try:
+                assert _classify(source_dir, config_path, repo_root) is None, label
+                tampered_status = daemon.service.run_status(
+                    source_dir.name, include_resume_preview=True
+                )
+                assert tampered_status.evidence.get("can_resume") is False, label
+                with pytest.raises(ValueError):
+                    _real_bootstrap(
+                        repo_root, config_path, wf_config, source_dir.name
+                    )
+                before = surface()
+                with pytest.raises(
+                    (DurableRecoveryRejection, DaemonError, ValueError)
+                ):
+                    daemon.service.resume(
+                        source_dir.name,
+                        caller_scope="local",
+                        idempotency_key=f"tampered-{label}",
+                        recovery={
+                            "mode": "durable_evidence",
+                            "worker_selector": "codex.base",
+                        },
+                    )
+                assert surface() == before, label
+            finally:
+                run_json_path.write_bytes(original_run_json)
+
+        # Canonical new contradicts the intact receipt's new identity: the
+        # after-turn new is bound exactly to the canonical recorded new path.
+        reject_canonical_case(
+            "canonical-new-contradict",
+            lambda run: run.__setitem__("new_plan_path", str(unrelated_repo)),
+        )
+        # The canonical terminal active is the controller's own
+        # post-transition selection for the finalized turn; redirecting it to
+        # another recorded identity contradicts that evidence and rejects.
+        reject_canonical_case(
+            "canonical-active-contradict",
+            lambda run: run.__setitem__("active_plan_path", str(unrelated_repo)),
+        )
+        # The intact fixture is still admitted after all the mutations revert.
+        assert isinstance(
+            _classify(source_dir, config_path, repo_root), BudgetBoundary
+        )
 
         # A contradicted earlier receipt of the same step is saved selector
         # evidence too: the finalized selector may not silently diverge.
@@ -1532,6 +2590,42 @@ def test_tampered_receipt_identity_rejects_every_surface(
         )
         reject_boolean_case(
             "returncode-bool", lambda r, j: r.__setitem__("returncode", False)
+        )
+
+        # False-NEW substitution (the reproduced #62 finding): the reserved
+        # new plan exists in both the primary checkout and the worktree
+        # mirror, and the finalized receipt claims that reserved path as its
+        # starting active.  A known path is not proof it was active for this
+        # turn: turn one provably starts from the canonical original plan, so
+        # the substitution rejects before reservation/provider launch.
+        b_reserved = b_repo_root / "plans" / "in-progress" / "plan-cp01-v01.md"
+        b_reserved.write_text(_REPAIR_PLAN, encoding="utf-8")
+        b_reserved_mirror = (
+            Path(
+                json.loads(b_original_run_json.decode(encoding="utf-8"))[
+                    "worktree_path"
+                ]
+            )
+            / "plans" / "in-progress" / "plan-cp01-v01.md"
+        )
+        b_reserved_mirror.parent.mkdir(parents=True, exist_ok=True)
+        b_reserved_mirror.write_text(_REPAIR_PLAN, encoding="utf-8")
+
+        def _false_new_substitution(receipt, run_json) -> None:
+            del run_json
+            receipt["active_plan_path"] = str(b_reserved)
+
+        reject_boolean_case("active-false-new", _false_new_substitution)
+
+        # Redirecting the canonical terminal active to the reserved overlay
+        # contradicts the controller's own post-transition selection and
+        # rejects as well.
+        def _canonical_active_contradiction(receipt, run_json) -> None:
+            del receipt
+            run_json["active_plan_path"] = str(b_reserved)
+
+        reject_boolean_case(
+            "canonical-active-contradict", _canonical_active_contradiction
         )
 
         # The intact single-turn fixture admits again after every restore.

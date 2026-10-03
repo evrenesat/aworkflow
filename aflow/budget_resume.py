@@ -20,7 +20,13 @@ from pathlib import Path
 from typing import Any, Literal, Mapping
 
 from aflow.plan import load_plan
-from aflow.workflow import WorkflowError, evaluate_condition
+from aflow.runlog import load_run_json
+from aflow.workflow import (
+    WorkflowError,
+    _select_transition,
+    _terminal_resume_run_dir,
+    evaluate_condition,
+)
 
 #: Canonical clean-state preflight failure recorded when the merge teardown
 #: refused to integrate over uncommitted work.
@@ -91,6 +97,23 @@ def _is_clean_state_preflight_failure(reason: Any) -> bool:
         isinstance(reason, str)
         and reason.startswith(MERGE_CLEAN_STATE_PREFLIGHT_SIGNATURE)
     )
+
+
+def _plan_identity(value: str, repo_root: Path) -> Path | None:
+    """Normalize a recorded plan path to an absolute identity inside the repo.
+
+    Relative paths are resolved against the primary checkout root, matching the
+    receipt/run.json recording convention; a path that escapes the repository
+    is unowned evidence and returns None.
+    """
+    path = Path(value).expanduser()
+    if not path.is_absolute():
+        path = repo_root / value
+    try:
+        path.resolve().relative_to(repo_root.resolve())
+    except (OSError, ValueError):
+        return None
+    return path
 
 
 #: Persisted evidence that a supported selector control or recovery override
@@ -165,6 +188,297 @@ def _worktree_mirror(
     except ValueError:
         return None
     return Path(worktree_value) / rel
+
+
+def _post_transition_active_plan(
+    *,
+    original_plan_path: Path,
+    active_plan_path: Path,
+    new_plan_path: Path,
+    new_plan_exists: bool,
+    transition: Any,
+) -> Path:
+    """Mirror the controller's next-active selection for one finalized turn.
+
+    After a turn the live controller selects the successor's active plan
+    (``_select_next_active_plan_path``): the new overlay when NEW_PLAN_EXISTS
+    was true, the same active plan when the selected transition preserves it,
+    and the original plan otherwise.  A completed turn implies the live
+    execution-checkout existence check passed, so the pure selection is exact.
+    """
+    if new_plan_exists:
+        return new_plan_path
+    if getattr(transition, "preserve_active_plan", False):
+        return active_plan_path
+    return original_plan_path
+
+
+def _validated_budget_end_edge(
+    *,
+    step_name: object,
+    saved_condition: object,
+    done: bool,
+    new_plan_exists: bool,
+    steps: Mapping[str, Any],
+) -> Any | None:
+    """Validate one finalized receipt's recorded budget-driven END edge.
+
+    Returns the exact ordered END transition when the recorded condition
+    identifies exactly one END edge of the named step, that edge was selected
+    only because the budget was exhausted (it stops matching once the budget
+    is restored), and it is the edge the live controller's ordered
+    first-match routing selects under the saved budget-exhausted conditions.
+    Any other recorded END — missing or ambiguous condition evidence, a
+    DONE-driven or unconditional END, or a contradiction with the configured
+    routing — returns None.
+    """
+    if not isinstance(step_name, str) or not step_name:
+        return None
+    if not isinstance(saved_condition, str) or not saved_condition:
+        return None
+    step = steps.get(step_name)
+    if step is None:
+        return None
+    transitions = tuple(getattr(step, "go", ()) or ())
+    matching = [t for t in transitions if t.when == saved_condition]
+    if len(matching) != 1 or matching[0].to != "END":
+        return None
+
+    def _evaluate(expression: str, max_flag: bool) -> bool:
+        try:
+            return evaluate_condition(
+                expression,
+                done=done,
+                new_plan_exists=new_plan_exists,
+                max_turns_reached=max_flag,
+            )
+        except WorkflowError:
+            return False
+
+    # The saved END edge must have been selected under the saved
+    # conditions, and only because the budget was exhausted.
+    if not _evaluate(saved_condition, True) or _evaluate(saved_condition, False):
+        return None
+    # The saved END must be the edge the live controller would actually
+    # select under the saved (budget-exhausted) conditions, using the same
+    # ordered first-match routing (unconditional fallbacks included), not
+    # an unordered scan of every matching conditional target.
+    try:
+        selected_end = _select_transition(
+            transitions,
+            step_path=step_name,
+            done=done,
+            new_plan_exists=new_plan_exists,
+            max_turns_reached=True,
+        )
+    except WorkflowError:
+        return None
+    if selected_end.to != "END" or selected_end.when != saved_condition:
+        return None
+    return selected_end
+
+
+def _receipt_plan_identities(
+    receipt: Mapping[str, object], repo_root: Path
+) -> tuple[Path, Path, bool] | None:
+    """Strictly type one finalized receipt's plan identities.
+
+    Returns ``(active, new, new_exists)`` as normalized owned identities, or
+    None when the receipt's plan evidence is missing or mistyped.
+    """
+    conditions = receipt.get("conditions")
+    if not isinstance(conditions, Mapping):
+        return None
+    new_exists = conditions.get("NEW_PLAN_EXISTS")
+    if not isinstance(new_exists, bool):
+        return None
+    active_value = receipt.get("active_plan_path")
+    new_value = receipt.get("new_plan_path")
+    if not all(
+        isinstance(value, str) and value for value in (active_value, new_value)
+    ):
+        return None
+    active = _plan_identity(active_value, repo_root)
+    new = _plan_identity(new_value, repo_root)
+    if active is None or new is None:
+        return None
+    return active, new, new_exists
+
+
+def _workspace_identity(
+    run: Mapping[str, object],
+) -> tuple[str | None, str | None]:
+    """The recorded execution workspace: worktree and feature branch."""
+    def _text(value: object) -> str | None:
+        return value if isinstance(value, str) and value else None
+
+    return (_text(run.get("worktree_path")), _text(run.get("feature_branch")))
+
+
+def _derived_next_start_identity(
+    predecessor: Mapping[str, object],
+    *,
+    steps: Mapping[str, Any],
+    repo_root: Path,
+    canonical_original_path: Path,
+) -> Path | None:
+    """Derive the next turn's starting active identity from one receipt.
+
+    The predecessor receipt records the exact edge its ordered routing
+    selected (target plus recorded condition) and its own saved conditions,
+    so the controller's post-transition selection is recomputable exactly
+    against the canonical original.  Contradictory or missing predecessor
+    evidence returns None instead of guessing a known path.
+    """
+    pred_step_name = predecessor.get("step_name")
+    pred_chosen = predecessor.get("chosen_transition")
+    pred_condition = predecessor.get("chosen_transition_condition")
+    if not isinstance(pred_step_name, str) or not pred_step_name:
+        return None
+    if pred_condition is not None and not isinstance(pred_condition, str):
+        return None
+    identities = _receipt_plan_identities(predecessor, repo_root)
+    if identities is None:
+        return None
+    pred_active, pred_new, pred_new_exists = identities
+    if pred_chosen is None:
+        # A retry-scheduled turn replayed with the same active plan and
+        # never selected a transition.
+        if predecessor.get("retry_next_turn") is not True:
+            return None
+        return pred_active
+    if not isinstance(pred_chosen, str) or pred_chosen == "END":
+        # An END selection would have ended the run before the next turn.
+        return None
+    pred_step = steps.get(pred_step_name)
+    if pred_step is None:
+        return None
+    pred_transitions = tuple(getattr(pred_step, "go", ()) or ())
+    selected = [
+        t for t in pred_transitions
+        if t.to == pred_chosen and t.when == pred_condition
+    ]
+    if not selected:
+        return None
+    return _post_transition_active_plan(
+        original_plan_path=canonical_original_path,
+        active_plan_path=pred_active,
+        new_plan_path=pred_new,
+        new_plan_exists=pred_new_exists,
+        transition=selected[0],
+    )
+
+
+def _inherited_start_identity(
+    prev_run: Mapping[str, object],
+    *,
+    run_dir: Path,
+    steps: Mapping[str, Any],
+    repo_root: Path,
+    canonical_original_path: Path,
+) -> Path | None:
+    """Derive the exact active identity a resumed run's first turn inherited.
+
+    A resumed successor legitimately starts from the continuation identity
+    its bootstrap derived from the recorded ``resumed_from_run_id``
+    predecessor: the overlay the predecessor's last finalized turn created,
+    otherwise the plan that turn started from — the same validated
+    continuation semantics the budget bootstrap applies.  The derivation
+    uses only that predecessor's durable evidence, bound to the same
+    original plan, workflow and execution workspace, with the predecessor's
+    own terminal active reconciled against its last receipt.  Across
+    invocations a validated budget-driven END is a legitimate predecessor
+    terminal and reconciles through the same budget-END edge semantics the
+    classifier enforces for any boundary source; within one invocation an
+    END never qualifies as a previous turn, and any non-budget or
+    contradicted END rejects.  Missing, cyclic or contradictory lineage
+    returns None instead of admitting a merely historical path.
+    """
+    parent_id = prev_run.get("resumed_from_run_id")
+    if not isinstance(parent_id, str) or not parent_id:
+        return None
+    if parent_id == run_dir.name:
+        # A self-referential lineage can never prove an inherited start.
+        return None
+    parent_dir = _terminal_resume_run_dir(repo_root, parent_id)
+    if parent_dir is None:
+        return None
+    parent_run = load_run_json(parent_dir)
+    if parent_run is None:
+        return None
+    if parent_run.get("workflow_name") != prev_run.get("workflow_name"):
+        return None
+    parent_original = parent_run.get("original_plan_path")
+    if not isinstance(parent_original, str) or not parent_original:
+        return None
+    if _plan_identity(parent_original, repo_root) != canonical_original_path:
+        return None
+    if _workspace_identity(parent_run) != _workspace_identity(prev_run):
+        return None
+    parent_turns = parent_run.get("turns_completed")
+    if not _strict_positive_int(parent_turns):
+        return None
+    parent_receipt = _load_receipt(parent_dir, parent_turns)
+    if parent_receipt is None:
+        return None
+    parent_identities = _receipt_plan_identities(parent_receipt, repo_root)
+    if parent_identities is None:
+        return None
+    parent_active, parent_new, parent_new_exists = parent_identities
+    # The predecessor's own records must agree first: its terminal active is
+    # the post-transition selection recomputed from its last finalized
+    # receipt — the same reconciliation every admitted run satisfies.
+    parent_terminal = parent_run.get("active_plan_path")
+    if not isinstance(parent_terminal, str) or not parent_terminal:
+        return None
+    parent_terminal_identity = _plan_identity(parent_terminal, repo_root)
+    if parent_terminal_identity is None:
+        return None
+    parent_chosen = parent_receipt.get("chosen_transition")
+    if parent_chosen == "END":
+        # A predecessor invocation may legitimately end at its validated
+        # budget-driven END before the successor was bootstrapped.  Its
+        # terminal active reconciles against the exact ordered END edge its
+        # last finalized turn selected — the same budget-END semantics the
+        # classifier enforces for any boundary source.  An END chosen for
+        # any other reason, or contradicted END evidence, never qualifies.
+        parent_conditions = parent_receipt.get("conditions")
+        parent_done = (
+            parent_conditions.get("DONE")
+            if isinstance(parent_conditions, Mapping)
+            else None
+        )
+        if not isinstance(parent_done, bool):
+            return None
+        selected_end = _validated_budget_end_edge(
+            step_name=parent_receipt.get("step_name"),
+            saved_condition=parent_receipt.get("chosen_transition_condition"),
+            done=parent_done,
+            new_plan_exists=parent_new_exists,
+            steps=steps,
+        )
+        if selected_end is None:
+            return None
+        parent_expected_terminal = _post_transition_active_plan(
+            original_plan_path=canonical_original_path,
+            active_plan_path=parent_active,
+            new_plan_path=parent_new,
+            new_plan_exists=parent_new_exists,
+            transition=selected_end,
+        )
+    else:
+        # A nonterminal predecessor (or a retry-scheduled turn without a
+        # selection) reconciles through the same-invocation derivation,
+        # which keeps rejecting an END as an alleged previous turn.
+        parent_expected_terminal = _derived_next_start_identity(
+            parent_receipt,
+            steps=steps,
+            repo_root=repo_root,
+            canonical_original_path=canonical_original_path,
+        )
+    if parent_terminal_identity != parent_expected_terminal:
+        return None
+    return parent_new if parent_new_exists else parent_active
 
 
 def classify_budget_boundary(
@@ -389,40 +703,50 @@ def classify_budget_boundary(
     saved_condition = receipt.get("chosen_transition_condition")
     if not isinstance(saved_condition, str):
         saved_condition = None
+    selected_edge: Any = None
     if chosen == "END":
-        if not saved_condition:
+        selected_end = _validated_budget_end_edge(
+            step_name=step_name,
+            saved_condition=saved_condition,
+            done=done,
+            new_plan_exists=new_plan_exists,
+            steps=steps,
+        )
+        if selected_end is None:
             return None
-        matching = [t for t in transitions if t.when == saved_condition]
-        if len(matching) != 1 or matching[0].to != "END":
+        selected_edge = selected_end
+        # With unchanged conditions and the budget not exhausted, the
+        # controller must continue to a real next step; an END or missing
+        # target is not a resumable budget exit.
+        try:
+            next_edge = _select_transition(
+                transitions,
+                step_path=step_name,
+                done=done,
+                new_plan_exists=new_plan_exists,
+                max_turns_reached=False,
+            )
+        except WorkflowError:
             return None
-        # The saved END edge must have been selected under the saved
-        # conditions, and only because the budget was exhausted.
-        if not _evaluate(saved_condition, True) or _evaluate(saved_condition, False):
+        if next_edge.to == "END":
             return None
-        next_targets = [
-            t.to
-            for t in transitions
-            if t is not matching[0]
-            and t.when is not None
-            and _evaluate(t.when, False)
-            and t.to != "END"
-        ]
-        if len(next_targets) != 1:
-            return None
-        next_step_name = next_targets[0]
+        next_step_name = next_edge.to
     else:
         next_step_name = chosen
-        saved_matches = [t for t in transitions if t.to == next_step_name]
-        if not saved_matches:
+        # The receipt names the exact edge the ordered first-match routing
+        # selected: same target and same recorded condition.  A different
+        # edge with the same target contradicts the recorded routing.
+        saved_edge_matches = [
+            t for t in transitions
+            if t.to == next_step_name and t.when == saved_condition
+        ]
+        if not saved_edge_matches:
             return None
-        if saved_condition is not None:
-            if not any(t.when == saved_condition for t in saved_matches):
-                return None
-            if not _evaluate(saved_condition, max_turns_reached):
-                return None
-        else:
-            if not any(t.when is None for t in saved_matches):
-                return None
+        selected_edge = saved_edge_matches[0]
+        if saved_condition is not None and not _evaluate(
+            saved_condition, max_turns_reached
+        ):
+            return None
     target_step = steps.get(next_step_name)
     if target_step is None:
         return None
@@ -430,11 +754,96 @@ def classify_budget_boundary(
     original_plan_value = prev_run.get("original_plan_path")
     if not isinstance(original_plan_value, str) or not original_plan_value:
         return None
-    original_plan_path = Path(original_plan_value).expanduser()
-    if not original_plan_path.is_absolute():
-        original_plan_path = repo_root / original_plan_path
-    active_plan_path = Path(active_plan_value)
-    new_plan_path = Path(new_plan_value)
+    # Bind every plan identity to the canonical run record with strict,
+    # owned, normalized identities.  The before-turn active overlay and the
+    # after-turn new overlay are distinct snapshots, and each is validated
+    # against its own boundary evidence: the after-turn new identity against
+    # the canonical recorded new plan, the before-turn active identity
+    # against the exact ordered predecessor/start evidence and the terminal
+    # reconciliation below.  A receipt that contradicts the canonical run
+    # record is rejected before any successor reservation or provider launch.
+    # Ownership is not inferred from filenames, repair credit, or existence
+    # alone.
+    canonical_active_value = prev_run.get("active_plan_path")
+    canonical_new_value = prev_run.get("new_plan_path")
+    if not isinstance(canonical_active_value, str) or not canonical_active_value:
+        return None
+    if not isinstance(canonical_new_value, str) or not canonical_new_value:
+        return None
+    original_plan_path = _plan_identity(original_plan_value, repo_root)
+    active_plan_path = _plan_identity(active_plan_value, repo_root)
+    new_plan_path = _plan_identity(new_plan_value, repo_root)
+    canonical_active_path = _plan_identity(canonical_active_value, repo_root)
+    canonical_new_path = _plan_identity(canonical_new_value, repo_root)
+    if (
+        original_plan_path is None
+        or active_plan_path is None
+        or new_plan_path is None
+        or canonical_active_path is None
+        or canonical_new_path is None
+    ):
+        return None
+    # The after-turn new identity is bound exactly to the canonical recorded
+    # new plan (they are the same after-turn snapshot); an unrelated
+    # substitution is rejected.
+    if new_plan_path != canonical_new_path:
+        return None
+    # Reconcile the selected transition with the canonical terminal active:
+    # the terminal record must equal the controller's own post-transition
+    # selection computed from the finalized receipt under its saved
+    # conditions (NEW_PLAN_EXISTS overlay, preserve-active, or original
+    # fallback).  Contradictory canonical evidence rejects.
+    if canonical_active_path != _post_transition_active_plan(
+        original_plan_path=original_plan_path,
+        active_plan_path=active_plan_path,
+        new_plan_path=new_plan_path,
+        new_plan_exists=new_plan_exists,
+        transition=selected_edge,
+    ):
+        return None
+    # Validate the receipt's starting active identity against the exact
+    # ordered boundary evidence.  Occurrence in recorded history is not
+    # proof that a path was active for this turn: a reserved new path or an
+    # older overlay must never qualify for that reason alone.
+    if turns_completed == 1:
+        # Start evidence: a fresh run's first turn starts from the canonical
+        # original plan, and a selected preserve-active transition without a
+        # new overlay keeps its start identity into the terminal record
+        # (already reconciled above, so the terminal active pins it).  A
+        # resumed run may instead inherit the exact continuation identity
+        # derived from its recorded predecessor; anything else is a
+        # substitution of a merely historical path.
+        preserve_start = (
+            getattr(selected_edge, "preserve_active_plan", False)
+            and not new_plan_exists
+        )
+        if active_plan_path != original_plan_path and not preserve_start:
+            inherited_start = _inherited_start_identity(
+                prev_run,
+                run_dir=run_dir,
+                steps=steps,
+                repo_root=repo_root,
+                canonical_original_path=original_plan_path,
+            )
+            if inherited_start is None or active_plan_path != inherited_start:
+                return None
+    else:
+        # Ordered predecessor evidence: the finalized turn must start from
+        # exactly the plan the controller selected at the end of the previous
+        # turn, recomputed from that turn's own receipt.
+        predecessor = _load_receipt(run_dir, turns_completed - 1)
+        expected_start = (
+            None
+            if predecessor is None
+            else _derived_next_start_identity(
+                predecessor,
+                steps=steps,
+                repo_root=repo_root,
+                canonical_original_path=original_plan_path,
+            )
+        )
+        if expected_start is None or active_plan_path != expected_start:
+            return None
 
     if kind == "historical_merge_failure":
         # The historical exception is bound to an incomplete strict *original*

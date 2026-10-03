@@ -1576,13 +1576,21 @@ def _bootstrap_resume_invocation(
         # default) rather than silently restoring the saved invocation value.
         effective_start_step = budget_boundary.next_step_name
         start_step_override = True
+        accepted_override_limit = _accepted_budget_override_max_turns(
+            run_dir, prev_run
+        )
+        # A saved invocation limit is only an explicit invocation value when
+        # its saved provenance was explicit; a default-derived saved limit must
+        # fall through to the current live default so future default changes
+        # keep working.
+        explicit_invocation_limit = (
+            max_turns_arg
+            if max_turns_arg is not None
+            else (saved_max_turns if saved_max_turns_explicit else None)
+        )
         successor_limit = resolve_successor_max_turns(
-            accepted_override_max_turns=_accepted_budget_override_max_turns(
-                run_dir, prev_run
-            ),
-            invocation_max_turns=(
-                max_turns_arg if max_turns_arg is not None else saved_max_turns
-            ),
+            accepted_override_max_turns=accepted_override_limit,
+            invocation_max_turns=explicit_invocation_limit,
             live_default_max_turns=getattr(
                 getattr(workflow_config, "aflow", None),
                 "max_turns",
@@ -1591,7 +1599,15 @@ def _bootstrap_resume_invocation(
         )
         effective_max_turns = successor_limit
         max_turns_override = max_turns_override or successor_limit != saved_max_turns
-        saved_max_turns_explicit = True
+        # Preserve provenance: only an accepted override, an explicit new
+        # invocation argument, or an already-explicit saved invocation makes the
+        # successor limit explicit; a default-derived limit keeps default
+        # provenance.
+        saved_max_turns_explicit = (
+            saved_max_turns_explicit
+            or max_turns_arg is not None
+            or accepted_override_limit is not None
+        )
 
     effective_extra = extra_instructions_arg if extra_instructions_provided else saved_extra
 
