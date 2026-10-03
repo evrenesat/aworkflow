@@ -13,6 +13,45 @@ from aflow.control_plane.persistent_units import PersistentUnitManager
 from aflow.control_plane.persistence import build_context_bundle, write_launch_phase
 
 
+@pytest.mark.parametrize("scenario", [
+    "absent", "worker_present", "wrapper_present", "worker_unknown",
+    "wrapper_unknown", "group_present", "group_permission", "wrong_nonce",
+    "wrong_pgid", "missing_birth", "invalid_pid",
+])
+def test_lost_worker_requires_positive_process_and_group_absence(tmp_path, monkeypatch, scenario):
+    from aflow.control_plane import worker_diagnostics as diagnostics
+    unit, run = reserve(tmp_path)
+    receipts = run / "units"
+    receipts.mkdir()
+    start = {"schema": 1, "run_id": run.name, "unit": unit, "nonce": "owned", "wrapper_pid": 99999991, "wrapper_birth": "fixture-wrapper"}
+    child = {"schema": 1, "nonce": "owned", "pid": 99999992, "pgid": 99999992, "process_birth": "fixture-child"}
+    if scenario == "wrong_nonce": child["nonce"] = "foreign"
+    if scenario == "wrong_pgid": child["pgid"] = 99999993
+    if scenario == "missing_birth": child.pop("process_birth")
+    if scenario == "invalid_pid": child["pid"] = True
+    for name, payload in (("start.json", start), ("child.json", child)):
+        (receipts / name).write_text(json.dumps(payload))
+    monkeypatch.setattr("aflow.control_plane.persistent_units._process_alive", lambda *_: False)
+    def liveness(pid):
+        who = "worker" if pid == 99999992 else "wrapper"
+        if scenario == who + "_present": return "present"
+        if scenario == who + "_unknown": return "unknown"
+        return "absent"
+    monkeypatch.setattr(diagnostics, "process_liveness", liveness)
+    def group_probe(pid, sig):
+        assert (pid, sig) == (99999992, 0)
+        if scenario == "group_present": return
+        if scenario == "group_permission": raise PermissionError
+        raise ProcessLookupError
+    monkeypatch.setattr(diagnostics.os, "killpg", group_probe)
+    before = {p.name: p.read_bytes() for p in receipts.iterdir()}
+    evidence = diagnostics.worker_evidence(tmp_path, run.name, unit)
+    assert diagnostics.confirmed_inactive(evidence) is (scenario == "absent")
+    assert before == {p.name: p.read_bytes() for p in receipts.iterdir()}
+    assert "exit_code" not in evidence
+    assert evidence["observation"] in {"ownership_lost", "startup_lost"}
+
+
 def reserve(root, run_id="diagnostic-test"):
     unit = f"aflow-run-{run_id}.service"
     create_launch_manifest(root, LaunchManifest(run_id=run_id, project_root=str(root), plan_path=str(root / "plan.md"), workflow_name="test", max_turns=1, idempotency_key=run_id, caller_scope="test", intended_unit=unit))
