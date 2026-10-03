@@ -852,6 +852,10 @@ class ResumeContext:
     resumed_from_team: str | None = None
     resume_team_override: str | None = None
     recovery_context: RecoverySessionContext | None = None
+    # Validated unfinished budget boundary (issue #62).  Typed as ``object``
+    # to avoid an import cycle: it is a ``aflow.budget_resume.BudgetBoundary``
+    # descriptor carried only by the shared classifier-validated paths.
+    budget_continuation: object | None = None
     # Set only by the validated durable resume reconstruction path.  This is
     # an in-process capability marker, not persisted resume input.
     _validated_resume_context_marker: object | None = field(

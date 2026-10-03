@@ -172,6 +172,39 @@ def _reject_recovery(code: str) -> NoReturn:
     raise DurableRecoveryRejection(code)
 
 
+def _recovery_active_plan_path(repo_root: Path, context: object) -> Path:
+    """Map the recorded active plan to the file a worktree run actually keeps.
+
+    Receipts record plan paths anchored at the primary checkout, while a
+    worktree run's working plan file lives inside the run worktree.  A
+    worktree resume therefore always binds the worktree mirror, even when
+    the primary checkout still holds a copy of the same plan, because the
+    successor reads and edits the worktree file and the workspace
+    fingerprint must cover those bytes.  A path that cannot be mapped into
+    the recorded worktree, or whose mirror is missing or resolves outside
+    it, is rejected instead of silently binding an unrelated primary copy.
+    Branch and no-worktree runs keep binding the recorded primary path.
+    """
+    active = Path(context.active_plan_path)
+    if "worktree" not in tuple(context.setup) or not getattr(
+        context, "worktree_path", None
+    ):
+        return active
+    worktree = Path(context.worktree_path)
+    try:
+        rel = active.resolve().relative_to(repo_root)
+    except (OSError, ValueError) as exc:
+        raise DurableRecoveryRejection("recovery_evidence_unavailable") from exc
+    mirror = worktree / rel
+    if not mirror.is_file():
+        _reject_recovery("recovery_evidence_unavailable")
+    try:
+        mirror.resolve(strict=True).relative_to(worktree.resolve())
+    except (OSError, ValueError) as exc:
+        raise DurableRecoveryRejection("recovery_evidence_unavailable") from exc
+    return mirror
+
+
 def _recovery_fingerprint_plan_paths(paths: Iterable[Path]) -> tuple[Path, ...]:
     """Normalize the exact Markdown evidence inputs used by both boundaries."""
     normalized: list[Path] = []
@@ -1143,9 +1176,15 @@ class DaemonService:
                     "waiting_for_valid_override",
                     "owner_stopped",
                 }:
-                    raise DaemonError(
-                        "source run is incomplete, terminal, or lacks safe resume evidence"
-                    )
+                    # Issue #62: a no-delivery budget exit is a completed run
+                    # with unfinished review/repair work.  Only the shared
+                    # classifier may admit that terminal shape.
+                    if source.status != "completed" or (
+                        self._budget_boundary_for(normalized_source_run_id) is None
+                    ):
+                        raise DaemonError(
+                            "source run is incomplete, terminal, or lacks safe resume evidence"
+                        )
             else:
                 self._admit_recovery_source(
                     normalized_source_run_id,
@@ -1510,7 +1549,13 @@ class DaemonService:
             "waiting_for_valid_override",
             "owner_stopped",
         }:
-            return False
+            # Issue #62: a no-delivery budget exit is a completed run with
+            # unfinished review/repair work; only the shared classifier may
+            # admit that terminal shape into the preview.
+            if status.status != "completed" or (
+                self._budget_boundary_for(status.run_id) is None
+            ):
+                return False
         if status.launch_phase in {None, "manifest_only", "launch_requested"}:
             return False
         if (
@@ -2292,7 +2337,15 @@ class DaemonService:
         if source.ownership != "control_plane":
             _reject_recovery("recovery_source_state")
         if source.status not in {"failed", "interrupted", "owner_stopped"}:
-            _reject_recovery("recovery_source_state")
+            # Issue #62: a no-delivery budget exit is a completed source with
+            # unfinished review/repair work.  Only the shared classifier may
+            # admit that terminal shape into durable-evidence replacement;
+            # every generic completed source still rejects here, before any
+            # reservation or launch.
+            if source.status != "completed" or (
+                self._budget_boundary_for(source_run_id) is None
+            ):
+                _reject_recovery("recovery_source_state")
         worker = source.evidence.get("worker")
         if not isinstance(worker, Mapping) or not confirmed_inactive(worker):
             _reject_recovery("recovery_source_activity")
@@ -2430,10 +2483,34 @@ class DaemonService:
         )
 
         plan_path = Path(getattr(bootstrap, "plan_path", ""))
-        add_file(plan_path)
+        if str(plan_path):
+            add_file(plan_path)
         active_plan_path = context.active_plan_path
         if active_plan_path is not None:
-            add_file(Path(active_plan_path))
+            active_file = _recovery_active_plan_path(repo_root, context)
+            try:
+                add_file(active_file)
+            except DurableRecoveryRejection:
+                # A worktree run keeps its active plan inside the execution
+                # worktree, which lives outside the primary checkout.  ``add_file``
+                # only binds repo-root files, so bind the worktree plan as an
+                # absolute worktree-file reference and let the workspace
+                # fingerprint cover its bytes.
+                try:
+                    resolved_active = active_file.resolve(strict=True)
+                    active_bytes = resolved_active.read_bytes()
+                except OSError as exc:
+                    raise DurableRecoveryRejection("recovery_evidence_unavailable") from exc
+                if not resolved_active.is_file():
+                    _reject_recovery("recovery_evidence_unavailable")
+                evidence.append(
+                    RecoveryEvidenceReference(
+                        path=f"worktree-file:{resolved_active}",
+                        sha256=hashlib.sha256(active_bytes).hexdigest(),
+                        size=len(active_bytes),
+                    )
+                )
+                evidence_file_paths.append(resolved_active)
 
         setup = tuple(context.setup)
         if any(item not in {"branch", "worktree"} for item in setup):
@@ -3236,6 +3313,30 @@ class DaemonService:
             "non-persistent extra instructions are unavailable; submit a new resume request"
         )
 
+    def _budget_boundary_for(self, source_run_id: str):
+        """Issue #62: classify one run for an unfinished budget boundary.
+
+        Read-only.  Returns the validated descriptor, or None when the run is
+        not a resumable budget boundary.  The shared classifier is the single
+        authority; the daemon never re-derives the shape itself.
+        """
+        from aflow.budget_resume import classify_budget_boundary
+
+        try:
+            self._refresh_workflow_config()
+            run_dir = self._application.repository.run_directory(source_run_id)
+            raw = json.loads((run_dir / "run.json").read_text(encoding="utf-8"))
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError, ConfigError):
+            return None
+        if not isinstance(raw, Mapping):
+            return None
+        return classify_budget_boundary(
+            run_dir=run_dir,
+            prev_run=raw,
+            workflow_config=self._workflow_config,
+            repo_root=self._config.repo_root,
+        )
+
     def _resume_bootstrap(
         self,
         source_run_id: str,
@@ -3526,8 +3627,34 @@ def worker_main(
     return 0
 
 
-def _recovery_file_reference_path(repo_root: Path, reference: RecoveryEvidenceReference) -> Path:
+def _recovery_file_reference_path(
+    repo_root: Path,
+    reference: RecoveryEvidenceReference,
+    workspace: Path | None = None,
+) -> Path:
     """Resolve one successor evidence reference without following unsafe paths."""
+    if reference.path.startswith("worktree-file:"):
+        # A worktree run keeps its active plan inside the execution worktree,
+        # which lives outside the primary checkout.  Such references bind an
+        # absolute worktree path and must resolve back into the bound workspace.
+        if workspace is None:
+            _reject_recovery("recovery_evidence_unavailable")
+        target = Path(reference.path.removeprefix("worktree-file:"))
+        if not target.is_absolute():
+            _reject_recovery("recovery_evidence_unavailable")
+        if target.is_symlink():
+            _reject_recovery("recovery_evidence_unavailable")
+        try:
+            resolved = target.resolve(strict=True)
+            resolved.relative_to(workspace.resolve())
+            data = resolved.read_bytes()
+        except (OSError, ValueError) as exc:
+            raise DurableRecoveryRejection("recovery_evidence_unavailable") from exc
+        if not resolved.is_file():
+            _reject_recovery("recovery_evidence_unavailable")
+        if len(data) != reference.size or hashlib.sha256(data).hexdigest() != reference.sha256:
+            _reject_recovery("recovery_evidence_unavailable")
+        return resolved
     relative = Path(reference.path)
     if relative.is_absolute() or not relative.parts or ".." in relative.parts:
         _reject_recovery("recovery_evidence_unavailable")
@@ -3554,15 +3681,10 @@ def _validate_recovery_evidence_for_worker(
     intent: RecoveryIntent,
 ) -> tuple[tuple[Path, ...], dict[str, object]]:
     """Recheck the immutable evidence immediately before target launch."""
-    file_paths: list[Path] = []
     workspace_reference: RecoveryEvidenceReference | None = None
     for reference in intent.evidence:
-        if reference.kind == "file":
-            file_paths.append(_recovery_file_reference_path(repo_root, reference))
-        elif workspace_reference is None:
+        if reference.kind == "workspace" and workspace_reference is None:
             workspace_reference = reference
-        else:
-            _reject_recovery("recovery_evidence_unavailable")
     if workspace_reference is None or not workspace_reference.path.startswith("worktree:"):
         _reject_recovery("recovery_evidence_unavailable")
     workspace_text = workspace_reference.path.removeprefix("worktree:")
@@ -3571,6 +3693,14 @@ def _validate_recovery_evidence_for_worker(
     workspace = Path(workspace_text)
     if workspace.is_symlink() or not workspace.is_dir():
         _reject_recovery("recovery_evidence_unavailable")
+    file_paths: list[Path] = []
+    for reference in intent.evidence:
+        if reference.kind == "file":
+            file_paths.append(
+                _recovery_file_reference_path(repo_root, reference, workspace)
+            )
+        elif reference.kind == "workspace":
+            continue
     plan_paths = _recovery_fingerprint_plan_paths(file_paths)
     observed = workspace_fingerprint(workspace, plan_paths)
     if observed.get("sha256") != workspace_reference.sha256:

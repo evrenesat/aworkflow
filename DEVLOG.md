@@ -34,6 +34,90 @@
   publication entrypoints, assert zero calls, and verify files, branch,
   worktree, and plan locations remain intact.
 
+## 2026-10-02 — Resume validated budget boundaries through managed APIs (issue #62)
+
+- New `aflow/budget_resume.py` is the single shared classifier/reconstructor
+  for unfinished budget boundaries. It is used by the explicit resume
+  bootstrap, the daemon read-only `can_resume` preview, and managed launch
+  revalidation; the automatic candidate scanner never consults it. It admits
+  only two shapes: a new no-delivery budget exit (`status=completed`,
+  `end_reason=max_turns_reached`) and the one narrow historical merge-failure
+  shape (`status=failed`, incomplete strict original snapshot,
+  `end_reason=max_turns_reached`, `merge_status=failed` with the canonical
+  clean-state preflight signature, and an intact recorded execution
+  branch/worktree). Everything else returns `None` and falls through to the
+  existing completed/failed policies.
+- The classifier re-validates the exact last finalized receipt (turn equal to
+  the completed/active turn, successful finalized result, same snapshot,
+  source step/role/selector, exact original/active/new plan paths, strict
+  booleans, no later or in-flight turn) against the current configured graph.
+  A saved `END` must be uniquely matched and selected by the saved conditions
+  only while `MAX_TURNS_REACHED` is true; a saved nonterminal next edge stays
+  authoritative. `NEW_PLAN_EXISTS=true` binds the owned repair overlay, which
+  the successor uses as its active plan. A missing `review_rejection` credit is
+  not an error and is never fabricated.
+- The validated descriptor rides in `ResumeContext.budget_continuation`,
+  distinct from generic incomplete manager-boundary replay. The successor
+  re-selects only the budget-sensitive saved edge with unchanged
+  `DONE`/`NEW_PLAN_EXISTS`; there is no replayed provider/reviewer call and no
+  replay of a completed source manager decision. Ambiguous or incompatibly
+  changed graph evidence is rejected with a bounded reason before any provider
+  launch.
+- Successor budget resolves through the existing precedence (accepted run max
+  override, then explicit invocation limit, then live default) and starts at
+  zero: the source turn count is evidence, not turns already spent. A historical
+  48/4 shape starts with `MAX_TURNS_REACHED=false` and at most four new turns;
+  the override is never erased nor silently restored.
+- Threaded through the daemon read-only `can_resume`, ordinary explicit resume,
+  and explicit durable-evidence replacement admission without bypassing any
+  liveness, unit/nonce/project/caller/workspace/scope, or idempotency check.
+  The predecessor stays immutable (only the existing append-only request-audit
+  events may be appended). Worktree runs bind their in-worktree active plan as
+  an absolute worktree-file evidence reference re-verified against the bound
+  workspace fingerprint, since that file lives outside the primary checkout.
+- `tests/test_budget_exit_recovery.py` adds integrated temporary-repository
+  regressions using the real canonical bootstrap and controller: explicit resume
+  of a pre-turn cap starts the reviewer first, explicit resume of a reviewer
+  overlay starts the repair, the classifier rejects a reviewed completion and
+  tampered shapes, automatic scanning never classifies a budget exit, and a
+  daemon durable-evidence recovery of the historical 48/4 shape produces one
+  successor/one launch with the repair worker reading the exact overlay and no
+  premature merge. The daemon preview and resume admit a budget exit and reject
+  a reviewed completion.
+- No new public API or UI change; setup and flags are unchanged. Selector
+  restoration uses existing controls only.
+- Repair (cp02 review finding): `_recovery_active_plan_path` preferred the
+  primary checkout's active plan whenever that file existed, so a worktree
+  resume bound and fingerprinted the primary copy instead of the worktree
+  plan the successor reads. Because the boundary syncs the worktree plan
+  back to the primary checkout after every turn, both files hold equal
+  bytes at admission and post-admission worktree plan drift left the
+  workspace fingerprint unchanged, defeating the prelaunch rejection. The
+  mapper now always binds the recorded worktree mirror for worktree runs
+  and rejects missing or ambiguous mappings before reservation; branch and
+  no-worktree behavior is unchanged. A dedicated regression proves the
+  worktree-plan binding, the post-admission drift rejection with no
+  provider call, and the unchanged plan reaching the pending reviewer.
+  Also stabilizes one pre-existing launch-manifest assertion in the MCP
+  dispatch regression whose sorted-actual list was compared against an
+  unsorted source/successor expectation, a coin flip on the random
+  run-id suffix.
+- Repair (cp02 review finding): the classifier's numeric-equality branches
+  admitted boolean impostors because Python evaluates `True == 1` and
+  `False == 0`, so a finalized receipt with `"turn_number": true`, a run
+  record with `"active_turn": true`, or a receipt `"returncode": false`
+  passed the strict finalized-turn contract on a single-turn budget exit.
+  The receipt turn number and a present `active_turn` now require a strict
+  positive integer before the equality comparison, and the successful
+  finalized returncode requires a strict integer zero; the remaining
+  completed-status, snapshot, selector, condition, transition, and
+  workspace validations are unchanged. The existing tamper regression now
+  proves `turn_number: true`, `active_turn: true`, and `returncode: false`
+  each reject through the classifier, the read-only preview, explicit
+  bootstrap, and managed replacement before any successor reservation or
+  provider launch, while the intact single-turn and historical fixtures
+  stay admitted everywhere.
+
 ## 2026-10-02 — Establish plan relevance before startup ambiguity (issue #63)
 
 - `_candidate_match` in `aflow/control_plane/startup_context.py` now decides

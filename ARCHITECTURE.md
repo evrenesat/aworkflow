@@ -1873,6 +1873,72 @@ All state-changing routes require bearer-token authentication. The app is
 designed for authenticated local or LAN deployment, not direct internet
 exposure.
 
+### Unfinished budget-boundary continuation (issue #62)
+
+`aflow/budget_resume.py` is the single shared authority that decides whether a
+terminal run left a safe, resumable unfinished budget boundary, and what the
+successor must start from. It is consulted only by the three explicit, owner-
+requested paths: the CLI resume bootstrap (`_bootstrap_resume_invocation`), the
+daemon read-only `can_resume` preview, and managed launch revalidation. The
+automatic candidate scanner never calls it, so the narrow historical exception
+can never be picked up by an unrequested resume prompt.
+
+Two shapes are admitted, and nothing else:
+
+- **budget exit** — a new no-delivery budget exit recorded with
+  `status=completed` and `end_reason=max_turns_reached` (checkpoint one's
+delivery gate). The review/repair work is unfinished even though the controller
+invocation is complete.
+- **historical merge failure** — the one narrow historical shape:
+  `status=failed`, an incomplete strict original snapshot,
+  `end_reason=max_turns_reached`, `merge_status=failed` carrying the canonical
+clean-state preflight signature, and an intact recorded execution
+  branch/worktree. Completion/publication receipts, other merge errors, and
+  complete-original historical repair overlays are all rejected.
+
+The classifier re-validates the exact last finalized receipt (positive strict
+integer turn equal to the completed/active turn, successful finalized result,
+same snapshot, source step/role/selector, exact original/active/new plan paths,
+strict booleans, no later or in-flight turn) against the current configured
+workflow graph. For a saved `END` it requires a uniquely matching transition that
+is selected by the saved conditions and stops matching when only
+`MAX_TURNS_REACHED` is false; a saved nonterminal next edge remains
+authoritative. `NEW_PLAN_EXISTS=true` binds an existing owned repair overlay to
+the recorded new path, which the successor uses as its active plan; the
+before-turn active overlay and after-turn new overlay are separate identities.
+A missing `review_rejection` credit is not an error and is never fabricated.
+
+The validated descriptor rides in `ResumeContext.budget_continuation`, distinct
+from the generic incomplete manager-boundary replay. The successor re-selects only the
+budget-sensitive saved edge with unchanged `DONE`/`NEW_PLAN_EXISTS` using its
+own current graph; there is no replayed provider/reviewer call and no replay of
+a completed source manager decision. Ambiguous, incompatibly changed, or
+non-executable graph evidence is rejected with a bounded reason before any
+provider launch. Ordinary incomplete resume does not gain this
+reinterpretation.
+
+The successor budget resolves through the existing precedence — accepted run
+max override, then explicit invocation limit, then current live default — before
+routing/provider launch. New successor turn accounting starts at zero: the
+source's turn count (e.g. turn 4) is evidence, not four turns already spent. A
+historical shape with saved 48 and accepted/effective 4 therefore starts with
+`MAX_TURNS_REACHED=false` and at most four new turns; a later supported
+revisioned control may raise its own limit. The override is never erased nor
+silently restored to the saved value.
+
+The predecessor is immutable: canonical `run.json`, finalized turn receipts,
+scope artifacts, plan/overlay files, workspace files, and launch manifests keep
+their exact bytes. Only the existing append-only predecessor
+`resume_requested`/`recovery_requested` request-audit events may be appended.
+Existing identity, liveness, unit/nonce/project/caller/workspace/scope, and
+idempotency checks are unchanged; a duplicate successor ownership, an active or
+unknown unit, a changed fingerprint, a conflicting manifest, or prelaunch
+workspace drift is rejected. The replacement's worker selector stays persistent
+until supported controls change it; selector restoration uses existing controls
+only. Worktree runs keep their active plan inside the execution worktree, so
+recovery binds it as an absolute worktree-file evidence reference re-verified
+against the bound workspace fingerprint.
+
 ### Detached worker diagnostics
 
 `worker_diagnostics.py` projects nonce-bound portable unit receipts on reads, shared by repository status, REST lists/details, recovery admission and reconciliation. Controller terminal state and owner stops retain authority; a live child contradicting an exit remains uncertain. Nonzero exits without controller metadata report startup failure; zero exits alone never prove workflow completion. Worker exit timing is separate from controller execution timing.

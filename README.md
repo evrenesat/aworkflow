@@ -569,10 +569,15 @@ aflow run --resume <run-id>
 Resume accepts an eligible, complete schema-v2 run in any supported lifecycle
 mode: no lifecycle, branch-only, or linked worktree. Most resumptions continue
 an incomplete plan; a narrowly validated completed run may instead retry only
-a failed terminal merge. AFlow reconstructs the saved plan, invocation, and
-lifecycle identity when no plan is supplied. Older run metadata remains
-readable for analysis but is not migrated or resumable. Detailed compatibility,
-recovery, supervision, and next-turn override rules are documented separately.
+a failed terminal merge. A narrowly validated unfinished budget boundary (a
+no-delivery budget exit, or one recorded historical merge failure) may resume
+through ordinary explicit resume or explicit durable-evidence recovery, starting
+a fresh successor invocation at the saved repair/review step with its own turn
+accounting while the source run stays immutable. AFlow reconstructs the saved
+plan, invocation, and lifecycle identity when no plan is supplied. Older run
+metadata remains readable for analysis but is not migrated or resumable.
+Detailed compatibility, recovery, supervision, and next-turn override rules
+are documented separately.
 
 Use `--continue-from-current` for an accepted, partially completed plan:
 

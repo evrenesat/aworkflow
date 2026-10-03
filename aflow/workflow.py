@@ -8140,6 +8140,10 @@ def _run_workflow_unchecked(
     if resume is not None and resume.pending_cumulative_review is not None:
         # The cumulative worker result is the reviewer's immutable evidence.
         preserved_resume_run_ids.add(resume.resumed_from_run_id)
+    if resume is not None and resume.budget_continuation is not None:
+        # The validated budget boundary binds the successor to the source
+        # run's immutable receipts; keep that lineage available.
+        preserved_resume_run_ids.add(resume.resumed_from_run_id)
     if terminal_completion_resume and resume is not None:
         preserved_resume_run_ids.update(terminal_delivery_lineage)
     if (
@@ -8757,6 +8761,7 @@ def _run_workflow_unchecked(
         and (
             resume.pending_finalized_turn is not None
             or resume.pending_cumulative_review is not None
+            or resume.budget_continuation is not None
             or _has_resumable_cumulative_repair(
                 resume,
                 repo_root=config.repo_root,

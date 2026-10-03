@@ -8,11 +8,16 @@ Reviewed completions keep delivering normally.
 
 from __future__ import annotations
 
+import asyncio
+import hashlib
 import json
+import os
 import subprocess
 import tempfile
 from pathlib import Path
 from unittest.mock import patch
+
+import pytest
 
 from aflow.config import load_workflow_config
 from aflow.harnesses.base import HarnessInvocation
@@ -128,6 +133,25 @@ _REPAIR_PLAN = (
     "- [ ] fix reviewer finding\n"
 )
 
+# The historical source left its strict original plan incomplete at the cap;
+# the on-disk original must keep agreeing with that saved snapshot.
+_PARTIAL_PLAN = (
+    "# Plan\n\n"
+    "### [x] Checkpoint 1: First\n"
+    "- [x] step one\n\n"
+    "### [ ] Checkpoint 2: Second\n"
+    "- [ ] step two\n"
+)
+
+# An ordinary budget exit can leave a worker-edited worktree plan that
+# differs from the committed primary checkout copy and stays incomplete.
+_CHANGED_INCOMPLETE_PLAN = (
+    "# Plan\n\n"
+    "### [ ] Checkpoint 1: First\n"
+    "- [ ] step one\n"
+    "- [ ] step two edited in the worktree\n"
+)
+
 
 def _write_budget_config(
     config_dir: Path,
@@ -146,6 +170,9 @@ team_lead = "senior_architect"
 
 [harness.codex.profiles.base]
 model = "model-base"
+
+[harness.codex.profiles.other]
+model = "model-other"
 
 [roles]
 worker = "codex.base"
@@ -188,6 +215,7 @@ def _run_budget(
     *,
     max_turns: int,
     resume: ResumeContext | None = None,
+    adapter: RecordingAdapter | None = None,
 ):
     config = ControllerConfig(
         repo_root=repo_root,
@@ -202,7 +230,7 @@ def _run_budget(
         config_dir=config_path,
         working_dir=repo_root,
         snapshot_config=False,
-        adapter=RecordingAdapter(),
+        adapter=adapter or RecordingAdapter(),
         runner=runner,
         resume=resume,
     )
@@ -624,3 +652,1809 @@ def test_finalized_replay_of_budget_only_end_does_not_merge(tmp_path: Path) -> N
         assert rc == 0
         assert plan_path.is_file()
         assert plan_path.read_text(encoding="utf-8") == _VALID_PLAN
+
+
+# ---------------------------------------------------------------------------
+# Checkpoint #2: budget boundary classification and successor resume.
+# ---------------------------------------------------------------------------
+
+from aflow.budget_resume import (
+    MERGE_CLEAN_STATE_PREFLIGHT_SIGNATURE,
+    BudgetBoundary,
+    classify_budget_boundary,
+)
+from aflow.cli import (
+    _bootstrap_resume_invocation,
+    _detect_resume_candidate,
+    _resume_candidate_mismatch_reason,
+)
+from aflow.control_plane import InMemoryUnitManager, write_launch_phase
+from aflow.daemon import (
+    AflowDaemon,
+    DaemonConfig,
+    DaemonError,
+    DaemonIdempotencyConflict,
+    DurableRecoveryRejection,
+)
+from aflow.mcp_control_plane import create_control_plane_mcp
+from aflow_app_server.control_plane_service import ControlPlaneService
+from aflow_app_server.project_registry import ProjectRegistry
+
+
+_HISTORICAL_WORKFLOWS = '''\
+[workflow.live]
+team = "base"
+setup = ["worktree", "branch"]
+teardown = ["merge", "rm_worktree"]
+main_branch = "main"
+
+[workflow.live.steps.work]
+role = "worker"
+prompts = ["p"]
+go = [{ to = "final_review" }, { to = "END", when = "DONE" }]
+
+[workflow.live.steps.final_review]
+role = "final_reviewer"
+prompts = ["p"]
+go = [{ to = "END", when = "MAX_TURNS_REACHED" }, { to = "work", when = "NEW_PLAN_EXISTS || !DONE" }, { to = "END", when = "DONE" }]
+'''
+
+_HISTORICAL_MERGE_REASON = (
+    MERGE_CLEAN_STATE_PREFLIGHT_SIGNATURE
+    + "2 path(s) unclean: plans/in-progress/plan.md, src/app.py"
+)
+
+
+class PromptRecordingAdapter(RecordingAdapter):
+    """Records each user prompt so successor prompts can be asserted."""
+
+    def __init__(self) -> None:
+        self.prompts: list[str] = []
+
+    def build_invocation(
+        self,
+        *,
+        repo_root: Path,
+        model: str | None,
+        system_prompt: str,
+        user_prompt: str,
+        effort: str | None = None,
+    ):
+        self.prompts.append(user_prompt)
+        return super().build_invocation(
+            repo_root=repo_root,
+            model=model,
+            system_prompt=system_prompt,
+            user_prompt=user_prompt,
+            effort=effort,
+        )
+
+
+def _run_dir_bytes(root: Path) -> dict[str, bytes]:
+    """Snapshot the authoritative run records (run.json + turn receipts).
+
+    The resume protocol appends journal events to the source run, so the
+    immutability guarantee covers the record the classifier and successor
+    rely on, not the append-only event log.
+    """
+    return {
+        path.relative_to(root).as_posix(): path.read_bytes()
+        for path in sorted(root.rglob("*.json"))
+        if path.name in {"run.json", "result.json"}
+    }
+
+
+def _real_bootstrap(repo_root: Path, config_path: Path, wf_config, run_id: str):
+    """The production bootstrap, with the fixture config as live source."""
+    return _bootstrap_resume_invocation(
+        repo_root=repo_root,
+        config_path=config_path,
+        default_config_path=config_path,
+        config_path_is_explicit=True,
+        workflow_config=wf_config,
+        requested_run_id=run_id,
+        workflow_arg=None,
+        plan_file_arg=None,
+        team_arg=None,
+        start_step_arg=None,
+        max_turns_arg=None,
+        extra_instructions_arg=(),
+        extra_instructions_provided=False,
+        live_loader=load_workflow_config,
+    )
+
+
+def _classify(run_dir: Path, config_path: Path, repo_root: Path) -> BudgetBoundary | None:
+    return classify_budget_boundary(
+        run_dir=run_dir,
+        prev_run=json.loads((run_dir / "run.json").read_text(encoding="utf-8")),
+        workflow_config=load_workflow_config(config_path),
+        repo_root=repo_root,
+    )
+
+
+def _make_source_pre_turn_cap(root: Path, *, plan_text: str = _COMPLETE_PLAN):
+    """Run the review workflow to a pre-turn budget cap (pending review).
+
+    ``plan_text`` is what the source worker writes into the execution
+    worktree's plan file, so a fixture can model a changed worktree plan
+    that differs from the committed primary checkout copy.
+    """
+    repo_root, plan_path = _make_repo(root)
+    worktree_root = root / "worktrees"
+    worktree_root.mkdir()
+    config_path = _write_budget_config(
+        root / "config",
+        max_turns=1,
+        worktree_root=worktree_root,
+        workflows_text=_REVIEW_WORKFLOWS,
+    )
+
+    def source_runner(argv, **kwargs):
+        cwd = Path(kwargs["cwd"])
+        _write_plan(_plan_path_in(cwd), plan_text)
+        return subprocess.CompletedProcess(argv, 0, "ok", "")
+
+    with _DeliverySpies() as spies:
+        result = _run_budget(
+            config_path, repo_root, plan_path, source_runner, max_turns=1,
+        )
+    spies.assert_no_delivery()
+    assert result.status == "completed"
+    assert result.end_reason == "max_turns_reached"
+    return repo_root, plan_path, config_path, result
+
+
+def test_explicit_resume_of_pre_turn_cap_starts_review_first(tmp_path: Path) -> None:
+    """A pre-turn budget exit resumes the pending review, then delivers."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        root = Path(tmpdir)
+        repo_root, plan_path, config_path, result = _make_source_pre_turn_cap(root)
+        source_dir = result.run_dir
+        source_before = _run_dir_bytes(source_dir)
+
+        boundary = _classify(source_dir, config_path, repo_root)
+        assert isinstance(boundary, BudgetBoundary)
+        assert boundary.kind == "budget_exit"
+        assert boundary.next_step_name == "review"
+        assert boundary.saved_max_turns == 1
+
+        bootstrap = _real_bootstrap(
+            repo_root, config_path, load_workflow_config(config_path),
+            source_dir.name,
+        )
+        assert bootstrap.start_step == "review"
+        assert bootstrap.max_turns == 1
+        context = bootstrap.resume_context
+        assert isinstance(context.budget_continuation, BudgetBoundary)
+        assert context.budget_continuation.kind == "budget_exit"
+        assert context.interrupted_step_name == "review"
+
+        worktree_path = Path(
+            json.loads(
+                (source_dir / "run.json").read_text(encoding="utf-8")
+            )["worktree_path"]
+        )
+        worktree_plan = worktree_path / "plans" / "in-progress" / "plan.md"
+
+        adapter = PromptRecordingAdapter()
+
+        def successor_runner(argv, **kwargs):
+            cwd = Path(kwargs["cwd"])
+            _write_plan(_plan_path_in(cwd), _COMPLETE_PLAN)
+            return subprocess.CompletedProcess(argv, 0, "ok", "")
+
+        with _DeliverySpies() as spies:
+            successor = _run_budget(
+                config_path,
+                repo_root,
+                bootstrap.plan_path,
+                successor_runner,
+                max_turns=bootstrap.max_turns,
+                resume=context,
+                adapter=adapter,
+            )
+
+        # The successor ran the pending review first and then delivered.
+        assert successor.status == "completed"
+        assert successor.end_reason == "done"
+        assert successor.run_dir != source_dir
+        turn1 = json.loads(
+            (
+                successor.run_dir / "turns" / "turn-001" / "result.json"
+            ).read_text(encoding="utf-8")
+        )
+        assert turn1["step_name"] == "review"
+        assert str(worktree_plan) in adapter.prompts[0]
+        assert spies.merge_calls == 1
+        assert spies.deliver_calls == 1
+        # The source run stayed byte-identical.
+        assert _run_dir_bytes(source_dir) == source_before
+
+
+def test_explicit_resume_of_reviewer_overlay_starts_repair(tmp_path: Path) -> None:
+    """A reviewer overlay at the cap becomes the successor's active plan."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        root = Path(tmpdir)
+        repo_root, plan_path = _make_repo(root)
+        worktree_root = root / "worktrees"
+        worktree_root.mkdir()
+        config_path = _write_budget_config(
+            root / "config",
+            max_turns=2,
+            worktree_root=worktree_root,
+            workflows_text=_FINAL_REVIEW_WORKFLOWS,
+        )
+        turns = 0
+
+        def source_runner(argv, **kwargs):
+            nonlocal turns
+            turns += 1
+            cwd = Path(kwargs["cwd"])
+            if turns == 1:
+                _write_plan(_plan_path_in(cwd), _COMPLETE_PLAN)
+            else:
+                overlay = cwd / "plans" / "in-progress" / "plan-cp01-v01.md"
+                _write_plan(overlay, _REPAIR_PLAN)
+            return subprocess.CompletedProcess(argv, 0, "ok", "")
+
+        with _DeliverySpies() as spies:
+            result = _run_budget(
+                config_path, repo_root, plan_path, source_runner, max_turns=2,
+            )
+        spies.assert_no_delivery()
+        source_dir = result.run_dir
+        source_before = _run_dir_bytes(source_dir)
+
+        boundary = _classify(source_dir, config_path, repo_root)
+        assert isinstance(boundary, BudgetBoundary)
+        assert boundary.kind == "budget_exit"
+        assert boundary.next_step_name == "work"
+        assert boundary.new_plan_exists is True
+        assert boundary.overlay_path is not None
+        assert boundary.overlay_path.name == "plan-cp01-v01.md"
+
+        bootstrap = _real_bootstrap(
+            repo_root, config_path, load_workflow_config(config_path),
+            source_dir.name,
+        )
+        assert bootstrap.start_step == "work"
+        assert bootstrap.max_turns == 2
+        context = bootstrap.resume_context
+        assert isinstance(context.budget_continuation, BudgetBoundary)
+        assert context.active_plan_path.name == "plan-cp01-v01.md"
+
+        adapter = PromptRecordingAdapter()
+        complete_repair = (
+            "# Repair\n\n"
+            "### [x] Checkpoint 1: Repair\n"
+            "- [x] fix reviewer finding\n"
+        )
+        s_turns = 0
+
+        def successor_runner(argv, **kwargs):
+            nonlocal s_turns
+            s_turns += 1
+            cwd = Path(kwargs["cwd"])
+            if s_turns == 1:
+                _write_plan(_plan_path_in(cwd), _COMPLETE_PLAN)
+                _write_plan(
+                    cwd / "plans" / "in-progress" / "plan-cp01-v01.md",
+                    complete_repair,
+                )
+            return subprocess.CompletedProcess(argv, 0, "ok", "")
+
+        with _DeliverySpies() as spies2:
+            successor = _run_budget(
+                config_path,
+                repo_root,
+                bootstrap.plan_path,
+                successor_runner,
+                max_turns=bootstrap.max_turns,
+                resume=context,
+                adapter=adapter,
+            )
+
+        assert s_turns == 2
+        assert successor.status == "completed"
+        assert successor.end_reason == "done"
+        turn1 = json.loads(
+            (
+                successor.run_dir / "turns" / "turn-001" / "result.json"
+            ).read_text(encoding="utf-8")
+        )
+        assert turn1["step_name"] == "work"
+        # The overlay was synced into the successor's worktree and the first
+        # prompt addressed it, not the original plan.
+        successor_worktree = Path(
+            json.loads(
+                (successor.run_dir / "run.json").read_text(encoding="utf-8")
+            )["worktree_path"]
+        )
+        overlay = successor_worktree / "plans" / "in-progress" / "plan-cp01-v01.md"
+        assert overlay.is_file()
+        assert str(overlay) in adapter.prompts[0]
+        # The successor's reviewed completion delivers normally.
+        assert spies2.merge_calls == 1
+        assert spies2.deliver_calls == 1
+        # The source run stayed byte-identical.
+        assert _run_dir_bytes(source_dir) == source_before
+
+
+def test_classifier_rejects_reviewed_completion(tmp_path: Path) -> None:
+    """A reviewed END at the cap is a genuine completion, not a boundary."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        root = Path(tmpdir)
+        repo_root, plan_path = _make_repo(root)
+        worktree_root = root / "worktrees"
+        worktree_root.mkdir()
+        config_path = _write_budget_config(
+            root / "config",
+            max_turns=2,
+            worktree_root=worktree_root,
+            workflows_text=_REVIEW_WORKFLOWS,
+        )
+        turns = 0
+
+        def runner(argv, **kwargs):
+            nonlocal turns
+            turns += 1
+            cwd = Path(kwargs["cwd"])
+            if turns == 1:
+                _write_plan(_plan_path_in(cwd), _COMPLETE_PLAN)
+            return subprocess.CompletedProcess(argv, 0, "ok", "")
+
+        with _DeliverySpies() as spies:
+            result = _run_budget(
+                config_path, repo_root, plan_path, runner, max_turns=2,
+            )
+        assert result.status == "completed"
+        assert result.end_reason == "done"
+        assert spies.merge_calls == 1
+        assert _classify(result.run_dir, config_path, repo_root) is None
+
+
+def test_classifier_rejects_tampered_budget_shapes(tmp_path: Path) -> None:
+    """Receipt, worktree, and turn-count damage all reject the boundary."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        root = Path(tmpdir)
+        repo_root, plan_path, config_path, result = _make_source_pre_turn_cap(root)
+        source_dir = result.run_dir
+        run_json = json.loads((source_dir / "run.json").read_text(encoding="utf-8"))
+        worktree_path = Path(run_json["worktree_path"])
+
+        # Baseline accepts.
+        assert _classify(source_dir, config_path, repo_root) is not None
+
+        # A tampered receipt no longer agrees with the final snapshot.
+        receipt_path = source_dir / "turns" / "turn-001" / "result.json"
+        receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+        tampered = json.loads(json.dumps(receipt))
+        tampered["snapshot_after"]["is_complete"] = (
+            not tampered["snapshot_after"]["is_complete"]
+        )
+        receipt_path.write_text(json.dumps(tampered), encoding="utf-8")
+        assert _classify(source_dir, config_path, repo_root) is None
+        receipt_path.write_text(json.dumps(receipt), encoding="utf-8")
+
+        # A run count that points past the last receipt rejects.
+        run_json_path = source_dir / "run.json"
+        broken = json.loads(json.dumps(run_json))
+        broken["turns_completed"] = 2
+        run_json_path.write_text(json.dumps(broken), encoding="utf-8")
+        assert _classify(source_dir, config_path, repo_root) is None
+        run_json_path.write_text(json.dumps(run_json), encoding="utf-8")
+
+        # A missing worktree rejects the budget_exit shape.
+        _run_git_in_test(["worktree", "remove", "--force", str(worktree_path)],
+                         cwd=repo_root)
+        assert _classify(source_dir, config_path, repo_root) is None
+
+
+def test_auto_scan_never_classifies_budget_exit(tmp_path: Path) -> None:
+    """Unrequested resume prompts never admit a budget boundary."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        root = Path(tmpdir)
+        repo_root, plan_path, config_path, result = _make_source_pre_turn_cap(root)
+        source_dir = result.run_dir
+        wf_config = load_workflow_config(config_path)
+
+        # Automatic candidate scanning has no bootstrap and must not admit
+        # the completed budget exit.
+        assert _detect_resume_candidate(
+            repo_root,
+            wf_config,
+            "live",
+            plan_path,
+            "base",
+            None,
+            1,
+            (),
+            requested_run_id=source_dir.name,
+        ) is None
+
+        # The explicit bootstrap path does admit it.
+        bootstrap = _real_bootstrap(repo_root, config_path, wf_config, source_dir.name)
+        context = _detect_resume_candidate(
+            repo_root,
+            wf_config,
+            "live",
+            plan_path,
+            "base",
+            None,
+            1,
+            (),
+            requested_run_id=source_dir.name,
+            resume_bootstrap=bootstrap,
+        )
+        assert context is not None
+        assert isinstance(context.budget_continuation, BudgetBoundary)
+
+
+def _make_source_historical(root: Path):
+    """Build the narrow historical merge-failure shape from a real run."""
+    repo_root, plan_path = _make_repo(root)
+    worktree_root = root / "worktrees"
+    worktree_root.mkdir()
+    config_path = _write_budget_config(
+        root / "config",
+        max_turns=4,
+        worktree_root=worktree_root,
+        workflows_text=_HISTORICAL_WORKFLOWS,
+    )
+    turns = 0
+
+    def source_runner(argv, **kwargs):
+        nonlocal turns
+        turns += 1
+        cwd = Path(kwargs["cwd"])
+        if turns == 1:
+            # The original plan stays incomplete through the cap: this is the
+            # historical shape, not a completed ledger awaiting review.
+            _write_plan(_plan_path_in(cwd), _PARTIAL_PLAN)
+        elif turns == 4:
+            _write_plan(
+                cwd / "plans" / "in-progress" / "plan-cp01-v02.md",
+                _REPAIR_PLAN,
+            )
+        return subprocess.CompletedProcess(argv, 0, "ok", "")
+
+    with _DeliverySpies() as spies:
+        result = _run_budget(
+            config_path, repo_root, plan_path, source_runner, max_turns=4,
+        )
+    spies.assert_no_delivery()
+    assert turns == 4
+    assert result.status == "completed"
+    assert result.end_reason == "max_turns_reached"
+
+    source_dir = result.run_dir
+    run_json_path = source_dir / "run.json"
+    run_json = json.loads(run_json_path.read_text(encoding="utf-8"))
+    # Rewrite the terminal record into the historical shape: a failed merge
+    # teardown over an accepted 4-turn budget under a 48-turn invocation.
+    run_json["status"] = "failed"
+    run_json["max_turns"] = 48
+    run_json["effective_max_turns"] = 4
+    run_json["merge_status"] = "failed"
+    run_json["merge_failure_reason"] = _HISTORICAL_MERGE_REASON
+    run_json["failure_reason"] = "merge teardown failed"
+    run_json["last_accepted_override"] = {
+        "status": "accepted",
+        "digest": "d" * 64,
+        "message": "accepted",
+        "max_turns": 4,
+    }
+    run_json_path.write_text(json.dumps(run_json), encoding="utf-8")
+    return repo_root, plan_path, config_path, result, run_json
+
+
+def test_historical_merge_failure_budget_boundary(tmp_path: Path) -> None:
+    """The one historical shape resumes the repair with the accepted budget."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        root = Path(tmpdir)
+        repo_root, plan_path, config_path, result, run_json = (
+            _make_source_historical(root)
+        )
+        source_dir = result.run_dir
+        source_before = _run_dir_bytes(source_dir)
+        wf_config = load_workflow_config(config_path)
+
+        boundary = _classify(source_dir, config_path, repo_root)
+        assert isinstance(boundary, BudgetBoundary)
+        assert boundary.kind == "historical_merge_failure"
+        assert boundary.next_step_name == "work"
+        assert boundary.effective_max_turns == 4
+        assert boundary.saved_max_turns == 48
+        assert boundary.overlay_path is not None
+        assert boundary.overlay_path.name == "plan-cp01-v02.md"
+
+        # Without budget continuation the historical shape is not resumable.
+        mismatch = _resume_candidate_mismatch_reason(
+            run_json,
+            wf_config,
+            repo_root,
+            "live",
+            plan_path,
+            "base",
+            None,
+            48,
+            (),
+            run_dir=source_dir,
+        )
+        assert mismatch is not None
+
+        bootstrap = _real_bootstrap(repo_root, config_path, wf_config, source_dir.name)
+        assert bootstrap.start_step == "work"
+        # The accepted override budget (4), not the saved invocation (48).
+        assert bootstrap.max_turns == 4
+        context = bootstrap.resume_context
+        assert isinstance(context.budget_continuation, BudgetBoundary)
+        assert context.budget_continuation.kind == "historical_merge_failure"
+        assert context.active_plan_path.name == "plan-cp01-v02.md"
+
+        complete_repair = (
+            "# Repair\n\n"
+            "### [x] Checkpoint 1: Repair\n"
+            "- [x] fix reviewer finding\n"
+        )
+        s_turns = 0
+
+        def successor_runner(argv, **kwargs):
+            nonlocal s_turns
+            s_turns += 1
+            cwd = Path(kwargs["cwd"])
+            if s_turns == 1:
+                _write_plan(_plan_path_in(cwd), _COMPLETE_PLAN)
+                _write_plan(
+                    cwd / "plans" / "in-progress" / "plan-cp01-v02.md",
+                    complete_repair,
+                )
+            return subprocess.CompletedProcess(argv, 0, "ok", "")
+
+        with _DeliverySpies() as spies:
+            successor = _run_budget(
+                config_path,
+                repo_root,
+                bootstrap.plan_path,
+                successor_runner,
+                max_turns=bootstrap.max_turns,
+                resume=context,
+            )
+
+        assert s_turns == 2
+        assert successor.status == "completed"
+        assert successor.end_reason == "done"
+        turn1 = json.loads(
+            (
+                successor.run_dir / "turns" / "turn-001" / "result.json"
+            ).read_text(encoding="utf-8")
+        )
+        assert turn1["step_name"] == "work"
+        assert spies.merge_calls == 1
+        assert spies.deliver_calls == 1
+        # The source run stayed byte-identical.
+        assert _run_dir_bytes(source_dir) == source_before
+
+
+def test_historical_shape_negatives_reject(tmp_path: Path) -> None:
+    """Arbitrary merge failures, missing worktrees, and tampering reject."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        root = Path(tmpdir)
+        repo_root, plan_path, config_path, result, run_json = (
+            _make_source_historical(root)
+        )
+        source_dir = result.run_dir
+        run_json_path = source_dir / "run.json"
+
+        # Baseline accepts.
+        assert _classify(source_dir, config_path, repo_root) is not None
+
+        # An arbitrary merge failure reason is not the canonical signature.
+        broken = json.loads(json.dumps(run_json))
+        broken["merge_failure_reason"] = "merge failed: unknown"
+        run_json_path.write_text(json.dumps(broken), encoding="utf-8")
+        assert _classify(source_dir, config_path, repo_root) is None
+        run_json_path.write_text(json.dumps(run_json), encoding="utf-8")
+
+        # A failed merge without merge_status is not the historical shape.
+        broken = json.loads(json.dumps(run_json))
+        del broken["merge_status"]
+        run_json_path.write_text(json.dumps(broken), encoding="utf-8")
+        assert _classify(source_dir, config_path, repo_root) is None
+        run_json_path.write_text(json.dumps(run_json), encoding="utf-8")
+
+        # A missing worktree rejects the historical shape.
+        worktree_path = Path(run_json["worktree_path"])
+        _run_git_in_test(
+            ["worktree", "remove", "--force", str(worktree_path)],
+            cwd=repo_root,
+        )
+        assert _classify(source_dir, config_path, repo_root) is None
+
+
+def test_historical_complete_original_with_overlay_rejects(tmp_path: Path) -> None:
+    """A complete original (issue #58 shape) is not the historical boundary."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        root = Path(tmpdir)
+        repo_root, plan_path, config_path, result, run_json = (
+            _make_source_historical(root)
+        )
+        source_dir = result.run_dir
+        run_json_path = source_dir / "run.json"
+        worktree_path = Path(run_json["worktree_path"])
+        original_in_worktree = worktree_path / "plans" / "in-progress" / "plan.md"
+
+        # Baseline: incomplete strict original agrees with the saved snapshot.
+        assert _classify(source_dir, config_path, repo_root) is not None
+
+        # The #58 shape: the on-disk original plan is complete while a
+        # historical repair overlay differs from it.  The saved snapshot no
+        # longer matches the validated on-disk original, so reject.
+        original_in_worktree.write_text(_COMPLETE_PLAN, encoding="utf-8")
+        assert _classify(source_dir, config_path, repo_root) is None
+
+        # A different incomplete original also breaks the identity binding.
+        other_partial = (
+            "# Plan\n\n"
+            "### [ ] Checkpoint 9: Other\n"
+            "- [ ] step\n"
+        )
+        original_in_worktree.write_text(other_partial, encoding="utf-8")
+        assert _classify(source_dir, config_path, repo_root) is None
+
+        # A missing on-disk original rejects before any reservation.
+        original_in_worktree.unlink()
+        assert _classify(source_dir, config_path, repo_root) is None
+        original_in_worktree.write_text(_PARTIAL_PLAN, encoding="utf-8")
+        assert _classify(source_dir, config_path, repo_root) is not None
+
+        # A saved complete original snapshot (kept consistent with the
+        # finalized receipt) rejects even when the on-disk plan is complete:
+        # the historical exception requires an incomplete strict original.
+        broken = json.loads(json.dumps(run_json))
+        broken["last_snapshot"]["is_complete"] = True
+        run_json_path.write_text(json.dumps(broken), encoding="utf-8")
+        receipt_path = source_dir / "turns" / "turn-004" / "result.json"
+        receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+        receipt["snapshot_after"]["is_complete"] = True
+        original_in_worktree.write_text(_COMPLETE_PLAN, encoding="utf-8")
+        receipt_path.write_text(json.dumps(receipt), encoding="utf-8")
+        assert _classify(source_dir, config_path, repo_root) is None
+
+
+def test_tampered_receipt_identity_rejects_every_surface(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Contradicted receipt role/selector/conditions never reach a launch.
+
+    The classifier, the daemon preview, the explicit bootstrap, and managed
+    durable recovery all reject before any successor reservation or provider
+    launch, while the untouched fixture stays admitted.
+    """
+    with tempfile.TemporaryDirectory() as tmpdir:
+        root = Path(tmpdir)
+        repo_root, plan_path, config_path, result, run_json = (
+            _make_source_historical(root)
+        )
+        source_dir = result.run_dir
+        run_json_path = source_dir / "run.json"
+        receipt_path = source_dir / "turns" / "turn-004" / "result.json"
+        sibling_path = source_dir / "turns" / "turn-002" / "result.json"
+        original_receipt = receipt_path.read_bytes()
+        original_run_json = run_json_path.read_bytes()
+        wf_config = load_workflow_config(config_path)
+        _attach_launch_evidence(repo_root, source_dir.name, "failed")
+
+        daemon = _make_daemon(tmp_path, monkeypatch, repo_root, config_path, wf_config)
+        _patch_inactive_worker_evidence(
+            monkeypatch, daemon.application.repository
+        )
+
+        def surface() -> tuple[list[str], list[str]]:
+            return (
+                sorted(
+                    p.name
+                    for p in (repo_root / ".aflow" / "runs").iterdir()
+                    if p.is_dir()
+                ),
+                sorted(
+                    p.name
+                    for p in (repo_root / ".aflow" / "launches").iterdir()
+                    if p.name.endswith(".json")
+                    and not p.name.endswith(".state.json")
+                ),
+            )
+
+        # Baseline: the intact fixture is admitted everywhere.
+        assert isinstance(_classify(source_dir, config_path, repo_root), BudgetBoundary)
+        status = daemon.service.run_status(
+            source_dir.name, include_resume_preview=True
+        )
+        assert status.evidence.get("can_resume") is True
+        bootstrap = _real_bootstrap(repo_root, config_path, wf_config, source_dir.name)
+        assert bootstrap.start_step == "work"
+
+        def reject_case(label: str, mutate) -> None:
+            receipt = json.loads(original_receipt.decode(encoding="utf-8"))
+            mutate(receipt)
+            receipt_path.write_text(json.dumps(receipt), encoding="utf-8")
+            try:
+                assert _classify(source_dir, config_path, repo_root) is None, label
+                tampered_status = daemon.service.run_status(
+                    source_dir.name, include_resume_preview=True
+                )
+                assert tampered_status.evidence.get("can_resume") is False, label
+                with pytest.raises(ValueError):
+                    _real_bootstrap(
+                        repo_root, config_path, wf_config, source_dir.name
+                    )
+                before = surface()
+                with pytest.raises(
+                    (DurableRecoveryRejection, DaemonError, ValueError)
+                ):
+                    daemon.service.resume(
+                        source_dir.name,
+                        caller_scope="local",
+                        idempotency_key=f"tampered-{label}",
+                        recovery={
+                            "mode": "durable_evidence",
+                            "worker_selector": "codex.base",
+                        },
+                    )
+                assert surface() == before, label
+            finally:
+                receipt_path.write_bytes(original_receipt)
+
+        # The finalized role must be the saved source step's configured role.
+        reject_case("role", lambda r: r.__setitem__("step_role", "architect"))
+        # The step identity itself cannot be swapped under a kept role.
+        reject_case("step", lambda r: r.__setitem__("step_name", "work"))
+        # The selector must agree with the earlier receipt of the same step.
+        reject_case("selector", lambda r: r.__setitem__("selector", "codex.other"))
+        # Missing selector identity rejects.
+        reject_case("selector-missing", lambda r: r.__setitem__("selector", ""))
+        # DONE is bound to the saved snapshot, MAX to the effective limit.
+        reject_case(
+            "done", lambda r: r["conditions"].__setitem__("DONE", True)
+        )
+        reject_case(
+            "max",
+            lambda r: r["conditions"].__setitem__("MAX_TURNS_REACHED", False),
+        )
+
+
+        # A contradicted earlier receipt of the same step is saved selector
+        # evidence too: the finalized selector may not silently diverge.
+        original_sibling = sibling_path.read_bytes()
+        sibling = json.loads(original_sibling.decode(encoding="utf-8"))
+        sibling["selector"] = "codex.other"
+        sibling_path.write_text(json.dumps(sibling), encoding="utf-8")
+        try:
+            assert _classify(source_dir, config_path, repo_root) is None
+        finally:
+            sibling_path.write_bytes(original_sibling)
+        assert isinstance(_classify(source_dir, config_path, repo_root), BudgetBoundary)
+
+        # Boolean numeric impostors: Python's ``True == 1`` and ``False == 0``
+        # must not let a boolean receipt turn number, boolean active turn, or
+        # boolean returncode pose as strict finalized-turn evidence.  The
+        # single-turn budget exit is the shape where those impostors match.
+        boolean_root = root / "single-turn-budget-exit"
+        boolean_root.mkdir()
+        b_repo_root, b_plan_path, b_config_path, b_result = (
+            _make_source_pre_turn_cap(boolean_root)
+        )
+        b_source_dir = b_result.run_dir
+        b_run_json_path = b_source_dir / "run.json"
+        b_receipt_path = b_source_dir / "turns" / "turn-001" / "result.json"
+        b_original_receipt = b_receipt_path.read_bytes()
+        b_original_run_json = b_run_json_path.read_bytes()
+        b_wf_config = load_workflow_config(b_config_path)
+        _attach_launch_evidence(b_repo_root, b_source_dir.name, "completed")
+
+        b_daemon = _make_daemon(
+            boolean_root, monkeypatch, b_repo_root, b_config_path, b_wf_config
+        )
+        _patch_inactive_worker_evidence(
+            monkeypatch, b_daemon.application.repository
+        )
+
+        def boolean_surface() -> tuple[list[str], list[str]]:
+            return (
+                sorted(
+                    p.name
+                    for p in (b_repo_root / ".aflow" / "runs").iterdir()
+                    if p.is_dir()
+                ),
+                sorted(
+                    p.name
+                    for p in (b_repo_root / ".aflow" / "launches").iterdir()
+                    if p.name.endswith(".json")
+                    and not p.name.endswith(".state.json")
+                ),
+            )
+
+        # Baseline: the intact single-turn fixture is admitted everywhere.
+        assert isinstance(
+            _classify(b_source_dir, b_config_path, b_repo_root), BudgetBoundary
+        )
+        b_status = b_daemon.service.run_status(
+            b_source_dir.name, include_resume_preview=True
+        )
+        assert b_status.evidence.get("can_resume") is True
+        b_bootstrap = _real_bootstrap(
+            b_repo_root, b_config_path, b_wf_config, b_source_dir.name
+        )
+        assert b_bootstrap.start_step == "review"
+
+        def reject_boolean_case(label: str, mutate) -> None:
+            receipt = json.loads(b_original_receipt.decode(encoding="utf-8"))
+            run_json = json.loads(b_original_run_json.decode(encoding="utf-8"))
+            mutate(receipt, run_json)
+            b_receipt_path.write_text(json.dumps(receipt), encoding="utf-8")
+            b_run_json_path.write_text(json.dumps(run_json), encoding="utf-8")
+            try:
+                assert (
+                    _classify(b_source_dir, b_config_path, b_repo_root) is None
+                ), label
+                tampered_status = b_daemon.service.run_status(
+                    b_source_dir.name, include_resume_preview=True
+                )
+                assert tampered_status.evidence.get("can_resume") is False, label
+                with pytest.raises(ValueError):
+                    _real_bootstrap(
+                        b_repo_root, b_config_path, b_wf_config, b_source_dir.name
+                    )
+                before = boolean_surface()
+                with pytest.raises(
+                    (DurableRecoveryRejection, DaemonError, ValueError)
+                ):
+                    b_daemon.service.resume(
+                        b_source_dir.name,
+                        caller_scope="local",
+                        idempotency_key=f"tampered-{label}",
+                        recovery={
+                            "mode": "durable_evidence",
+                            "worker_selector": "codex.base",
+                        },
+                    )
+                assert boolean_surface() == before, label
+            finally:
+                b_receipt_path.write_bytes(b_original_receipt)
+                b_run_json_path.write_bytes(b_original_run_json)
+
+        reject_boolean_case(
+            "turn-number-bool", lambda r, j: r.__setitem__("turn_number", True)
+        )
+        reject_boolean_case(
+            "active-turn-bool", lambda r, j: j.__setitem__("active_turn", True)
+        )
+        reject_boolean_case(
+            "returncode-bool", lambda r, j: r.__setitem__("returncode", False)
+        )
+
+        # The intact single-turn fixture admits again after every restore.
+        assert isinstance(
+            _classify(b_source_dir, b_config_path, b_repo_root), BudgetBoundary
+        )
+        assert b_run_json_path.read_bytes() == b_original_run_json
+
+        # The run record itself was never modified by any rejected surface.
+        assert run_json_path.read_bytes() == original_run_json
+
+
+def _make_daemon(
+    tmp_path: Path,
+    monkeypatch,
+    repo_root: Path,
+    config_path: Path,
+    wf_config,
+) -> AflowDaemon:
+    environment_file = tmp_path / "aflowd.env"
+    environment_file.write_text("AFLOWD_MODE=test\n", encoding="utf-8")
+    executable = tmp_path / "release" / "bin" / "aflow"
+    executable.parent.mkdir(parents=True)
+    executable.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    executable.chmod(0o755)
+    # The daemon's live config refresh uses the fixture config, but the
+    # resume bootstrap runs the real production path (only the config loader
+    # is shared).
+    monkeypatch.setattr(
+        "aflow.daemon.load_workflow_config", lambda _path: wf_config
+    )
+    daemon = AflowDaemon(
+        DaemonConfig(
+            repo_root=repo_root,
+            config_path=config_path,
+            aflow_executable=executable,
+            environment_file=environment_file,
+            release_identity="release-test",
+            environment={"PATH": str(executable.parent)},
+            stop_timeout_seconds=0,
+        ),
+        units=InMemoryUnitManager(),
+    )
+    daemon.start()
+    return daemon
+
+
+def _attach_launch_evidence(
+    repo_root: Path, run_id: str, phase: str, caller_scope: str = "local"
+) -> None:
+    """The direct controller already published the launch manifest; align its
+    caller scope with the daemon caller under test and set the fixture phase.
+    (A daemon-launched production run carries the daemon caller scope.)"""
+    manifest_path = repo_root / ".aflow" / "launches" / f"{run_id}.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["caller_scope"] = caller_scope
+    manifest_path.write_text(
+        json.dumps(manifest, sort_keys=True) + "\n", encoding="utf-8"
+    )
+    write_launch_phase(repo_root, run_id, phase)
+
+
+def test_daemon_preview_and_resume_admit_budget_exit(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The daemon preview and managed resume admit a validated budget exit."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        root = Path(tmpdir)
+        repo_root, plan_path, config_path, result = _make_source_pre_turn_cap(root)
+        source_dir = result.run_dir
+        source_before = _run_dir_bytes(source_dir)
+        wf_config = load_workflow_config(config_path)
+        _attach_launch_evidence(repo_root, source_dir.name, "completed")
+
+        daemon = _make_daemon(tmp_path, monkeypatch, repo_root, config_path, wf_config)
+        status = daemon.service.run_status(
+            source_dir.name, include_resume_preview=True
+        )
+        assert status.status == "completed"
+        assert status.evidence.get("can_resume") is True
+
+        # Without the preview the field is absent entirely.
+        plain = daemon.service.run_status(source_dir.name,
+                                          include_resume_preview=False)
+        assert "can_resume" not in plain.evidence
+
+        continuation = daemon.service.resume(
+            source_dir.name,
+            caller_scope="local",
+            idempotency_key="resume-budget-exit",
+        )
+        assert continuation.created is True
+        assert continuation.run_id != source_dir.name
+        # The source run stayed byte-identical.
+        assert _run_dir_bytes(source_dir) == source_before
+
+
+def test_daemon_preview_rejects_reviewed_completion(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A reviewed completion stays non-resumable in the daemon preview."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        root = Path(tmpdir)
+        repo_root, plan_path = _make_repo(root)
+        worktree_root = root / "worktrees"
+        worktree_root.mkdir()
+        config_path = _write_budget_config(
+            root / "config",
+            max_turns=2,
+            worktree_root=worktree_root,
+            workflows_text=_REVIEW_WORKFLOWS,
+        )
+        turns = 0
+
+        def runner(argv, **kwargs):
+            nonlocal turns
+            turns += 1
+            cwd = Path(kwargs["cwd"])
+            if turns == 1:
+                _write_plan(_plan_path_in(cwd), _COMPLETE_PLAN)
+            return subprocess.CompletedProcess(argv, 0, "ok", "")
+
+        with _DeliverySpies():
+            result = _run_budget(
+                config_path, repo_root, plan_path, runner, max_turns=2,
+            )
+        assert result.end_reason == "done"
+        wf_config = load_workflow_config(config_path)
+        _attach_launch_evidence(repo_root, result.run_dir.name, "completed")
+
+        daemon = _make_daemon(tmp_path, monkeypatch, repo_root, config_path, wf_config)
+        status = daemon.service.run_status(
+            result.run_dir.name, include_resume_preview=True
+        )
+        assert status.status == "completed"
+        assert status.evidence.get("can_resume") is False
+
+
+def test_daemon_durable_recovery_of_historical_shape(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Durable recovery admits the historical shape with a selected target."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        root = Path(tmpdir)
+        repo_root, plan_path, config_path, result, run_json = (
+            _make_source_historical(root)
+        )
+        source_dir = result.run_dir
+        source_before = _run_dir_bytes(source_dir)
+        wf_config = load_workflow_config(config_path)
+        _attach_launch_evidence(repo_root, source_dir.name, "failed")
+
+        daemon = _make_daemon(tmp_path, monkeypatch, repo_root, config_path, wf_config)
+        repository = daemon.application.repository
+        original_get_status = repository.get_run_status
+
+        def get_run_status_with_worker(*args, **kwargs):
+            status = original_get_status(*args, **kwargs)
+            return _replace_evidence(status, {"active": False, "exit_code": 17})
+
+        monkeypatch.setattr(
+            repository, "get_run_status", get_run_status_with_worker
+        )
+        status = daemon.service.run_status(
+            source_dir.name, include_resume_preview=True
+        )
+        assert status.status == "failed"
+        assert status.evidence.get("can_resume") is True
+
+        # The source request-audit stream is append-only; its prior records
+        # must remain intact (no resume/recovery record is appended to the
+        # source by a durable recovery, which starts a successor stream).
+        source_events_before = (source_dir / "events.jsonl").read_bytes()
+        source_launch = (
+            repo_root / ".aflow" / "launches" / f"{source_dir.name}.json"
+        ).read_bytes()
+
+        continuation = daemon.service.resume(
+            source_dir.name,
+            caller_scope="local",
+            idempotency_key="recover-historical",
+            recovery={
+                "mode": "durable_evidence",
+                "worker_selector": "codex.base",
+            },
+        )
+        assert continuation.created is True
+        assert continuation.run_id != source_dir.name
+
+        # One successor, one launch.  The source launch manifest is unchanged
+        # and exactly one new launch manifest appears for the successor.
+        successor_launch = (
+            repo_root / ".aflow" / "launches" / f"{continuation.run_id}.json"
+        )
+        assert successor_launch.is_file()
+        assert (
+            repo_root / ".aflow" / "launches" / f"{source_dir.name}.json"
+        ).read_bytes() == source_launch
+        launch_manifests = sorted(
+            p.name
+            for p in (repo_root / ".aflow" / "launches").iterdir()
+            if p.name.endswith(".json") and not p.name.endswith(".state.json")
+        )
+        assert len(launch_manifests) == 2
+
+        # Inherited effective budget: the successor is bounded by the
+        # accepted effective max (4), not the source's saved 48.  A later
+        # revisioned control may raise it; the source bytes are not touched.
+        successor_manifest = json.loads(successor_launch.read_text(encoding="utf-8"))
+        assert successor_manifest["max_turns"] == 4
+
+        # The durable recovery intent binds the repair worker and the exact
+        # worktree overlay as evidence, so the successor's first provider is
+        # the selected target reading that overlay (no source reviewer rerun).
+        from aflow.control_plane.recovery import read_recovery_intent
+
+        intent = read_recovery_intent(
+            repo_root / ".aflow" / "runs" / continuation.run_id
+        )
+        assert intent.source_run_id == source_dir.name
+        assert intent.target_run_id == continuation.run_id
+        assert intent.source_selector == "codex.base"
+        assert intent.target_selector == "codex.base"
+        overlay_refs = [
+            ref.path
+            for ref in intent.evidence
+            if ref.path.startswith("worktree-file:")
+        ]
+        assert overlay_refs, "successor must be bound to the worktree overlay"
+
+        # No premature merge and no source reviewer rerun: the source record
+        # (run.json + finalized turn receipts) is byte-identical, and its
+        # merge status is unchanged.
+        assert _run_dir_bytes(source_dir) == source_before
+        assert json.loads(
+            (source_dir / "run.json").read_text(encoding="utf-8")
+        )["merge_status"] == "failed"
+        assert (
+            (source_dir / "events.jsonl").read_bytes() == source_events_before
+        )
+
+        # The recovery audit record is appended to the successor's own
+        # append-only stream, starting with recovery_requested.
+        successor_events = [
+            line
+            for line in (
+                repo_root / ".aflow" / "runs" / continuation.run_id / "events.jsonl"
+            )
+            .read_text(encoding="utf-8")
+            .splitlines()
+            if line.strip()
+        ]
+        assert successor_events, "successor audit stream is missing"
+        assert json.loads(successor_events[0])["event_type"] == "recovery_requested"
+
+        # Idempotent replay with the same key returns the same successor.
+        replay = daemon.service.resume(
+            source_dir.name,
+            caller_scope="local",
+            idempotency_key="recover-historical",
+            recovery={
+                "mode": "durable_evidence",
+                "worker_selector": "codex.base",
+            },
+        )
+        assert replay.run_id == continuation.run_id
+        assert replay.created is False
+
+        # A competing request under a different key is rejected: the source
+        # already owns a successor (duplicate ownership).
+        with pytest.raises((DaemonIdempotencyConflict, DaemonError)):
+            daemon.service.resume(
+                source_dir.name,
+                caller_scope="local",
+                idempotency_key="recover-historical-competing",
+                recovery={
+                    "mode": "durable_evidence",
+                    "worker_selector": "codex.other",
+                },
+            )
+
+        # The source stayed immutable through replay and the rejected race.
+        assert _run_dir_bytes(source_dir) == source_before
+
+
+def _patch_inactive_worker_evidence(monkeypatch, repository) -> None:
+    """Direct-controller fixtures carry no worker record; give the admission
+    path the same confirmed-inactive evidence the daemon-level fixture uses."""
+    original_get_status = repository.get_run_status
+
+    def get_run_status_with_worker(*args, **kwargs):
+        status = original_get_status(*args, **kwargs)
+        return _replace_evidence(status, {"active": False, "exit_code": 17})
+
+    monkeypatch.setattr(repository, "get_run_status", get_run_status_with_worker)
+
+
+def _replace_evidence(status, worker: dict):
+    from dataclasses import replace as _replace
+
+    return _replace(
+        status,
+        evidence={**status.evidence, "worker": worker},
+    )
+
+
+def test_daemon_durable_recovery_admits_completed_budget_exit(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A validated completed no-delivery budget exit admits replacement."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        root = Path(tmpdir)
+        repo_root, plan_path, config_path, result = _make_source_pre_turn_cap(root)
+        source_dir = result.run_dir
+        source_before = _run_dir_bytes(source_dir)
+        wf_config = load_workflow_config(config_path)
+        _attach_launch_evidence(repo_root, source_dir.name, "completed")
+
+        daemon = _make_daemon(tmp_path, monkeypatch, repo_root, config_path, wf_config)
+        _patch_inactive_worker_evidence(
+            monkeypatch, daemon.application.repository
+        )
+
+        continuation = daemon.service.resume(
+            source_dir.name,
+            caller_scope="local",
+            idempotency_key="recover-budget-exit",
+            recovery={
+                "mode": "durable_evidence",
+                "worker_selector": "codex.base",
+            },
+        )
+        assert continuation.created is True
+        assert continuation.run_id != source_dir.name
+
+        # One successor, one launch: exactly one new launch manifest appears
+        # for the successor alongside the source's own manifest.
+        successor_launch = (
+            repo_root / ".aflow" / "launches" / f"{continuation.run_id}.json"
+        )
+        assert successor_launch.is_file()
+        launch_manifests = sorted(
+            p.name
+            for p in (repo_root / ".aflow" / "launches").iterdir()
+            if p.name.endswith(".json") and not p.name.endswith(".state.json")
+        )
+        assert len(launch_manifests) == 2
+
+        # The replacement binds the selected worker; the successor inherits
+        # the source's effective budget (1), not an inflated limit.
+        from aflow.control_plane.recovery import read_recovery_intent
+
+        intent = read_recovery_intent(
+            repo_root / ".aflow" / "runs" / continuation.run_id
+        )
+        assert intent.source_run_id == source_dir.name
+        assert intent.target_selector == "codex.base"
+        successor_manifest = json.loads(successor_launch.read_text(encoding="utf-8"))
+        assert successor_manifest["max_turns"] == 1
+
+        # The predecessor's canonical evidence stayed byte-identical and no
+        # audit record was appended to its stream.
+        assert _run_dir_bytes(source_dir) == source_before
+
+
+def test_daemon_durable_recovery_rejects_generic_completed_source(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A reviewed completion has no budget boundary and rejects replacement."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        root = Path(tmpdir)
+        repo_root, plan_path = _make_repo(root)
+        worktree_root = root / "worktrees"
+        worktree_root.mkdir()
+        config_path = _write_budget_config(
+            root / "config",
+            max_turns=2,
+            worktree_root=worktree_root,
+            workflows_text=_REVIEW_WORKFLOWS,
+        )
+        turns = 0
+
+        def runner(argv, **kwargs):
+            nonlocal turns
+            turns += 1
+            cwd = Path(kwargs["cwd"])
+            if turns == 1:
+                _write_plan(_plan_path_in(cwd), _COMPLETE_PLAN)
+            return subprocess.CompletedProcess(argv, 0, "ok", "")
+
+        with _DeliverySpies():
+            result = _run_budget(
+                config_path, repo_root, plan_path, runner, max_turns=2,
+            )
+        assert result.end_reason == "done"
+        wf_config = load_workflow_config(config_path)
+        _attach_launch_evidence(repo_root, result.run_dir.name, "completed")
+
+        daemon = _make_daemon(tmp_path, monkeypatch, repo_root, config_path, wf_config)
+        _patch_inactive_worker_evidence(
+            monkeypatch, daemon.application.repository
+        )
+
+        runs_before = sorted(
+            p.name for p in (repo_root / ".aflow" / "runs").iterdir() if p.is_dir()
+        )
+        with pytest.raises(DurableRecoveryRejection):
+            daemon.service.resume(
+                result.run_dir.name,
+                caller_scope="local",
+                idempotency_key="recover-generic-completed",
+                recovery={
+                    "mode": "durable_evidence",
+                    "worker_selector": "codex.base",
+                },
+            )
+
+        # No provider launch and no successor reservation: the run and launch
+        # surfaces are unchanged.
+        assert sorted(
+            p.name for p in (repo_root / ".aflow" / "runs").iterdir() if p.is_dir()
+        ) == runs_before
+        launch_manifests = sorted(
+            p.name
+            for p in (repo_root / ".aflow" / "launches").iterdir()
+            if p.name.endswith(".json") and not p.name.endswith(".state.json")
+        )
+        assert launch_manifests == [f"{result.run_dir.name}.json"]
+
+
+def _fake_provider_bin(root: Path, provider_log: Path) -> Path:
+    """Install a fake ``codex`` provider that logs argv, cwd, and prompt."""
+    fake_bin = root / "fake-provider-bin"
+    fake_bin.mkdir()
+    (fake_bin / "codex").write_text(
+        "#!/usr/bin/env python3\n"
+        "import json, os, sys\n"
+        "argv = sys.argv[1:]\n"
+        "if '--help' in argv:\n"
+        "    if 'resume' in argv:\n"
+        "        print('resume [SESSION_ID]')\n"
+        "        print('-m, --model')\n"
+        "    else:\n"
+        "        print('--json resume')\n"
+        "    sys.exit(0)\n"
+        "entry = {'argv': argv, 'cwd': os.getcwd(),"
+        " 'prompt': sys.stdin.read()}\n"
+        f"with open({str(provider_log)!r}, 'a', encoding='utf-8') as handle:\n"
+        "    handle.write(json.dumps(entry) + '\\n')\n"
+        "print(json.dumps({'type': 'agent_message',"
+        " 'thread_id': 'fake-recovery-session', 'text': 'ok'}))\n",
+        encoding="utf-8",
+    )
+    (fake_bin / "codex").chmod(0o755)
+    return fake_bin
+
+
+def _source_worktree_plan(run_dir: Path) -> tuple[Path, Path]:
+    """Return the recorded execution worktree root and its active plan file."""
+    worktree = Path(
+        json.loads((run_dir / "run.json").read_text(encoding="utf-8"))[
+            "worktree_path"
+        ]
+    )
+    return worktree, worktree / "plans" / "in-progress" / "plan.md"
+
+
+def test_durable_recovery_binds_worktree_active_plan_and_rejects_drift(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Durable recovery binds the worktree active plan, not the primary copy.
+
+    An ordinary budget exit with a pending reviewer keeps both plan files:
+    the committed primary original and the worker-edited worktree plan the
+    successor reads.  Admission must bind the worktree file so that changing
+    its bytes after admission rejects the prepared worker with
+    ``recovery_evidence_unavailable`` before any provider launch, while the
+    unchanged plan still reaches the pending reviewer.
+    """
+    with tempfile.TemporaryDirectory() as drift_tmp, \
+            tempfile.TemporaryDirectory() as clean_tmp:
+        from aflow.control_plane.recovery import read_recovery_intent
+        from aflow.daemon import (
+            _validate_recovery_evidence_for_worker,
+            worker_main,
+        )
+
+        # --- Admission binds the worktree plan, not the primary copy -------
+        root = Path(drift_tmp)
+        repo_root, plan_path, config_path, result = _make_source_pre_turn_cap(
+            root, plan_text=_CHANGED_INCOMPLETE_PLAN,
+        )
+        source_dir = result.run_dir
+        source_before = _run_dir_bytes(source_dir)
+        worktree, worktree_plan = _source_worktree_plan(source_dir)
+        assert worktree_plan.is_file()
+        # The boundary synced the worker edit back to the primary checkout, so
+        # both files exist with the same changed bytes; only the worktree file
+        # is the one the successor's provider reads and edits after admission.
+        assert worktree_plan.read_bytes() != _VALID_PLAN.encode("utf-8")
+        assert worktree_plan.read_bytes() == plan_path.read_bytes()
+        primary_before = plan_path.read_bytes()
+
+        wf_config = load_workflow_config(config_path)
+        _attach_launch_evidence(repo_root, source_dir.name, "completed")
+        daemon = _make_daemon(tmp_path, monkeypatch, repo_root, config_path, wf_config)
+        _patch_inactive_worker_evidence(
+            monkeypatch, daemon.application.repository
+        )
+
+        continuation = daemon.service.resume(
+            source_dir.name,
+            caller_scope="local",
+            idempotency_key="recover-worktree-plan-drift",
+            recovery={
+                "mode": "durable_evidence",
+                "worker_selector": "codex.base",
+            },
+        )
+        assert continuation.created is True
+
+        intent = read_recovery_intent(
+            repo_root / ".aflow" / "runs" / continuation.run_id
+        )
+        bound = next(
+            ref
+            for ref in intent.evidence
+            if ref.path == f"worktree-file:{worktree_plan}"
+        )
+        assert bound.sha256 == hashlib.sha256(
+            worktree_plan.read_bytes()
+        ).hexdigest()
+
+        # The admitted intent revalidates while the worktree plan is intact.
+        _evidence_paths, workspace_evidence = _validate_recovery_evidence_for_worker(
+            repo_root, intent
+        )
+        assert workspace_evidence["workspace"] == worktree.resolve()
+
+        # --- Post-admission plan drift rejects before any provider launch --
+        provider_log = root / "provider-calls.jsonl"
+        fake_bin = _fake_provider_bin(root, provider_log)
+        monkeypatch.setenv(
+            "PATH", str(fake_bin) + os.pathsep + os.environ.get("PATH", "")
+        )
+        reservation = daemon.service._admission.reservation(continuation.run_id)
+        assert reservation is not None
+        monkeypatch.setenv(
+            "AFLOW_ADMISSION_RESERVATION_NONCE", reservation.nonce
+        )
+
+        drifted = worktree_plan.read_bytes() + b"\n<!-- post-admission drift -->\n"
+        worktree_plan.write_bytes(drifted)
+
+        with pytest.raises(DurableRecoveryRejection) as rejected:
+            _validate_recovery_evidence_for_worker(repo_root, intent)
+        assert rejected.value.code == "recovery_evidence_unavailable"
+
+        assert worker_main(
+            repo_root=repo_root,
+            config_path=config_path,
+            run_id=continuation.run_id,
+        ) == 1
+        assert not provider_log.exists(), "drifted plan reached a provider"
+        # Recovery mutated no source evidence and no workspace files.
+        assert _run_dir_bytes(source_dir) == source_before
+        assert plan_path.read_bytes() == primary_before
+        assert worktree_plan.read_bytes() == drifted
+
+        # --- The unchanged worktree plan still reaches the reviewer --------
+        clean_root = Path(clean_tmp)
+        clean_repo, _clean_plan, clean_config, clean_source = (
+            _make_source_pre_turn_cap(
+                clean_root, plan_text=_CHANGED_INCOMPLETE_PLAN,
+            )
+        )
+        clean_source_dir = clean_source.run_dir
+        clean_source_before = _run_dir_bytes(clean_source_dir)
+        clean_worktree, clean_worktree_plan = _source_worktree_plan(
+            clean_source_dir
+        )
+        _attach_launch_evidence(clean_repo, clean_source_dir.name, "completed")
+        (tmp_path / "clean-daemon").mkdir()
+        clean_daemon = _make_daemon(
+            tmp_path / "clean-daemon",
+            monkeypatch,
+            clean_repo,
+            clean_config,
+            load_workflow_config(clean_config),
+        )
+        _patch_inactive_worker_evidence(
+            monkeypatch, clean_daemon.application.repository
+        )
+        clean_continuation = clean_daemon.service.resume(
+            clean_source_dir.name,
+            caller_scope="local",
+            idempotency_key="recover-worktree-plan-clean",
+            recovery={
+                "mode": "durable_evidence",
+                "worker_selector": "codex.base",
+            },
+        )
+        assert clean_continuation.created is True
+        clean_reservation = clean_daemon.service._admission.reservation(
+            clean_continuation.run_id
+        )
+        assert clean_reservation is not None
+        monkeypatch.setenv(
+            "AFLOW_ADMISSION_RESERVATION_NONCE", clean_reservation.nonce
+        )
+
+        clean_provider_log = clean_root / "provider-calls.jsonl"
+        clean_fake_bin = _fake_provider_bin(clean_root, clean_provider_log)
+        monkeypatch.setenv(
+            "PATH", str(clean_fake_bin) + os.pathsep + os.environ.get("PATH", "")
+        )
+        assert worker_main(
+            repo_root=clean_repo,
+            config_path=clean_config,
+            run_id=clean_continuation.run_id,
+        ) == 0
+
+        calls = [
+            json.loads(line)
+            for line in clean_provider_log.read_text(encoding="utf-8").splitlines()
+            if line.strip()
+        ]
+        # The inherited effective budget (1) bounds the successor to the
+        # single pending reviewer turn before its own pre-turn budget exit.
+        assert len(calls) == 1
+        assert Path(calls[0]["cwd"]) == clean_worktree
+        assert str(clean_worktree_plan) in calls[0]["prompt"]
+
+        successor_run_json = json.loads(
+            (clean_repo / ".aflow" / "runs" / clean_continuation.run_id / "run.json")
+            .read_text(encoding="utf-8")
+        )
+        # The successor continues the recorded execution worktree and its
+        # first turn is the pending review, not a source reviewer rerun.
+        assert successor_run_json["worktree_path"] == str(clean_worktree)
+        turns_root = (
+            clean_repo / ".aflow" / "runs" / clean_continuation.run_id / "turns"
+        )
+        assert sorted(p.name for p in turns_root.iterdir()) == ["turn-001"]
+        first_receipt = json.loads(
+            (turns_root / "turn-001" / "result.json").read_text(encoding="utf-8")
+        )
+        assert first_receipt["step_name"] == "review"
+        assert first_receipt["selector"] == "codex.base"
+        # The successor stopped at its own inherited budget with no merge.
+        assert successor_run_json["status"] == "completed"
+        assert successor_run_json["end_reason"] == "max_turns_reached"
+        assert successor_run_json["effective_max_turns"] == 1
+        assert "merge_status" not in successor_run_json
+        # The source stayed immutable through admission and the successor boot.
+        assert _run_dir_bytes(clean_source_dir) == clean_source_before
+
+
+def test_mcp_durable_recovery_dispatch_of_historical_shape(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The registered MCP resume tool dispatches durable-evidence recovery.
+
+    Exercises the real tool registry and project routing down to one
+    successor/one launch bound to the repair worker and exact overlay, with
+    the predecessor evidence unchanged.
+    """
+    with tempfile.TemporaryDirectory() as tmpdir:
+        root = Path(tmpdir)
+        repo_root, plan_path, config_path, result, run_json = (
+            _make_source_historical(root)
+        )
+        source_dir = result.run_dir
+        source_before = _run_dir_bytes(source_dir)
+        source_events_before = (source_dir / "events.jsonl").read_bytes()
+        # The service maps the MCP transport to bearer:{project_id}, so the
+        # fixture's already-published launch manifest carries that scope.
+        _attach_launch_evidence(
+            repo_root,
+            source_dir.name,
+            "failed",
+            caller_scope="bearer:budget-recovery",
+        )
+        source_launch = (
+            repo_root / ".aflow" / "launches" / f"{source_dir.name}.json"
+        ).read_bytes()
+
+        environment_file = tmp_path / "aflowd.env"
+        environment_file.write_text("AFLOWD_MODE=test\n", encoding="utf-8")
+        executable = tmp_path / "release" / "bin" / "aflow"
+        executable.parent.mkdir(parents=True)
+        executable.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+        executable.chmod(0o755)
+        units = InMemoryUnitManager()
+
+        registry = ProjectRegistry(root, root / "registry.json")
+        registry.register("budget-recovery", "Fixture project", "repo")
+        service = ControlPlaneService(
+            registry,
+            aflow_executable=executable,
+            environment_file=environment_file,
+            release_identity="release-test",
+            daemon_factory=lambda config: AflowDaemon(config, units=units),
+            workflow_config_path=config_path,
+        )
+
+        # Route the registered project to its daemon and give the admission
+        # path confirmed-inactive worker evidence for the direct source.
+        service.run_status("budget-recovery", source_dir.name)
+        repository = service._projects["budget-recovery"].daemon.application.repository
+        _patch_inactive_worker_evidence(monkeypatch, repository)
+
+        mcp = create_control_plane_mcp(lambda: service)
+        payload = asyncio.run(
+            mcp.call_tool(
+                "resume_run",
+                {
+                    "project_id": "budget-recovery",
+                    "run_id": source_dir.name,
+                    "idempotency_key": "mcp-recover-historical",
+                    "recovery": {
+                        "mode": "durable_evidence",
+                        "worker_selector": "codex.base",
+                    },
+                },
+            )
+        )
+        assert payload.is_error is False
+        body = json.loads(payload.content[0].text)
+        successor_run_id = body["run_id"]
+        assert body["created"] is True
+        assert successor_run_id != source_dir.name
+
+        # One successor, one launch: the source launch manifest is unchanged
+        # and exactly one new launch manifest appears for the successor.
+        successor_launch = (
+            repo_root / ".aflow" / "launches" / f"{successor_run_id}.json"
+        )
+        assert successor_launch.is_file()
+        assert (
+            repo_root / ".aflow" / "launches" / f"{source_dir.name}.json"
+        ).read_bytes() == source_launch
+        launch_manifests = sorted(
+            p.name
+            for p in (repo_root / ".aflow" / "launches").iterdir()
+            if p.name.endswith(".json") and not p.name.endswith(".state.json")
+        )
+        assert len(launch_manifests) == 2
+
+        # Inherited effective budget: the successor is bounded by the
+        # accepted effective max (4), not the source's saved 48.
+        successor_manifest = json.loads(successor_launch.read_text(encoding="utf-8"))
+        assert successor_manifest["max_turns"] == 4
+
+        # The dispatched recovery binds the repair worker and the exact
+        # worktree overlay; no source reviewer rerun is scheduled.
+        from aflow.control_plane.recovery import read_recovery_intent
+
+        intent = read_recovery_intent(
+            repo_root / ".aflow" / "runs" / successor_run_id
+        )
+        assert intent.source_run_id == source_dir.name
+        assert intent.target_run_id == successor_run_id
+        assert intent.target_selector == "codex.base"
+        overlay_refs = [
+            ref.path
+            for ref in intent.evidence
+            if ref.path.startswith("worktree-file:")
+        ]
+        assert any(
+            ref.endswith("plan-cp01-v02.md") for ref in overlay_refs
+        ), "successor must be bound to the exact worktree overlay"
+
+        # The predecessor's canonical evidence and audit stream are unchanged.
+        assert _run_dir_bytes(source_dir) == source_before
+        assert (source_dir / "events.jsonl").read_bytes() == source_events_before
+
+        # Idempotent replay through the same registered tool returns the same
+        # successor without a second launch.
+        replay = asyncio.run(
+            mcp.call_tool(
+                "resume_run",
+                {
+                    "project_id": "budget-recovery",
+                    "run_id": source_dir.name,
+                    "idempotency_key": "mcp-recover-historical",
+                    "recovery": {
+                        "mode": "durable_evidence",
+                        "worker_selector": "codex.base",
+                    },
+                },
+            )
+        )
+        assert replay.is_error is False
+        replay_body = json.loads(replay.content[0].text)
+        assert replay_body["run_id"] == successor_run_id
+        assert replay_body["created"] is False
+        assert _run_dir_bytes(source_dir) == source_before
+
+        # Boot the prepared successor through the fake owned unit's recorded
+        # worker argv and the real canonical controller entry (worker_main ->
+        # execute_workflow) to its first fake provider.  The inherited
+        # effective budget (4) is proven behaviorally: the successor runs
+        # exactly four new turns and stops at its own no-delivery budget exit.
+        daemon = service._projects["budget-recovery"].daemon
+        assert len(units.start_calls) == 1
+        unit_name, worker_argv, worker_cwd = units.start_calls[0]
+        assert unit_name == f"aflow-run-{successor_run_id}.service"
+        assert worker_argv[1] == "daemon-worker"
+        assert worker_argv[-1] == successor_run_id
+        assert Path(worker_argv[worker_argv.index("--repo-root") + 1]) == repo_root
+        assert Path(worker_argv[worker_argv.index("--config") + 1]) == config_path
+        assert worker_cwd == repo_root
+
+        fake_bin = root / "fake-provider-bin"
+        fake_bin.mkdir()
+        provider_log = root / "provider-calls.jsonl"
+        (fake_bin / "codex").write_text(
+            "#!/usr/bin/env python3\n"
+            "import json, os, sys\n"
+            "argv = sys.argv[1:]\n"
+            "if '--help' in argv:\n"
+            "    if 'resume' in argv:\n"
+            "        print('resume [SESSION_ID]')\n"
+            "        print('-m, --model')\n"
+            "    else:\n"
+            "        print('--json resume')\n"
+            "    sys.exit(0)\n"
+            "entry = {'argv': argv, 'cwd': os.getcwd(),"
+            " 'prompt': sys.stdin.read()}\n"
+            f"with open({str(provider_log)!r}, 'a', encoding='utf-8') as handle:\n"
+            "    handle.write(json.dumps(entry) + '\\n')\n"
+            "print(json.dumps({'type': 'agent_message',"
+            " 'thread_id': 'fake-repair-session', 'text': 'ok'}))\n",
+            encoding="utf-8",
+        )
+        (fake_bin / "codex").chmod(0o755)
+        monkeypatch.setenv(
+            "PATH", str(fake_bin) + os.pathsep + os.environ.get("PATH", "")
+        )
+        reservation = daemon.service._admission.reservation(successor_run_id)
+        assert reservation is not None
+        monkeypatch.setenv("AFLOW_ADMISSION_RESERVATION_NONCE", reservation.nonce)
+
+        from aflow.daemon import worker_main
+
+        worker_returncode = worker_main(
+            repo_root=repo_root,
+            config_path=config_path,
+            run_id=successor_run_id,
+        )
+        assert worker_returncode == 0, "successor worker boot failed"
+
+        calls = [
+            json.loads(line)
+            for line in provider_log.read_text(encoding="utf-8").splitlines()
+            if line.strip()
+        ]
+        successor_run_json = json.loads(
+            (repo_root / ".aflow" / "runs" / successor_run_id / "run.json")
+            .read_text(encoding="utf-8")
+        )
+        successor_worktree = Path(successor_run_json["worktree_path"])
+        assert len(calls) == 4
+        # The successor continues the recorded execution worktree, so every
+        # provider turn runs inside it.
+        assert all(Path(call["cwd"]) == successor_worktree for call in calls)
+
+        # The first provider is the selected repair worker (codex.base ->
+        # model-base) reading the exact overlay synced into the execution
+        # worktree, introduced by the durable-recovery replacement brief; the
+        # source run's finalized reviewer turn is never re-executed.
+        overlay_in_successor = (
+            successor_worktree / "plans" / "in-progress" / "plan-cp01-v02.md"
+        )
+        assert "--model" in calls[0]["argv"]
+        assert calls[0]["argv"][calls[0]["argv"].index("--model") + 1] == "model-base"
+        assert str(overlay_in_successor) in calls[0]["prompt"]
+        assert "Durable provider-recovery evidence" in calls[0]["prompt"]
+        assert source_dir.name in calls[0]["prompt"]
+
+        turns_root = repo_root / ".aflow" / "runs" / successor_run_id / "turns"
+        assert sorted(p.name for p in turns_root.iterdir()) == [
+            f"turn-{number:03d}" for number in range(1, 5)
+        ]
+        first_receipt = json.loads(
+            (turns_root / "turn-001" / "result.json").read_text(encoding="utf-8")
+        )
+        assert first_receipt["step_name"] == "work"
+        assert first_receipt["step_role"] == "worker"
+        assert first_receipt["selector"] == "codex.base"
+        assert first_receipt["active_plan_path"].endswith("plan-cp01-v02.md")
+        last_receipt = json.loads(
+            (turns_root / "turn-004" / "result.json").read_text(encoding="utf-8")
+        )
+        assert last_receipt["chosen_transition"] == "END"
+        assert last_receipt["chosen_transition_condition"] == "MAX_TURNS_REACHED"
+
+        # The successor stopped at its own inherited budget with no merge
+        # teardown, publication, or plan move.
+        assert successor_run_json["status"] == "completed"
+        assert successor_run_json["end_reason"] == "max_turns_reached"
+        assert successor_run_json["max_turns"] == 4
+        assert successor_run_json["effective_max_turns"] == 4
+        assert "merge_status" not in successor_run_json
+        assert overlay_in_successor.is_file()
+
+        # Still one successor and one launch, and the predecessor's canonical
+        # evidence and audit stream stayed byte-identical through the boot.
+        assert len(units.start_calls) == 1
+        assert (
+            sorted(
+                p.name
+                for p in (repo_root / ".aflow" / "launches").iterdir()
+                if p.name.endswith(".json") and not p.name.endswith(".state.json")
+            )
+            # Run-id suffixes are random, so sort the expectation too.
+            == sorted(
+                [f"{source_dir.name}.json", f"{successor_run_id}.json"]
+            )
+        )
+        assert _run_dir_bytes(source_dir) == source_before
+        assert (source_dir / "events.jsonl").read_bytes() == source_events_before
+        assert json.loads(
+            (source_dir / "run.json").read_text(encoding="utf-8")
+        )["merge_status"] == "failed"

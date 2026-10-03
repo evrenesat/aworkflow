@@ -33,6 +33,10 @@ from .config import (
     WorkflowConfig,
     WorkflowStepConfig,
 )
+from .budget_resume import (
+    classify_budget_boundary,
+    resolve_successor_max_turns,
+)
 from .manager_context import scoped_reviewer_rejection_count
 from .live_config import load_live_config, load_live_config_for_run
 from .resume_relocation import ResumeRelocation, prepare_resume_relocation
@@ -1276,6 +1280,34 @@ def _validate_resume_run_id(resolved_run_id: Path) -> str:
     return run_id
 
 
+def _accepted_budget_override_max_turns(
+    run_dir: Path,
+    prev_run: Mapping[str, object],
+) -> int | None:
+    """Return the accepted run max-turns override, if the source has one."""
+    resolution = resolve_resume_override(
+        run_dir,
+        prev_run.get("override_result")
+        if isinstance(prev_run.get("override_result"), Mapping)
+        else None,
+        persisted_accepted_result=(
+            prev_run.get("last_accepted_override")
+            if isinstance(prev_run.get("last_accepted_override"), Mapping)
+            else None
+        ),
+    )
+    accepted = resolution.last_accepted_override
+    if (
+        accepted is not None
+        and accepted.status == "accepted"
+        and isinstance(accepted.max_turns, int)
+        and not isinstance(accepted.max_turns, bool)
+        and accepted.max_turns >= 1
+    ):
+        return accepted.max_turns
+    return None
+
+
 def _bootstrap_resume_invocation(
     *,
     repo_root: Path,
@@ -1388,6 +1420,17 @@ def _bootstrap_resume_invocation(
             f"'{workflow_name}'."
         )
     workflow_spec = workflow_config.workflows[workflow_name]
+
+    # Issue #62: a terminal run may have left an unfinished budget boundary
+    # (a no-delivery budget exit, or the one narrow historical merge-failure
+    # shape).  The shared classifier is the single authority for that shape;
+    # automatic candidate scanning never reaches this code path.
+    budget_boundary = classify_budget_boundary(
+        run_dir=run_dir,
+        prev_run=prev_run,
+        workflow_config=workflow_config,
+        repo_root=repo_root,
+    )
 
     team_value = prev_run.get("team")
     if team_value is not None and (
@@ -1526,6 +1569,30 @@ def _bootstrap_resume_invocation(
             )
         effective_max_turns = current_default_max_turns
 
+    if budget_boundary is not None:
+        # The successor starts from the validated boundary, not from the
+        # source run's saved starting step, and inherits the resolved
+        # successor budget (accepted override, invocation limit, live
+        # default) rather than silently restoring the saved invocation value.
+        effective_start_step = budget_boundary.next_step_name
+        start_step_override = True
+        successor_limit = resolve_successor_max_turns(
+            accepted_override_max_turns=_accepted_budget_override_max_turns(
+                run_dir, prev_run
+            ),
+            invocation_max_turns=(
+                max_turns_arg if max_turns_arg is not None else saved_max_turns
+            ),
+            live_default_max_turns=getattr(
+                getattr(workflow_config, "aflow", None),
+                "max_turns",
+                None,
+            ),
+        )
+        effective_max_turns = successor_limit
+        max_turns_override = max_turns_override or successor_limit != saved_max_turns
+        saved_max_turns_explicit = True
+
     effective_extra = extra_instructions_arg if extra_instructions_provided else saved_extra
 
     ordinary_owner_stop = _is_ordinary_owner_stopped_resume(
@@ -1559,6 +1626,7 @@ def _bootstrap_resume_invocation(
             ordinary_owner_stop or has_owner_stopped_pending_review
         ),
         allow_owner_stopped_pending_review=has_owner_stopped_pending_review,
+        allow_budget_continuation=budget_boundary is not None,
         team_explicit=saved_team_explicit,
         max_turns_explicit=saved_max_turns_explicit,
         run_dir=run_dir,
@@ -1588,6 +1656,7 @@ def _bootstrap_resume_invocation(
         max_turns_explicit=saved_max_turns_explicit,
         start_step_explicit=True,
         effective_max_turns=effective_max_turns,
+        budget_boundary=budget_boundary,
     )
     assert resume_context is not None
 
@@ -1637,6 +1706,7 @@ def _resume_candidate_mismatch_reason(
     allow_max_turns_override: bool = False,
     allow_owner_stopped: bool = False,
     allow_owner_stopped_pending_review: bool = False,
+    allow_budget_continuation: bool = False,
     team_explicit: bool | None = None,
     max_turns_explicit: bool | None = None,
     run_dir: Path | None = None,
@@ -1681,11 +1751,16 @@ def _resume_candidate_mismatch_reason(
     allowed_statuses = ("failed", "running", "waiting_for_valid_override")
     if allow_owner_stopped:
         allowed_statuses = (*allowed_statuses, "owner_stopped")
+    if allow_budget_continuation:
+        # A no-delivery budget exit is a completed run whose review/repair
+        # work is unfinished; the shared classifier already validated it.
+        allowed_statuses = (*allowed_statuses, "completed")
     if status not in allowed_statuses:
         return (
             f"its status is '{status}', not 'failed', 'running', or "
             "'waiting_for_valid_override'"
             + (" or 'owner_stopped'" if allow_owner_stopped else "")
+            + (" or 'completed'" if allow_budget_continuation else "")
         )
 
     last_snapshot = prev_run.get("last_snapshot")
@@ -1697,6 +1772,7 @@ def _resume_candidate_mismatch_reason(
         and not terminal_integration_only
         and not terminal_completion_only
         and not allow_owner_stopped_pending_review
+        and not allow_budget_continuation
     ):
         if run_dir is not None:
             try:
@@ -1721,6 +1797,7 @@ def _resume_candidate_mismatch_reason(
         and not terminal_completion_only
         and pending_cumulative_review is None
         and not allow_owner_stopped_pending_review
+        and not allow_budget_continuation
         and not _completed_manager_budget_boundary_pending(prev_run, current_repo_root)
     ):
         return "its last saved plan snapshot was already complete"
@@ -1729,6 +1806,7 @@ def _resume_candidate_mismatch_reason(
         "merge_status" in prev_run
         and not terminal_integration_only
         and not terminal_completion_only
+        and not allow_budget_continuation
     ):
         return "it already entered merge teardown"
 
@@ -3705,6 +3783,7 @@ def _reconstruct_resume_context(
     max_turns_explicit: bool | None = None,
     start_step_explicit: bool | None = None,
     effective_max_turns: int | None = None,
+    budget_boundary: object | None = None,
 ) -> ResumeContext | None:
     """Decode all durable resume state from one already-loaded run payload."""
     run_id = resolved_run_id.name
@@ -3892,6 +3971,7 @@ def _reconstruct_resume_context(
         and not terminal_completion_only
         and not terminal_integration_only
         and not has_owner_stopped_pending_review
+        and budget_boundary is None
     ):
         repo_root_value = prev_run.get("repo_root")
         if isinstance(repo_root_value, str) and repo_root_value.strip():
@@ -3912,6 +3992,7 @@ def _reconstruct_resume_context(
         and not terminal_integration_only
         and pending_cumulative_review is None
         and not has_owner_stopped_pending_review
+        and budget_boundary is None
     ):
         reconciled_scope = _reconcile_verified_resume_scope(
             run_id=run_id,
@@ -3949,6 +4030,14 @@ def _reconstruct_resume_context(
         and pending_finalized_turn.conditions["NEW_PLAN_EXISTS"]
     ):
         recovered_active_plan = str(pending_finalized_turn.new_plan_path)
+    if budget_boundary is not None:
+        # The validated boundary is authoritative for the successor's active
+        # plan: an overlay when NEW_PLAN_EXISTS was true, otherwise the
+        # recorded pre-turn active plan.
+        overlay = getattr(budget_boundary, "overlay_path", None)
+        recovered_active_plan = str(
+            overlay if overlay is not None else budget_boundary.active_plan_path
+        )
 
     override_value = prev_run.get("override_result")
     accepted_override_value = prev_run.get("last_accepted_override")
@@ -4028,6 +4117,8 @@ def _reconstruct_resume_context(
         interrupted_step_name=(
             None
             if reset_scope
+            else str(budget_boundary.next_step_name)
+            if budget_boundary is not None
             else pending_cumulative_review.reviewer_step_name
             if pending_cumulative_review is not None
             else effective_start_step
@@ -4104,6 +4195,7 @@ def _reconstruct_resume_context(
         resume_relocation=relocation.provenance() if relocation is not None else None,
         resumed_from_team=resumed_from_team,
         resume_team_override=resume_team_override,
+        budget_continuation=budget_boundary,
         **hotplug_fields,
         **manager_fields,
     ))
@@ -4207,6 +4299,10 @@ def _detect_resume_candidate(
             ordinary_owner_stop or has_owner_stopped_pending_review
         ),
         allow_owner_stopped_pending_review=has_owner_stopped_pending_review,
+        allow_budget_continuation=(
+            resume_bootstrap is not None
+            and resume_bootstrap.resume_context.budget_continuation is not None
+        ),
         team_explicit=team_explicit,
         max_turns_explicit=max_turns_explicit,
         run_dir=run_dir,
