@@ -1,5 +1,32 @@
 # DEVLOG
 
+## 2026-10-03 — Canonical budget-recovery fixture roots for macOS CI (issue #62)
+
+- The reviewed issue #62 repair failed both macOS CI Python 3.11/3.12 test
+  jobs: macOS exposes `TMPDIR` through the `/var` -> `/private/var`
+  directory symlink, so `tests/test_budget_exit_recovery.py` built fixture
+  roots from the unresolved temporary path while `_bootstrap_resume_invocation`
+  and `RunRepository` canonicalize their inputs. Twelve bootstrap tests
+  rejected their own runs as belonging to a different repo root, and managed
+  MCP dispatch compared a canonical `/private/var/...` worker root against
+  the fixture's `/var/...` root.
+- All 31 temporary-root constructions in the module now apply `.resolve()`
+  before any repo, config, plan, worktree, or provider path is derived, so
+  every fixture identity reference shares the same canonical spelling the
+  production entrypoints supply. No production code changed.
+- Added the module-local `budget_temp_parent` fixture (canonical and symlink
+  parameters) that creates a real directory symlink under the pytest
+  `tmp_path` and routes `test_single_step_budget_exit_starts_work` and
+  `test_mcp_durable_recovery_dispatch_of_historical_shape` through both
+  spellings. The two tests now exercise real explicit bootstrap and real
+  registered MCP dispatch under a symlinked temporary parent without
+  depending on the host `TMPDIR` or mutating `tempfile.tempdir`.
+- Verified on Linux: the full module passes normally, under the new
+  canonical/symlink parameters, and under a fresh-process aliased `TMPDIR`
+  reproduction. Exact-SHA CI (including both macOS test jobs) and the
+  existing deployment gate remain outstanding delivery checks for the
+  coordinator.
+
 ## 2026-10-02 — Keep unfinished budget boundaries out of delivery (issue #62)
 
 - `_finish_normal_terminal` in `aflow/workflow.py` now takes an explicit

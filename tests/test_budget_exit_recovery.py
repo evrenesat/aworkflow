@@ -153,6 +153,30 @@ _CHANGED_INCOMPLETE_PLAN = (
 )
 
 
+@pytest.fixture(
+    params=["canonical", "symlink"],
+    ids=["canonical-temp-root", "symlink-temp-root"],
+)
+def budget_temp_parent(tmp_path: Path, request) -> Path:
+    """Give real bootstrap/dispatch tests both temporary-parent spellings.
+
+    Production entrypoints supply canonical roots (_resolve_repo_root and
+    RunRepository.__init__ resolve their inputs), so fixtures must do the
+    same.  The symlink parameter creates a real directory-symlinked parent
+    in the pytest process without touching the host TMPDIR, standing in for
+    macOS /var -> /private/var aliases.
+    """
+    base = tmp_path.resolve() / f"parent-{request.param}"
+    base.mkdir()
+    if request.param == "canonical":
+        return base
+    alias = base.parent / f"{base.name}-alias"
+    alias.symlink_to(base, target_is_directory=True)
+    assert alias != alias.resolve()
+    assert alias.resolve() == base
+    return alias
+
+
 def _write_budget_config(
     config_dir: Path,
     *,
@@ -189,6 +213,10 @@ p = "Work from {{ACTIVE_PLAN_PATH}}."
     return _write_split_config(config_dir, aflow_text, workflows_text)[0]
 
 
+# Every temporary root in this module is canonicalized with .resolve() before
+# any child path is derived, matching the canonical roots the production
+# entrypoints supply, so all fixture identity references share one canonical
+# spelling even when the OS exposes temporary paths through a directory symlink.
 def _make_repo(tmp_path: Path) -> tuple[Path, Path]:
     repo_root = tmp_path / "repo"
     repo_root.mkdir()
@@ -277,7 +305,7 @@ def _plan_path_in(cwd: Path) -> Path:
 
 def test_budget_exit_preserves_clean_incomplete_worktree(tmp_path: Path) -> None:
     with tempfile.TemporaryDirectory() as tmpdir:
-        root = Path(tmpdir)
+        root = Path(tmpdir).resolve()
         repo_root, plan_path = _make_repo(root)
         worktree_root = root / "worktrees"
         worktree_root.mkdir()
@@ -338,7 +366,7 @@ def test_budget_exit_preserves_clean_incomplete_worktree(tmp_path: Path) -> None
 
 def test_budget_exit_preserves_dirty_incomplete_worktree(tmp_path: Path) -> None:
     with tempfile.TemporaryDirectory() as tmpdir:
-        root = Path(tmpdir)
+        root = Path(tmpdir).resolve()
         repo_root, plan_path = _make_repo(root)
         worktree_root = root / "worktrees"
         worktree_root.mkdir()
@@ -384,7 +412,7 @@ def test_pre_turn_cap_after_complete_ledger_with_pending_review(
     tmp_path: Path,
 ) -> None:
     with tempfile.TemporaryDirectory() as tmpdir:
-        root = Path(tmpdir)
+        root = Path(tmpdir).resolve()
         repo_root, plan_path = _make_repo(root)
         worktree_root = root / "worktrees"
         worktree_root.mkdir()
@@ -434,7 +462,7 @@ def test_pre_turn_cap_after_complete_ledger_with_pending_review(
 
 def test_budget_exit_preserves_reviewer_repair_overlay(tmp_path: Path) -> None:
     with tempfile.TemporaryDirectory() as tmpdir:
-        root = Path(tmpdir)
+        root = Path(tmpdir).resolve()
         repo_root, plan_path = _make_repo(root)
         worktree_root = root / "worktrees"
         worktree_root.mkdir()
@@ -492,7 +520,7 @@ def test_budget_exit_preserves_reviewer_repair_overlay(tmp_path: Path) -> None:
 
 def test_reviewed_completion_at_cap_still_delivers(tmp_path: Path) -> None:
     with tempfile.TemporaryDirectory() as tmpdir:
-        root = Path(tmpdir)
+        root = Path(tmpdir).resolve()
         repo_root, plan_path = _make_repo(root)
         worktree_root = root / "worktrees"
         worktree_root.mkdir()
@@ -537,7 +565,7 @@ def test_reviewed_completion_at_cap_still_delivers(tmp_path: Path) -> None:
 
 def test_finalized_replay_of_budget_only_end_does_not_merge(tmp_path: Path) -> None:
     with tempfile.TemporaryDirectory() as tmpdir:
-        root = Path(tmpdir)
+        root = Path(tmpdir).resolve()
         repo_root, plan_path = _make_repo(root)
         worktree_root = root / "worktrees"
         worktree_root.mkdir()
@@ -867,10 +895,13 @@ def _bootstrap_with_args(
     )
 
 
-def test_single_step_budget_exit_starts_work(tmp_path: Path) -> None:
+def test_single_step_budget_exit_starts_work(
+    tmp_path: Path, budget_temp_parent: Path
+) -> None:
     """An incomplete one-turn budget exit resumes work and then delivers."""
-    with tempfile.TemporaryDirectory() as tmpdir:
-        root = Path(tmpdir)
+    with tempfile.TemporaryDirectory(dir=budget_temp_parent) as tmpdir:
+        assert Path(tmpdir).parent == budget_temp_parent
+        root = Path(tmpdir).resolve()
         repo_root, plan_path, config_path, result = _make_source_single_step(root)
         source_dir = result.run_dir
         source_before = _run_dir_bytes(source_dir)
@@ -924,7 +955,7 @@ def test_single_step_budget_exit_starts_work(tmp_path: Path) -> None:
 def test_single_step_incompatible_saved_end_evidence_rejects(tmp_path: Path) -> None:
     """A saved END condition that does not identify its edge rejects."""
     with tempfile.TemporaryDirectory() as tmpdir:
-        root = Path(tmpdir)
+        root = Path(tmpdir).resolve()
         repo_root, plan_path, config_path, result = _make_source_single_step(root)
         source_dir = result.run_dir
         receipt_path = source_dir / "turns" / "turn-001" / "result.json"
@@ -954,7 +985,7 @@ def test_budget_provenance_default_explicit_and_invocation(tmp_path: Path) -> No
     explicit new invocation limit are honored with explicit provenance.
     """
     with tempfile.TemporaryDirectory() as tmpdir:
-        root = Path(tmpdir)
+        root = Path(tmpdir).resolve()
         repo_root, plan_path, config_path, result = _make_source_single_step(root)
         source_dir = result.run_dir
         run_json_path = source_dir / "run.json"
@@ -1028,7 +1059,7 @@ def test_budget_provenance_default_explicit_and_invocation(tmp_path: Path) -> No
 def test_explicit_resume_of_pre_turn_cap_starts_review_first(tmp_path: Path) -> None:
     """A pre-turn budget exit resumes the pending review, then delivers."""
     with tempfile.TemporaryDirectory() as tmpdir:
-        root = Path(tmpdir)
+        root = Path(tmpdir).resolve()
         repo_root, plan_path, config_path, result = _make_source_pre_turn_cap(root)
         source_dir = result.run_dir
         source_before = _run_dir_bytes(source_dir)
@@ -1095,7 +1126,7 @@ def test_explicit_resume_of_pre_turn_cap_starts_review_first(tmp_path: Path) -> 
 def test_explicit_resume_of_reviewer_overlay_starts_repair(tmp_path: Path) -> None:
     """A reviewer overlay at the cap becomes the successor's active plan."""
     with tempfile.TemporaryDirectory() as tmpdir:
-        root = Path(tmpdir)
+        root = Path(tmpdir).resolve()
         repo_root, plan_path = _make_repo(root)
         worktree_root = root / "worktrees"
         worktree_root.mkdir()
@@ -1212,7 +1243,7 @@ def test_cap_on_repair_turn_started_from_overlay_classifies(tmp_path: Path) -> N
     distinct (original vs overlay).
     """
     with tempfile.TemporaryDirectory() as tmpdir:
-        root = Path(tmpdir)
+        root = Path(tmpdir).resolve()
         repo_root, plan_path = _make_repo(root)
         worktree_root = root / "worktrees"
         worktree_root.mkdir()
@@ -1395,7 +1426,7 @@ def test_inherited_overlay_start_survives_next_budget_exit(tmp_path: Path) -> No
     fresh, and every predecessor evidence stays byte-identical.
     """
     with tempfile.TemporaryDirectory() as tmpdir:
-        root = Path(tmpdir)
+        root = Path(tmpdir).resolve()
         repo_root, plan_path, config_path, source, successor, overlay = (
             _make_inherited_overlay_successor(root)
         )
@@ -1488,7 +1519,7 @@ def test_inherited_overlay_start_survives_budget_end_predecessor(
     delivers normally.
     """
     with tempfile.TemporaryDirectory() as tmpdir:
-        root = Path(tmpdir)
+        root = Path(tmpdir).resolve()
         repo_root, plan_path, config_path, source, successor, overlay = (
             _make_inherited_overlay_successor(root, budget_end_source=True)
         )
@@ -1597,7 +1628,7 @@ def test_budget_end_predecessor_surfaces_admit_and_reject(
     before any successor reservation.
     """
     with tempfile.TemporaryDirectory() as tmpdir:
-        root = Path(tmpdir)
+        root = Path(tmpdir).resolve()
         repo_root, plan_path, config_path, source, successor, overlay = (
             _make_inherited_overlay_successor(root, budget_end_source=True)
         )
@@ -1730,7 +1761,7 @@ def test_inherited_start_contradictions_reject_before_launch(
     successor still admits a bound replacement.
     """
     with tempfile.TemporaryDirectory() as tmpdir:
-        root = Path(tmpdir)
+        root = Path(tmpdir).resolve()
         repo_root, plan_path, config_path, source, successor, overlay = (
             _make_inherited_overlay_successor(root)
         )
@@ -1952,7 +1983,7 @@ def test_inherited_start_contradictions_reject_before_launch(
 def test_classifier_rejects_reviewed_completion(tmp_path: Path) -> None:
     """A reviewed END at the cap is a genuine completion, not a boundary."""
     with tempfile.TemporaryDirectory() as tmpdir:
-        root = Path(tmpdir)
+        root = Path(tmpdir).resolve()
         repo_root, plan_path = _make_repo(root)
         worktree_root = root / "worktrees"
         worktree_root.mkdir()
@@ -1985,7 +2016,7 @@ def test_classifier_rejects_reviewed_completion(tmp_path: Path) -> None:
 def test_classifier_rejects_tampered_budget_shapes(tmp_path: Path) -> None:
     """Receipt, worktree, and turn-count damage all reject the boundary."""
     with tempfile.TemporaryDirectory() as tmpdir:
-        root = Path(tmpdir)
+        root = Path(tmpdir).resolve()
         repo_root, plan_path, config_path, result = _make_source_pre_turn_cap(root)
         source_dir = result.run_dir
         run_json = json.loads((source_dir / "run.json").read_text(encoding="utf-8"))
@@ -2022,7 +2053,7 @@ def test_classifier_rejects_tampered_budget_shapes(tmp_path: Path) -> None:
 def test_auto_scan_never_classifies_budget_exit(tmp_path: Path) -> None:
     """Unrequested resume prompts never admit a budget boundary."""
     with tempfile.TemporaryDirectory() as tmpdir:
-        root = Path(tmpdir)
+        root = Path(tmpdir).resolve()
         repo_root, plan_path, config_path, result = _make_source_pre_turn_cap(root)
         source_dir = result.run_dir
         wf_config = load_workflow_config(config_path)
@@ -2120,7 +2151,7 @@ def _make_source_historical(root: Path):
 def test_historical_merge_failure_budget_boundary(tmp_path: Path) -> None:
     """The one historical shape resumes the repair with the accepted budget."""
     with tempfile.TemporaryDirectory() as tmpdir:
-        root = Path(tmpdir)
+        root = Path(tmpdir).resolve()
         repo_root, plan_path, config_path, result, run_json = (
             _make_source_historical(root)
         )
@@ -2208,7 +2239,7 @@ def test_historical_merge_failure_budget_boundary(tmp_path: Path) -> None:
 def test_historical_shape_negatives_reject(tmp_path: Path) -> None:
     """Arbitrary merge failures, missing worktrees, and tampering reject."""
     with tempfile.TemporaryDirectory() as tmpdir:
-        root = Path(tmpdir)
+        root = Path(tmpdir).resolve()
         repo_root, plan_path, config_path, result, run_json = (
             _make_source_historical(root)
         )
@@ -2244,7 +2275,7 @@ def test_historical_shape_negatives_reject(tmp_path: Path) -> None:
 def test_historical_complete_original_with_overlay_rejects(tmp_path: Path) -> None:
     """A complete original (issue #58 shape) is not the historical boundary."""
     with tempfile.TemporaryDirectory() as tmpdir:
-        root = Path(tmpdir)
+        root = Path(tmpdir).resolve()
         repo_root, plan_path, config_path, result, run_json = (
             _make_source_historical(root)
         )
@@ -2301,7 +2332,7 @@ def test_tampered_receipt_identity_rejects_every_surface(
     launch, while the untouched fixture stays admitted.
     """
     with tempfile.TemporaryDirectory() as tmpdir:
-        root = Path(tmpdir)
+        root = Path(tmpdir).resolve()
         repo_root, plan_path, config_path, result, run_json = (
             _make_source_historical(root)
         )
@@ -2693,7 +2724,7 @@ def test_daemon_preview_and_resume_admit_budget_exit(
 ) -> None:
     """The daemon preview and managed resume admit a validated budget exit."""
     with tempfile.TemporaryDirectory() as tmpdir:
-        root = Path(tmpdir)
+        root = Path(tmpdir).resolve()
         repo_root, plan_path, config_path, result = _make_source_pre_turn_cap(root)
         source_dir = result.run_dir
         source_before = _run_dir_bytes(source_dir)
@@ -2728,7 +2759,7 @@ def test_daemon_preview_rejects_reviewed_completion(
 ) -> None:
     """A reviewed completion stays non-resumable in the daemon preview."""
     with tempfile.TemporaryDirectory() as tmpdir:
-        root = Path(tmpdir)
+        root = Path(tmpdir).resolve()
         repo_root, plan_path = _make_repo(root)
         worktree_root = root / "worktrees"
         worktree_root.mkdir()
@@ -2769,7 +2800,7 @@ def test_daemon_durable_recovery_of_historical_shape(
 ) -> None:
     """Durable recovery admits the historical shape with a selected target."""
     with tempfile.TemporaryDirectory() as tmpdir:
-        root = Path(tmpdir)
+        root = Path(tmpdir).resolve()
         repo_root, plan_path, config_path, result, run_json = (
             _make_source_historical(root)
         )
@@ -2937,7 +2968,7 @@ def test_daemon_durable_recovery_admits_completed_budget_exit(
 ) -> None:
     """A validated completed no-delivery budget exit admits replacement."""
     with tempfile.TemporaryDirectory() as tmpdir:
-        root = Path(tmpdir)
+        root = Path(tmpdir).resolve()
         repo_root, plan_path, config_path, result = _make_source_pre_turn_cap(root)
         source_dir = result.run_dir
         source_before = _run_dir_bytes(source_dir)
@@ -2996,7 +3027,7 @@ def test_daemon_durable_recovery_rejects_generic_completed_source(
 ) -> None:
     """A reviewed completion has no budget boundary and rejects replacement."""
     with tempfile.TemporaryDirectory() as tmpdir:
-        root = Path(tmpdir)
+        root = Path(tmpdir).resolve()
         repo_root, plan_path = _make_repo(root)
         worktree_root = root / "worktrees"
         worktree_root.mkdir()
@@ -3114,7 +3145,7 @@ def test_durable_recovery_binds_worktree_active_plan_and_rejects_drift(
         )
 
         # --- Admission binds the worktree plan, not the primary copy -------
-        root = Path(drift_tmp)
+        root = Path(drift_tmp).resolve()
         repo_root, plan_path, config_path, result = _make_source_pre_turn_cap(
             root, plan_text=_CHANGED_INCOMPLETE_PLAN,
         )
@@ -3196,7 +3227,7 @@ def test_durable_recovery_binds_worktree_active_plan_and_rejects_drift(
         assert worktree_plan.read_bytes() == drifted
 
         # --- The unchanged worktree plan still reaches the reviewer --------
-        clean_root = Path(clean_tmp)
+        clean_root = Path(clean_tmp).resolve()
         clean_repo, _clean_plan, clean_config, clean_source = (
             _make_source_pre_turn_cap(
                 clean_root, plan_text=_CHANGED_INCOMPLETE_PLAN,
@@ -3285,7 +3316,9 @@ def test_durable_recovery_binds_worktree_active_plan_and_rejects_drift(
 
 
 def test_mcp_durable_recovery_dispatch_of_historical_shape(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path,
+    budget_temp_parent: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """The registered MCP resume tool dispatches durable-evidence recovery.
 
@@ -3293,8 +3326,9 @@ def test_mcp_durable_recovery_dispatch_of_historical_shape(
     successor/one launch bound to the repair worker and exact overlay, with
     the predecessor evidence unchanged.
     """
-    with tempfile.TemporaryDirectory() as tmpdir:
-        root = Path(tmpdir)
+    with tempfile.TemporaryDirectory(dir=budget_temp_parent) as tmpdir:
+        assert Path(tmpdir).parent == budget_temp_parent
+        root = Path(tmpdir).resolve()
         repo_root, plan_path, config_path, result, run_json = (
             _make_source_historical(root)
         )
