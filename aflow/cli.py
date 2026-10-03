@@ -37,6 +37,7 @@ from .budget_resume import (
     classify_budget_boundary,
     resolve_successor_max_turns,
 )
+from .review_repair_resume import pending_review_repair_step
 from .manager_context import scoped_reviewer_rejection_count
 from .live_config import load_live_config, load_live_config_for_run
 from .resume_relocation import ResumeRelocation, prepare_resume_relocation
@@ -1421,6 +1422,11 @@ def _bootstrap_resume_invocation(
         )
     workflow_spec = workflow_config.workflows[workflow_name]
 
+    review_repair_step = pending_review_repair_step(
+        run_dir=run_dir, prev_run=prev_run, workflow_steps=workflow_spec.steps,
+        repo_root=repo_root, plan_path=plan_path,
+    )
+
     # Issue #62: a terminal run may have left an unfinished budget boundary
     # (a no-delivery budget exit, or the one narrow historical merge-failure
     # shape).  The shared classifier is the single authority for that shape;
@@ -1643,6 +1649,7 @@ def _bootstrap_resume_invocation(
         ),
         allow_owner_stopped_pending_review=has_owner_stopped_pending_review,
         allow_budget_continuation=budget_boundary is not None,
+        allow_review_repair=review_repair_step is not None,
         team_explicit=saved_team_explicit,
         max_turns_explicit=saved_max_turns_explicit,
         run_dir=run_dir,
@@ -1673,6 +1680,7 @@ def _bootstrap_resume_invocation(
         start_step_explicit=True,
         effective_max_turns=effective_max_turns,
         budget_boundary=budget_boundary,
+        review_repair_step=review_repair_step,
     )
     assert resume_context is not None
 
@@ -1723,6 +1731,7 @@ def _resume_candidate_mismatch_reason(
     allow_owner_stopped: bool = False,
     allow_owner_stopped_pending_review: bool = False,
     allow_budget_continuation: bool = False,
+    allow_review_repair: bool = False,
     team_explicit: bool | None = None,
     max_turns_explicit: bool | None = None,
     run_dir: Path | None = None,
@@ -1815,6 +1824,7 @@ def _resume_candidate_mismatch_reason(
         and not allow_owner_stopped_pending_review
         and not allow_budget_continuation
         and not _completed_manager_budget_boundary_pending(prev_run, current_repo_root)
+        and not allow_review_repair
     ):
         return "its last saved plan snapshot was already complete"
 
@@ -3800,6 +3810,7 @@ def _reconstruct_resume_context(
     start_step_explicit: bool | None = None,
     effective_max_turns: int | None = None,
     budget_boundary: object | None = None,
+    review_repair_step: str | None = None,
 ) -> ResumeContext | None:
     """Decode all durable resume state from one already-loaded run payload."""
     run_id = resolved_run_id.name
@@ -4133,6 +4144,8 @@ def _reconstruct_resume_context(
         interrupted_step_name=(
             None
             if reset_scope
+            else review_repair_step
+            if review_repair_step is not None
             else str(budget_boundary.next_step_name)
             if budget_boundary is not None
             else pending_cumulative_review.reviewer_step_name
@@ -4212,6 +4225,7 @@ def _reconstruct_resume_context(
         resumed_from_team=resumed_from_team,
         resume_team_override=resume_team_override,
         budget_continuation=budget_boundary,
+        review_repair_step=review_repair_step,
         **hotplug_fields,
         **manager_fields,
     ))

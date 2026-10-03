@@ -802,6 +802,7 @@ class ResumeContext:
     last_manager_report_path: str | None = None
     pending_finalized_turn: PendingFinalizedTurn | None = None
     pending_cumulative_review: PendingCumulativeReview | None = None
+    review_repair_step: str | None = None
     frozen_run_identity: FrozenRunIdentity | None = None
     live_config_path: str | None = None
     team_explicit: bool | None = None

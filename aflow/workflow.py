@@ -8762,6 +8762,7 @@ def _run_workflow_unchecked(
             resume.pending_finalized_turn is not None
             or resume.pending_cumulative_review is not None
             or resume.budget_continuation is not None
+            or resume.review_repair_step is not None
             or _has_resumable_cumulative_repair(
                 resume,
                 repo_root=config.repo_root,
