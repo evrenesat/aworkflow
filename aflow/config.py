@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import hashlib
+import json
 import re
 from dataclasses import dataclass, field
 from importlib import resources
@@ -24,6 +26,26 @@ TEAM_DISPLAY_NAME_MAX_LENGTH = 128
 class HarnessProfileConfig:
     model: str | None = None
     effort: str | None = None
+    exclusive: bool = False
+
+
+def execution_resource_key(
+    harness_name: str, model: str | None, effort: str | None
+) -> str:
+    """Return the stable account-local identity of one marked combination.
+
+    The key binds only the declared harness/model/effort tuple: profile,
+    role, team, and configuration/project paths are excluded, so marked
+    aliases of the same tuple share one resource while any different model
+    or effort value computes a different key. ``None`` stays JSON null;
+    model/effort case is preserved and no provider-alias discovery occurs.
+    """
+    payload = json.dumps(
+        ["aflow-exclusive-v1", harness_name, model, effort],
+        ensure_ascii=False,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return hashlib.sha256(payload).hexdigest()
 
 
 def _config_path() -> Path:
@@ -52,13 +74,20 @@ def _optional_text(value: object | None, *, path: str) -> str | None:
 
 
 def _parse_profile_table(raw: Mapping[str, object], *, path: str) -> HarnessProfileConfig:
-    allowed = {"model", "effort"}
+    allowed = {"model", "effort", "exclusive"}
     unknown = sorted(set(raw) - allowed)
     if unknown:
         raise ConfigError(f"unsupported keys in {path}: {', '.join(unknown)}")
+    exclusive = False
+    if "exclusive" in raw:
+        value = raw["exclusive"]
+        if not isinstance(value, bool):
+            raise ConfigError(f"{path}.exclusive must be a boolean")
+        exclusive = value
     return HarnessProfileConfig(
         model=_optional_text(raw.get("model"), path=f"{path}.model"),
         effort=_optional_text(raw.get("effort"), path=f"{path}.effort"),
+        exclusive=exclusive,
     )
 
 

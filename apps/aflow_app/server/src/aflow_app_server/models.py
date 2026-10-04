@@ -549,11 +549,20 @@ class SetMaxTurnsAction(GuidedActionBase):
 
 
 class UpsertProfileAction(GuidedActionBase):
+    """Upsert one profile row.
+
+    ``exclusive`` is optional and strict: omission leaves the saved flag
+    unchanged, ``True``/``False`` writes that boolean, and an explicit null
+    removes the key. ``StrictBool`` rejects non-boolean coercion (``1``,
+    ``"true"``) at the contract boundary.
+    """
+
     type: Literal["upsert_profile"]
     harness: str = Field(min_length=1, max_length=64)
     profile: str = Field(min_length=1, max_length=64)
     model: str | None = Field(default=None, min_length=1, max_length=128)
     effort: str | None = Field(default=None, min_length=1, max_length=64)
+    exclusive: StrictBool | None = Field(default=None)
 
 
 class SetGlobalRoleAction(GuidedActionBase):
@@ -744,6 +753,8 @@ class ProjectConfigFormPayload(CanonicalTransportModel):
 class GuidedProfileSummary(CanonicalTransportModel):
     model: str | None = None
     effort: str | None = None
+    # Declared exclusive flag; older projections and fixtures default to False.
+    exclusive: bool = False
 
 
 class GuidedWorkflowStepSummaries(CanonicalTransportModel):

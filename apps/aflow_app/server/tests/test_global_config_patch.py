@@ -163,7 +163,9 @@ def test_custom_profile_role_and_team_and_prompt_move(service):
         dict(type='move_role_prompt', role='new-role', target_role='worker', target_team='new-team'),
     ])
     form = guided_form_response(result.aflow_toml, result.workflows_toml)['form']
-    assert form['harnesses']['codex']['new-profile'] == {'model': 'new-model', 'effort': 'new-effort'}
+    assert form['harnesses']['codex']['new-profile'] == {
+        'model': 'new-model', 'effort': 'new-effort', 'exclusive': False
+    }
     assert form['teams']['new-team']['prompts']['worker'] == 'Text {preserved}\nλ'
     assert 'new-role' not in form['role_prompts']
 

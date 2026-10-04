@@ -29,6 +29,7 @@ from .config import (
     WorkflowConfig,
     WorkflowStepConfig,
     WorkflowUserConfig,
+    execution_resource_key,
     resolve_team_config,
 )
 from .live_config import load_live_config
@@ -3479,6 +3480,9 @@ class ResolvedProfile:
     profile_name: str
     model: str | None
     effort: str | None
+    # Derived internal identity for exclusive combinations; None for every
+    # unmarked profile. It is never a user-entered configuration field.
+    exclusive_resource: str | None = None
 
 
 @dataclass(frozen=True)
@@ -3543,6 +3547,13 @@ def _resolve_selector(
         profile_name=profile_name,
         model=profile_config.model,
         effort=profile_config.effort,
+        exclusive_resource=(
+            execution_resource_key(
+                harness_name, profile_config.model, profile_config.effort
+            )
+            if profile_config.exclusive
+            else None
+        ),
     )
 
 

@@ -776,6 +776,13 @@ def _apply_upsert_profile(action: UpsertProfileAction, aflow_doc: TOMLDocument) 
             profile_table.pop("effort", None)
         else:
             profile_table["effort"] = action.effort
+    if "exclusive" in submitted:
+        # Omission never reaches here (unchanged); explicit null removes the
+        # key, and explicit false is a real declaration that must persist.
+        if action.exclusive is None:
+            profile_table.pop("exclusive", None)
+        else:
+            profile_table["exclusive"] = action.exclusive
 
 
 def _manager_source(
@@ -858,6 +865,9 @@ def _projection(
                         if isinstance(profile_value.get("effort"), str)
                         else None
                     ),
+                    # Literal true only; anything else projects as False so a
+                    # malformed declaration can never claim exclusivity.
+                    "exclusive": profile_value.get("exclusive") is True,
                 }
             if profiles:
                 harnesses[str(harness_name)] = profiles
