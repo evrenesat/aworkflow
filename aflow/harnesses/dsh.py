@@ -16,7 +16,9 @@ from .session import (
     SessionExecutionResult,
     SessionRequest,
     SessionResult,
+    retain_lifecycle_after_failure,
 )
+from ..execution_resources import owned_child_binding
 
 
 ACP_PROTOCOL_VERSION = 1
@@ -588,14 +590,36 @@ class DshAcpDriver:
         request: SessionRequest,
         invocation: HarnessInvocation,
         control_callback: Any | None = None,
+        lifecycle: Any | None = None,
     ) -> SessionExecutionResult:
-        process = DshAcpProcess.start(
-            repo_root=request.repo_root,
-            executable=invocation.argv[0],
-        )
+        if lifecycle is not None:
+            # Durable launch intent precedes the ACP child spawn.
+            lifecycle.mark_launching()
+        try:
+            process = DshAcpProcess.start(
+                repo_root=request.repo_root,
+                executable=invocation.argv[0],
+            )
+        except OSError:
+            if lifecycle is not None:
+                # Popen raised before returning a process: positive evidence
+                # that launch never occurred releases the claim.
+                lifecycle.complete()
+            raise
+        if lifecycle is not None:
+            try:
+                child_pid, child_birth, process_group = owned_child_binding(process.process)
+                lifecycle.bind_child(child_pid, child_birth, process_group)
+            except BaseException as exc:
+                try:
+                    process.close()
+                except BaseException:
+                    pass
+                retain_lifecycle_after_failure(lifecycle, "register_child", exc)
 
         session_id: str | None = None
         session_closed = False
+        execution: SessionExecutionResult | None = None
 
         try:
             initialize = process.initialize()
@@ -771,7 +795,7 @@ class DshAcpDriver:
 
             raw_transport = "".join(process.raw_lines)
 
-            return SessionExecutionResult(
+            execution = SessionExecutionResult(
                 result=SessionResult(
                     session_id=session_id,
                     selector=request.selector,
@@ -803,7 +827,18 @@ class DshAcpDriver:
                 ):
                     pass
 
-            process.close()
+            try:
+                process.close()
+            except BaseException as exc:
+                if lifecycle is not None:
+                    retain_lifecycle_after_failure(lifecycle, "cleanup", exc)
+                raise
+            if lifecycle is not None:
+                # close() reaped the child; the claim can be released even on
+                # the in-flight error path.
+                lifecycle.complete()
+        assert execution is not None
+        return execution
 
     def parse_result(
         self,

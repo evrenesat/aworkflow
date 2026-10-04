@@ -76,6 +76,11 @@ from .git_status import (
     preflight_worktree,
     probe_repo_state,
 )
+from .execution_resources import (
+    ExecutionLease,
+    ResourceLeaseError,
+    owned_child_binding,
+)
 from .harnesses import get_adapter
 from .harnesses.preflight import (
     HarnessEnvironmentBlocker,
@@ -136,7 +141,7 @@ from .hotplug import (
     classify_hotplug_resume_stage, copy_hotplug_resume_artifacts,
     safe_hotplug_artifact_path, validate_hotplug_resume_artifacts,
 )
-from .harnesses.session import SessionDriver, SessionRequest, SessionResult
+from .harnesses.session import SessionDriver, SessionRequest, SessionResult, retain_lifecycle_after_failure
 from .runlog import create_repartition_attempt_paths, create_run_paths, engine_assertion_confirmation, finalize_turn_artifacts, load_run_json, prune_old_runs, write_issue_summary, write_manager_artifacts, write_manager_note_correction_artifacts, write_repartition_artifact, RunMetadataWriter, RunPaths, write_turn_artifacts_start
 from .stop_marker import (
     COMMAND_OUTPUT_CONTRACT,
@@ -5506,13 +5511,43 @@ def _normalize_process_launch_error(
     )
 
 
+def _reap_owned_process(proc: subprocess.Popen, grace_seconds: float = 5.0) -> None:
+    """Best-effort reap of a child we own; never raises into the caller."""
+    try:
+        proc.wait(timeout=grace_seconds)
+        return
+    except subprocess.TimeoutExpired:
+        pass
+    try:
+        proc.terminate()
+    except OSError:
+        pass
+    try:
+        proc.wait(timeout=grace_seconds)
+        return
+    except subprocess.TimeoutExpired:
+        pass
+    try:
+        proc.kill()
+    except OSError:
+        pass
+    try:
+        proc.wait(timeout=grace_seconds)
+    except subprocess.TimeoutExpired:
+        pass
+
+
 def _run_process(
     invocation: HarnessInvocation,
     repo_root: Path,
     banner: BannerRenderer,
     state: ControllerState,
     control_callback: Callable[[], object] | None = None,
+    lease: ExecutionLease | None = None,
 ) -> subprocess.CompletedProcess[str]:
+    if lease is not None:
+        # Durable launch intent is persisted before the spawn attempt.
+        lease.mark_launching()
     try:
         proc = subprocess.Popen(
             list(invocation.argv),
@@ -5530,7 +5565,22 @@ def _run_process(
             text=True,
         )
     except OSError as exc:
+        if lease is not None:
+            # Positive evidence that launch never occurred releases the claim.
+            lease.complete()
         return _normalize_process_launch_error(invocation, exc)
+
+    if lease is not None:
+        try:
+            child_pid, child_birth, process_group = owned_child_binding(proc)
+            lease.bind_child(child_pid, child_birth, process_group)
+        except BaseException as exc:
+            _reap_owned_process(proc)
+            try:
+                lease.mark_unconfirmed()
+            except ResourceLeaseError as retain_error:
+                raise retain_error from exc
+            raise ResourceLeaseError("register_child", str(exc), context=exc) from exc
 
     banner.update(state)
 
@@ -5588,18 +5638,30 @@ def _run_process(
         t_in = threading.Thread(target=_write_stdin, daemon=True)
         t_in.start()
 
-    while True:
-        try:
-            proc.wait(timeout=PROCESS_POLL_INTERVAL_SECONDS)
-            break
-        except subprocess.TimeoutExpired:
-            if control_callback is not None:
-                control_callback()
+    try:
+        while True:
+            try:
+                proc.wait(timeout=PROCESS_POLL_INTERVAL_SECONDS)
+                break
+            except subprocess.TimeoutExpired:
+                if control_callback is not None:
+                    control_callback()
+    except BaseException:
+        # A live child may still be running when the controller stops polling
+        # (for example an owner stop); ownership is retained, never released.
+        if lease is not None:
+            lease.mark_unconfirmed()
+        raise
 
     if t_in is not None:
         t_in.join()
     t_out.join()
     t_err.join()
+
+    if lease is not None:
+        # The child was reaped by proc.wait() above (including the stdin-error
+        # path below), so the claim can be released.
+        lease.complete()
 
     if stdin_errors:
         raise stdin_errors[0]
@@ -5616,7 +5678,11 @@ def _run_injected_runner(
     runner: Callable[..., subprocess.CompletedProcess[str]],
     invocation: HarnessInvocation,
     repo_root: Path,
+    lease: ExecutionLease | None = None,
 ) -> subprocess.CompletedProcess[str]:
+    if lease is not None:
+        # Durable launch intent is persisted before the runner is invoked.
+        lease.mark_launching()
     kwargs: dict[str, object] = {
         "cwd": str(repo_root),
         "env": {**os.environ, **invocation.env},
@@ -5627,9 +5693,28 @@ def _run_injected_runner(
     if invocation.stdin_text is not None:
         kwargs["input"] = invocation.stdin_text
     try:
-        return runner(list(invocation.argv), **kwargs)
-    except OSError as exc:
-        return _normalize_process_launch_error(invocation, exc)
+        completed = runner(list(invocation.argv), **kwargs)
+    except Exception as exc:
+        if lease is not None:
+            # This seam has no pre-spawn evidence hook: an injected runner may
+            # have already spawned a child before raising, so every failure
+            # (including OSError) retains ownership as unconfirmed and
+            # surfaces the typed resource error instead of a launch result.
+            retain_lifecycle_after_failure(lease, "injected_runner", exc)
+        if isinstance(exc, OSError):
+            # Without a lease a launch failure stays a normal failed result.
+            return _normalize_process_launch_error(invocation, exc)
+        raise
+    except BaseException:
+        # Control-flow signals keep propagating, but the child's cessation is
+        # equally unconfirmed: retain ownership rather than release it.
+        if lease is not None:
+            lease.mark_unconfirmed()
+        raise
+    if lease is not None:
+        # The synchronous runner contract reaps its child before returning.
+        lease.complete()
+    return completed
 
 
 def _workflow_requires_git_tracking(

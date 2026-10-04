@@ -9,7 +9,13 @@ from pathlib import Path
 from typing import Any, Callable, Mapping
 
 from .base import HarnessInvocation
-from .session import SessionCapabilities, SessionExecutionResult, SessionRequest, SessionResult
+from .session import (
+    SessionCapabilities,
+    SessionExecutionResult,
+    SessionRequest,
+    SessionResult,
+    retain_lifecycle_after_failure,
+)
 from .preflight import (
     REASONIX_BWRAP_REMEDIATION,
     HarnessEnvironmentBlocker,
@@ -17,10 +23,14 @@ from .preflight import (
     HarnessPreflightProbe,
     diagnostic_fields,
 )
+from ..execution_resources import owned_child_binding
 from ..stop_marker import STRUCTURED_TRANSPORT_OUTPUT_SOURCE
 
 
 REASONIX_SESSION_CONTROL_TIMEOUT_SECONDS = 60.0
+REASONIX_ACP_CLOSE_GRACE_SECONDS = 10.0
+REASONIX_ACP_CLOSE_TERMINATE_SECONDS = 5.0
+REASONIX_ACP_CLOSE_KILL_SECONDS = 5.0
 REASONIX_ACP_MAX_LINE_BYTES = 1_048_576
 REASONIX_ACP_MAX_PERMISSION_REQUESTS = 128
 REASONIX_ACP_MAX_PERMISSION_OPTIONS = 128
@@ -501,9 +511,22 @@ class ReasonixAcpProcess:
         return self.request("initialize", {})
 
     def close(self) -> None:
+        """Cooperative close, then escalation; always reaps the owned child."""
         if self.process.stdin is not None:
             self.process.stdin.close()
+        try:
+            self.process.wait(timeout=REASONIX_ACP_CLOSE_GRACE_SECONDS)
+            return
+        except subprocess.TimeoutExpired:
+            pass
         self.process.terminate()
+        try:
+            self.process.wait(timeout=REASONIX_ACP_CLOSE_TERMINATE_SECONDS)
+            return
+        except subprocess.TimeoutExpired:
+            pass
+        self.process.kill()
+        self.process.wait(timeout=REASONIX_ACP_CLOSE_KILL_SECONDS)
 
 
 class ReasonixAcpDriver:
@@ -580,9 +603,31 @@ class ReasonixAcpDriver:
     def execute_session(
         self, request: SessionRequest, invocation: HarnessInvocation,
         control_callback: Any | None = None,
+        lifecycle: Any | None = None,
     ) -> SessionExecutionResult:
-        process = ReasonixAcpProcess.start(repo_root=request.repo_root, executable=invocation.argv[0])
+        if lifecycle is not None:
+            # Durable launch intent precedes the ACP child spawn.
+            lifecycle.mark_launching()
+        try:
+            process = ReasonixAcpProcess.start(repo_root=request.repo_root, executable=invocation.argv[0])
+        except OSError:
+            if lifecycle is not None:
+                # Popen raised before returning a process: positive evidence
+                # that launch never occurred releases the claim.
+                lifecycle.complete()
+            raise
+        if lifecycle is not None:
+            try:
+                child_pid, child_birth, process_group = owned_child_binding(process.process)
+                lifecycle.bind_child(child_pid, child_birth, process_group)
+            except BaseException as exc:
+                try:
+                    process.close()
+                except BaseException:
+                    pass
+                retain_lifecycle_after_failure(lifecycle, "register_child", exc)
         wire: list[Mapping[str, Any]] = []
+        execution: SessionExecutionResult | None = None
         try:
             initialize = process.initialize()
             wire.append(initialize)
@@ -670,7 +715,7 @@ class ReasonixAcpDriver:
             )
             if parsed_id is None or final_output is None:
                 raise ValueError("Reasonix ACP prompt did not return exact output")
-            return SessionExecutionResult(
+            execution = SessionExecutionResult(
                 result=SessionResult(
                     session_id=parsed_id, selector=request.selector, model=request.model,
                     effort=request.effort, final_output=final_output,
@@ -678,7 +723,18 @@ class ReasonixAcpDriver:
                 ), raw_transport=raw, events=tuple(wire),
             )
         finally:
-            process.close()
+            try:
+                process.close()
+            except BaseException as exc:
+                if lifecycle is not None:
+                    retain_lifecycle_after_failure(lifecycle, "cleanup", exc)
+                raise
+            if lifecycle is not None:
+                # close() reaped the child; the claim can be released even on
+                # the in-flight error path.
+                lifecycle.complete()
+        assert execution is not None
+        return execution
 
     def build_initialize(self, *, client_name: str = "aflow") -> str:
         return json.dumps({

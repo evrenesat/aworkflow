@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import inspect
 import json
 from pathlib import Path
-from typing import Any, Final, Mapping, Protocol
+from typing import Any, Final, Mapping, NoReturn, Protocol
 
 from .base import HarnessInvocation
+from ..execution_resources import ResourceLeaseError
 from ..stop_marker import (
     FINAL_TEXT_OUTPUT_SOURCE,
     SemanticOutputSource,
@@ -80,8 +82,57 @@ class SessionDriver(Protocol):
         request: SessionRequest,
         invocation: HarnessInvocation,
         control_callback: Any | None = None,
+        lifecycle: Any | None = None,
     ) -> SessionExecutionResult:
+        """Run one owned session turn.
+
+        ``lifecycle`` is an optional exclusive-resource lease (see
+        ``aflow.execution_resources.ExecutionLease``).  Drivers that accept it
+        must persist launch intent before spawning, bind the exact owned child
+        before prompting, and release the claim only after the child is reaped;
+        they retain the claim when cessation cannot be positively confirmed.
+        """
         ...
+
+
+def session_driver_accepts_lifecycle(driver: Any) -> bool:
+    """Whether this driver can honor the exclusive lifetime contract.
+
+    Opaque drivers without a lifecycle seam cannot prove their child ceased;
+    exclusive dispatch must reject them before launch rather than silently
+    skipping the gate.  A ``**kwargs`` seam counts as support because such a
+    driver will at least surface the unknown parameter loudly.
+    """
+    execute = getattr(driver, "execute_session", None)
+    if not callable(execute):
+        return False
+    try:
+        parameters = inspect.signature(execute).parameters
+    except (TypeError, ValueError):
+        return False
+    if "lifecycle" in parameters:
+        return True
+    return any(
+        parameter.kind is inspect.Parameter.VAR_KEYWORD
+        for parameter in parameters.values()
+    )
+
+
+def retain_lifecycle_after_failure(
+    lifecycle: Any,
+    stage: str,
+    error: BaseException,
+) -> NoReturn:
+    """Retain an unconfirmed claim and surface a resource-specific error.
+
+    The original exception is preserved as diagnostic context so cleanup and
+    launch failures stay distinguishable in logs.
+    """
+    try:
+        lifecycle.mark_unconfirmed()
+    except Exception as retain_error:  # fail closed with context
+        raise ResourceLeaseError(stage, str(retain_error), context=error) from retain_error
+    raise ResourceLeaseError(stage, str(error), context=error) from error
 
 
 class NoSessionDriver:

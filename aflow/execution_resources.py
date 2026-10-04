@@ -25,10 +25,11 @@ import re
 import stat as stat_module
 import sys
 import tempfile
+import time
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable, Iterator, Literal
+from typing import Any, Callable, Iterator, Literal
 
 from aflow.process_identity import (
     host_boot_identity,
@@ -39,12 +40,15 @@ from aflow.process_identity import (
 __all__ = [
     "ClaimSpec",
     "ControllerIdentity",
+    "ExecutionLease",
     "ExecutionResourceStore",
     "MAX_JOURNAL_BYTES",
     "MAX_OUTSTANDING_CLAIMS",
     "Outcome",
     "ProcessEvidence",
+    "ResourceLeaseError",
     "JOURNAL_VERSION",
+    "owned_child_binding",
 ]
 
 JOURNAL_VERSION = 1
@@ -117,6 +121,43 @@ class _StoreError(Exception):
     def __init__(self, reason: str) -> None:
         super().__init__(reason)
         self.reason = reason
+
+
+class ResourceLeaseError(Exception):
+    """Resource-specific lifetime failure.
+
+    Typed so callers can bypass catch-all provider recovery, manager-output
+    validation, and correction escalation: a lease failure is an admission
+    problem, not a model result.
+    """
+
+    def __init__(
+        self,
+        stage: str,
+        reason: str,
+        *,
+        context: BaseException | None = None,
+    ) -> None:
+        super().__init__(f"execution resource {stage} failed: {reason}")
+        self.stage = stage
+        self.reason = reason
+        if context is not None:
+            self.__cause__ = context
+
+
+def owned_child_binding(process: Any) -> tuple[int, str | None, int | None]:
+    """Observe the exact owned child: PID, birth identity, and real group.
+
+    The group is the child's *actual* process-group identity, which differs
+    per launch topology (a new session leader versus the parent's group).
+    An unobservable group stays ``None`` and fails closed at reconciliation.
+    """
+    pid = process.pid
+    try:
+        pgid: int | None = os.getpgid(pid)
+    except OSError:
+        pgid = None
+    return pid, process_birth_identity(pid), pgid
 
 
 def _default_process_evidence(pid: int) -> ProcessEvidence:
@@ -711,6 +752,10 @@ class ExecutionResourceStore:
             return Outcome("rejected", reason=exc.reason)
         return Outcome(success, ticket=ticket, reason=reason)
 
+
+
+
+
     @staticmethod
     def _reconcile_claim(
         claim: dict,
@@ -754,3 +799,102 @@ class ExecutionResourceStore:
         if groups(claim["process_group"]) != "absent":
             return "keep"
         return "remove"
+
+
+class ExecutionLease:
+    """Bind one durable claim to the actual lifetime of an owned invocation.
+
+    The controller owns the admission wait loop and acquires the reservation
+    before constructing the lease.  The lease then drives the claim through
+    ``launching -> running -> released`` (or ``unconfirmed`` retention), with
+    every transition fenced by the invocation nonce.  It never enqueues,
+    acquires, cancels, calls providers, or rewrites workflow state; a bounded
+    contention retry only re-issues the same nonce-checked transition.
+    """
+
+    def __init__(
+        self,
+        store: ExecutionResourceStore,
+        resource: str,
+        invocation_id: str,
+        controller: ControllerIdentity,
+        *,
+        sleeper: Callable[[float], None] | None = None,
+        contention_deadline_seconds: float = 5.0,
+    ) -> None:
+        self._store = store
+        self._resource = resource
+        self._invocation_id = invocation_id
+        self._controller = controller
+        self._sleeper = sleeper or time.sleep
+        self._contention_deadline_seconds = contention_deadline_seconds
+
+    # -- transitions ---------------------------------------------------------
+
+    def _transition(self, operation: Callable[[], Outcome]) -> Outcome:
+        deadline = time.monotonic() + self._contention_deadline_seconds
+        while True:
+            outcome = operation()
+            if outcome.state != "contended" or time.monotonic() >= deadline:
+                return outcome
+            self._sleeper(0.01)
+
+    def _require(
+        self, stage: str, expected: str, operation: Callable[[], Outcome]
+    ) -> None:
+        outcome = self._transition(operation)
+        if outcome.state != expected:
+            raise ResourceLeaseError(stage, outcome.reason or outcome.state)
+
+    def mark_launching(self) -> None:
+        """Persist durable launch intent before any model-bearing process starts."""
+        self._require(
+            "mark_launching",
+            "launching",
+            lambda: self._store.mark_launching(
+                self._resource, self._invocation_id, self._controller
+            ),
+        )
+
+    def bind_child(
+        self,
+        child_pid: int,
+        child_birth: str | None = None,
+        process_group: int | None = None,
+    ) -> None:
+        """Register the exact owned child before prompting it."""
+        self._require(
+            "register_child",
+            "running",
+            lambda: self._store.register_child(
+                self._resource,
+                self._invocation_id,
+                self._controller,
+                child_pid,
+                child_birth,
+                process_group,
+            ),
+        )
+
+    def complete(self) -> None:
+        """Release only after the owned process has been reaped (or launch never occurred)."""
+        self._require(
+            "release",
+            "released",
+            lambda: self._store.record_completion(
+                self._resource, self._invocation_id, self._controller
+            ),
+        )
+
+    def mark_unconfirmed(self) -> None:
+        """Retain ownership when cessation cannot be positively confirmed."""
+        self._require(
+            "retain",
+            "retained",
+            lambda: self._store.record_completion(
+                self._resource,
+                self._invocation_id,
+                self._controller,
+                unconfirmed=True,
+            ),
+        )
