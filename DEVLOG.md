@@ -1,5 +1,49 @@
 # DEVLOG
 
+## 2026-10-04 — Checkpoint reviewers receive the exact worker-artifact read location (issue #64)
+
+- `_CheckpointReviewPromptTarget` now carries the selected worker result's
+  concrete `Path` alongside its unchanged primary-relative reference, and
+  `_review_worker_artifact_reference` returns the pair. Locations are computed
+  only from existing controller-owned paths: matching worker turn-history
+  records, the current `run_dir`, the validated `resumed-from` predecessor for
+  active scopes; the typed `source_run_dir` for pending cumulative reviews and
+  recovered finalized boundaries; and the evidence `source_run_dir` for
+  scope-less recovery. A malformed or unbound source identity yields an
+  explicitly unavailable location, never another source.
+- Resolved and ambiguous review contexts share one renderer that keeps the
+  `- Worker artifact reference:` line, appends
+  `- Worker artifact path (read this exact file): <absolute path>` with a note
+  that it is the read location independent of the execution directory, and
+  states explicit `Worker artifact unavailable` when the expected file is
+  absent or uninspectable. Availability never changes target selection,
+  ambiguity, or review transitions; non-reviewer prompts are unchanged. Both
+  normal and retry prompt assembly use the same rendering.
+- New `worker_artifact` regressions in `tests/test_runtime.py` cover matching
+  history with a decoy under the current run, current-run-file fallback,
+  missing plain-turn fallback, resumed fallback, malformed resumed source,
+  missing selected history despite a plausible replacement, recovered
+  finalized worker, scope-less predecessor, and ambiguous target with an
+  existing artifact; each resolves the emitted path and reads/asserts the
+  selected result bytes. An injected-runner worktree regression asserts the
+  reviewer cwd is the execution worktree, extracts the path from the actual
+  prompt, opens the primary result through a subprocess rooted at that cwd,
+  and verifies worker turn/role and unique content on both the ordinary and
+  inconsistent-plan retry invocations with the same target.
+- The same-root and relocated pending-review tests in
+  `tests/test_resume_pending_review.py` now have their actual reviewer runners
+  read the exact predecessor artifact bytes, with conflicting sibling-run and
+  old-root decoys present during the read; source hashes and relocation
+  assertions are preserved.
+- Verified: `uv run pytest -q tests/test_runtime.py -k 'worker_artifact or
+  reviewer_prompt or checkpoint_review_context or worker_review_loop or
+  scope_less_resume'`, the full `tests/test_resume_pending_review.py`, the
+  cumulative resume suites, `uv run ruff check aflow/workflow.py`, and
+  `git diff --check` all pass. Live acceptance on the next already-authorized
+  managed review remains pending for issue #64.
+
+Source: https://github.com/evrenesat/aworkflow/issues/64.
+
 ## 2026-10-04 — Budget-only controls preserve an existing worker hotplug (issue #68)
 
 - `workflow.py::_apply_boundary_override` now compares each supplied role

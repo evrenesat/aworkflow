@@ -3761,6 +3761,10 @@ class _CheckpointReviewPromptTarget:
     worker_artifact_path: str | None
     source: str
     ambiguity: str | None = None
+    # Concrete absolute read location for the selected worker result, carried
+    # alongside its reference text. Provenance only: it never alters target
+    # selection and is never persisted.
+    worker_artifact_location: Path | None = None
 
 
 @dataclass(frozen=True)
@@ -3846,6 +3850,7 @@ def _review_target_from_snapshot(
     original_plan_path: Path,
     worker_artifact_path: str,
     source: str,
+    worker_artifact_location: Path | None = None,
 ) -> _CheckpointReviewPromptTarget | None:
     """Validate one recovered worker snapshot against the original plan."""
     try:
@@ -3860,6 +3865,7 @@ def _review_target_from_snapshot(
             ambiguity=(
                 "the original plan could not be read as checkpointed review state"
             ),
+            worker_artifact_location=worker_artifact_location,
         )
     if not parsed.sections:
         return None
@@ -3872,6 +3878,7 @@ def _review_target_from_snapshot(
             ambiguity=(
                 "the recovered worker result has no usable snapshot_before checkpoint"
             ),
+            worker_artifact_location=worker_artifact_location,
         )
     checkpoint_index = snapshot_before.current_checkpoint_index
     if checkpoint_index is None or not 1 <= checkpoint_index <= len(parsed.sections):
@@ -3883,6 +3890,7 @@ def _review_target_from_snapshot(
             ambiguity=(
                 "the recovered worker result does not identify one existing checkpoint"
             ),
+            worker_artifact_location=worker_artifact_location,
         )
     section = parsed.sections[checkpoint_index - 1]
     if (
@@ -3895,6 +3903,7 @@ def _review_target_from_snapshot(
             worker_artifact_path=worker_artifact_path,
             source=source,
             ambiguity="the result checkpoint name disagrees with the original plan",
+            worker_artifact_location=worker_artifact_location,
         )
     approved_index = _latest_approved_checkpoint_index(plan_text)
     if approved_index is not None and checkpoint_index <= approved_index:
@@ -3907,12 +3916,14 @@ def _review_target_from_snapshot(
                 f"checkpoint #{checkpoint_index} is already recorded as approved; "
                 "an explicit target is required to review it again"
             ),
+            worker_artifact_location=worker_artifact_location,
         )
     return _CheckpointReviewPromptTarget(
         checkpoint_index=checkpoint_index,
         checkpoint_name=section.name,
         worker_artifact_path=worker_artifact_path,
         source=f"{source} and review state",
+        worker_artifact_location=worker_artifact_location,
     )
 
 
@@ -3973,16 +3984,22 @@ def _review_worker_artifact_reference(
     repo_root: Path,
     run_dir: Path,
     resumed_from_run_id: str | None = None,
-) -> str:
-    """Return a stable reference to the selected worker's result metadata."""
+) -> tuple[str, Path | None]:
+    """Return the selected worker result's reference and its concrete location.
+
+    The reference text is unchanged from the historical selection; the
+    location is the exact absolute file the reference designates, or None
+    when the existing state cannot bind it to one readable source.
+    """
     for record in reversed(state.turn_history):
         if (
             record.turn_number == attempt.turn_number
             and record.step_role == "worker"
             and record.turn_dir is not None
         ):
+            candidate = record.turn_dir / "result.json"
             try:
-                return str((record.turn_dir / "result.json").relative_to(repo_root))
+                return str(candidate.relative_to(repo_root)), candidate
             except ValueError:
                 break
     current_result = (
@@ -3990,12 +4007,28 @@ def _review_worker_artifact_reference(
     )
     if current_result.is_file():
         try:
-            return str(current_result.relative_to(repo_root))
+            return str(current_result.relative_to(repo_root)), current_result
         except ValueError:
             pass
     source_run_id = resumed_from_run_id
-    prefix = f"resumed-from/{source_run_id}/" if source_run_id else ""
-    return f"{prefix}turns/turn-{attempt.turn_number:03d}/result.json"
+    if source_run_id:
+        # Pair the resumed-from fallback with its validated predecessor under
+        # the primary repository; a malformed source identity binds nothing.
+        source_name = Path(source_run_id)
+        location: Path | None = (
+            repo_root
+            / ".aflow" / "runs" / source_run_id / "turns"
+            / f"turn-{attempt.turn_number:03d}" / "result.json"
+            if source_name.name == source_run_id and source_run_id not in {".", ".."}
+            else None
+        )
+        prefix = f"resumed-from/{source_run_id}/"
+    else:
+        location = (
+            run_dir / "turns" / f"turn-{attempt.turn_number:03d}" / "result.json"
+        )
+        prefix = ""
+    return f"{prefix}turns/turn-{attempt.turn_number:03d}/result.json", location
 
 
 def _recovered_review_target(
@@ -4003,6 +4036,7 @@ def _recovered_review_target(
     *,
     original_plan_path: Path,
     worker_artifact_path: str,
+    worker_artifact_location: Path,
 ) -> _CheckpointReviewPromptTarget | None:
     """Resolve a legacy pending worker only when its review state is clear."""
     if pending.step_role != "worker":
@@ -4012,6 +4046,7 @@ def _recovered_review_target(
         original_plan_path=original_plan_path,
         worker_artifact_path=worker_artifact_path,
         source="recovered finalized worker metadata",
+        worker_artifact_location=worker_artifact_location,
     )
 
 
@@ -4134,12 +4169,57 @@ def _scope_less_recovered_review_target(
         f"resumed-from/{source_run_id}/turns/"
         f"turn-{evidence.turn_number:03d}/result.json"
     )
+    worker_artifact_location = (
+        evidence.source_run_dir / "turns"
+        / f"turn-{evidence.turn_number:03d}" / "result.json"
+    )
     return _review_target_from_snapshot(
         evidence.snapshot_before,
         original_plan_path=original_plan_path,
         worker_artifact_path=worker_artifact_path,
         source="scope-less resumed predecessor worker result",
+        worker_artifact_location=worker_artifact_location,
     )
+
+
+def _worker_artifact_lines(
+    reference: str | None,
+    location: Path | None,
+) -> list[str]:
+    """Render the selected worker result's reference and exact read location.
+
+    The reference is provenance text; the location is the absolute file the
+    reviewer must open, independent of its execution directory. A missing or
+    uninspectable candidate stays explicitly unavailable and is never
+    replaced; existence is a prompt diagnostic, not result validation.
+    """
+    if reference is None:
+        return []
+    lines = [f"- Worker artifact reference: {reference}"]
+    if location is None:
+        lines.append(
+            "- Worker artifact unavailable: no readable location is known for "
+            "this reference; do not infer a path or read a replacement."
+        )
+        return lines
+    lines.append(
+        f"- Worker artifact path (read this exact file): {location}. "
+        "This is the read location for the selected result, independent of "
+        "the execution directory."
+    )
+    try:
+        if not location.is_file():
+            lines.append(
+                f"- Worker artifact unavailable: the expected file at "
+                f"{location} is missing or not a regular file; no replacement "
+                "was selected."
+            )
+    except OSError:
+        lines.append(
+            f"- Worker artifact unavailable: {location} could not be "
+            "inspected; no replacement was selected."
+        )
+    return lines
 
 
 def _render_checkpoint_review_context(
@@ -4170,25 +4250,34 @@ def _render_checkpoint_review_context(
                 "verified completed cumulative worker result "
                 "(full original-plan review)"
             ),
+            worker_artifact_location=(
+                pending.source_run_dir / "turns"
+                / f"turn-{pending.worker_turn_number:03d}" / "result.json"
+            ),
         )
     elif scope is not None and scope.awaiting_review:
         attempts = state.implementation_attempts.get(scope.scope_id, [])
         worker_attempts = [item for item in attempts if item.role == "worker"]
         if worker_attempts:
             attempt = worker_attempts[-1]
+            (
+                worker_artifact_path,
+                worker_artifact_location,
+            ) = _review_worker_artifact_reference(
+                state,
+                attempt=attempt,
+                repo_root=repo_root,
+                run_dir=run_dir,
+                resumed_from_run_id=(
+                    resume.resumed_from_run_id if resume is not None else None
+                ),
+            )
             target = _CheckpointReviewPromptTarget(
                 checkpoint_index=scope.checkpoint_index,
                 checkpoint_name=scope.checkpoint_name,
-                worker_artifact_path=_review_worker_artifact_reference(
-                    state,
-                    attempt=attempt,
-                    repo_root=repo_root,
-                    run_dir=run_dir,
-                    resumed_from_run_id=(
-                        resume.resumed_from_run_id if resume is not None else None
-                    ),
-                ),
+                worker_artifact_path=worker_artifact_path,
                 source="active implementation scope awaiting review",
+                worker_artifact_location=worker_artifact_location,
             )
         else:
             target = _CheckpointReviewPromptTarget(
@@ -4209,6 +4298,10 @@ def _render_checkpoint_review_context(
             worker_artifact_path=(
                 f"resumed-from/{recovered_boundary.source_run_dir.name}/"
                 f"turns/turn-{recovered_boundary.turn_number:03d}/result.json"
+            ),
+            worker_artifact_location=(
+                recovered_boundary.source_run_dir / "turns"
+                / f"turn-{recovered_boundary.turn_number:03d}" / "result.json"
             ),
         )
     elif (
@@ -4239,8 +4332,11 @@ def _render_checkpoint_review_context(
             "- Pending target: unresolved from "
             f"{target.source}; {target.ambiguity}."
         )
-        if target.worker_artifact_path is not None:
-            lines.append(f"- Worker artifact reference: {target.worker_artifact_path}")
+        lines.extend(
+            _worker_artifact_lines(
+                target.worker_artifact_path, target.worker_artifact_location
+            )
+        )
         if active_plan_path != original_plan_path:
             lines.append(f"- Active plan/overlay: {active_plan_path}")
         lines.append(
@@ -4266,8 +4362,11 @@ def _render_checkpoint_review_context(
         )
     if active_plan_path != original_plan_path:
         lines.append(f"- Active plan/overlay: {active_plan_path}")
-    if target.worker_artifact_path is not None:
-        lines.append(f"- Worker artifact reference: {target.worker_artifact_path}")
+    lines.extend(
+        _worker_artifact_lines(
+            target.worker_artifact_path, target.worker_artifact_location
+        )
+    )
     return "\n".join(lines)
 
 

@@ -763,6 +763,22 @@ a later verified rejection is due for another edge. The existing hotplug
 transaction handles a cross-harness target and fails explicitly if it cannot
 start. A separate checkpoint starts from its baseline team.
 
+Checkpoint-review prompts expose the selected worker result as a
+primary-root-relative `Worker artifact reference` (historical provenance, text
+unchanged) plus an exact absolute `Worker artifact path (read this exact
+file)` computed at selection time from existing controller-owned paths: the
+matching worker turn-history record, the current `run_dir`, or the validated
+`resumed-from` predecessor for active scopes; the typed `source_run_dir` and
+turn for pending cumulative reviews and recovered finalized boundaries; and
+the evidence `source_run_dir` for scope-less recovery. The absolute path is
+the read location independent of the execution directory, because reviewers
+run in a managed worktree while results remain under the primary checkout.
+A malformed or unbound source identity, or an absent expected file, renders an
+explicit unavailable status with the retained reference; the controller never
+substitutes another run's result, and availability never changes target
+selection, ambiguity messages, or review transitions. Non-reviewer prompts
+receive no review context.
+
 ## Module Breakdown
 
 Explicit current-branch continuation validates the symbolic current branch,

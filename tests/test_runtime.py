@@ -62,6 +62,15 @@ def _runner_prompt(argv, kwargs) -> str:
     return prompt if isinstance(prompt, str) else " ".join(argv)
 
 
+def _extract_worker_artifact_path(prompt: str) -> str:
+    """Return the exact read location a reviewer prompt exposes."""
+    marker = "- Worker artifact path (read this exact file): "
+    for line in prompt.splitlines():
+        if line.startswith(marker):
+            return line[len(marker):].split(". This is the read location", 1)[0].strip()
+    raise AssertionError("worker artifact path line missing from prompt")
+
+
 def _record_inactive_direct_source(run_dir: Path) -> None:
     """Give synthetic resume sources the terminal record real CLI runs need."""
     metadata_path = run_dir / "run.json"
@@ -3546,6 +3555,641 @@ class WorkflowRuntimeTests(unittest.TestCase):
             assert f"Active plan/overlay: {active_overlay}" in prompt
             assert "explicit operator checkpoint target" in prompt
             assert "Original checkpoint:" not in prompt
+
+    def _worker_artifact_scope_state(
+        self, root: Path, checkpoint_index: int = 1
+    ) -> ControllerState:
+        original_plan = root / "plan.md"
+        original_plan.write_text(
+            "# Plan\n\n"
+            "### [x] Checkpoint 1: First\n"
+            "- [x] implement\n\n"
+            "### [ ] Checkpoint 2: Next\n"
+            "- [ ] implement\n",
+            encoding="utf-8",
+        )
+        state = ControllerState(
+            last_snapshot=PlanSnapshot("Checkpoint 2: Next", 1, 1, False, 2, 2)
+        )
+        scope = ActiveImplementationScope(
+            scope_id=f"{original_plan}::checkpoint-{checkpoint_index}::pending",
+            original_plan_path=str(original_plan),
+            checkpoint_index=checkpoint_index,
+            checkpoint_name="Checkpoint 1: First",
+            opened_turn_number=2,
+            awaiting_review=True,
+        )
+        state.active_implementation_scope = scope
+        state.implementation_attempts[scope.scope_id] = [
+            ImplementationAttempt(
+                turn_number=3,
+                step_name="implement",
+                role="worker",
+                team="default",
+                selector="codex.worker",
+                outcome="progress",
+            )
+        ]
+        return state
+
+    def test_worker_artifact_history_record_location_wins_over_decoy(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            state = self._worker_artifact_scope_state(root)
+            original_plan = root / "plan.md"
+            run_dir = root / ".aflow" / "runs" / "current"
+            history_turn = root / ".aflow" / "runs" / "prior-run" / "turns" / "turn-003"
+            history_result = history_turn / "result.json"
+            history_turn.mkdir(parents=True)
+            history_result.write_text(
+                json.dumps({
+                    "turn_number": 3,
+                    "step_role": "worker",
+                    "stdout": "history-worker-sentinel-7f3a",
+                }),
+                encoding="utf-8",
+            )
+            decoy_turn = run_dir / "turns" / "turn-003"
+            decoy_turn.mkdir(parents=True)
+            (decoy_turn / "result.json").write_text(
+                json.dumps({
+                    "turn_number": 3,
+                    "step_role": "worker",
+                    "stdout": "decoy-must-not-be-read",
+                }),
+                encoding="utf-8",
+            )
+            state.turn_history.append(
+                TurnRecord(
+                    turn_number=3,
+                    step_name="implement",
+                    resolved_harness_name="codex",
+                    resolved_model_display="worker",
+                    turn_dir=history_turn,
+                    step_role="worker",
+                )
+            )
+
+            prompt = _append_checkpoint_review_context(
+                "Review the active plan.",
+                step_role="reviewer",
+                state=state,
+                repo_root=root,
+                run_dir=run_dir,
+                original_plan_path=original_plan,
+                active_plan_path=original_plan,
+                resume=None,
+                recovered_boundary=None,
+            )
+
+            assert "Original checkpoint: #1 — Checkpoint 1: First" in prompt
+            assert (
+                "- Worker artifact reference: "
+                ".aflow/runs/prior-run/turns/turn-003/result.json"
+            ) in prompt
+            path = Path(_extract_worker_artifact_path(prompt))
+            assert path == history_result
+            content = path.read_text(encoding="utf-8")
+            assert "history-worker-sentinel-7f3a" in content
+            assert "decoy-must-not-be-read" not in content
+
+    def test_worker_artifact_current_run_file_fallback_location(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            state = self._worker_artifact_scope_state(root)
+            original_plan = root / "plan.md"
+            run_dir = root / ".aflow" / "runs" / "current"
+            current_result = run_dir / "turns" / "turn-003" / "result.json"
+            current_result.parent.mkdir(parents=True)
+            current_result.write_text(
+                json.dumps({
+                    "turn_number": 3,
+                    "step_role": "worker",
+                    "stdout": "current-run-sentinel-91bc",
+                }),
+                encoding="utf-8",
+            )
+
+            prompt = _append_checkpoint_review_context(
+                "Review the active plan.",
+                step_role="reviewer",
+                state=state,
+                repo_root=root,
+                run_dir=run_dir,
+                original_plan_path=original_plan,
+                active_plan_path=original_plan,
+                resume=None,
+                recovered_boundary=None,
+            )
+
+            assert (
+                "- Worker artifact reference: "
+                ".aflow/runs/current/turns/turn-003/result.json"
+            ) in prompt
+            path = Path(_extract_worker_artifact_path(prompt))
+            assert path == current_result
+            content = path.read_text(encoding="utf-8")
+            assert "current-run-sentinel-91bc" in content
+
+    def test_worker_artifact_missing_plain_turn_fallback_is_explicit(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            state = self._worker_artifact_scope_state(root)
+            original_plan = root / "plan.md"
+            run_dir = root / ".aflow" / "runs" / "current"
+
+            prompt = _append_checkpoint_review_context(
+                "Review the active plan.",
+                step_role="reviewer",
+                state=state,
+                repo_root=root,
+                run_dir=run_dir,
+                original_plan_path=original_plan,
+                active_plan_path=original_plan,
+                resume=None,
+                recovered_boundary=None,
+            )
+
+            assert "Original checkpoint: #1 — Checkpoint 1: First" in prompt
+            assert "- Worker artifact reference: turns/turn-003/result.json" in prompt
+            path = Path(_extract_worker_artifact_path(prompt))
+            assert path == run_dir / "turns" / "turn-003" / "result.json"
+            assert not path.exists()
+            assert "Worker artifact unavailable" in prompt
+
+    def test_worker_artifact_resumed_fallback_pairs_predecessor(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            state = self._worker_artifact_scope_state(root)
+            original_plan = root / "plan.md"
+            predecessor_result = (
+                root / ".aflow" / "runs" / "prior-run" / "turns"
+                / "turn-003" / "result.json"
+            )
+            predecessor_result.parent.mkdir(parents=True)
+            predecessor_result.write_text(
+                json.dumps({
+                    "turn_number": 3,
+                    "step_role": "worker",
+                    "stdout": "predecessor-sentinel-44aa",
+                }),
+                encoding="utf-8",
+            )
+
+            prompt = _append_checkpoint_review_context(
+                "Review the active plan.",
+                step_role="reviewer",
+                state=state,
+                repo_root=root,
+                run_dir=root / ".aflow" / "runs" / "resumed",
+                original_plan_path=original_plan,
+                active_plan_path=original_plan,
+                resume=ResumeContext(
+                    resumed_from_run_id="prior-run",
+                    feature_branch=None,
+                    worktree_path=None,
+                    main_branch=None,
+                    setup=(),
+                    teardown=(),
+                ),
+                recovered_boundary=None,
+            )
+
+            assert (
+                "- Worker artifact reference: "
+                "resumed-from/prior-run/turns/turn-003/result.json"
+            ) in prompt
+            path = Path(_extract_worker_artifact_path(prompt))
+            assert path == predecessor_result
+            assert "predecessor-sentinel-44aa" in path.read_text(encoding="utf-8")
+
+    def test_worker_artifact_malformed_resumed_source_is_unavailable(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            state = self._worker_artifact_scope_state(root)
+            original_plan = root / "plan.md"
+
+            prompt = _append_checkpoint_review_context(
+                "Review the active plan.",
+                step_role="reviewer",
+                state=state,
+                repo_root=root,
+                run_dir=root / ".aflow" / "runs" / "resumed",
+                original_plan_path=original_plan,
+                active_plan_path=original_plan,
+                resume=ResumeContext(
+                    resumed_from_run_id="a/../b",
+                    feature_branch=None,
+                    worktree_path=None,
+                    main_branch=None,
+                    setup=(),
+                    teardown=(),
+                ),
+                recovered_boundary=None,
+            )
+
+            assert (
+                "- Worker artifact reference: "
+                "resumed-from/a/../b/turns/turn-003/result.json"
+            ) in prompt
+            assert (
+                "- Worker artifact unavailable: no readable location is known"
+            ) in prompt
+            assert "Worker artifact path (read this exact file)" not in prompt
+
+    def test_worker_artifact_missing_history_result_is_never_substituted(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            state = self._worker_artifact_scope_state(root)
+            original_plan = root / "plan.md"
+            run_dir = root / ".aflow" / "runs" / "current"
+            history_turn = root / ".aflow" / "runs" / "prior-run" / "turns" / "turn-003"
+            history_turn.mkdir(parents=True)
+            replacement = run_dir / "turns" / "turn-003" / "result.json"
+            replacement.parent.mkdir(parents=True)
+            replacement.write_text(
+                json.dumps({
+                    "turn_number": 3,
+                    "step_role": "worker",
+                    "stdout": "replacement-must-not-be-read",
+                }),
+                encoding="utf-8",
+            )
+            state.turn_history.append(
+                TurnRecord(
+                    turn_number=3,
+                    step_name="implement",
+                    resolved_harness_name="codex",
+                    resolved_model_display="worker",
+                    turn_dir=history_turn,
+                    step_role="worker",
+                )
+            )
+
+            prompt = _append_checkpoint_review_context(
+                "Review the active plan.",
+                step_role="reviewer",
+                state=state,
+                repo_root=root,
+                run_dir=run_dir,
+                original_plan_path=original_plan,
+                active_plan_path=original_plan,
+                resume=None,
+                recovered_boundary=None,
+            )
+
+            assert "Original checkpoint: #1 — Checkpoint 1: First" in prompt
+            assert (
+                "- Worker artifact reference: "
+                ".aflow/runs/prior-run/turns/turn-003/result.json"
+            ) in prompt
+            path = Path(_extract_worker_artifact_path(prompt))
+            assert path == history_turn / "result.json"
+            assert not path.exists()
+            assert "Worker artifact unavailable" in prompt
+            assert str(replacement) not in prompt
+
+    def test_worker_artifact_recovered_finalized_worker_location(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            original_plan = root / "plan.md"
+            original_plan.write_text(
+                "# Plan\n\n"
+                "### [x] Checkpoint 1: Earlier\n"
+                "- [x] finish\n\n"
+                "### [ ] Checkpoint 2: Next\n"
+                "- [ ] implement\n",
+                encoding="utf-8",
+            )
+            source_run = root / ".aflow" / "runs" / "prior-run"
+            result_path = source_run / "turns" / "turn-002" / "result.json"
+            result_path.parent.mkdir(parents=True)
+            result_path.write_text(
+                json.dumps({
+                    "turn_number": 2,
+                    "step_role": "worker",
+                    "stdout": "recovered-sentinel-5d11",
+                    "snapshot_before": PlanSnapshot(
+                        "Checkpoint 1: Earlier", 1, 1, False, 2, 1
+                    ).to_dict(),
+                }),
+                encoding="utf-8",
+            )
+            pending = PendingFinalizedTurn(
+                source_run_dir=source_run,
+                turn_number=2,
+                step_name="implement",
+                step_role="worker",
+                selector="codex.worker",
+                active_plan_path=original_plan,
+                new_plan_path=root / "plan-cp01-v01.md",
+                snapshot_after=PlanSnapshot(
+                    "Checkpoint 2: Next", 1, 1, False, 2, 2
+                ),
+                snapshot_before=None,
+                conditions={
+                    "DONE": False,
+                    "NEW_PLAN_EXISTS": True,
+                    "MAX_TURNS_REACHED": False,
+                },
+                chosen_transition="review",
+            )
+
+            prompt = _append_checkpoint_review_context(
+                "Review the active plan.",
+                step_role="reviewer",
+                state=ControllerState(
+                    last_snapshot=pending.snapshot_after, turns_completed=0
+                ),
+                repo_root=root,
+                run_dir=root / ".aflow" / "runs" / "resumed",
+                original_plan_path=original_plan,
+                active_plan_path=pending.new_plan_path,
+                resume=ResumeContext(
+                    resumed_from_run_id="prior-run",
+                    feature_branch=None,
+                    worktree_path=None,
+                    main_branch=None,
+                    setup=(),
+                    teardown=(),
+                ),
+                recovered_boundary=pending,
+            )
+
+            assert "Original checkpoint: #1 — Checkpoint 1: Earlier" in prompt
+            assert (
+                "- Worker artifact reference: "
+                "resumed-from/prior-run/turns/turn-002/result.json"
+            ) in prompt
+            path = Path(_extract_worker_artifact_path(prompt))
+            assert path == result_path
+            assert "recovered-sentinel-5d11" in path.read_text(encoding="utf-8")
+
+    def test_worker_artifact_scope_less_predecessor_location(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            original_plan = root / "plan.md"
+            plan_text = (
+                "# Plan\n\n"
+                "### [x] Checkpoint 1: Earlier\n"
+                "- [x] finish\n\n"
+                "### [x] Checkpoint 2: Earlier\n"
+                "- [x] finish\n\n"
+                "### [x] Checkpoint 3: Approved\n"
+                "- [x] finish\n\n"
+                "### [x] Checkpoint 4: Pending implementation\n"
+                "- [x] implement\n\n"
+                "### [ ] Checkpoint 5: Next\n"
+                "- [ ] implement\n\n"
+                "## Git Tracking\n\n"
+                "- Plan Branch: `test`\n"
+                "- Pre-Handoff Base HEAD: `base`\n"
+                "- Last Reviewed Checkpoint: `cp3 v01` — approved.\n\n"
+                "### Review Log\n"
+                "- Approved `cp3 v01`; CP5 remains unchecked.\n"
+            )
+            original_plan.write_text(plan_text, encoding="utf-8")
+            source_run = root / ".aflow" / "runs" / "prior-run"
+            result_path = source_run / "turns" / "turn-004" / "result.json"
+            result_path.parent.mkdir(parents=True)
+            (source_run / "run.json").write_text(
+                json.dumps({"active_turn": 4, "turns_completed": 4}),
+                encoding="utf-8",
+            )
+            _record_inactive_direct_source(source_run)
+            result_path.write_text(
+                json.dumps({
+                    "status": "completed",
+                    "step_role": "worker",
+                    "stdout": "scope-less-sentinel-e007",
+                    "snapshot_before": PlanSnapshot(
+                        "Checkpoint 4: Pending implementation", 2, 1, False, 5, 4
+                    ).to_dict(),
+                }),
+                encoding="utf-8",
+            )
+
+            prompt = _append_checkpoint_review_context(
+                "Review the active plan.",
+                step_role="reviewer",
+                state=ControllerState(
+                    last_snapshot=PlanSnapshot("Checkpoint 5: Next", 1, 1, False, 5, 5),
+                    turns_completed=0,
+                ),
+                repo_root=root,
+                run_dir=root / ".aflow" / "runs" / "resumed",
+                original_plan_path=original_plan,
+                active_plan_path=original_plan,
+                resume=ResumeContext(
+                    resumed_from_run_id="prior-run",
+                    feature_branch=None,
+                    worktree_path=None,
+                    main_branch=None,
+                    setup=(),
+                    teardown=(),
+                ),
+                recovered_boundary=None,
+            )
+
+            assert "Original checkpoint: #4 — Checkpoint 4: Pending implementation" in prompt
+            assert (
+                "- Worker artifact reference: "
+                "resumed-from/prior-run/turns/turn-004/result.json"
+            ) in prompt
+            path = Path(_extract_worker_artifact_path(prompt))
+            assert path == result_path
+            assert "scope-less-sentinel-e007" in path.read_text(encoding="utf-8")
+
+    def test_worker_artifact_ambiguous_target_exposes_existing_artifact(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            original_plan = root / "plan.md"
+            original_plan.write_text(
+                "# Plan\n\n"
+                "- Last Reviewed Checkpoint: `cp1 v01` — approved.\n\n"
+                "### [x] Checkpoint 1: Already approved\n"
+                "- [x] finish\n\n"
+                "### [ ] Checkpoint 2: Next\n"
+                "- [ ] implement\n",
+                encoding="utf-8",
+            )
+            source_run = root / ".aflow" / "runs" / "prior"
+            result_path = source_run / "turns" / "turn-002" / "result.json"
+            result_path.parent.mkdir(parents=True)
+            result_path.write_text(
+                json.dumps({
+                    "turn_number": 2,
+                    "step_role": "worker",
+                    "stdout": "ambiguous-artifact-sentinel-2b6c",
+                    "snapshot_before": PlanSnapshot(
+                        "Checkpoint 1: Already approved", 1, 1, False, 2, 1
+                    ).to_dict(),
+                }),
+                encoding="utf-8",
+            )
+            pending = PendingFinalizedTurn(
+                source_run_dir=source_run,
+                turn_number=2,
+                step_name="implement",
+                step_role="worker",
+                selector="codex.worker",
+                active_plan_path=original_plan,
+                new_plan_path=root / "plan-cp01-v02.md",
+                snapshot_after=PlanSnapshot(
+                    "Checkpoint 2: Next", 1, 1, False, 2, 2
+                ),
+                snapshot_before=None,
+                conditions={
+                    "DONE": False,
+                    "NEW_PLAN_EXISTS": False,
+                    "MAX_TURNS_REACHED": False,
+                },
+                chosen_transition="review",
+            )
+
+            prompt = _append_checkpoint_review_context(
+                "Review the active plan.",
+                step_role="reviewer",
+                state=ControllerState(
+                    last_snapshot=pending.snapshot_after, turns_completed=0
+                ),
+                repo_root=root,
+                run_dir=root / ".aflow" / "runs" / "resumed",
+                original_plan_path=original_plan,
+                active_plan_path=original_plan,
+                resume=None,
+                recovered_boundary=pending,
+            )
+
+            assert "Pending target: unresolved" in prompt
+            assert "already recorded as approved" in prompt
+            assert "Original checkpoint: #1" not in prompt
+            assert (
+                "- Worker artifact reference: "
+                "resumed-from/prior/turns/turn-002/result.json"
+            ) in prompt
+            path = Path(_extract_worker_artifact_path(prompt))
+            assert path == result_path
+            assert "ambiguous-artifact-sentinel-2b6c" in path.read_text(encoding="utf-8")
+
+    def test_worker_artifact_reviewer_reads_primary_result_from_execution_worktree(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            repo_root = root / "repo"
+            repo_root.mkdir()
+            _make_lifecycle_git_repo(repo_root, branch="main")
+            worktree_root = root / "worktrees"
+            worktree_root.mkdir()
+            plan_rel = Path("plans") / "in-progress" / "plan.md"
+            plan_path = repo_root / plan_rel
+            plan_path.parent.mkdir(parents=True)
+            _write_plan(plan_path, _VALID_PLAN)
+            workflow = WorkflowConfig(
+                steps={
+                    "implement": WorkflowStepConfig(
+                        role="worker",
+                        prompts=("p",),
+                        go=(GoTransition(to="review"),),
+                    ),
+                    "review": WorkflowStepConfig(
+                        role="reviewer",
+                        prompts=("p",),
+                        go=(GoTransition(to="END", when="DONE"),),
+                    ),
+                },
+                first_step="implement",
+                setup=("worktree", "branch"),
+                teardown=(),
+                main_branch="main",
+                retry_inconsistent_checkpoint_state=1,
+            )
+            config = WorkflowUserConfig(
+                aflow=AflowSection(
+                    team_lead="senior_architect", worktree_root=str(worktree_root)
+                ),
+                roles={
+                    "worker": "codex.worker",
+                    "reviewer": "codex.reviewer",
+                    "senior_architect": "codex.default",
+                },
+                harnesses={"codex": WorkflowHarnessConfig(profiles={
+                    "worker": HarnessProfileConfig(model="worker"),
+                    "reviewer": HarnessProfileConfig(model="reviewer"),
+                    "default": HarnessProfileConfig(model="m"),
+                })},
+                workflows={"wt_review": workflow},
+                prompts={"p": "Work from {ACTIVE_PLAN_PATH}."},
+            )
+            sentinel = "worker-artifact-sentinel-c7e2"
+            calls: list[dict[str, object]] = []
+
+            def runner(argv, **kwargs):
+                prompt = _runner_prompt(argv, kwargs)
+                calls.append({"cwd": kwargs.get("cwd"), "prompt": prompt})
+                cwd = Path(kwargs["cwd"])
+                if len(calls) == 1:
+                    assert cwd != repo_root
+                    _write_plan(cwd / plan_rel, _COMPLETE_PLAN)
+                    return subprocess.CompletedProcess(argv, 0, sentinel, "")
+                assert cwd != repo_root
+                path = Path(_extract_worker_artifact_path(prompt))
+                assert str(path).startswith(f"{repo_root}{os.sep}")
+                read = subprocess.run(
+                    [
+                        sys.executable,
+                        "-c",
+                        "import json,sys;"
+                        "d=json.load(open(sys.argv[1]));"
+                        "print(d['step_role'], d['turn_number'], d['stdout'])",
+                        str(path),
+                    ],
+                    cwd=cwd,
+                    capture_output=True,
+                    text=True,
+                    check=True,
+                )
+                assert read.stdout.splitlines()[0] == f"worker 1 {sentinel}"
+                if len(calls) == 2:
+                    _write_plan(cwd / plan_rel, _BROKEN_PLAN)
+                else:
+                    _write_plan(cwd / plan_rel, _COMPLETE_PLAN)
+                return subprocess.CompletedProcess(argv, 0, "ok", "")
+
+            result = run_workflow(
+                ControllerConfig(
+                    repo_root=repo_root, plan_path=plan_path, max_turns=4
+                ),
+                config,
+                "wt_review",
+                config_dir=repo_root,
+                snapshot_config=False,
+                adapter=CodexAdapter(),
+                runner=runner,
+            )
+
+            assert result.final_snapshot.is_complete
+            assert len(calls) == 3
+            worker_call, review_call, retry_call = calls
+            assert str(review_call["cwd"]).startswith(f"{worktree_root}{os.sep}")
+            assert str(retry_call["cwd"]).startswith(f"{worktree_root}{os.sep}")
+            assert (
+                "Original checkpoint: #1 — Checkpoint 1: First"
+                in review_call["prompt"]
+            )
+            assert (
+                "Original checkpoint: #1 — Checkpoint 1: First"
+                in retry_call["prompt"]
+            )
+            assert (
+                _extract_worker_artifact_path(review_call["prompt"])
+                == _extract_worker_artifact_path(retry_call["prompt"])
+            )
+            first_turn = json.loads(
+                (result.run_dir / "turns" / "turn-002" / "result.json").read_text(
+                    encoding="utf-8"
+                )
+            )
+            assert first_turn["status"] == "retry-scheduled"
 
     def test_new_plan_path_increments_version_for_checkpoint_anchor(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:

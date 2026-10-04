@@ -4,7 +4,9 @@ import hashlib
 import json
 from dataclasses import replace
 from pathlib import Path
+import shutil
 import subprocess
+import sys
 
 import pytest
 
@@ -138,6 +140,32 @@ def _file_hashes(root: Path) -> dict[str, str]:
         for path in root.rglob("*")
         if path.is_file()
     }
+
+
+def _worker_artifact_read_path(prompt: str) -> str:
+    """Extract the exact read location a reviewer prompt exposes."""
+    marker = "- Worker artifact path (read this exact file): "
+    for line in prompt.splitlines():
+        if line.startswith(marker):
+            return line[len(marker):].split(". This is the read location", 1)[0].strip()
+    raise AssertionError("worker artifact path line missing from reviewer prompt")
+
+
+def _read_worker_artifact_from(cwd: Path, path: Path) -> str:
+    """Open the exact artifact the way a reviewer in cwd can."""
+    read = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            "import sys; sys.stdout.write(open(sys.argv[1], 'rb').read().decode())",
+            str(path),
+        ],
+        cwd=cwd,
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    return read.stdout
 
 
 def _isolate_fixture_git_ignores(root: Path) -> None:
@@ -377,10 +405,30 @@ def test_relocated_pending_review_maps_worker_receipts_and_reviews_first(
     assert bootstrap.start_step == "review_implementation"
     assert bootstrap.resume_context.resume_relocation["current_worktree_root"] == str(worktree)
     (root / ".aflow-config-pair.lock").unlink(missing_ok=True)
+    relocated_result = source / "turns" / "turn-002" / "result.json"
+    relocated_bytes = relocated_result.read_bytes()
+    old_result = (
+        old_repo / ".aflow" / "runs" / source.name / "turns"
+        / "turn-002" / "result.json"
+    )
+    old_result.parent.mkdir(parents=True)
+    old_result.write_text(
+        json.dumps({
+            "turn_number": 2,
+            "step_role": "worker",
+            "stdout": "old-root-decoy-must-not-be-read",
+        }) + "\n",
+        encoding="utf-8",
+    )
     calls: list[str] = []
+    reads: list[str] = []
 
     def reviewer(argv, **kwargs):
-        calls.append(kwargs["input"])
+        prompt = kwargs["input"]
+        calls.append(prompt)
+        path = Path(_worker_artifact_read_path(prompt))
+        assert str(path).startswith(f"{root}/")
+        reads.append(_read_worker_artifact_from(Path(kwargs["cwd"]), path))
         return subprocess.CompletedProcess(argv, 0, "approved", "")
 
     result = run_workflow(
@@ -403,6 +451,9 @@ def test_relocated_pending_review_maps_worker_receipts_and_reviews_first(
 
     assert len(calls) == 1
     assert "complete original plan and all accumulated implementation commits" in calls[0]
+    assert len(reads) == 1
+    assert reads[0] == relocated_bytes.decode()
+    assert "old-root-decoy-must-not-be-read" not in reads[0]
     review_turn = json.loads(
         (result.run_dir / "turns" / "turn-001" / "result.json").read_text(
             encoding="utf-8"
@@ -436,10 +487,34 @@ def test_pending_review_approval_launches_one_reviewer_and_no_worker(
 ):
     case = pending_review_run
     context = _resume_context(case)
+    source = case["source"]
+    source_result = source / "turns" / "turn-002" / "result.json"
+    source_bytes = source_result.read_bytes()
     calls: list[str] = []
+    reads: list[str] = []
 
     def reviewer(argv, **kwargs):
-        calls.append(kwargs["input"])
+        prompt = kwargs["input"]
+        calls.append(prompt)
+        path = Path(_worker_artifact_read_path(prompt))
+        assert path == source_result
+        # A conflicting artifact at a plausible sibling run root must lose
+        # to the verified predecessor while the reviewer reads.
+        decoy_run = case["root"] / ".aflow" / "runs" / "decoy-run"
+        decoy_result = decoy_run / "turns" / "turn-002" / "result.json"
+        decoy_result.parent.mkdir(parents=True)
+        decoy_result.write_text(
+            json.dumps({
+                "turn_number": 2,
+                "step_role": "worker",
+                "stdout": "same-root-decoy-must-not-be-read",
+            }) + "\n",
+            encoding="utf-8",
+        )
+        try:
+            reads.append(_read_worker_artifact_from(Path(kwargs["cwd"]), path))
+        finally:
+            shutil.rmtree(decoy_run)
         return subprocess.CompletedProcess(argv, 0, "approved", "")
 
     result = run_workflow(
@@ -463,6 +538,9 @@ def test_pending_review_approval_launches_one_reviewer_and_no_worker(
     assert len(calls) == 1
     assert "complete original plan and all accumulated implementation commits" in calls[0]
     assert "checked boxes are not approval" in calls[0]
+    assert len(reads) == 1
+    assert reads[0] == source_bytes.decode()
+    assert "same-root-decoy-must-not-be-read" not in reads[0]
     result_turn = json.loads(
         (result.run_dir / "turns" / "turn-001" / "result.json").read_text(
             encoding="utf-8"
