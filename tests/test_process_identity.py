@@ -153,7 +153,7 @@ def test_missing_linux_pid_keeps_fallback_when_existence_is_uncertain(
     assert ps_calls == [
         (
             (("ps", "-o", "lstart=", "-p", "123"),),
-            {"check": False, "capture_output": True, "text": True},
+            {"check": False, "capture_output": True, "text": True, "timeout": 5},
         )
     ]
 
@@ -342,7 +342,7 @@ def test_ps_fallback_returns_birth_identity(monkeypatch: pytest.MonkeyPatch) -> 
     assert calls == [
         (
             (("ps", "-o", "lstart=", "-p", "123"),),
-            {"check": False, "capture_output": True, "text": True},
+            {"check": False, "capture_output": True, "text": True, "timeout": 5},
         )
     ]
 
@@ -389,6 +389,62 @@ def test_process_liveness_keeps_unavailable_identity_unknown(
     )
 
     assert process_identity.process_liveness(123) == "unknown"
+
+
+def test_host_boot_identity_reads_linux_boot_id(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(process_identity.sys, "platform", "linux")
+    value = "11223344-5566-7788-99aa-bbccddeeff00"
+
+    class FakeBootFile:
+        def read_text(self, *, encoding: str) -> str:
+            assert encoding == "utf-8"
+            return f"{value}\n"
+
+    monkeypatch.setattr(process_identity, "Path", lambda _: FakeBootFile())
+    assert process_identity.host_boot_identity() == value
+
+
+@pytest.mark.skipif(sys.platform != "linux", reason="real boot id file is Linux-specific")
+def test_host_boot_identity_is_observable_on_this_host() -> None:
+    assert process_identity.host_boot_identity() is not None
+
+
+@pytest.mark.parametrize("failure", [OSError("no sysctl"), subprocess.TimeoutExpired("sysctl", 5)])
+def test_host_boot_identity_darwin_failure_returns_none(
+    monkeypatch: pytest.MonkeyPatch, failure: BaseException
+) -> None:
+    monkeypatch.setattr(process_identity.sys, "platform", "darwin")
+
+    def fail(*args, **kwargs):
+        raise failure
+
+    monkeypatch.setattr(process_identity.subprocess, "run", fail)
+    assert process_identity.host_boot_identity() is None
+
+
+def test_host_boot_identity_darwin_boot_session_uuid(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(process_identity.sys, "platform", "darwin")
+    calls: list[tuple[tuple[object, ...], dict[str, object]]] = []
+
+    def fake_run(args, **kwargs):
+        calls.append((args, kwargs))
+        return subprocess.CompletedProcess(args, 0, stdout="boot-session-uuid\n")
+
+    monkeypatch.setattr(process_identity.subprocess, "run", fake_run)
+    assert process_identity.host_boot_identity() == "boot-session-uuid"
+    assert calls == [
+        (
+            ["/usr/sbin/sysctl", "-n", "kern.bootsessionuuid"],
+            {"capture_output": True, "text": True, "timeout": 5, "check": False},
+        )
+    ]
+
+
+def test_host_boot_identity_unsupported_platform_returns_none(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(process_identity.sys, "platform", "win32")
+    assert process_identity.host_boot_identity() is None
 
 
 def test_ownership_consumers_reject_reused_identities(monkeypatch: pytest.MonkeyPatch) -> None:

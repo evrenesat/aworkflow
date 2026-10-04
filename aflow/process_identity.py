@@ -44,14 +44,47 @@ def process_birth_identity(pid: int) -> str | None:
                 pass
     except (OSError, IndexError):
         pass
-    completed = subprocess.run(
-        ("ps", "-o", "lstart=", "-p", str(pid)),
-        check=False,
-        capture_output=True,
-        text=True,
-    )
+    try:
+        completed = subprocess.run(
+            ("ps", "-o", "lstart=", "-p", str(pid)),
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
     value = completed.stdout.strip()
     return f"ps-lstart:{value}" if completed.returncode == 0 and value else None
+
+
+def host_boot_identity() -> str | None:
+    """Return a portable identity of the current host boot, if observable.
+
+    Linux exposes a random boot UUID under procfs; macOS exposes a boot
+    session UUID through ``sysctl``.  A missing or unobservable value is
+    ``None`` so callers fail closed instead of assuming no reboot occurred.
+    """
+    if sys.platform == "darwin":
+        try:
+            result = subprocess.run(
+                ["/usr/sbin/sysctl", "-n", "kern.bootsessionuuid"],
+                capture_output=True,
+                text=True,
+                timeout=5,
+                check=False,
+            )
+        except (OSError, subprocess.SubprocessError):
+            return None
+        value = result.stdout.strip()
+        return value if result.returncode == 0 and value else None
+    if sys.platform == "linux":
+        try:
+            value = Path("/proc/sys/kernel/random/boot_id").read_text(encoding="utf-8").strip()
+        except OSError:
+            return None
+        return value if value else None
+    return None
 
 
 def process_liveness(pid: int) -> ProcessLiveness:
@@ -95,6 +128,7 @@ def process_liveness(pid: int) -> ProcessLiveness:
             check=False,
             capture_output=True,
             text=True,
+            timeout=5,
         )
     except (OSError, subprocess.SubprocessError):
         return "unknown"
