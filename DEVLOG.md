@@ -1,5 +1,19 @@
 # DEVLOG
 
+## 2026-10-04 — Canonical worker-artifact integration fixture roots (issue #70)
+
+- Resolve the fixture root before deriving primary-repository and worktree
+  paths, matching macOS `/var` and `/private/var` aliases without changing the
+  production artifact behavior delivered by #64.
+- Reuse the complete workflow scenario through an unresolved directory symlink.
+  Before the correction, it reproduced the worktree cwd containment failure
+  after both real reviewer subprocess reads; all original assertions remain.
+- Verified: 18 focused runtime tests and all 12 pending-review tests pass;
+  `git diff --check` passes. Remote CI and p100 activation remain pending.
+
+Sources: https://github.com/evrenesat/aworkflow/issues/70,
+https://github.com/evrenesat/aworkflow/issues/64.
+
 ## 2026-10-04 — Checkpoint reviewers receive the exact worker-artifact read location (issue #64)
 
 - `_CheckpointReviewPromptTarget` now carries the selected worker result's

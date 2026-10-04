@@ -4074,122 +4074,144 @@ class WorkflowRuntimeTests(unittest.TestCase):
 
     def test_worker_artifact_reviewer_reads_primary_result_from_execution_worktree(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
-            root = Path(tmpdir)
-            repo_root = root / "repo"
-            repo_root.mkdir()
-            _make_lifecycle_git_repo(repo_root, branch="main")
-            worktree_root = root / "worktrees"
-            worktree_root.mkdir()
-            plan_rel = Path("plans") / "in-progress" / "plan.md"
-            plan_path = repo_root / plan_rel
-            plan_path.parent.mkdir(parents=True)
-            _write_plan(plan_path, _VALID_PLAN)
-            workflow = WorkflowConfig(
-                steps={
-                    "implement": WorkflowStepConfig(
-                        role="worker",
-                        prompts=("p",),
-                        go=(GoTransition(to="review"),),
-                    ),
-                    "review": WorkflowStepConfig(
-                        role="reviewer",
-                        prompts=("p",),
-                        go=(GoTransition(to="END", when="DONE"),),
-                    ),
-                },
-                first_step="implement",
-                setup=("worktree", "branch"),
-                teardown=(),
-                main_branch="main",
-                retry_inconsistent_checkpoint_state=1,
+            self._assert_worker_artifact_reviewer_reads_primary_result_from_execution_worktree(
+                Path(tmpdir)
             )
-            config = WorkflowUserConfig(
-                aflow=AflowSection(
-                    team_lead="senior_architect", worktree_root=str(worktree_root)
-                ),
-                roles={
-                    "worker": "codex.worker",
-                    "reviewer": "codex.reviewer",
-                    "senior_architect": "codex.default",
-                },
-                harnesses={"codex": WorkflowHarnessConfig(profiles={
-                    "worker": HarnessProfileConfig(model="worker"),
-                    "reviewer": HarnessProfileConfig(model="reviewer"),
-                    "default": HarnessProfileConfig(model="m"),
-                })},
-                workflows={"wt_review": workflow},
-                prompts={"p": "Work from {ACTIVE_PLAN_PATH}."},
-            )
-            sentinel = "worker-artifact-sentinel-c7e2"
-            calls: list[dict[str, object]] = []
 
-            def runner(argv, **kwargs):
-                prompt = _runner_prompt(argv, kwargs)
-                calls.append({"cwd": kwargs.get("cwd"), "prompt": prompt})
-                cwd = Path(kwargs["cwd"])
-                if len(calls) == 1:
-                    assert cwd != repo_root
-                    _write_plan(cwd / plan_rel, _COMPLETE_PLAN)
-                    return subprocess.CompletedProcess(argv, 0, sentinel, "")
+    def test_worker_artifact_reviewer_reads_primary_result_from_execution_worktree_with_parent_alias(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            outer_root = Path(tmpdir).resolve()
+            real_root = outer_root / "real"
+            real_root.mkdir()
+            alias_root = outer_root / "alias"
+            alias_root.symlink_to(real_root, target_is_directory=True)
+            assert alias_root.is_symlink()
+            assert alias_root != alias_root.resolve()
+            assert alias_root.resolve() == real_root
+            self._assert_worker_artifact_reviewer_reads_primary_result_from_execution_worktree(
+                alias_root
+            )
+
+    def _assert_worker_artifact_reviewer_reads_primary_result_from_execution_worktree(
+        self, root: Path
+    ) -> None:
+        # Match canonical worktree paths through aliases such as macOS /var.
+        root = root.resolve()
+        repo_root = root / "repo"
+        repo_root.mkdir()
+        _make_lifecycle_git_repo(repo_root, branch="main")
+        worktree_root = root / "worktrees"
+        worktree_root.mkdir()
+        plan_rel = Path("plans") / "in-progress" / "plan.md"
+        plan_path = repo_root / plan_rel
+        plan_path.parent.mkdir(parents=True)
+        _write_plan(plan_path, _VALID_PLAN)
+        workflow = WorkflowConfig(
+            steps={
+                "implement": WorkflowStepConfig(
+                    role="worker",
+                    prompts=("p",),
+                    go=(GoTransition(to="review"),),
+                ),
+                "review": WorkflowStepConfig(
+                    role="reviewer",
+                    prompts=("p",),
+                    go=(GoTransition(to="END", when="DONE"),),
+                ),
+            },
+            first_step="implement",
+            setup=("worktree", "branch"),
+            teardown=(),
+            main_branch="main",
+            retry_inconsistent_checkpoint_state=1,
+        )
+        config = WorkflowUserConfig(
+            aflow=AflowSection(
+                team_lead="senior_architect", worktree_root=str(worktree_root)
+            ),
+            roles={
+                "worker": "codex.worker",
+                "reviewer": "codex.reviewer",
+                "senior_architect": "codex.default",
+            },
+            harnesses={"codex": WorkflowHarnessConfig(profiles={
+                "worker": HarnessProfileConfig(model="worker"),
+                "reviewer": HarnessProfileConfig(model="reviewer"),
+                "default": HarnessProfileConfig(model="m"),
+            })},
+            workflows={"wt_review": workflow},
+            prompts={"p": "Work from {ACTIVE_PLAN_PATH}."},
+        )
+        sentinel = "worker-artifact-sentinel-c7e2"
+        calls: list[dict[str, object]] = []
+
+        def runner(argv, **kwargs):
+            prompt = _runner_prompt(argv, kwargs)
+            calls.append({"cwd": kwargs.get("cwd"), "prompt": prompt})
+            cwd = Path(kwargs["cwd"])
+            if len(calls) == 1:
                 assert cwd != repo_root
-                path = Path(_extract_worker_artifact_path(prompt))
-                assert str(path).startswith(f"{repo_root}{os.sep}")
-                read = subprocess.run(
-                    [
-                        sys.executable,
-                        "-c",
-                        "import json,sys;"
-                        "d=json.load(open(sys.argv[1]));"
-                        "print(d['step_role'], d['turn_number'], d['stdout'])",
-                        str(path),
-                    ],
-                    cwd=cwd,
-                    capture_output=True,
-                    text=True,
-                    check=True,
-                )
-                assert read.stdout.splitlines()[0] == f"worker 1 {sentinel}"
-                if len(calls) == 2:
-                    _write_plan(cwd / plan_rel, _BROKEN_PLAN)
-                else:
-                    _write_plan(cwd / plan_rel, _COMPLETE_PLAN)
-                return subprocess.CompletedProcess(argv, 0, "ok", "")
+                _write_plan(cwd / plan_rel, _COMPLETE_PLAN)
+                return subprocess.CompletedProcess(argv, 0, sentinel, "")
+            assert cwd != repo_root
+            path = Path(_extract_worker_artifact_path(prompt))
+            assert str(path).startswith(f"{repo_root}{os.sep}")
+            read = subprocess.run(
+                [
+                    sys.executable,
+                    "-c",
+                    "import json,sys;"
+                    "d=json.load(open(sys.argv[1]));"
+                    "print(d['step_role'], d['turn_number'], d['stdout'])",
+                    str(path),
+                ],
+                cwd=cwd,
+                capture_output=True,
+                text=True,
+                check=True,
+            )
+            assert read.stdout.splitlines()[0] == f"worker 1 {sentinel}"
+            if len(calls) == 2:
+                _write_plan(cwd / plan_rel, _BROKEN_PLAN)
+            else:
+                _write_plan(cwd / plan_rel, _COMPLETE_PLAN)
+            return subprocess.CompletedProcess(argv, 0, "ok", "")
 
-            result = run_workflow(
-                ControllerConfig(
-                    repo_root=repo_root, plan_path=plan_path, max_turns=4
-                ),
-                config,
-                "wt_review",
-                config_dir=repo_root,
-                snapshot_config=False,
-                adapter=CodexAdapter(),
-                runner=runner,
-            )
+        result = run_workflow(
+            ControllerConfig(
+                repo_root=repo_root, plan_path=plan_path, max_turns=4
+            ),
+            config,
+            "wt_review",
+            config_dir=repo_root,
+            snapshot_config=False,
+            adapter=CodexAdapter(),
+            runner=runner,
+        )
 
-            assert result.final_snapshot.is_complete
-            assert len(calls) == 3
-            worker_call, review_call, retry_call = calls
-            assert str(review_call["cwd"]).startswith(f"{worktree_root}{os.sep}")
-            assert str(retry_call["cwd"]).startswith(f"{worktree_root}{os.sep}")
-            assert (
-                "Original checkpoint: #1 — Checkpoint 1: First"
-                in review_call["prompt"]
+        assert result.final_snapshot.is_complete
+        assert len(calls) == 3
+        worker_call, review_call, retry_call = calls
+        assert str(review_call["cwd"]).startswith(f"{worktree_root}{os.sep}")
+        assert str(retry_call["cwd"]).startswith(f"{worktree_root}{os.sep}")
+        assert (
+            "Original checkpoint: #1 — Checkpoint 1: First"
+            in review_call["prompt"]
+        )
+        assert (
+            "Original checkpoint: #1 — Checkpoint 1: First"
+            in retry_call["prompt"]
+        )
+        assert (
+            _extract_worker_artifact_path(review_call["prompt"])
+            == _extract_worker_artifact_path(retry_call["prompt"])
+        )
+        first_turn = json.loads(
+            (result.run_dir / "turns" / "turn-002" / "result.json").read_text(
+                encoding="utf-8"
             )
-            assert (
-                "Original checkpoint: #1 — Checkpoint 1: First"
-                in retry_call["prompt"]
-            )
-            assert (
-                _extract_worker_artifact_path(review_call["prompt"])
-                == _extract_worker_artifact_path(retry_call["prompt"])
-            )
-            first_turn = json.loads(
-                (result.run_dir / "turns" / "turn-002" / "result.json").read_text(
-                    encoding="utf-8"
-                )
-            )
-            assert first_turn["status"] == "retry-scheduled"
+        )
+        assert first_turn["status"] == "retry-scheduled"
 
     def test_new_plan_path_increments_version_for_checkpoint_anchor(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
