@@ -11888,6 +11888,25 @@ def _run_workflow_unchecked(
         state.status_message = f"hotplug target failed; source retained: {reason}"
         _write_override_boundary(status="failed")
 
+    def _current_effective_selector(role: str) -> str | None:
+        """Current effective routing for a role before a new control request.
+
+        Run-local selectors take precedence; otherwise the ordinary role
+        resolver applies with the current team/configuration. Returns None
+        when the role cannot be resolved so callers fail closed.
+        """
+        if role in state.role_selectors:
+            return state.role_selectors[role]
+        try:
+            return resolve_role_selector(
+                role,
+                state.current_team,
+                workflow_config,
+                run_local_role_selectors=None,
+            )
+        except WorkflowError:
+            return None
+
     def _apply_boundary_override() -> tuple[str, str | None]:
         nonlocal current_step_name, baseline_team_name
         source_run_dir = state.override_source_run_dir or run_paths.run_dir
@@ -12005,6 +12024,15 @@ def _run_workflow_unchecked(
                 except ControlValidationError as exc:
                     validation_error = str(exc)
             if validation_error is None and request.role_selectors:
+                # A retained selector is a no-op against current effective
+                # routing; only a request that actually changes a supplied
+                # role conflicts with a non-terminal transaction. A mixed map
+                # containing one changed role still rejects the whole request.
+                changed_roles = tuple(
+                    role
+                    for role, selector in request.role_selectors.items()
+                    if _current_effective_selector(role) != selector
+                )
                 terminal_hotplug_stages = {"applied", "failed"}
                 in_progress = tuple(
                     transaction for transaction in (
@@ -12014,10 +12042,11 @@ def _run_workflow_unchecked(
                     if transaction is not None
                     and transaction.stage not in terminal_hotplug_stages
                 )
-                if in_progress:
+                if in_progress and changed_roles:
                     validation_error = (
                         "hotplug_in_progress: a non-terminal hotplug transaction "
-                        "must be completed before accepting another roles digest"
+                        "must be completed before accepting a roles digest that "
+                        "changes effective routing"
                     )
 
         if validation_error is not None or request is None:
@@ -12083,7 +12112,10 @@ def _run_workflow_unchecked(
 
         worker_target_selector = request.role_selectors.get("worker")
         worker_transaction: HotplugTransactionV1 | None = None
-        if worker_target_selector is not None:
+        if (
+            worker_target_selector is not None
+            and worker_target_selector != _current_effective_selector("worker")
+        ):
             target_profile = resolve_profile(
                 worker_target_selector, workflow_config, step_path="hotplug target"
             )

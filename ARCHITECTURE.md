@@ -1815,6 +1815,17 @@ snapshot therefore always carries the exact replacement session needed for a
 later ordinary continuation. The no-session adapter path retains its existing
 consumption behavior.
 
+A revisioned control that retains the effective worker selector is a budget
+no-op for hotplug: the controller compares each supplied role against the
+current effective routing (run-local `role_selectors` first, then the ordinary
+role resolver) before deciding whether a nonterminal transaction conflicts.
+Only a genuine selector change triggers the all-or-nothing rejection; a
+retained selector accepts the budget revision without creating a duplicate
+transaction, incrementing its number, or emitting another requested event.
+Historical sources whose accepted transaction persisted with no active
+sessions remain resumable through the managed budget-boundary path; the
+transaction identity, number, stage, and history are preserved unchanged.
+
 ### Explicit durable-evidence recovery admission
 
 `DaemonService.resume` accepts an optional canonical recovery object only when

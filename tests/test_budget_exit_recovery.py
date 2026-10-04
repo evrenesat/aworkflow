@@ -3586,3 +3586,213 @@ def test_mcp_durable_recovery_dispatch_of_historical_shape(
         assert json.loads(
             (source_dir / "run.json").read_text(encoding="utf-8")
         )["merge_status"] == "failed"
+
+
+# Issue #68: actual revisioned control, no-session target work, budget exit,
+# registered MCP resume, and real successor boot to the independent reviewer.
+
+@pytest.mark.parametrize("prior_failed_attempt", [False, True])
+def test_budget_only_retained_worker_control_reaches_managed_review(
+    tmp_path: Path,
+    budget_temp_parent: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    prior_failed_attempt: bool,
+) -> None:
+    from dataclasses import replace
+    from aflow.daemon import worker_main
+    from aflow.run_state import load_override_request
+
+    with tempfile.TemporaryDirectory(dir=budget_temp_parent) as tmpdir:
+        root = Path(tmpdir).resolve()
+        repo_root, plan = _make_repo(root)
+        worktree_root = root / "worktrees"
+        worktree_root.mkdir()
+        config_path = _write_budget_config(
+            root / "config", max_turns=2, worktree_root=worktree_root,
+            workflows_text=_FINAL_REVIEW_WORKFLOWS.replace(
+                'go = [{ to = "final_review" }, { to = "END", when = "DONE" }]',
+                'go = [{ to = "final_review", when = "DONE" }, { to = "work" }]',
+            ),
+        )
+        with config_path.open("a", encoding="utf-8") as handle:
+            handle.write('\n[harness.pi.profiles.other]\nmodel = "model-other"\n')
+        environment_file = root / "aflowd.env"
+        environment_file.write_text("AFLOWD_MODE=test\n", encoding="utf-8")
+        executable = root / "release" / "bin" / "aflow"
+        executable.parent.mkdir(parents=True)
+        executable.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+        executable.chmod(0o755)
+        units = InMemoryUnitManager()
+        registry = ProjectRegistry(root, root / "registry.json")
+        registry.register("issue68", "Issue 68 project", "repo")
+        service = ControlPlaneService(
+            registry, aflow_executable=executable,
+            environment_file=environment_file, release_identity="release-test",
+            daemon_factory=lambda config: AflowDaemon(config, units=units),
+            workflow_config_path=config_path,
+        )
+        mcp = create_control_plane_mcp(lambda: service)
+        calls = []
+        controls = []
+        source_dir = None
+
+        class ModelAdapter(RecordingAdapter):
+            def build_invocation(self, *, model, **kwargs):
+                invocation = super().build_invocation(model=model, **kwargs)
+                return replace(invocation, argv=("fake-provider", model))
+
+        def source_runner(argv, **kwargs):
+            nonlocal source_dir
+            calls.append(tuple(argv))
+            source_dir = next((repo_root / ".aflow" / "runs").iterdir())
+            if len(calls) == 1:
+                _attach_launch_evidence(repo_root, source_dir.name, "launch_started", "bearer:issue68")
+                request = {"expected_revision": 0,
+                           "role_selectors": {"worker": "pi.other"}}
+            elif len(calls) == 2:
+                request = {"expected_revision": 1, "max_turns": 3}
+            else:
+                # Target work completes the ledger; its configured final review
+                # must still run before any delivery, even with DONE=true.
+                active_plan = Path(kwargs["cwd"]) / plan.relative_to(repo_root)
+                active_plan.write_text(_COMPLETE_PLAN, encoding="utf-8")
+                return subprocess.CompletedProcess(argv, 0, "DONE", "")
+            response = asyncio.run(mcp.call_tool("control_run", {
+                "project_id": "issue68", "run_id": source_dir.name,
+                "idempotency_key": f"control-issue68-{len(calls)}", **request,
+            }))
+            assert response.is_error is False
+            loaded = load_override_request(source_dir / "overrides.toml")
+            assert loaded.request is not None
+            controls.append(loaded.request)
+            return subprocess.CompletedProcess(argv, 0, "continue", "")
+
+        result = run_workflow(
+            ControllerConfig(repo_root=repo_root, plan_path=plan,
+                             max_turns=2, team="base"),
+            load_workflow_config(config_path), "live", config_dir=config_path,
+            working_dir=repo_root, snapshot_config=False,
+            adapter=ModelAdapter(), runner=source_runner,
+        )
+        assert source_dir == result.run_dir
+        assert [call[1] for call in calls] == ["model-base", "model-other", "model-other"]
+        assert [control.revision for control in controls] == [1, 2]
+        assert controls[1].role_selectors == {"worker": "pi.other"}
+        assert controls[0].digest != controls[1].digest
+        source_state = json.loads((source_dir / "run.json").read_text())
+        assert source_state["status"] == "completed"
+        assert source_state["end_reason"] == "max_turns_reached"
+        assert source_state["effective_max_turns"] == 3
+        assert source_state["current_step_name"] == "final_review"
+        assert source_state["active_role_sessions"] == []
+        transaction = source_state["current_hotplug_transaction"]
+        assert transaction["stage"] == "accepted"
+        assert source_state["pending_hotplug_transaction"] == transaction
+        assert transaction["transaction_number"] == 1
+        assert source_state["hotplug_history"] == []
+        assert "merge_status" not in source_state
+
+        # A later budget revision must also be replayed at controller entry.
+        response = asyncio.run(mcp.call_tool("control_run", {
+            "project_id": "issue68", "run_id": source_dir.name,
+            "expected_revision": 2, "idempotency_key": "budget-review-issue68",
+            "max_turns": 5,
+        }))
+        assert response.is_error is False
+        loaded = load_override_request(source_dir / "overrides.toml")
+        assert loaded.request.revision == 3
+        assert loaded.request.role_selectors == {"worker": "pi.other"}
+        assert loaded.request.digest != controls[1].digest
+        _attach_launch_evidence(repo_root, source_dir.name, "completed", "bearer:issue68")
+        daemon = service._projects["issue68"].daemon
+        _patch_inactive_worker_evidence(monkeypatch, daemon.application.repository)
+        source_before = _run_dir_bytes(source_dir)
+        failed_manifest = None
+        if prior_failed_attempt:
+            # Fake only an external worker dying before controller entry;
+            # reservation, ownership and retry admission remain real.
+            failed = asyncio.run(mcp.call_tool("resume_run", {
+                "project_id": "issue68", "run_id": source_dir.name,
+                "idempotency_key": "failed-first-resume-issue68",
+            }))
+            failed_id = json.loads(failed.content[0].text)["run_id"]
+            unit_name = f"aflow-run-{failed_id}.service"
+            units.units[unit_name] = replace(units.units[unit_name],
+                active_state="failed", sub_state="failed", result="exit:1")
+            failed_dir = repo_root / ".aflow" / "runs" / failed_id
+            failed_dir.mkdir(exist_ok=True)
+            failed_state = {**source_state, "status": "failed",
+                            "turns_completed": 0, "active_turn": 0,
+                            "resumed_from_run_id": source_dir.name,
+                            "failure_reason": "hotplug_in_progress at controller entry"}
+            (failed_dir / "run.json").write_text(json.dumps(failed_state))
+            write_launch_phase(repo_root, failed_id, "failed")
+            failed_manifest = repo_root / ".aflow" / "launches" / f"{failed_id}.json"
+            failed_manifest_before = failed_manifest.read_bytes()
+        request = {"project_id": "issue68", "run_id": source_dir.name,
+                   "idempotency_key": "resume-issue68"}
+        response = asyncio.run(mcp.call_tool("resume_run", request))
+        assert response.is_error is False
+        body = json.loads(response.content[0].text)
+        successor = body["run_id"]
+        assert body["created"] is True
+        replay = asyncio.run(mcp.call_tool("resume_run", request))
+        assert replay.is_error is False
+        replay_body = json.loads(replay.content[0].text)
+        assert replay_body["run_id"] == successor
+        assert replay_body["created"] is False
+        expected_launches = 1 + int(prior_failed_attempt)
+        assert len(units.start_calls) == expected_launches
+
+        fake_bin = root / "fake-provider-bin"
+        fake_bin.mkdir()
+        provider_log = root / "provider-calls.jsonl"
+        (fake_bin / "codex").write_text(
+            "#!/usr/bin/env python3\n"
+            "import json, os, sys\n"
+            "args = sys.argv[1:]\n"
+            "if '--help' in args:\n"
+            "    print('--json resume [SESSION_ID] -m, --model MODEL'); sys.exit(0)\n"
+            "entry = {'argv': args, 'cwd': os.getcwd(), 'prompt': sys.stdin.read()}\n"
+            f"with open({str(provider_log)!r}, 'a') as f: f.write(json.dumps(entry) + '\\n')\n"
+            # The normal Codex invocation exposes final text, not JSON events.
+            "text = 'AFLOW_STOP: independent final reviewer reached'\n"
+            "if '--output-last-message' in args:\n"
+            "    from pathlib import Path\n"
+            "    Path(args[args.index('--output-last-message') + 1]).write_text(text)\n"
+            "print(text)\n",
+            encoding="utf-8",
+        )
+        (fake_bin / "codex").chmod(0o755)
+        monkeypatch.setenv("PATH", str(fake_bin) + os.pathsep + os.environ.get("PATH", ""))
+        reservation = daemon.service._admission.reservation(successor)
+        assert reservation is not None
+        monkeypatch.setenv("AFLOW_ADMISSION_RESERVATION_NONCE", reservation.nonce)
+        assert worker_main(repo_root=repo_root, config_path=config_path,
+                           run_id=successor) == 1  # deliberate reviewer stop
+        provider_calls = [json.loads(line) for line in provider_log.read_text().splitlines()]
+        assert len(provider_calls) == 1
+        first = provider_calls[0]
+        assert first["argv"][first["argv"].index("--model") + 1] == "model-base"
+        successor_dir = repo_root / ".aflow" / "runs" / successor
+        receipt = json.loads((successor_dir / "turns" / "turn-001" / "result.json").read_text())
+        assert receipt["step_name"] == "final_review"
+        assert receipt["step_role"] == "final_reviewer"
+        assert receipt["selector"] == "codex.base"
+        state = json.loads((successor_dir / "run.json").read_text())
+        assert state["effective_max_turns"] == 5
+        assert state["role_selectors"] == {"worker": "pi.other"}
+        assert state["current_hotplug_transaction"] == transaction
+        assert state["pending_hotplug_transaction"] == transaction
+        assert state["hotplug_transaction_number"] == 1
+        assert state["hotplug_history"] == []
+        assert state["worktree_path"] == source_state["worktree_path"]
+        assert state["feature_branch"] == source_state["feature_branch"]
+        assert Path(first["cwd"]) == Path(state["worktree_path"])
+        assert "merge_status" not in state
+        assert (Path(state["worktree_path"]) / plan.relative_to(repo_root)).is_file()
+        assert not (repo_root / "plans" / "done" / plan.name).exists()
+        assert len(units.start_calls) == expected_launches
+        if failed_manifest is not None:
+            assert failed_manifest.read_bytes() == failed_manifest_before
+        assert _run_dir_bytes(source_dir) == source_before

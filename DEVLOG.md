@@ -1,5 +1,31 @@
 # DEVLOG
 
+## 2026-10-04 — Budget-only controls preserve an existing worker hotplug (issue #68)
+
+- `workflow.py::_apply_boundary_override` now compares each supplied role
+  against the current effective routing (run-local `role_selectors` first,
+  then the ordinary role resolver) before deciding whether a nonterminal
+  transaction conflicts. A retained worker selector accepts the budget
+  revision without creating a duplicate transaction, incrementing its number,
+  or emitting another requested event. A genuine selector change still
+  triggers the all-or-nothing rejection.
+- Worker-transaction creation is gated on an actual worker-selector change as
+  well as the existing execution-change logic. A retained selector skips
+  creation even when an active session still names the old source.
+- Hotplug regressions cover retained-selector acceptance, genuine and
+  mixed-map changes, and stale source sessions without duplicate switches.
+- The managed integration regression now creates the worker switch through
+  revision-checked MCP control, runs successful target work without sessions,
+  applies a budget-only revision retaining that worker, and reaches the real
+  budget exit with independent final review still pending. It then uses actual
+  MCP resume and worker bootstrap to dispatch the configured final reviewer.
+  The fake external reviewer explicitly stops instead of fabricating approval;
+  no merge or publication occurs. Canonical and symlinked temporary roots,
+  idempotent replay, and retry after an inactive zero-turn failed successor
+  preserve source records, the original worktree/branch and transaction.
+
+Source: https://github.com/evrenesat/aworkflow/issues/68.
+
 ## 2026-10-03 — Canonical budget-recovery fixture roots for macOS CI (issue #62)
 
 - The reviewed issue #62 repair failed both macOS CI Python 3.11/3.12 test

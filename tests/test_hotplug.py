@@ -598,6 +598,194 @@ def test_controller_second_changed_digest_while_pending_does_not_mutate_transact
     assert "hotplug_in_progress" in state["override_result"]["message"]
 
 
+def test_controller_entry_retained_selector_with_budget_revision_preserves_transaction(tmp_path: Path) -> None:
+    """Issue #68: a revisioned budget-only control that retains the effective
+    worker selector is accepted at controller entry while the predecessor's
+    non-terminal hotplug transaction keeps its identity and history."""
+    transaction = replace(
+        make_transaction("accepted"), source_selector="codex.high", target_selector="codex.low",
+        source_harness="codex", target_harness="codex", source_profile="high", target_profile="low",
+        source_model_display="codex / high", target_model_display="codex / low",
+    )
+    plan = tmp_path / "plan.md"
+    plan.write_text("# Plan\n\n### [ ] Checkpoint 1: First\n- [ ] step\n", encoding="utf-8")
+    # The predecessor's accepted switch installed the target mapping; the new
+    # revision only raises the budget while retaining that effective selector.
+    (tmp_path / "overrides.toml").write_text(
+        'revision = 2\nmax_turns = 2\n\n[roles]\nworker = "codex.low"\n',
+        encoding="utf-8",
+    )
+    _record_inactive_source(tmp_path, "retained-source")
+    # The predecessor's live worker session is carried into the resume so the
+    # same-harness handover has its exact source to resume.
+    session = HarnessSessionRefV1(
+        session_id="source", role="worker", selector=transaction.source_selector,
+        harness="codex", profile="high", model_display="codex / high",
+    )
+    resume = ResumeContext(
+        resumed_from_run_id="retained-source", feature_branch=None,
+        worktree_path=None, main_branch=None, setup=(), teardown=(),
+        interrupted_step_name="implement", role_selectors={"worker": transaction.target_selector},
+        current_hotplug_transaction=transaction, pending_hotplug_transaction=transaction,
+        active_role_sessions=(session,), hotplug_transaction_number=1,
+        override_source_run_dir=tmp_path,
+    )
+    calls: list[tuple[str, ...]] = []
+    def runner(argv, **kwargs):
+        calls.append(tuple(argv))
+        plan.write_text("# Plan\n\n### [x] Checkpoint 1: First\n- [x] step\n", encoding="utf-8")
+        return subprocess.CompletedProcess(
+            argv, 0,
+            '{"type":"thread.started","thread_id":"source"}\n'
+            '{"type":"message.completed","text":"DONE"}\n',
+            "",
+        )
+    result = run_workflow(
+        ControllerConfig(repo_root=tmp_path, plan_path=plan, max_turns=1),
+        _controller_config(), "live", config_dir=tmp_path, adapter=CodexAdapter(),
+            snapshot_config=False,
+        runner=runner, resume=resume,
+        session_driver=CodexAdapter().session_driver(
+            exec_help="codex exec --json resume",
+            resume_help="resume [SESSION_ID] -m, --model MODEL",
+        ),
+    )
+    state = json.loads((result.run_dir / "run.json").read_text(encoding="utf-8"))
+    # The budget revision was accepted, the source session was handed to the
+    # installed target, and the historical transaction kept its identity,
+    # number, and history.
+    assert calls[0][:4] == ("codex", "exec", "resume", "source")
+    assert "low-model" in calls[0]
+    assert state["effective_max_turns"] == 2
+    assert state["current_hotplug_transaction"] is None
+    assert len(state["hotplug_history"]) == 1
+    assert state["hotplug_history"][0]["transaction_id"] == transaction.transaction_id
+    assert state["hotplug_history"][0]["transaction_number"] == 1
+    assert state["hotplug_history"][0]["stage"] == "applied"
+    assert state["role_selectors"]["worker"] == "codex.low"
+    assert state["override_result"]["applied"] is True
+
+
+def test_controller_entry_mixed_map_with_changed_role_still_rejects(tmp_path: Path) -> None:
+    """A retained worker plus one changed role still rejects the whole
+    request while a non-terminal transaction is pending."""
+    transaction = replace(
+        make_transaction("accepted"), source_selector="codex.high", target_selector="codex.low",
+        source_harness="codex", target_harness="codex", source_profile="high", target_profile="low",
+        source_model_display="codex / high", target_model_display="codex / low",
+    )
+    plan = tmp_path / "plan.md"
+    plan.write_text("# Plan\n\n### [ ] Checkpoint 1: First\n- [ ] step\n", encoding="utf-8")
+    (tmp_path / "overrides.toml").write_text(
+        'max_turns = 2\n\n[roles]\nworker = "codex.high"\nreviewer = "codex.high"\n',
+        encoding="utf-8",
+    )
+    _record_inactive_source(tmp_path, "mixed-source")
+    resume = ResumeContext(
+        resumed_from_run_id="mixed-source", feature_branch=None,
+        worktree_path=None, main_branch=None, setup=(), teardown=(),
+        interrupted_step_name="implement", role_selectors={"worker": transaction.source_selector},
+        current_hotplug_transaction=transaction, pending_hotplug_transaction=transaction,
+        active_role_sessions=(), hotplug_transaction_number=1,
+        override_source_run_dir=tmp_path,
+    )
+    calls: list[tuple[str, ...]] = []
+    with pytest.raises(WorkflowError) as error:
+        run_workflow(
+            ControllerConfig(repo_root=tmp_path, plan_path=plan, max_turns=1),
+            _controller_config(with_review=True), "live", config_dir=tmp_path,
+                adapter=CodexAdapter(), snapshot_config=False,
+            runner=lambda argv, **kwargs: (calls.append(tuple(argv)) or subprocess.CompletedProcess(argv, 0, "continue", "")),
+            resume=resume,
+        )
+    state = json.loads((error.value.run_dir / "run.json").read_text(encoding="utf-8"))
+    assert calls == []
+    # The whole request is rejected: the budget revision is not applied and
+    # the pending transaction is preserved unchanged.
+    assert "hotplug_in_progress" in state["override_result"]["message"]
+    assert state["effective_max_turns"] == 1
+    assert state["current_hotplug_transaction"]["transaction_id"] == transaction.transaction_id
+    assert state["current_hotplug_transaction"]["stage"] == "accepted"
+    assert state["hotplug_history"] == []
+
+
+def test_controller_entry_retained_selector_with_old_source_session_creates_no_transaction(tmp_path: Path) -> None:
+    """A retained mapping plus an old source session is not a new switch:
+    no hotplug transaction is created."""
+    plan = tmp_path / "plan.md"
+    plan.write_text("# Plan\n\n### [ ] Checkpoint 1: First\n- [ ] step\n", encoding="utf-8")
+    (tmp_path / "overrides.toml").write_text(
+        'max_turns = 2\n\n[roles]\nworker = "codex.low"\n',
+        encoding="utf-8",
+    )
+    _record_inactive_source(tmp_path, "stale-session-source")
+    session = HarnessSessionRefV1(
+        session_id="source", role="worker", selector="codex.high",
+        harness="codex", profile="high", model_display="codex / high",
+    )
+    resume = ResumeContext(
+        resumed_from_run_id="stale-session-source", feature_branch=None,
+        worktree_path=None, main_branch=None, setup=(), teardown=(),
+        interrupted_step_name="implement", role_selectors={"worker": "codex.low"},
+        current_hotplug_transaction=None, pending_hotplug_transaction=None,
+        active_role_sessions=(session,), hotplug_transaction_number=0,
+        override_source_run_dir=tmp_path,
+    )
+    calls: list[tuple[str, ...]] = []
+    def runner(argv, **kwargs):
+        calls.append(tuple(argv))
+        plan.write_text("# Plan\n\n### [x] Checkpoint 1: First\n- [x] step\n", encoding="utf-8")
+        return subprocess.CompletedProcess(
+            argv, 0,
+            '{"type":"thread.started","thread_id":"low"}\n'
+            '{"type":"message.completed","text":"DONE"}\n',
+            "",
+        )
+    result = run_workflow(
+        ControllerConfig(repo_root=tmp_path, plan_path=plan, max_turns=1),
+        _controller_config(), "live", config_dir=tmp_path, adapter=CodexAdapter(),
+            snapshot_config=False,
+        runner=runner, resume=resume,
+    )
+    state = json.loads((result.run_dir / "run.json").read_text(encoding="utf-8"))
+    assert "low-model" in calls[0]
+    assert state["effective_max_turns"] == 2
+    assert state["current_hotplug_transaction"] is None
+    assert state["hotplug_history"] == []
+    assert state["role_selectors"]["worker"] == "codex.low"
+
+
+def test_live_retained_selector_after_applied_transaction_starts_no_switch(tmp_path: Path) -> None:
+    """A live budget-only revision retaining the installed target after the
+    transaction applied starts no second switch and keeps one history entry."""
+    switch = '[roles]\nworker = "codex.low"\n'
+    retained = 'max_turns = 6\n\n[roles]\nworker = "codex.low"\n'
+    driver = CodexAdapter().session_driver(
+        exec_help="codex exec --json resume", resume_help="resume [SESSION_ID] -m, --model MODEL"
+    )
+    calls, states, _ = _run_scripted_controller(
+        tmp_path,
+        config=_controller_config(with_review=True),
+        writes=(switch, retained),
+        max_turns=5,
+        driver=driver,
+    )
+    state = states[-1]
+    # Turn 1 source, turn 2 review, turn 3 target success (transaction
+    # applied), turns 4-5 target: the retained revision is consumed with the
+    # transaction already terminal and must not start another switch.
+    assert len(calls) == 5
+    assert "low-model" in calls[4]
+    assert calls[4][:4] == ("codex", "exec", "resume", "source")
+    assert state["effective_max_turns"] == 6
+    assert len(state["hotplug_history"]) == 1
+    assert state["hotplug_history"][0]["transaction_number"] == 1
+    assert state["hotplug_history"][0]["stage"] == "applied"
+    assert state["role_selectors"]["worker"] == "codex.low"
+    assert state["override_result"]["applied"] is True
+    assert state["active_role_sessions"][0]["selector"] == "codex.low"
+
+
 def test_reviewer_interposition_keeps_target_mapping_and_session_dormant(tmp_path: Path) -> None:
     first = '[roles]\nworker = "codex.low"\n'
     driver = CodexAdapter().session_driver(exec_help="codex exec --json resume", resume_help="resume [SESSION_ID] -m, --model MODEL")
