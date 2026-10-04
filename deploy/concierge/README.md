@@ -23,6 +23,16 @@ status record (schema v2, including `action`, `outcome`, `mutating`,
 The units are **not** activated from a worker checkout. Activation is a
 post-delivery step on the p100 host.
 
+> **Scope note.** These units document the separate *portable* deployment
+> route. The p100 owner's persistent-chat mandate instead wakes the pinned
+> concierge chat through the host-specific adapter
+> [`scripts/concierge/codex_chat_tick.py`](../../scripts/concierge/codex_chat_tick.py)
+> (issue 69), installed by the coordinator at
+> `/usr/local/bin/aflow-concierge-chat-tick` after exact-SHA CI on
+> `origin/main`. That host adapter supersedes this directory's inactive
+> advice only for the host bootstrap; the units and portable policy here are
+> left intact and are not activated by the chat-wakeup route.
+
 ## Units
 
 - `aflow-concierge.timer` — `OnCalendar=*:00,20,40`, `Persistent=true`,

@@ -1651,6 +1651,19 @@ repository's issues (including closed ones), files the first unfiled
  concierge process is the authoritative boundary; see
  [deploy/concierge/README.md](deploy/concierge/README.md).
 
+The p100 host also runs a separate persistent-chat wakeup adapter,
+`scripts/concierge/codex_chat_tick.py` (issue 69), which wakes the pinned
+concierge chat through the local Codex app-server Unix socket under the
+cron launcher's bootstrap flock. It is host-specific and outside the portable
+concierge: one invocation makes at most one `turn/start`, proves ownership
+only by an exact `userMessage.clientId` nonce match (tolerating delayed item
+visibility, lost replies, reconnects, and capped pagination), and stays in
+the foreground under one 780-second service-start deadline until the proven
+owned turn reaches a terminal state or the deadline; unproven turns are never
+interrupted. Atomic 0600 receipts capped at 64 KiB record operational
+identities and statuses only. Installation to the host launcher path is a
+coordinator-only step; see `scripts/concierge/AGENTS.md`.
+
 The versioned project registry is the sole project authority beneath one
 managed root. `project_service.py` creates, registers, renames, and safely
 unregisters exact Git roots. Read-only project_discovery.py lists bounded Git

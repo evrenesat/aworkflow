@@ -5633,3 +5633,30 @@ HISTORY: Published clipboard history `c14f1f2`/`cd78d53` remains separate and mu
   for oldest uncovered owner issue.
 - Updated `concierge_prompt.md`, `deploy/concierge/README.md`, and
   `ARCHITECTURE.md` to describe the staged lifecycle and mutation budget.
+
+## 2026-10-04 — Persistent-chat wakeup ownership visibility repair (issue 69)
+
+- Checked in the p100 bootstrap wakeup wrapper as
+  `scripts/concierge/codex_chat_tick.py`, the host-specific adapter that wakes
+  the pinned concierge chat through the local Codex app-server Unix socket
+  under the cron launcher's bootstrap flock.
+- Replaced the one-shot ownership lookup with bounded reconciliation that
+  tolerates empty history, delayed `userMessage.clientId` visibility, lost
+  start replies, reconnects, buffered completion events, and capped
+  pagination (10 pages per pass). Ownership is proven only by an exact nonce
+  match; an accepted turn ID alone never grants ownership, and unproven turns
+  are never interrupted.
+- Kept the wrapper in the foreground under one 780-second service-start
+  deadline (with oneshot service-start monotonic adoption) through visibility
+  waits, supervised execution, the minute-12 exact-owned advisory, and the
+  final five-second cleanup window, so the parent flock is held for the whole
+  supervised lifecycle. The no-socket exact-chat CLI fallback now runs a
+  supervised foreground child within the remaining budget instead of an
+  unbounded `execv`.
+- Added mock-only deterministic tests in `tests/test_concierge_chat_tick.py`
+  (real temporary Unix WebSocket servers, injected clock, harmless fake CLI
+  children, isolated flock/subprocess lifecycle assertions) covering delayed
+  visibility, buffered completion, start races, pagination, cleanup races,
+  deadline bounds, prior-tick recovery, CLI fallback, and receipt privacy.
+- Real idle wakeup acceptance on p100 remains pending coordinator evidence;
+  host installation is coordinator-only after exact-SHA CI on `origin/main`.
