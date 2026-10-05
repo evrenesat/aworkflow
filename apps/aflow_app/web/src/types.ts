@@ -116,6 +116,8 @@ export interface ConfigBlockedRun {
 export interface GuidedProfileSummary {
   model: string | null
   effort: string | null
+  /** Declared exclusive flag; older projections and fixtures default to unchecked. */
+  exclusive?: boolean
 }
 
 export interface GuidedWorkflowStepSummaries {
@@ -225,7 +227,7 @@ export type GuidedConfigAction =
   | { type: 'build_starter'; workflow: string; main_branch: string; team?: string | null }
   | { type: 'set_default_workflow'; value: string }
   | { type: 'set_max_turns'; value: number | null }
-  | { type: 'upsert_profile'; harness: string; profile: string; model?: string | null; effort?: string | null }
+  | { type: 'upsert_profile'; harness: string; profile: string; model?: string | null; effort?: string | null; exclusive?: boolean | null }
   | { type: 'set_global_role'; role: string; selector: string }
   | { type: 'add_team'; team: string }
   | { type: 'set_team_role'; team: string; role: string; selector: string | null }

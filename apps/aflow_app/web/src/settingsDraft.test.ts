@@ -128,6 +128,57 @@ describe('changed-only settings', () => {
     expect(settingsActions(baseline, draft)).toEqual([{ type: 'set_default_workflow', value: 'demo-alias' }])
   })
 
+  describe('exclusive resource', () => {
+    it('emits an exclusive-only upsert action and preserves explicit false', () => {
+      const marked = structuredClone(baseline)
+      marked.harnesses.codex.worker.exclusive = true
+      expect(settingsActions(baseline, marked)).toEqual([{ type: 'upsert_profile', harness: 'codex', profile: 'worker', exclusive: true }])
+
+      // Unchecking must persist false, not be dropped by a truthiness check.
+      const unmarked = structuredClone(marked)
+      unmarked.harnesses.codex.worker.exclusive = false
+      expect(settingsActions(marked, unmarked)).toEqual([{ type: 'upsert_profile', harness: 'codex', profile: 'worker', exclusive: false }])
+
+      // Reverting an explicit false back to omitted is not a change.
+      expect(settingsActions(unmarked, baseline)).toEqual([])
+    })
+
+    it('defaults older projections and fixtures to unchecked', () => {
+      const older = structuredClone(baseline)
+      delete older.harnesses.codex.worker.exclusive
+      const unchecked: GuidedFormProjection = {
+        ...older,
+        harnesses: { codex: { worker: { model: 'model', effort: 'high', exclusive: false } } },
+      }
+      expect(settingsActions(older, unchecked)).toEqual([])
+      expect(settingsActions(baseline, older)).toEqual([])
+    })
+
+    it('keeps the checkbox through a model change and out of that action', () => {
+      const marked = structuredClone(baseline)
+      marked.harnesses.codex.worker.exclusive = true
+      const remodeled = structuredClone(marked)
+      remodeled.harnesses.codex.worker.model = 'other-model'
+      expect(settingsActions(marked, remodeled)).toEqual([{ type: 'upsert_profile', harness: 'codex', profile: 'worker', model: 'other-model' }])
+      expect(settingsActions(baseline, remodeled)).toEqual([{ type: 'upsert_profile', harness: 'codex', profile: 'worker', model: 'other-model', exclusive: true }])
+    })
+
+    it('leaves unrelated edits and other rows untouched', () => {
+      const withOther: GuidedFormProjection = {
+        ...baseline,
+        harnesses: { codex: { worker: baseline.harnesses.codex.worker, other: { model: null, effort: null } } },
+      }
+      const draft = structuredClone(withOther)
+      draft.harnesses.codex.worker.exclusive = true
+      draft.harnesses.codex.other.exclusive = false
+      draft.prompts!.work = 'changed'
+      const actions = settingsActions(withOther, draft)
+      expect(actions).toContainEqual({ type: 'upsert_profile', harness: 'codex', profile: 'worker', exclusive: true })
+      expect(actions).toContainEqual({ type: 'set_prompt', name: 'work', text: 'changed' })
+      expect(actions.find(action => action.type === 'upsert_profile' && action.profile === 'other')).toBeUndefined()
+    })
+  })
+
   it('rejects a released clean reconciliation after the coordinator receives a custom effort', () => {
     const coordinator = createDraftPreviewCoordinator(async () => { throw new Error('preview should not run') })
     const cleanActionsKey = JSON.stringify(settingsActions(baseline, baseline))

@@ -57,7 +57,8 @@ function changedProfileActions(base: GuidedFormProjection, draft: GuidedFormProj
         if (value.model !== (old?.model ?? null)) action.model = value.model
         if (value.effort !== (old?.effort ?? null)) action.effort = value.effort
       }
-      if (!old || 'model' in action || 'effort' in action) actions.push(action)
+      if ((value.exclusive ?? false) !== (old?.exclusive ?? false)) action.exclusive = value.exclusive ?? false
+      if (!old || 'model' in action || 'effort' in action || 'exclusive' in action) actions.push(action)
     }
   }
   return actions

@@ -84,7 +84,7 @@ export function GlobalSettings({ onDirtyChange, onSaved, project = null }: { onD
   const [notice, setNotice] = useState<string | null>(null)
   const [busy, setBusy] = useState(false)
   const [reading, setReading] = useState(false)
-  const [newProfile, setNewProfile] = useState({ harness: '', profile: '', model: '', effort: '' })
+  const [newProfile, setNewProfile] = useState({ harness: '', profile: '', model: '', effort: '', exclusive: false })
   const [newProfileError, setNewProfileError] = useState<string | null>(null)
   const [newRole, setNewRole] = useState({ role: '', selector: '' })
   const [newRoleError, setNewRoleError] = useState<string | null>(null)
@@ -360,7 +360,7 @@ export function GlobalSettings({ onDirtyChange, onSaved, project = null }: { onD
     projectSchedulingDirtyRef.current = false
     setDeletedPrompts([])
     draftPreviewCoordinator.invalidate()
-    setPassword(''); setNewProfile({ harness: '', profile: '', model: '', effort: '' }); setNewProfileError(null); setNewRole({ role: '', selector: '' }); setNewRoleError(null); setNewTeamName(''); setNewTeamError(null); setPendingFocusTeam(null); setTeamWizardDirty(false); setTeamWizardResetVersion(value => value + 1)
+    setPassword(''); setNewProfile({ harness: '', profile: '', model: '', effort: '', exclusive: false }); setNewProfileError(null); setNewRole({ role: '', selector: '' }); setNewRoleError(null); setNewTeamName(''); setNewTeamError(null); setPendingFocusTeam(null); setTeamWizardDirty(false); setTeamWizardResetVersion(value => value + 1)
     setPendingNames({}); setRawEdited(false); setError(null); setNotice(null); setProjectionError(null)
     if (snapshot) setTexts([snapshot.aflow_toml, snapshot.workflows_toml])
     const resetDraft = baseline ? clone(baseline) : null
@@ -494,7 +494,7 @@ export function GlobalSettings({ onDirtyChange, onSaved, project = null }: { onD
     if (Object.values(newProfile).some(Boolean)) {
       const validation = validateNewProfile(newProfile, value)
       if (validation) throw new Error(validation)
-      ;(value.harnesses[newProfile.harness] ??= {})[String(newProfile.profile ?? '').trim()] = { model: newProfile.model || null, effort: newProfile.effort || null }
+      ;(value.harnesses[newProfile.harness] ??= {})[String(newProfile.profile ?? '').trim()] = { model: newProfile.model || null, effort: newProfile.effort || null, exclusive: newProfile.exclusive }
     }
     if (newRole.role || newRole.selector) {
       const validation = validateNewRole(newRole, value)
@@ -527,9 +527,10 @@ export function GlobalSettings({ onDirtyChange, onSaved, project = null }: { onD
       profiles[profile] = {
         model: value.model || null,
         effort: value.effort || null,
+        exclusive: value.exclusive,
       }
     })
-    setNewProfile({ harness: '', profile: '', model: '', effort: '' })
+    setNewProfile({ harness: '', profile: '', model: '', effort: '', exclusive: false })
   }
 
   function addRole() {
@@ -678,7 +679,7 @@ export function GlobalSettings({ onDirtyChange, onSaved, project = null }: { onD
         }
         if (rawEdited) {
           setDraft(next.form); setBaseline(next.form); setPendingNames({})
-          setNewProfile({ harness: '', profile: '', model: '', effort: '' }); setNewProfileError(null); setNewRole({ role: '', selector: '' }); setNewRoleError(null); setNewTeamName(''); setNewTeamError(null); setPendingFocusTeam(null)
+          setNewProfile({ harness: '', profile: '', model: '', effort: '', exclusive: false }); setNewProfileError(null); setNewRole({ role: '', selector: '' }); setNewRoleError(null); setNewTeamName(''); setNewTeamError(null); setPendingFocusTeam(null)
         }
       } else if (advanced && rawEdited) {
         const form = await api.postGlobalConfigForm({ aflow_toml: texts[0], workflows_toml: texts[1] })
@@ -844,7 +845,7 @@ export function GlobalSettings({ onDirtyChange, onSaved, project = null }: { onD
         // Acknowledged writes are cleared even if a later projection or server write fails.
         if (selectedPrompt.startsWith('named:') && pendingNames[selectedPrompt.slice(6)]) setSelectedPrompt(`named:${pendingNames[selectedPrompt.slice(6)]}`)
         configSaved = true; setDeletedPrompts([]); setSnapshot(saved); setTexts([saved.aflow_toml, saved.workflows_toml]); setBaseline(candidate().form); setDraft(candidate().form); setPendingNames({}); setRawEdited(false)
-        setNewProfile({ harness: '', profile: '', model: '', effort: '' }); setNewProfileError(null); setNewRole({ role: '', selector: '' }); setNewRoleError(null); setNewTeamName(''); setNewTeamError(null); setPendingFocusTeam(null)
+        setNewProfile({ harness: '', profile: '', model: '', effort: '', exclusive: false }); setNewProfileError(null); setNewRole({ role: '', selector: '' }); setNewRoleError(null); setNewTeamName(''); setNewTeamError(null); setPendingFocusTeam(null)
         onSaved(saved)
         await acceptConfig(saved, epochRef.current)
         if (epochRef.current !== epoch) return
@@ -909,12 +910,19 @@ export function GlobalSettings({ onDirtyChange, onSaved, project = null }: { onD
   const teamNames = draft ? Object.keys(draft.teams).sort() : []
   const workflowNames = draft ? Object.keys(draft.workflows).sort() : []
   const selectors = draft ? Object.entries(draft.harnesses).flatMap(([h, profiles]) => Object.keys(profiles).map(p => `${h}.${p}`)) : []
-  function profileFields(harness: string, profile: string, model: string, effort: string, update: (field: 'model' | 'effort', text: string) => void) {
+  function profileFields(harness: string, profile: string, model: string, effort: string, exclusive: boolean, update: (field: 'model' | 'effort', text: string) => void, onExclusiveChange: (value: boolean) => void) {
+    const exclusiveIdentity = profile ? `${harness}.${profile}` : `new profile ${harness}`
     const suggestions = projection?.suggestions.profiles.filter(p => p.harness === harness) ?? []
     const adapter = projection?.suggestions.harnesses.find(h => h.name === harness)
-    return harness === 'zcode' ? <p className="profile-editor-note">Model and effort are configured in ZCode.</p> : <>
-      <div className="profile-editor-field"><Combobox label={`Model ${harness}.${profile}`} visibleLabel="Model" value={model} allowCustom options={[...new Set(suggestions.flatMap(p => p.model ? [p.model] : []))]} onChange={value => update('model', value)} /></div>
-      {adapter?.supports_effort && <div className="profile-editor-field"><Combobox label={`Effort ${harness}.${profile}`} visibleLabel="Effort" value={effort} allowCustom options={[...new Set(suggestions.flatMap(p => p.effort ? [p.effort] : []))]} onChange={value => update('effort', value)} /></div>}
+    return <>
+      {harness === 'zcode' ? <p className="profile-editor-note">Model and effort are configured in ZCode.</p> : <>
+        <div className="profile-editor-field"><Combobox label={`Model ${harness}.${profile}`} visibleLabel="Model" value={model} allowCustom options={[...new Set(suggestions.flatMap(p => p.model ? [p.model] : []))]} onChange={value => update('model', value)} /></div>
+        {adapter?.supports_effort && <div className="profile-editor-field"><Combobox label={`Effort ${harness}.${profile}`} visibleLabel="Effort" value={effort} allowCustom options={[...new Set(suggestions.flatMap(p => p.effort ? [p.effort] : []))]} onChange={value => update('effort', value)} /></div>}
+      </>}
+      <div className="profile-editor-field">
+        <label className="profile-editor-exclusive-label"><input type="checkbox" aria-label={`Exclusive ${exclusiveIdentity}`} checked={exclusive} onChange={event => onExclusiveChange(event.target.checked)} />Exclusive</label>
+        <span className="text-xs text-dim">Run only one invocation at a time for this harness, model, and effort combination.</span>
+      </div>
     </>
   }
   const headerCompact = useSettingsHeaderCompact()
@@ -981,7 +989,7 @@ export function GlobalSettings({ onDirtyChange, onSaved, project = null }: { onD
     {projectionError && <div className="error-message" role="alert">The guided settings view is unavailable: {projectionError} <button className="btn btn-secondary btn-sm" onClick={() => void retryProjection()} disabled={busy || !snapshot}>Retry</button> The saved documents stay editable under Advanced TOML.</div>}
     {draftPreviewState.error && <p className="error-message" role="alert">The current settings preview is unavailable: {draftPreviewState.error.message} Your edits remain in the draft; edit again or save to retry.</p>}
     <fieldset disabled={busy && !reading} data-settings-tab={advanced ? 'Advanced TOML' : tab} className="settings-body" id="settings-domain-panel" role={advanced ? 'region' : 'tabpanel'} aria-label={advanced ? 'Advanced TOML editor' : undefined} aria-labelledby={advanced ? undefined : `settings-tab-${tabs.indexOf(tab)}`}>
-    {advanced ? <div className="settings-fields">{texts.map((text, index) => <div className="text-editor-field" key={index}><span className="text-editor-label">{index ? 'workflows.toml' : 'aflow.toml'}</span><TextEditor className="mono config-textarea" aria-label={index ? 'workflows.toml contents' : 'aflow.toml contents'} value={text} onChange={e => { draftPreviewCoordinator.invalidate(); setDraftPreviewState(draftPreviewCoordinator.state()); const next: [string, string] = [...texts]; next[index] = e.target.value; setTexts(next); if (!rawEdited) { const form = candidate().form; setBaseline(form); setDraft(form); if (form) draftPreviewCoordinator.updateDraft(form); setPendingNames({}); setNewProfile({ harness: '', profile: '', model: '', effort: '' }); setNewProfileError(null); setNewRole({ role: '', selector: '' }); setNewRoleError(null); setNewTeamName(''); setNewTeamError(null); setPendingFocusTeam(null) } setRawEdited(true) }} /></div>)}</div> : <><div className="settings-retained-skills" hidden={tab !== 'Skills'} aria-hidden={tab !== 'Skills' || undefined}><SkillsSettings
+    {advanced ? <div className="settings-fields">{texts.map((text, index) => <div className="text-editor-field" key={index}><span className="text-editor-label">{index ? 'workflows.toml' : 'aflow.toml'}</span><TextEditor className="mono config-textarea" aria-label={index ? 'workflows.toml contents' : 'aflow.toml contents'} value={text} onChange={e => { draftPreviewCoordinator.invalidate(); setDraftPreviewState(draftPreviewCoordinator.state()); const next: [string, string] = [...texts]; next[index] = e.target.value; setTexts(next); if (!rawEdited) { const form = candidate().form; setBaseline(form); setDraft(form); if (form) draftPreviewCoordinator.updateDraft(form); setPendingNames({}); setNewProfile({ harness: '', profile: '', model: '', effort: '', exclusive: false }); setNewProfileError(null); setNewRole({ role: '', selector: '' }); setNewRoleError(null); setNewTeamName(''); setNewTeamError(null); setPendingFocusTeam(null) } setRawEdited(true) }} /></div>)}</div> : <><div className="settings-retained-skills" hidden={tab !== 'Skills'} aria-hidden={tab !== 'Skills' || undefined}><SkillsSettings
       skills={skills}
       loadError={skillsLoadError}
       selected={effectiveSkill}
@@ -1070,7 +1078,7 @@ export function GlobalSettings({ onDirtyChange, onSaved, project = null }: { onD
         <p className="settings-section-lead">Effective profiles are shown first. New profiles are added to this shared draft and persist only with Save all changes.</p>
         {Object.entries(draft.harnesses).flatMap(([harness, profiles]) => Object.entries(profiles).map(([profile, value]) => <div className="card profile-editor-row" key={`${harness}.${profile}`}>
           <div className="profile-editor-name"><span className="text-xs text-dim">Profile</span><strong className="mono">{harness}.{profile}</strong></div>
-          {profileFields(harness, profile, value.model ?? '', value.effort ?? '', (field, text) => change(next => { next.harnesses[harness][profile][field] = text || null }))}
+          {profileFields(harness, profile, value.model ?? '', value.effort ?? '', value.exclusive ?? false, (field, text) => change(next => { next.harnesses[harness][profile][field] = text || null }), exclusive => change(next => { next.harnesses[harness][profile].exclusive = exclusive }))}
         </div>))}
         <details className="settings-disclosure">
           <summary>Add profile</summary>
@@ -1086,7 +1094,7 @@ export function GlobalSettings({ onDirtyChange, onSaved, project = null }: { onD
           }}>
             <Combobox label="New profile name" value={newProfile.profile} allowCustom options={projection?.suggestions.profiles.filter(p => p.harness === newProfile.harness).map(p => p.profile) ?? []} optionLabel={formatMachineLabel} onChange={profile => { setNewProfile({ ...newProfile, profile }); setNewProfileError(null) }} />
           </div>
-          {newProfile.harness && <div className="profile-editor-new-fields">{profileFields(newProfile.harness, newProfile.profile, newProfile.model, newProfile.effort, (field, text) => { setNewProfile({ ...newProfile, [field]: text }); setNewProfileError(null) })}</div>}
+          {newProfile.harness && <div className="profile-editor-new-fields">{profileFields(newProfile.harness, newProfile.profile, newProfile.model, newProfile.effort, newProfile.exclusive, (field, text) => { setNewProfile({ ...newProfile, [field]: text }); setNewProfileError(null) }, exclusive => { setNewProfile({ ...newProfile, exclusive }); setNewProfileError(null) })}</div>}
           <div className="profile-editor-actions"><button type="button" className="btn btn-secondary" onClick={() => addProfile()}>Add profile</button>{newProfileError && <span role="alert" className="text-sm add-team-error">{newProfileError}</span>}</div>
           </div>
         </details>

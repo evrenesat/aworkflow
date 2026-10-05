@@ -1070,6 +1070,200 @@ describe('GlobalSettings', () => {
     expect((screen.getByLabelText('New role profile') as HTMLInputElement).value).toBe('codex.worker')
   })
 
+  describe('exclusive resource', () => {
+    const exclusiveForm: GuidedFormProjection = { ...form, harnesses: { codex: { worker: { model: 'model', effort: 'high', exclusive: true } } } }
+    const exclusiveResponse: ProjectConfigFormResponse = { ...response, form: exclusiveForm }
+    const twoProfileForm: GuidedFormProjection = {
+      ...form,
+      harnesses: { codex: { worker: { model: 'model', effort: 'high', exclusive: true }, other: { model: null, effort: null } } },
+    }
+    const twoProfileResponse: ProjectConfigFormResponse = {
+      ...response,
+      form: twoProfileForm,
+      choices: { ...response.choices!, profiles: { codex: ['other', 'worker'] }, selectors: ['codex.other', 'codex.worker'] },
+    }
+
+    it('saves an exclusive-only change as the minimal typed action and reloads it', async () => {
+      render(<GlobalSettings onDirtyChange={() => {}} onSaved={() => {}} />)
+      const checkbox = await screen.findByRole('checkbox', { name: 'Exclusive codex.worker' }) as HTMLInputElement
+      expect(checkbox.checked).toBe(false)
+      fireEvent.click(checkbox)
+      fireEvent.click(screen.getByRole('button', { name: 'Save all changes' }))
+      await waitFor(() => expect(api.patchGlobalConfig).toHaveBeenCalledWith({ expected_revision: config.revision, actions: [{ type: 'upsert_profile', harness: 'codex', profile: 'worker', exclusive: true }] }))
+
+      // A reload with the server projection carrying the flag renders it checked.
+      vi.mocked(api.postGlobalConfigForm).mockResolvedValue(exclusiveResponse)
+      const reloaded = render(<GlobalSettings onDirtyChange={() => {}} onSaved={() => {}} />)
+      await waitFor(() => expect((within(reloaded.container).getByRole('checkbox', { name: 'Exclusive codex.worker' }) as HTMLInputElement).checked).toBe(true))
+    })
+
+    it('persists unchecking as explicit false', async () => {
+      vi.mocked(api.postGlobalConfigForm).mockResolvedValue(exclusiveResponse)
+      render(<GlobalSettings onDirtyChange={() => {}} onSaved={() => {}} />)
+      const checkbox = await screen.findByRole('checkbox', { name: 'Exclusive codex.worker' }) as HTMLInputElement
+      expect(checkbox.checked).toBe(true)
+      fireEvent.click(checkbox)
+      fireEvent.click(screen.getByRole('button', { name: 'Save all changes' }))
+      await waitFor(() => expect(api.patchGlobalConfig).toHaveBeenCalledWith({ expected_revision: config.revision, actions: [{ type: 'upsert_profile', harness: 'codex', profile: 'worker', exclusive: false }] }))
+    })
+
+    it('creates a new exclusive profile row without any resource identifier', async () => {
+      const view = render(<GlobalSettings onDirtyChange={() => {}} onSaved={() => {}} />)
+      fireEvent.change(await screen.findByLabelText('Harness'), { target: { value: 'codex' } })
+      fireEvent.change(screen.getByLabelText('New profile name'), { target: { value: 'brand-new' } })
+      fireEvent.change(screen.getByLabelText('Model codex.brand-new'), { target: { value: 'new-model' } })
+      const addForm = view.container.querySelector('.profile-editor-new') as HTMLElement
+      fireEvent.click(within(addForm).getByRole('checkbox', { name: 'Exclusive codex.brand-new' }))
+      fireEvent.click(screen.getByRole('button', { name: 'Save all changes' }))
+      await waitFor(() => expect(api.patchGlobalConfig).toHaveBeenCalledWith({ expected_revision: config.revision, actions: [{ type: 'upsert_profile', harness: 'codex', profile: 'brand-new', model: 'new-model', exclusive: true }] }))
+    })
+
+    it('keeps the exclusive checkbox through a model edit', async () => {
+      vi.mocked(api.postGlobalConfigForm).mockResolvedValue(exclusiveResponse)
+      render(<GlobalSettings onDirtyChange={() => {}} onSaved={() => {}} />)
+      fireEvent.change(await screen.findByLabelText('Model codex.worker'), { target: { value: 'new-model' } })
+      expect((screen.getByRole('checkbox', { name: 'Exclusive codex.worker' }) as HTMLInputElement).checked).toBe(true)
+      fireEvent.click(screen.getByRole('button', { name: 'Save all changes' }))
+      await waitFor(() => expect(api.patchGlobalConfig).toHaveBeenCalledWith({ expected_revision: config.revision, actions: [{ type: 'upsert_profile', harness: 'codex', profile: 'worker', model: 'new-model' }] }))
+    })
+
+    it('does not mark or edit a different profile row', async () => {
+      vi.mocked(api.postGlobalConfigForm).mockResolvedValue(twoProfileResponse)
+      render(<GlobalSettings onDirtyChange={() => {}} onSaved={() => {}} />)
+      const worker = await screen.findByRole('checkbox', { name: 'Exclusive codex.worker' }) as HTMLInputElement
+      const other = screen.getByRole('checkbox', { name: 'Exclusive codex.other' }) as HTMLInputElement
+      expect(worker.checked).toBe(true)
+      expect(other.checked).toBe(false)
+      fireEvent.change(screen.getByLabelText('Model codex.other'), { target: { value: 'other-model' } })
+      fireEvent.click(screen.getByRole('button', { name: 'Save all changes' }))
+      await waitFor(() => expect(api.patchGlobalConfig).toHaveBeenCalledWith({ expected_revision: config.revision, actions: [{ type: 'upsert_profile', harness: 'codex', profile: 'other', model: 'other-model' }] }))
+      expect(worker.checked).toBe(true)
+      expect(other.checked).toBe(false)
+    })
+
+    it('locates each profile row checkbox by its accessible identity and saves only the selected row', async () => {
+      vi.mocked(api.postGlobalConfigForm).mockResolvedValue(twoProfileResponse)
+      render(<GlobalSettings onDirtyChange={() => {}} onSaved={() => {}} />)
+      const worker = await screen.findByRole('checkbox', { name: 'Exclusive codex.worker' }) as HTMLInputElement
+      const other = screen.getByRole('checkbox', { name: 'Exclusive codex.other' }) as HTMLInputElement
+      // Each row keeps the visible label while its accessible name carries the exact profile identity.
+      expect(worker.closest('label')!.textContent).toBe('Exclusive')
+      expect(other.closest('label')!.textContent).toBe('Exclusive')
+      expect(worker.checked).toBe(true)
+      expect(other.checked).toBe(false)
+      await waitFor(() => expect(other.disabled).toBe(false))
+      fireEvent.click(other)
+      expect(worker.checked).toBe(true)
+      expect(other.checked).toBe(true)
+      fireEvent.click(screen.getByRole('button', { name: 'Save all changes' }))
+      await waitFor(() => expect(api.patchGlobalConfig).toHaveBeenCalledWith({ expected_revision: config.revision, actions: [{ type: 'upsert_profile', harness: 'codex', profile: 'other', exclusive: true }] }))
+      // Saving the second row must not touch the first row's saved choice.
+      expect(api.patchGlobalConfig).not.toHaveBeenCalledWith(expect.objectContaining({ actions: [{ type: 'upsert_profile', harness: 'codex', profile: 'worker', exclusive: true }] }))
+    })
+
+    it('identifies the Add profile checkbox as the new profile control before and after naming', async () => {
+      const view = render(<GlobalSettings onDirtyChange={() => {}} onSaved={() => {}} />)
+      fireEvent.change(await screen.findByLabelText('Harness'), { target: { value: 'codex' } })
+      const addForm = view.container.querySelector('.profile-editor-new') as HTMLElement
+      // Before a name is entered the control is identifiable as the new-profile control.
+      const unnamed = within(addForm).getByRole('checkbox', { name: 'Exclusive new profile codex' }) as HTMLInputElement
+      expect(unnamed.checked).toBe(false)
+      fireEvent.click(unnamed)
+      expect(unnamed.checked).toBe(true)
+      // The identity follows the entered profile name, matching the form's Model/Effort naming.
+      fireEvent.change(screen.getByLabelText('New profile name'), { target: { value: 'named-row' } })
+      const named = within(addForm).getByRole('checkbox', { name: 'Exclusive codex.named-row' }) as HTMLInputElement
+      expect(named.checked).toBe(true)
+      expect(screen.queryByRole('checkbox', { name: 'Exclusive new profile codex' })).toBeNull()
+      // The existing row checkbox keeps its own distinct identity.
+      expect((screen.getByRole('checkbox', { name: 'Exclusive codex.worker' }) as HTMLInputElement).checked).toBe(false)
+      fireEvent.click(screen.getByRole('button', { name: 'Save all changes' }))
+      await waitFor(() => expect(api.patchGlobalConfig).toHaveBeenCalledWith({ expected_revision: config.revision, actions: [{ type: 'upsert_profile', harness: 'codex', profile: 'named-row', exclusive: true }] }))
+    })
+
+    it('retains a dirty exclusive draft through an unchanged passive refresh', async () => {
+      const firstProject = selectedProject
+      const otherProject = { ...selectedProject, id: 'beta', display_name: 'Beta', current_path: '/code/beta' }
+      const view = render(<GlobalSettings project={firstProject} onDirtyChange={() => {}} onSaved={() => {}} />)
+      const checkbox = await screen.findByRole('checkbox', { name: 'Exclusive codex.worker' }) as HTMLInputElement
+      fireEvent.click(checkbox)
+      expect(checkbox.checked).toBe(true)
+      expect((screen.getByRole('button', { name: 'Save all changes' }) as HTMLButtonElement).disabled).toBe(false)
+      // A passive refresh (re-load with unchanged server data) must not clear the draft.
+      view.rerender(<GlobalSettings project={otherProject} onDirtyChange={() => {}} onSaved={() => {}} />)
+      await waitFor(() => expect(api.getGlobalConfig).toHaveBeenCalledTimes(2))
+      expect(checkbox.checked).toBe(true)
+      expect((screen.getByRole('button', { name: 'Save all changes' }) as HTMLButtonElement).disabled).toBe(false)
+      expect(screen.queryByText(/changed on the server/)).toBeNull()
+      expect(api.patchGlobalConfig).not.toHaveBeenCalled()
+    })
+
+    it('restores the saved checked state on the confirmed discard/reload without sending a patch', async () => {
+      vi.spyOn(window, 'confirm').mockReturnValue(true)
+      render(<GlobalSettings onDirtyChange={() => {}} onSaved={() => {}} />)
+      const checkbox = await screen.findByRole('checkbox', { name: 'Exclusive codex.worker' }) as HTMLInputElement
+      expect(checkbox.checked).toBe(false)
+      fireEvent.click(checkbox)
+      expect(checkbox.checked).toBe(true)
+      fireEvent.click(screen.getByRole('button', { name: 'Reload server settings' }))
+      await waitFor(() => expect(checkbox.checked).toBe(false))
+      expect(api.patchGlobalConfig).not.toHaveBeenCalled()
+      expect((screen.getByRole('button', { name: 'Save all changes' }) as HTMLButtonElement).disabled).toBe(true)
+      expect(screen.queryByRole('alert')).toBeNull()
+    })
+
+    it('toggles the focused exclusive checkbox through keyboard activation', async () => {
+      render(<GlobalSettings onDirtyChange={() => {}} onSaved={() => {}} />)
+      const checkbox = await screen.findByRole('checkbox', { name: 'Exclusive codex.worker' }) as HTMLInputElement
+      await waitFor(() => expect(checkbox.disabled).toBe(false))
+      checkbox.focus()
+      expect(document.activeElement).toBe(checkbox)
+      // Space activation of the focused checkbox (jsdom delivers it as the control click).
+      fireEvent.keyDown(checkbox, { key: ' ', code: 'Space' })
+      fireEvent.click(checkbox)
+      expect(checkbox.checked).toBe(true)
+      expect((screen.getByRole('button', { name: 'Save all changes' }) as HTMLButtonElement).disabled).toBe(false)
+    })
+
+    it('toggles the exclusive checkbox through its visible label as the touch-equivalent activation', async () => {
+      render(<GlobalSettings onDirtyChange={() => {}} onSaved={() => {}} />)
+      const checkbox = await screen.findByRole('checkbox', { name: 'Exclusive codex.worker' }) as HTMLInputElement
+      expect(checkbox.checked).toBe(false)
+      await waitFor(() => expect(checkbox.disabled).toBe(false))
+      // Pointer activation on the visible label text reaches the wrapped control.
+      fireEvent.click(screen.getByText('Exclusive', { exact: true }))
+      expect(checkbox.checked).toBe(true)
+      expect(checkbox.closest('label')!.classList.contains('profile-editor-exclusive-label')).toBe(true)
+    })
+
+    it('retains the exclusive draft after a failed save and across navigation', async () => {
+      vi.mocked(api.patchGlobalConfig).mockRejectedValueOnce(new Error('conflict'))
+      render(<GlobalSettings onDirtyChange={() => {}} onSaved={() => {}} />)
+      const checkbox = await screen.findByRole('checkbox', { name: 'Exclusive codex.worker' }) as HTMLInputElement
+      fireEvent.click(checkbox)
+      fireEvent.click(screen.getByRole('button', { name: 'Save all changes' }))
+      await screen.findByText(/conflict.*Your remaining edits are retained/)
+      expect(checkbox.checked).toBe(true)
+
+      vi.mocked(api.patchGlobalConfig).mockResolvedValue(config)
+      fireEvent.click(screen.getByRole('tab', { name: 'General', exact: true }))
+      fireEvent.click(screen.getByRole('tab', { name: 'Agents & Roles', exact: true }))
+      expect(checkbox.checked).toBe(true)
+    })
+
+    it('treats a cancelled exclusive edit as no change and stays keyboard accessible', async () => {
+      render(<GlobalSettings onDirtyChange={() => {}} onSaved={() => {}} />)
+      const checkbox = await screen.findByRole('checkbox', { name: 'Exclusive codex.worker' }) as HTMLInputElement
+      fireEvent.focus(checkbox)
+      fireEvent.click(checkbox)
+      expect(checkbox.checked).toBe(true)
+      fireEvent.click(checkbox)
+      expect(checkbox.checked).toBe(false)
+      expect((screen.getByRole('button', { name: 'Save all changes' }) as HTMLButtonElement).disabled).toBe(true)
+      expect(api.patchGlobalConfig).not.toHaveBeenCalled()
+    })
+  })
+
   it('includes an in-progress prompt rename in Save and preserves it across tabs', async () => {
     render(<GlobalSettings onDirtyChange={() => {}} onSaved={() => {}} />)
     await screen.findByLabelText('Effort codex.worker')
