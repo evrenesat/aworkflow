@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import errno
 import hashlib
+import inspect
 import json
 import os
 import re
@@ -15,7 +16,7 @@ from datetime import datetime, timezone
 from dataclasses import asdict, dataclass, replace
 from enum import Enum
 from pathlib import Path
-from typing import TYPE_CHECKING, Callable, Literal, Mapping, NoReturn, Sequence
+from typing import TYPE_CHECKING, Callable, Literal, Mapping, NoReturn, Sequence, cast
 from uuid import uuid4
 
 if TYPE_CHECKING:
@@ -429,6 +430,7 @@ class _ManagerCallExecutor:
     banner: BannerRenderer
     adapter: HarnessAdapter | None
     preflight_or_fail: Callable[..., None]
+    resource_admission: _AuxiliaryAdmissionContext | None = None
 
     def refresh_configuration(
         self,
@@ -439,6 +441,52 @@ class _ManagerCallExecutor:
         """Replace live configuration without resetting manager state."""
         self.workflow_config = workflow_config
         self.max_turns = max_turns
+
+    def _prepare_manager_route(
+        self,
+        config: WorkflowUserConfig,
+        *,
+        level: str,
+        baseline_team_name: str | None,
+        system_prompt: str,
+        user_prompt: str,
+        context_schema_version: int,
+        current_step_name: str | None,
+    ) -> tuple[str, ResolvedProfile, tuple[HarnessAdapter, object]]:
+        """Resolve, build, and preflight one manager route (no model call)."""
+        role_resolution = resolve_manager_role(
+            config, level=level, baseline_team=baseline_team_name,  # type: ignore[arg-type]
+            workflow_name=self.workflow_name,
+        )
+        profile = resolve_profile(role_resolution.selector, config, step_path="manager")
+        adapter = self.adapter or get_adapter(profile.harness_name)
+        if (
+            context_schema_version >= 4
+            and not adapter_manager_workspace_read(adapter)
+        ):
+            raise ManagerDecisionError(
+                "manager adapter "
+                f"'{getattr(adapter, 'name', type(adapter).__name__)}' "
+                "does not advertise manager_workspace_read; reference-only manager "
+                "contexts require repository workspace-read capability"
+            )
+        invocation = adapter.build_invocation(
+            repo_root=self.execution_repo_root,
+            model=profile.model,
+            system_prompt=system_prompt,
+            user_prompt=user_prompt,
+            effort=profile.effort,
+        ).for_final_output()
+        self.preflight_or_fail(
+            invocation,
+            adapter,
+            invocation_kind="manager",
+            cwd=self.execution_repo_root,
+            step_name=current_step_name,
+            turn_number=self.state.turns_completed + 1,
+            manager_level=level,
+        )
+        return role_resolution.selector, profile, (adapter, invocation)
 
     def run(
         self,
@@ -647,41 +695,96 @@ class _ManagerCallExecutor:
         role_resolution = None
         manager_profile = None
         manager_adapter = None
+        manager_lease: ExecutionLease | None = None
         try:
             if prelaunch_failure:
                 raise ManagerDecisionError(error or "manager context was unavailable before provider launch")
-            role_resolution = resolve_manager_role(
-                self.workflow_config, level=level, baseline_team=baseline_team_name,  # type: ignore[arg-type]
-                workflow_name=self.workflow_name,
-            )
-            manager_profile = resolve_profile(role_resolution.selector, self.workflow_config, step_path="manager")
-            manager_adapter = self.adapter or get_adapter(manager_profile.harness_name)
-            if (
-                boundary.context_schema_version >= 4
-                and not adapter_manager_workspace_read(manager_adapter)
-            ):
-                raise ManagerDecisionError(
-                    "manager adapter "
-                    f"'{getattr(manager_adapter, 'name', type(manager_adapter).__name__)}' "
-                    "does not advertise manager_workspace_read; reference-only manager "
-                    "contexts require repository workspace-read capability"
+            if self.resource_admission is not None:
+                def _prepare_manager_admission(
+                    cfg: WorkflowUserConfig | None,
+                ) -> tuple[str, object, ResolvedProfile, object]:
+                    config = cfg if cfg is not None else self.workflow_config
+                    if (
+                        cfg is not None
+                        and config.manager.skill != self.workflow_config.manager.skill
+                    ):
+                        rebuilt_system, rebuilt_user = build_manager_prompts(
+                            context, skill_name=config.manager.skill
+                        )
+                    else:
+                        rebuilt_system, rebuilt_user = system_prompt, user_prompt
+                    selector, profile, route_payload = self._prepare_manager_route(
+                        config,
+                        level=level,
+                        baseline_team_name=baseline_team_name,
+                        system_prompt=rebuilt_system,
+                        user_prompt=rebuilt_user,
+                        context_schema_version=boundary.context_schema_version,
+                        current_step_name=current_step_name,
+                    )
+                    return (
+                        selector,
+                        _manager_route_identity(
+                            config,
+                            level=level,
+                            baseline_team_name=baseline_team_name,
+                            workflow_name=self.workflow_name,
+                        ),
+                        profile,
+                        (*route_payload, rebuilt_system, rebuilt_user),
+                    )
+                grant = self.resource_admission.admit(
+                    _prepare_manager_admission,
+                    resolve_route=lambda config: _manager_route_identity(
+                        config,
+                        level=level,
+                        baseline_team_name=baseline_team_name,
+                        workflow_name=self.workflow_name,
+                    ),
                 )
-            manager_invocation = manager_adapter.build_invocation(
-                repo_root=self.execution_repo_root,
-                model=manager_profile.model,
-                system_prompt=system_prompt,
-                user_prompt=user_prompt,
-                effort=manager_profile.effort,
-            ).for_final_output()
-            self.preflight_or_fail(
-                manager_invocation,
-                manager_adapter,
-                invocation_kind="manager",
-                cwd=self.execution_repo_root,
-                step_name=current_step_name,
-                turn_number=self.state.turns_completed + 1,
-                manager_level=level,
-            )
+                manager_profile = grant.resolved
+                manager_adapter, manager_invocation = (
+                    grant.payload[0],
+                    cast(HarnessInvocation, grant.payload[1]),
+                )
+                system_prompt, user_prompt = grant.payload[2], grant.payload[3]
+                manager_lease = grant.lease
+            else:
+                role_resolution = resolve_manager_role(
+                    self.workflow_config, level=level, baseline_team=baseline_team_name,  # type: ignore[arg-type]
+                    workflow_name=self.workflow_name,
+                )
+                manager_profile = resolve_profile(role_resolution.selector, self.workflow_config, step_path="manager")
+                manager_adapter = self.adapter or get_adapter(manager_profile.harness_name)
+                if (
+                    boundary.context_schema_version >= 4
+                    and not adapter_manager_workspace_read(manager_adapter)
+                ):
+                    raise ManagerDecisionError(
+                        "manager adapter "
+                        f"'{getattr(manager_adapter, 'name', type(manager_adapter).__name__)}' "
+                        "does not advertise manager_workspace_read; reference-only manager "
+                        "contexts require repository workspace-read capability"
+                    )
+                manager_invocation = manager_adapter.build_invocation(
+                    repo_root=self.execution_repo_root,
+                    model=manager_profile.model,
+                    system_prompt=system_prompt,
+                    user_prompt=user_prompt,
+                    effort=manager_profile.effort,
+                ).for_final_output()
+                self.preflight_or_fail(
+                    manager_invocation,
+                    manager_adapter,
+                    invocation_kind="manager",
+                    cwd=self.execution_repo_root,
+                    step_name=current_step_name,
+                    turn_number=self.state.turns_completed + 1,
+                    manager_level=level,
+                )
+            # The invocation-start marker and budget metrics are recorded only
+            # after admission (or the unmarked legacy fast path), and the
+            # dispatch carries the exclusive lease.
             _emit_event(self.observer, ManagerStartedEvent.create(
                 decision_number=decision_number, level=level, trigger=boundary.trigger,
                 target_step=boundary.proposed_transition, target_team=target_team,
@@ -701,9 +804,11 @@ class _ManagerCallExecutor:
                     argv=manager_invocation.argv,
                 )
             if self.runner is None:
-                completed = _run_process(manager_invocation, self.execution_repo_root, self.banner, self.state)
+                completed = _run_process(manager_invocation, self.execution_repo_root, self.banner, self.state, lease=manager_lease)
             else:
-                completed = _run_injected_runner(self.runner, manager_invocation, self.execution_repo_root)
+                completed = _run_injected_runner(self.runner, manager_invocation, self.execution_repo_root, lease=manager_lease)
+            if self.resource_admission is not None:
+                self.resource_admission.note_released()
             stdout, stderr = completed.stdout, completed.stderr
             if completed.returncode != 0:
                 raise ManagerDecisionError(f"manager harness exited with code {completed.returncode}")
@@ -738,6 +843,14 @@ class _ManagerCallExecutor:
             note_violation = exc
             error = str(exc)
             result_payload["error"] = error
+        except OwnerStopRequested:
+            # Owner stop during admission: the engine has cancelled the claim;
+            # the run_workflow call site finalizes the owner-stop boundary.
+            raise
+        except ResourceLeaseError:
+            # Exclusive resource became unavailable; fail closed before the
+            # generic decision-error handler can record an invalid decision.
+            raise
         except (ManagerDecisionError, ValueError, WorkflowError) as exc:
             if isinstance(exc, WorkflowError) and exc.failure_kind == "environment_preflight":
                 raise
@@ -828,35 +941,86 @@ class _ManagerCallExecutor:
                     raise ManagerDecisionError(
                         "manager target plan identity or note scope drifted before correction"
                     )
-                correction_system_prompt, correction_user_prompt = (
-                    build_manager_note_correction_prompts(
-                        context,
-                        original_decision=original_candidate,
-                        violation=note_violation,
-                        skill_name=self.workflow_config.manager.skill,
+                correction_lease: ExecutionLease | None = None
+                if self.resource_admission is not None:
+                    def _prepare_correction_admission(
+                        cfg: WorkflowUserConfig | None,
+                    ) -> tuple[str, object, ResolvedProfile, object]:
+                        config = cfg if cfg is not None else self.workflow_config
+                        csys, cuser = build_manager_note_correction_prompts(
+                            context,
+                            original_decision=original_candidate,
+                            violation=note_violation,
+                            skill_name=config.manager.skill,
+                        )
+                        selector, profile, route_payload = self._prepare_manager_route(
+                            config,
+                            level=level,
+                            baseline_team_name=baseline_team_name,
+                            system_prompt=csys,
+                            user_prompt=cuser,
+                            context_schema_version=boundary.context_schema_version,
+                            current_step_name=current_step_name,
+                        )
+                        return (
+                            selector,
+                            _manager_route_identity(
+                                config,
+                                level=level,
+                                baseline_team_name=baseline_team_name,
+                                workflow_name=self.workflow_name,
+                            ),
+                            profile,
+                            (*route_payload, csys, cuser),
+                        )
+                    cgrant = self.resource_admission.admit(
+                        _prepare_correction_admission,
+                        resolve_route=lambda config: _manager_route_identity(
+                            config,
+                            level=level,
+                            baseline_team_name=baseline_team_name,
+                            workflow_name=self.workflow_name,
+                        ),
                     )
-                )
+                    correction_invocation = cast(
+                        HarnessInvocation, cgrant.payload[1]
+                    )
+                    correction_system_prompt = cgrant.payload[2]
+                    correction_user_prompt = cgrant.payload[3]
+                    correction_lease = cgrant.lease
+                else:
+                    correction_system_prompt, correction_user_prompt = (
+                        build_manager_note_correction_prompts(
+                            context,
+                            original_decision=original_candidate,
+                            violation=note_violation,
+                            skill_name=self.workflow_config.manager.skill,
+                        )
+                    )
+                    if manager_profile is None or manager_adapter is None:
+                        raise ManagerDecisionError(
+                            "manager correction cannot reuse unresolved manager profile"
+                        )
+                    correction_invocation = manager_adapter.build_invocation(
+                        repo_root=self.execution_repo_root,
+                        model=manager_profile.model,
+                        system_prompt=correction_system_prompt,
+                        user_prompt=correction_user_prompt,
+                        effort=manager_profile.effort,
+                    ).for_final_output()
+                    self.preflight_or_fail(
+                        correction_invocation,
+                        manager_adapter,
+                        invocation_kind="manager_note_correction",
+                        cwd=self.execution_repo_root,
+                        step_name=current_step_name,
+                        turn_number=self.state.turns_completed + 1,
+                        manager_level=level,
+                    )
+                # The correction is an independent queue participant: it
+                # acquires its own ticket after the parent decision's lease
+                # has been released, never nesting under it.
                 correction_invoked = True
-                if manager_profile is None or manager_adapter is None:
-                    raise ManagerDecisionError(
-                        "manager correction cannot reuse unresolved manager profile"
-                    )
-                correction_invocation = manager_adapter.build_invocation(
-                    repo_root=self.execution_repo_root,
-                    model=manager_profile.model,
-                    system_prompt=correction_system_prompt,
-                    user_prompt=correction_user_prompt,
-                    effort=manager_profile.effort,
-                ).for_final_output()
-                self.preflight_or_fail(
-                    correction_invocation,
-                    manager_adapter,
-                    invocation_kind="manager_note_correction",
-                    cwd=self.execution_repo_root,
-                    step_name=current_step_name,
-                    turn_number=self.state.turns_completed + 1,
-                    manager_level=level,
-                )
                 correction_consumed = True
                 correction_result["invocation"] = {
                     "label": correction_invocation.label,
@@ -864,12 +1028,16 @@ class _ManagerCallExecutor:
                 }
                 if self.runner is None:
                     correction_completed = _run_process(
-                        correction_invocation, self.execution_repo_root, self.banner, self.state
+                        correction_invocation, self.execution_repo_root, self.banner, self.state,
+                        lease=correction_lease,
                     )
                 else:
                     correction_completed = _run_injected_runner(
-                        self.runner, correction_invocation, self.execution_repo_root
+                        self.runner, correction_invocation, self.execution_repo_root,
+                        lease=correction_lease,
                     )
+                if self.resource_admission is not None:
+                    self.resource_admission.note_released()
                 correction_stdout = correction_completed.stdout
                 correction_stderr = correction_completed.stderr
                 if correction_completed.returncode != 0:
@@ -909,6 +1077,10 @@ class _ManagerCallExecutor:
                 error = None
                 correction_status = "accepted"
                 correction_result.update({"status": "accepted", **corrected.to_dict()})
+            except OwnerStopRequested:
+                raise
+            except ResourceLeaseError:
+                raise
             except (ManagerDecisionError, ValueError, WorkflowError, SkillStoreError) as exc:
                 if isinstance(exc, WorkflowError) and exc.failure_kind == "environment_preflight":
                     raise
@@ -978,7 +1150,9 @@ class _RepartitionCycleExecutor:
     execution_context: ExecutionContext | None
     fail_manager_gate: Callable[..., NoReturn]
     persist_repartition: Callable[[PendingRepartitionV1], None]
-    prepare_repartition_invocation: Callable[..., HarnessInvocation]
+    prepare_repartition_invocation: Callable[
+        ..., tuple[HarnessInvocation, ResolvedProfile]
+    ]
     invoke_repartition_full: Callable[..., tuple[str, str, str | None]]
 
     def refresh_configuration(self, workflow_config: WorkflowUserConfig) -> None:
@@ -3567,6 +3741,278 @@ def _resource_wait_record(
 
 
 @dataclass(frozen=True)
+class _AuxiliaryAdmissionGrant:
+    """Result of one auxiliary admission: lease plus the prepared payload."""
+
+    lease: ExecutionLease | None
+    selector: str
+    resolved: ResolvedProfile
+    payload: object
+
+
+class _AuxiliaryAdmissionContext:
+    """Shared admission/lifetime contract for auxiliary model-bearing calls.
+
+    One context per auxiliary call category (manager, repartition,
+    bootstrap, team-lead recovery, merge, provider handover).  Every
+    :meth:`admit` call is an independent FIFO participant with a fresh
+    invocation id: note corrections and partitioning subcalls never nest
+    under a parent turn's lease.  While a claim is queued the context
+    revalidates the live configuration (route identity only); a
+    ``TurnReprepareRequired`` verdict re-runs the site's ``prepare``
+    callable against the refreshed configuration and re-queues, retaining
+    the ticket only when the verdict carries an invocation id.
+
+    Unmarked profiles keep the legacy fast path: the engine is not
+    contacted and no lease is produced.  ``prepare`` runs the site's
+    non-model readiness work (route resolution, invocation build,
+    preflight) and returns the selector, a comparable route identity,
+    the resolved profile, and the site's dispatch payload.
+    """
+
+    def __init__(
+        self,
+        *,
+        project_root: Path,
+        run_id: str,
+        kind: str,
+        role: str,
+        observer: "ExecutionObserver | None",
+        stop_check: Callable[[], None],
+        live_config_source_path: Path | None = None,
+        persist_wait: Callable[[dict[str, object] | None], None] | None = None,
+        emit_event: Callable[..., None] | None = None,
+        step_name: Callable[[], str] | None = None,
+    ) -> None:
+        self._project_root = project_root
+        self._run_id = run_id
+        self._kind = kind
+        self._role = role
+        self._observer = observer
+        self._stop_check = stop_check
+        self._live_config_source_path = live_config_source_path
+        self._persist_wait = persist_wait
+        self._emit_event = emit_event
+        self._step_name = step_name
+        self._invocation_id = ""
+        self._resolve_route: Callable[[WorkflowUserConfig], object] | None = None
+        self._revision_cache: tuple | None = None
+        self._captured_route: object | None = None
+        self._last_loaded_config: WorkflowUserConfig | None = None
+        self._wait_started_at: str | None = None
+        self._controller: ControllerIdentity | None = None
+        self._last_resource: str | None = None
+        self._last_label: str | None = None
+
+    @property
+    def last_loaded_config(self) -> WorkflowUserConfig | None:
+        return self._last_loaded_config
+
+    def admit(
+        self,
+        prepare: Callable[
+            [WorkflowUserConfig | None],
+            tuple[str, object, ResolvedProfile, object],
+        ],
+        resolve_route: Callable[[WorkflowUserConfig], object] | None = None,
+    ) -> _AuxiliaryAdmissionGrant:
+        """Admit one auxiliary subcall as an independent queue participant."""
+        self._invocation_id = uuid4().hex
+        self._captured_route = None
+        self._revision_cache = None
+        self._last_loaded_config = None
+        self._resolve_route = resolve_route
+        while True:
+            selector, route_identity, resolved, payload = prepare(
+                self._last_loaded_config
+            )
+            if resolved.exclusive_resource is None:
+                return _AuxiliaryAdmissionGrant(None, selector, resolved, payload)
+            resource = resolved.exclusive_resource
+            label = _resource_label(resolved)
+            self._captured_route = route_identity
+            store = _default_execution_resource_store()
+            controller = store.current_controller_identity()
+            self._controller = controller
+            self._wait_started_at = None
+            admission = ExecutionResourceAdmission(
+                store, **_execution_resource_admission_options()
+            )
+            spec = ClaimSpec(
+                project_root=str(self._project_root),
+                run_id=str(self._run_id),
+                invocation_id=self._invocation_id,
+                kind=self._kind,
+                role=self._role,
+                selector=selector,
+            )
+            try:
+                lease = admission.admit(
+                    resource=resource,
+                    spec=spec,
+                    controller=controller,
+                    stop_check=self._stop_check,
+                    revalidate=self._revalidate,
+                    on_waiting=lambda reason, ticket: self._on_waiting(
+                        resource, label, selector, reason, ticket
+                    ),
+                    on_acquired=lambda ticket: self._on_acquired(
+                        resource, label, ticket
+                    ),
+                    on_cancelled=lambda reason: self._on_cancelled(
+                        resource, label, reason
+                    ),
+                )
+            except TurnReprepareRequired as reprepare:
+                self._invocation_id = (
+                    reprepare.retained_invocation_id
+                    if reprepare.retained_invocation_id is not None
+                    else uuid4().hex
+                )
+                continue
+            return _AuxiliaryAdmissionGrant(lease, selector, resolved, payload)
+
+    # -- hooks -------------------------------------------------------------
+
+    def _step(self) -> str:
+        return self._step_name() if self._step_name is not None else ""
+
+    def _emit(
+        self,
+        phase: str,
+        *,
+        resource: str,
+        label: str,
+        ticket: int | None = None,
+        reason: str | None = None,
+    ) -> None:
+        if self._emit_event is None:
+            return
+        self._emit_event(
+            phase,
+            resource=resource,
+            label=label,
+            ticket=ticket,
+            reason=reason,
+            step_name=self._step(),
+            role=self._role,
+            invocation_id=self._invocation_id or None,
+        )
+
+    def _on_waiting(
+        self,
+        resource: str,
+        label: str,
+        selector: str,
+        reason: str | None,
+        ticket: int | None,
+    ) -> None:
+        if self._wait_started_at is None:
+            self._wait_started_at = datetime.now(timezone.utc).isoformat()
+        if self._persist_wait is not None:
+            self._persist_wait(
+                _resource_wait_record(
+                    resource=resource,
+                    label=label,
+                    ticket=ticket,
+                    reason=reason,
+                    step_name=self._step(),
+                    role=self._role,
+                    invocation_id=self._invocation_id,
+                    kind=self._kind,
+                    selector=selector,
+                    wait_started_at=self._wait_started_at,
+                    controller=self._controller,
+                )
+            )
+        self._emit(
+            "waiting", resource=resource, label=label, ticket=ticket, reason=reason
+        )
+
+    def _on_acquired(
+        self, resource: str, label: str, ticket: int | None
+    ) -> None:
+        self._wait_started_at = None
+        if self._persist_wait is not None:
+            self._persist_wait(None)
+        self._last_resource = resource
+        self._last_label = label
+        self._emit("acquired", resource=resource, label=label, ticket=ticket)
+
+    def _on_cancelled(self, resource: str, label: str, reason: str) -> None:
+        self._wait_started_at = None
+        if self._persist_wait is not None:
+            self._persist_wait(None)
+        self._emit("cancelled", resource=resource, label=label, reason=reason)
+
+    def note_released(self) -> None:
+        """Record the release of the most recent granted lease.
+
+        Called by each auxiliary dispatch path immediately after the
+        granted invocation has returned and its lease has been completed.
+        Non-exclusive grants have no lease, so this is a no-op for them.
+        """
+        if self._last_resource is None:
+            return
+        self._emit(
+            "released", resource=self._last_resource, label=self._last_label
+        )
+        self._last_resource = None
+        self._last_label = None
+
+    # -- live configuration revalidation ------------------------------------
+
+    def _revalidate(self, final: bool) -> RevalidationVerdict:
+        if self._live_config_source_path is None or self._resolve_route is None:
+            return UNCHANGED
+        revision = self._live_revision()
+        if not final and revision is not None and revision == self._revision_cache:
+            return UNCHANGED
+        try:
+            loaded = load_live_config(
+                self._live_config_source_path, nonblocking=True
+            )
+        except LiveConfigPairLockBusy:
+            if final:
+                return RevalidationVerdict("retry", None, "pair_lock_busy")
+            return UNCHANGED
+        self._revision_cache = revision
+        self._last_loaded_config = loaded.workflow_config
+        if self._captured_route is None:
+            return UNCHANGED
+        new_route = self._resolve_route(loaded.workflow_config)
+        if new_route != self._captured_route:
+            return RevalidationVerdict("reprepare", None, "route_changed")
+        return UNCHANGED
+
+    def _live_revision(self) -> tuple | None:
+        path = self._live_config_source_path
+        if path is None:
+            return None
+        try:
+            stat = path.stat()
+        except OSError:
+            return None
+        workflows = path.with_name("workflows.toml")
+        wstat = None
+        try:
+            if workflows.exists():
+                wstat = workflows.stat()
+        except OSError:
+            wstat = None
+        return (
+            stat.st_mtime_ns,
+            stat.st_size,
+            stat.st_ino,
+            (
+                (wstat.st_mtime_ns, wstat.st_size, wstat.st_ino)
+                if wstat is not None
+                else None
+            ),
+        )
+
+
+@dataclass(frozen=True)
 class _PreparedPrimaryPlanForMerge:
     plan_path: Path
     original_text: str | None
@@ -3593,6 +4039,36 @@ def resolve_profile(
     *, step_path: str,
 ) -> ResolvedProfile:
     return _resolve_selector(selector, config, step_path=step_path)
+
+
+def _manager_route_identity(
+    config: WorkflowUserConfig,
+    *,
+    level: str,
+    baseline_team_name: str | None,
+    workflow_name: str,
+) -> tuple[str, str | None, str | None, str | None, str]:
+    """Comparable identity for one manager route under the live config.
+
+    Includes the effective resolved profile (exclusive resource, model,
+    effort) in addition to the selector and manager skill, so a live edit to
+    the same selector's model or effort re-identifies the route and reprepares
+    a queued manager call or note correction.  A prompt or unrelated config
+    edit leaves every field unchanged and therefore retains the claim.
+    """
+    selector = resolve_manager_role(
+        config, level=level,  # type: ignore[arg-type]
+        baseline_team=baseline_team_name,
+        workflow_name=workflow_name,
+    ).selector
+    profile = resolve_profile(selector, config, step_path="manager")
+    return (
+        selector,
+        profile.exclusive_resource,
+        profile.model,
+        profile.effort,
+        config.manager.skill,
+    )
 
 
 def _resolve_selector(
@@ -5793,6 +6269,30 @@ def _run_injected_runner(
     return completed
 
 
+def _handover_claim_retained_after_error(
+    lease: ExecutionLease, error: BaseException
+) -> bool:
+    """Retain the handover claim unless the callback already released it.
+
+    Returns True when the claim was still present after the callback raised:
+    it is now durably ``unconfirmed`` because the owned child's cessation
+    was never positively confirmed, and the caller must surface a
+    resource-specific error.  Returns False when the callback had already
+    released the claim after confirmed reap, so its original error is the
+    truthful outcome.  Retention attempts failing for any other reason raise
+    fail-closed instead of guessing.
+    """
+    try:
+        lease.mark_unconfirmed()
+    except ResourceLeaseError as retain_error:
+        if retain_error.reason == "not_owner":
+            return False
+        raise ResourceLeaseError(
+            "handover", str(retain_error), context=error
+        ) from error
+    return True
+
+
 def _workflow_requires_git_tracking(
     wf: WorkflowConfig,
     config: WorkflowUserConfig,
@@ -7040,39 +7540,79 @@ def _execute_init_repo_handoff(
     readme_body: str,
     banner: BannerRenderer,
     state: ControllerState,
+    admission: _AuxiliaryAdmissionContext | None = None,
 ) -> tuple[subprocess.CompletedProcess[str], OutputContract]:
-    team_lead_role = workflow_config.aflow.team_lead
-    if not team_lead_role:
-        raise WorkflowError("lifecycle bootstrap requires [aflow].team_lead to be configured")
-
-    team_lead_selector = resolve_role_selector(
-        team_lead_role, team_name, workflow_config, step_path="lifecycle bootstrap"
-    )
-    resolved = resolve_profile(team_lead_selector, workflow_config, step_path="lifecycle bootstrap")
-
     user_prompt = _build_init_repo_user_prompt(primary_root, main_branch, readme_title, readme_body)
 
-    init_adapter = adapter or get_adapter(resolved.harness_name)
-    invocation = init_adapter.build_invocation(
-        repo_root=primary_root,
-        model=resolved.model,
-        system_prompt="",
-        user_prompt=user_prompt,
-        effort=resolved.effort,
-    )
+    def _bootstrap_route(
+        cfg: WorkflowUserConfig,
+    ) -> tuple[str, ResolvedProfile]:
+        team_lead_role = cfg.aflow.team_lead
+        if not team_lead_role:
+            raise WorkflowError(
+                "lifecycle bootstrap requires [aflow].team_lead to be configured"
+            )
+        team_lead_selector = resolve_role_selector(
+            team_lead_role, team_name, cfg, step_path="lifecycle bootstrap"
+        )
+        return team_lead_selector, resolve_profile(
+            team_lead_selector, cfg, step_path="lifecycle bootstrap"
+        )
 
-    _preflight_invocation(
-        invocation,
-        init_adapter,
-        preflight_probe,
-        invocation_kind="lifecycle_bootstrap",
-        cwd=primary_root,
-        lifecycle_phase="bootstrap",
-    )
-    if runner is None:
-        completed = _run_process(invocation, primary_root, banner, state)
+    lease: ExecutionLease | None = None
+    if admission is not None:
+        def _prepare_bootstrap_admission(
+            cfg: WorkflowUserConfig | None,
+        ) -> tuple[str, object, ResolvedProfile, object]:
+            config = cfg if cfg is not None else workflow_config
+            team_lead_selector, resolved = _bootstrap_route(config)
+            init_adapter = adapter or get_adapter(resolved.harness_name)
+            invocation = init_adapter.build_invocation(
+                repo_root=primary_root,
+                model=resolved.model,
+                system_prompt="",
+                user_prompt=user_prompt,
+                effort=resolved.effort,
+            )
+            _preflight_invocation(
+                invocation,
+                init_adapter,
+                preflight_probe,
+                invocation_kind="lifecycle_bootstrap",
+                cwd=primary_root,
+                lifecycle_phase="bootstrap",
+            )
+            return team_lead_selector, resolved, resolved, invocation
+        grant = admission.admit(
+            _prepare_bootstrap_admission,
+            resolve_route=lambda config: _bootstrap_route(config),
+        )
+        invocation = cast(HarnessInvocation, grant.payload)
+        lease = grant.lease
     else:
-        completed = _run_injected_runner(runner, invocation, primary_root)
+        team_lead_selector, resolved = _bootstrap_route(workflow_config)
+        init_adapter = adapter or get_adapter(resolved.harness_name)
+        invocation = init_adapter.build_invocation(
+            repo_root=primary_root,
+            model=resolved.model,
+            system_prompt="",
+            user_prompt=user_prompt,
+            effort=resolved.effort,
+        )
+        _preflight_invocation(
+            invocation,
+            init_adapter,
+            preflight_probe,
+            invocation_kind="lifecycle_bootstrap",
+            cwd=primary_root,
+            lifecycle_phase="bootstrap",
+        )
+    if runner is None:
+        completed = _run_process(invocation, primary_root, banner, state, lease=lease)
+    else:
+        completed = _run_injected_runner(runner, invocation, primary_root, lease=lease)
+    if admission is not None:
+        admission.note_released()
     return completed, invocation.output_contract
 
 
@@ -7120,8 +7660,8 @@ def _run_team_lead_recovery_handoff(
     matched_rule_action: str | None,
     matched_terms: tuple[str, ...],
     backup_team: str | None,
+    admission: _AuxiliaryAdmissionContext | None = None,
 ) -> TeamLeadRecoveryDecision:
-    resolved = _resolve_team_lead_profile(workflow_config, team_name=team_name, step_path=step_path)
     user_prompt = build_team_lead_recovery_prompt(
         step_path=step_path,
         current_team=current_team,
@@ -7140,27 +7680,80 @@ def _run_team_lead_recovery_handoff(
         matched_terms=matched_terms,
         backup_team=backup_team,
     )
-    lead_adapter = adapter or get_adapter(resolved.harness_name)
-    invocation = lead_adapter.build_invocation(
-        repo_root=repo_root,
-        model=resolved.model,
-        system_prompt="",
-        user_prompt=user_prompt,
-        effort=resolved.effort,
-    )
-    _preflight_invocation(
-        invocation,
-        lead_adapter,
-        preflight_probe,
-        invocation_kind="team_lead_recovery",
-        cwd=repo_root,
-        step_name=step_path,
-        turn_number=state.turns_completed + 1,
-    )
-    if runner is None:
-        completed = _run_process(invocation, repo_root, banner, state)
+
+    def _recovery_route(
+        cfg: WorkflowUserConfig,
+    ) -> tuple[str, ResolvedProfile]:
+        team_lead_role = cfg.aflow.team_lead
+        if not team_lead_role:
+            raise WorkflowError(
+                f"{step_path} requires [aflow].team_lead to be configured"
+            )
+        team_lead_selector = resolve_role_selector(
+            team_lead_role, team_name, cfg, step_path=step_path
+        )
+        return team_lead_selector, resolve_profile(
+            team_lead_selector, cfg, step_path=step_path
+        )
+
+    lease: ExecutionLease | None = None
+    if admission is not None:
+        def _prepare_recovery_admission(
+            cfg: WorkflowUserConfig | None,
+        ) -> tuple[str, object, ResolvedProfile, object]:
+            config = cfg if cfg is not None else workflow_config
+            team_lead_selector, resolved = _recovery_route(config)
+            lead_adapter = adapter or get_adapter(resolved.harness_name)
+            invocation = lead_adapter.build_invocation(
+                repo_root=repo_root,
+                model=resolved.model,
+                system_prompt="",
+                user_prompt=user_prompt,
+                effort=resolved.effort,
+            )
+            _preflight_invocation(
+                invocation,
+                lead_adapter,
+                preflight_probe,
+                invocation_kind="team_lead_recovery",
+                cwd=repo_root,
+                step_name=step_path,
+                turn_number=state.turns_completed + 1,
+            )
+            return team_lead_selector, resolved, resolved, invocation
+        grant = admission.admit(
+            _prepare_recovery_admission,
+            resolve_route=lambda config: _recovery_route(config),
+        )
+        invocation = cast(HarnessInvocation, grant.payload)
+        lease = grant.lease
     else:
-        completed = _run_injected_runner(runner, invocation, repo_root)
+        resolved = _resolve_team_lead_profile(
+            workflow_config, team_name=team_name, step_path=step_path
+        )
+        lead_adapter = adapter or get_adapter(resolved.harness_name)
+        invocation = lead_adapter.build_invocation(
+            repo_root=repo_root,
+            model=resolved.model,
+            system_prompt="",
+            user_prompt=user_prompt,
+            effort=resolved.effort,
+        )
+        _preflight_invocation(
+            invocation,
+            lead_adapter,
+            preflight_probe,
+            invocation_kind="team_lead_recovery",
+            cwd=repo_root,
+            step_path=step_path,
+            turn_number=state.turns_completed + 1,
+        )
+    if runner is None:
+        completed = _run_process(invocation, repo_root, banner, state, lease=lease)
+    else:
+        completed = _run_injected_runner(runner, invocation, repo_root, lease=lease)
+    if admission is not None:
+        admission.note_released()
     if completed.returncode != 0:
         evidence = build_recovery_evidence(
             stdout=completed.stdout,
@@ -7718,20 +8311,19 @@ def _execute_merge_handoff(
     new_plan_path: Path,
     banner: BannerRenderer,
     state: ControllerState,
+    admission: _AuxiliaryAdmissionContext | None = None,
 ) -> tuple[subprocess.CompletedProcess[str], OutputContract]:
     primary_root = exec_ctx.primary_repo_root
-    team_lead_role = workflow_config.aflow.team_lead
-    if not team_lead_role:
-        raise WorkflowError("merge teardown requires [aflow].team_lead to be configured")
 
     fast_forward_merge = _try_fast_forward_merge(exec_ctx)
     if fast_forward_merge is not None:
+        # Git-only fast-forward stays out of the admission gate: no model
+        # call is made, so no exclusive resource is consumed.
         return fast_forward_merge
 
-    team_lead_selector = resolve_role_selector(
-        team_lead_role, team_name, workflow_config, step_path="merge teardown"
-    )
-    resolved = resolve_profile(team_lead_selector, workflow_config, step_path="merge teardown")
+    team_lead_role = workflow_config.aflow.team_lead
+    if not team_lead_role:
+        raise WorkflowError("merge teardown requires [aflow].team_lead to be configured")
 
     user_prompt = _build_merge_user_prompt(
         wf, workflow_config,
@@ -7743,27 +8335,75 @@ def _execute_merge_handoff(
         new_plan_path=new_plan_path,
     )
 
-    merge_adapter = adapter or get_adapter(resolved.harness_name)
-    invocation = merge_adapter.build_invocation(
-        repo_root=primary_root,
-        model=resolved.model,
-        system_prompt="",
-        user_prompt=user_prompt,
-        effort=resolved.effort,
-    )
+    def _merge_route(
+        cfg: WorkflowUserConfig,
+    ) -> tuple[str, ResolvedProfile]:
+        team_lead_role = cfg.aflow.team_lead
+        if not team_lead_role:
+            raise WorkflowError(
+                "merge teardown requires [aflow].team_lead to be configured"
+            )
+        team_lead_selector = resolve_role_selector(
+            team_lead_role, team_name, cfg, step_path="merge teardown"
+        )
+        return team_lead_selector, resolve_profile(
+            team_lead_selector, cfg, step_path="merge teardown"
+        )
 
-    _preflight_invocation(
-        invocation,
-        merge_adapter,
-        preflight_probe,
-        invocation_kind="lifecycle_merge",
-        cwd=primary_root,
-        lifecycle_phase="merge",
-    )
-    if runner is None:
-        completed = _run_process(invocation, primary_root, banner, state)
+    lease: ExecutionLease | None = None
+    if admission is not None:
+        def _prepare_merge_admission(
+            cfg: WorkflowUserConfig | None,
+        ) -> tuple[str, object, ResolvedProfile, object]:
+            config = cfg if cfg is not None else workflow_config
+            team_lead_selector, resolved = _merge_route(config)
+            merge_adapter = adapter or get_adapter(resolved.harness_name)
+            invocation = merge_adapter.build_invocation(
+                repo_root=primary_root,
+                model=resolved.model,
+                system_prompt="",
+                user_prompt=user_prompt,
+                effort=resolved.effort,
+            )
+            _preflight_invocation(
+                invocation,
+                merge_adapter,
+                preflight_probe,
+                invocation_kind="lifecycle_merge",
+                cwd=primary_root,
+                lifecycle_phase="merge",
+            )
+            return team_lead_selector, resolved, resolved, invocation
+        grant = admission.admit(
+            _prepare_merge_admission,
+            resolve_route=lambda config: _merge_route(config),
+        )
+        invocation = cast(HarnessInvocation, grant.payload)
+        lease = grant.lease
     else:
-        completed = _run_injected_runner(runner, invocation, primary_root)
+        team_lead_selector, resolved = _merge_route(workflow_config)
+        merge_adapter = adapter or get_adapter(resolved.harness_name)
+        invocation = merge_adapter.build_invocation(
+            repo_root=primary_root,
+            model=resolved.model,
+            system_prompt="",
+            user_prompt=user_prompt,
+            effort=resolved.effort,
+        )
+        _preflight_invocation(
+            invocation,
+            merge_adapter,
+            preflight_probe,
+            invocation_kind="lifecycle_merge",
+            cwd=primary_root,
+            lifecycle_phase="merge",
+        )
+    if runner is None:
+        completed = _run_process(invocation, primary_root, banner, state, lease=lease)
+    else:
+        completed = _run_injected_runner(runner, invocation, primary_root, lease=lease)
+    if admission is not None:
+        admission.note_released()
     return completed, invocation.output_contract
 
 
@@ -7784,6 +8424,7 @@ def _perform_merge_teardown(
     new_plan_path: Path | None,
     banner: BannerRenderer,
     state: ControllerState,
+    admission: _AuxiliaryAdmissionContext | None = None,
 ) -> tuple[str, str | None]:
     prepared_primary_plan: _PreparedPrimaryPlanForMerge | None = None
     try:
@@ -7810,6 +8451,7 @@ def _perform_merge_teardown(
             new_plan_path=new_plan_path or original_plan_path,
             banner=banner,
             state=state,
+            admission=admission,
         )
     except HarnessEnvironmentPreflightError:
         _restore_primary_plan_after_merge(prepared_primary_plan)
@@ -8478,6 +9120,83 @@ def _run_workflow_unchecked(
         )
     write_launch_phase(config.repo_root, reserved_run_id, "launch_started")
     append_run_event(run_paths.run_dir, "launch_started", {"resumed": resume is not None})
+    def _finish_owner_stop(
+        *,
+        invocation: HarnessInvocation | None = None,
+        turn_dir: Path | None = None,
+        started_at: datetime | None = None,
+        step_name: str | None = None,
+        step_role: str | None = None,
+        selector: str | None = None,
+        snapshot_before: PlanSnapshot | None = None,
+        post_snapshot: PlanSnapshot | None = None,
+        completed: subprocess.CompletedProcess[str] | None = None,
+    ) -> ControllerRunResult:
+        final_snapshot = post_snapshot or state.last_snapshot
+        if (
+            invocation is not None
+            and turn_dir is not None
+            and started_at is not None
+            and snapshot_before is not None
+            and state.turn_history
+            and state.turn_history[-1].outcome == "running"
+        ):
+            owner_process = completed or subprocess.CompletedProcess(
+                invocation.argv,
+                0,
+                "",
+                "",
+            )
+            _finalize_turn_record(
+                status="owner-stopped",
+                started_at=started_at,
+                snapshot_before=snapshot_before,
+                snapshot_after=final_snapshot,
+                invocation=invocation,
+                turn_dir=turn_dir,
+                stdout=owner_process.stdout or "",
+                stderr=owner_process.stderr or "",
+                returncode=owner_process.returncode,
+                error=None,
+                step_name=step_name,
+                step_role=step_role,
+                selector=selector,
+                active_path=active_plan_path,
+                new_path=new_plan_path,
+                preserve_terminal_outcome_on_observer_error=True,
+            )
+        state.end_reason = "owner_stopped"
+        state.status_message = "owner_stopped"
+        # An owner stop clears any durable wait evidence.
+        state.execution_resource_wait = None
+        run_metadata.write(
+            status="owner_stopped",
+            end_reason="owner_stopped",
+            last_snapshot=final_snapshot,
+            turns_completed=state.turns_completed,
+            original_plan_path=original_plan_path,
+            current_step_name=current_step_name,
+            active_plan_path=active_plan_path,
+            new_plan_path=new_plan_path,
+        )
+        append_run_event(
+            run_paths.run_dir,
+            "owner_stopped",
+            {"turns_completed": state.turns_completed},
+        )
+        write_launch_phase(config.repo_root, reserved_run_id, "owner_stopped")
+        banner.stop(state)
+        return ControllerRunResult(
+            run_dir=run_paths.run_dir,
+            turns_completed=state.turns_completed,
+            final_snapshot=final_snapshot,
+            status="owner_stopped",
+            issues_accumulated=state.issues_accumulated,
+            end_reason="owner_stopped",
+            recovery_summary=state.current_harness_recovery,
+            recovery_history=tuple(state.harness_recovery_history),
+        )
+
     if resume is not None:
         append_run_event(
             run_paths.run_dir,
@@ -8667,12 +9386,24 @@ def _run_workflow_unchecked(
                             and evidence.provider_operation_id != reconciled.provider_operation_id
                         ):
                             evidence_error = "provider evidence operation id does not match the recorded operation"
+                        elif (
+                            evidence.model is not None and not isinstance(evidence.model, str)
+                        ) or (
+                            evidence.effort is not None and not isinstance(evidence.effort, str)
+                        ):
+                            evidence_error = "provider evidence model/effort is not str or None"
                         if evidence_error is not None:
                             reconciled = replace(
                                 reconciled, stage="waiting_for_hotplug_recovery",
                                 remediation=evidence_error,
                             )
                         else:
+                            # The recovered session's resource identity is the
+                            # combination its provider operation was
+                            # dispatched with, not the live profile: the
+                            # target model/effort may have been edited since
+                            # the operation completed, and a later handover
+                            # keys its exclusive claim on this tuple.
                             recovered_target = HarnessSessionRefV1(
                                 session_id=evidence.session_id,
                                 role=reconciled.target_role,
@@ -8681,6 +9412,11 @@ def _run_workflow_unchecked(
                                 profile=reconciled.target_profile,
                                 model_display=reconciled.target_model_display,
                                 status="active",
+                                resource_identity=(
+                                    reconciled.target_harness,
+                                    evidence.model,
+                                    evidence.effort,
+                                ),
                             )
                             state.role_selectors[reconciled.source_role] = reconciled.target_selector
                             state.active_role_sessions = tuple(
@@ -9132,6 +9868,59 @@ def _run_workflow_unchecked(
     state.current_team = active_team_name
     state.current_team_override = None
 
+    def _write_override_boundary(*, status: str) -> None:
+        run_metadata.write(
+            status=status,
+            execution_context=exec_ctx,
+            last_snapshot=state.last_snapshot,
+            turns_completed=state.turns_completed,
+            original_plan_path=original_plan_path,
+            current_step_name=current_step_name,
+            active_plan_path=active_plan_path,
+            new_plan_path=new_plan_path,
+        )
+
+    def _honor_owner_stop_before_live_reload() -> None:
+        """Honor a stop request without requiring the current config to parse."""
+        source_run_dir = state.override_source_run_dir or run_paths.run_dir
+        override_path = source_run_dir / "overrides.toml"
+        prior = state.override_result
+        if (
+            prior is not None
+            and prior.status == "accepted"
+            and not prior.applied
+            and prior.owner_stop
+        ):
+            state.override_result = replace(prior, applied=True)
+            _write_override_boundary(status="owner_stop_requested")
+            raise OwnerStopRequested()
+
+        consumed_digest = (
+            prior.digest
+            if prior is not None
+            and prior.status == "accepted"
+            and prior.applied
+            else None
+        )
+        loaded = load_override_request(
+            override_path,
+            consumed_digest=consumed_digest,
+        )
+        state.override_file_present = loaded.status != "absent"
+        if loaded.status == "valid" and loaded.request is not None:
+            request = loaded.request
+            if request.owner_stop:
+                state.override_result = OverrideResult(
+                    status="accepted",
+                    digest=request.digest,
+                    message="owner stop accepted at pre-turn boundary",
+                    source_text=request.source_text,
+                    owner_stop=True,
+                    applied=True,
+                )
+                _write_override_boundary(status="owner_stop_requested")
+                raise OwnerStopRequested()
+
     if resume is not None:
         state.manager_decision_number = resume.manager_decision_number
         state.manager_history = list(resume.manager_history)
@@ -9337,12 +10126,32 @@ def _run_workflow_unchecked(
                 execution_context=exec_ctx,
             )
             raise WorkflowError(summary, run_dir=run_paths.run_dir) from exc
+
     elif lifecycle_plan is not None:
         try:
             if needs_bootstrap:
                 plan_text = original_plan_path.read_text(encoding="utf-8")
                 readme_title, readme_body = derive_readme_content(
                     plan_text, original_plan_path.stem
+                )
+                # Bootstrap runs before the turn loop: build a lightweight
+                # admission context with no durable wait persistence and an
+                # inline event emitter (the loop's closures are not in scope
+                # yet).  Unmarked routes keep the legacy fast path.
+                bootstrap_admission = _AuxiliaryAdmissionContext(
+                    project_root=Path(config.repo_root),
+                    run_id=str(reserved_run_id),
+                    kind="bootstrap",
+                    role="team_lead",
+                    observer=observer,
+                    stop_check=_honor_owner_stop_before_live_reload,
+                    live_config_source_path=live_config_source_path,
+                    persist_wait=None,
+                    emit_event=lambda phase, **kwargs: _emit_event(
+                        observer,
+                        ExecutionResourceEvent.create(phase, **kwargs),
+                    ),
+                    step_name=lambda: current_step_name,
                 )
                 bootstrap_result, bootstrap_output_contract = _execute_init_repo_handoff(
                     config.repo_root,
@@ -9356,6 +10165,7 @@ def _run_workflow_unchecked(
                     readme_body=readme_body,
                     banner=banner,
                     state=state,
+                    admission=bootstrap_admission,
                 )
                 stop_reason = _detect_stop_marker(
                     bootstrap_result.stdout,
@@ -9458,6 +10268,8 @@ def _run_workflow_unchecked(
                     raise WorkflowError(
                         "lifecycle bootstrap Git Tracking base does not match verified HEAD"
                     )
+        except OwnerStopRequested:
+            return _finish_owner_stop()
         except HarnessEnvironmentPreflightError as exc:
             _handle_environment_preflight_failure(exc)
         except WorkflowError as exc:
@@ -10284,7 +11096,10 @@ def _run_workflow_unchecked(
                     matched_rule_action=None,
                     matched_terms=(),
                     backup_team=backup_team,
+                    admission=team_lead_admission,
                 )
+            except OwnerStopRequested:
+                return _finish_owner_stop()
             except HarnessEnvironmentPreflightError as exc:
                 _handle_environment_preflight_failure(exc)
             except TeamLeadRecoveryDecisionError as exc:
@@ -10461,7 +11276,10 @@ def _run_workflow_unchecked(
                     matched_rule_action=matched_rule.action,
                     matched_terms=matched_terms,
                     backup_team=backup_team,
+                    admission=team_lead_admission,
                 )
+            except OwnerStopRequested:
+                return _finish_owner_stop()
             except HarnessEnvironmentPreflightError as exc:
                 _handle_environment_preflight_failure(exc)
             except TeamLeadRecoveryDecisionError as exc:
@@ -11002,13 +11820,18 @@ def _run_workflow_unchecked(
         *,
         system_prompt: str,
         user_prompt: str,
+        config: WorkflowUserConfig | None = None,
     ) -> HarnessInvocation:
+        # Build from the same effective config that admission selects so a
+        # queued model/effort/selector change launches the newly resolved
+        # profile, never the captured config's stale model.
+        route_config = config if config is not None else workflow_config
         role_resolution = resolve_manager_role(
-            workflow_config, level="full", baseline_team=baseline_team_name,
+            route_config, level="full", baseline_team=baseline_team_name,
             workflow_name=workflow_name,
         )
         profile = resolve_profile(
-            role_resolution.selector, workflow_config,
+            role_resolution.selector, route_config,
             step_path="manager.repartition",
         )
         call_adapter = adapter or get_adapter(profile.harness_name)
@@ -11024,17 +11847,20 @@ def _run_workflow_unchecked(
         *,
         system_prompt: str,
         user_prompt: str,
-    ) -> HarnessInvocation:
+        config: WorkflowUserConfig | None = None,
+    ) -> tuple[HarnessInvocation, ResolvedProfile]:
+        route_config = config if config is not None else workflow_config
         invocation = _build_repartition_invocation(
             system_prompt=system_prompt,
             user_prompt=user_prompt,
+            config=route_config,
         )
         role_resolution = resolve_manager_role(
-            workflow_config, level="full", baseline_team=baseline_team_name,
+            route_config, level="full", baseline_team=baseline_team_name,
             workflow_name=workflow_name,
         )
         profile = resolve_profile(
-            role_resolution.selector, workflow_config,
+            role_resolution.selector, route_config,
             step_path="manager.repartition",
         )
         call_adapter = adapter or get_adapter(profile.harness_name)
@@ -11047,46 +11873,102 @@ def _run_workflow_unchecked(
             turn_number=state.turns_completed + 1,
             manager_level="full",
         )
-        return invocation
+        # The prepared invocation carries the selected profile so the
+        # dispatched argv, the preflight adapter, and the admitted resource
+        # all agree on the same effective combination.
+        return invocation, profile
+
+    def _repartition_route(config: WorkflowUserConfig) -> tuple[str, ResolvedProfile]:
+        role_resolution = resolve_manager_role(
+            config, level="full", baseline_team=baseline_team_name,
+            workflow_name=workflow_name,
+        )
+        profile = resolve_profile(
+            role_resolution.selector, config,
+            step_path="manager.repartition",
+        )
+        return role_resolution.selector, profile
 
     def _invoke_repartition_full(
         *,
         system_prompt: str,
         user_prompt: str,
-        prepared_invocation: HarnessInvocation | None = None,
+        prepared_invocation: tuple[HarnessInvocation, ResolvedProfile] | None = None,
     ) -> tuple[str, str, str | None]:
         '''Invoke the configured Full role without manager/turn accounting.'''
         stdout = ""
         stderr = ""
         error: str | None = None
-        fingerprint_before = _protected_repartition_fingerprint()
+        fingerprint_before: tuple[
+            tuple[str, str, tuple[tuple[str, str], ...]],
+            tuple[tuple[str, str], ...],
+        ] | None = None
+        lease: ExecutionLease | None = None
         try:
-            invocation = (
-                prepared_invocation
-                if prepared_invocation is not None
-                else _prepare_repartition_invocation(
-                    system_prompt=system_prompt,
-                    user_prompt=user_prompt,
+            if repartition_admission is not None:
+                def _prepare_repartition_admission(
+                    cfg: WorkflowUserConfig | None,
+                ) -> tuple[str, object, ResolvedProfile, object]:
+                    config = cfg if cfg is not None else workflow_config
+                    if prepared_invocation is None or cfg is not None:
+                        prepared = _prepare_repartition_invocation(
+                            system_prompt=system_prompt,
+                            user_prompt=user_prompt,
+                            config=config,
+                        )
+                    else:
+                        prepared = prepared_invocation
+                    selector, profile = _repartition_route(config)
+                    return selector, (selector, profile), profile, prepared[0]
+                grant = repartition_admission.admit(
+                    _prepare_repartition_admission,
+                    resolve_route=lambda config: _repartition_route(config),
                 )
-            )
-            if runner is None:
-                completed = _run_process(invocation, execution_repo_root, banner, state)
+                invocation = cast(HarnessInvocation, grant.payload)
+                lease = grant.lease
             else:
-                completed = _run_injected_runner(runner, invocation, execution_repo_root)
+                if prepared_invocation is not None:
+                    invocation = prepared_invocation[0]
+                else:
+                    prepared = _prepare_repartition_invocation(
+                        system_prompt=system_prompt,
+                        user_prompt=user_prompt,
+                    )
+                    invocation = prepared[0]
+            # The protected-state window must bracket only the model call:
+            # admission bookkeeping (the run.json wait record) is
+            # controller-authored, not a mutation by the Full call.
+            fingerprint_before = _protected_repartition_fingerprint()
+            if runner is None:
+                completed = _run_process(invocation, execution_repo_root, banner, state, lease=lease)
+            else:
+                completed = _run_injected_runner(runner, invocation, execution_repo_root, lease=lease)
             stdout, stderr = completed.stdout, completed.stderr
             if completed.returncode != 0:
                 error = f"repartition Full harness exited with code {completed.returncode}"
+        except OwnerStopRequested:
+            raise
+        except ResourceLeaseError:
+            raise
         except WorkflowError as exc:
             if exc.failure_kind == "environment_preflight":
                 raise
             error = str(exc)
         except ValueError as exc:
             error = str(exc)
-        if _protected_repartition_fingerprint() != fingerprint_before:
+        if (
+            fingerprint_before is not None
+            and _protected_repartition_fingerprint() != fingerprint_before
+        ):
             error = (
                 "repartition Full call mutated repository, plan, "
                 "or protected run-artifact state"
             )
+        if repartition_admission is not None and fingerprint_before is not None:
+            # Emitted after the protected-state check: the released event is
+            # controller-authored and must not land inside the mutation-
+            # detection window (it appends to the run's events artifact).
+            repartition_admission.note_released()
         return stdout, stderr, error
 
     repartition_cycle_executor = _RepartitionCycleExecutor(
@@ -11364,6 +12246,95 @@ def _run_workflow_unchecked(
             )
         return pending.notes, True
 
+    def _emit_resource_event(
+        phase: str,
+        *,
+        resource: str,
+        label: str,
+        ticket: int | None = None,
+        reason: str | None = None,
+        step_name: str | None = None,
+        role: str | None = None,
+        invocation_id: str | None = None,
+    ) -> None:
+        _emit_event(
+            observer,
+            ExecutionResourceEvent.create(
+                phase,
+                resource=resource,
+                label=label,
+                ticket=ticket,
+                reason=reason,
+                step_name=step_name,
+                role=role,
+                invocation_id=invocation_id,
+            ),
+        )
+
+    def _persist_execution_resource_wait(
+        record: dict[str, object] | None,
+    ) -> None:
+        if record is not None:
+            # Clear the previous active-turn fields before publishing the
+            # wait: the durable state must never claim a turn is running
+            # while the controller is only waiting.  Completed turn history
+            # is untouched.
+            state.active_turn = 0
+            state.current_turn_started_at = None
+            state.execution_resource_wait = dict(record)
+            message = f"Waiting for {record['label']} (exclusive)"
+            if record.get("reason") == "owner_unconfirmed":
+                message += (
+                    "; previous execution could not be confirmed stopped"
+                )
+            state.status_message = message
+        else:
+            state.execution_resource_wait = None
+            if state.status_message.startswith("Waiting for"):
+                state.status_message = (
+                    f"running turn {turn_number}: step {current_step_name}"
+                )
+        run_metadata.write(
+            status="running",
+            last_snapshot=state.last_snapshot,
+            turns_completed=state.turns_completed,
+            original_plan_path=original_plan_path,
+            current_step_name=current_step_name,
+            active_plan_path=active_plan_path,
+            new_plan_path=new_plan_path,
+        )
+
+    def _auxiliary_admission_context(
+        kind: str, role: str
+    ) -> _AuxiliaryAdmissionContext:
+        """One shared admission/lifetime contract per auxiliary category."""
+        return _AuxiliaryAdmissionContext(
+            project_root=Path(config.repo_root),
+            run_id=str(reserved_run_id),
+            kind=kind,
+            role=role,
+            observer=observer,
+            stop_check=_honor_owner_stop_before_live_reload,
+            live_config_source_path=live_config_source_path,
+            persist_wait=_persist_execution_resource_wait,
+            emit_event=_emit_resource_event,
+            step_name=lambda: current_step_name,
+        )
+    # Auxiliary model-bearing calls share the admission/lifetime contract:
+    # manager decisions and note corrections, repartitioning subcalls, team-
+    # lead recovery, and merge handoffs each queue as independent FIFO
+    # participants.  Unmarked routes keep the legacy fast path inside
+    # ``admit``; the contexts are inert for them.
+    manager_admission = _auxiliary_admission_context("manager", "manager")
+    repartition_admission = _auxiliary_admission_context(
+        "repartition", "manager"
+    )
+    team_lead_admission = _auxiliary_admission_context(
+        "team_lead_recovery", "team_lead"
+    )
+    merge_admission = _auxiliary_admission_context("merge", "team_lead")
+    manager_call_executor.resource_admission = manager_admission
+
     if terminal_integration_only:
         if not done:
             raise WorkflowError(
@@ -11394,7 +12365,10 @@ def _run_workflow_unchecked(
                 new_plan_path=new_plan_path,
                 banner=banner,
                 state=state,
+                admission=merge_admission,
             )
+        except OwnerStopRequested:
+            return _finish_owner_stop()
         except HarnessEnvironmentPreflightError as exc:
             _handle_environment_preflight_failure(exc)
         if merge_status != "failed":
@@ -11715,7 +12689,10 @@ def _run_workflow_unchecked(
                         new_plan_path=new_plan_path,
                         banner=banner,
                         state=state,
+                        admission=merge_admission,
                     )
+                except OwnerStopRequested:
+                    return _finish_owner_stop()
                 except HarnessEnvironmentPreflightError as exc:
                     _handle_environment_preflight_failure(exc)
             if replay_delivery_eligible and merge_status != "failed":
@@ -11832,18 +12809,6 @@ def _run_workflow_unchecked(
         )
         run_metadata.write(
             status="running",
-            execution_context=exec_ctx,
-            last_snapshot=state.last_snapshot,
-            turns_completed=state.turns_completed,
-            original_plan_path=original_plan_path,
-            current_step_name=current_step_name,
-            active_plan_path=active_plan_path,
-            new_plan_path=new_plan_path,
-        )
-
-    def _write_override_boundary(*, status: str) -> None:
-        run_metadata.write(
-            status=status,
             execution_context=exec_ctx,
             last_snapshot=state.last_snapshot,
             turns_completed=state.turns_completed,
@@ -11978,47 +12943,6 @@ def _run_workflow_unchecked(
             state.last_accepted_override = accepted
         return accepted
 
-    def _honor_owner_stop_before_live_reload() -> None:
-        """Honor a stop request without requiring the current config to parse."""
-        source_run_dir = state.override_source_run_dir or run_paths.run_dir
-        override_path = source_run_dir / "overrides.toml"
-        prior = state.override_result
-        if (
-            prior is not None
-            and prior.status == "accepted"
-            and not prior.applied
-            and prior.owner_stop
-        ):
-            state.override_result = replace(prior, applied=True)
-            _write_override_boundary(status="owner_stop_requested")
-            raise OwnerStopRequested()
-
-        consumed_digest = (
-            prior.digest
-            if prior is not None
-            and prior.status == "accepted"
-            and prior.applied
-            else None
-        )
-        loaded = load_override_request(
-            override_path,
-            consumed_digest=consumed_digest,
-        )
-        state.override_file_present = loaded.status != "absent"
-        if loaded.status == "valid" and loaded.request is not None:
-            request = loaded.request
-            if request.owner_stop:
-                state.override_result = OverrideResult(
-                    status="accepted",
-                    digest=request.digest,
-                    message="owner stop accepted at pre-turn boundary",
-                    source_text=request.source_text,
-                    owner_stop=True,
-                    applied=True,
-                )
-                _write_override_boundary(status="owner_stop_requested")
-                raise OwnerStopRequested()
-
     def _reload_live_configuration_at_boundary() -> None:
         """Refresh all configuration-derived turn inputs exactly once."""
         nonlocal workflow_config, wf, retry_limit, baseline_team_name
@@ -12065,83 +12989,6 @@ def _run_workflow_unchecked(
         else:
             state.effective_max_turns = workflow_config.aflow.max_turns
         _refresh_live_supervision_consumers()
-
-    def _finish_owner_stop(
-        *,
-        invocation: HarnessInvocation | None = None,
-        turn_dir: Path | None = None,
-        started_at: datetime | None = None,
-        step_name: str | None = None,
-        step_role: str | None = None,
-        selector: str | None = None,
-        snapshot_before: PlanSnapshot | None = None,
-        post_snapshot: PlanSnapshot | None = None,
-        completed: subprocess.CompletedProcess[str] | None = None,
-    ) -> ControllerRunResult:
-        final_snapshot = post_snapshot or state.last_snapshot
-        if (
-            invocation is not None
-            and turn_dir is not None
-            and started_at is not None
-            and snapshot_before is not None
-            and state.turn_history
-            and state.turn_history[-1].outcome == "running"
-        ):
-            owner_process = completed or subprocess.CompletedProcess(
-                invocation.argv,
-                0,
-                "",
-                "",
-            )
-            _finalize_turn_record(
-                status="owner-stopped",
-                started_at=started_at,
-                snapshot_before=snapshot_before,
-                snapshot_after=final_snapshot,
-                invocation=invocation,
-                turn_dir=turn_dir,
-                stdout=owner_process.stdout or "",
-                stderr=owner_process.stderr or "",
-                returncode=owner_process.returncode,
-                error=None,
-                step_name=step_name,
-                step_role=step_role,
-                selector=selector,
-                active_path=active_plan_path,
-                new_path=new_plan_path,
-                preserve_terminal_outcome_on_observer_error=True,
-            )
-        state.end_reason = "owner_stopped"
-        state.status_message = "owner_stopped"
-        # An owner stop clears any durable wait evidence.
-        state.execution_resource_wait = None
-        run_metadata.write(
-            status="owner_stopped",
-            end_reason="owner_stopped",
-            last_snapshot=final_snapshot,
-            turns_completed=state.turns_completed,
-            original_plan_path=original_plan_path,
-            current_step_name=current_step_name,
-            active_plan_path=active_plan_path,
-            new_plan_path=new_plan_path,
-        )
-        append_run_event(
-            run_paths.run_dir,
-            "owner_stopped",
-            {"turns_completed": state.turns_completed},
-        )
-        write_launch_phase(config.repo_root, reserved_run_id, "owner_stopped")
-        banner.stop(state)
-        return ControllerRunResult(
-            run_dir=run_paths.run_dir,
-            turns_completed=state.turns_completed,
-            final_snapshot=final_snapshot,
-            status="owner_stopped",
-            issues_accumulated=state.issues_accumulated,
-            end_reason="owner_stopped",
-            recovery_summary=state.current_harness_recovery,
-            recovery_history=tuple(state.harness_recovery_history),
-        )
 
     def _fail_hotplug_target(reason: str) -> None:
         transaction = state.current_hotplug_transaction
@@ -12778,6 +13625,107 @@ def _run_workflow_unchecked(
         handover = getattr(source_driver, "handover", None)
         if not callable(handover):
             raise RuntimeError("source driver does not implement read-only handover")
+        # Select the supported handover signature statically before the
+        # call; the callback is never probed with a second model call.
+        try:
+            handover_signature = inspect.signature(handover)
+            _handover_params = list(handover_signature.parameters.values())
+        except (TypeError, ValueError) as exc:
+            raise RuntimeError(
+                "source driver handover signature is not inspectable"
+            ) from exc
+        _accepts_prompt = (
+            len(_handover_params) >= 2
+            or any(p.kind is inspect.Parameter.VAR_POSITIONAL for p in _handover_params)
+        )
+        _accepts_lifecycle = "lifecycle" in handover_signature.parameters or any(
+            p.kind is inspect.Parameter.VAR_KEYWORD for p in _handover_params
+        )
+        captured_identity = getattr(source_session, "resource_identity", None)
+
+        def _handover_source_route(
+            config: WorkflowUserConfig,
+        ) -> tuple[str, str, bool]:
+            """Comparable identity of the handover's current source route.
+
+            The current source profile supplies only the exclusive opt-in:
+            its harness/profile must keep matching the source session and
+            transaction, while a source model/effort edit never
+            re-identifies the route because the resource key is computed
+            solely from the session's captured dispatch tuple.
+            """
+            resolved_source = resolve_profile(
+                transaction.source_selector, config,
+                step_path="provider handover source",
+            )
+            return (
+                resolved_source.harness_name,
+                resolved_source.profile_name,
+                resolved_source.exclusive_resource is not None,
+            )
+
+        def _prepare_handover_admission(
+            cfg: WorkflowUserConfig | None,
+        ) -> tuple[str, object, ResolvedProfile, object]:
+            current = cfg if cfg is not None else workflow_config
+            resolved_source = resolve_profile(
+                transaction.source_selector, current,
+                step_path="provider handover source",
+            )
+            if (
+                (resolved_source.harness_name, resolved_source.profile_name)
+                != (transaction.source_harness, transaction.source_profile)
+                or (source_session.harness, source_session.profile)
+                != (transaction.source_harness, transaction.source_profile)
+            ):
+                raise WorkflowError(
+                    f"provider handover source selector "
+                    f"'{transaction.source_selector}' does not match the "
+                    "source session and transaction"
+                )
+            route = (
+                resolved_source.harness_name,
+                resolved_source.profile_name,
+                resolved_source.exclusive_resource is not None,
+            )
+            if resolved_source.exclusive_resource is None:
+                # The current source profile is unmarked: keep the legacy
+                # ungrouped handover call and never contact the broker,
+                # even when the session carries a captured tuple.
+                return (transaction.source_selector, route, resolved_source, None)
+            if not _accepts_lifecycle:
+                # A marked source whose handover entry point cannot carry
+                # the durable lifetime contract is rejected before
+                # admission and before any model call, so no claim is ever
+                # created.
+                raise RuntimeError(
+                    "exclusive source handover requires a lifecycle-capable "
+                    "handover entry point"
+                )
+            if captured_identity is None:
+                # Missing legacy identity cannot be guessed from
+                # model_display or an edited source row: fail instead.
+                raise WorkflowError(
+                    "exclusive source handover requires the source "
+                    "session's captured (harness, model, effort) tuple"
+                )
+            harness_name, handover_model, handover_effort = captured_identity
+            handover_resolved = ResolvedProfile(
+                harness_name=harness_name,
+                profile_name="handover",
+                model=handover_model,
+                effort=handover_effort,
+                exclusive_resource=execution_resource_key(
+                    harness_name, handover_model, handover_effort
+                ),
+            )
+            return (
+                transaction.source_selector,
+                route,
+                handover_resolved,
+                None,
+            )
+
         source_request = SessionRequest(
             repo_root=execution_repo_root,
             selector=transaction.source_selector,
@@ -12787,10 +13735,90 @@ def _run_workflow_unchecked(
             user_prompt=prompt,
             session_id=source_session.session_id,
         )
+        # Provider handover is a model-bearing source-session call.  The
+        # transaction's exact source selector is resolved against the
+        # current authoritative configuration: the current source profile
+        # supplies the exclusive opt-in, while the session's captured
+        # dispatch tuple alone supplies the resource key.  While a claim is
+        # queued the nonblocking live-config path revalidates that opt-in
+        # and selector; the lease binds the callback's owned child through
+        # the same launch/register/reap lifecycle as every other dispatch
+        # seam, and the source resource is released before the fresh target
+        # is launched.
+        handover_admission = _AuxiliaryAdmissionContext(
+            project_root=Path(config.repo_root),
+            run_id=str(reserved_run_id),
+            kind="handover",
+            role="worker",
+            observer=observer,
+            stop_check=_honor_owner_stop_before_live_reload,
+            live_config_source_path=live_config_source_path,
+            persist_wait=_persist_execution_resource_wait,
+            emit_event=_emit_resource_event,
+            step_name=lambda: current_step_name,
+        )
+        grant = handover_admission.admit(
+            _prepare_handover_admission,
+            resolve_route=_handover_source_route,
+        )
+        handover_lease = grant.lease
+        if handover_lease is not None:
+            # Durable launch intent is persisted before the model-bearing
+            # callback starts, so a crash can never leave the claim in the
+            # removable prelaunch state while handover work runs; the
+            # callback's own mark_launching is an idempotent no-op.  A failed
+            # intent is a known prelaunch failure: the unlaunched reservation
+            # is released before the error propagates.
+            try:
+                handover_lease.mark_launching()
+            except ResourceLeaseError:
+                try:
+                    handover_lease.complete()
+                except ResourceLeaseError:
+                    pass
+                raise
         try:
-            output = handover(source_request, prompt)
-        except TypeError:
-            output = handover(source_request)
+            if _accepts_prompt:
+                if handover_lease is not None:
+                    output = handover(source_request, prompt, lifecycle=handover_lease)
+                else:
+                    output = handover(source_request, prompt)
+            elif handover_lease is not None:
+                output = handover(source_request, lifecycle=handover_lease)
+            else:
+                output = handover(source_request)
+        except ResourceLeaseError:
+            # The callback retained the claim (unconfirmed child cessation)
+            # or failed a nonce-checked lease transition; ownership stays
+            # occupied and the typed error already carries the original
+            # cause, so no further lease action is taken here.
+            raise
+        except BaseException as exc:
+            if (
+                handover_lease is not None
+                and _handover_claim_retained_after_error(handover_lease, exc)
+                and isinstance(exc, Exception)
+            ):
+                # Uncertain child cessation: the claim is retained and the
+                # resource-specific error replaces the bare callback failure
+                # while keeping it as diagnostic context.  A callback that
+                # had already released after confirmed reap propagates its
+                # original error unchanged.
+                raise ResourceLeaseError(
+                    "handover", str(exc), context=exc
+                ) from exc
+            raise
+        if handover_lease is not None:
+            # The synchronous handover contract reaps the owned child before
+            # returning; a callback that already released the claim makes
+            # this completion a no-op, and any other lease failure stays
+            # fail-closed.
+            try:
+                handover_lease.complete()
+            except ResourceLeaseError as exc:
+                if exc.reason != "not_owner":
+                    raise
+            handover_admission.note_released()
         if not isinstance(output, str):
             output = getattr(output, "final_output", None)
         normalized = validate_handover_output(output)
@@ -12863,7 +13891,10 @@ def _run_workflow_unchecked(
                     new_plan_path=new_plan_path,
                     banner=banner,
                     state=state,
+                    admission=merge_admission,
                 )
+            except OwnerStopRequested:
+                return _finish_owner_stop()
             except HarnessEnvironmentPreflightError as exc:
                 _handle_environment_preflight_failure(exc)
 
@@ -13059,31 +14090,6 @@ def _run_workflow_unchecked(
             _resource_store = _default_execution_resource_store()
         return _resource_store
 
-    def _emit_resource_event(
-        phase: str,
-        *,
-        resource: str,
-        label: str,
-        ticket: int | None = None,
-        reason: str | None = None,
-        step_name: str | None = None,
-        role: str | None = None,
-        invocation_id: str | None = None,
-    ) -> None:
-        _emit_event(
-            observer,
-            ExecutionResourceEvent.create(
-                phase,
-                resource=resource,
-                label=label,
-                ticket=ticket,
-                reason=reason,
-                step_name=step_name,
-                role=role,
-                invocation_id=invocation_id,
-            ),
-        )
-
     def _begin_admission_wait() -> str:
         """Record the wait start once; unchanged polls reuse it."""
         nonlocal admission_wait_started_at
@@ -13096,39 +14102,6 @@ def _run_workflow_unchecked(
     def _clear_admission_wait_start() -> None:
         nonlocal admission_wait_started_at
         admission_wait_started_at = None
-
-    def _persist_execution_resource_wait(
-        record: dict[str, object] | None,
-    ) -> None:
-        if record is not None:
-            # Clear the previous active-turn fields before publishing the
-            # wait: the durable state must never claim a turn is running
-            # while the controller is only waiting.  Completed turn history
-            # is untouched.
-            state.active_turn = 0
-            state.current_turn_started_at = None
-            state.execution_resource_wait = dict(record)
-            message = f"Waiting for {record['label']} (exclusive)"
-            if record.get("reason") == "owner_unconfirmed":
-                message += (
-                    "; previous execution could not be confirmed stopped"
-                )
-            state.status_message = message
-        else:
-            state.execution_resource_wait = None
-            if state.status_message.startswith("Waiting for"):
-                state.status_message = (
-                    f"running turn {turn_number}: step {current_step_name}"
-                )
-        run_metadata.write(
-            status="running",
-            last_snapshot=state.last_snapshot,
-            turns_completed=state.turns_completed,
-            original_plan_path=original_plan_path,
-            current_step_name=current_step_name,
-            active_plan_path=active_plan_path,
-            new_plan_path=new_plan_path,
-        )
 
     def _admission_live_revision() -> tuple | None:
         """Cheap change detector for the live configuration pair.
@@ -13349,891 +14322,914 @@ def _run_workflow_unchecked(
             )
         return UNCHANGED
 
+
     turn_number = 1
     while True:
         try:
-            _honor_owner_stop_before_live_reload()
-        except OwnerStopRequested:
-            return _finish_owner_stop()
-        try:
-            _reload_live_configuration_at_boundary()
-        except WorkflowError as exc:
-            _raise_pre_turn_failure(
-                reason=exc.summary,
-                snapshot=state.last_snapshot,
-                active_path=active_plan_path,
-                new_path=new_plan_path,
-            )
-        try:
-            current_step_name, baseline_team_name = _apply_boundary_override()
-        except OwnerStopRequested:
-            return _finish_owner_stop()
-        effective_max_turns = state.effective_max_turns or config.max_turns
-        if turn_number > effective_max_turns:
-            if live_config_source_path is not None:
-                # A pre-turn budget cap can never approve an outstanding
-                # review/repair boundary, so the cap is always a no-delivery
-                # budget exit even when the ledger is already complete.
-                return _finish_normal_terminal(
-                    final_snapshot=state.last_snapshot,
-                    end_reason="max_turns_reached",
-                    terminal_step_name=current_step_name,
-                    terminal_step_role=None,
-                    terminal_selector=None,
-                    active_team=state.current_team,
-                    delivery_eligible=False,
-                )
-            break
-        retry_ctx = state.pending_retry
-        boundary_active_path = (
-            retry_ctx.active_plan_path if retry_ctx is not None else active_plan_path
-        )
-        boundary_new_path = (
-            retry_ctx.new_plan_path if retry_ctx is not None else new_plan_path
-        )
-        if current_step_name not in wf.steps:
-            _raise_pre_turn_failure(
-                reason=(
-                    f"current step '{current_step_name}' is not an executable step "
-                    f"in current workflow '{workflow_name}'; correct the live "
-                    "configuration or submit a valid next_step override"
-                ),
-                snapshot=(
-                    retry_ctx.snapshot_before
-                    if retry_ctx is not None
-                    else state.last_snapshot
-                ),
-                active_path=boundary_active_path,
-                new_path=boundary_new_path,
-            )
-        active_team_name = (
-            state.current_team_override
-            if state.current_team_override is not None
-            else state.current_team
-        )
-        followup_candidates_before: set[Path] = set()
-        consume_manager_notes = False
-        consume_team_override = False
-        attempt_repair_ordinal: int | None = None
-        attempt_team_repairs_completed: int | None = None
-        attempt_ordinal: int | None = None
-        cumulative_route_scope_id: str | None = None
-        turn_session_request: SessionRequest | None = None
-        owned_session_result = None
-        cross_handover_prompt = ""
-        recovery_first_worker = (
-            state.recovery_context is not None
-            and not state.recovery_consumed
-            and (
-                current_step_name in wf.steps
-                and wf.steps[current_step_name].role == "worker"
-            )
-        )
-        if retry_ctx is not None:
-            state.status_message = (
-                f"running turn {turn_number}: step {current_step_name} "
-                f"(retry {retry_ctx.attempt}/{retry_ctx.retry_limit})"
-            )
-            run_metadata.write(
-                status="running", last_snapshot=state.last_snapshot,
-                 original_plan_path=original_plan_path,
-                current_step_name=current_step_name, active_plan_path=retry_ctx.active_plan_path,
-            )
-            done = retry_ctx.snapshot_before.is_complete
-            active_plan_path = retry_ctx.active_plan_path
-            new_plan_path = retry_ctx.new_plan_path
-            followup_candidates_before = _list_followup_plan_candidates(
-                _exec_plan_path(original_plan_path, exec_ctx)
-            )
-            step = wf.steps[current_step_name]
-            step_path = f"workflow.{workflow_name}.steps.{current_step_name}"
-            if step.role == "worker" and state.active_implementation_scope is None:
-                cumulative_route_scope_id = _cumulative_repair_scope_id(
-                    state, repo_root=run_paths.repo_root,
-                    original_plan_path=original_plan_path,
-                    target_plan_path=active_plan_path,
-                    exec_ctx=exec_ctx,
-                )
-            if step.role == "worker" and not done:
-                try:
-                    _scope, scope_was_opened = _open_implementation_scope(
-                        state,
-                        original_plan_path=original_plan_path,
-                        original_snapshot=state.last_snapshot,
-                        turn_number=turn_number,
-                    )
-                    if scope_was_opened:
-                        _capture_scope_envelope(
-                            state,
-                            scope=_scope,
-                            plan_text=None,
-                            primary_plan_path=original_plan_path,
-                            run_dir=run_paths.run_dir,
-                            exec_ctx=exec_ctx,
-                            repo_root=config.repo_root,
-                        )
-                        run_metadata.write(
-                            status="running",
-                            execution_context=exec_ctx,
-                            last_snapshot=state.last_snapshot,
-                            turns_completed=state.turns_completed,
-                            original_plan_path=original_plan_path,
-                            current_step_name=current_step_name,
-                            active_plan_path=active_plan_path,
-                            new_plan_path=new_plan_path,
-                        )
-                    elif not scope_was_opened:
-                        _validate_existing_scope_envelope(
-                            run_paths.run_dir,
-                            _scope,
-                        )
-                except WorkflowError as exc:
-                    _raise_pre_turn_failure(
-                        reason=exc.summary,
-                        snapshot=retry_ctx.snapshot_before,
-                        active_path=active_plan_path,
-                        new_path=new_plan_path,
-                    )
-            pending_override = state.pending_step_team_override
-            if (
-                pending_override is not None
-                and not pending_override.consumed
-                and pending_override.target_step == current_step_name
-                and pending_override.role == step.role
-                and _pending_matches_scope_and_plan(
-                    pending_override,
-                    state,
-                    _target_plan_identity(active_plan_path),
-                )
-            ):
-                active_team_name = pending_override.target_team
-                consume_team_override = True
-                attempt_repair_ordinal = pending_override.repair_ordinal
-                attempt_team_repairs_completed = pending_override.team_repairs_completed
-            routing_scope_id = (
-                state.active_implementation_scope.scope_id
-                if state.active_implementation_scope is not None
-                else cumulative_route_scope_id
-            )
-            if step.role == "worker" and routing_scope_id is not None:
-                if attempt_repair_ordinal is None:
-                    prelaunch_policy = determine_repair_upgrade_policy(
-                        workflow_config,
-                        threshold=wf.upgrade_after_repairs,
-                        role="worker",
-                        baseline_team=baseline_team_name,
-                        scope_id=routing_scope_id,
-                        attempts=state.implementation_attempts.get(
-                            routing_scope_id, []
-                        ),
-                        rejections=state.review_rejection_history,
-                    )
-                    attempt_repair_ordinal = (
-                        prelaunch_policy.repair_ordinal
-                        if prelaunch_policy.active
-                        else 0
-                    )
-                    attempt_team_repairs_completed = (
-                        prelaunch_policy.team_repairs_completed
-                        if prelaunch_policy.active
-                        else 0
-                    )
-            selector, resolved = _resolve_step_runtime(
-                step,
-                workflow_config,
-                team_name=active_team_name,
-                step_path=step_path,
-                step_name=current_step_name,
-                run_local_role_selectors=state.role_selectors,
-                pending_team_override=(
-                    state.pending_step_team_override if consume_team_override else None
-                ),
-            )
-            _reconcile_live_worker_target(
-                selector=selector,
-                resolved=resolved,
-                step_role=step.role,
-            )
-            system_prompt = resolve_role_prompt(
-                step.role,
-                active_team_name,
-                workflow_config,
-                step_path=step_path,
-            )
-            step_adapter = adapter or get_adapter(resolved.harness_name)
-            turn_session_driver = session_driver or (
-                _discover_session_driver(step_adapter, repo_root=execution_repo_root) if runner is None else None
-            )
-            snapshot_before = retry_ctx.snapshot_before
-            manager_notes, consume_manager_notes = _prepare_pending_manager_notes(
-                step_name=current_step_name,
-                step_role=step.role,
-                selector=selector,
-                target_plan_path=active_plan_path,
-                active_team=active_team_name,
-            )
             try:
-                user_prompt = render_step_prompts(
-                    step,
-                    workflow_config,
-                    config_dir=prompt_config_dir,
-                    working_dir=working_dir,
-                    original_plan_path=_exec_plan_path(original_plan_path, exec_ctx),
-                    new_plan_path=_exec_plan_path(new_plan_path, exec_ctx),
-                    active_plan_path=_exec_plan_path(active_plan_path, exec_ctx),
-                )
-                user_prompt = _append_checkpoint_review_context(
-                    user_prompt,
-                    step_role=step.role,
-                    state=state,
-                    repo_root=run_paths.repo_root,
-                    run_dir=run_paths.run_dir,
-                    original_plan_path=_exec_plan_path(original_plan_path, exec_ctx),
-                    active_plan_path=_exec_plan_path(active_plan_path, exec_ctx),
-                    resume=resume,
-                    recovered_boundary=(
-                        replayed_boundary
-                        if state.turns_completed == 0
-                        else None
-                    ),
-                )
-                user_prompt = _append_durable_recovery_context(
-                    user_prompt,
-                    step_role=step.role,
-                    recovery_context=state.recovery_context,
-                )
-                if config.extra_instructions:
-                    extra_text = " ".join(config.extra_instructions).strip()
-                    user_prompt = "\n\n".join((user_prompt, extra_text))
-                user_prompt += "\n\n" + _build_retry_appendix(retry_ctx.parse_error_str)
-                if manager_notes:
-                    user_prompt += "\n\n## Manager notes for this turn\n" + "\n".join(
-                        f"- {note}" for note in manager_notes
-                    )
-                override_notes_match = bool(state.pending_override_notes) and (
-                    state.pending_override_target_step == current_step_name
-                    or (
-                        state.pending_override_target_step is None
-                        and step.role == "worker"
-                    )
-                )
-                if override_notes_match:
-                    user_prompt += (
-                        "\n\n## User override notes for this turn\n"
-                        + "\n".join(
-                            f"- {note}" for note in state.pending_override_notes
-                        )
-                    )
-                transaction = state.current_hotplug_transaction
-                if (
-                    (runner is None or session_driver is not None)
-                    and
-                    step.role == "worker"
-                    and not recovery_first_worker
-                    and transaction is not None
-                    and transaction.target_selector == selector
-                    and transaction.source_harness != transaction.target_harness
-                    and turn_session_driver is not None
-                ):
-                    source_driver = source_session_driver or (
-                        _discover_session_driver(
-                            get_adapter(transaction.source_harness),
-                            repo_root=execution_repo_root,
-                        )
-                        if runner is None else None
-                    )
-                    cross_handover_prompt = _prepare_cross_harness_handover(
-                        transaction, source_driver, turn_session_driver, selector=selector,
-                        system_prompt=system_prompt, user_prompt=user_prompt,
-                        target_preflight=lambda: _preflight_or_fail(
-                            turn_session_driver.build_invocation(
-                                SessionRequest(
-                                    repo_root=execution_repo_root,
-                                    selector=selector,
-                                    model=resolved.model,
-                                    system_prompt=system_prompt,
-                                    user_prompt=user_prompt,
-                                    effort=resolved.effort,
-                                )
-                            ),
-                            step_adapter,
-                            invocation_kind="workflow_turn",
-                            cwd=execution_repo_root,
-                            workflow_turn=turn_number,
-                            step_name=current_step_name,
-                            turn_number=turn_number,
-                        ),
-                    )
-                    user_prompt += cross_handover_prompt
-                if (
-                    (runner is None or session_driver is not None)
-                    and
-                    step.role == "worker"
-                    and not recovery_first_worker
-                    and transaction is not None
-                    and transaction.target_selector == selector
-                    and transaction.source_harness == resolved.harness_name
-                    and transaction.target_harness == resolved.harness_name
-                    and (
-                        turn_session_driver is None
-                        or not turn_session_driver.capabilities.resume_with_model
-                    )
-                ):
-                    raise RuntimeError(
-                        "same-harness hotplug requires a session driver with exact resume"
-                    )
-                if turn_session_driver is not None and (runner is None or session_driver is not None) and step.role == "worker":
-                    transaction = state.current_hotplug_transaction
-                    previous_session = (
-                        None
-                        if recovery_first_worker
-                        else _find_previous_worker_session(
-                            selector=selector,
-                            resolved=resolved,
-                            transaction=transaction,
-                        )
-                    )
-                    turn_session_request = SessionRequest(
-                        repo_root=execution_repo_root,
-                        selector=selector,
-                        model=resolved.model,
-                        effort=resolved.effort,
-                        system_prompt=system_prompt,
-                        user_prompt=user_prompt,
-                        session_id=(
-                            previous_session.session_id
-                            if previous_session is not None
-                            and turn_session_driver.capabilities.resume_with_model
-                            else None
-                        ),
-                        idempotency_key=(
-                            state.recovery_context.intent_digest
-                            if recovery_first_worker and state.recovery_context is not None
-                            else transaction.transaction_id
-                            if transaction is not None
-                            and transaction.source_harness != transaction.target_harness
-                            else None
-                        ),
-                    )
-                    transaction = state.current_hotplug_transaction
-                    if (
-                        transaction is not None
-                        and not recovery_first_worker
-                        and transaction.target_selector == selector
-                        and transaction.source_harness == resolved.harness_name
-                        and transaction.target_harness == resolved.harness_name
-                        and turn_session_request.session_id is None
-                    ):
-                        raise RuntimeError(
-                            "same-harness hotplug requires an exact active source session"
-                        )
-                    invocation = turn_session_driver.build_invocation(turn_session_request)
-                else:
-                    invocation = step_adapter.build_invocation(
-                        repo_root=execution_repo_root,
-                        model=resolved.model,
-                        system_prompt=system_prompt,
-                        user_prompt=user_prompt,
-                        effort=resolved.effort,
-                    )
-                if turn_session_request is not None:
-                    invocation = replace(
-                        invocation,
-                        semantic_output_source=STRUCTURED_TRANSPORT_OUTPUT_SOURCE,
-                    )
-                _preflight_or_fail(
-                    invocation,
-                    step_adapter,
-                    invocation_kind="workflow_turn",
-                    cwd=execution_repo_root,
-                    workflow_turn=turn_number,
-                    step_name=current_step_name,
-                    turn_number=turn_number,
-                )
-                # Must complete before the harness runs: in-progress approval
-                # cleanup may delete the follow-up plan this turn is about to use.
-                _backup_active_followup_plan(
-                    config.repo_root,
-                    original_plan_path,
-                    active_plan_path,
-                    source_path=_exec_plan_path(active_plan_path, exec_ctx),
-                    event="before_followup_turn",
-                    run_id=run_paths.run_dir.name,
-                    turn_number=turn_number,
-                )
+                _honor_owner_stop_before_live_reload()
+            except OwnerStopRequested:
+                return _finish_owner_stop()
+            try:
+                _reload_live_configuration_at_boundary()
             except WorkflowError as exc:
-                if exc.failure_kind == "environment_preflight":
-                    _fail_hotplug_target(exc.summary)
-                    raise
-                _fail_hotplug_target(exc.summary)
                 _raise_pre_turn_failure(
                     reason=exc.summary,
-                    snapshot=snapshot_before,
-                    active_path=active_plan_path,
-                    new_path=new_plan_path,
-                )
-            except Exception as exc:
-                _fail_hotplug_target(str(exc))
-                _raise_pre_turn_failure(
-                    reason=str(exc),
-                    snapshot=snapshot_before,
-                    active_path=active_plan_path,
-                    new_path=new_plan_path,
-                )
-        else:
-            state.status_message = f"running turn {turn_number}: step {current_step_name}"
-            run_metadata.write(
-                status="running", last_snapshot=state.last_snapshot,
-             original_plan_path=original_plan_path,
-            current_step_name=current_step_name, active_plan_path=active_plan_path,
-        )
-
-            _sync_plan_to_worktree(original_plan_path, exec_ctx)
-
-            try:
-                current_plan = load_plan(original_plan_path)
-            except (PlanParseError, FileNotFoundError) as exc:
-                state.status_message = "failed"
-                banner.stop(state)
-                summary = _format_failure(
-                    reason=str(exc),
-                    run_dir=run_paths.run_dir,
                     snapshot=state.last_snapshot,
+                    active_path=active_plan_path,
+                    new_path=new_plan_path,
+                )
+            try:
+                current_step_name, baseline_team_name = _apply_boundary_override()
+            except OwnerStopRequested:
+                return _finish_owner_stop()
+            effective_max_turns = state.effective_max_turns or config.max_turns
+            if turn_number > effective_max_turns:
+                if live_config_source_path is not None:
+                    # A pre-turn budget cap can never approve an outstanding
+                    # review/repair boundary, so the cap is always a no-delivery
+                    # budget exit even when the ledger is already complete.
+                    return _finish_normal_terminal(
+                        final_snapshot=state.last_snapshot,
+                        end_reason="max_turns_reached",
+                        terminal_step_name=current_step_name,
+                        terminal_step_role=None,
+                        terminal_selector=None,
+                        active_team=state.current_team,
+                        delivery_eligible=False,
+                    )
+                break
+            retry_ctx = state.pending_retry
+            boundary_active_path = (
+                retry_ctx.active_plan_path if retry_ctx is not None else active_plan_path
+            )
+            boundary_new_path = (
+                retry_ctx.new_plan_path if retry_ctx is not None else new_plan_path
+            )
+            if current_step_name not in wf.steps:
+                _raise_pre_turn_failure(
+                    reason=(
+                        f"current step '{current_step_name}' is not an executable step "
+                        f"in current workflow '{workflow_name}'; correct the live "
+                        "configuration or submit a valid next_step override"
+                    ),
+                    snapshot=(
+                        retry_ctx.snapshot_before
+                        if retry_ctx is not None
+                        else state.last_snapshot
+                    ),
+                    active_path=boundary_active_path,
+                    new_path=boundary_new_path,
+                )
+            active_team_name = (
+                state.current_team_override
+                if state.current_team_override is not None
+                else state.current_team
+            )
+            followup_candidates_before: set[Path] = set()
+            consume_manager_notes = False
+            consume_team_override = False
+            attempt_repair_ordinal: int | None = None
+            attempt_team_repairs_completed: int | None = None
+            attempt_ordinal: int | None = None
+            cumulative_route_scope_id: str | None = None
+            turn_session_request: SessionRequest | None = None
+            owned_session_result = None
+            cross_handover_prompt = ""
+            recovery_first_worker = (
+                state.recovery_context is not None
+                and not state.recovery_consumed
+                and (
+                    current_step_name in wf.steps
+                    and wf.steps[current_step_name].role == "worker"
+                )
+            )
+            if retry_ctx is not None:
+                state.status_message = (
+                    f"running turn {turn_number}: step {current_step_name} "
+                    f"(retry {retry_ctx.attempt}/{retry_ctx.retry_limit})"
                 )
                 run_metadata.write(
-                    status="failed", failure_reason=summary,
+                    status="running", last_snapshot=state.last_snapshot,
                      original_plan_path=original_plan_path,
-                    current_step_name=current_step_name, active_plan_path=active_plan_path,
+                    current_step_name=current_step_name, active_plan_path=retry_ctx.active_plan_path,
                 )
-                raise WorkflowError(summary, run_dir=run_paths.run_dir) from exc
-
-            done = current_plan.snapshot.is_complete
-            checkpoint_index = current_plan.snapshot.current_checkpoint_index
-
-            execution_original_plan_path = _exec_plan_path(
-                original_plan_path,
-                exec_ctx,
-            )
-            execution_new_plan_path = generate_new_plan_path(
-                execution_original_plan_path,
-                checkpoint_index=checkpoint_index,
-            )
-            new_plan_path = _primary_plan_path(
-                execution_new_plan_path,
-                exec_ctx,
-            )
-
-            step = wf.steps[current_step_name]
-            step_path = f"workflow.{workflow_name}.steps.{current_step_name}"
-            if step.role == "worker" and state.active_implementation_scope is None:
-                cumulative_route_scope_id = _cumulative_repair_scope_id(
-                    state, repo_root=run_paths.repo_root,
-                    original_plan_path=original_plan_path,
-                    target_plan_path=active_plan_path,
-                    exec_ctx=exec_ctx,
+                done = retry_ctx.snapshot_before.is_complete
+                active_plan_path = retry_ctx.active_plan_path
+                new_plan_path = retry_ctx.new_plan_path
+                followup_candidates_before = _list_followup_plan_candidates(
+                    _exec_plan_path(original_plan_path, exec_ctx)
                 )
-            if step.role == "worker" and not current_plan.snapshot.is_complete:
-                try:
-                    _scope, scope_was_opened = _open_implementation_scope(
-                        state,
+                step = wf.steps[current_step_name]
+                step_path = f"workflow.{workflow_name}.steps.{current_step_name}"
+                if step.role == "worker" and state.active_implementation_scope is None:
+                    cumulative_route_scope_id = _cumulative_repair_scope_id(
+                        state, repo_root=run_paths.repo_root,
                         original_plan_path=original_plan_path,
-                        original_snapshot=current_plan.snapshot,
-                        turn_number=turn_number,
+                        target_plan_path=active_plan_path,
+                        exec_ctx=exec_ctx,
                     )
-                    if scope_was_opened:
-                        _capture_scope_envelope(
+                if step.role == "worker" and not done:
+                    try:
+                        _scope, scope_was_opened = _open_implementation_scope(
                             state,
-                            scope=_scope,
-                            plan_text=None,
-                            primary_plan_path=original_plan_path,
-                            run_dir=run_paths.run_dir,
-                            exec_ctx=exec_ctx,
-                            repo_root=config.repo_root,
-                        )
-                        run_metadata.write(
-                            status="running",
-                            execution_context=exec_ctx,
-                            last_snapshot=current_plan.snapshot,
-                            turns_completed=state.turns_completed,
                             original_plan_path=original_plan_path,
-                            current_step_name=current_step_name,
-                            active_plan_path=active_plan_path,
-                            new_plan_path=new_plan_path,
+                            original_snapshot=state.last_snapshot,
+                            turn_number=turn_number,
                         )
-                    elif not scope_was_opened:
-                        _validate_existing_scope_envelope(
-                            run_paths.run_dir,
-                            _scope,
+                        if scope_was_opened:
+                            _capture_scope_envelope(
+                                state,
+                                scope=_scope,
+                                plan_text=None,
+                                primary_plan_path=original_plan_path,
+                                run_dir=run_paths.run_dir,
+                                exec_ctx=exec_ctx,
+                                repo_root=config.repo_root,
+                            )
+                            run_metadata.write(
+                                status="running",
+                                execution_context=exec_ctx,
+                                last_snapshot=state.last_snapshot,
+                                turns_completed=state.turns_completed,
+                                original_plan_path=original_plan_path,
+                                current_step_name=current_step_name,
+                                active_plan_path=active_plan_path,
+                                new_plan_path=new_plan_path,
+                            )
+                        elif not scope_was_opened:
+                            _validate_existing_scope_envelope(
+                                run_paths.run_dir,
+                                _scope,
+                            )
+                    except WorkflowError as exc:
+                        _raise_pre_turn_failure(
+                            reason=exc.summary,
+                            snapshot=retry_ctx.snapshot_before,
+                            active_path=active_plan_path,
+                            new_path=new_plan_path,
                         )
-                except WorkflowError as exc:
-                    _raise_pre_turn_failure(
-                        reason=exc.summary,
-                        snapshot=current_plan.snapshot,
-                        active_path=active_plan_path,
-                        new_path=new_plan_path,
+                pending_override = state.pending_step_team_override
+                if (
+                    pending_override is not None
+                    and not pending_override.consumed
+                    and pending_override.target_step == current_step_name
+                    and pending_override.role == step.role
+                    and _pending_matches_scope_and_plan(
+                        pending_override,
+                        state,
+                        _target_plan_identity(active_plan_path),
                     )
-            pending_override = state.pending_step_team_override
-            if (
-                pending_override is not None
-                and not pending_override.consumed
-                and pending_override.target_step == current_step_name
-                and pending_override.role == step.role
-                and _pending_matches_scope_and_plan(
-                    pending_override,
-                    state,
-                    _target_plan_identity(active_plan_path),
+                ):
+                    active_team_name = pending_override.target_team
+                    consume_team_override = True
+                    attempt_repair_ordinal = pending_override.repair_ordinal
+                    attempt_team_repairs_completed = pending_override.team_repairs_completed
+                routing_scope_id = (
+                    state.active_implementation_scope.scope_id
+                    if state.active_implementation_scope is not None
+                    else cumulative_route_scope_id
                 )
-            ):
-                active_team_name = pending_override.target_team
-                consume_team_override = True
-                attempt_repair_ordinal = pending_override.repair_ordinal
-                attempt_team_repairs_completed = pending_override.team_repairs_completed
-            routing_scope_id = (
-                state.active_implementation_scope.scope_id
-                if state.active_implementation_scope is not None
-                else cumulative_route_scope_id
-            )
-            if step.role == "worker" and routing_scope_id is not None:
-                if attempt_repair_ordinal is None:
-                    prelaunch_policy = determine_repair_upgrade_policy(
-                        workflow_config,
-                        threshold=wf.upgrade_after_repairs,
-                        role="worker",
-                        baseline_team=baseline_team_name,
-                        scope_id=routing_scope_id,
-                        attempts=state.implementation_attempts.get(
-                            routing_scope_id, []
-                        ),
-                        rejections=state.review_rejection_history,
-                    )
-                    attempt_repair_ordinal = (
-                        prelaunch_policy.repair_ordinal
-                        if prelaunch_policy.active
-                        else 0
-                    )
-                    attempt_team_repairs_completed = (
-                        prelaunch_policy.team_repairs_completed
-                        if prelaunch_policy.active
-                        else 0
-                    )
-            selector, resolved = _resolve_step_runtime(
-                step,
-                workflow_config,
-                team_name=active_team_name,
-                step_path=step_path,
-                step_name=current_step_name,
-                run_local_role_selectors=state.role_selectors,
-                pending_team_override=(
-                    state.pending_step_team_override if consume_team_override else None
-                ),
-            )
-            _reconcile_live_worker_target(
-                selector=selector,
-                resolved=resolved,
-                step_role=step.role,
-            )
-            system_prompt = resolve_role_prompt(
-                step.role,
-                active_team_name,
-                workflow_config,
-                step_path=step_path,
-            )
-
-            step_adapter = adapter or get_adapter(resolved.harness_name)
-            turn_session_driver = session_driver or (
-                _discover_session_driver(step_adapter, repo_root=execution_repo_root) if runner is None else None
-            )
-            snapshot_before = state.last_snapshot
-
-            _sync_plan_to_worktree(original_plan_path, exec_ctx)
-            followup_candidates_before = _list_followup_plan_candidates(
-                _exec_plan_path(original_plan_path, exec_ctx)
-            )
-            manager_notes, consume_manager_notes = _prepare_pending_manager_notes(
-                step_name=current_step_name,
-                step_role=step.role,
-                selector=selector,
-                target_plan_path=active_plan_path,
-                active_team=active_team_name,
-            )
-
-            try:
-                user_prompt = render_step_prompts(
+                if step.role == "worker" and routing_scope_id is not None:
+                    if attempt_repair_ordinal is None:
+                        prelaunch_policy = determine_repair_upgrade_policy(
+                            workflow_config,
+                            threshold=wf.upgrade_after_repairs,
+                            role="worker",
+                            baseline_team=baseline_team_name,
+                            scope_id=routing_scope_id,
+                            attempts=state.implementation_attempts.get(
+                                routing_scope_id, []
+                            ),
+                            rejections=state.review_rejection_history,
+                        )
+                        attempt_repair_ordinal = (
+                            prelaunch_policy.repair_ordinal
+                            if prelaunch_policy.active
+                            else 0
+                        )
+                        attempt_team_repairs_completed = (
+                            prelaunch_policy.team_repairs_completed
+                            if prelaunch_policy.active
+                            else 0
+                        )
+                selector, resolved = _resolve_step_runtime(
                     step,
                     workflow_config,
-                    config_dir=prompt_config_dir,
-                    working_dir=working_dir,
-                    original_plan_path=_exec_plan_path(original_plan_path, exec_ctx),
-                    new_plan_path=_exec_plan_path(new_plan_path, exec_ctx),
-                    active_plan_path=_exec_plan_path(active_plan_path, exec_ctx),
-                )
-
-                user_prompt = _append_checkpoint_review_context(
-                    user_prompt,
-                    step_role=step.role,
-                    state=state,
-                    repo_root=run_paths.repo_root,
-                    run_dir=run_paths.run_dir,
-                    original_plan_path=_exec_plan_path(original_plan_path, exec_ctx),
-                    active_plan_path=_exec_plan_path(active_plan_path, exec_ctx),
-                    resume=resume,
-                    recovered_boundary=(
-                        replayed_boundary
-                        if state.turns_completed == 0
-                        else None
+                    team_name=active_team_name,
+                    step_path=step_path,
+                    step_name=current_step_name,
+                    run_local_role_selectors=state.role_selectors,
+                    pending_team_override=(
+                        state.pending_step_team_override if consume_team_override else None
                     ),
                 )
-                user_prompt = _append_durable_recovery_context(
-                    user_prompt,
+                _reconcile_live_worker_target(
+                    selector=selector,
+                    resolved=resolved,
                     step_role=step.role,
-                    recovery_context=state.recovery_context,
                 )
-
-                if config.extra_instructions:
-                    extra_text = " ".join(config.extra_instructions).strip()
-                    user_prompt = "\n\n".join((user_prompt, extra_text))
-
-                if manager_notes:
-                    user_prompt += "\n\n## Manager notes for this turn\n" + "\n".join(
-                        f"- {note}" for note in manager_notes
-                    )
-                override_notes_match = bool(state.pending_override_notes) and (
-                    state.pending_override_target_step == current_step_name
-                    or (
-                        state.pending_override_target_step is None
-                        and step.role == "worker"
-                    )
+                system_prompt = resolve_role_prompt(
+                    step.role,
+                    active_team_name,
+                    workflow_config,
+                    step_path=step_path,
                 )
-                if override_notes_match:
-                    user_prompt += (
-                        "\n\n## User override notes for this turn\n"
-                        + "\n".join(
-                            f"- {note}" for note in state.pending_override_notes
-                        )
+                step_adapter = adapter or get_adapter(resolved.harness_name)
+                turn_session_driver = session_driver or (
+                    _discover_session_driver(step_adapter, repo_root=execution_repo_root) if runner is None else None
+                )
+                snapshot_before = retry_ctx.snapshot_before
+                manager_notes, consume_manager_notes = _prepare_pending_manager_notes(
+                    step_name=current_step_name,
+                    step_role=step.role,
+                    selector=selector,
+                    target_plan_path=active_plan_path,
+                    active_team=active_team_name,
+                )
+                try:
+                    user_prompt = render_step_prompts(
+                        step,
+                        workflow_config,
+                        config_dir=prompt_config_dir,
+                        working_dir=working_dir,
+                        original_plan_path=_exec_plan_path(original_plan_path, exec_ctx),
+                        new_plan_path=_exec_plan_path(new_plan_path, exec_ctx),
+                        active_plan_path=_exec_plan_path(active_plan_path, exec_ctx),
                     )
-
-                transaction = state.current_hotplug_transaction
-                if (
-                    step.role == "worker"
-                    and not recovery_first_worker
-                    and transaction is not None
-                    and transaction.target_selector == selector
-                    and transaction.source_harness != transaction.target_harness
-                    and turn_session_driver is not None
-                ):
-                    source_driver = source_session_driver or (
-                        _discover_session_driver(
-                            get_adapter(transaction.source_harness),
-                            repo_root=execution_repo_root,
-                        )
-                        if runner is None else None
-                    )
-                    cross_handover_prompt = _prepare_cross_harness_handover(
-                        transaction, source_driver, turn_session_driver, selector=selector,
-                        system_prompt=system_prompt, user_prompt=user_prompt,
-                        target_preflight=lambda: _preflight_or_fail(
-                            turn_session_driver.build_invocation(
-                                SessionRequest(
-                                    repo_root=execution_repo_root,
-                                    selector=selector,
-                                    model=resolved.model,
-                                    system_prompt=system_prompt,
-                                    user_prompt=user_prompt,
-                                    effort=resolved.effort,
-                                )
-                            ),
-                            step_adapter,
-                            invocation_kind="workflow_turn",
-                            cwd=execution_repo_root,
-                            workflow_turn=turn_number,
-                            step_name=current_step_name,
-                            turn_number=turn_number,
-                        ),
-                    )
-                    user_prompt += cross_handover_prompt
-                if (
-                    step.role == "worker"
-                    and not recovery_first_worker
-                    and transaction is not None
-                    and transaction.target_selector == selector
-                    and transaction.source_harness == resolved.harness_name
-                    and transaction.target_harness == resolved.harness_name
-                    and (
-                        turn_session_driver is None
-                        or not turn_session_driver.capabilities.resume_with_model
-                    )
-                ):
-                    raise RuntimeError(
-                        "same-harness hotplug requires a session driver with exact resume"
-                    )
-                if turn_session_driver is not None and (runner is None or session_driver is not None) and step.role == "worker":
-                    transaction = state.current_hotplug_transaction
-                    previous_session = (
-                        None
-                        if recovery_first_worker
-                        else _find_previous_worker_session(
-                            selector=selector,
-                            resolved=resolved,
-                            transaction=transaction,
-                        )
-                    )
-                    turn_session_request = SessionRequest(
-                        repo_root=execution_repo_root,
-                        selector=selector,
-                        model=resolved.model,
-                        effort=resolved.effort,
-                        system_prompt=system_prompt,
-                        user_prompt=user_prompt,
-                        session_id=(
-                            previous_session.session_id
-                            if previous_session is not None
-                            and turn_session_driver.capabilities.resume_with_model
-                            else None
-                        ),
-                        idempotency_key=(
-                            state.recovery_context.intent_digest
-                            if recovery_first_worker and state.recovery_context is not None
-                            else transaction.transaction_id
-                            if transaction is not None
-                            and transaction.source_harness != transaction.target_harness
+                    user_prompt = _append_checkpoint_review_context(
+                        user_prompt,
+                        step_role=step.role,
+                        state=state,
+                        repo_root=run_paths.repo_root,
+                        run_dir=run_paths.run_dir,
+                        original_plan_path=_exec_plan_path(original_plan_path, exec_ctx),
+                        active_plan_path=_exec_plan_path(active_plan_path, exec_ctx),
+                        resume=resume,
+                        recovered_boundary=(
+                            replayed_boundary
+                            if state.turns_completed == 0
                             else None
                         ),
                     )
+                    user_prompt = _append_durable_recovery_context(
+                        user_prompt,
+                        step_role=step.role,
+                        recovery_context=state.recovery_context,
+                    )
+                    if config.extra_instructions:
+                        extra_text = " ".join(config.extra_instructions).strip()
+                        user_prompt = "\n\n".join((user_prompt, extra_text))
+                    user_prompt += "\n\n" + _build_retry_appendix(retry_ctx.parse_error_str)
+                    if manager_notes:
+                        user_prompt += "\n\n## Manager notes for this turn\n" + "\n".join(
+                            f"- {note}" for note in manager_notes
+                        )
+                    override_notes_match = bool(state.pending_override_notes) and (
+                        state.pending_override_target_step == current_step_name
+                        or (
+                            state.pending_override_target_step is None
+                            and step.role == "worker"
+                        )
+                    )
+                    if override_notes_match:
+                        user_prompt += (
+                            "\n\n## User override notes for this turn\n"
+                            + "\n".join(
+                                f"- {note}" for note in state.pending_override_notes
+                            )
+                        )
                     transaction = state.current_hotplug_transaction
                     if (
-                        transaction is not None
+                        (runner is None or session_driver is not None)
+                        and
+                        step.role == "worker"
                         and not recovery_first_worker
+                        and transaction is not None
+                        and transaction.target_selector == selector
+                        and transaction.source_harness != transaction.target_harness
+                        and turn_session_driver is not None
+                    ):
+                        source_driver = source_session_driver or (
+                            _discover_session_driver(
+                                get_adapter(transaction.source_harness),
+                                repo_root=execution_repo_root,
+                            )
+                            if runner is None else None
+                        )
+                        try:
+                            cross_handover_prompt = _prepare_cross_harness_handover(
+                                transaction, source_driver, turn_session_driver, selector=selector,
+                                system_prompt=system_prompt, user_prompt=user_prompt,
+                                target_preflight=lambda: _preflight_or_fail(
+                                    turn_session_driver.build_invocation(
+                                        SessionRequest(
+                                            repo_root=execution_repo_root,
+                                            selector=selector,
+                                            model=resolved.model,
+                                            system_prompt=system_prompt,
+                                            user_prompt=user_prompt,
+                                            effort=resolved.effort,
+                                        )
+                                    ),
+                                    step_adapter,
+                                    invocation_kind="workflow_turn",
+                                    cwd=execution_repo_root,
+                                    workflow_turn=turn_number,
+                                    step_name=current_step_name,
+                                    turn_number=turn_number,
+                                ),
+                            )
+                        except OwnerStopRequested:
+                            return _finish_owner_stop()
+                        user_prompt += cross_handover_prompt
+                    if (
+                        (runner is None or session_driver is not None)
+                        and
+                        step.role == "worker"
+                        and not recovery_first_worker
+                        and transaction is not None
                         and transaction.target_selector == selector
                         and transaction.source_harness == resolved.harness_name
                         and transaction.target_harness == resolved.harness_name
-                        and turn_session_request.session_id is None
+                        and (
+                            turn_session_driver is None
+                            or not turn_session_driver.capabilities.resume_with_model
+                        )
                     ):
                         raise RuntimeError(
-                            "same-harness hotplug requires an exact active source session"
+                            "same-harness hotplug requires a session driver with exact resume"
                         )
-                    invocation = turn_session_driver.build_invocation(turn_session_request)
-                else:
-                    invocation = step_adapter.build_invocation(
-                        repo_root=execution_repo_root,
-                        model=resolved.model,
-                        system_prompt=system_prompt,
-                        user_prompt=user_prompt,
-                        effort=resolved.effort,
-                    )
-                if turn_session_request is not None:
-                    invocation = replace(
+                    if turn_session_driver is not None and (runner is None or session_driver is not None) and step.role == "worker":
+                        transaction = state.current_hotplug_transaction
+                        previous_session = (
+                            None
+                            if recovery_first_worker
+                            else _find_previous_worker_session(
+                                selector=selector,
+                                resolved=resolved,
+                                transaction=transaction,
+                            )
+                        )
+                        turn_session_request = SessionRequest(
+                            repo_root=execution_repo_root,
+                            selector=selector,
+                            model=resolved.model,
+                            effort=resolved.effort,
+                            system_prompt=system_prompt,
+                            user_prompt=user_prompt,
+                            session_id=(
+                                previous_session.session_id
+                                if previous_session is not None
+                                and turn_session_driver.capabilities.resume_with_model
+                                else None
+                            ),
+                            idempotency_key=(
+                                state.recovery_context.intent_digest
+                                if recovery_first_worker and state.recovery_context is not None
+                                else transaction.transaction_id
+                                if transaction is not None
+                                and transaction.source_harness != transaction.target_harness
+                                else None
+                            ),
+                        )
+                        transaction = state.current_hotplug_transaction
+                        if (
+                            transaction is not None
+                            and not recovery_first_worker
+                            and transaction.target_selector == selector
+                            and transaction.source_harness == resolved.harness_name
+                            and transaction.target_harness == resolved.harness_name
+                            and turn_session_request.session_id is None
+                        ):
+                            raise RuntimeError(
+                                "same-harness hotplug requires an exact active source session"
+                            )
+                        invocation = turn_session_driver.build_invocation(turn_session_request)
+                    else:
+                        invocation = step_adapter.build_invocation(
+                            repo_root=execution_repo_root,
+                            model=resolved.model,
+                            system_prompt=system_prompt,
+                            user_prompt=user_prompt,
+                            effort=resolved.effort,
+                        )
+                    if turn_session_request is not None:
+                        invocation = replace(
+                            invocation,
+                            semantic_output_source=STRUCTURED_TRANSPORT_OUTPUT_SOURCE,
+                        )
+                    _preflight_or_fail(
                         invocation,
-                        semantic_output_source=STRUCTURED_TRANSPORT_OUTPUT_SOURCE,
+                        step_adapter,
+                        invocation_kind="workflow_turn",
+                        cwd=execution_repo_root,
+                        workflow_turn=turn_number,
+                        step_name=current_step_name,
+                        turn_number=turn_number,
                     )
-                _preflight_or_fail(
-                    invocation,
-                    step_adapter,
-                    invocation_kind="workflow_turn",
-                    cwd=execution_repo_root,
-                    workflow_turn=turn_number,
-                    step_name=current_step_name,
-                    turn_number=turn_number,
-                )
-                # Must complete before the harness runs: in-progress approval
-                # cleanup may delete the follow-up plan this turn is about to use.
-                _backup_active_followup_plan(
-                    config.repo_root,
-                    original_plan_path,
-                    active_plan_path,
-                    source_path=_exec_plan_path(active_plan_path, exec_ctx),
-                    event="before_followup_turn",
-                    run_id=run_paths.run_dir.name,
-                    turn_number=turn_number,
-                )
-            except WorkflowError as exc:
-                if exc.failure_kind == "environment_preflight":
+                    # Must complete before the harness runs: in-progress approval
+                    # cleanup may delete the follow-up plan this turn is about to use.
+                    _backup_active_followup_plan(
+                        config.repo_root,
+                        original_plan_path,
+                        active_plan_path,
+                        source_path=_exec_plan_path(active_plan_path, exec_ctx),
+                        event="before_followup_turn",
+                        run_id=run_paths.run_dir.name,
+                        turn_number=turn_number,
+                    )
+                except WorkflowError as exc:
+                    if exc.failure_kind == "environment_preflight":
+                        _fail_hotplug_target(exc.summary)
+                        raise
                     _fail_hotplug_target(exc.summary)
-                    raise
-                _fail_hotplug_target(exc.summary)
-                _raise_pre_turn_failure(
-                    reason=exc.summary,
-                    snapshot=snapshot_before,
-                    active_path=active_plan_path,
-                    new_path=new_plan_path,
-                )
-            except Exception as exc:
-                _fail_hotplug_target(str(exc))
-                _raise_pre_turn_failure(
-                    reason=str(exc),
-                    snapshot=snapshot_before,
-                    active_path=active_plan_path,
-                    new_path=new_plan_path,
-                )
-
-        if step.role == "worker" and routing_scope_id is not None:
-            attempt_ordinal = _next_implementation_attempt_ordinal(
-                state.implementation_attempts.get(
-                    routing_scope_id,
-                    [],
-                )
+                    _raise_pre_turn_failure(
+                        reason=exc.summary,
+                        snapshot=snapshot_before,
+                        active_path=active_plan_path,
+                        new_path=new_plan_path,
+                    )
+                except Exception as exc:
+                    _fail_hotplug_target(str(exc))
+                    _raise_pre_turn_failure(
+                        reason=str(exc),
+                        snapshot=snapshot_before,
+                        active_path=active_plan_path,
+                        new_path=new_plan_path,
+                    )
+            else:
+                state.status_message = f"running turn {turn_number}: step {current_step_name}"
+                run_metadata.write(
+                    status="running", last_snapshot=state.last_snapshot,
+                 original_plan_path=original_plan_path,
+                current_step_name=current_step_name, active_plan_path=active_plan_path,
             )
 
-        # Exclusive execution resource gate: exclusive combinations must be
-        # admitted by the durable FIFO broker before the turn starts.
-        # Unmarked profiles keep the legacy fast path (no broker, no event).
-        turn_lease: ExecutionLease | None = None
-        if resolved.exclusive_resource is not None:
-            admission_resource = resolved.exclusive_resource
-            admission_label = _resource_label(resolved)
-            admission_step = step
-            admission_override = (
-                state.pending_step_team_override if consume_team_override else None
-            )
-            admission_selector = selector
-            admission_resolved = resolved
-            try:
-                admission_fingerprint = _step_prompt_fingerprint(
-                    step, workflow_config, active_team_name
+                _sync_plan_to_worktree(original_plan_path, exec_ctx)
+
+                try:
+                    current_plan = load_plan(original_plan_path)
+                except (PlanParseError, FileNotFoundError) as exc:
+                    state.status_message = "failed"
+                    banner.stop(state)
+                    summary = _format_failure(
+                        reason=str(exc),
+                        run_dir=run_paths.run_dir,
+                        snapshot=state.last_snapshot,
+                    )
+                    run_metadata.write(
+                        status="failed", failure_reason=summary,
+                         original_plan_path=original_plan_path,
+                        current_step_name=current_step_name, active_plan_path=active_plan_path,
+                    )
+                    raise WorkflowError(summary, run_dir=run_paths.run_dir) from exc
+
+                done = current_plan.snapshot.is_complete
+                checkpoint_index = current_plan.snapshot.current_checkpoint_index
+
+                execution_original_plan_path = _exec_plan_path(
+                    original_plan_path,
+                    exec_ctx,
                 )
-                admission_prompt_files = _prompt_file_fingerprint(
-                    admission_fingerprint
+                execution_new_plan_path = generate_new_plan_path(
+                    execution_original_plan_path,
+                    checkpoint_index=checkpoint_index,
                 )
-            except WorkflowError as exc:
-                _raise_pre_turn_failure(
-                    reason=exc.summary,
-                    snapshot=snapshot_before,
-                    active_path=active_plan_path,
-                    new_path=new_plan_path,
+                new_plan_path = _primary_plan_path(
+                    execution_new_plan_path,
+                    exec_ctx,
                 )
-            if admission_invocation_id is None:
-                admission_invocation_id = uuid4().hex
-            invocation_id = admission_invocation_id
-            admission_spec = ClaimSpec(
-                project_root=str(config.repo_root),
-                run_id=str(reserved_run_id),
-                invocation_id=invocation_id,
-                kind="turn",
-                role=step.role,
-                selector=selector,
-            )
-            admission_store = _exclusive_resource_store()
-            admission_controller = admission_store.current_controller_identity()
-            admission = ExecutionResourceAdmission(
-                admission_store, **_execution_resource_admission_options()
-            )
-            try:
-                turn_lease = admission.admit(
-                    resource=admission_resource,
-                    spec=admission_spec,
-                    controller=admission_controller,
-                    stop_check=_honor_owner_stop_before_live_reload,
-                    revalidate=lambda final: _revalidate_admission_config(
-                        final=final,
-                        step=admission_step,
-                        pending_override=admission_override,
-                        selector=admission_selector,
-                        resolved=admission_resolved,
-                        prompt_fingerprint=admission_fingerprint,
-                        prompt_files=admission_prompt_files,
+
+                step = wf.steps[current_step_name]
+                step_path = f"workflow.{workflow_name}.steps.{current_step_name}"
+                if step.role == "worker" and state.active_implementation_scope is None:
+                    cumulative_route_scope_id = _cumulative_repair_scope_id(
+                        state, repo_root=run_paths.repo_root,
+                        original_plan_path=original_plan_path,
+                        target_plan_path=active_plan_path,
+                        exec_ctx=exec_ctx,
+                    )
+                if step.role == "worker" and not current_plan.snapshot.is_complete:
+                    try:
+                        _scope, scope_was_opened = _open_implementation_scope(
+                            state,
+                            original_plan_path=original_plan_path,
+                            original_snapshot=current_plan.snapshot,
+                            turn_number=turn_number,
+                        )
+                        if scope_was_opened:
+                            _capture_scope_envelope(
+                                state,
+                                scope=_scope,
+                                plan_text=None,
+                                primary_plan_path=original_plan_path,
+                                run_dir=run_paths.run_dir,
+                                exec_ctx=exec_ctx,
+                                repo_root=config.repo_root,
+                            )
+                            run_metadata.write(
+                                status="running",
+                                execution_context=exec_ctx,
+                                last_snapshot=current_plan.snapshot,
+                                turns_completed=state.turns_completed,
+                                original_plan_path=original_plan_path,
+                                current_step_name=current_step_name,
+                                active_plan_path=active_plan_path,
+                                new_plan_path=new_plan_path,
+                            )
+                        elif not scope_was_opened:
+                            _validate_existing_scope_envelope(
+                                run_paths.run_dir,
+                                _scope,
+                            )
+                    except WorkflowError as exc:
+                        _raise_pre_turn_failure(
+                            reason=exc.summary,
+                            snapshot=current_plan.snapshot,
+                            active_path=active_plan_path,
+                            new_path=new_plan_path,
+                        )
+                pending_override = state.pending_step_team_override
+                if (
+                    pending_override is not None
+                    and not pending_override.consumed
+                    and pending_override.target_step == current_step_name
+                    and pending_override.role == step.role
+                    and _pending_matches_scope_and_plan(
+                        pending_override,
+                        state,
+                        _target_plan_identity(active_plan_path),
+                    )
+                ):
+                    active_team_name = pending_override.target_team
+                    consume_team_override = True
+                    attempt_repair_ordinal = pending_override.repair_ordinal
+                    attempt_team_repairs_completed = pending_override.team_repairs_completed
+                routing_scope_id = (
+                    state.active_implementation_scope.scope_id
+                    if state.active_implementation_scope is not None
+                    else cumulative_route_scope_id
+                )
+                if step.role == "worker" and routing_scope_id is not None:
+                    if attempt_repair_ordinal is None:
+                        prelaunch_policy = determine_repair_upgrade_policy(
+                            workflow_config,
+                            threshold=wf.upgrade_after_repairs,
+                            role="worker",
+                            baseline_team=baseline_team_name,
+                            scope_id=routing_scope_id,
+                            attempts=state.implementation_attempts.get(
+                                routing_scope_id, []
+                            ),
+                            rejections=state.review_rejection_history,
+                        )
+                        attempt_repair_ordinal = (
+                            prelaunch_policy.repair_ordinal
+                            if prelaunch_policy.active
+                            else 0
+                        )
+                        attempt_team_repairs_completed = (
+                            prelaunch_policy.team_repairs_completed
+                            if prelaunch_policy.active
+                            else 0
+                        )
+                selector, resolved = _resolve_step_runtime(
+                    step,
+                    workflow_config,
+                    team_name=active_team_name,
+                    step_path=step_path,
+                    step_name=current_step_name,
+                    run_local_role_selectors=state.role_selectors,
+                    pending_team_override=(
+                        state.pending_step_team_override if consume_team_override else None
                     ),
-                    on_waiting=lambda reason, ticket: (
-                        _persist_execution_resource_wait(
-                            _resource_wait_record(
+                )
+                _reconcile_live_worker_target(
+                    selector=selector,
+                    resolved=resolved,
+                    step_role=step.role,
+                )
+                system_prompt = resolve_role_prompt(
+                    step.role,
+                    active_team_name,
+                    workflow_config,
+                    step_path=step_path,
+                )
+
+                step_adapter = adapter or get_adapter(resolved.harness_name)
+                turn_session_driver = session_driver or (
+                    _discover_session_driver(step_adapter, repo_root=execution_repo_root) if runner is None else None
+                )
+                snapshot_before = state.last_snapshot
+
+                _sync_plan_to_worktree(original_plan_path, exec_ctx)
+                followup_candidates_before = _list_followup_plan_candidates(
+                    _exec_plan_path(original_plan_path, exec_ctx)
+                )
+                manager_notes, consume_manager_notes = _prepare_pending_manager_notes(
+                    step_name=current_step_name,
+                    step_role=step.role,
+                    selector=selector,
+                    target_plan_path=active_plan_path,
+                    active_team=active_team_name,
+                )
+
+                try:
+                    user_prompt = render_step_prompts(
+                        step,
+                        workflow_config,
+                        config_dir=prompt_config_dir,
+                        working_dir=working_dir,
+                        original_plan_path=_exec_plan_path(original_plan_path, exec_ctx),
+                        new_plan_path=_exec_plan_path(new_plan_path, exec_ctx),
+                        active_plan_path=_exec_plan_path(active_plan_path, exec_ctx),
+                    )
+
+                    user_prompt = _append_checkpoint_review_context(
+                        user_prompt,
+                        step_role=step.role,
+                        state=state,
+                        repo_root=run_paths.repo_root,
+                        run_dir=run_paths.run_dir,
+                        original_plan_path=_exec_plan_path(original_plan_path, exec_ctx),
+                        active_plan_path=_exec_plan_path(active_plan_path, exec_ctx),
+                        resume=resume,
+                        recovered_boundary=(
+                            replayed_boundary
+                            if state.turns_completed == 0
+                            else None
+                        ),
+                    )
+                    user_prompt = _append_durable_recovery_context(
+                        user_prompt,
+                        step_role=step.role,
+                        recovery_context=state.recovery_context,
+                    )
+
+                    if config.extra_instructions:
+                        extra_text = " ".join(config.extra_instructions).strip()
+                        user_prompt = "\n\n".join((user_prompt, extra_text))
+
+                    if manager_notes:
+                        user_prompt += "\n\n## Manager notes for this turn\n" + "\n".join(
+                            f"- {note}" for note in manager_notes
+                        )
+                    override_notes_match = bool(state.pending_override_notes) and (
+                        state.pending_override_target_step == current_step_name
+                        or (
+                            state.pending_override_target_step is None
+                            and step.role == "worker"
+                        )
+                    )
+                    if override_notes_match:
+                        user_prompt += (
+                            "\n\n## User override notes for this turn\n"
+                            + "\n".join(
+                                f"- {note}" for note in state.pending_override_notes
+                            )
+                        )
+
+                    transaction = state.current_hotplug_transaction
+                    if (
+                        step.role == "worker"
+                        and not recovery_first_worker
+                        and transaction is not None
+                        and transaction.target_selector == selector
+                        and transaction.source_harness != transaction.target_harness
+                        and turn_session_driver is not None
+                    ):
+                        source_driver = source_session_driver or (
+                            _discover_session_driver(
+                                get_adapter(transaction.source_harness),
+                                repo_root=execution_repo_root,
+                            )
+                            if runner is None else None
+                        )
+                        try:
+                            cross_handover_prompt = _prepare_cross_harness_handover(
+                                transaction, source_driver, turn_session_driver, selector=selector,
+                                system_prompt=system_prompt, user_prompt=user_prompt,
+                                target_preflight=lambda: _preflight_or_fail(
+                                    turn_session_driver.build_invocation(
+                                        SessionRequest(
+                                            repo_root=execution_repo_root,
+                                            selector=selector,
+                                            model=resolved.model,
+                                            system_prompt=system_prompt,
+                                            user_prompt=user_prompt,
+                                            effort=resolved.effort,
+                                        )
+                                    ),
+                                    step_adapter,
+                                    invocation_kind="workflow_turn",
+                                    cwd=execution_repo_root,
+                                    workflow_turn=turn_number,
+                                    step_name=current_step_name,
+                                    turn_number=turn_number,
+                                ),
+                            )
+                        except OwnerStopRequested:
+                            return _finish_owner_stop()
+                        user_prompt += cross_handover_prompt
+                    if (
+                        step.role == "worker"
+                        and not recovery_first_worker
+                        and transaction is not None
+                        and transaction.target_selector == selector
+                        and transaction.source_harness == resolved.harness_name
+                        and transaction.target_harness == resolved.harness_name
+                        and (
+                            turn_session_driver is None
+                            or not turn_session_driver.capabilities.resume_with_model
+                        )
+                    ):
+                        raise RuntimeError(
+                            "same-harness hotplug requires a session driver with exact resume"
+                        )
+                    if turn_session_driver is not None and (runner is None or session_driver is not None) and step.role == "worker":
+                        transaction = state.current_hotplug_transaction
+                        previous_session = (
+                            None
+                            if recovery_first_worker
+                            else _find_previous_worker_session(
+                                selector=selector,
+                                resolved=resolved,
+                                transaction=transaction,
+                            )
+                        )
+                        turn_session_request = SessionRequest(
+                            repo_root=execution_repo_root,
+                            selector=selector,
+                            model=resolved.model,
+                            effort=resolved.effort,
+                            system_prompt=system_prompt,
+                            user_prompt=user_prompt,
+                            session_id=(
+                                previous_session.session_id
+                                if previous_session is not None
+                                and turn_session_driver.capabilities.resume_with_model
+                                else None
+                            ),
+                            idempotency_key=(
+                                state.recovery_context.intent_digest
+                                if recovery_first_worker and state.recovery_context is not None
+                                else transaction.transaction_id
+                                if transaction is not None
+                                and transaction.source_harness != transaction.target_harness
+                                else None
+                            ),
+                        )
+                        transaction = state.current_hotplug_transaction
+                        if (
+                            transaction is not None
+                            and not recovery_first_worker
+                            and transaction.target_selector == selector
+                            and transaction.source_harness == resolved.harness_name
+                            and transaction.target_harness == resolved.harness_name
+                            and turn_session_request.session_id is None
+                        ):
+                            raise RuntimeError(
+                                "same-harness hotplug requires an exact active source session"
+                            )
+                        invocation = turn_session_driver.build_invocation(turn_session_request)
+                    else:
+                        invocation = step_adapter.build_invocation(
+                            repo_root=execution_repo_root,
+                            model=resolved.model,
+                            system_prompt=system_prompt,
+                            user_prompt=user_prompt,
+                            effort=resolved.effort,
+                        )
+                    if turn_session_request is not None:
+                        invocation = replace(
+                            invocation,
+                            semantic_output_source=STRUCTURED_TRANSPORT_OUTPUT_SOURCE,
+                        )
+                    _preflight_or_fail(
+                        invocation,
+                        step_adapter,
+                        invocation_kind="workflow_turn",
+                        cwd=execution_repo_root,
+                        workflow_turn=turn_number,
+                        step_name=current_step_name,
+                        turn_number=turn_number,
+                    )
+                    # Must complete before the harness runs: in-progress approval
+                    # cleanup may delete the follow-up plan this turn is about to use.
+                    _backup_active_followup_plan(
+                        config.repo_root,
+                        original_plan_path,
+                        active_plan_path,
+                        source_path=_exec_plan_path(active_plan_path, exec_ctx),
+                        event="before_followup_turn",
+                        run_id=run_paths.run_dir.name,
+                        turn_number=turn_number,
+                    )
+                except WorkflowError as exc:
+                    if exc.failure_kind == "environment_preflight":
+                        _fail_hotplug_target(exc.summary)
+                        raise
+                    _fail_hotplug_target(exc.summary)
+                    _raise_pre_turn_failure(
+                        reason=exc.summary,
+                        snapshot=snapshot_before,
+                        active_path=active_plan_path,
+                        new_path=new_plan_path,
+                    )
+                except Exception as exc:
+                    _fail_hotplug_target(str(exc))
+                    _raise_pre_turn_failure(
+                        reason=str(exc),
+                        snapshot=snapshot_before,
+                        active_path=active_plan_path,
+                        new_path=new_plan_path,
+                    )
+
+            if step.role == "worker" and routing_scope_id is not None:
+                attempt_ordinal = _next_implementation_attempt_ordinal(
+                    state.implementation_attempts.get(
+                        routing_scope_id,
+                        [],
+                    )
+                )
+
+            # Exclusive execution resource gate: exclusive combinations must be
+            # admitted by the durable FIFO broker before the turn starts.
+            # Unmarked profiles keep the legacy fast path (no broker, no event).
+            turn_lease: ExecutionLease | None = None
+            if resolved.exclusive_resource is not None:
+                admission_resource = resolved.exclusive_resource
+                admission_label = _resource_label(resolved)
+                admission_step = step
+                admission_override = (
+                    state.pending_step_team_override if consume_team_override else None
+                )
+                admission_selector = selector
+                admission_resolved = resolved
+                try:
+                    admission_fingerprint = _step_prompt_fingerprint(
+                        step, workflow_config, active_team_name
+                    )
+                    admission_prompt_files = _prompt_file_fingerprint(
+                        admission_fingerprint
+                    )
+                except WorkflowError as exc:
+                    _raise_pre_turn_failure(
+                        reason=exc.summary,
+                        snapshot=snapshot_before,
+                        active_path=active_plan_path,
+                        new_path=new_plan_path,
+                    )
+                if admission_invocation_id is None:
+                    admission_invocation_id = uuid4().hex
+                invocation_id = admission_invocation_id
+                admission_spec = ClaimSpec(
+                    project_root=str(config.repo_root),
+                    run_id=str(reserved_run_id),
+                    invocation_id=invocation_id,
+                    kind="turn",
+                    role=step.role,
+                    selector=selector,
+                )
+                admission_store = _exclusive_resource_store()
+                admission_controller = admission_store.current_controller_identity()
+                admission = ExecutionResourceAdmission(
+                    admission_store, **_execution_resource_admission_options()
+                )
+                try:
+                    turn_lease = admission.admit(
+                        resource=admission_resource,
+                        spec=admission_spec,
+                        controller=admission_controller,
+                        stop_check=_honor_owner_stop_before_live_reload,
+                        revalidate=lambda final: _revalidate_admission_config(
+                            final=final,
+                            step=admission_step,
+                            pending_override=admission_override,
+                            selector=admission_selector,
+                            resolved=admission_resolved,
+                            prompt_fingerprint=admission_fingerprint,
+                            prompt_files=admission_prompt_files,
+                        ),
+                        on_waiting=lambda reason, ticket: (
+                            _persist_execution_resource_wait(
+                                _resource_wait_record(
+                                    resource=admission_resource,
+                                    label=admission_label,
+                                    ticket=ticket,
+                                    reason=reason,
+                                    step_name=current_step_name,
+                                    role=step.role,
+                                    invocation_id=invocation_id,
+                                    kind="turn",
+                                    selector=selector,
+                                    wait_started_at=_begin_admission_wait(),
+                                    controller=admission_controller,
+                                )
+                            ),
+                            _emit_resource_event(
+                                "waiting",
                                 resource=admission_resource,
                                 label=admission_label,
                                 ticket=ticket,
@@ -14241,212 +15237,879 @@ def _run_workflow_unchecked(
                                 step_name=current_step_name,
                                 role=step.role,
                                 invocation_id=invocation_id,
-                                kind="turn",
-                                selector=selector,
-                                wait_started_at=_begin_admission_wait(),
-                                controller=admission_controller,
-                            )
+                            ),
                         ),
-                        _emit_resource_event(
-                            "waiting",
-                            resource=admission_resource,
-                            label=admission_label,
-                            ticket=ticket,
-                            reason=reason,
-                            step_name=current_step_name,
-                            role=step.role,
-                            invocation_id=invocation_id,
+                        on_acquired=lambda ticket: (
+                            _clear_admission_wait_start(),
+                            _persist_execution_resource_wait(None),
+                            _emit_resource_event(
+                                "acquired",
+                                resource=admission_resource,
+                                label=admission_label,
+                                ticket=ticket,
+                                step_name=current_step_name,
+                                role=step.role,
+                                invocation_id=invocation_id,
+                            ),
                         ),
-                    ),
-                    on_acquired=lambda ticket: (
-                        _clear_admission_wait_start(),
-                        _persist_execution_resource_wait(None),
-                        _emit_resource_event(
-                            "acquired",
-                            resource=admission_resource,
-                            label=admission_label,
-                            ticket=ticket,
-                            step_name=current_step_name,
-                            role=step.role,
-                            invocation_id=invocation_id,
+                        on_cancelled=lambda reason: (
+                            _clear_admission_wait_start(),
+                            _persist_execution_resource_wait(None),
+                            _emit_resource_event(
+                                "cancelled",
+                                resource=admission_resource,
+                                label=admission_label,
+                                reason=reason,
+                                step_name=current_step_name,
+                                role=step.role,
+                                invocation_id=invocation_id,
+                            ),
                         ),
-                    ),
-                    on_cancelled=lambda reason: (
-                        _clear_admission_wait_start(),
-                        _persist_execution_resource_wait(None),
-                        _emit_resource_event(
-                            "cancelled",
-                            resource=admission_resource,
-                            label=admission_label,
-                            reason=reason,
-                            step_name=current_step_name,
-                            role=step.role,
-                            invocation_id=invocation_id,
+                    )
+                except TurnReprepareRequired as reprepare:
+                    admission_invocation_id = reprepare.retained_invocation_id
+                    # A fresh re-prepare starts a new wait window; a retained
+                    # (prompt-only) re-prepare keeps the original wait start.
+                    if reprepare.retained_invocation_id is None:
+                        admission_wait_started_at = None
+                    continue
+                except OwnerStopRequested:
+                    return _finish_owner_stop()
+                except (ConfigError, WorkflowError) as exc:
+                    # A changed live configuration that cannot be trusted (a
+                    # malformed pair, or a route that no longer resolves) fails
+                    # the turn closed at the pre-turn boundary, mid-wait or
+                    # post-acquire alike; the admission engine has already
+                    # cancelled the claim or released the reservation.
+                    _raise_pre_turn_failure(
+                        reason=(
+                            "exclusive execution resource admission "
+                            "revalidation failed: "
+                            f"{getattr(exc, 'summary', None) or exc}"
                         ),
-                    ),
-                )
-            except TurnReprepareRequired as reprepare:
-                admission_invocation_id = reprepare.retained_invocation_id
-                # A fresh re-prepare starts a new wait window; a retained
-                # (prompt-only) re-prepare keeps the original wait start.
-                if reprepare.retained_invocation_id is None:
-                    admission_wait_started_at = None
-                continue
-            except OwnerStopRequested:
-                return _finish_owner_stop()
-            except (ConfigError, WorkflowError) as exc:
-                # A changed live configuration that cannot be trusted (a
-                # malformed pair, or a route that no longer resolves) fails
-                # the turn closed at the pre-turn boundary, mid-wait or
-                # post-acquire alike; the admission engine has already
-                # cancelled the claim or released the reservation.
-                _raise_pre_turn_failure(
-                    reason=(
-                        "exclusive execution resource admission "
-                        "revalidation failed: "
-                        f"{getattr(exc, 'summary', None) or exc}"
-                    ),
-                    snapshot=state.last_snapshot,
-                    active_path=active_plan_path,
-                    new_path=new_plan_path,
-                )
-            except ResourceLeaseError as exc:
-                _raise_pre_turn_failure(
-                    reason=(
-                        "exclusive execution resource unavailable: "
-                        f"{exc.reason}"
-                    ),
-                    snapshot=state.last_snapshot,
-                    active_path=active_plan_path,
-                    new_path=new_plan_path,
-                )
+                        snapshot=state.last_snapshot,
+                        active_path=active_plan_path,
+                        new_path=new_plan_path,
+                    )
+                except ResourceLeaseError as exc:
+                    _raise_pre_turn_failure(
+                        reason=(
+                            "exclusive execution resource unavailable: "
+                            f"{exc.reason}"
+                        ),
+                        snapshot=state.last_snapshot,
+                        active_path=active_plan_path,
+                        new_path=new_plan_path,
+                    )
 
-            # Durable launch intent is ordered before _start_turn: no turn,
-            # repair, or recovery accounting may exist before the claim is
-            # durably "launching".  A confirmed non-launch may release the
-            # reserved claim; the turn then fails closed with zero
-            # accounting.
-            try:
-                turn_lease.mark_launching()
-            except ResourceLeaseError as exc:
+                # Durable launch intent is ordered before _start_turn: no turn,
+                # repair, or recovery accounting may exist before the claim is
+                # durably "launching".  A confirmed non-launch may release the
+                # reserved claim; the turn then fails closed with zero
+                # accounting.
                 try:
-                    turn_lease.complete()
-                except ResourceLeaseError:
-                    pass
-                _raise_pre_turn_failure(
-                    reason=(
-                        "exclusive execution resource launch intent "
-                        f"failed: {exc.reason}"
-                    ),
-                    snapshot=state.last_snapshot,
-                    active_path=active_plan_path,
-                    new_path=new_plan_path,
-                )
+                    turn_lease.mark_launching()
+                except ResourceLeaseError as exc:
+                    try:
+                        turn_lease.complete()
+                    except ResourceLeaseError:
+                        pass
+                    _raise_pre_turn_failure(
+                        reason=(
+                            "exclusive execution resource launch intent "
+                            f"failed: {exc.reason}"
+                        ),
+                        snapshot=state.last_snapshot,
+                        active_path=active_plan_path,
+                        new_path=new_plan_path,
+                    )
 
-        turn_dir, turn_started_at = _start_turn(
-            turn_number=turn_number,
-            step_name=current_step_name,
-            step=step,
-            step_role=step.role,
-            resolved_selector=selector,
-            resolved=resolved,
-            active_path=active_plan_path,
-            new_path=new_plan_path,
-            invocation=invocation,
-            snapshot_before=snapshot_before,
-        )
-        if recovery_first_worker:
-            # The marker is written after turn artifacts are prepared but
-            # before any provider call.  A later restart therefore rejects an
-            # operation whose liveness cannot be proven.
-            _persist_recovery_operation_state("in_flight")
-        completed: subprocess.CompletedProcess[str] | None = None
-        semantic_stdout: str | None = None
-        post_snapshot: PlanSnapshot | None = None
-        conditions: dict[str, bool] | None = None
-        selected_transition: GoTransition | None = None
-        transition_target: str | None = None
-        try:
-            if override_notes_match:
-                state.pending_override_notes = ()
-                state.pending_override_target_step = None
-                run_metadata.write(
-                    status="running",
-                    last_snapshot=state.last_snapshot,
-                    original_plan_path=original_plan_path,
-                    current_step_name=current_step_name,
-                    active_plan_path=active_plan_path,
-                    new_plan_path=new_plan_path,
-                )
-            if consume_manager_notes:
-                state.pending_manager_notes = None
-            # Keep the selected worker route durable through the provider
-            # launch boundary.  Clearing it here leaves a prelaunch resume
-            # with only the baseline team, even though the override was
-            # already selected and persisted in the turn metadata.  The
-            # finalized-turn path below clears it after the provider result
-            # has been recorded.
-            boundary_target_started = (
-                state.pending_boundary_decision is not None
-                and not state.pending_boundary_decision.consumed
-                and state.pending_boundary_decision.resolved_next_step == current_step_name
-                and (state.pending_boundary_decision.target_role is None or state.pending_boundary_decision.target_role == step.role)
-                and _pending_matches_scope_and_plan(
-                    state.pending_boundary_decision,
-                    state,
-                    _target_plan_identity(active_plan_path),
-                )
-                and (state.pending_boundary_decision.target_selector is None or state.pending_boundary_decision.target_selector == selector)
+            turn_dir, turn_started_at = _start_turn(
+                turn_number=turn_number,
+                step_name=current_step_name,
+                step=step,
+                step_role=step.role,
+                resolved_selector=selector,
+                resolved=resolved,
+                active_path=active_plan_path,
+                new_path=new_plan_path,
+                invocation=invocation,
+                snapshot_before=snapshot_before,
             )
-            if consume_manager_notes or consume_team_override or boundary_target_started:
-                if boundary_target_started:
-                    completed_repartition_boundary = (
-                        state.pending_boundary_decision.action
-                        == "repartition_current_checkpoint"
-                    )
-                    state.pending_boundary_decision = replace(
-                        state.pending_boundary_decision, applied=True, consumed=True
-                    )
-                    if completed_repartition_boundary:
-                        state.pending_repartition = None
-                run_metadata.write(
-                    status="running", last_snapshot=state.last_snapshot,
-                     original_plan_path=original_plan_path,
-                    current_step_name=current_step_name, active_plan_path=active_plan_path,
-                    new_plan_path=new_plan_path,
-                )
-
+            if recovery_first_worker:
+                # The marker is written after turn artifacts are prepared but
+                # before any provider call.  A later restart therefore rejects an
+                # operation whose liveness cannot be proven.
+                _persist_recovery_operation_state("in_flight")
+            completed: subprocess.CompletedProcess[str] | None = None
+            semantic_stdout: str | None = None
+            post_snapshot: PlanSnapshot | None = None
+            conditions: dict[str, bool] | None = None
+            selected_transition: GoTransition | None = None
+            transition_target: str | None = None
             try:
-                if use_popen:
-                    execute_session = (
-                        getattr(turn_session_driver, "execute_session", None)
-                        if turn_session_driver is not None else None
+                if override_notes_match:
+                    state.pending_override_notes = ()
+                    state.pending_override_target_step = None
+                    run_metadata.write(
+                        status="running",
+                        last_snapshot=state.last_snapshot,
+                        original_plan_path=original_plan_path,
+                        current_step_name=current_step_name,
+                        active_plan_path=active_plan_path,
+                        new_plan_path=new_plan_path,
                     )
-                    if callable(execute_session) and turn_session_request is not None:
-                        execution = execute_session(
-                            turn_session_request, invocation,
-                            _poll_live_control if step.role == "worker" else None,
-                            turn_lease,
+                if consume_manager_notes:
+                    state.pending_manager_notes = None
+                # Keep the selected worker route durable through the provider
+                # launch boundary.  Clearing it here leaves a prelaunch resume
+                # with only the baseline team, even though the override was
+                # already selected and persisted in the turn metadata.  The
+                # finalized-turn path below clears it after the provider result
+                # has been recorded.
+                boundary_target_started = (
+                    state.pending_boundary_decision is not None
+                    and not state.pending_boundary_decision.consumed
+                    and state.pending_boundary_decision.resolved_next_step == current_step_name
+                    and (state.pending_boundary_decision.target_role is None or state.pending_boundary_decision.target_role == step.role)
+                    and _pending_matches_scope_and_plan(
+                        state.pending_boundary_decision,
+                        state,
+                        _target_plan_identity(active_plan_path),
+                    )
+                    and (state.pending_boundary_decision.target_selector is None or state.pending_boundary_decision.target_selector == selector)
+                )
+                if consume_manager_notes or consume_team_override or boundary_target_started:
+                    if boundary_target_started:
+                        completed_repartition_boundary = (
+                            state.pending_boundary_decision.action
+                            == "repartition_current_checkpoint"
                         )
-                        owned_session_result = execution.result
+                        state.pending_boundary_decision = replace(
+                            state.pending_boundary_decision, applied=True, consumed=True
+                        )
+                        if completed_repartition_boundary:
+                            state.pending_repartition = None
+                    run_metadata.write(
+                        status="running", last_snapshot=state.last_snapshot,
+                         original_plan_path=original_plan_path,
+                        current_step_name=current_step_name, active_plan_path=active_plan_path,
+                        new_plan_path=new_plan_path,
+                    )
+
+                try:
+                    if use_popen:
+                        execute_session = (
+                            getattr(turn_session_driver, "execute_session", None)
+                            if turn_session_driver is not None else None
+                        )
+                        if callable(execute_session) and turn_session_request is not None:
+                            execution = execute_session(
+                                turn_session_request, invocation,
+                                _poll_live_control if step.role == "worker" else None,
+                                turn_lease,
+                            )
+                            owned_session_result = execution.result
+                            completed = subprocess.CompletedProcess(
+                                invocation.argv, 0, execution.raw_transport, ""
+                            )
+                        else:
+                            completed = _run_process(
+                                invocation, execution_repo_root, banner, state,
+                                control_callback=(
+                                    _poll_live_control if step.role == "worker" else None
+                                ),
+                                lease=turn_lease,
+                            )
+                    else:
+                        assert runner is not None
+                        if step.role == "worker":
+                            _poll_live_control()
+                        completed = _run_injected_runner(
+                            runner, invocation, execution_repo_root, lease=turn_lease
+                        )
+                except OwnerStopRequested:
+                    return _finish_owner_stop(
+                        invocation=invocation,
+                        turn_dir=turn_dir,
+                        started_at=turn_started_at,
+                        step_name=current_step_name,
+                        step_role=step.role,
+                        selector=selector,
+                        snapshot_before=snapshot_before,
+                        post_snapshot=post_snapshot,
+                        completed=completed,
+                    )
+                except Exception as exc:
+                    _raise_unexpected_started_turn_failure(
+                        exc,
+                        invocation=invocation,
+                        turn_dir=turn_dir,
+                        started_at=turn_started_at,
+                        step_name=current_step_name,
+                        step_role=step.role,
+                        selector=selector,
+                        snapshot_before=snapshot_before,
+                        post_snapshot=post_snapshot,
+                        completed=completed,
+                    )
+
+                assert completed is not None
+
+                if turn_lease is not None:
+                    # The dispatch helper already completed the lease (or left it
+                    # unconfirmed on launch failure); record the release here at
+                    # the safe boundary where the turn result is durable.
+                    _clear_admission_wait_start()
+                    _persist_execution_resource_wait(None)
+                    _emit_resource_event(
+                        "released",
+                        resource=admission_resource,
+                        label=admission_label,
+                        step_name=current_step_name,
+                        role=step.role,
+                        invocation_id=invocation_id,
+                    )
+                    admission_invocation_id = None
+                    admission_wait_started_at = None
+
+                if recovery_first_worker and turn_session_request is None:
+                    _persist_recovery_operation_state("consumed")
+
+                if turn_session_request is not None and turn_session_driver is not None:
+                    try:
+                        raw_transport_stdout = completed.stdout
+                        session_result = (
+                            owned_session_result
+                            if owned_session_result is not None
+                            else turn_session_driver.parse_result(
+                                turn_session_request,
+                                completed.stdout,
+                                returncode=completed.returncode,
+                            )
+                        )
+                        if session_result.selector != selector:
+                            raise ValueError(
+                                "session result selector does not match the workflow invocation"
+                            )
+                    except (RuntimeError, ValueError) as exc:
+                        _fail_hotplug_target(f"session result validation failed: {exc}")
+                        semantic_stdout = ""
                         completed = subprocess.CompletedProcess(
-                            invocation.argv, 0, execution.raw_transport, ""
+                            completed.args, 1, completed.stdout,
+                            f"session result validation failed: {exc}",
                         )
                     else:
-                        completed = _run_process(
-                            invocation, execution_repo_root, banner, state,
-                            control_callback=(
-                                _poll_live_control if step.role == "worker" else None
+                        session_ref = HarnessSessionRefV1(
+                            session_id=session_result.session_id,
+                            role=step.role,
+                            selector=selector,
+                            harness=resolved.harness_name,
+                            profile=selector.partition(".")[2],
+                            model_display=format_harness_model_display(
+                                resolved.harness_name, resolved.model, resolved.effort
                             ),
-                            lease=turn_lease,
+                            status="active",
+                            resource_identity=(
+                                resolved.harness_name,
+                                resolved.model,
+                                resolved.effort,
+                            ),
                         )
-                else:
-                    assert runner is not None
-                    if step.role == "worker":
-                        _poll_live_control()
-                    completed = _run_injected_runner(
-                        runner, invocation, execution_repo_root, lease=turn_lease
+                        state.active_role_sessions = tuple(
+                            item for item in state.active_role_sessions
+                            if item.role != step.role
+                        ) + (session_ref,)
+                        if recovery_first_worker:
+                            # Persist the consumed marker and validated replacement
+                            # session in one atomic run.json snapshot. A crash
+                            # before this write leaves the prior in-flight marker
+                            # durable, so resume cannot silently start unguarded.
+                            _persist_recovery_operation_state("consumed")
+                        else:
+                            run_metadata.write(
+                                status="running",
+                                last_snapshot=state.last_snapshot,
+                                original_plan_path=original_plan_path,
+                                current_step_name=current_step_name,
+                                active_plan_path=active_plan_path,
+                                new_plan_path=new_plan_path,
+                            )
+                        (turn_dir / "transport.stdout").write_text(
+                            raw_transport_stdout, encoding="utf-8"
+                        )
+                        completed = subprocess.CompletedProcess(
+                            completed.args, completed.returncode,
+                            session_result.final_output, completed.stderr,
+                        )
+                        invocation = replace(
+                            invocation,
+                            semantic_output_source=FINAL_TEXT_OUTPUT_SOURCE,
+                        )
+                        semantic_stdout = session_result.final_output
+                        transaction = state.current_hotplug_transaction
+                        if (
+                            transaction is not None
+                            and transaction.target_selector == selector
+                            and transaction.stage not in {"applied", "failed"}
+                        ):
+                            transaction = replace(
+                                transaction,
+                                provider_operation_id=session_result.provider_operation_id,
+                                idempotency_key=(
+                                    session_result.idempotency_key or turn_session_request.idempotency_key
+                                    if turn_session_request is not None else session_result.idempotency_key
+                                ),
+                            )
+                            applied_transaction = replace(transaction, stage="applied")
+                            state.current_hotplug_transaction = None
+                            state.pending_hotplug_transaction = None
+                            state.hotplug_history = list(bounded_hotplug_history(
+                                [*state.hotplug_history, applied_transaction]
+                            ))
+                            _emit_hotplug_event(observer, ExecutionEventType.HOTPLUG_APPLIED, applied_transaction)
+                            run_metadata.write(
+                                status="running",
+                                last_snapshot=state.last_snapshot,
+                                original_plan_path=original_plan_path,
+                                current_step_name=current_step_name,
+                                active_plan_path=active_plan_path,
+                                new_plan_path=new_plan_path,
+                            )
+
+                stop_reason = _detect_stop_marker(
+                    completed.stdout,
+                    completed.stderr,
+                    output_contract=invocation.output_contract,
+                    semantic_stdout=semantic_stdout,
+                )
+                if stop_reason is not None:
+                    state.status_message = "failed"
+                    _record_issue("aflow-stop", f"AFLOW_STOP: {stop_reason}", turn_dir=turn_dir)
+                    _finalize_turn_record(
+                        status="harness-failed",
+                        started_at=turn_started_at,
+                        snapshot_before=snapshot_before,
+                        snapshot_after=None,
+                        invocation=invocation,
+                        turn_dir=turn_dir,
+                        stdout=completed.stdout,
+                        stderr=completed.stderr,
+                        returncode=completed.returncode,
+                        error=f"AFLOW_STOP: {stop_reason}",
+                        step_name=current_step_name,
+                        step_role=step.role,
+                        selector=selector,
+                        active_path=active_plan_path,
+                        new_path=new_plan_path,
+                        preserve_terminal_outcome_on_observer_error=True,
                     )
+                    report = _manager_terminal_incident(
+                        trigger="explicit_stop", reason=f"AFLOW_STOP: {stop_reason}",
+                        current_step=current_step_name, current_role=step.role,
+                        active_team=active_team_name, active_selector=selector,
+                    )
+                    summary = report or _format_failure(
+                        reason=f"workflow stopped by explicit AFLOW_STOP marker: {stop_reason}",
+                        run_dir=run_paths.run_dir, snapshot=snapshot_before,
+                    )
+                    failure_finalizer.raise_failure(
+                        summary,
+                        original_plan_path=original_plan_path,
+                        current_step_name=current_step_name,
+                        active_plan_path=active_plan_path,
+                        new_plan_path=new_plan_path,
+                    )
+
+                review_overlay_at_expected_path = False
+                try:
+                    exec_original = _exec_plan_path(original_plan_path, exec_ctx)
+                    resolved_exec_plan_path = _resolve_post_turn_original_plan_path(
+                        execution_repo_root,
+                        exec_original,
+                        completed_returncode=completed.returncode,
+                    )
+                    parsed_after = load_plan(resolved_exec_plan_path)
+
+                    # Sync the original plan back after every worktree turn so the
+                    # primary checkout remains the durable source of truth between turns.
+                    if exec_ctx is not None and exec_ctx.worktree_path is not None:
+                        _sync_plan_from_worktree(original_plan_path, exec_ctx)
+
+                    if resolved_exec_plan_path != exec_original:
+                        if exec_ctx is not None and exec_ctx.worktree_path is not None:
+                            try:
+                                rel = resolved_exec_plan_path.relative_to(execution_repo_root)
+                                original_plan_path = config.repo_root / rel
+                            except ValueError:
+                                original_plan_path = resolved_exec_plan_path
+                        else:
+                            original_plan_path = resolved_exec_plan_path
+                        if active_plan_path == config.plan_path:
+                            active_plan_path = original_plan_path
+                    expected_review_overlay_path = new_plan_path
+                    resolved_exec_new_plan_path = _resolve_post_turn_new_plan_path(
+                        original_plan_path=resolved_exec_plan_path,
+                        expected_new_plan_path=_exec_plan_path(new_plan_path, exec_ctx),
+                        candidates_before=followup_candidates_before,
+                    )
+                    if resolved_exec_new_plan_path is not None:
+                        review_overlay_at_expected_path = (
+                            resolved_exec_new_plan_path
+                            == _exec_plan_path(expected_review_overlay_path, exec_ctx)
+                        )
+                        new_plan_path = _primary_plan_path(resolved_exec_new_plan_path, exec_ctx)
+                    post_snapshot = parsed_after.snapshot
+                except (PlanParseError, FileNotFoundError) as exc:
+                    is_retryable = (
+                        isinstance(exc, PlanParseError)
+                        and exc.error_kind == "inconsistent_checkpoint_state"
+                        and completed.returncode == 0
+                    )
+                    current_attempt = (retry_ctx.attempt if retry_ctx is not None else 0) + 1
+                    base_prompt = retry_ctx.base_user_prompt if retry_ctx is not None else user_prompt
+
+                    if is_retryable and current_attempt <= retry_limit and turn_number < effective_max_turns:
+                        _record_issue("retry-scheduled", str(exc), turn_dir=turn_dir)
+                        state.turns_completed += 1
+                        new_retry_ctx = RetryContext(
+                            step_name=current_step_name,
+                            step_role=step.role,
+                            resolved_selector=selector,
+                            resolved_harness_name=resolved.harness_name,
+                            resolved_model=resolved.model,
+                            resolved_effort=resolved.effort,
+                            snapshot_before=snapshot_before,
+                            active_plan_path=active_plan_path,
+                            new_plan_path=new_plan_path,
+                            base_user_prompt=base_prompt,
+                            parse_error_str=str(exc),
+                            attempt=current_attempt,
+                            retry_limit=retry_limit,
+                        )
+                        state.pending_retry = new_retry_ctx
+                        _finalize_turn_record(
+                            status="retry-scheduled",
+                            started_at=turn_started_at,
+                            snapshot_before=snapshot_before,
+                            snapshot_after=None,
+                            invocation=invocation,
+                            turn_dir=turn_dir,
+                            stdout=completed.stdout,
+                            stderr=completed.stderr,
+                            returncode=completed.returncode,
+                            error=str(exc),
+                            step_name=current_step_name,
+                            step_role=step.role,
+                            selector=selector,
+                            active_path=active_plan_path,
+                            new_path=new_plan_path,
+                            conditions={"DONE": done, "NEW_PLAN_EXISTS": False, "MAX_TURNS_REACHED": turn_number >= effective_max_turns},
+                            retry_attempt=current_attempt,
+                            retry_limit_value=retry_limit,
+                            retry_reason="inconsistent_checkpoint_state",
+                            retry_next_turn=True,
+                        )
+                        run_metadata.write(
+                            status="running",
+                            turns_completed=state.turns_completed,
+                            last_snapshot=state.last_snapshot,
+                             original_plan_path=original_plan_path,
+                            current_step_name=current_step_name, active_plan_path=active_plan_path,
+                            new_plan_path=new_plan_path,
+                        )
+                        banner.update(state)
+                        turn_number += 1
+                        continue
+
+                    state.pending_retry = None
+                    state.status_message = "failed"
+                    _record_issue("plan-invalid", str(exc), turn_dir=turn_dir)
+                    _finalize_turn_record(
+                        status="plan-invalid",
+                        started_at=turn_started_at,
+                        snapshot_before=snapshot_before,
+                        snapshot_after=None,
+                        invocation=invocation,
+                        turn_dir=turn_dir,
+                        stdout=completed.stdout,
+                        stderr=completed.stderr,
+                        returncode=completed.returncode,
+                        error=str(exc),
+                        step_name=current_step_name,
+                        step_role=step.role,
+                        selector=selector,
+                        active_path=active_plan_path,
+                        new_path=new_plan_path,
+                        conditions={"DONE": done, "NEW_PLAN_EXISTS": False, "MAX_TURNS_REACHED": turn_number >= effective_max_turns},
+                        preserve_terminal_outcome_on_observer_error=True,
+                    )
+                    report = _manager_terminal_incident(
+                        trigger="invalid_plan", reason=str(exc), current_step=current_step_name,
+                        current_role=step.role, active_team=active_team_name, active_selector=selector,
+                    )
+                    summary = report or _format_failure(
+                        reason=str(exc), run_dir=run_paths.run_dir, snapshot=snapshot_before,
+                        parse_error=exc if isinstance(exc, PlanParseError) else None,
+                    )
+                    failure_finalizer.raise_failure(
+                        summary,
+                        original_plan_path=original_plan_path,
+                        current_step_name=current_step_name,
+                        active_plan_path=active_plan_path,
+                        new_plan_path=new_plan_path,
+                        cause=exc,
+                    )
+                except Exception as exc:
+                    _raise_unexpected_started_turn_failure(
+                        exc,
+                        invocation=invocation,
+                        turn_dir=turn_dir,
+                        started_at=turn_started_at,
+                        step_name=current_step_name,
+                        step_role=step.role,
+                        selector=selector,
+                        snapshot_before=snapshot_before,
+                        post_snapshot=post_snapshot,
+                        completed=completed,
+                    )
+
+                state.pending_retry = None
+
+                try:
+                    if state.recovery_context is not None:
+                        # Explicit durable recovery is a one-shot, provider-neutral
+                        # replacement. Never route a target failure through the
+                        # legacy retry or backup-team failover policy.
+                        recovery_scheduled = False
+                    else:
+                        recovery_scheduled = _handle_harness_recovery(
+                            turn_number=turn_number,
+                            step_name=current_step_name,
+                            step=step,
+                            step_path=step_path,
+                            active_team_name=active_team_name,
+                            selector=selector,
+                            resolved=resolved,
+                            invocation=invocation,
+                            turn_dir=turn_dir,
+                            started_at=turn_started_at,
+                            snapshot_before=snapshot_before,
+                            snapshot_after=post_snapshot,
+                            stdout=completed.stdout,
+                            stderr=completed.stderr,
+                            returncode=completed.returncode,
+                        )
+                except Exception as exc:
+                    _raise_unexpected_started_turn_failure(
+                        exc,
+                        invocation=invocation,
+                        turn_dir=turn_dir,
+                        started_at=turn_started_at,
+                        step_name=current_step_name,
+                        step_role=step.role,
+                        selector=selector,
+                        snapshot_before=snapshot_before,
+                        post_snapshot=post_snapshot,
+                        completed=completed,
+                    )
+                if recovery_scheduled:
+                    turn_number += 1
+                    continue
+
+                state.consecutive_harness_recoveries = 0
+
+                if completed.returncode != 0:
+                    state.status_message = "failed"
+                    _record_issue(
+                        "harness-failed",
+                        f"harness '{invocation.label}' exited with code {completed.returncode}",
+                        turn_dir=turn_dir,
+                    )
+                    _finalize_turn_record(
+                        status="harness-failed",
+                        started_at=turn_started_at,
+                        snapshot_before=snapshot_before,
+                        snapshot_after=post_snapshot,
+                        invocation=invocation,
+                        turn_dir=turn_dir,
+                        stdout=completed.stdout,
+                        stderr=completed.stderr,
+                        returncode=completed.returncode,
+                        step_name=current_step_name,
+                        step_role=step.role,
+                        selector=selector,
+                        active_path=active_plan_path,
+                        new_path=new_plan_path,
+                        conditions={"DONE": post_snapshot.is_complete, "NEW_PLAN_EXISTS": False, "MAX_TURNS_REACHED": turn_number >= effective_max_turns},
+                        preserve_terminal_outcome_on_observer_error=True,
+                    )
+                    report = _manager_terminal_incident(
+                        trigger="ambiguous_failure",
+                        reason=f"harness '{invocation.label}' exited with code {completed.returncode}",
+                        current_step=current_step_name, current_role=step.role,
+                        active_team=active_team_name, active_selector=selector,
+                    )
+                    summary = report or _format_failure(
+                        reason=f"harness '{invocation.label}' exited with code {completed.returncode}",
+                        run_dir=run_paths.run_dir, snapshot=post_snapshot,
+                    )
+                    failure_finalizer.raise_failure(
+                        summary,
+                        original_plan_path=original_plan_path,
+                        current_step_name=current_step_name,
+                        active_plan_path=active_plan_path,
+                        new_plan_path=new_plan_path,
+                        last_snapshot=post_snapshot,
+                    )
+
+                state.last_snapshot = post_snapshot
+                state.turns_completed += 1
+
+                done = post_snapshot.is_complete
+                new_plan_exists = _exec_plan_path(new_plan_path, exec_ctx).is_file()
+
+                if new_plan_exists:
+                    active_plan_path = new_plan_path
+
+                # A source-backed run must reach the next boundary before deciding
+                # that the limit is terminal. The saved turn still uses the
+                # current limit for accounting, but a boundary edit may increase
+                # it before the next synthetic/provider launch.
+                max_turns_reached = turn_number >= effective_max_turns
+
+                conditions = {
+                    "DONE": done,
+                    "NEW_PLAN_EXISTS": new_plan_exists,
+                    "MAX_TURNS_REACHED": max_turns_reached,
+                }
+
+                selected_transition = None
+                transition_target = None
+                try:
+                    selected_transition = _select_transition(
+                        step.go,
+                        step_path=step_path,
+                        done=done,
+                        new_plan_exists=new_plan_exists,
+                        max_turns_reached=max_turns_reached,
+                    )
+                    transition_target = selected_transition.to
+                except WorkflowError as exc:
+                    state.status_message = "failed"
+                    _record_issue("transition-failed", exc.summary, turn_dir=turn_dir)
+                    _finalize_turn_record(
+                        status="transition-failed",
+                        started_at=turn_started_at,
+                        snapshot_before=snapshot_before,
+                        snapshot_after=post_snapshot,
+                        invocation=invocation,
+                        turn_dir=turn_dir,
+                        stdout=completed.stdout,
+                        stderr=completed.stderr,
+                        returncode=completed.returncode,
+                        step_name=current_step_name,
+                        step_role=step.role,
+                        selector=selector,
+                        active_path=active_plan_path,
+                        new_path=new_plan_path,
+                        conditions=conditions,
+                        preserve_terminal_outcome_on_observer_error=True,
+                    )
+                    report = _manager_terminal_incident(
+                        trigger="illegal_transition", reason=exc.summary, current_step=current_step_name,
+                        current_role=step.role, active_team=active_team_name, active_selector=selector,
+                    )
+                    summary = report or _format_failure(
+                        reason=exc.summary, run_dir=run_paths.run_dir, snapshot=state.last_snapshot,
+                    )
+                    failure_finalizer.raise_failure(
+                        summary,
+                        original_plan_path=original_plan_path,
+                        current_step_name=current_step_name,
+                        active_plan_path=active_plan_path,
+                        new_plan_path=new_plan_path,
+                        last_snapshot=state.last_snapshot,
+                        cause=exc,
+                    )
+                except Exception as exc:
+                    _raise_unexpected_started_turn_failure(
+                        exc,
+                        invocation=invocation,
+                        turn_dir=turn_dir,
+                        started_at=turn_started_at,
+                        step_name=current_step_name,
+                        step_role=step.role,
+                        selector=selector,
+                        snapshot_before=snapshot_before,
+                        post_snapshot=post_snapshot,
+                        completed=completed,
+                        conditions=conditions,
+                    )
+
+                limit_terminal = (
+                    transition_target == "END"
+                    and live_config_source_path is not None
+                    and max_turns_reached
+                    and selected_transition is not None
+                    and selected_transition.when is not None
+                    and not evaluate_condition(
+                        selected_transition.when,
+                        done=done,
+                        new_plan_exists=new_plan_exists,
+                        max_turns_reached=False,
+                    )
+                )
+                review_rejection: ReviewRejectionRecord | None = None
+                scope_before_finalize = state.active_implementation_scope
+                controller_next_step = (
+                    wf.steps.get(transition_target)
+                    if transition_target != "END" else None
+                )
+                is_scoped_rejection = (
+                    scope_before_finalize is not None
+                    and scope_before_finalize.awaiting_review
+                    and step.role == "reviewer"
+                    and (
+                        not done
+                        or review_overlay_at_expected_path
+                        or (
+                            resume is not None
+                            and resume.pending_cumulative_review is not None
+                        )
+                    )
+                    and new_plan_exists
+                    and snapshot_before == post_snapshot
+                    and controller_next_step is not None
+                    and controller_next_step.role == "worker"
+                )
+                cumulative_review = (
+                    current_step_name == "final_review"
+                    and step.role in {"architect", "final_reviewer"}
+                    and scope_before_finalize is None
+                    and done
+                    and review_overlay_at_expected_path
+                    and new_plan_exists
+                    and snapshot_before == post_snapshot
+                    and controller_next_step is not None
+                    and controller_next_step.role == "worker"
+                )
+                cumulative_attempt = (
+                    _cumulative_review_attempt(
+                        state,
+                        original_plan_path=original_plan_path,
+                        completed_snapshot=post_snapshot,
+                    )
+                    if cumulative_review else None
+                )
+                if is_scoped_rejection or cumulative_attempt is not None:
+                    rejection_scope_id = (
+                        scope_before_finalize.scope_id
+                        if is_scoped_rejection and scope_before_finalize is not None
+                        else cumulative_attempt[0]
+                    )
+                    attempts = (
+                        state.implementation_attempts.get(rejection_scope_id, [])
+                        if is_scoped_rejection
+                        else [cumulative_attempt[1]]
+                    )
+                    if not attempts:
+                        raise WorkflowError(
+                            "internal error: review rejection has no implementation attempt",
+                            run_dir=run_paths.run_dir,
+                        )
+                    reviewed_attempt = attempts[-1]
+                    if cumulative_attempt is not None and not is_scoped_rejection:
+                        # The first cumulative review links the final checkpoint's
+                        # accepted worker into its own durable repair lineage.
+                        # Later review retries of that same worker earn no new
+                        # rejection credit.
+                        state.implementation_attempts.setdefault(
+                            rejection_scope_id, [reviewed_attempt],
+                        )
+                    repair_path = new_plan_path if new_plan_exists else None
+                    try:
+                        repair_path_text = str(repair_path.relative_to(run_paths.repo_root)) if repair_path else None
+                    except ValueError:
+                        repair_path_text = str(repair_path) if repair_path else None
+                    matching = [
+                        item.rejection_number for item in state.review_rejection_history
+                        if item.scope_id == rejection_scope_id
+                    ]
+                    already_rejected = any(
+                        item.scope_id == rejection_scope_id
+                        and item.reviewed_attempt_ordinal == reviewed_attempt.attempt_ordinal
+                        and item.reviewed_implementation_turn_number == reviewed_attempt.turn_number
+                        for item in state.review_rejection_history
+                    )
+                    if is_scoped_rejection or not already_rejected:
+                        review_rejection = ReviewRejectionRecord(
+                            scope_id=rejection_scope_id,
+                            rejection_number=max(matching, default=0) + 1,
+                            source_run_id=state.run_id or run_paths.run_dir.name,
+                            review_turn_number=turn_number,
+                            review_step_name=current_step_name,
+                            reviewer_selector=selector,
+                            checkpoint_index=(
+                                scope_before_finalize.checkpoint_index
+                                if is_scoped_rejection and scope_before_finalize is not None else None
+                            ),
+                            checkpoint_name=(
+                                scope_before_finalize.checkpoint_name
+                                if is_scoped_rejection and scope_before_finalize is not None else None
+                            ),
+                            reviewed_implementation_turn_number=reviewed_attempt.turn_number,
+                            reviewed_worker_team=reviewed_attempt.team,
+                            reviewed_worker_selector=reviewed_attempt.selector,
+                            reviewed_attempt_ordinal=reviewed_attempt.attempt_ordinal,
+                            review_summary=summarize_review_rejection(completed.stdout),
+                            repair_plan_summary=summarize_repair_plan(repair_path),
+                            review_stdout_artifact_path=_turn_artifact_display_path(
+                                run_paths.repo_root, turn_dir, "stdout.txt",
+                                content=completed.stdout,
+                            ),
+                            repair_plan_path=repair_path_text,
+                        )
+
+                _finalize_turn_record(
+                    status="completed" if done or limit_terminal else "running",
+                    started_at=turn_started_at,
+                    snapshot_before=snapshot_before,
+                    snapshot_after=post_snapshot,
+                    invocation=invocation,
+                    turn_dir=turn_dir,
+                    stdout=completed.stdout,
+                    stderr=completed.stderr,
+                    returncode=completed.returncode,
+                    step_name=current_step_name,
+                    step_role=step.role,
+                    selector=selector,
+                    active_path=active_plan_path,
+                    new_path=new_plan_path,
+                    conditions=conditions,
+                    chosen_transition=transition_target,
+                    chosen_transition_condition=selected_transition.when,
+                    end_reason=(
+                        "max_turns_reached"
+                        if limit_terminal
+                        else (
+                            _normalize_end_reason(
+                                selected_transition=selected_transition,
+                                done=done,
+                                max_turns_reached=max_turns_reached,
+                            )
+                            if (
+                                transition_target == "END"
+                                and selected_transition is not None
+                                and post_snapshot.is_complete
+                            )
+                            else None
+                        )
+                    ),
+                    was_retry=True if retry_ctx is not None else None,
+                    retry_attempt=retry_ctx.attempt if retry_ctx is not None else None,
+                    review_rejection=review_rejection,
+                )
             except OwnerStopRequested:
                 return _finish_owner_stop(
                     invocation=invocation,
@@ -14471,471 +16134,178 @@ def _run_workflow_unchecked(
                     snapshot_before=snapshot_before,
                     post_snapshot=post_snapshot,
                     completed=completed,
+                    conditions=conditions,
+                    chosen_transition=transition_target,
+                    chosen_transition_condition=(
+                        selected_transition.when
+                        if selected_transition is not None else None
+                    ),
                 )
+            if review_rejection is not None:
+                state.review_rejection_history.append(review_rejection)
 
-            assert completed is not None
-
-            if turn_lease is not None:
-                # The dispatch helper already completed the lease (or left it
-                # unconfirmed on launch failure); record the release here at
-                # the safe boundary where the turn result is durable.
-                _clear_admission_wait_start()
-                _persist_execution_resource_wait(None)
-                _emit_resource_event(
-                    "released",
-                    resource=admission_resource,
-                    label=admission_label,
-                    step_name=current_step_name,
-                    role=step.role,
-                    invocation_id=invocation_id,
-                )
-                admission_invocation_id = None
-                admission_wait_started_at = None
-
-            if recovery_first_worker and turn_session_request is None:
-                _persist_recovery_operation_state("consumed")
-
-            if turn_session_request is not None and turn_session_driver is not None:
-                try:
-                    raw_transport_stdout = completed.stdout
-                    session_result = (
-                        owned_session_result
-                        if owned_session_result is not None
-                        else turn_session_driver.parse_result(
-                            turn_session_request,
-                            completed.stdout,
-                            returncode=completed.returncode,
-                        )
+            if step.role == "worker" and routing_scope_id is not None:
+                state.implementation_attempts.setdefault(routing_scope_id, []).append(ImplementationAttempt(
+                    turn_number=turn_number, step_name=current_step_name, role=step.role,
+                    team=active_team_name, selector=selector,
+                    outcome="accepted" if done else "progress",
+                    manager_decision_number=(state.pending_boundary_decision.decision_number
+                        if state.pending_boundary_decision is not None else None),
+                    repair_ordinal=attempt_repair_ordinal,
+                    team_repairs_completed=attempt_team_repairs_completed,
+                    attempt_ordinal=attempt_ordinal,
+                ))
+                if state.active_implementation_scope is not None:
+                    next_config = (
+                        wf.steps.get(transition_target)
+                        if transition_target != "END" else None
                     )
-                    if session_result.selector != selector:
-                        raise ValueError(
-                            "session result selector does not match the workflow invocation"
-                        )
-                except (RuntimeError, ValueError) as exc:
-                    _fail_hotplug_target(f"session result validation failed: {exc}")
-                    semantic_stdout = ""
-                    completed = subprocess.CompletedProcess(
-                        completed.args, 1, completed.stdout,
-                        f"session result validation failed: {exc}",
-                    )
-                else:
-                    session_ref = HarnessSessionRefV1(
-                        session_id=session_result.session_id,
-                        role=step.role,
-                        selector=selector,
-                        harness=resolved.harness_name,
-                        profile=selector.partition(".")[2],
-                        model_display=format_harness_model_display(
-                            resolved.harness_name, resolved.model, resolved.effort
+                    state.active_implementation_scope = replace(
+                        state.active_implementation_scope,
+                        awaiting_review=(
+                            next_config is not None and next_config.role != "worker"
                         ),
-                        status="active",
                     )
-                    state.active_role_sessions = tuple(
-                        item for item in state.active_role_sessions
-                        if item.role != step.role
-                    ) + (session_ref,)
-                    if recovery_first_worker:
-                        # Persist the consumed marker and validated replacement
-                        # session in one atomic run.json snapshot. A crash
-                        # before this write leaves the prior in-flight marker
-                        # durable, so resume cannot silently start unguarded.
-                        _persist_recovery_operation_state("consumed")
-                    else:
-                        run_metadata.write(
-                            status="running",
-                            last_snapshot=state.last_snapshot,
-                            original_plan_path=original_plan_path,
-                            current_step_name=current_step_name,
-                            active_plan_path=active_plan_path,
-                            new_plan_path=new_plan_path,
-                        )
-                    (turn_dir / "transport.stdout").write_text(
-                        raw_transport_stdout, encoding="utf-8"
-                    )
-                    completed = subprocess.CompletedProcess(
-                        completed.args, completed.returncode,
-                        session_result.final_output, completed.stderr,
-                    )
-                    invocation = replace(
-                        invocation,
-                        semantic_output_source=FINAL_TEXT_OUTPUT_SOURCE,
-                    )
-                    semantic_stdout = session_result.final_output
-                    transaction = state.current_hotplug_transaction
-                    if (
-                        transaction is not None
-                        and transaction.target_selector == selector
-                        and transaction.stage not in {"applied", "failed"}
-                    ):
-                        transaction = replace(
-                            transaction,
-                            provider_operation_id=session_result.provider_operation_id,
-                            idempotency_key=(
-                                session_result.idempotency_key or turn_session_request.idempotency_key
-                                if turn_session_request is not None else session_result.idempotency_key
-                            ),
-                        )
-                        applied_transaction = replace(transaction, stage="applied")
-                        state.current_hotplug_transaction = None
-                        state.pending_hotplug_transaction = None
-                        state.hotplug_history = list(bounded_hotplug_history(
-                            [*state.hotplug_history, applied_transaction]
-                        ))
-                        _emit_hotplug_event(observer, ExecutionEventType.HOTPLUG_APPLIED, applied_transaction)
-                        run_metadata.write(
-                            status="running",
-                            last_snapshot=state.last_snapshot,
-                            original_plan_path=original_plan_path,
-                            current_step_name=current_step_name,
-                            active_plan_path=active_plan_path,
-                            new_plan_path=new_plan_path,
-                        )
+                if consume_team_override:
+                    state.pending_step_team_override = None
 
-            stop_reason = _detect_stop_marker(
-                completed.stdout,
-                completed.stderr,
-                output_contract=invocation.output_contract,
-                semantic_stdout=semantic_stdout,
+            post_transition_active_path = _select_next_active_plan_path(
+                original_plan_path=original_plan_path,
+                active_plan_path=active_plan_path,
+                new_plan_path=new_plan_path,
+                new_plan_exists=new_plan_exists,
+                selected_transition=selected_transition,
+                exec_ctx=exec_ctx,
             )
-            if stop_reason is not None:
-                state.status_message = "failed"
-                _record_issue("aflow-stop", f"AFLOW_STOP: {stop_reason}", turn_dir=turn_dir)
-                _finalize_turn_record(
-                    status="harness-failed",
-                    started_at=turn_started_at,
-                    snapshot_before=snapshot_before,
-                    snapshot_after=None,
-                    invocation=invocation,
-                    turn_dir=turn_dir,
-                    stdout=completed.stdout,
-                    stderr=completed.stderr,
-                    returncode=completed.returncode,
-                    error=f"AFLOW_STOP: {stop_reason}",
-                    step_name=current_step_name,
-                    step_role=step.role,
-                    selector=selector,
-                    active_path=active_plan_path,
-                    new_path=new_plan_path,
-                    preserve_terminal_outcome_on_observer_error=True,
+
+            scope = state.active_implementation_scope
+            next_config = (
+                wf.steps.get(transition_target)
+                if transition_target != "END" else None
+            )
+            if scope is not None and step.role != "worker" and scope.awaiting_review:
+                scope = replace(scope, awaiting_review=False)
+                state.active_implementation_scope = scope
+            if (
+                scope is not None
+                and not new_plan_exists
+                and _original_checkpoint_advanced(scope, post_snapshot)
+                and (
+                    step.role != "worker"
+                    or next_config is None
+                    or next_config.role == "worker"
                 )
+            ):
+                _close_implementation_scope(state)
+
+            # A live source may change the effective limit at the next boundary;
+            # let the completed turn reach that reload before deciding whether
+            # another provider launch is allowed. Static runs retain their
+            # existing terminal manager gate, while live END transitions flow
+            # through normal END finalization so their edge is recorded.
+            if max_turns_reached and not done and live_config_source_path is None:
+                reason = f"reached max turns limit of {effective_max_turns} without completing the active plan"
                 report = _manager_terminal_incident(
-                    trigger="explicit_stop", reason=f"AFLOW_STOP: {stop_reason}",
-                    current_step=current_step_name, current_role=step.role,
-                    active_team=active_team_name, active_selector=selector,
+                    trigger="max_turns", reason=reason, current_step=current_step_name,
+                    current_role=step.role, active_team=active_team_name, active_selector=selector,
                 )
-                summary = report or _format_failure(
-                    reason=f"workflow stopped by explicit AFLOW_STOP marker: {stop_reason}",
-                    run_dir=run_paths.run_dir, snapshot=snapshot_before,
-                )
-                failure_finalizer.raise_failure(
-                    summary,
-                    original_plan_path=original_plan_path,
-                    current_step_name=current_step_name,
-                    active_plan_path=active_plan_path,
-                    new_plan_path=new_plan_path,
+                _raise_incomplete_terminal_failure(
+                    reason=reason,
+                    post_snapshot=post_snapshot,
+                    turn_dir=turn_dir,
+                    manager_report=report,
                 )
 
-            review_overlay_at_expected_path = False
-            try:
-                exec_original = _exec_plan_path(original_plan_path, exec_ctx)
-                resolved_exec_plan_path = _resolve_post_turn_original_plan_path(
-                    execution_repo_root,
-                    exec_original,
-                    completed_returncode=completed.returncode,
-                )
-                parsed_after = load_plan(resolved_exec_plan_path)
+            plan_progressed = _plan_snapshot_made_progress(snapshot_before, post_snapshot)
 
-                # Sync the original plan back after every worktree turn so the
-                # primary checkout remains the durable source of truth between turns.
-                if exec_ctx is not None and exec_ctx.worktree_path is not None:
-                    _sync_plan_from_worktree(original_plan_path, exec_ctx)
-
-                if resolved_exec_plan_path != exec_original:
-                    if exec_ctx is not None and exec_ctx.worktree_path is not None:
-                        try:
-                            rel = resolved_exec_plan_path.relative_to(execution_repo_root)
-                            original_plan_path = config.repo_root / rel
-                        except ValueError:
-                            original_plan_path = resolved_exec_plan_path
-                    else:
-                        original_plan_path = resolved_exec_plan_path
-                    if active_plan_path == config.plan_path:
-                        active_plan_path = original_plan_path
-                expected_review_overlay_path = new_plan_path
-                resolved_exec_new_plan_path = _resolve_post_turn_new_plan_path(
-                    original_plan_path=resolved_exec_plan_path,
-                    expected_new_plan_path=_exec_plan_path(new_plan_path, exec_ctx),
-                    candidates_before=followup_candidates_before,
+            # A same-step cap is a terminal controller boundary, not a normal
+            # transition followed by a second manager call. Decide it before the
+            # ordinary gate so Full is invoked exactly once when supervision is on.
+            # Productive cumulative turns reset the streak even when the workflow
+            # deliberately routes back through the same worker node.
+            if (
+                len(wf.steps) > 1
+                and transition_target == current_step_name
+                and not plan_progressed
+            ):
+                max_cap = workflow_config.aflow.max_same_step_turns
+                new_streak = (
+                    state.consec_step_count + 1
+                    if state.consec_step_name == current_step_name
+                    else 1
                 )
-                if resolved_exec_new_plan_path is not None:
-                    review_overlay_at_expected_path = (
-                        resolved_exec_new_plan_path
-                        == _exec_plan_path(expected_review_overlay_path, exec_ctx)
+                if max_cap > 0 and new_streak >= max_cap:
+                    reason = (
+                        f"same-step cap reached: step '{current_step_name}' "
+                        f"selected {new_streak} consecutive times (limit: {max_cap})"
                     )
-                    new_plan_path = _primary_plan_path(resolved_exec_new_plan_path, exec_ctx)
-                post_snapshot = parsed_after.snapshot
-            except (PlanParseError, FileNotFoundError) as exc:
-                is_retryable = (
-                    isinstance(exc, PlanParseError)
-                    and exc.error_kind == "inconsistent_checkpoint_state"
-                    and completed.returncode == 0
-                )
-                current_attempt = (retry_ctx.attempt if retry_ctx is not None else 0) + 1
-                base_prompt = retry_ctx.base_user_prompt if retry_ctx is not None else user_prompt
-
-                if is_retryable and current_attempt <= retry_limit and turn_number < effective_max_turns:
-                    _record_issue("retry-scheduled", str(exc), turn_dir=turn_dir)
-                    state.turns_completed += 1
-                    new_retry_ctx = RetryContext(
-                        step_name=current_step_name,
-                        step_role=step.role,
-                        resolved_selector=selector,
-                        resolved_harness_name=resolved.harness_name,
-                        resolved_model=resolved.model,
-                        resolved_effort=resolved.effort,
-                        snapshot_before=snapshot_before,
+                    state.status_message = "failed"
+                    report = _manager_terminal_incident(
+                        trigger="same_step_cap", reason=reason,
+                        current_step=current_step_name, current_role=step.role,
+                        active_team=active_team_name, active_selector=selector,
+                    )
+                    _record_issue("same-step-cap", reason, turn_dir=turn_dir)
+                    summary = report or _format_failure(
+                        reason=reason, run_dir=run_paths.run_dir, snapshot=post_snapshot,
+                    )
+                    failure_finalizer.raise_failure(
+                        summary,
+                        original_plan_path=original_plan_path,
+                        current_step_name=current_step_name,
                         active_plan_path=active_plan_path,
                         new_plan_path=new_plan_path,
-                        base_user_prompt=base_prompt,
-                        parse_error_str=str(exc),
-                        attempt=current_attempt,
-                        retry_limit=retry_limit,
+                        last_snapshot=post_snapshot,
                     )
-                    state.pending_retry = new_retry_ctx
-                    _finalize_turn_record(
-                        status="retry-scheduled",
-                        started_at=turn_started_at,
-                        snapshot_before=snapshot_before,
-                        snapshot_after=None,
-                        invocation=invocation,
-                        turn_dir=turn_dir,
-                        stdout=completed.stdout,
-                        stderr=completed.stderr,
-                        returncode=completed.returncode,
-                        error=str(exc),
-                        step_name=current_step_name,
-                        step_role=step.role,
-                        selector=selector,
-                        active_path=active_plan_path,
-                        new_path=new_plan_path,
-                        conditions={"DONE": done, "NEW_PLAN_EXISTS": False, "MAX_TURNS_REACHED": turn_number >= effective_max_turns},
-                        retry_attempt=current_attempt,
-                        retry_limit_value=retry_limit,
-                        retry_reason="inconsistent_checkpoint_state",
-                        retry_next_turn=True,
-                    )
-                    run_metadata.write(
-                        status="running",
-                        turns_completed=state.turns_completed,
-                        last_snapshot=state.last_snapshot,
-                         original_plan_path=original_plan_path,
-                        current_step_name=current_step_name, active_plan_path=active_plan_path,
-                        new_plan_path=new_plan_path,
-                    )
-                    banner.update(state)
-                    turn_number += 1
-                    continue
 
-                state.pending_retry = None
-                state.status_message = "failed"
-                _record_issue("plan-invalid", str(exc), turn_dir=turn_dir)
-                _finalize_turn_record(
-                    status="plan-invalid",
-                    started_at=turn_started_at,
-                    snapshot_before=snapshot_before,
-                    snapshot_after=None,
-                    invocation=invocation,
-                    turn_dir=turn_dir,
-                    stdout=completed.stdout,
-                    stderr=completed.stderr,
-                    returncode=completed.returncode,
-                    error=str(exc),
-                    step_name=current_step_name,
-                    step_role=step.role,
-                    selector=selector,
-                    active_path=active_plan_path,
-                    new_path=new_plan_path,
-                    conditions={"DONE": done, "NEW_PLAN_EXISTS": False, "MAX_TURNS_REACHED": turn_number >= effective_max_turns},
-                    preserve_terminal_outcome_on_observer_error=True,
-                )
-                report = _manager_terminal_incident(
-                    trigger="invalid_plan", reason=str(exc), current_step=current_step_name,
-                    current_role=step.role, active_team=active_team_name, active_selector=selector,
-                )
-                summary = report or _format_failure(
-                    reason=str(exc), run_dir=run_paths.run_dir, snapshot=snapshot_before,
-                    parse_error=exc if isinstance(exc, PlanParseError) else None,
-                )
-                failure_finalizer.raise_failure(
-                    summary,
+            # Detect scope pressure from the finalized turn before the manager gate.
+            # Stop already won at this point (checked at line 5257).  When pressure
+            # is present, the manager gate coordinator forces Full or fails clearly for disabled
+            # supervision; it must not reach the stop path with a simultaneous
+            # real AFLOW_STOP marker.
+            scope_pressure = parse_scope_pressure(
+                (turn_dir / "stdout.txt").read_text(encoding="utf-8")
+                if (turn_dir / "stdout.txt").is_file() else "",
+                (turn_dir / "stderr.txt").read_text(encoding="utf-8")
+                if (turn_dir / "stderr.txt").is_file() else "",
+                output_contract=invocation.output_contract,
+            )
+            scope_pressure_reason = scope_pressure.reason if scope_pressure.detected else None
+
+            transition_target = manager_gate_coordinator.run(
+                proposed_transition=transition_target,
+                current_step=current_step_name,
+                current_role=step.role,
+                active_team=active_team_name,
+                baseline_team_name=baseline_team_name,
+                active_selector=selector,
+                post_transition_active_path=post_transition_active_path,
+                original_plan_path=original_plan_path,
+                active_plan_path=active_plan_path,
+                new_plan_path=new_plan_path,
+                runtime_current_step_name=current_step_name,
+                scope_pressure_reason=scope_pressure_reason,
+            )
+
+            if transition_target != "END":
+                state.current_team_override = None
+            if selected_transition is None:
+                raise WorkflowError("internal error: transition selection produced no result")
+            try:
+                active_plan_path = _select_next_active_plan_path(
                     original_plan_path=original_plan_path,
-                    current_step_name=current_step_name,
                     active_plan_path=active_plan_path,
                     new_plan_path=new_plan_path,
-                    cause=exc,
-                )
-            except Exception as exc:
-                _raise_unexpected_started_turn_failure(
-                    exc,
-                    invocation=invocation,
-                    turn_dir=turn_dir,
-                    started_at=turn_started_at,
-                    step_name=current_step_name,
-                    step_role=step.role,
-                    selector=selector,
-                    snapshot_before=snapshot_before,
-                    post_snapshot=post_snapshot,
-                    completed=completed,
-                )
-
-            state.pending_retry = None
-
-            try:
-                if state.recovery_context is not None:
-                    # Explicit durable recovery is a one-shot, provider-neutral
-                    # replacement. Never route a target failure through the
-                    # legacy retry or backup-team failover policy.
-                    recovery_scheduled = False
-                else:
-                    recovery_scheduled = _handle_harness_recovery(
-                        turn_number=turn_number,
-                        step_name=current_step_name,
-                        step=step,
-                        step_path=step_path,
-                        active_team_name=active_team_name,
-                        selector=selector,
-                        resolved=resolved,
-                        invocation=invocation,
-                        turn_dir=turn_dir,
-                        started_at=turn_started_at,
-                        snapshot_before=snapshot_before,
-                        snapshot_after=post_snapshot,
-                        stdout=completed.stdout,
-                        stderr=completed.stderr,
-                        returncode=completed.returncode,
-                    )
-            except Exception as exc:
-                _raise_unexpected_started_turn_failure(
-                    exc,
-                    invocation=invocation,
-                    turn_dir=turn_dir,
-                    started_at=turn_started_at,
-                    step_name=current_step_name,
-                    step_role=step.role,
-                    selector=selector,
-                    snapshot_before=snapshot_before,
-                    post_snapshot=post_snapshot,
-                    completed=completed,
-                )
-            if recovery_scheduled:
-                turn_number += 1
-                continue
-
-            state.consecutive_harness_recoveries = 0
-
-            if completed.returncode != 0:
-                state.status_message = "failed"
-                _record_issue(
-                    "harness-failed",
-                    f"harness '{invocation.label}' exited with code {completed.returncode}",
-                    turn_dir=turn_dir,
-                )
-                _finalize_turn_record(
-                    status="harness-failed",
-                    started_at=turn_started_at,
-                    snapshot_before=snapshot_before,
-                    snapshot_after=post_snapshot,
-                    invocation=invocation,
-                    turn_dir=turn_dir,
-                    stdout=completed.stdout,
-                    stderr=completed.stderr,
-                    returncode=completed.returncode,
-                    step_name=current_step_name,
-                    step_role=step.role,
-                    selector=selector,
-                    active_path=active_plan_path,
-                    new_path=new_plan_path,
-                    conditions={"DONE": post_snapshot.is_complete, "NEW_PLAN_EXISTS": False, "MAX_TURNS_REACHED": turn_number >= effective_max_turns},
-                    preserve_terminal_outcome_on_observer_error=True,
-                )
-                report = _manager_terminal_incident(
-                    trigger="ambiguous_failure",
-                    reason=f"harness '{invocation.label}' exited with code {completed.returncode}",
-                    current_step=current_step_name, current_role=step.role,
-                    active_team=active_team_name, active_selector=selector,
-                )
-                summary = report or _format_failure(
-                    reason=f"harness '{invocation.label}' exited with code {completed.returncode}",
-                    run_dir=run_paths.run_dir, snapshot=post_snapshot,
-                )
-                failure_finalizer.raise_failure(
-                    summary,
-                    original_plan_path=original_plan_path,
-                    current_step_name=current_step_name,
-                    active_plan_path=active_plan_path,
-                    new_plan_path=new_plan_path,
-                    last_snapshot=post_snapshot,
-                )
-
-            state.last_snapshot = post_snapshot
-            state.turns_completed += 1
-
-            done = post_snapshot.is_complete
-            new_plan_exists = _exec_plan_path(new_plan_path, exec_ctx).is_file()
-
-            if new_plan_exists:
-                active_plan_path = new_plan_path
-
-            # A source-backed run must reach the next boundary before deciding
-            # that the limit is terminal. The saved turn still uses the
-            # current limit for accounting, but a boundary edit may increase
-            # it before the next synthetic/provider launch.
-            max_turns_reached = turn_number >= effective_max_turns
-
-            conditions = {
-                "DONE": done,
-                "NEW_PLAN_EXISTS": new_plan_exists,
-                "MAX_TURNS_REACHED": max_turns_reached,
-            }
-
-            selected_transition = None
-            transition_target = None
-            try:
-                selected_transition = _select_transition(
-                    step.go,
-                    step_path=step_path,
-                    done=done,
                     new_plan_exists=new_plan_exists,
-                    max_turns_reached=max_turns_reached,
+                    selected_transition=selected_transition,
+                    exec_ctx=exec_ctx,
                 )
-                transition_target = selected_transition.to
             except WorkflowError as exc:
                 state.status_message = "failed"
-                _record_issue("transition-failed", exc.summary, turn_dir=turn_dir)
-                _finalize_turn_record(
-                    status="transition-failed",
-                    started_at=turn_started_at,
-                    snapshot_before=snapshot_before,
-                    snapshot_after=post_snapshot,
-                    invocation=invocation,
-                    turn_dir=turn_dir,
-                    stdout=completed.stdout,
-                    stderr=completed.stderr,
-                    returncode=completed.returncode,
-                    step_name=current_step_name,
-                    step_role=step.role,
-                    selector=selector,
-                    active_path=active_plan_path,
-                    new_path=new_plan_path,
-                    conditions=conditions,
-                    preserve_terminal_outcome_on_observer_error=True,
-                )
-                report = _manager_terminal_incident(
-                    trigger="illegal_transition", reason=exc.summary, current_step=current_step_name,
-                    current_role=step.role, active_team=active_team_name, active_selector=selector,
-                )
-                summary = report or _format_failure(
-                    reason=exc.summary, run_dir=run_paths.run_dir, snapshot=state.last_snapshot,
+                summary = _format_failure(
+                    reason=exc.summary,
+                    run_dir=run_paths.run_dir,
+                    snapshot=state.last_snapshot,
                 )
                 failure_finalizer.raise_failure(
                     summary,
@@ -14946,493 +16316,111 @@ def _run_workflow_unchecked(
                     last_snapshot=state.last_snapshot,
                     cause=exc,
                 )
-            except Exception as exc:
-                _raise_unexpected_started_turn_failure(
-                    exc,
-                    invocation=invocation,
-                    turn_dir=turn_dir,
-                    started_at=turn_started_at,
-                    step_name=current_step_name,
-                    step_role=step.role,
-                    selector=selector,
-                    snapshot_before=snapshot_before,
-                    post_snapshot=post_snapshot,
-                    completed=completed,
-                    conditions=conditions,
-                )
 
-            limit_terminal = (
-                transition_target == "END"
-                and live_config_source_path is not None
-                and max_turns_reached
-                and selected_transition is not None
-                and selected_transition.when is not None
-                and not evaluate_condition(
-                    selected_transition.when,
-                    done=done,
-                    new_plan_exists=new_plan_exists,
-                    max_turns_reached=False,
-                )
-            )
-            review_rejection: ReviewRejectionRecord | None = None
-            scope_before_finalize = state.active_implementation_scope
-            controller_next_step = (
-                wf.steps.get(transition_target)
-                if transition_target != "END" else None
-            )
-            is_scoped_rejection = (
-                scope_before_finalize is not None
-                and scope_before_finalize.awaiting_review
-                and step.role == "reviewer"
-                and (
-                    not done
-                    or review_overlay_at_expected_path
-                    or (
-                        resume is not None
-                        and resume.pending_cumulative_review is not None
-                    )
-                )
-                and new_plan_exists
-                and snapshot_before == post_snapshot
-                and controller_next_step is not None
-                and controller_next_step.role == "worker"
-            )
-            cumulative_review = (
-                current_step_name == "final_review"
-                and step.role in {"architect", "final_reviewer"}
-                and scope_before_finalize is None
-                and done
-                and review_overlay_at_expected_path
-                and new_plan_exists
-                and snapshot_before == post_snapshot
-                and controller_next_step is not None
-                and controller_next_step.role == "worker"
-            )
-            cumulative_attempt = (
-                _cumulative_review_attempt(
-                    state,
-                    original_plan_path=original_plan_path,
-                    completed_snapshot=post_snapshot,
-                )
-                if cumulative_review else None
-            )
-            if is_scoped_rejection or cumulative_attempt is not None:
-                rejection_scope_id = (
-                    scope_before_finalize.scope_id
-                    if is_scoped_rejection and scope_before_finalize is not None
-                    else cumulative_attempt[0]
-                )
-                attempts = (
-                    state.implementation_attempts.get(rejection_scope_id, [])
-                    if is_scoped_rejection
-                    else [cumulative_attempt[1]]
-                )
-                if not attempts:
-                    raise WorkflowError(
-                        "internal error: review rejection has no implementation attempt",
-                        run_dir=run_paths.run_dir,
-                    )
-                reviewed_attempt = attempts[-1]
-                if cumulative_attempt is not None and not is_scoped_rejection:
-                    # The first cumulative review links the final checkpoint's
-                    # accepted worker into its own durable repair lineage.
-                    # Later review retries of that same worker earn no new
-                    # rejection credit.
-                    state.implementation_attempts.setdefault(
-                        rejection_scope_id, [reviewed_attempt],
-                    )
-                repair_path = new_plan_path if new_plan_exists else None
-                try:
-                    repair_path_text = str(repair_path.relative_to(run_paths.repo_root)) if repair_path else None
-                except ValueError:
-                    repair_path_text = str(repair_path) if repair_path else None
-                matching = [
-                    item.rejection_number for item in state.review_rejection_history
-                    if item.scope_id == rejection_scope_id
-                ]
-                already_rejected = any(
-                    item.scope_id == rejection_scope_id
-                    and item.reviewed_attempt_ordinal == reviewed_attempt.attempt_ordinal
-                    and item.reviewed_implementation_turn_number == reviewed_attempt.turn_number
-                    for item in state.review_rejection_history
-                )
-                if is_scoped_rejection or not already_rejected:
-                    review_rejection = ReviewRejectionRecord(
-                        scope_id=rejection_scope_id,
-                        rejection_number=max(matching, default=0) + 1,
-                        source_run_id=state.run_id or run_paths.run_dir.name,
-                        review_turn_number=turn_number,
-                        review_step_name=current_step_name,
-                        reviewer_selector=selector,
-                        checkpoint_index=(
-                            scope_before_finalize.checkpoint_index
-                            if is_scoped_rejection and scope_before_finalize is not None else None
-                        ),
-                        checkpoint_name=(
-                            scope_before_finalize.checkpoint_name
-                            if is_scoped_rejection and scope_before_finalize is not None else None
-                        ),
-                        reviewed_implementation_turn_number=reviewed_attempt.turn_number,
-                        reviewed_worker_team=reviewed_attempt.team,
-                        reviewed_worker_selector=reviewed_attempt.selector,
-                        reviewed_attempt_ordinal=reviewed_attempt.attempt_ordinal,
-                        review_summary=summarize_review_rejection(completed.stdout),
-                        repair_plan_summary=summarize_repair_plan(repair_path),
-                        review_stdout_artifact_path=_turn_artifact_display_path(
-                            run_paths.repo_root, turn_dir, "stdout.txt",
-                            content=completed.stdout,
-                        ),
-                        repair_plan_path=repair_path_text,
-                    )
-
-            _finalize_turn_record(
-                status="completed" if done or limit_terminal else "running",
-                started_at=turn_started_at,
-                snapshot_before=snapshot_before,
-                snapshot_after=post_snapshot,
-                invocation=invocation,
-                turn_dir=turn_dir,
-                stdout=completed.stdout,
-                stderr=completed.stderr,
-                returncode=completed.returncode,
-                step_name=current_step_name,
-                step_role=step.role,
-                selector=selector,
-                active_path=active_plan_path,
-                new_path=new_plan_path,
-                conditions=conditions,
-                chosen_transition=transition_target,
-                chosen_transition_condition=selected_transition.when,
-                end_reason=(
-                    "max_turns_reached"
-                    if limit_terminal
-                    else (
-                        _normalize_end_reason(
-                            selected_transition=selected_transition,
-                            done=done,
-                            max_turns_reached=max_turns_reached,
-                        )
-                        if (
-                            transition_target == "END"
-                            and selected_transition is not None
-                            and post_snapshot.is_complete
-                        )
-                        else None
-                    )
-                ),
-                was_retry=True if retry_ctx is not None else None,
-                retry_attempt=retry_ctx.attempt if retry_ctx is not None else None,
-                review_rejection=review_rejection,
-            )
-        except OwnerStopRequested:
-            return _finish_owner_stop(
-                invocation=invocation,
-                turn_dir=turn_dir,
-                started_at=turn_started_at,
-                step_name=current_step_name,
-                step_role=step.role,
-                selector=selector,
-                snapshot_before=snapshot_before,
-                post_snapshot=post_snapshot,
-                completed=completed,
-            )
-        except Exception as exc:
-            _raise_unexpected_started_turn_failure(
-                exc,
-                invocation=invocation,
-                turn_dir=turn_dir,
-                started_at=turn_started_at,
-                step_name=current_step_name,
-                step_role=step.role,
-                selector=selector,
-                snapshot_before=snapshot_before,
-                post_snapshot=post_snapshot,
-                completed=completed,
-                conditions=conditions,
-                chosen_transition=transition_target,
-                chosen_transition_condition=(
-                    selected_transition.when
-                    if selected_transition is not None else None
-                ),
-            )
-        if review_rejection is not None:
-            state.review_rejection_history.append(review_rejection)
-
-        if step.role == "worker" and routing_scope_id is not None:
-            state.implementation_attempts.setdefault(routing_scope_id, []).append(ImplementationAttempt(
-                turn_number=turn_number, step_name=current_step_name, role=step.role,
-                team=active_team_name, selector=selector,
-                outcome="accepted" if done else "progress",
-                manager_decision_number=(state.pending_boundary_decision.decision_number
-                    if state.pending_boundary_decision is not None else None),
-                repair_ordinal=attempt_repair_ordinal,
-                team_repairs_completed=attempt_team_repairs_completed,
-                attempt_ordinal=attempt_ordinal,
-            ))
-            if state.active_implementation_scope is not None:
-                next_config = (
-                    wf.steps.get(transition_target)
-                    if transition_target != "END" else None
-                )
-                state.active_implementation_scope = replace(
-                    state.active_implementation_scope,
-                    awaiting_review=(
-                        next_config is not None and next_config.role != "worker"
-                    ),
-                )
-            if consume_team_override:
-                state.pending_step_team_override = None
-
-        post_transition_active_path = _select_next_active_plan_path(
-            original_plan_path=original_plan_path,
-            active_plan_path=active_plan_path,
-            new_plan_path=new_plan_path,
-            new_plan_exists=new_plan_exists,
-            selected_transition=selected_transition,
-            exec_ctx=exec_ctx,
-        )
-
-        scope = state.active_implementation_scope
-        next_config = (
-            wf.steps.get(transition_target)
-            if transition_target != "END" else None
-        )
-        if scope is not None and step.role != "worker" and scope.awaiting_review:
-            scope = replace(scope, awaiting_review=False)
-            state.active_implementation_scope = scope
-        if (
-            scope is not None
-            and not new_plan_exists
-            and _original_checkpoint_advanced(scope, post_snapshot)
-            and (
-                step.role != "worker"
-                or next_config is None
-                or next_config.role == "worker"
-            )
-        ):
-            _close_implementation_scope(state)
-
-        # A live source may change the effective limit at the next boundary;
-        # let the completed turn reach that reload before deciding whether
-        # another provider launch is allowed. Static runs retain their
-        # existing terminal manager gate, while live END transitions flow
-        # through normal END finalization so their edge is recorded.
-        if max_turns_reached and not done and live_config_source_path is None:
-            reason = f"reached max turns limit of {effective_max_turns} without completing the active plan"
-            report = _manager_terminal_incident(
-                trigger="max_turns", reason=reason, current_step=current_step_name,
-                current_role=step.role, active_team=active_team_name, active_selector=selector,
-            )
-            _raise_incomplete_terminal_failure(
-                reason=reason,
-                post_snapshot=post_snapshot,
-                turn_dir=turn_dir,
-                manager_report=report,
-            )
-
-        plan_progressed = _plan_snapshot_made_progress(snapshot_before, post_snapshot)
-
-        # A same-step cap is a terminal controller boundary, not a normal
-        # transition followed by a second manager call. Decide it before the
-        # ordinary gate so Full is invoked exactly once when supervision is on.
-        # Productive cumulative turns reset the streak even when the workflow
-        # deliberately routes back through the same worker node.
-        if (
-            len(wf.steps) > 1
-            and transition_target == current_step_name
-            and not plan_progressed
-        ):
-            max_cap = workflow_config.aflow.max_same_step_turns
-            new_streak = (
-                state.consec_step_count + 1
-                if state.consec_step_name == current_step_name
-                else 1
-            )
-            if max_cap > 0 and new_streak >= max_cap:
-                reason = (
-                    f"same-step cap reached: step '{current_step_name}' "
-                    f"selected {new_streak} consecutive times (limit: {max_cap})"
-                )
-                state.status_message = "failed"
-                report = _manager_terminal_incident(
-                    trigger="same_step_cap", reason=reason,
-                    current_step=current_step_name, current_role=step.role,
-                    active_team=active_team_name, active_selector=selector,
-                )
-                _record_issue("same-step-cap", reason, turn_dir=turn_dir)
-                summary = report or _format_failure(
-                    reason=reason, run_dir=run_paths.run_dir, snapshot=post_snapshot,
-                )
-                failure_finalizer.raise_failure(
-                    summary,
-                    original_plan_path=original_plan_path,
-                    current_step_name=current_step_name,
-                    active_plan_path=active_plan_path,
-                    new_plan_path=new_plan_path,
-                    last_snapshot=post_snapshot,
-                )
-
-        # Detect scope pressure from the finalized turn before the manager gate.
-        # Stop already won at this point (checked at line 5257).  When pressure
-        # is present, the manager gate coordinator forces Full or fails clearly for disabled
-        # supervision; it must not reach the stop path with a simultaneous
-        # real AFLOW_STOP marker.
-        scope_pressure = parse_scope_pressure(
-            (turn_dir / "stdout.txt").read_text(encoding="utf-8")
-            if (turn_dir / "stdout.txt").is_file() else "",
-            (turn_dir / "stderr.txt").read_text(encoding="utf-8")
-            if (turn_dir / "stderr.txt").is_file() else "",
-            output_contract=invocation.output_contract,
-        )
-        scope_pressure_reason = scope_pressure.reason if scope_pressure.detected else None
-
-        transition_target = manager_gate_coordinator.run(
-            proposed_transition=transition_target,
-            current_step=current_step_name,
-            current_role=step.role,
-            active_team=active_team_name,
-            baseline_team_name=baseline_team_name,
-            active_selector=selector,
-            post_transition_active_path=post_transition_active_path,
-            original_plan_path=original_plan_path,
-            active_plan_path=active_plan_path,
-            new_plan_path=new_plan_path,
-            runtime_current_step_name=current_step_name,
-            scope_pressure_reason=scope_pressure_reason,
-        )
-
-        if transition_target != "END":
-            state.current_team_override = None
-        if selected_transition is None:
-            raise WorkflowError("internal error: transition selection produced no result")
-        try:
-            active_plan_path = _select_next_active_plan_path(
-                original_plan_path=original_plan_path,
+            banner.set_context(
                 active_plan_path=active_plan_path,
-                new_plan_path=new_plan_path,
-                new_plan_exists=new_plan_exists,
-                selected_transition=selected_transition,
-                exec_ctx=exec_ctx,
+                new_plan_path=new_plan_path if new_plan_exists else None,
             )
-        except WorkflowError as exc:
-            state.status_message = "failed"
-            summary = _format_failure(
-                reason=exc.summary,
-                run_dir=run_paths.run_dir,
-                snapshot=state.last_snapshot,
-            )
-            failure_finalizer.raise_failure(
-                summary,
-                original_plan_path=original_plan_path,
-                current_step_name=current_step_name,
-                active_plan_path=active_plan_path,
-                new_plan_path=new_plan_path,
+            banner.update(state)
+
+            run_metadata.write(
+                status="running",
+                execution_context=exec_ctx,
                 last_snapshot=state.last_snapshot,
-                cause=exc,
+                turns_completed=state.turns_completed,
+                 original_plan_path=original_plan_path,
+                current_step_name=current_step_name, active_plan_path=active_plan_path,
+                new_plan_path=new_plan_path,
             )
 
-        banner.set_context(
-            active_plan_path=active_plan_path,
-            new_plan_path=new_plan_path if new_plan_exists else None,
-        )
-        banner.update(state)
-
-        run_metadata.write(
-            status="running",
-            execution_context=exec_ctx,
-            last_snapshot=state.last_snapshot,
-            turns_completed=state.turns_completed,
-             original_plan_path=original_plan_path,
-            current_step_name=current_step_name, active_plan_path=active_plan_path,
-            new_plan_path=new_plan_path,
-        )
-
-        if transition_target == "END":
-            if not post_snapshot.is_complete and not limit_terminal:
-                terminal_reason = (
-                    f"reached max turns limit of {effective_max_turns} without "
-                    "completing the active plan"
-                    if max_turns_reached
-                    else "workflow selected END while the active plan remains incomplete"
-                )
-                _raise_incomplete_terminal_failure(
-                    reason=terminal_reason,
-                    post_snapshot=post_snapshot,
-                    turn_dir=turn_dir,
-                )
-            if limit_terminal:
-                # A selected END that only matches because MAX_TURNS_REACHED
-                # is true is a budget exit, including when the worker just
-                # completed the ledger.  It never approves an outstanding
-                # review/repair boundary, so delivery stays withheld and the
-                # end reason stays truthful even at the numerical limit.
-                end_reason = "max_turns_reached"
-            else:
-                end_reason = _normalize_end_reason(
-                    selected_transition=selected_transition,
-                    done=done,
-                    max_turns_reached=max_turns_reached,
-                )
-            return _finish_normal_terminal(
-                terminal_step_name=current_step_name,
-                terminal_step_role=step.role,
-                terminal_selector=selector,
-                active_team=active_team_name,
-                final_snapshot=post_snapshot,
-                end_reason=end_reason,
-                delivery_eligible=not limit_terminal,
-            )
-
-        if len(wf.steps) > 1:
-            max_cap = workflow_config.aflow.max_same_step_turns
-            if transition_target == current_step_name and not plan_progressed:
-                new_streak = (
-                    state.consec_step_count + 1
-                    if state.consec_step_name == current_step_name
-                    else 1
-                )
-                if max_cap > 0 and new_streak >= max_cap:
-                    state.status_message = "failed"
-                    _manager_terminal_incident(
-                        trigger="same_step_cap",
-                        reason=(f"same-step cap reached: step '{current_step_name}' "
-                                f"selected {new_streak} consecutive times (limit: {max_cap})"),
-                        current_step=current_step_name, current_role=step.role,
-                        active_team=active_team_name, active_selector=selector,
+            if transition_target == "END":
+                if not post_snapshot.is_complete and not limit_terminal:
+                    terminal_reason = (
+                        f"reached max turns limit of {effective_max_turns} without "
+                        "completing the active plan"
+                        if max_turns_reached
+                        else "workflow selected END while the active plan remains incomplete"
                     )
-                    _record_issue(
-                        "same-step-cap",
-                        (
-                            f"same-step cap reached: step '{current_step_name}' "
-                            f"selected {new_streak} consecutive times (limit: {max_cap})"
-                        ),
+                    _raise_incomplete_terminal_failure(
+                        reason=terminal_reason,
+                        post_snapshot=post_snapshot,
                         turn_dir=turn_dir,
                     )
-                    summary = _format_failure(
-                        reason=(
-                            f"same-step cap reached: step '{current_step_name}' "
-                            f"selected {new_streak} consecutive times (limit: {max_cap})"
-                        ),
-                        run_dir=run_paths.run_dir,
-                        snapshot=post_snapshot,
+                if limit_terminal:
+                    # A selected END that only matches because MAX_TURNS_REACHED
+                    # is true is a budget exit, including when the worker just
+                    # completed the ledger.  It never approves an outstanding
+                    # review/repair boundary, so delivery stays withheld and the
+                    # end reason stays truthful even at the numerical limit.
+                    end_reason = "max_turns_reached"
+                else:
+                    end_reason = _normalize_end_reason(
+                        selected_transition=selected_transition,
+                        done=done,
+                        max_turns_reached=max_turns_reached,
                     )
-                    failure_finalizer.raise_failure(
-                        summary,
-                        original_plan_path=original_plan_path,
-                        current_step_name=current_step_name,
-                        active_plan_path=active_plan_path,
-                        new_plan_path=new_plan_path,
-                        last_snapshot=post_snapshot,
+                return _finish_normal_terminal(
+                    terminal_step_name=current_step_name,
+                    terminal_step_role=step.role,
+                    terminal_selector=selector,
+                    active_team=active_team_name,
+                    final_snapshot=post_snapshot,
+                    end_reason=end_reason,
+                    delivery_eligible=not limit_terminal,
+                )
+
+            if len(wf.steps) > 1:
+                max_cap = workflow_config.aflow.max_same_step_turns
+                if transition_target == current_step_name and not plan_progressed:
+                    new_streak = (
+                        state.consec_step_count + 1
+                        if state.consec_step_name == current_step_name
+                        else 1
                     )
-                state.consec_step_name = current_step_name
-                state.consec_step_count = new_streak
-            else:
-                state.consec_step_name = None
-                state.consec_step_count = 0
+                    if max_cap > 0 and new_streak >= max_cap:
+                        state.status_message = "failed"
+                        _manager_terminal_incident(
+                            trigger="same_step_cap",
+                            reason=(f"same-step cap reached: step '{current_step_name}' "
+                                    f"selected {new_streak} consecutive times (limit: {max_cap})"),
+                            current_step=current_step_name, current_role=step.role,
+                            active_team=active_team_name, active_selector=selector,
+                        )
+                        _record_issue(
+                            "same-step-cap",
+                            (
+                                f"same-step cap reached: step '{current_step_name}' "
+                                f"selected {new_streak} consecutive times (limit: {max_cap})"
+                            ),
+                            turn_dir=turn_dir,
+                        )
+                        summary = _format_failure(
+                            reason=(
+                                f"same-step cap reached: step '{current_step_name}' "
+                                f"selected {new_streak} consecutive times (limit: {max_cap})"
+                            ),
+                            run_dir=run_paths.run_dir,
+                            snapshot=post_snapshot,
+                        )
+                        failure_finalizer.raise_failure(
+                            summary,
+                            original_plan_path=original_plan_path,
+                            current_step_name=current_step_name,
+                            active_plan_path=active_plan_path,
+                            new_plan_path=new_plan_path,
+                            last_snapshot=post_snapshot,
+                        )
+                    state.consec_step_name = current_step_name
+                    state.consec_step_count = new_streak
+                else:
+                    state.consec_step_name = None
+                    state.consec_step_count = 0
 
-        current_step_name = transition_target
-        turn_number += 1
+            current_step_name = transition_target
+            turn_number += 1
 
+        except OwnerStopRequested:
+            return _finish_owner_stop()
     state.status_message = "failed"
     effective_max_turns = state.effective_max_turns or config.max_turns
     report = _manager_terminal_incident(

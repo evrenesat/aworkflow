@@ -83,6 +83,11 @@ class HarnessSessionRefV1:
     model_display: str
     status: Literal["active", "handed_over", "closed"] = "active"
     schema_version: int = HOTPLUG_SCHEMA_VERSION
+    # Raw (harness, model, effort) tuple captured at dispatch.  Persisted for
+    # every session with known dispatched values, marked or not; provider
+    # handover admission keys an exclusive claim on it only when the current
+    # source profile opts in.  Legacy sessions persist without it (None).
+    resource_identity: tuple[str, str | None, str | None] | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.schema_version, int) or isinstance(self.schema_version, bool) or self.schema_version != HOTPLUG_SCHEMA_VERSION:
@@ -92,12 +97,25 @@ class HarnessSessionRefV1:
                 raise ValueError(f"{field_name} is required")
         if self.status not in {"active", "handed_over", "closed"}:
             raise ValueError("invalid hotplug session status")
+        if self.resource_identity is not None:
+            identity = self.resource_identity
+            if (
+                len(identity) != 3
+                or not isinstance(identity[0], str)
+                or not identity[0]
+                or (identity[1] is not None and not isinstance(identity[1], str))
+                or (identity[2] is not None and not isinstance(identity[2], str))
+            ):
+                raise ValueError("invalid hotplug session resource identity")
 
     def to_dict(self) -> dict[str, object]:
-        return {"schema_version": self.schema_version, "session_id": self.session_id,
-                "role": self.role, "selector": self.selector, "harness": self.harness,
-                "profile": self.profile, "model_display": self.model_display,
-                "status": self.status}
+        raw = {"schema_version": self.schema_version, "session_id": self.session_id,
+               "role": self.role, "selector": self.selector, "harness": self.harness,
+               "profile": self.profile, "model_display": self.model_display,
+               "status": self.status}
+        if self.resource_identity is not None:
+            raw["resource_identity"] = list(self.resource_identity)
+        return raw
 
     @classmethod
     def from_dict(cls, raw: Mapping[str, Any], *, strict: bool = False) -> "HarnessSessionRefV1":
@@ -113,6 +131,27 @@ class HarnessSessionRefV1:
         status = raw.get("status", "active")
         if not isinstance(status, str):
             raise ValueError("hotplug session status must be a string")
+        resource_identity: tuple[str, str | None, str | None] | None = None
+        if "resource_identity" in raw and raw["resource_identity"] is not None:
+            identity = raw["resource_identity"]
+            if not isinstance(identity, (list, tuple)) or len(identity) != 3:
+                raise ValueError(
+                    "hotplug session resource identity must be a triple"
+                )
+            harness, model, effort = identity
+            if not isinstance(harness, str) or not harness:
+                raise ValueError(
+                    "hotplug session resource identity harness is invalid"
+                )
+            if model is not None and not isinstance(model, str):
+                raise ValueError(
+                    "hotplug session resource identity model is invalid"
+                )
+            if effort is not None and not isinstance(effort, str):
+                raise ValueError(
+                    "hotplug session resource identity effort is invalid"
+                )
+            resource_identity = (harness, model, effort)
         return cls(schema_version=schema_version,
                    session_id=_required_text(raw, "session_id"),
                    role=_required_text(raw, "role"),
@@ -120,7 +159,8 @@ class HarnessSessionRefV1:
                    harness=_required_text(raw, "harness"),
                    profile=_required_text(raw, "profile"),
                    model_display=_required_text(raw, "model_display"),
-                   status=status)
+                   status=status,
+                   resource_identity=resource_identity)
 
 
 @dataclass(frozen=True)

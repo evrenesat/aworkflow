@@ -15,38 +15,81 @@ import fcntl
 import json
 import os
 import subprocess
+import sys
 import threading
 import time
+from dataclasses import replace
 from pathlib import Path
 from typing import Callable
 
 import pytest
 
-from aflow.config import load_workflow_config
+from aflow.config import (
+    AflowSection,
+    ErrorHandlingConfig,
+    GoTransition,
+    HarnessErrorRecoveryConfig,
+    HarnessProfileConfig,
+    ManagerConfig,
+    TeamConfig,
+    WorkflowConfig,
+    WorkflowHarnessConfig,
+    WorkflowStepConfig,
+    WorkflowUserConfig,
+    execution_resource_key,
+    load_workflow_config,
+)
 from aflow.execution_resources import (
     ClaimSpec,
     ControllerIdentity,
     ExecutionLease,
     ExecutionResourceAdmission,
     ExecutionResourceStore,
+    ProcessEvidence,
     RevalidationVerdict,
     ResourceLeaseError,
     TurnReprepareRequired,
     UNCHANGED,
+    owned_child_binding,
 )
+from aflow.harnesses.base import HarnessInvocation
 from aflow.harnesses.codex import CodexAdapter
+from aflow.harnesses.preflight import NoOpHarnessPreflightProbe
+from aflow.harnesses.session import (
+    SessionCapabilities,
+    SessionRequest,
+    SessionResult,
+    retain_lifecycle_after_failure,
+)
+from aflow.hotplug import (
+    HANDOVER_HEADINGS,
+    HarnessSessionRefV1,
+    HotplugTransactionV1,
+    hotplug_transaction_id,
+)
 from aflow.run_state import (
     ControllerConfig,
+    ImplementationAttempt,
     ResumeContext,
     _mark_validated_resume_context,
     manager_resume_fields,
 )
 from aflow.workflow import (
+    ResolvedProfile,
+    WorkflowError,
+    _AuxiliaryAdmissionContext,
     load_scope_evidence_for_resume,
     resolve_profile,
     run_workflow,
 )
-from tests._support import _write_split_config
+from tests._support import (
+    _git_commit_file,
+    _git_merge_feature_into_main,
+    _make_lifecycle_git_repo,
+    _run_git_in_test,
+    _write_plan,
+    _write_split_config,
+)
 
 # ---------------------------------------------------------------------------
 # Configuration templates
@@ -78,15 +121,18 @@ def _aflow_toml(
     prompt2: str | None = None,
     max_turns: int = 12,
     manager_enabled: bool = False,
+    manager_exclusive: bool = False,
+    manager_model: str = _MANAGER_MODEL,
 ) -> str:
     w_excl = "exclusive = true\n" if worker_exclusive else ""
     r_excl = "exclusive = true\n" if reviewer_exclusive else ""
     a_excl = "exclusive = true\n" if auditor_exclusive else ""
+    m_excl = "exclusive = true\n" if manager_exclusive else ""
     manager_profiles = (
         f"""
 [harness.codex.profiles.manager]
-model = "{_MANAGER_MODEL}"
-"""
+model = "{manager_model}"
+{m_excl}"""
         if manager_enabled
         else ""
     )
@@ -412,6 +458,48 @@ def _launch(
                 runner=runner,
                 observer=observer,
                 resume=resume,
+            )
+        except BaseException as exc:  # noqa: BLE001 - surfaced by assertions
+            result["error"] = exc
+
+    thread = threading.Thread(target=target, daemon=True)
+    thread.start()
+    return thread, result
+
+
+def _launch_config(
+    tmp_path: Path,
+    wf_config: WorkflowUserConfig,
+    plan_path: Path,
+    runner: Callable[..., subprocess.CompletedProcess[str]],
+    observer: _Observer | None = None,
+    *,
+    workflow_name: str = "live",
+    max_turns: int = 12,
+    config_kwargs: dict | None = None,
+    repo_root: Path | None = None,
+) -> tuple[threading.Thread, dict]:
+    """Launch ``run_workflow`` with an in-memory config (no config file)."""
+    root = repo_root if repo_root is not None else tmp_path
+    config = ControllerConfig(
+        repo_root=root,
+        plan_path=plan_path,
+        max_turns=max_turns,
+        **(config_kwargs or {}),
+    )
+    result: dict = {}
+
+    def target() -> None:
+        try:
+            result["value"] = run_workflow(
+                config,
+                wf_config,
+                workflow_name,
+                config_dir=root,
+                snapshot_config=False,
+                adapter=CodexAdapter(),
+                runner=runner,
+                observer=observer,
             )
         except BaseException as exc:  # noqa: BLE001 - surfaced by assertions
             result["error"] = exc
@@ -2436,3 +2524,2727 @@ class TestPairedControllers:
             )
             assert journal["owner"] is None
             assert journal["queue"] == []
+
+
+# ---------------------------------------------------------------------------
+# Auxiliary admission matrix (checkpoint 5)
+# ---------------------------------------------------------------------------
+
+
+# ---------------------------------------------------------------------------
+# Provider handover lifetime fixtures (checkpoint 5)
+# ---------------------------------------------------------------------------
+
+_HANDOVER_OUTPUT = "\n".join(
+    f"## {heading}\n- bounded operational evidence"
+    for heading in HANDOVER_HEADINGS
+)
+_HANDOVER_SOURCE_RESOURCE = execution_resource_key("codex", "source-m", None)
+
+
+def _handover_source_identity() -> tuple[str, str | None, str | None]:
+    """The exclusive (harness, model, effort) tuple captured at dispatch."""
+    return ("codex", "source-m", None)
+
+
+def _record_inactive_source(root: Path, run_id: str) -> None:
+    """Prove a named predecessor stopped before continuing its session."""
+    run_dir = root / ".aflow" / "runs" / run_id
+    run_dir.mkdir(parents=True, exist_ok=True)
+    assert not (run_dir / "run.json").exists()
+    (run_dir / "run.json").write_text(
+        json.dumps({"status": "interrupted"}), encoding="utf-8"
+    )
+
+
+def _make_handover_transaction() -> HotplugTransactionV1:
+    digest = "a" * 64
+    return HotplugTransactionV1(
+        transaction_id=hotplug_transaction_id("run-1", digest, 1),
+        run_id="run-1", accepted_override_digest=digest, transaction_number=1,
+        source_role="worker", target_role="worker",
+        source_selector="codex.source", target_selector="reasonix.ds4-1-flash",
+        source_harness="codex", target_harness="reasonix",
+        source_profile="source", target_profile="ds4-1-flash",
+        source_model_display="codex / source-m",
+        target_model_display="reasonix / ds4-1-flash",
+        stage="accepted",
+    )
+
+
+def _handover_resume(
+    *,
+    source_identity: tuple[str, str | None, str | None] | None,
+    source_selector: str | None = None,
+    session_profile: str | None = None,
+) -> ResumeContext:
+    transaction = _make_handover_transaction()
+    if source_selector is not None:
+        transaction = replace(transaction, source_selector=source_selector)
+    source = HarnessSessionRefV1(
+        session_id="codex-source", role="worker",
+        selector=transaction.source_selector,
+        harness=transaction.source_harness,
+        profile=session_profile or transaction.source_profile,
+        model_display=transaction.source_model_display,
+        resource_identity=source_identity,
+    )
+    attempts = (ImplementationAttempt(
+        turn_number=1, step_name="implement", role="worker", team="source",
+        selector=transaction.source_selector, outcome="progress",
+        attempt_ordinal=1,
+    ),)
+    return ResumeContext(
+        resumed_from_run_id="codex-source-run", feature_branch=None,
+        worktree_path=None, main_branch=None, setup=(), teardown=(),
+        interrupted_step_name="implement",
+        role_selectors={"worker": transaction.target_selector},
+        current_hotplug_transaction=transaction,
+        pending_hotplug_transaction=transaction,
+        active_role_sessions=(source,), hotplug_transaction_number=1,
+        implementation_attempts={"scope-1": attempts},
+    )
+
+
+def _handover_repo(tmp_path: Path) -> tuple[Path, Path]:
+    """A disposable git repo; the broker journal stays in its sibling."""
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    plan_path = repo / "plan.md"
+    _write_plan(plan_path, _VALID_PLAN)
+    (repo / ".gitignore").write_text(".aflow/\n", encoding="utf-8")
+    for args in (
+        ("git", "init", "-q"),
+        ("git", "add", "-A"),
+        (
+            "git", "-c", "user.name=Test", "-c", "user.email=test@example.com",
+            "commit", "-qm", "initial",
+        ),
+    ):
+        subprocess.run(args, cwd=repo, check=True, capture_output=True)
+    _record_inactive_source(repo, "codex-source-run")
+    return repo, plan_path
+
+
+def _handover_config(
+    *,
+    source_exclusive: bool = True,
+    source_model: str = "source-m",
+) -> WorkflowUserConfig:
+    # The source profile is declared so the transaction's source selector
+    # resolves against the current configuration; its exclusive mark supplies
+    # the handover opt-in while the session's captured tuple supplies the
+    # resource key.  The fresh target profile is unmarked.
+    return WorkflowUserConfig(
+        roles={"worker": "reasonix.ds4-1-flash"},
+        harnesses={
+            "codex": WorkflowHarnessConfig(profiles={
+                "source": HarnessProfileConfig(
+                    model=source_model, exclusive=source_exclusive,
+                ),
+            }),
+            "reasonix": WorkflowHarnessConfig(profiles={
+                "ds4-1-flash": HarnessProfileConfig(model="ds4-1-flash"),
+            }),
+        },
+        workflows={"live": WorkflowConfig(
+            steps={"implement": WorkflowStepConfig(
+                role="worker",
+                prompts=("p",),
+                go=(GoTransition(to="END", when="DONE"),),
+            )},
+            first_step="implement",
+        )},
+        prompts={"p": "Work."},
+    )
+
+
+def _handover_runner(
+    plan_path: Path,
+) -> Callable[..., subprocess.CompletedProcess[str]]:
+    def runner(argv: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+        del kwargs
+        _write_plan(plan_path, _VALID_PLAN.replace("[ ]", "[x]"))
+        return subprocess.CompletedProcess(argv, 0, "wire", "")
+
+    return runner
+
+
+def _launch_handover(
+    repo: Path,
+    plan_path: Path,
+    resume: ResumeContext,
+    source_driver: object,
+    target_driver: object,
+    *,
+    config_path: Path | None = None,
+    wf_config: WorkflowUserConfig | None = None,
+    observer: _Observer | None = None,
+) -> tuple[threading.Thread, dict]:
+    config = ControllerConfig(repo_root=repo, plan_path=plan_path, max_turns=2)
+    launch_config_dir = config_path if config_path is not None else repo
+    if wf_config is None and config_path is not None:
+        wf_config = load_workflow_config(config_path)
+    if wf_config is None:
+        wf_config = _handover_config()
+    result: dict = {}
+
+    def target() -> None:
+        try:
+            result["value"] = run_workflow(
+                config, wf_config, "live", config_dir=launch_config_dir,
+                snapshot_config=False, adapter=CodexAdapter(),
+                runner=_handover_runner(plan_path), session_driver=target_driver,
+                source_session_driver=source_driver, resume=resume,
+                preflight_probe=NoOpHarnessPreflightProbe(),
+                observer=observer,
+            )
+        except BaseException as exc:  # noqa: BLE001 - surfaced by assertions
+            result["error"] = exc
+
+    thread = threading.Thread(target=target, daemon=True)
+    thread.start()
+    return thread, result
+
+
+def _handover_aflow_toml(*, source_exclusive: bool, source_model: str = "source-m") -> str:
+    """Live aflow.toml pair text whose source profile is resolvable."""
+    marker = "exclusive = true\n" if source_exclusive else ""
+    return f"""
+[aflow]
+default_workflow = "live"
+max_turns = 2
+
+[harness.codex.profiles.source]
+model = "{source_model}"
+{marker}[harness.reasonix.profiles.ds4-1-flash]
+model = "ds4-1-flash"
+
+[roles]
+worker = "reasonix.ds4-1-flash"
+
+[prompts]
+p = "Work."
+"""
+
+
+def _handover_workflows_toml() -> str:
+    return """
+[workflow.live]
+[workflow.live.steps.implement]
+role = "worker"
+prompts = ["p"]
+go = [{ to = "END", when = "DONE" }]
+"""
+
+
+def _reap_test_child(child: subprocess.Popen) -> None:
+    child.terminate()
+    try:
+        child.wait(timeout=10)
+    except subprocess.TimeoutExpired:
+        child.kill()
+        child.wait(timeout=10)
+
+
+class _HandoverSourceDriver:
+    """Fake provider source driver whose handover owns a real child process.
+
+    ``mode`` selects the tested exit: ``success`` reaps the child and
+    releases the lease; ``released_failure`` does the same and then raises a
+    plain callback error; ``unconfirmed_failure`` retains the claim through
+    the shared production helper while the child is still alive.
+    """
+
+    capabilities = SessionCapabilities(
+        session_identity=True, followup_turn=True, read_only_teardown=True,
+        idempotent_turn_start=True,
+    )
+
+    def __init__(
+        self, *, mode: str, release: threading.Event, started: threading.Event,
+        on_entry: Callable[[], str | None] | None = None,
+        require_lifecycle: bool = True,
+    ) -> None:
+        self.mode = mode
+        self.release = release
+        self.started = started
+        self.on_entry = on_entry
+        self.require_lifecycle = require_lifecycle
+        self.entry_status: str | None = None
+        self.calls = 0
+        self.legacy_call = False
+        self.child: subprocess.Popen | None = None
+        self.bound: tuple[int, str | None, int | None] | None = None
+
+    def build_full_context(self, run_dir: Path) -> dict:
+        return {"plan_state": {"checkpoint": 1}}
+
+    def handover(self, request: SessionRequest, prompt: str, lifecycle=None) -> str:
+        if self.require_lifecycle:
+            assert lifecycle is not None, "exclusive handover must carry the lease"
+        else:
+            self.legacy_call = lifecycle is None
+        self.calls += 1
+        if self.on_entry is not None:
+            # Sampled before any callback work: the durable launch intent
+            # must already exist when the model-bearing callback begins.
+            self.entry_status = self.on_entry()
+        # Idempotent no-op: the workflow persisted launch intent already.
+        if lifecycle is not None:
+            lifecycle.mark_launching()
+        child = subprocess.Popen(
+            [sys.executable, "-c", "import time; time.sleep(120)"],
+            stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        self.child = child
+        child_pid, child_birth, process_group = owned_child_binding(child)
+        self.bound = (child_pid, child_birth, process_group)
+        if lifecycle is not None:
+            lifecycle.bind_child(child_pid, child_birth, process_group)
+        self.started.set()
+        if not self.release.wait(timeout=30):
+            raise AssertionError("handover callback was abandoned by the test")
+        if self.mode == "unconfirmed_failure":
+            # The child is still alive: cessation cannot be confirmed, so
+            # the production helper retains the claim as unconfirmed.
+            retain_lifecycle_after_failure(
+                lifecycle, "handover",
+                ValueError("handover transport failed mid-turn"),
+            )
+        _reap_test_child(child)
+        if lifecycle is not None:
+            lifecycle.complete()
+        if self.mode == "released_failure":
+            raise ValueError("handover output rejected after confirmed reap")
+        return _HANDOVER_OUTPUT
+
+
+class _HandoverTargetDriver:
+    capabilities = SessionCapabilities(
+        session_identity=True, idempotent_turn_start=True,
+    )
+
+    def __init__(self) -> None:
+        self.prompts: list[str] = []
+        self.starts = 0
+
+    def build_invocation(self, request: SessionRequest) -> HarnessInvocation:
+        self.prompts.append(request.user_prompt)
+        return HarnessInvocation(
+            label="handover-target", argv=("handover-target",), env={},
+            prompt_mode="synthetic", system_prompt=request.system_prompt,
+            user_prompt=request.user_prompt, effective_prompt=request.user_prompt,
+        )
+
+    def parse_result(
+        self, request: SessionRequest, stdout: str, *, returncode: int = 0,
+    ) -> SessionResult:
+        del stdout, returncode
+        self.starts += 1
+        return SessionResult(
+            session_id="reasonix-target", selector=request.selector,
+            model=request.model, effort=request.effort, final_output="DONE",
+            capabilities=self.capabilities,
+        )
+
+
+class TestAuxiliaryAdmission:
+    """Auxiliary model-bearing calls share the admission/lifetime contract.
+
+    The manager decision is the primary auxiliary model call and exercises
+    the shared :class:`_AuxiliaryAdmissionContext` through the real
+    ``run_workflow`` path: an exclusive manager queues as an independent
+    FIFO participant, dispatches zero model calls while blocked, and acquires
+    only after the resource frees.  Unmarked managers keep the legacy fast
+    path and never touch the broker.  Owner stop while a manager claim is
+    queued finalizes the run as ``owner_stopped`` with no manager dispatch.
+    """
+
+    def test_manager_decision_admits_on_its_resource(
+        self, tmp_path: Path, resource_store: ExecutionResourceStore
+    ) -> None:
+        config_path, _ = _write_split_config(
+            home_dir=tmp_path,
+            aflow_text=_aflow_toml(
+                worker_exclusive=False,
+                manager_enabled=True,
+                manager_exclusive=True,
+            ),
+            workflows_text=_workflows_toml(
+                steps="work_only", manager_enabled=True
+            ),
+        )
+        plan_path = tmp_path / "plan.md"
+        plan_path.write_text(_VALID_PLAN, encoding="utf-8")
+        resource = _resource_for(config_path, "codex.manager", "manager")
+        assert resource is not None
+        identity, invocation_id = _occupy(resource_store, resource, role="manager")
+        calls: list[str] = []
+        observer = _Observer()
+        thread, result = _launch(
+            tmp_path, config_path, plan_path,
+            _worker_runner(plan_path, calls, complete_after=2), observer,
+        )
+        run_dir = _first_run_dir(tmp_path)
+        try:
+            # The unmarked worker runs freely; the exclusive manager blocks.
+            assert _wait_until(lambda: calls == [_WORKER_BASE])
+            assert _wait_until(
+                lambda: (
+                    _run_json(run_dir).get("execution_resource_wait") is not None
+                )
+            )
+            waiting = _run_json(run_dir)["execution_resource_wait"]
+            assert waiting["resource"] == resource
+            assert waiting["role"] == "manager"
+            assert waiting["kind"] == "manager"
+            assert waiting["selector"] == "codex.manager"
+            assert "manager" not in calls, "no manager dispatch while blocked"
+            _release(resource_store, resource, identity, invocation_id)
+            thread.join(timeout=20)
+        finally:
+            _release(
+                resource_store, resource, identity, invocation_id,
+                required=False,
+            )
+        assert "error" not in result, result.get("error")
+        assert not thread.is_alive()
+        assert calls.count("manager") >= 1, "manager dispatched after release"
+        run = _run_json(run_dir)
+        assert run["status"] == "completed"
+        assert run.get("execution_resource_wait") is None
+        phases = [event.phase for event in observer.resource_events()]
+        assert "acquired" in phases
+        assert "released" in phases
+
+    def test_manager_unmarked_never_touches_broker(
+        self, tmp_path: Path, resource_store: ExecutionResourceStore
+    ) -> None:
+        config_path, _ = _write_split_config(
+            home_dir=tmp_path,
+            aflow_text=_aflow_toml(
+                worker_exclusive=False,
+                manager_enabled=True,
+                manager_exclusive=False,
+            ),
+            workflows_text=_workflows_toml(
+                steps="work_only", manager_enabled=True
+            ),
+        )
+        plan_path = tmp_path / "plan.md"
+        plan_path.write_text(_VALID_PLAN, encoding="utf-8")
+        resource = _resource_for(config_path, "codex.manager", "manager")
+        assert resource is None, "unmarked manager has no exclusive resource"
+        calls: list[str] = []
+        thread, result = _launch(
+            tmp_path, config_path, plan_path,
+            _worker_runner(plan_path, calls, complete_after=2),
+        )
+        thread.join(timeout=20)
+        assert "error" not in result, result.get("error")
+        assert calls.count("manager") >= 1
+        run = _run_json(_first_run_dir(tmp_path))
+        assert run["status"] == "completed"
+        assert run.get("execution_resource_wait") is None
+        # The unmarked manager never created a broker journal entry.
+        journal = tmp_path / "resource-store" / f"{resource}.json" if resource else None
+        if journal is not None:
+            assert not journal.exists()
+
+    def test_manager_owner_stop_while_blocked(
+        self, tmp_path: Path, resource_store: ExecutionResourceStore
+    ) -> None:
+        config_path, _ = _write_split_config(
+            home_dir=tmp_path,
+            aflow_text=_aflow_toml(
+                worker_exclusive=False,
+                manager_enabled=True,
+                manager_exclusive=True,
+            ),
+            workflows_text=_workflows_toml(
+                steps="work_only", manager_enabled=True
+            ),
+        )
+        plan_path = tmp_path / "plan.md"
+        plan_path.write_text(_VALID_PLAN, encoding="utf-8")
+        resource = _resource_for(config_path, "codex.manager", "manager")
+        assert resource is not None
+        identity, invocation_id = _occupy(resource_store, resource, role="manager")
+        calls: list[str] = []
+        thread, result = _launch(
+            tmp_path, config_path, plan_path,
+            _worker_runner(plan_path, calls, complete_after=2),
+        )
+        run_dir = _first_run_dir(tmp_path)
+        try:
+            assert _wait_until(lambda: calls == [_WORKER_BASE])
+            assert _wait_until(
+                lambda: (
+                    _run_json(run_dir).get("execution_resource_wait") is not None
+                )
+            )
+            _stop_run(run_dir)
+            thread.join(timeout=20)
+        finally:
+            _release(
+                resource_store, resource, identity, invocation_id,
+                required=False,
+            )
+        assert "error" not in result, result.get("error")
+        assert "manager" not in calls, "no manager dispatch after owner stop"
+        run = _run_json(run_dir)
+        assert run["status"] == "owner_stopped"
+        assert run.get("execution_resource_wait") is None
+
+    def test_no_resource_auxiliary_compatibility(
+        self, tmp_path: Path, resource_store: ExecutionResourceStore
+    ) -> None:
+        # No exclusive roles at all: every auxiliary call takes the legacy
+        # fast path and the run completes without touching the broker.
+        config_path, _ = _write_split_config(
+            home_dir=tmp_path,
+            aflow_text=_aflow_toml(
+                worker_exclusive=False,
+                reviewer_exclusive=False,
+                auditor_exclusive=False,
+                manager_enabled=True,
+                manager_exclusive=False,
+            ),
+            workflows_text=_workflows_toml(
+                steps="work_only", manager_enabled=True
+            ),
+        )
+        plan_path = tmp_path / "plan.md"
+        plan_path.write_text(_VALID_PLAN, encoding="utf-8")
+        calls: list[str] = []
+        thread, result = _launch(
+            tmp_path, config_path, plan_path,
+            _worker_runner(plan_path, calls, complete_after=2),
+        )
+        thread.join(timeout=20)
+        assert "error" not in result, result.get("error")
+        assert calls.count(_WORKER_BASE) == 2
+        assert calls.count("manager") >= 1
+        run = _run_json(_first_run_dir(tmp_path))
+        assert run["status"] == "completed"
+        assert run.get("execution_resource_wait") is None
+
+    # ------------------------------------------------------------------
+    # Checkpoint 5: every auxiliary model-bearing call category
+    # ------------------------------------------------------------------
+
+    def test_manager_note_correction_admits_as_independent_entrant(
+        self, tmp_path: Path, resource_store: ExecutionResourceStore
+    ) -> None:
+        # A correctable note violation triggers a second manager call that
+        # must re-enter the queue as its own participant: it acquires only
+        # after the parent decision's lease is released, with a fresh
+        # invocation id of its own.
+        config_path, _ = _write_split_config(
+            home_dir=tmp_path,
+            aflow_text=_aflow_toml(
+                worker_exclusive=False,
+                manager_enabled=True,
+                manager_exclusive=True,
+            ),
+            workflows_text=_workflows_toml(
+                steps="work_only", manager_enabled=True
+            ),
+        )
+        plan_path = tmp_path / "plan.md"
+        plan_path.write_text(_VALID_PLAN, encoding="utf-8")
+        resource = _resource_for(config_path, "codex.manager", "manager")
+        assert resource is not None
+        identity, invocation_id = _occupy(resource_store, resource, role="manager")
+        calls: list[str] = []
+        decision_count = 0
+        observer = _Observer()
+        worker_runner = _worker_runner(plan_path, calls, complete_after=2)
+
+        def runner(
+            argv: list[str], **kwargs: object
+        ) -> subprocess.CompletedProcess[str]:
+            nonlocal decision_count
+            model = argv[argv.index("--model") + 1]
+            prompt = str(kwargs.get("input", ""))
+            if model == _MANAGER_MODEL:
+                if "MANAGER_NOTE_CORRECTION_JSON" in prompt:
+                    calls.append("manager-correction")
+                    return subprocess.CompletedProcess(
+                        argv,
+                        0,
+                        json.dumps({
+                            "schema_version": 1,
+                            "action": "continue",
+                            "reason": "synthetic continue",
+                            "next_step_notes": [],
+                            "stop_report": None,
+                        }),
+                        "",
+                    )
+                decision_count += 1
+                calls.append("manager")
+                notes = (
+                    ("use plans/done/other.md for the next round",)
+                    if decision_count == 1
+                    else ()
+                )
+                return subprocess.CompletedProcess(
+                    argv,
+                    0,
+                    json.dumps({
+                        "schema_version": 1,
+                        "action": "continue",
+                        "reason": "synthetic continue",
+                        "next_step_notes": list(notes),
+                        "stop_report": None,
+                    }),
+                    "",
+                )
+            return worker_runner(argv, **kwargs)
+
+        thread, result = _launch(
+            tmp_path, config_path, plan_path, runner, observer,
+        )
+        run_dir = _first_run_dir(tmp_path)
+        try:
+            # The unmarked worker runs; the exclusive manager decision (and
+            # any correction it would trigger) dispatch zero model calls.
+            assert _wait_until(lambda: calls == [_WORKER_BASE])
+            assert _wait_until(
+                lambda: (
+                    _run_json(run_dir).get("execution_resource_wait") is not None
+                )
+            )
+            waiting = _run_json(run_dir)["execution_resource_wait"]
+            assert waiting["resource"] == resource
+            assert waiting["kind"] == "manager"
+            assert "manager" not in calls
+            assert "manager-correction" not in calls
+            _release(resource_store, resource, identity, invocation_id)
+            thread.join(timeout=30)
+        finally:
+            _release(
+                resource_store, resource, identity, invocation_id,
+                required=False,
+            )
+        assert "error" not in result, result.get("error")
+        assert not thread.is_alive()
+        assert calls.index("manager") < calls.index("manager-correction")
+        run = _run_json(run_dir)
+        assert run["status"] == "completed"
+        # The correction re-queued as an independent FIFO participant: every
+        # manager grant (decision, correction, later decisions) has a unique
+        # invocation id and is released exactly once, in order.
+        acquired = [
+            e for e in observer.resource_events()
+            if e.phase == "acquired" and e.role == "manager"
+        ]
+        released = [
+            e for e in observer.resource_events()
+            if e.phase == "released" and e.role == "manager"
+        ]
+        assert len(acquired) >= 2
+        assert len({e.invocation_id for e in acquired}) == len(acquired)
+        assert [e.invocation_id for e in acquired] == [
+            e.invocation_id for e in released
+        ]
+        # The correction sub-attempt is recorded on the parent decision.
+        decision = json.loads(
+            (run_dir / "manager" / "decision-001" / "result.json").read_text(
+                encoding="utf-8"
+            )
+        )
+        assert decision["correction_attempted"] is True
+        assert decision["correction"]["status"] == "accepted"
+
+    # ------------------------------------------------------------------
+    # Checkpoint 5 repair: auxiliary dispatch follows its admitted profile
+    # ------------------------------------------------------------------
+
+    def test_manager_decision_model_edit_reprepares_on_new_resource(
+        self, tmp_path: Path, resource_store: ExecutionResourceStore
+    ) -> None:
+        # A live edit to the manager model while the decision is queued must
+        # cancel the old resource ticket and re-queue on the new combination,
+        # dispatching the newly built invocation (new model argv).
+        new_model = "manager-high"
+        config_path, _ = _write_split_config(
+            home_dir=tmp_path,
+            aflow_text=_aflow_toml(
+                worker_exclusive=False,
+                manager_enabled=True,
+                manager_exclusive=True,
+            ),
+            workflows_text=_workflows_toml(
+                steps="work_only", manager_enabled=True
+            ),
+        )
+        plan_path = tmp_path / "plan.md"
+        plan_path.write_text(_VALID_PLAN, encoding="utf-8")
+        old_resource = _resource_for(config_path, "codex.manager", "manager")
+        new_resource = execution_resource_key("codex", new_model, None)
+        assert old_resource != new_resource
+        old_identity, old_invocation = _occupy(
+            resource_store, old_resource, role="manager"
+        )
+        new_identity, new_invocation = _occupy(
+            resource_store, new_resource, role="manager"
+        )
+        calls: list[str] = []
+        manager_models: list[str] = []
+        observer = _Observer()
+        worker_count = 0
+
+        def runner(
+            argv: list[str], **kwargs: object
+        ) -> subprocess.CompletedProcess[str]:
+            nonlocal worker_count
+            model = argv[argv.index("--model") + 1]
+            prompt = str(kwargs.get("input", ""))
+            if model in (_MANAGER_MODEL, new_model) and "schema_version" in prompt:
+                calls.append("manager")
+                manager_models.append(model)
+                return subprocess.CompletedProcess(
+                    argv, 0, json.dumps({
+                        "schema_version": 1, "action": "continue",
+                        "reason": "synthetic continue",
+                        "next_step_notes": [], "stop_report": None,
+                    }), ""
+                )
+            calls.append(model)
+            worker_count += 1
+            if worker_count >= 1:
+                plan_path.write_text(
+                    _VALID_PLAN.replace("[ ]", "[x]"), encoding="utf-8"
+                )
+            return subprocess.CompletedProcess(argv, 0, "synthetic output", "")
+
+        thread, result = _launch(
+            tmp_path, config_path, plan_path, runner, observer
+        )
+        run_dir = _first_run_dir(tmp_path)
+        try:
+            # Worker turn 1 runs and completes the plan; the exclusive manager
+            # decision blocks on the old resource with zero dispatches.
+            assert _wait_until(lambda: calls == [_WORKER_BASE])
+            assert _wait_until(
+                lambda: (
+                    _run_json(run_dir).get("execution_resource_wait") is not None
+                )
+            )
+            assert (
+                _run_json(run_dir)["execution_resource_wait"]["resource"]
+                == old_resource
+            )
+            assert "manager" not in calls
+            # Live manager-model edit: the queued decision must cancel the
+            # old ticket and re-queue on the new (also busy) resource.
+            config_path.write_text(
+                _aflow_toml(
+                    worker_exclusive=False,
+                    manager_enabled=True,
+                    manager_exclusive=True,
+                    manager_model=new_model,
+                ),
+                encoding="utf-8",
+            )
+            assert _wait_until(
+                lambda: (
+                    _run_json(run_dir).get("execution_resource_wait")
+                    and _run_json(run_dir)["execution_resource_wait"][
+                        "resource"
+                    ]
+                    == new_resource
+                )
+            )
+            assert "manager" not in calls, "no manager dispatch before admission"
+            # The manager's old ticket was cancelled: it is no longer queued
+            # behind the (still-occupying) foreign claim.
+            old_journal = json.loads(
+                (tmp_path / "resource-store" / f"{old_resource}.json").read_text()
+            )
+            assert old_journal["queue"] == []
+            assert old_journal["owner"]["invocation_id"] == "foreign-invocation"
+            _release(resource_store, new_resource, new_identity, new_invocation)
+            thread.join(timeout=30)
+        finally:
+            _release(
+                resource_store, old_resource, old_identity, old_invocation,
+                required=False,
+            )
+            _release(
+                resource_store, new_resource, new_identity, new_invocation,
+                required=False,
+            )
+        assert "error" not in result, result.get("error")
+        assert not thread.is_alive()
+        assert "manager" in calls
+        # The dispatched manager invocation used the new profile's model.
+        assert manager_models == [new_model]
+        run = _run_json(run_dir)
+        assert run["status"] == "completed"
+        phases = [event.phase for event in observer.resource_events()]
+        assert "cancelled" in phases
+        assert "acquired" in phases
+
+    def test_manager_note_correction_model_edit_reprepares_on_new_resource(
+        self, tmp_path: Path, resource_store: ExecutionResourceStore
+    ) -> None:
+        # A live manager-model edit while the note correction is queued must
+        # cancel the old resource ticket and re-queue on the new combination,
+        # dispatching the newly built correction invocation (new model argv).
+        new_model = "manager-high"
+        config_path, _ = _write_split_config(
+            home_dir=tmp_path,
+            aflow_text=_aflow_toml(
+                worker_exclusive=False,
+                manager_enabled=True,
+                manager_exclusive=True,
+            ),
+            workflows_text=_workflows_toml(
+                steps="work_only", manager_enabled=True
+            ),
+        )
+        plan_path = tmp_path / "plan.md"
+        plan_path.write_text(_VALID_PLAN, encoding="utf-8")
+        old_resource = _resource_for(config_path, "codex.manager", "manager")
+        new_resource = execution_resource_key("codex", new_model, None)
+        assert old_resource != new_resource
+        # Pre-occupy the new resource so the re-queued correction stays
+        # blocked there after the live edit.
+        new_identity, new_invocation = _occupy(
+            resource_store, new_resource, role="manager"
+        )
+        calls: list[str] = []
+        correction_models: list[str] = []
+        observer = _Observer()
+        worker_count = 0
+        decision_count = 0
+        foreign: dict = {}
+
+        def runner(
+            argv: list[str], **kwargs: object
+        ) -> subprocess.CompletedProcess[str]:
+            nonlocal worker_count, decision_count
+            model = argv[argv.index("--model") + 1]
+            prompt = str(kwargs.get("input", ""))
+            if model in (_MANAGER_MODEL, new_model):
+                if "MANAGER_NOTE_CORRECTION_JSON" in prompt:
+                    calls.append("manager-correction")
+                    correction_models.append(model)
+                    return subprocess.CompletedProcess(
+                        argv, 0, json.dumps({
+                            "schema_version": 1, "action": "continue",
+                            "reason": "synthetic continue",
+                            "next_step_notes": [], "stop_report": None,
+                        }), ""
+                    )
+                decision_count += 1
+                calls.append("manager")
+                if decision_count == 1:
+                    # Enqueue a foreign claim on the manager resource *while
+                    # the decision holds its lease*: it takes the resource the
+                    # instant the decision releases, deterministically
+                    # blocking the follow-on note correction.
+                    real = resource_store.current_controller_identity()
+                    assert real is not None
+                    fid = ControllerIdentity(
+                        pid=888888, birth="foreign-birth", boot=real.boot
+                    )
+                    finv = "foreign-correction-block"
+                    spec = ClaimSpec(
+                        project_root="/foreign", run_id="foreign-run",
+                        invocation_id=finv, kind="manager",
+                        role="manager", selector="codex.manager",
+                    )
+                    outcome = resource_store.enqueue(old_resource, spec, fid)
+                    assert outcome.state in ("queued", "acquired"), outcome
+                    foreign["identity"] = fid
+                    foreign["invocation"] = finv
+
+                    def _hold() -> None:
+                        deadline = time.monotonic() + 30
+                        while time.monotonic() < deadline:
+                            out = resource_store.try_acquire(
+                                old_resource, finv, fid
+                            )
+                            if out.state in ("acquired", "rejected"):
+                                return
+                            time.sleep(0.01)
+
+                    threading.Thread(target=_hold, daemon=True).start()
+                notes = (
+                    ("use plans/done/other.md for the next round",)
+                    if decision_count == 1
+                    else ()
+                )
+                return subprocess.CompletedProcess(
+                    argv, 0, json.dumps({
+                        "schema_version": 1, "action": "continue",
+                        "reason": "synthetic continue",
+                        "next_step_notes": list(notes),
+                        "stop_report": None,
+                    }), ""
+                )
+            calls.append(model)
+            worker_count += 1
+            if worker_count >= 2:
+                plan_path.write_text(
+                    _VALID_PLAN.replace("[ ]", "[x]"), encoding="utf-8"
+                )
+            return subprocess.CompletedProcess(argv, 0, "synthetic output", "")
+
+        thread, result = _launch(
+            tmp_path, config_path, plan_path, runner, observer
+        )
+        run_dir = _first_run_dir(tmp_path)
+        try:
+            # Worker turn 1 runs; the manager decision acquires the (free)
+            # old resource, dispatches a correctable note violation, and the
+            # follow-on correction is blocked behind the foreign claim.
+            assert _wait_until(lambda: calls == [_WORKER_BASE, "manager"])
+            assert _wait_until(
+                lambda: (
+                    _run_json(run_dir).get("execution_resource_wait") is not None
+                )
+            )
+            assert (
+                _run_json(run_dir)["execution_resource_wait"]["resource"]
+                == old_resource
+            )
+            assert "manager-correction" not in calls
+            # Live manager-model edit while the correction is queued.
+            config_path.write_text(
+                _aflow_toml(
+                    worker_exclusive=False,
+                    manager_enabled=True,
+                    manager_exclusive=True,
+                    manager_model=new_model,
+                ),
+                encoding="utf-8",
+            )
+            assert _wait_until(
+                lambda: (
+                    _run_json(run_dir).get("execution_resource_wait")
+                    and _run_json(run_dir)["execution_resource_wait"][
+                        "resource"
+                    ]
+                    == new_resource
+                )
+            )
+            assert "manager-correction" not in calls, (
+                "no correction dispatch before admission"
+            )
+            _release(resource_store, new_resource, new_identity, new_invocation)
+            thread.join(timeout=30)
+        finally:
+            _release(
+                resource_store, new_resource, new_identity, new_invocation,
+                required=False,
+            )
+            if foreign.get("identity") is not None:
+                _release(
+                    resource_store, old_resource,
+                    foreign["identity"], foreign["invocation"],
+                    required=False,
+                )
+        assert "error" not in result, result.get("error")
+        assert not thread.is_alive()
+        assert "manager-correction" in calls
+        # The dispatched correction used the new profile's model.
+        assert correction_models == [new_model]
+        run = _run_json(run_dir)
+        assert run["status"] == "completed"
+        phases = [event.phase for event in observer.resource_events()]
+        assert "cancelled" in phases
+
+    def test_manager_prompt_only_edit_retains_queue_position(
+        self, tmp_path: Path, resource_store: ExecutionResourceStore
+    ) -> None:
+        # A prompt-only (unrelated) config edit that does not change the
+        # manager route must retain the queued decision's ticket.
+        config_path, _ = _write_split_config(
+            home_dir=tmp_path,
+            aflow_text=_aflow_toml(
+                worker_exclusive=False,
+                manager_enabled=True,
+                manager_exclusive=True,
+                prompt="first prompt {ACTIVE_PLAN_PATH}",
+            ),
+            workflows_text=_workflows_toml(
+                steps="work_only", manager_enabled=True
+            ),
+        )
+        plan_path = tmp_path / "plan.md"
+        plan_path.write_text(_VALID_PLAN, encoding="utf-8")
+        resource = _resource_for(config_path, "codex.manager", "manager")
+        identity, invocation_id = _occupy(resource_store, resource, role="manager")
+        calls: list[str] = []
+        thread, result = _launch(
+            tmp_path, config_path, plan_path,
+            _worker_runner(plan_path, calls, complete_after=2),
+        )
+        run_dir = _first_run_dir(tmp_path)
+        try:
+            assert _wait_until(lambda: calls == [_WORKER_BASE])
+            assert _wait_until(
+                lambda: (
+                    _run_json(run_dir).get("execution_resource_wait") is not None
+                )
+            )
+            first_ticket = _run_json(run_dir)["execution_resource_wait"]["ticket"]
+            # A prompt-only edit does not change the manager route: the queued
+            # decision retains its ticket and dispatches nothing.
+            config_path.write_text(
+                _aflow_toml(
+                    worker_exclusive=False,
+                    manager_enabled=True,
+                    manager_exclusive=True,
+                    prompt="second prompt {ACTIVE_PLAN_PATH}",
+                ),
+                encoding="utf-8",
+            )
+            time.sleep(0.4)
+            waiting = _run_json(run_dir)["execution_resource_wait"]
+            assert waiting is not None
+            assert waiting["ticket"] == first_ticket
+            assert "manager" not in calls
+            _release(resource_store, resource, identity, invocation_id)
+            thread.join(timeout=30)
+        finally:
+            _release(
+                resource_store, resource, identity, invocation_id,
+                required=False,
+            )
+        assert "error" not in result, result.get("error")
+        assert "manager" in calls
+
+    def _repartition_aflow_toml(self, full_model: str) -> str:
+        return f"""
+[aflow]
+default_workflow = "live"
+max_turns = 6
+
+[harness.codex.profiles.default]
+model = "worker-m"
+[harness.codex.profiles.reviewer]
+model = "reviewer-m"
+[harness.codex.profiles.manager-lite]
+model = "lite-m"
+[harness.codex.profiles.manager-full]
+model = "{full_model}"
+exclusive = true
+
+[roles]
+worker = "codex.default"
+reviewer = "codex.reviewer"
+manager_lite = "codex.manager-lite"
+manager_full = "codex.manager-full"
+
+[teams.base]
+worker = "codex.default"
+reviewer = "codex.reviewer"
+
+[prompts]
+p = "Work from {{ACTIVE_PLAN_PATH}}."
+
+[manager]
+lite_role = "manager_lite"
+full_role = "manager_full"
+"""
+
+    def _repartition_workflows_toml(self) -> str:
+        return """
+[workflow.live]
+team = "base"
+manager_enabled = true
+
+[workflow.live.steps.implement]
+role = "worker"
+prompts = ["p"]
+go = [{ to = "END", when = "DONE" }, { to = "review" }]
+
+[workflow.live.steps.review]
+role = "reviewer"
+prompts = ["p"]
+go = [{ to = "END", when = "DONE" }, { to = "implement" }]
+"""
+
+    def test_repartition_full_profile_edit_agrees_argv_and_resource(
+        self, tmp_path: Path, resource_store: ExecutionResourceStore
+    ) -> None:
+        # A live Full-profile edit while a repartition subcall is queued must
+        # reprepare it on the new combination; every resulting Full
+        # invocation's argv, preflight adapter, and admitted resource agree,
+        # and decision/proposal/validation remain distinct entrants.
+        old_model = "full-m"
+        new_model = "full-high"
+        config_path, _ = _write_split_config(
+            home_dir=tmp_path,
+            aflow_text=self._repartition_aflow_toml(old_model),
+            workflows_text=self._repartition_workflows_toml(),
+        )
+        plan_path = tmp_path / "plan.md"
+        _write_plan(plan_path, _VALID_PLAN)
+        old_resource = execution_resource_key("codex", old_model, None)
+        new_resource = execution_resource_key("codex", new_model, None)
+        assert old_resource != new_resource
+        old_identity, old_invocation = _occupy(
+            resource_store, old_resource, role="manager"
+        )
+        new_identity, new_invocation = _occupy(
+            resource_store, new_resource, role="manager"
+        )
+        calls: list[str] = []
+        full_models: list[str] = []
+        observer = _Observer()
+
+        def runner(argv: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+            prompt = str(kwargs.get("input", ""))
+            model = argv[argv.index("--model") + 1]
+            if model == "worker-m":
+                calls.append("worker")
+                if calls.count("worker") == 1:
+                    return subprocess.CompletedProcess(
+                        argv, 0, "AFLOW_SCOPE_PRESSURE: split this checkpoint", ""
+                    )
+                text = plan_path.read_text(encoding="utf-8")
+                text = text.replace(
+                    "### [ ] Checkpoint 1: First / Partition 2/2: Part 2",
+                    "### [x] Checkpoint 1: First / Partition 2/2: Part 2",
+                    1,
+                ).replace("- [ ] Implement part 2.", "- [x] Implement part 2.", 1)
+                plan_path.write_text(text, encoding="utf-8")
+                return subprocess.CompletedProcess(
+                    argv, 0, "second child complete", ""
+                )
+            if model == "reviewer-m":
+                calls.append("reviewer")
+                text = plan_path.read_text(encoding="utf-8")
+                text = text.replace(
+                    "### [ ] Checkpoint 1: First / Partition 1/2: Part 1",
+                    "### [x] Checkpoint 1: First / Partition 1/2: Part 1",
+                    1,
+                ).replace("- [ ] Implement part 1.", "- [x] Implement part 1.", 1)
+                plan_path.write_text(text, encoding="utf-8")
+                return subprocess.CompletedProcess(
+                    argv, 0, "first child approved", ""
+                )
+            if model == "lite-m":
+                return subprocess.CompletedProcess(
+                    argv, 0, json.dumps({
+                        "schema_version": 1, "action": "continue",
+                        "reason": "synthetic continue",
+                        "next_step_notes": [], "stop_report": None,
+                    }), ""
+                )
+            if model in (old_model, new_model):
+                full_models.append(model)
+                if "REPARTITION_PROPOSE_CONTEXT_JSON:\n" in prompt:
+                    calls.append("propose")
+                    payload = json.loads(
+                        prompt.split("REPARTITION_PROPOSE_CONTEXT_JSON:\n", 1)[1]
+                    )
+                    envelope = payload["envelope"]
+                    source_ids = [b["block_id"] for b in envelope["source_blocks"]]
+                    repair_ids = [
+                        b["block_id"] for b in payload["repair_evidence_blocks"]
+                    ]
+                    children = []
+                    for ordinal in (1, 2):
+                        children.append({
+                            "title": f"Part {ordinal}",
+                            "narrow_goal": f"Implement part {ordinal}.",
+                            "source_block_ids": source_ids,
+                            "repair_evidence_ids": repair_ids,
+                            "implementation_steps": [f"Implement part {ordinal}."],
+                            "verification_commands": ["uv run pytest -q"],
+                            "done_criteria": [f"Part {ordinal} is observable."],
+                        })
+                    proposal = {
+                        "schema_version": 1,
+                        "envelope_sha256": envelope["canonical_envelope_sha256"],
+                        "source_plan_sha256": payload["source_plan_sha256"],
+                        "rationale": "Two independently reviewable slices.",
+                        "children": children,
+                        "current_disposition": "review_current_partition",
+                        "cross_cutting_source_reasons": {
+                            block_id: "The obligation constrains both slices."
+                            for block_id in source_ids
+                        },
+                    }
+                    return subprocess.CompletedProcess(argv, 0, json.dumps(proposal), "")
+                if "REPARTITION_VALIDATE_CONTEXT_JSON:\n" in prompt:
+                    calls.append("validate")
+                    payload = json.loads(
+                        prompt.split("REPARTITION_VALIDATE_CONTEXT_JSON:\n", 1)[1]
+                    )
+                    return subprocess.CompletedProcess(
+                        argv, 0, json.dumps({
+                            "schema_version": 1,
+                            "proposal_sha256": payload["proposal_sha256"],
+                            "candidate_sha256": payload["candidate_plan_sha256"],
+                            "verdict": "accept",
+                            "reason": "The split preserves all exact obligations.",
+                            "findings": [],
+                        }), ""
+                    )
+                calls.append("decision")
+                action = (
+                    "repartition_current_checkpoint"
+                    if calls.count("decision") == 1
+                    else "continue"
+                )
+                return subprocess.CompletedProcess(
+                    argv, 0, json.dumps({
+                        "schema_version": 1, "action": action,
+                        "reason": "The scope has two independently reviewable slices.",
+                        "next_step_notes": [], "stop_report": None,
+                    }), ""
+                )
+            raise AssertionError(f"unexpected model {model}")
+
+        thread, result = _launch(
+            tmp_path, config_path, plan_path, runner, observer, max_turns=6,
+        )
+        run_dir = _first_run_dir(tmp_path)
+        try:
+            # Worker turn 1 emits scope pressure; the exclusive Full decision
+            # blocks on the old resource with zero dispatches.
+            assert _wait_until(lambda: calls == ["worker"])
+            assert "decision" not in calls
+            assert "propose" not in calls
+            assert "validate" not in calls
+            assert _wait_until(
+                lambda: (
+                    _run_json(run_dir).get("execution_resource_wait") is not None
+                )
+            )
+            assert (
+                _run_json(run_dir)["execution_resource_wait"]["resource"]
+                == old_resource
+            )
+            # Live Full-profile model edit: the queued decision must cancel
+            # the old ticket and re-queue on the new (also busy) resource.
+            config_path.write_text(
+                self._repartition_aflow_toml(new_model), encoding="utf-8"
+            )
+            assert _wait_until(
+                lambda: (
+                    _run_json(run_dir).get("execution_resource_wait")
+                    and _run_json(run_dir)["execution_resource_wait"][
+                        "resource"
+                    ]
+                    == new_resource
+                )
+            )
+            assert "decision" not in calls
+            assert "propose" not in calls
+            assert "validate" not in calls
+            _release(resource_store, new_resource, new_identity, new_invocation)
+            thread.join(timeout=30)
+        finally:
+            _release(
+                resource_store, old_resource, old_identity, old_invocation,
+                required=False,
+            )
+            _release(
+                resource_store, new_resource, new_identity, new_invocation,
+                required=False,
+            )
+        assert "error" not in result, result.get("error")
+        assert "decision" in calls and "propose" in calls and "validate" in calls
+        # Every Full invocation launched with the new profile's model: the
+        # dispatched argv, the (codex) preflight adapter, and the admitted
+        # resource all agree on the new combination.
+        assert full_models == [new_model, new_model, new_model]
+        full_events = [
+            e for e in observer.resource_events()
+            if e.phase in ("acquired", "released") and e.label.endswith(new_model)
+        ]
+        acquired = [e for e in full_events if e.phase == "acquired"]
+        released = [e for e in full_events if e.phase == "released"]
+        # Decision, proposal, and validation are distinct FIFO entrants.
+        assert len(acquired) == 3
+        assert len(released) == 3
+        assert len({e.invocation_id for e in acquired}) == 3
+        assert [e.invocation_id for e in acquired] == [
+            e.invocation_id for e in released
+        ]
+        phases = [event.phase for event in observer.resource_events()]
+        assert "cancelled" in phases
+
+    def test_same_resource_worker_then_manager_requeue_independently(
+        self, tmp_path: Path, resource_store: ExecutionResourceStore
+    ) -> None:
+        # The manager shares the worker's exact (harness, model, effort)
+        # tuple: both are exclusive on one resource, and each round must
+        # requeue as its own FIFO participant instead of nesting.
+        config_path, _ = _write_split_config(
+            home_dir=tmp_path,
+            aflow_text=_aflow_toml(
+                worker_exclusive=True,
+                manager_enabled=True,
+                manager_exclusive=True,
+                manager_model=_WORKER_BASE,
+            ),
+            workflows_text=_workflows_toml(
+                steps="work_only", manager_enabled=True
+            ),
+        )
+        plan_path = tmp_path / "plan.md"
+        plan_path.write_text(_VALID_PLAN, encoding="utf-8")
+        worker_resource = _resource_for(config_path, "codex.base")
+        manager_resource = _resource_for(config_path, "codex.manager", "manager")
+        assert worker_resource == manager_resource is not None
+        identity, invocation_id = _occupy(resource_store, worker_resource)
+        calls: list[str] = []
+        observer = _Observer()
+        worker_count = 0
+
+        def runner(
+            argv: list[str], **kwargs: object
+        ) -> subprocess.CompletedProcess[str]:
+            nonlocal worker_count
+            model = argv[argv.index("--model") + 1]
+            prompt = str(kwargs.get("input", ""))
+            # The manager shares the worker's model, so the call kind is
+            # detected from the prompt, not the model tuple.
+            if "schema_version" in prompt:
+                calls.append("manager")
+                return subprocess.CompletedProcess(
+                    argv,
+                    0,
+                    json.dumps({
+                        "schema_version": 1,
+                        "action": "continue",
+                        "reason": "synthetic continue",
+                        "next_step_notes": [],
+                        "stop_report": None,
+                    }),
+                    "",
+                )
+            calls.append(model)
+            worker_count += 1
+            if worker_count >= 2:
+                plan_path.write_text(
+                    _VALID_PLAN.replace("[ ]", "[x]"), encoding="utf-8"
+                )
+            return subprocess.CompletedProcess(argv, 0, "synthetic output", "")
+
+        thread, result = _launch(
+            tmp_path, config_path, plan_path, runner, observer,
+        )
+        run_dir = _first_run_dir(tmp_path)
+        try:
+            # The worker turn is blocked behind the foreign owner; no model
+            # call of any kind may happen while the shared resource is held.
+            assert _wait_until(
+                lambda: (
+                    _run_json(run_dir).get("execution_resource_wait") is not None
+                )
+            )
+            waiting = _run_json(run_dir)["execution_resource_wait"]
+            assert waiting["resource"] == worker_resource
+            assert waiting["kind"] == "turn"
+            assert calls == []
+            _release(resource_store, worker_resource, identity, invocation_id)
+            thread.join(timeout=30)
+        finally:
+            _release(
+                resource_store, worker_resource, identity, invocation_id,
+                required=False,
+            )
+        assert "error" not in result, result.get("error")
+        assert not thread.is_alive()
+        assert calls.count(_WORKER_BASE) == 2
+        assert calls.count("manager") >= 1
+        run = _run_json(run_dir)
+        assert run["status"] == "completed"
+        # Worker turn 1, the manager decision, and worker turn 2 each took
+        # the shared resource as independent participants: unique invocation
+        # ids, every grant released exactly once, in acquisition order.
+        acquired = [
+            e for e in observer.resource_events() if e.phase == "acquired"
+        ]
+        released = [
+            e for e in observer.resource_events() if e.phase == "released"
+        ]
+        assert len(acquired) >= 3
+        roles = [e.role for e in acquired]
+        assert "worker" in roles and "manager" in roles
+        assert len({e.invocation_id for e in acquired}) == len(acquired)
+        assert [e.invocation_id for e in acquired] == [
+            e.invocation_id for e in released
+        ]
+
+    def _branch_only_config(self, lead_exclusive: bool = True) -> WorkflowUserConfig:
+        return WorkflowUserConfig(
+            aflow=AflowSection(team_lead="senior_architect"),
+            roles={"architect": "codex.default", "senior_architect": "codex.lead"},
+            harnesses={"codex": WorkflowHarnessConfig(profiles={
+                "default": HarnessProfileConfig(model="worker-m"),
+                "lead": HarnessProfileConfig(
+                    model="lead-m", exclusive=lead_exclusive
+                ),
+            })},
+            workflows={"branch_wf": WorkflowConfig(
+                steps={"impl": WorkflowStepConfig(
+                    role="architect",
+                    prompts=("p",),
+                    go=(
+                        GoTransition(to="END", when="DONE || MAX_TURNS_REACHED"),
+                        GoTransition(to="impl"),
+                    ),
+                )},
+                first_step="impl",
+                setup=("branch",),
+                teardown=("merge",),
+                main_branch="main",
+            )},
+            prompts={"p": "Work from {ACTIVE_PLAN_PATH}."},
+        )
+
+    def _bootstrap_runner(self, tmp_path: Path, plan_path: Path, calls: list[str]):
+        def runner(argv: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+            model = argv[argv.index("--model") + 1]
+            cwd = Path(kwargs["cwd"])
+            calls.append(model)
+            if model == "lead-m":
+                if not (cwd / ".git").exists():
+                    # Lifecycle bootstrap: initialize the repository.
+                    subprocess.run(
+                        ["git", "init", "-b", "main"],
+                        cwd=str(cwd), check=True, capture_output=True,
+                    )
+                    subprocess.run(
+                        ["git", "config", "user.email", "test@test.com"],
+                        cwd=str(cwd), check=True, capture_output=True,
+                    )
+                    subprocess.run(
+                        ["git", "config", "user.name", "Test"],
+                        cwd=str(cwd), check=True, capture_output=True,
+                    )
+                    (cwd / "README.md").write_text(
+                        "# Plan\n\nBootstrapped.\n", encoding="utf-8"
+                    )
+                    subprocess.run(
+                        ["git", "add", "README.md"],
+                        cwd=str(cwd), check=True, capture_output=True,
+                    )
+                    subprocess.run(
+                        ["git", "commit", "-m", "Initial commit"],
+                        cwd=str(cwd), check=True, capture_output=True,
+                    )
+                else:
+                    # Merge teardown (only when fast-forward is impossible).
+                    _git_merge_feature_into_main(cwd, "main")
+                return subprocess.CompletedProcess(argv, 0, "ok", "")
+            # Worker turn: complete the plan.
+            _write_plan(plan_path, _VALID_PLAN.replace("[ ]", "[x]"))
+            _git_commit_file(cwd, plan_path)
+            return subprocess.CompletedProcess(argv, 0, "synthetic output", "")
+
+        return runner
+
+    def test_bootstrap_admits_on_team_lead_resource(
+        self, tmp_path: Path, resource_store: ExecutionResourceStore
+    ) -> None:
+        # Lifecycle bootstrap is a model-bearing team-lead call: an
+        # exclusive team lead must be admitted on its own resource before
+        # any repository side effect, dispatching zero calls while blocked.
+        # The repo lives in a subdirectory so the resource-store journal
+        # (a sibling) never dirties the primary checkout.
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        wf_config = self._branch_only_config()
+        plan_path = repo / "plan.md"
+        _write_plan(plan_path, _VALID_PLAN)
+        resource = execution_resource_key("codex", "lead-m", None)
+        identity, invocation_id = _occupy(resource_store, resource, role="team_lead")
+        calls: list[str] = []
+        observer = _Observer()
+        thread, result = _launch_config(
+            tmp_path, wf_config, plan_path,
+            self._bootstrap_runner(repo, plan_path, calls), observer,
+            workflow_name="branch_wf",
+            repo_root=repo,
+        )
+        try:
+            # Bootstrap is the very first model-bearing work: while the
+            # exclusive team-lead resource is held there must be zero
+            # dispatches and no repository side effects.
+            assert _wait_until(
+                lambda: any(
+                    e.phase == "waiting" and e.role == "team_lead"
+                    for e in observer.resource_events()
+                )
+            )
+            assert calls == []
+            assert not (repo / ".git").exists()
+            _release(resource_store, resource, identity, invocation_id)
+            thread.join(timeout=30)
+        finally:
+            _release(
+                resource_store, resource, identity, invocation_id,
+                required=False,
+            )
+        assert "error" not in result, result.get("error")
+        assert "lead-m" in calls, "bootstrap dispatched after release"
+        assert (repo / ".git").exists()
+        run = _run_json(_first_run_dir(repo))
+        assert run["status"] == "completed"
+        bootstrap_events = [
+            e for e in observer.resource_events() if e.role == "team_lead"
+        ]
+        phases = [e.phase for e in bootstrap_events]
+        assert "acquired" in phases
+        assert "released" in phases
+        assert phases.count("acquired") == phases.count("released")
+
+    def test_merge_admits_on_team_lead_resource(
+        self, tmp_path: Path, resource_store: ExecutionResourceStore
+    ) -> None:
+        # The model-based merge handoff is admitted on the exclusive team
+        # lead resource: the unmarked worker turn proceeds, while the merge
+        # dispatches zero model calls until the resource frees.
+        # The repo lives in a subdirectory so the resource-store journal
+        # (a sibling) never dirties the primary checkout.
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        _make_lifecycle_git_repo(repo, branch="main")
+        wf_config = self._branch_only_config()
+        plan_path = repo / "plan.md"
+        _write_plan(plan_path, _VALID_PLAN)
+        _git_commit_file(repo, plan_path)
+        resource = execution_resource_key("codex", "lead-m", None)
+        identity, invocation_id = _occupy(resource_store, resource, role="team_lead")
+        calls: list[str] = []
+        observer = _Observer()
+
+        def runner(argv: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+            model = argv[argv.index("--model") + 1]
+            cwd = Path(kwargs["cwd"])
+            calls.append(model)
+            if model == "worker-m":
+                _write_plan(plan_path, _VALID_PLAN.replace("[ ]", "[x]"))
+                _git_commit_file(cwd, plan_path)
+                # Diverge main so the teardown merge cannot fast-forward.
+                rc, branch, err = _run_git_in_test(
+                    ["branch", "--show-current"], cwd=cwd
+                )
+                assert rc == 0, err
+                subprocess.run(
+                    ["git", "checkout", "main"],
+                    cwd=str(cwd), check=True, capture_output=True,
+                )
+                (cwd / "main-only.txt").write_text("main change\n", encoding="utf-8")
+                _git_commit_file(cwd, cwd / "main-only.txt")
+                subprocess.run(
+                    ["git", "checkout", branch],
+                    cwd=str(cwd), check=True, capture_output=True,
+                )
+                return subprocess.CompletedProcess(argv, 0, "synthetic output", "")
+            # Model-based merge handoff: a true (non-ff) merge.
+            rc, out, err = _run_git_in_test(
+                ["branch", "--list", "aflow-*"], cwd=cwd
+            )
+            assert rc == 0 and out.strip(), f"no aflow feature branch: {err}"
+            feature = out.strip().lstrip("+* ").strip()
+            subprocess.run(
+                ["git", "checkout", "main"],
+                cwd=str(cwd), check=True, capture_output=True,
+            )
+            subprocess.run(
+                ["git", "merge", "--no-ff", "-m", "Merge feature", feature],
+                cwd=str(cwd), check=True, capture_output=True,
+            )
+            return subprocess.CompletedProcess(argv, 0, "merged", "")
+
+        thread, result = _launch_config(
+            tmp_path, wf_config, plan_path, runner, observer,
+            workflow_name="branch_wf",
+            repo_root=repo,
+        )
+        run_dir = _first_run_dir(repo)
+        try:
+            # The worker turn runs on its unmarked profile; the exclusive
+            # merge handoff blocks with zero model dispatches.
+            assert _wait_until(lambda: calls == ["worker-m"])
+            assert _wait_until(
+                lambda: (
+                    _run_json(run_dir).get("execution_resource_wait") is not None
+                )
+            )
+            waiting = _run_json(run_dir)["execution_resource_wait"]
+            assert waiting["resource"] == resource
+            assert waiting["kind"] == "merge"
+            assert "lead-m" not in calls, "no merge dispatch while blocked"
+            _release(resource_store, resource, identity, invocation_id)
+            thread.join(timeout=30)
+        finally:
+            _release(
+                resource_store, resource, identity, invocation_id,
+                required=False,
+            )
+        assert "error" not in result, result.get("error")
+        assert "lead-m" in calls, "merge dispatched after release"
+        run = _run_json(run_dir)
+        assert run["status"] == "completed"
+        merge_events = [
+            e for e in observer.resource_events() if e.role == "team_lead"
+        ]
+        phases = [e.phase for e in merge_events]
+        assert "acquired" in phases
+        assert "released" in phases
+        assert phases.count("acquired") == phases.count("released")
+
+    def test_team_lead_recovery_admits_on_its_resource(
+        self, tmp_path: Path, resource_store: ExecutionResourceStore
+    ) -> None:
+        # Team-lead harness recovery is a model-bearing call: an exclusive
+        # team lead is admitted on its own resource, dispatching zero calls
+        # while blocked, before the retry decision is recorded.
+        wf_config = WorkflowUserConfig(
+            aflow=AflowSection(team_lead="senior_architect"),
+            roles={"architect": "codex.primary", "senior_architect": "codex.lead"},
+            teams={
+                "primary": TeamConfig(roles={
+                    "architect": "codex.primary",
+                    "senior_architect": "codex.lead",
+                }),
+            },
+            harnesses={"codex": WorkflowHarnessConfig(profiles={
+                "primary": HarnessProfileConfig(model="worker-m"),
+                "lead": HarnessProfileConfig(model="lead-m", exclusive=True),
+            })},
+            workflows={"simple": WorkflowConfig(
+                steps={"implement_plan": WorkflowStepConfig(
+                    role="architect",
+                    prompts=("p",),
+                    go=(
+                        GoTransition(to="END", when="DONE"),
+                        GoTransition(to="implement_plan"),
+                    ),
+                )},
+                first_step="implement_plan",
+                team="primary",
+            )},
+            prompts={"p": "Work."},
+            error_handling=ErrorHandlingConfig(
+                harness_error_recovery=HarnessErrorRecoveryConfig(rules=()),
+            ),
+        )
+        plan_path = tmp_path / "plan.md"
+        _write_plan(plan_path, _VALID_PLAN)
+        resource = execution_resource_key("codex", "lead-m", None)
+        identity, invocation_id = _occupy(resource_store, resource, role="team_lead")
+        calls: list[str] = []
+        observer = _Observer()
+        count = 0
+
+        def runner(argv: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+            nonlocal count
+            count += 1
+            model = argv[argv.index("--model") + 1]
+            calls.append(model)
+            if model == "lead-m":
+                return subprocess.CompletedProcess(
+                    argv,
+                    0,
+                    json.dumps({
+                        "action": "retry_same_team_after_delay",
+                        "delay_seconds": None,
+                        "reason": "retry the same team once",
+                        "suggested_keywords": ["mystery failure"],
+                        "suggested_action": None,
+                    }) + "\n",
+                    "",
+                )
+            if count == 1:
+                return subprocess.CompletedProcess(
+                    argv, 1, "", "mystery failure\n"
+                )
+            _write_plan(plan_path, _VALID_PLAN.replace("[ ]", "[x]"))
+            return subprocess.CompletedProcess(argv, 0, "ok", "")
+
+        thread, result = _launch_config(
+            tmp_path, wf_config, plan_path, runner, observer,
+            workflow_name="simple", max_turns=4,
+        )
+        run_dir = _first_run_dir(tmp_path)
+        try:
+            # The failed worker turn must not dispatch the exclusive team
+            # lead recovery while the resource is held.
+            assert _wait_until(lambda: calls == ["worker-m"])
+            assert _wait_until(
+                lambda: (
+                    _run_json(run_dir).get("execution_resource_wait") is not None
+                )
+            )
+            waiting = _run_json(run_dir)["execution_resource_wait"]
+            assert waiting["resource"] == resource
+            assert waiting["kind"] == "team_lead_recovery"
+            assert "lead-m" not in calls, "no recovery dispatch while blocked"
+            _release(resource_store, resource, identity, invocation_id)
+            thread.join(timeout=30)
+        finally:
+            _release(
+                resource_store, resource, identity, invocation_id,
+                required=False,
+            )
+        assert "error" not in result, result.get("error")
+        assert "lead-m" in calls, "recovery dispatched after release"
+        run = _run_json(run_dir)
+        assert run["status"] == "completed"
+        assert run["recovery_summary"]["source"] == "team_lead"
+        assert run["recovery_summary"]["executed"] is True
+        recovery_events = [
+            e for e in observer.resource_events() if e.role == "team_lead"
+        ]
+        phases = [e.phase for e in recovery_events]
+        assert "acquired" in phases
+        assert "released" in phases
+        assert phases.count("acquired") == phases.count("released")
+
+    def test_repartition_subcalls_admit_as_independent_entries(
+        self, tmp_path: Path, resource_store: ExecutionResourceStore
+    ) -> None:
+        # Repartitioning is a multi-call cycle (Full decision, proposal,
+        # validation) on the exclusive Full manager resource: each subcall
+        # is its own FIFO entry with a fresh invocation id, and nothing
+        # dispatches while the resource is held.
+        workflow = WorkflowConfig(
+            manager_enabled=True,
+            steps={
+                "implement": WorkflowStepConfig(
+                    role="worker",
+                    prompts=("p",),
+                    go=(
+                        GoTransition(to="END", when="DONE"),
+                        GoTransition(to="review"),
+                    ),
+                ),
+                "review": WorkflowStepConfig(
+                    role="reviewer",
+                    prompts=("p",),
+                    go=(
+                        GoTransition(to="END", when="DONE"),
+                        GoTransition(to="implement"),
+                    ),
+                ),
+            },
+            first_step="implement",
+            team="base",
+        )
+        wf_config = WorkflowUserConfig(
+            roles={
+                "worker": "codex.default",
+                "reviewer": "codex.reviewer",
+                "manager_lite": "codex.manager-lite",
+                "manager_full": "codex.manager-full",
+            },
+            teams={
+                "base": TeamConfig(roles={
+                    "worker": "codex.default",
+                    "reviewer": "codex.reviewer",
+                }),
+            },
+            harnesses={"codex": WorkflowHarnessConfig(profiles={
+                "default": HarnessProfileConfig(model="worker-m"),
+                "reviewer": HarnessProfileConfig(model="reviewer-m"),
+                "manager-lite": HarnessProfileConfig(model="lite-m"),
+                "manager-full": HarnessProfileConfig(
+                    model="full-m", exclusive=True
+                ),
+            })},
+            workflows={"managed": workflow},
+            prompts={"p": "Work from {ACTIVE_PLAN_PATH}."},
+            manager=ManagerConfig(
+                lite_role="manager_lite", full_role="manager_full",
+            ),
+        )
+        plan_path = tmp_path / "plan.md"
+        _write_plan(plan_path, _VALID_PLAN)
+        resource = execution_resource_key("codex", "full-m", None)
+        identity, invocation_id = _occupy(resource_store, resource, role="manager")
+        calls: list[str] = []
+        observer = _Observer()
+
+        def runner(argv: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+            prompt = str(kwargs.get("input", ""))
+            model = argv[argv.index("--model") + 1]
+            if model == "worker-m":
+                calls.append("worker")
+                if calls.count("worker") == 1:
+                    return subprocess.CompletedProcess(
+                        argv, 0, "AFLOW_SCOPE_PRESSURE: split this checkpoint", ""
+                    )
+                text = plan_path.read_text(encoding="utf-8")
+                text = text.replace(
+                    "### [ ] Checkpoint 1: First / Partition 2/2: Part 2",
+                    "### [x] Checkpoint 1: First / Partition 2/2: Part 2",
+                    1,
+                ).replace("- [ ] Implement part 2.", "- [x] Implement part 2.", 1)
+                plan_path.write_text(text, encoding="utf-8")
+                return subprocess.CompletedProcess(
+                    argv, 0, "second child complete", ""
+                )
+            if model == "reviewer-m":
+                calls.append("reviewer")
+                text = plan_path.read_text(encoding="utf-8")
+                text = text.replace(
+                    "### [ ] Checkpoint 1: First / Partition 1/2: Part 1",
+                    "### [x] Checkpoint 1: First / Partition 1/2: Part 1",
+                    1,
+                ).replace("- [ ] Implement part 1.", "- [x] Implement part 1.", 1)
+                plan_path.write_text(text, encoding="utf-8")
+                return subprocess.CompletedProcess(
+                    argv, 0, "first child approved", ""
+                )
+            if "REPARTITION_PROPOSE_CONTEXT_JSON:\n" in prompt:
+                calls.append("propose")
+                payload = json.loads(
+                    prompt.split("REPARTITION_PROPOSE_CONTEXT_JSON:\n", 1)[1]
+                )
+                envelope = payload["envelope"]
+                source_ids = [b["block_id"] for b in envelope["source_blocks"]]
+                repair_ids = [
+                    b["block_id"] for b in payload["repair_evidence_blocks"]
+                ]
+                children = []
+                for ordinal in (1, 2):
+                    children.append({
+                        "title": f"Part {ordinal}",
+                        "narrow_goal": f"Implement part {ordinal}.",
+                        "source_block_ids": source_ids,
+                        "repair_evidence_ids": repair_ids,
+                        "implementation_steps": [f"Implement part {ordinal}."],
+                        "verification_commands": ["uv run pytest -q"],
+                        "done_criteria": [f"Part {ordinal} is observable."],
+                    })
+                proposal = {
+                    "schema_version": 1,
+                    "envelope_sha256": envelope["canonical_envelope_sha256"],
+                    "source_plan_sha256": payload["source_plan_sha256"],
+                    "rationale": "Two independently reviewable slices.",
+                    "children": children,
+                    "current_disposition": "review_current_partition",
+                    "cross_cutting_source_reasons": {
+                        block_id: "The obligation constrains both slices."
+                        for block_id in source_ids
+                    },
+                }
+                return subprocess.CompletedProcess(argv, 0, json.dumps(proposal), "")
+            if "REPARTITION_VALIDATE_CONTEXT_JSON:\n" in prompt:
+                calls.append("validate")
+                payload = json.loads(
+                    prompt.split("REPARTITION_VALIDATE_CONTEXT_JSON:\n", 1)[1]
+                )
+                return subprocess.CompletedProcess(
+                    argv,
+                    0,
+                    json.dumps({
+                        "schema_version": 1,
+                        "proposal_sha256": payload["proposal_sha256"],
+                        "candidate_sha256": payload["candidate_plan_sha256"],
+                        "verdict": "accept",
+                        "reason": "The split preserves all exact obligations.",
+                        "findings": [],
+                    }),
+                    "",
+                )
+            calls.append("decision")
+            action = (
+                "repartition_current_checkpoint"
+                if calls.count("decision") == 1
+                else "continue"
+            )
+            return subprocess.CompletedProcess(
+                argv,
+                0,
+                json.dumps({
+                    "schema_version": 1,
+                    "action": action,
+                    "reason": "The scope has two independently reviewable slices.",
+                    "next_step_notes": [],
+                    "stop_report": None,
+                }),
+                "",
+            )
+
+        thread, result = _launch_config(
+            tmp_path, wf_config, plan_path, runner, observer,
+            workflow_name="managed", max_turns=6,
+        )
+        run_dir = _first_run_dir(tmp_path)
+        try:
+            # Scope pressure forces a Full decision: the exclusive Full
+            # manager blocks with zero dispatches (no decision, proposal,
+            # or validation call).
+            assert _wait_until(lambda: calls == ["worker"])
+            assert "decision" not in calls
+            assert "propose" not in calls
+            assert "validate" not in calls
+            assert _wait_until(
+                lambda: (
+                    _run_json(run_dir).get("execution_resource_wait") is not None
+                )
+            )
+            waiting = _run_json(run_dir)["execution_resource_wait"]
+            assert waiting["resource"] == resource
+            assert waiting["selector"] == "codex.manager-full"
+            _release(resource_store, resource, identity, invocation_id)
+            thread.join(timeout=30)
+        finally:
+            _release(
+                resource_store, resource, identity, invocation_id,
+                required=False,
+            )
+        assert "error" not in result, result.get("error")
+        assert "decision" in calls and "propose" in calls and "validate" in calls
+        assert result["value"].final_snapshot.is_complete
+        # The Full decision, the proposal, and the validation each took the
+        # exclusive resource as independent FIFO participants: unique
+        # invocation ids, every grant released exactly once, in order.
+        full_events = [
+            e for e in observer.resource_events()
+            if e.phase in ("acquired", "released") and e.label.endswith("full-m")
+        ]
+        acquired = [e for e in full_events if e.phase == "acquired"]
+        released = [e for e in full_events if e.phase == "released"]
+        assert len(acquired) == 3
+        assert len(released) == 3
+        assert len({e.invocation_id for e in acquired}) == 3
+        assert [e.invocation_id for e in acquired] == [
+            e.invocation_id for e in released
+        ]
+
+    def test_handover_admission_routes_to_source_resource_identity(
+        self, tmp_path: Path, resource_store: ExecutionResourceStore
+    ) -> None:
+        # Provider handover is admitted against the source session's fixed
+        # (harness, model, effort) tuple -- never the target profile's --
+        # and the legacy (unmarked) source takes the fast path.
+        source_resource = execution_resource_key("codex", "source-m", None)
+        target_resource = execution_resource_key("codex", "target-m", None)
+        source_profile = ResolvedProfile(
+            harness_name="codex",
+            profile_name="source",
+            model="source-m",
+            effort=None,
+            exclusive_resource=source_resource,
+        )
+        events: list[dict[str, object]] = []
+
+        def emit(phase: str, **kwargs: object) -> None:
+            events.append({"phase": phase, **kwargs})
+
+        context = _AuxiliaryAdmissionContext(
+            project_root=tmp_path,
+            run_id="handover-run",
+            kind="handover",
+            role="worker",
+            observer=None,
+            stop_check=lambda: None,
+            emit_event=emit,
+        )
+        identity, invocation_id = _occupy(
+            resource_store, source_resource, role="worker"
+        )
+        grant_box: dict[str, object] = {}
+
+        def admit() -> None:
+            grant_box["grant"] = context.admit(
+                lambda cfg: (
+                    "codex.source",
+                    source_resource,
+                    source_profile,
+                    None,
+                )
+            )
+
+        thread = threading.Thread(target=admit, daemon=True)
+        thread.start()
+        try:
+            # The handover blocks on the source's resource (not the target
+            # tuple) with zero dispatch while it is held.
+            assert _wait_until(
+                lambda: _journal_owner(tmp_path, source_resource) is not None
+            )
+            assert thread.is_alive(), "handover must block while source is held"
+            assert _journal_owner(tmp_path, target_resource) is None, (
+                "handover must never queue on the target profile's resource"
+            )
+            _release(resource_store, source_resource, identity, invocation_id)
+            thread.join(timeout=20)
+        finally:
+            _release(
+                resource_store, source_resource, identity, invocation_id,
+                required=False,
+            )
+        grant = grant_box["grant"]
+        assert grant is not None
+        assert grant.lease is not None
+        assert grant.resolved.exclusive_resource == source_resource
+        grant.lease.complete()
+        context.note_released()
+        phases = [e["phase"] for e in events]
+        assert "acquired" in phases
+        assert "released" in phases
+        assert phases.count("acquired") == phases.count("released")
+
+    def test_handover_legacy_source_without_resource_tuple_skips_broker(
+        self, tmp_path: Path, resource_store: ExecutionResourceStore
+    ) -> None:
+        # A legacy source session carries no exclusive tuple: the handover
+        # takes the fast path and never contacts the broker.
+        legacy_profile = ResolvedProfile(
+            harness_name="codex",
+            profile_name="legacy",
+            model="legacy-m",
+            effort=None,
+            exclusive_resource=None,
+        )
+        context = _AuxiliaryAdmissionContext(
+            project_root=tmp_path,
+            run_id="handover-legacy",
+            kind="handover",
+            role="worker",
+            observer=None,
+            stop_check=lambda: None,
+        )
+        grant = context.admit(
+            lambda cfg: ("codex.legacy", None, legacy_profile, None)
+        )
+        assert grant.lease is None
+        assert grant.resolved.exclusive_resource is None
+        # No broker journal was created for the legacy source tuple.
+        store_dir = tmp_path / "resource-store"
+        if store_dir.exists():
+            assert list(store_dir.iterdir()) == []
+        context.note_released()  # no-op for a non-exclusive grant
+
+    def test_session_ref_serializes_raw_tuple_from_unmarked_session(self) -> None:
+        # A session dispatched under an unmarked profile still persists its
+        # raw (harness, model, effort) tuple, and the serializer round-trips
+        # it; old serialized sessions without the field stay readable.
+        ref = HarnessSessionRefV1(
+            session_id="unmarked-source", role="worker",
+            selector="codex.source", harness="codex", profile="source",
+            model_display="codex / source-m", status="active",
+            resource_identity=("codex", "source-m", None),
+        )
+        assert "resource_identity" in ref.to_dict()
+        restored = HarnessSessionRefV1.from_dict(ref.to_dict())
+        assert restored.resource_identity == ("codex", "source-m", None)
+        legacy_raw = {
+            "schema_version": 1,
+            "session_id": "legacy-source", "role": "worker",
+            "selector": "codex.source", "harness": "codex",
+            "profile": "source", "model_display": "codex / source-m",
+            "status": "active",
+        }
+        assert "resource_identity" not in legacy_raw
+        legacy = HarnessSessionRefV1.from_dict(legacy_raw)
+        assert legacy.resource_identity is None
+
+    def test_unmarked_new_session_persists_raw_tuple(
+        self, tmp_path: Path
+    ) -> None:
+        # End to end: a fresh session dispatched under an unmarked profile
+        # still carries its validated raw (harness, model, effort) tuple in
+        # the durable session reference, without deriving it from
+        # model_display.
+        repo, plan_path = _handover_repo(tmp_path)
+        target = _HandoverTargetDriver()
+        result = run_workflow(
+            ControllerConfig(repo_root=repo, plan_path=plan_path, max_turns=1),
+            _handover_config(source_exclusive=False), "live", config_dir=repo,
+            snapshot_config=False, adapter=CodexAdapter(),
+            runner=_handover_runner(plan_path), session_driver=target,
+            preflight_probe=NoOpHarnessPreflightProbe(),
+        )
+        state = _run_json(Path(result.run_dir))
+        sessions = state["active_role_sessions"]
+        assert sessions, "the owned turn must leave an active session ref"
+        assert sessions[0]["session_id"] == "reasonix-target"
+        # JSON serialization round-trips the tuple as a list.
+        assert sessions[0]["resource_identity"] == [
+            "reasonix", "ds4-1-flash", None,
+        ]
+
+    # -- source opt-in vs captured tuple (actual run_workflow handover) -----
+
+    def test_handover_unmarked_session_queues_on_captured_tuple_when_marked(
+        self, tmp_path: Path, resource_store: ExecutionResourceStore
+    ) -> None:
+        # The source session was dispatched while its profile was unmarked,
+        # so only the raw captured tuple proves its combination; the current
+        # source profile is marked and supplies the opt-in.  The handover
+        # must queue on the captured tuple's resource with no callback or
+        # target start while it is occupied.
+        repo, plan_path = _handover_repo(tmp_path)
+        resume = _handover_resume(source_identity=_handover_source_identity())
+        started = threading.Event()
+        release = threading.Event()
+        source_driver = _HandoverSourceDriver(
+            mode="success", release=release, started=started,
+        )
+        target = _HandoverTargetDriver()
+        identity, invocation_id = _occupy(
+            resource_store, _HANDOVER_SOURCE_RESOURCE, role="worker"
+        )
+        thread, result = _launch_handover(
+            repo, plan_path, resume, source_driver, target,
+        )
+        try:
+            assert _wait_until(lambda: len(_run_dirs(repo)) >= 2)
+            run_dir = _last_run_dir(repo)
+            assert _wait_until(
+                lambda: (
+                    _run_json(run_dir).get("execution_resource_wait")
+                    is not None
+                )
+            )
+            waiting = _run_json(run_dir)["execution_resource_wait"]
+            assert waiting["resource"] == _HANDOVER_SOURCE_RESOURCE
+            assert waiting["kind"] == "handover"
+            assert source_driver.calls == 0, (
+                "the callback must not start while the resource is occupied"
+            )
+            assert target.starts == 0, (
+                "the target must not start while the resource is occupied"
+            )
+            _release(resource_store, _HANDOVER_SOURCE_RESOURCE,
+                     identity, invocation_id)
+            assert started.wait(timeout=30), (
+                "handover callback never started after release"
+            )
+            owner = _journal_owner(tmp_path, _HANDOVER_SOURCE_RESOURCE)
+            assert owner is not None and owner["status"] == "running"
+        finally:
+            release.set()
+            if source_driver.child is not None and source_driver.child.poll() is None:
+                _reap_test_child(source_driver.child)
+            _release(
+                resource_store, _HANDOVER_SOURCE_RESOURCE,
+                identity, invocation_id, required=False,
+            )
+        thread.join(timeout=30)
+        assert not thread.is_alive(), "workflow never finished the handover"
+        assert "error" not in result, result.get("error")
+        assert source_driver.calls == 1
+        assert target.starts == 1
+        assert _journal_owner(tmp_path, _HANDOVER_SOURCE_RESOURCE) is None
+
+    def test_handover_marked_session_takes_legacy_path_when_unmarked(
+        self, tmp_path: Path, resource_store: ExecutionResourceStore
+    ) -> None:
+        # The source session was dispatched while its profile was marked
+        # (captured tuple present), but the current source profile is
+        # unmarked: the handover keeps the legacy ungrouped call shape,
+        # dispatches without waiting for the occupied resource, and the
+        # broker is never consulted by the workflow.
+        repo, plan_path = _handover_repo(tmp_path)
+        resume = _handover_resume(source_identity=_handover_source_identity())
+        started = threading.Event()
+        release = threading.Event()
+        source_driver = _HandoverSourceDriver(
+            mode="success", release=release, started=started,
+            require_lifecycle=False,
+        )
+        target = _HandoverTargetDriver()
+        observer = _Observer()
+        identity, invocation_id = _occupy(
+            resource_store, _HANDOVER_SOURCE_RESOURCE, role="worker"
+        )
+        thread, result = _launch_handover(
+            repo, plan_path, resume, source_driver, target,
+            wf_config=_handover_config(source_exclusive=False),
+            observer=observer,
+        )
+        try:
+            assert started.wait(timeout=30), (
+                "legacy handover must dispatch without the broker"
+            )
+            assert source_driver.calls == 1
+            assert source_driver.legacy_call, (
+                "the ungrouped handover must be called without a lease"
+            )
+            assert target.starts == 0, "target waits for the callback release"
+        finally:
+            release.set()
+            if source_driver.child is not None and source_driver.child.poll() is None:
+                _reap_test_child(source_driver.child)
+            _release(
+                resource_store, _HANDOVER_SOURCE_RESOURCE,
+                identity, invocation_id, required=False,
+            )
+        thread.join(timeout=30)
+        assert not thread.is_alive(), "workflow never finished the handover"
+        assert "error" not in result, result.get("error")
+        assert target.starts == 1
+        assert observer.resource_events() == [], (
+            "a legacy handover must never emit resource events"
+        )
+        assert _journal_owner(tmp_path, _HANDOVER_SOURCE_RESOURCE) is None, (
+            "the workflow must never own a claim on the legacy path"
+        )
+
+    @pytest.mark.parametrize(
+        "variant",
+        ["missing_tuple", "missing_selector", "mismatched_selector"],
+    )
+    def test_handover_marked_source_rejected_before_callback(
+        self, tmp_path: Path, resource_store: ExecutionResourceStore,
+        variant: str,
+    ) -> None:
+        # A marked current source profile without a captured tuple, an
+        # unresolvable source selector, and a source session whose profile
+        # contradicts the transaction each fail before any callback, target
+        # start, or claim.
+        repo, plan_path = _handover_repo(tmp_path)
+        if variant == "missing_tuple":
+            resume = _handover_resume(source_identity=None)
+        elif variant == "missing_selector":
+            resume = _handover_resume(
+                source_identity=_handover_source_identity(),
+                source_selector="codex.missing",
+            )
+        else:
+            resume = _handover_resume(
+                source_identity=_handover_source_identity(),
+                session_profile="stale",
+            )
+
+        class SilentDriver:
+            capabilities = SessionCapabilities(
+                session_identity=True, followup_turn=True, read_only_teardown=True,
+            )
+
+            def __init__(self) -> None:
+                self.calls = 0
+
+            def build_full_context(self, run_dir: Path) -> dict:
+                return {"plan_state": {"checkpoint": 1}}
+
+            def handover(self, request: SessionRequest, prompt: str,
+                         lifecycle=None) -> str:
+                self.calls += 1
+                return _HANDOVER_OUTPUT
+
+        source_driver = SilentDriver()
+        target = _HandoverTargetDriver()
+        with pytest.raises(WorkflowError) as ctx:
+            run_workflow(
+                ControllerConfig(repo_root=repo, plan_path=plan_path, max_turns=2),
+                _handover_config(), "live", config_dir=repo,
+                snapshot_config=False, adapter=CodexAdapter(),
+                runner=_handover_runner(plan_path), session_driver=target,
+                source_session_driver=source_driver, resume=resume,
+                preflight_probe=NoOpHarnessPreflightProbe(),
+            )
+        assert source_driver.calls == 0, "rejection must precede any model call"
+        assert target.starts == 0
+        assert not (
+            tmp_path / "resource-store"
+            / f"{_HANDOVER_SOURCE_RESOURCE}.json"
+        ).exists(), "no claim may be created for the rejection"
+        state = _run_json(ctx.value.run_dir)
+        assert state["status"] == "failed"
+        assert state["hotplug_history"][-1]["stage"] == "failed"
+
+    def test_handover_captured_tuple_defines_key_despite_source_model_edit(
+        self, tmp_path: Path, resource_store: ExecutionResourceStore
+    ) -> None:
+        # The current source profile stays marked but its model was edited
+        # while the handover was already queued: the captured tuple still
+        # defines the key and the ticket is kept, while the edited
+        # combination is never consulted.
+        repo, plan_path = _handover_repo(tmp_path)
+        config_path = repo / "aflow.toml"
+        config_path.write_text(
+            _handover_aflow_toml(source_exclusive=True), encoding="utf-8"
+        )
+        (repo / "workflows.toml").write_text(
+            _handover_workflows_toml(), encoding="utf-8"
+        )
+        resume = _handover_resume(source_identity=_handover_source_identity())
+        edited_resource = execution_resource_key("codex", "edited-m", None)
+        assert edited_resource != _HANDOVER_SOURCE_RESOURCE
+        started = threading.Event()
+        release = threading.Event()
+        source_driver = _HandoverSourceDriver(
+            mode="success", release=release, started=started,
+        )
+        target = _HandoverTargetDriver()
+        observer = _Observer()
+        identity, invocation_id = _occupy(
+            resource_store, _HANDOVER_SOURCE_RESOURCE, role="worker"
+        )
+        thread, result = _launch_handover(
+            repo, plan_path, resume, source_driver, target,
+            config_path=config_path, observer=observer,
+        )
+        try:
+            assert _wait_until(lambda: len(_run_dirs(repo)) >= 2)
+            run_dir = _last_run_dir(repo)
+            assert _wait_until(
+                lambda: (
+                    _run_json(run_dir).get("execution_resource_wait")
+                    is not None
+                )
+            )
+            waiting = _run_json(run_dir)["execution_resource_wait"]
+            assert waiting["resource"] == _HANDOVER_SOURCE_RESOURCE, (
+                "the captured tuple must define the resource key"
+            )
+            # Edit the marked source row's model while the handover is
+            # queued: the ticket and captured tuple must survive.  A short
+            # bounded pause lets at least two poll intervals observe the
+            # edit before asserting nothing changed.
+            config_path.write_text(
+                _handover_aflow_toml(
+                    source_exclusive=True, source_model="edited-m"
+                ),
+                encoding="utf-8",
+            )
+            time.sleep(0.6)
+            still_waiting = _run_json(run_dir).get("execution_resource_wait")
+            assert still_waiting is not None, (
+                "a source model edit must not cancel the queued ticket"
+            )
+            assert still_waiting["resource"] == _HANDOVER_SOURCE_RESOURCE
+            assert not (
+                tmp_path / "resource-store" / f"{edited_resource}.json"
+            ).exists(), "the edited source model must never be consulted"
+            assert source_driver.calls == 0
+            _release(resource_store, _HANDOVER_SOURCE_RESOURCE,
+                     identity, invocation_id)
+            assert started.wait(timeout=30)
+        finally:
+            release.set()
+            if source_driver.child is not None and source_driver.child.poll() is None:
+                _reap_test_child(source_driver.child)
+            _release(
+                resource_store, _HANDOVER_SOURCE_RESOURCE,
+                identity, invocation_id, required=False,
+            )
+        thread.join(timeout=30)
+        assert not thread.is_alive(), "workflow never finished the handover"
+        assert "error" not in result, result.get("error")
+        assert source_driver.calls == 1
+        assert target.starts == 1
+        phases = [event.phase for event in observer.resource_events()]
+        assert "cancelled" not in phases, (
+            "a source model edit must keep the ticket without cancelling"
+        )
+
+    def test_handover_queued_optin_edit_moves_to_legacy_path(
+        self, tmp_path: Path, resource_store: ExecutionResourceStore
+    ) -> None:
+        # While an exclusive handover is queued, a live-config edit that
+        # unmarks the source row cancels the ticket and re-prepares onto the
+        # legacy ungrouped path through the nonblocking reload path; the
+        # dispatch then proceeds without waiting for the occupied resource.
+        repo, plan_path = _handover_repo(tmp_path)
+        config_path = repo / "aflow.toml"
+        config_path.write_text(
+            _handover_aflow_toml(source_exclusive=True), encoding="utf-8"
+        )
+        (repo / "workflows.toml").write_text(
+            _handover_workflows_toml(), encoding="utf-8"
+        )
+        resume = _handover_resume(source_identity=_handover_source_identity())
+        started = threading.Event()
+        release = threading.Event()
+        source_driver = _HandoverSourceDriver(
+            mode="success", release=release, started=started,
+            require_lifecycle=False,
+        )
+        target = _HandoverTargetDriver()
+        observer = _Observer()
+        identity, invocation_id = _occupy(
+            resource_store, _HANDOVER_SOURCE_RESOURCE, role="worker"
+        )
+        thread, result = _launch_handover(
+            repo, plan_path, resume, source_driver, target,
+            config_path=config_path, observer=observer,
+        )
+        try:
+            assert _wait_until(lambda: len(_run_dirs(repo)) >= 2)
+            run_dir = _last_run_dir(repo)
+            assert _wait_until(
+                lambda: (
+                    _run_json(run_dir).get("execution_resource_wait")
+                    is not None
+                )
+            )
+            waiting = _run_json(run_dir)["execution_resource_wait"]
+            assert waiting["resource"] == _HANDOVER_SOURCE_RESOURCE
+            assert source_driver.calls == 0
+            # Unmark the source row while the handover is queued.
+            config_path.write_text(
+                _handover_aflow_toml(source_exclusive=False),
+                encoding="utf-8",
+            )
+            assert started.wait(timeout=30), (
+                "the unmarked edit must move the handover to the legacy path"
+            )
+            assert source_driver.legacy_call, (
+                "the re-prepared call must be ungrouped"
+            )
+        finally:
+            release.set()
+            if source_driver.child is not None and source_driver.child.poll() is None:
+                _reap_test_child(source_driver.child)
+            _release(
+                resource_store, _HANDOVER_SOURCE_RESOURCE,
+                identity, invocation_id, required=False,
+            )
+        thread.join(timeout=30)
+        assert not thread.is_alive(), "workflow never finished the handover"
+        assert "error" not in result, result.get("error")
+        assert target.starts == 1
+        phases = [event.phase for event in observer.resource_events()]
+        assert "waiting" in phases
+        assert "cancelled" in phases, "the old ticket must be cancelled"
+        assert "acquired" not in phases, (
+            "the handover must never own the resource after the edit"
+        )
+        assert _journal_owner(tmp_path, _HANDOVER_SOURCE_RESOURCE) is None
+
+
+    # -- provider handover lifetime (actual run_workflow handover path) -----
+
+    def test_handover_lifecycle_source_binds_child_and_gates_target(
+        self, tmp_path: Path, resource_store: ExecutionResourceStore
+    ) -> None:
+        # An exclusive source handover follows the full lifecycle contract:
+        # durable launch intent before the callback, exact child binding
+        # before prompting, and release only after confirmed reap.  While
+        # the callback owns the live child, the target starts nothing and a
+        # dead controller cannot free the active child; the waiting peer
+        # admits only after the confirmed release.
+        repo, plan_path = _handover_repo(tmp_path)
+        resume = _handover_resume(source_identity=_handover_source_identity())
+        started = threading.Event()
+        release = threading.Event()
+        source_driver = _HandoverSourceDriver(
+            mode="success", release=release, started=started,
+            on_entry=lambda: (
+                (_journal_owner(tmp_path, _HANDOVER_SOURCE_RESOURCE) or {}).get(
+                    "status"
+                )
+            ),
+        )
+        target = _HandoverTargetDriver()
+        thread, result = _launch_handover(
+            repo, plan_path, resume, source_driver, target,
+        )
+        try:
+            assert started.wait(timeout=30), "handover callback never started"
+            owner = _journal_owner(tmp_path, _HANDOVER_SOURCE_RESOURCE)
+            assert owner is not None and owner["status"] == "running"
+            assert owner["child_pid"] == source_driver.bound[0]
+            assert owner["child_birth"] == source_driver.bound[1]
+            # Launch intent was durable before the callback could spawn.
+            assert source_driver.entry_status == "launching"
+            assert target.starts == 0, "target must not start before release"
+            controller_pid = owner["controller"]["pid"]
+            # The waiting peer queues behind the executing handover.
+            peer_identity, peer_invocation = _foreign_enqueue(
+                resource_store, _HANDOVER_SOURCE_RESOURCE, role="worker"
+            )
+            # Injected observations: the controller is dead but the child is
+            # alive, so reconcile must keep the owner occupied.
+            def _child_alive_evidence(pid: int) -> ProcessEvidence:
+                if pid == controller_pid:
+                    return ProcessEvidence(liveness="absent", birth=None)
+                if pid == source_driver.bound[0]:
+                    return ProcessEvidence(
+                        liveness="present", birth=source_driver.bound[1]
+                    )
+                return ProcessEvidence(liveness="unknown", birth=None)
+
+            outcome = resource_store.reconcile(
+                _HANDOVER_SOURCE_RESOURCE,
+                process_evidence=_child_alive_evidence,
+                group_evidence=lambda pgid: "present",
+            )
+            assert outcome.state == "unchanged", outcome
+            blocked = resource_store.try_acquire(
+                _HANDOVER_SOURCE_RESOURCE, peer_invocation, peer_identity
+            )
+            assert blocked.state == "queued", blocked
+            release.set()
+            thread.join(timeout=30)
+            assert not thread.is_alive(), "workflow never finished the handover"
+        finally:
+            release.set()
+            if source_driver.child is not None and source_driver.child.poll() is None:
+                _reap_test_child(source_driver.child)
+            _release(
+                resource_store, _HANDOVER_SOURCE_RESOURCE,
+                peer_identity, peer_invocation, required=False,
+            )
+        assert "error" not in result, result.get("error")
+        assert source_driver.calls == 1
+        assert target.starts == 1, "target must start only after source release"
+        assert "Source worker handover:" in target.prompts[-1]
+        assert _journal_owner(tmp_path, _HANDOVER_SOURCE_RESOURCE) is None
+        # The peer that queued during the handover wins the freed resource.
+        _foreign_acquire(
+            resource_store, _HANDOVER_SOURCE_RESOURCE,
+            peer_identity, peer_invocation,
+        )
+        run = _run_json(_last_run_dir(repo))
+        assert run["status"] == "completed"
+
+    def test_handover_opaque_entry_point_rejected_before_dispatch(
+        self, tmp_path: Path, resource_store: ExecutionResourceStore
+    ) -> None:
+        # A marked source whose handover entry point cannot carry the
+        # lifecycle contract is rejected before admission and before any
+        # model call: no claim, no dispatch, and a failed run.
+        repo, plan_path = _handover_repo(tmp_path)
+        resume = _handover_resume(source_identity=_handover_source_identity())
+
+        class OpaqueDriver:
+            capabilities = SessionCapabilities(
+                session_identity=True, followup_turn=True, read_only_teardown=True,
+            )
+
+            def __init__(self) -> None:
+                self.calls = 0
+
+            def build_full_context(self, run_dir: Path) -> dict:
+                return {"plan_state": {"checkpoint": 1}}
+
+            def handover(self, request: SessionRequest, prompt: str) -> str:
+                self.calls += 1
+                return _HANDOVER_OUTPUT
+
+        source_driver = OpaqueDriver()
+        target = _HandoverTargetDriver()
+        with pytest.raises(WorkflowError) as ctx:
+            run_workflow(
+                ControllerConfig(repo_root=repo, plan_path=plan_path, max_turns=2),
+                _handover_config(), "live", config_dir=repo,
+                snapshot_config=False, adapter=CodexAdapter(),
+                runner=_handover_runner(plan_path), session_driver=target,
+                source_session_driver=source_driver, resume=resume,
+                preflight_probe=NoOpHarnessPreflightProbe(),
+            )
+        assert source_driver.calls == 0, "rejection must precede any model call"
+        assert target.starts == 0
+        assert _journal_owner(tmp_path, _HANDOVER_SOURCE_RESOURCE) is None
+        journal = (
+            tmp_path / "resource-store" / f"{_HANDOVER_SOURCE_RESOURCE}.json"
+        )
+        assert not journal.exists(), "no claim may be created for the rejection"
+        assert "lifecycle-capable" in str(ctx.value)
+        state = _run_json(ctx.value.run_dir)
+        assert state["status"] == "failed"
+        assert state["hotplug_history"][-1]["stage"] == "failed"
+
+    def test_handover_callback_failure_after_confirmed_cleanup_releases(
+        self, tmp_path: Path, resource_store: ExecutionResourceStore
+    ) -> None:
+        # A callback that reaps its child (confirmed cessation) and then
+        # raises leaves the claim released, and its original error -- not a
+        # resource error -- is the truthful failure.  A waiting peer can
+        # acquire the freed resource.
+        repo, plan_path = _handover_repo(tmp_path)
+        resume = _handover_resume(source_identity=_handover_source_identity())
+        started = threading.Event()
+        release = threading.Event()
+        source_driver = _HandoverSourceDriver(
+            mode="released_failure", release=release, started=started,
+        )
+        target = _HandoverTargetDriver()
+        thread, result = _launch_handover(
+            repo, plan_path, resume, source_driver, target,
+        )
+        try:
+            assert started.wait(timeout=30), "handover callback never started"
+            release.set()
+            thread.join(timeout=30)
+            assert not thread.is_alive(), "workflow never settled the failure"
+        finally:
+            release.set()
+            if source_driver.child is not None and source_driver.child.poll() is None:
+                _reap_test_child(source_driver.child)
+        error = result.get("error")
+        assert isinstance(error, WorkflowError)
+        assert "handover output rejected" in str(error)
+        assert "execution resource" not in str(error), (
+            "a confirmed cleanup failure must not surface as a resource error"
+        )
+        assert _journal_owner(tmp_path, _HANDOVER_SOURCE_RESOURCE) is None
+        assert target.starts == 0
+        state = _run_json(error.run_dir)
+        assert state["status"] == "failed"
+        # The freed resource admits a new claimant immediately.
+        peer_identity, peer_invocation = _foreign_enqueue(
+            resource_store, _HANDOVER_SOURCE_RESOURCE, role="worker"
+        )
+        _foreign_acquire(
+            resource_store, _HANDOVER_SOURCE_RESOURCE,
+            peer_identity, peer_invocation,
+        )
+        _release(
+            resource_store, _HANDOVER_SOURCE_RESOURCE,
+            peer_identity, peer_invocation, required=False,
+        )
+
+    def test_handover_owner_stop_clears_queued_ticket(
+        self, tmp_path: Path, resource_store: ExecutionResourceStore
+    ) -> None:
+        # Owner stop while the handover is queued clears the ticket and
+        # finalizes the run as owner-stopped with zero dispatches; the
+        # acquired-claim counterpart is structural: nothing in the handover
+        # block cancels after acquisition, so a stop cannot abandon an
+        # executing child.
+        repo, plan_path = _handover_repo(tmp_path)
+        resume = _handover_resume(source_identity=_handover_source_identity())
+        started = threading.Event()
+        release = threading.Event()
+        source_driver = _HandoverSourceDriver(
+            mode="success", release=release, started=started,
+        )
+        target = _HandoverTargetDriver()
+        identity, invocation_id = _occupy(
+            resource_store, _HANDOVER_SOURCE_RESOURCE, role="worker"
+        )
+        thread, result = _launch_handover(
+            repo, plan_path, resume, source_driver, target,
+        )
+        try:
+            assert _wait_until(lambda: len(_run_dirs(repo)) >= 2)
+            run_dir = _last_run_dir(repo)
+            assert _wait_until(
+                lambda: _run_json(run_dir).get("execution_resource_wait") is not None
+            )
+            waiting = _run_json(run_dir)["execution_resource_wait"]
+            assert waiting["resource"] == _HANDOVER_SOURCE_RESOURCE
+            assert waiting["kind"] == "handover"
+            assert source_driver.calls == 0
+            _stop_run(run_dir)
+            thread.join(timeout=30)
+            assert not thread.is_alive(), "run never finalized the owner stop"
+        finally:
+            release.set()
+            if source_driver.child is not None and source_driver.child.poll() is None:
+                _reap_test_child(source_driver.child)
+            _release(
+                resource_store, _HANDOVER_SOURCE_RESOURCE,
+                identity, invocation_id, required=False,
+            )
+        assert "error" not in result, result.get("error")
+        assert source_driver.calls == 0, "stop must prevent the handover dispatch"
+        assert target.starts == 0
+        state = _run_json(run_dir)
+        assert state["status"] == "owner_stopped"
+        assert state.get("execution_resource_wait") is None
+        assert _journal_owner(tmp_path, _HANDOVER_SOURCE_RESOURCE) is None, (
+            "the queued ticket must be cleared"
+        )
+
+    def test_handover_uncertain_child_retains_claim_until_confirmed(
+        self, tmp_path: Path, resource_store: ExecutionResourceStore
+    ) -> None:
+        # A callback that fails while its child is still alive retains the
+        # claim as unconfirmed and surfaces the resource-specific error with
+        # the original cause.  No controller death, injected or otherwise,
+        # frees the active child; the waiting peer admits only after the
+        # child's cessation is positively confirmed.
+        repo, plan_path = _handover_repo(tmp_path)
+        resume = _handover_resume(source_identity=_handover_source_identity())
+        started = threading.Event()
+        release = threading.Event()
+        source_driver = _HandoverSourceDriver(
+            mode="unconfirmed_failure", release=release, started=started,
+        )
+        target = _HandoverTargetDriver()
+        thread, result = _launch_handover(
+            repo, plan_path, resume, source_driver, target,
+        )
+        peer_identity: ControllerIdentity | None = None
+        peer_invocation: str | None = None
+        try:
+            assert started.wait(timeout=30), "handover callback never started"
+            owner = _journal_owner(tmp_path, _HANDOVER_SOURCE_RESOURCE)
+            assert owner is not None and owner["status"] == "running"
+            peer_identity, peer_invocation = _foreign_enqueue(
+                resource_store, _HANDOVER_SOURCE_RESOURCE, role="worker"
+            )
+            release.set()
+            thread.join(timeout=30)
+            assert not thread.is_alive(), "workflow never settled the failure"
+        finally:
+            release.set()
+            if source_driver.child is not None and source_driver.child.poll() is None:
+                _reap_test_child(source_driver.child)
+        error = result.get("error")
+        assert isinstance(error, WorkflowError)
+        assert "execution resource handover failed" in str(error)
+        assert target.starts == 0
+        owner = _journal_owner(tmp_path, _HANDOVER_SOURCE_RESOURCE)
+        assert owner is not None and owner["status"] == "unconfirmed"
+        assert owner["child_pid"] == source_driver.bound[0]
+        controller_pid = owner["controller"]["pid"]
+        assert peer_identity is not None and peer_invocation is not None
+        blocked = resource_store.try_acquire(
+            _HANDOVER_SOURCE_RESOURCE, peer_invocation, peer_identity
+        )
+        assert blocked.state == "queued", blocked
+
+        def _child_alive_evidence(pid: int) -> ProcessEvidence:
+            if pid == controller_pid:
+                return ProcessEvidence(liveness="absent", birth=None)
+            if pid == source_driver.bound[0]:
+                return ProcessEvidence(
+                    liveness="present", birth=source_driver.bound[1]
+                )
+            return ProcessEvidence(liveness="unknown", birth=None)
+
+        outcome = resource_store.reconcile(
+            _HANDOVER_SOURCE_RESOURCE,
+            process_evidence=_child_alive_evidence,
+            group_evidence=lambda pgid: "present",
+        )
+        assert outcome.state == "unchanged", (
+            "a dead controller cannot free an active child"
+        )
+        still_blocked = resource_store.try_acquire(
+            _HANDOVER_SOURCE_RESOURCE, peer_invocation, peer_identity
+        )
+        assert still_blocked.state == "queued", still_blocked
+        # Positive cessation: reap the child, then reconcile frees the claim.
+        _reap_test_child(source_driver.child)
+        child_pid = source_driver.bound[0]
+
+        def _child_gone_evidence(pid: int) -> ProcessEvidence:
+            if pid in (controller_pid, child_pid):
+                return ProcessEvidence(liveness="absent", birth=None)
+            return ProcessEvidence(liveness="unknown", birth=None)
+
+        reclaimed = resource_store.reconcile(
+            _HANDOVER_SOURCE_RESOURCE,
+            process_evidence=_child_gone_evidence,
+            group_evidence=lambda pgid: "absent",
+        )
+        assert reclaimed.state == "reclaimed", reclaimed
+        _foreign_acquire(
+            resource_store, _HANDOVER_SOURCE_RESOURCE,
+            peer_identity, peer_invocation,
+        )
+        _release(
+            resource_store, _HANDOVER_SOURCE_RESOURCE,
+            peer_identity, peer_invocation, required=False,
+        )

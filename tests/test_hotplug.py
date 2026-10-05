@@ -3,6 +3,8 @@ from dataclasses import replace
 import subprocess
 import hashlib
 import json
+import threading
+import time
 
 import pytest
 
@@ -29,7 +31,8 @@ from aflow.hotplug import (
 )
 from aflow.plan import PlanSnapshot
 from aflow.run_state import ControllerState, ImplementationAttempt, RetryContext, ResumeContext, hotplug_resume_fields, hotplug_state_payload, load_override_request
-from aflow.config import GoTransition, HarnessProfileConfig, TeamConfig, WorkflowConfig, WorkflowHarnessConfig, WorkflowStepConfig, WorkflowUserConfig
+from aflow.config import GoTransition, HarnessProfileConfig, TeamConfig, WorkflowConfig, WorkflowHarnessConfig, WorkflowStepConfig, WorkflowUserConfig, execution_resource_key
+from aflow.execution_resources import ClaimSpec, ControllerIdentity, ExecutionResourceStore
 from aflow.harnesses.codex import CodexAdapter
 from aflow.harnesses.base import HarnessInvocation
 from aflow.harnesses.session import (
@@ -484,6 +487,12 @@ def _controller_config(*, with_review: bool = False, with_team: bool = False) ->
             "high": HarnessProfileConfig(model="high-model"),
             "low": HarnessProfileConfig(model="low-model"),
             "review": HarnessProfileConfig(model="review-model"),
+        }),
+        # The legacy handover transactions' source selector must resolve
+        # against the current configuration; it stays unmarked so provider
+        # handover keeps the ungrouped legacy call shape.
+        "reasonix": WorkflowHarnessConfig(profiles={
+            "flash": HarnessProfileConfig(model="flash"),
         })},
         teams=teams,
         workflows={"live": WorkflowConfig(steps=steps, first_step="implement")},
@@ -1902,6 +1911,342 @@ def test_run_resume_imports_durable_provider_result_once(tmp_path: Path, evidenc
     else:
         assert persisted["current_hotplug_transaction"]["stage"] == "waiting_for_hotplug_recovery"
         assert persisted["active_role_sessions"][0]["session_id"] == "source"
+
+
+def _wait_until(predicate, timeout: float = 20.0) -> bool:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if predicate():
+            return True
+        time.sleep(0.02)
+    return predicate()
+
+
+def _occupy_resource(
+    store: ExecutionResourceStore, resource: str, role: str = "worker",
+) -> tuple[ControllerIdentity, str]:
+    """Enqueue a foreign claim and poll until it owns the resource."""
+    real = store.current_controller_identity()
+    assert real is not None, "controller identity must be available in tests"
+    identity = ControllerIdentity(pid=999999, birth="foreign-birth", boot=real.boot)
+    invocation_id = "foreign-invocation"
+    spec = ClaimSpec(
+        project_root="/foreign", run_id="foreign-run",
+        invocation_id=invocation_id, kind="turn", role=role, selector="codex.base",
+    )
+    outcome = store.enqueue(resource, spec, identity)
+    assert outcome.state in ("queued", "acquired"), outcome
+    deadline = time.monotonic() + 20.0
+    while time.monotonic() < deadline:
+        outcome = store.try_acquire(resource, invocation_id, identity)
+        if outcome.state == "acquired":
+            return identity, invocation_id
+        assert outcome.state in ("queued", "contended"), outcome
+        time.sleep(0.01)
+    pytest.fail("foreign controller never acquired the resource")
+
+
+def _release_resource(
+    store: ExecutionResourceStore,
+    resource: str,
+    identity: ControllerIdentity,
+    invocation_id: str,
+    *,
+    required: bool = True,
+) -> None:
+    """Release an owned claim, tolerating journal-lock contention."""
+    deadline = time.monotonic() + 20.0
+    while True:
+        outcome = store.record_completion(resource, invocation_id, identity)
+        if outcome.state != "contended" or time.monotonic() >= deadline:
+            break
+        time.sleep(0.01)
+    if required:
+        assert outcome.state in ("released", "cancelled", "acquired"), outcome
+
+
+def _resource_journal_owner(root: Path, resource: str) -> dict | None:
+    """Read the current journal owner claim (or None) for a resource."""
+    path = root / "resource-store" / f"{resource}.json"
+    if not path.exists():
+        return None
+    return json.loads(path.read_text(encoding="utf-8"))["owner"]
+
+
+def test_run_resume_recovered_session_resource_identity_survives_profile_drift(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Provider recovery captures the dispatched tuple, not the live profile.
+
+    The recovered target was dispatched with model/effort A while the live
+    codex.high profile now declares model/effort B.  The reconciled durable
+    result reports A, so the persisted active session tuple must be
+    (codex, A) across serialization, and a subsequent marked handover from
+    that recovered session must queue on A while it is occupied -- starting
+    no source callback or target -- and never claim B.
+    """
+    store = ExecutionResourceStore(root=tmp_path / "resource-store")
+    monkeypatch.setattr(
+        "aflow.workflow._default_execution_resource_store", lambda: store
+    )
+    monkeypatch.setattr(
+        "aflow.workflow._execution_resource_admission_options",
+        lambda: {"poll_interval": 0.02, "control_interval": 0.05},
+    )
+    plan = tmp_path / "plan.md"
+    plan.write_text("# Plan\n\n### [ ] Checkpoint 1: First\n- [ ] step\n", encoding="utf-8")
+    (tmp_path / ".gitignore").write_text(".aflow/\n", encoding="utf-8")
+    for args in (
+        ("git", "init", "-q"),
+        ("git", "add", "-A"),
+        ("git", "-c", "user.name=Test", "-c", "user.email=test@example.com", "commit", "-qm", "initial"),
+    ):
+        subprocess.run(args, cwd=tmp_path, check=True, capture_output=True)
+    _record_inactive_source(tmp_path, "provider-predecessor")
+    _record_inactive_source(tmp_path, "handover-predecessor")
+
+    # -- phase 1: recovery imports the durable result under an edited profile
+    base = make_transaction("waiting_for_hotplug_recovery")
+    source = HarnessSessionRefV1(
+        session_id="source", role="worker", selector=base.source_selector,
+        harness=base.source_harness, profile=base.source_profile,
+        model_display=base.source_model_display,
+    )
+    transaction = replace(
+        base, source_session=source,
+        provider_operation_id="provider-1", idempotency_key=base.transaction_id,
+    )
+    resume = ResumeContext(
+        resumed_from_run_id="provider-predecessor", feature_branch=None,
+        worktree_path=None, main_branch=None, setup=(), teardown=(),
+        interrupted_step_name="implement",
+        role_selectors={"worker": transaction.target_selector},
+        current_hotplug_transaction=transaction, pending_hotplug_transaction=transaction,
+        active_role_sessions=(source,), hotplug_transaction_number=1,
+    )
+
+    class RecoveryDriver:
+        capabilities = SessionCapabilities(session_identity=True, idempotent_turn_start=True)
+        def reconcile_provider_operation(self, operation_id, idempotency_key):
+            assert (operation_id, idempotency_key) == ("provider-1", transaction.transaction_id)
+            return SessionResult(
+                session_id="codex-target", selector="codex.high",
+                model="dispatched-model", effort="high",
+                final_output="DONE", provider_operation_id=operation_id,
+                idempotency_key=idempotency_key, capabilities=self.capabilities,
+            )
+        def build_invocation(self, request):
+            return HarnessInvocation(
+                label="fake", argv=("codex", "exec", "--json"), env={}, prompt_mode="stdin",
+                system_prompt=request.system_prompt, user_prompt=request.user_prompt,
+                effective_prompt=request.user_prompt, stdin_text=request.user_prompt,
+            )
+        def parse_result(self, request, stdout, *, returncode=0):
+            return SessionResult(
+                session_id="codex-target", selector=request.selector, model=request.model,
+                effort=request.effort, final_output="DONE", capabilities=self.capabilities,
+            )
+
+    edited = replace(
+        _controller_config(),
+        harnesses={
+            "codex": WorkflowHarnessConfig(profiles={
+                # The live profile now declares model/effort B.
+                "high": HarnessProfileConfig(model="edited-model", effort="mid"),
+                "low": HarnessProfileConfig(model="low-model"),
+                "review": HarnessProfileConfig(model="review-model"),
+            }),
+            "reasonix": WorkflowHarnessConfig(profiles={
+                "flash": HarnessProfileConfig(model="flash"),
+            }),
+        },
+    )
+
+    def failing_runner(argv, **kwargs):
+        del argv, kwargs
+        raise RuntimeError("worker dispatch failed after recovery")
+
+    with pytest.raises(WorkflowError) as error:
+        run_workflow(
+            ControllerConfig(repo_root=tmp_path, plan_path=plan, max_turns=1),
+            edited, "live", config_dir=tmp_path, adapter=CodexAdapter(),
+            snapshot_config=False, runner=failing_runner,
+            session_driver=RecoveryDriver(), resume=resume,
+        )
+    persisted = json.loads((error.value.run_dir / "run.json").read_text(encoding="utf-8"))
+    assert persisted["current_hotplug_transaction"] is None
+    assert persisted["hotplug_history"][-1]["stage"] == "applied"
+    assert persisted["hotplug_history"][-1]["provider_operation_id"] == "provider-1"
+    recovered_raw = persisted["active_role_sessions"][-1]
+    assert recovered_raw["session_id"] == "codex-target"
+    assert recovered_raw["resource_identity"] == ["codex", "dispatched-model", "high"]
+    recovered_session = HarnessSessionRefV1.from_dict(recovered_raw)
+    assert recovered_session.resource_identity == ("codex", "dispatched-model", "high")
+
+    # -- phase 2: a marked handover from the recovered session queues on A
+    marked_resource = execution_resource_key("codex", "dispatched-model", "high")
+    edited_resource = execution_resource_key("codex", "edited-model", "mid")
+    digest = "b" * 64
+    handover_transaction = HotplugTransactionV1(
+        transaction_id=hotplug_transaction_id("run-2", digest, 2),
+        run_id="run-2", accepted_override_digest=digest, transaction_number=2,
+        source_role="worker", target_role="worker",
+        source_selector="codex.high", target_selector="reasonix.ds4-1-flash",
+        source_harness="codex", target_harness="reasonix",
+        source_profile="high", target_profile="ds4-1-flash",
+        source_model_display="codex / edited-model (mid)",
+        target_model_display="reasonix / ds4-1-flash",
+        stage="accepted",
+    )
+    marked_config = WorkflowUserConfig(
+        roles={"worker": "reasonix.ds4-1-flash"},
+        harnesses={
+            # The edited codex.high profile is marked: it supplies the
+            # handover opt-in while the captured tuple supplies the key.
+            "codex": WorkflowHarnessConfig(profiles={
+                "high": HarnessProfileConfig(
+                    model="edited-model", effort="mid", exclusive=True,
+                ),
+            }),
+            "reasonix": WorkflowHarnessConfig(profiles={
+                "ds4-1-flash": HarnessProfileConfig(model="ds4-1-flash"),
+            }),
+        },
+        workflows={"live": WorkflowConfig(
+            steps={"implement": WorkflowStepConfig(
+                role="worker", prompts=("p",),
+                go=(GoTransition(to="END", when="DONE"),),
+            )},
+            first_step="implement",
+        )},
+        prompts={"p": "Work."},
+    )
+    handover_output = "\n".join(
+        f"## {heading}\n- bounded operational evidence"
+        for heading in HANDOVER_HEADINGS
+    )
+
+    class MarkedSourceDriver:
+        capabilities = SessionCapabilities(
+            session_identity=True, followup_turn=True, read_only_teardown=True,
+        )
+        def __init__(self) -> None:
+            self.calls = 0
+            self.started = threading.Event()
+        def build_full_context(self, run_dir):
+            return {"plan_state": {"checkpoint": 1}}
+        def handover(self, request, prompt, lifecycle=None):
+            assert lifecycle is not None, "exclusive handover must carry the lease"
+            self.calls += 1
+            self.started.set()
+            return handover_output
+
+    class HandoverTargetDriver:
+        capabilities = SessionCapabilities(
+            session_identity=True, idempotent_turn_start=True,
+        )
+        def __init__(self) -> None:
+            self.starts = 0
+        def build_invocation(self, request):
+            return HarnessInvocation(
+                label="handover-target", argv=("handover-target",), env={},
+                prompt_mode="synthetic", system_prompt=request.system_prompt,
+                user_prompt=request.user_prompt, effective_prompt=request.user_prompt,
+            )
+        def parse_result(self, request, stdout, *, returncode=0):
+            self.starts += 1
+            return SessionResult(
+                session_id="reasonix-target", selector=request.selector,
+                model=request.model, effort=request.effort, final_output="DONE",
+                capabilities=self.capabilities,
+            )
+
+    source_driver = MarkedSourceDriver()
+    target_driver = HandoverTargetDriver()
+    handover_resume = ResumeContext(
+        resumed_from_run_id="handover-predecessor", feature_branch=None,
+        worktree_path=None, main_branch=None, setup=(), teardown=(),
+        interrupted_step_name="implement",
+        role_selectors={"worker": handover_transaction.target_selector},
+        current_hotplug_transaction=handover_transaction,
+        pending_hotplug_transaction=handover_transaction,
+        active_role_sessions=(recovered_session,), hotplug_transaction_number=2,
+    )
+
+    def completing_runner(argv, **kwargs):
+        del kwargs
+        plan.write_text("# Plan\n\n### [x] Checkpoint 1: First\n- [x] step\n", encoding="utf-8")
+        return subprocess.CompletedProcess(argv, 0, "wire", "")
+
+    identity, invocation_id = _occupy_resource(store, marked_resource)
+    runs_root = tmp_path / ".aflow" / "runs"
+    known_runs = {item.name for item in runs_root.iterdir()} if runs_root.is_dir() else set()
+    result: dict = {}
+
+    def launch() -> None:
+        try:
+            result["value"] = run_workflow(
+                ControllerConfig(repo_root=tmp_path, plan_path=plan, max_turns=2),
+                marked_config, "live", config_dir=tmp_path, adapter=CodexAdapter(),
+                snapshot_config=False, runner=completing_runner,
+                session_driver=target_driver, source_session_driver=source_driver,
+                resume=handover_resume, preflight_probe=NoOpHarnessPreflightProbe(),
+            )
+        except BaseException as exc:  # noqa: BLE001 - surfaced by assertions
+            result["error"] = exc
+
+    def new_run_dirs() -> list[Path]:
+        if not runs_root.is_dir():
+            return []
+        return sorted(
+            item for item in runs_root.iterdir()
+            if item.is_dir() and item.name not in known_runs
+        )
+
+    def waiting_record() -> dict | None:
+        dirs = new_run_dirs()
+        if not dirs:
+            return None
+        payload_path = dirs[-1] / "run.json"
+        if not payload_path.is_file():
+            return None
+        payload = json.loads(payload_path.read_text(encoding="utf-8"))
+        return payload.get("execution_resource_wait")
+
+    thread = threading.Thread(target=launch, daemon=True)
+    thread.start()
+    try:
+        assert _wait_until(lambda: waiting_record() is not None), (
+            "the marked handover never queued on the recovered tuple's resource"
+        )
+        waiting = waiting_record()
+        assert waiting["resource"] == marked_resource, waiting
+        assert waiting["resource"] != edited_resource
+        assert waiting["kind"] == "handover"
+        assert source_driver.calls == 0, (
+            "the source callback must not start while the resource is occupied"
+        )
+        assert target_driver.starts == 0, (
+            "the target must not start while the resource is occupied"
+        )
+        assert _resource_journal_owner(tmp_path, edited_resource) is None, (
+            "the handover must never queue or claim the edited profile's resource"
+        )
+        _release_resource(store, marked_resource, identity, invocation_id)
+        assert source_driver.started.wait(timeout=30), (
+            "handover callback never started after release"
+        )
+    finally:
+        _release_resource(
+            store, marked_resource, identity, invocation_id, required=False,
+        )
+    thread.join(timeout=30)
+    assert not thread.is_alive(), "workflow never finished the handover"
+    assert "error" not in result, result.get("error")
+    assert source_driver.calls == 1
+    assert target_driver.starts == 1
+    assert _resource_journal_owner(tmp_path, marked_resource) is None
+    assert _resource_journal_owner(tmp_path, edited_resource) is None
 
 
 @pytest.mark.parametrize("field", [
