@@ -36,6 +36,11 @@
   admission and populated checkpoint detail before opening the result and
   measuring scroll; exact equality, retained focus/disclosure and zero-launch
   assertions remain in force.
+- Admission now publishes the allocated queue ticket when an enqueue retries
+  successfully after journal-lock contention, replacing its provisional wait
+  record. A deterministic real-lock regression covers that transition; the
+  subsequent-round fairness check waits for ticket 3 before asserting it,
+  while preserving the worker-call and release ordering checks.
 - The controller persists an `execution_resource_wait` record with private
   controller identity in `run.json`; the bounded, redacted read-only projection surfaces a neutral
   `Waiting for resource` status with the exact resource label only while the

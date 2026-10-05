@@ -1427,6 +1427,48 @@ class TestTurnAdmission:
         assert calls == [_WORKER_BASE]
         assert _run_json(run_dir).get("execution_resource_wait") is None
 
+    def test_retried_enqueue_publishes_allocated_ticket_after_lock_contention(
+        self, tmp_path: Path, resource_store: ExecutionResourceStore,
+    ) -> None:
+        resource = execution_resource_key("codex", "retry-ticket", None)
+        foreign, foreign_invocation = _occupy(resource_store, resource)
+        controller = resource_store.current_controller_identity()
+        assert controller is not None
+        spec = ClaimSpec(str(tmp_path), "run", "retry", "turn", "worker", "codex.base")
+        waiting: list[tuple[str | None, int | None]] = []
+        lock_fd = os.open(tmp_path / "resource-store" / f"{resource}.lock", os.O_RDWR)
+        fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+
+        def on_waiting(reason: str | None, ticket: int | None) -> None:
+            waiting.append((reason, ticket))
+            if ticket is None:
+                assert reason == "lock_contended"
+                fcntl.flock(lock_fd, fcntl.LOCK_UN)
+
+        def release_after_ticket_published(_seconds: float) -> None:
+            # Enqueue recovered while the foreign owner still holds the
+            # resource: the new ticket must replace the provisional record.
+            assert waiting == [("lock_contended", None), (None, 2)]
+            _release(resource_store, resource, foreign, foreign_invocation)
+
+        admission = ExecutionResourceAdmission(
+            resource_store, sleeper=release_after_ticket_published, clock=lambda: 0.0,
+        )
+        try:
+            lease = admission.admit(
+                resource=resource, spec=spec, controller=controller,
+                stop_check=lambda: None, revalidate=lambda final: UNCHANGED,
+                on_waiting=on_waiting,
+            )
+            assert lease is not None
+            assert waiting == [("lock_contended", None), (None, 2)]
+            lease.complete()
+        finally:
+            fcntl.flock(lock_fd, fcntl.LOCK_UN)
+            os.close(lock_fd)
+            resource_store.cancel(resource, spec.invocation_id, controller)
+            _release(resource_store, resource, foreign, foreign_invocation, required=False)
+
     def test_stale_post_acquire_preparation_reprepares(
         self, tmp_path: Path, resource_store: ExecutionResourceStore,
         monkeypatch: pytest.MonkeyPatch,
@@ -1951,7 +1993,7 @@ class TestTurnAdmission:
             _foreign_acquire(resource_store, resource, identity, invocation_id)
             assert _wait_until(
                 lambda: (
-                    _run_json(run_dir).get("execution_resource_wait") is not None
+                    (_run_json(run_dir).get("execution_resource_wait") or {}).get("ticket") == 3
                 )
             )
             waiting = _run_json(run_dir)["execution_resource_wait"]

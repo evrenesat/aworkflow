@@ -1057,6 +1057,12 @@ class ExecutionResourceAdmission:
                         )
                     ticket = outcome.ticket
                     acquired = outcome.state == "acquired"
+                    if not acquired and on_waiting is not None and (
+                        ticket is not None or outcome.reason != last_reason
+                    ):
+                        # A lock-contended enqueue had no ticket. Publish
+                        # its recovered queue position before yielding again.
+                        on_waiting(outcome.reason, ticket)
                     last_reason = outcome.reason
                 else:
                     outcome = self._store.try_acquire(
