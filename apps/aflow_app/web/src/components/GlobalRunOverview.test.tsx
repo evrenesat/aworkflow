@@ -1206,4 +1206,40 @@ describe('GlobalRunOverview project context', () => {
     cancelledResponse.resolve(matchingDetail(run))
     replacementResponse.resolve(matchingDetail(run))
   })
+
+  it('lists a running exclusive resource wait in Ongoing with the exact resource message', async () => {
+    const waiting = makeRun('exclusive-wait-run', {
+      status: 'running',
+      activity: 'active',
+      status_reason_code: 'running',
+      history_state: 'visible',
+      plan_path: 'plans/in-progress/exclusive.md',
+      original_plan_display_name: 'exclusive-plan.md',
+      evidence: {
+        execution_resource_wait: {
+          version: 1,
+          resource: 'd'.repeat(64),
+          label: 'codex / gpt-5-codex / effort high',
+          invocation_id: 'inv-g-1',
+          kind: 'workflow',
+          role: 'worker',
+          selector: 'codex.gpt-5-codex',
+          step: 'implement',
+          ticket: 1,
+          wait_started_at: '2026-10-04T10:00:00Z',
+        },
+      },
+    })
+    vi.mocked(api.listControlPlaneRuns).mockResolvedValue(page([waiting]))
+    vi.mocked(api.getControlPlaneRun).mockResolvedValue(waiting)
+    render(<GlobalRunOverview projects={[primary]} onOpen={vi.fn()} />)
+
+    expect(await screen.findByRole('heading', { name: 'Ongoing (1)' })).toBeTruthy()
+    const row = document.querySelector('[data-run-row="true"]')
+    expect(row).toBeTruthy()
+    expect(row?.querySelector('.status-pill')?.textContent).toBe('Waiting for resource')
+    expect(row?.querySelector('.run-row-meta-fact')?.textContent).toBe(
+      'Waiting for codex / gpt-5-codex / effort high (exclusive)',
+    )
+  })
 })

@@ -1,5 +1,6 @@
 """Read-only, shared evidence projection for public run activity."""
 
+from collections.abc import Mapping
 from dataclasses import replace
 import os
 from pathlib import Path
@@ -51,6 +52,72 @@ def valid_startup_question(record) -> bool:
         return False
 
 
+_EXECUTION_RESOURCE_WAIT_CODE = "execution_resource_wait"
+
+# Only the bounded, owner-safe fields of the durable wait record are projected
+# to status consumers. Controller process identity and every other runlog
+# field stay in the run directory.
+_WAIT_REQUIRED_FIELDS: tuple[str, ...] = (
+    "resource",
+    "label",
+    "invocation_id",
+    "kind",
+    "role",
+    "selector",
+    "step",
+    "wait_started_at",
+)
+_WAIT_OPTIONAL_FIELDS: tuple[str, ...] = ("reason",)
+
+
+def execution_resource_wait_projection(record: object) -> dict[str, object] | None:
+    """Validate a durable execution-resource wait record for status display.
+
+    Returns a projected copy containing only the safe display fields, or
+    ``None`` when the record is missing, stale (a different schema version),
+    or malformed.  Projection never interprets the record beyond this shape
+    check; terminal, stopped, unknown, and inactive controller evidence are
+    handled separately by :func:`project_activity`.
+    """
+    if not isinstance(record, Mapping) or record.get("version") != 1:
+        return None
+    projected: dict[str, object] = {"version": 1}
+    for field in _WAIT_REQUIRED_FIELDS:
+        value = record.get(field)
+        if not isinstance(value, str) or not value.strip() or len(value) > 256:
+            return None
+        projected[field] = value.strip()
+    # The durable ticket is a positive integer (FIFO order) or explicit null
+    # when the broker has not yet assigned one.  Strings, booleans, and
+    # non-positive numbers are malformed and fail the projection closed.
+    ticket = record.get("ticket")
+    if ticket is not None and not (isinstance(ticket, int) and not isinstance(ticket, bool) and ticket > 0):
+        return None
+    projected["ticket"] = ticket
+    for field in _WAIT_OPTIONAL_FIELDS:
+        value = record.get(field)
+        if value is None or value == "":
+            continue
+        if not isinstance(value, str) or not value.strip() or len(value) > 128:
+            return None
+        projected[field] = value.strip()
+    owner_unconfirmed = record.get("owner_unconfirmed")
+    if owner_unconfirmed is not None and not isinstance(owner_unconfirmed, bool):
+        return None
+    if owner_unconfirmed is True:
+        projected["owner_unconfirmed"] = True
+    return projected
+
+
+def execution_resource_wait_message(record: Mapping[str, object]) -> str:
+    """Owner-facing neutral message for a validated wait record."""
+    label = str(record.get("label") or "resource")
+    message = f"Waiting for {label} (exclusive)"
+    if record.get("owner_unconfirmed") is True or record.get("reason") == "owner_unconfirmed":
+        message += "; previous execution could not be confirmed stopped"
+    return message
+
+
 def project_activity(run: RunStatus) -> RunStatus:
     evidence = run.evidence
     active = evidence.get("unit_active")
@@ -69,6 +136,17 @@ def project_activity(run: RunStatus) -> RunStatus:
     elif active is True:
         status = raw if raw in {"paused", "waiting_for_input", "waiting_for_valid_override"} else "running" if evidence.get("has_run_metadata") else "launch_started"
         code, reason = "execution_active" if evidence.get("has_run_metadata") else "launch_active", None
+        # A confirmed active controller may report the bounded, neutral
+        # execution-resource wait.  Terminal, stopped, unknown, and inactive
+        # evidence above take precedence, so this never masks a stronger
+        # state; a stale record on an inactive controller is ignored.
+        if status == "running":
+            wait_record = execution_resource_wait_projection(evidence.get("execution_resource_wait"))
+            if wait_record is not None:
+                code = _EXECUTION_RESOURCE_WAIT_CODE
+                reason = execution_resource_wait_message(wait_record)
+                # Publish only the bounded projection, never the raw record.
+                run = replace(run, evidence={**evidence, "execution_resource_wait": wait_record})
     elif evidence.get("startup_failure"):
         code = "startup_failed"
     elif evidence.get("startup_state") == "awaiting_startup_answer" and evidence.get("startup_question_valid"):

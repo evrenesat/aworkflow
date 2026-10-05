@@ -1,5 +1,31 @@
 # DEVLOG
 
+## 2026-10-05 — Exclusive execution resources: durable FIFO broker and neutral waiting status
+
+- Harness profiles can mark a resolved `(harness, model, effort)` combination
+  as exclusive (`exclusive = true` in `aflow.toml` or the Teams Settings
+  `Exclusive` checkbox). The derived identity excludes profile, role, team,
+  and project, so marked aliases share one account-local capacity-one FIFO
+  resource per host/account, and any model/effort edit changes identity.
+- `execution_resources.py` adds the durable broker: nonce-checked
+  `queued -> reserved -> launching -> running -> removed` claims bound to
+  controller process lifetime, positive-evidence release, conservative
+  `unconfirmed` owner diagnosis, and fail-closed journal handling. Deleting
+  journal files or restarting a controller is not safe release evidence.
+- Workflow turns and auxiliary model calls gate on the shared control-aware
+  admission loop (owner stop and live config revalidation serviced while
+  queued; cancel-and-reprepare on live changes); probe-free paths such as
+  git-only fast-forward merges never consume a resource. A busy selected
+  worker waits without moving through the upgrade chain.
+- The controller persists a bounded redacted `execution_resource_wait`
+  record in `run.json`; the read-only status projection surfaces a neutral
+  `Waiting for resource` status with the exact resource label only while the
+  controller is active and running, with terminal/stop/unknown precedence.
+  The web run rows, All runs, and Current work render the same message;
+  acquisition clears it without remounting populated content.
+- Docs: runtime-behavior and cli-usage sections, architecture boundary
+  record, and a README configuration pointer.
+
 ## 2026-10-04 — Canonical worker-artifact integration fixture roots (issue #70)
 
 - Resolve the fixture root before deriving primary-repository and worktree

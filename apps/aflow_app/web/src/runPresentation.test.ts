@@ -21,6 +21,7 @@ import {
   runExecutorFacts,
   runActivityText,
   runDisplayProjection,
+  executionResourceWaiting,
   runFinishText,
   runPlanDisplayName,
   runPlanDisplayNameForRun,
@@ -452,5 +453,99 @@ describe('launch team family presentation', () => {
     expect(launchTeamUpgradeRoute(withExternal, 'product_fast')).toEqual(['product_fast', 'external'])
     const product = launchTeamFamilyGroups(withExternal).find((group) => group.rootId === 'product')!
     expect(launchTeamFamilyHint(withExternal, product)).toContain('Fast → External')
+  })
+})
+
+const exclusiveWaitRecord = {
+  version: 1,
+  resource: 'a'.repeat(64),
+  label: 'codex / gpt-5-codex / effort high',
+  invocation_id: 'inv-1',
+  kind: 'workflow',
+  role: 'worker',
+  selector: 'codex.gpt-5-codex',
+  step: 'implement',
+  ticket: 1,
+  wait_started_at: '2026-10-04T10:00:00Z',
+}
+
+function makeExclusiveRun(overrides: Partial<RunStatus> = {}): RunStatus {
+  return {
+    run_id: 'run-exclusive-1', status: 'running', schema_version: 1, ownership: 'control_plane', revision: 1,
+    reason: null, unit_name: 'aflow-run-run-exclusive-1.service', launch_phase: 'unit_started',
+    workflow_name: 'managed', team: 'base-team', original_plan_display_name: 'Exclusive resource run',
+    current_step: 'implement', turns_completed: 1, max_turns: 100, selected_start_step: 'implement',
+    skipped_steps: [], restarted_from_run_id: null, started_at: '2026-10-04T09:59:00Z', ended_at: null,
+    activity: 'active', evidence: { execution_resource_wait: exclusiveWaitRecord }, progress: null,
+    ...overrides,
+  }
+}
+
+describe('exclusive resource waiting presentation', () => {
+  it('shows the exact resource message while the controller is confirmed active and running', () => {
+    const run = makeExclusiveRun()
+    expect(executionResourceWaiting(run)).toEqual({
+      label: 'codex / gpt-5-codex / effort high',
+      message: 'Waiting for codex / gpt-5-codex / effort high (exclusive)',
+    })
+    expect(runActivityText(run)).toBe('Waiting for codex / gpt-5-codex / effort high (exclusive)')
+    expect(runDisplayProjection(run)).toEqual({ category: 'active', label: 'Waiting for resource', tone: 'neutral' })
+  })
+
+  it('keeps the unconfirmed-owner suffix when the durable record records it', () => {
+    const run = makeExclusiveRun({
+      evidence: { execution_resource_wait: { ...exclusiveWaitRecord, reason: 'owner_unconfirmed', owner_unconfirmed: true } },
+    })
+    expect(executionResourceWaiting(run)?.message).toBe(
+      'Waiting for codex / gpt-5-codex / effort high (exclusive); previous execution could not be confirmed stopped',
+    )
+  })
+
+  it.each([
+    ['terminal completed', { status: 'completed', activity: 'inactive' }],
+    ['owner stop', { status: 'owner_stopped', activity: 'inactive' }],
+    ['inactive controller', { activity: 'inactive' }],
+    ['unknown controller', { activity: 'unknown' }],
+  ])('does not render waiting under %s evidence', (_name, overrides) => {
+    const run = makeExclusiveRun(overrides)
+    expect(executionResourceWaiting(run)).toBeNull()
+    expect(runActivityText(run)).not.toContain('Waiting for')
+    expect(runDisplayProjection(run).label).not.toBe('Waiting for resource')
+  })
+
+  it('ignores stale, malformed, or unbounded wait records', () => {
+    for (const evidence of [
+      { execution_resource_wait: { ...exclusiveWaitRecord, version: 2 } },
+      { execution_resource_wait: { ...exclusiveWaitRecord, label: '' } },
+      { execution_resource_wait: { ...exclusiveWaitRecord, label: 7 } },
+      { execution_resource_wait: 'Waiting for something' },
+      { execution_resource_wait: null },
+      { execution_resource_wait: { ...exclusiveWaitRecord, owner_unconfirmed: 'yes' } },
+      {},
+    ]) {
+      const run = makeExclusiveRun({ evidence })
+      expect(executionResourceWaiting(run), JSON.stringify(evidence)).toBeNull()
+    }
+  })
+
+  it('accepts integer and null tickets and rejects malformed tickets', () => {
+    for (const good of [1, 42, null]) {
+      const run = makeExclusiveRun({
+        evidence: { execution_resource_wait: { ...exclusiveWaitRecord, ticket: good } },
+      })
+      expect(executionResourceWaiting(run), JSON.stringify(good)).not.toBeNull()
+    }
+    for (const bad of ['1', 0, -1, true, 1.5, '']) {
+      const run = makeExclusiveRun({
+        evidence: { execution_resource_wait: { ...exclusiveWaitRecord, ticket: bad } },
+      })
+      expect(executionResourceWaiting(run), JSON.stringify(bad)).toBeNull()
+    }
+  })
+
+  it('never renders waiting for a terminal record that keeps a stale wait field', () => {
+    const run = makeExclusiveRun({ status: 'failed', activity: 'inactive', ended_at: '2026-10-04T11:00:00Z' })
+    expect(executionResourceWaiting(run)).toBeNull()
+    expect(runDisplayProjection(run).label).toBe('Failed')
   })
 })

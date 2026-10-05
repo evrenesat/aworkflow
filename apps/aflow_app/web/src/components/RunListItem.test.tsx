@@ -382,4 +382,49 @@ describe('RunListItem', () => {
     expect(Number.parseInt(preview.style.top, 10)).toBeGreaterThanOrEqual(12)
     expect(Number.parseInt(preview.style.width, 10)).toBeLessThanOrEqual(320)
   })
+
+  describe('exclusive resource waiting row', () => {
+    const waitingRun: RunStatus = {
+      ...run,
+      run_id: 'run-exclusive-row',
+      current_step: null,
+      evidence: {
+        execution_resource_wait: {
+          version: 1,
+          resource: 'b'.repeat(64),
+          label: 'codex / gpt-5-codex / effort high',
+          invocation_id: 'inv-1',
+          kind: 'workflow',
+          role: 'worker',
+          selector: 'codex.gpt-5-codex',
+          step: 'implement',
+          ticket: 1,
+          wait_started_at: '2026-10-04T10:00:00Z',
+        },
+      },
+    }
+
+    it('shows the neutral waiting label and the exact resource message on the compact activity line', () => {
+      const { container } = render(<RunListItem run={waitingRun} stableKey="run-exclusive-row" onSelect={vi.fn()} />)
+      const pill = container.querySelector('.status-pill')!
+      expect(pill.textContent).toBe('Waiting for resource')
+      expect(pill.className).toContain('status-active')
+      const fact = container.querySelector('.run-row-meta-fact')!
+      expect(fact.textContent).toBe('Waiting for codex / gpt-5-codex / effort high (exclusive)')
+    })
+
+    it('keeps the resource message in the accessible name and preview while progress is present', () => {
+      const runWithProgress: RunStatus = {
+        ...waitingRun,
+        progress: previewProgress(progressCount(2), progressCount(11)),
+      }
+      const { container } = render(<RunListItem run={runWithProgress} stableKey="run-exclusive-row-progress" onSelect={vi.fn()} />)
+      const fact = container.querySelector('.run-row-meta-fact')!
+      expect(fact.textContent).toBe('Waiting for codex / gpt-5-codex / effort high (exclusive)')
+      const selection = container.querySelector<HTMLButtonElement>('.run-list-select')!
+      expect(selection.getAttribute('aria-label')).toContain('Waiting for codex / gpt-5-codex / effort high (exclusive)')
+      fireEvent.click(screen.getByRole('button', { name: /Preview Automatic/ }))
+      expect(screen.getByRole('dialog').textContent).toContain('Waiting for codex / gpt-5-codex / effort high (exclusive)')
+    })
+  })
 })

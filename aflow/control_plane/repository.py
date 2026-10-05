@@ -24,7 +24,12 @@ from .models import (
     bounded_redacted,
 )
 from .persistence import PersistenceError, RunIdentityError, read_events, validate_run_id
-from .run_activity import project_activity, preparation_active, valid_startup_question
+from .run_activity import (
+    execution_resource_wait_projection,
+    project_activity,
+    preparation_active,
+    valid_startup_question,
+)
 
 
 MAX_PAGE_SIZE = 1_000
@@ -444,6 +449,13 @@ class RunRepository:
                 "no_agent_started": status != "running" and not metadata and phase in {None, "manifest_only"},
                 "overrides": self._override_summary(run_dir, metadata),
                 **({"recovery_worker": recovery_worker} if recovery_worker is not None else {}),
+                # Bounded, validated projection of the durable wait record;
+                # read-only and never sourced from the resource store.
+                **({
+                    "execution_resource_wait": wait_projection
+                } if (wait_projection := execution_resource_wait_projection(
+                    metadata.get("execution_resource_wait")
+                )) is not None else {}),
             },
         )
         projected = project_activity(

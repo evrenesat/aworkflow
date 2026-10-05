@@ -590,6 +590,55 @@ function isUnrecordedOutcome(run: RunStatus): boolean {
     && run.status_reason_code === 'unit_missing'
 }
 
+/**
+ * A neutral, bounded view of the durable execution-resource wait record the
+ * control plane projects into `evidence`.  The record is only meaningful while
+ * the exact controller is confirmed active and running; terminal, stopped,
+ * inactive, and unknown controller evidence never renders as waiting.
+ */
+export interface ExecutionResourceWaiting {
+  label: string
+  message: string
+}
+
+const RESOURCE_WAIT_REQUIRED_FIELDS = [
+  'resource',
+  'label',
+  'invocation_id',
+  'kind',
+  'role',
+  'selector',
+  'step',
+  'wait_started_at',
+] as const
+
+// The durable ticket is a positive integer (FIFO order) or explicit null when
+// the broker has not yet assigned one.  Strings, booleans, and non-positive
+// numbers are malformed and fail the projection closed.
+function isValidResourceTicket(value: unknown): boolean {
+  return value === null || (typeof value === 'number' && Number.isInteger(value) && value > 0)
+}
+
+export function executionResourceWaiting(run: RunStatus | null | undefined): ExecutionResourceWaiting | null {
+  if (!run || run.status !== 'running' || run.activity !== 'active') return null
+  const record = run.evidence?.execution_resource_wait
+  if (!record || typeof record !== 'object' || Array.isArray(record)) return null
+  const candidate = record as Record<string, unknown>
+  if (candidate.version !== 1) return null
+  for (const field of RESOURCE_WAIT_REQUIRED_FIELDS) {
+    if (typeof candidate[field] !== 'string' || (candidate[field] as string).trim() === '') return null
+  }
+  if ('ticket' in candidate && !isValidResourceTicket(candidate.ticket)) return null
+  if (candidate.owner_unconfirmed !== undefined && typeof candidate.owner_unconfirmed !== 'boolean') return null
+  if (candidate.reason !== undefined && typeof candidate.reason !== 'string') return null
+  const label = (candidate.label as string).trim()
+  let message = `Waiting for ${label} (exclusive)`
+  if (candidate.owner_unconfirmed === true || candidate.reason === 'owner_unconfirmed') {
+    message += '; previous execution could not be confirmed stopped'
+  }
+  return { label, message }
+}
+
 function rawStatusLabel(run: RunStatus): string {
   if (run.status === 'failed' && run.worker_exit && !run.evidence.has_run_metadata) return 'Could not start'
   if (run.status_reason_code === 'startup_failed') return 'Could not start'
@@ -609,6 +658,13 @@ function rawStatusLabel(run: RunStatus): string {
 export function runDisplayProjection(run: RunStatus): RunDisplayProjection {
   if (isUnrecordedOutcome(run)) {
     return { category: 'outcome-unrecorded', label: 'Outcome not recorded', tone: 'muted' }
+  }
+
+  // A confirmed active controller waiting on an exclusive resource keeps the
+  // run active with a neutral waiting label; the exact resource message is
+  // shown by `executionResourceWaiting` on the activity and detail surfaces.
+  if (executionResourceWaiting(run)) {
+    return { category: 'active', label: 'Waiting for resource', tone: 'neutral' }
   }
 
   const label = rawStatusLabel(run)
@@ -663,6 +719,8 @@ export function runFinishText(run: RunStatus): string | null {
 /** One compact line for a collapsed row; detailed evidence belongs in Details. */
 export function runActivityText(run: RunStatus): string {
   if (isTerminalInactiveRun(run)) return runFinishText(run) ?? 'Finish time not reported'
+  const resourceWait = executionResourceWaiting(run)
+  if (resourceWait) return resourceWait.message
   const context = [
     run.workflow_name ? formatMachineLabel(run.workflow_name) : null,
     run.team ? formatMachineLabel(run.team) : null,

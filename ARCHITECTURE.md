@@ -242,6 +242,44 @@ loading, review-stop remains visible but disabled and cannot mutate state.
 Disposable captures and the frozen-reference comparison are recorded in
 `docs/ui-reference/calm-workspace/verification.md`.
 
+## Exclusive execution resources
+
+`execution_resources.py` owns a durable account-local broker for exclusive
+execution resources: one capacity-one FIFO resource per derived
+`(harness, model, effort)` combination key, serialized across controller
+processes on the same host/account under the user's AFlow configuration
+directory. The broker validates, fences, and persists claims only; it never
+calls providers, invokes harnesses, or rewrites workflow state.
+
+Claims move `queued -> reserved -> launching -> running -> removed` under the
+journal lock. A `reserved` claim cannot execute until a nonce-checked durable
+`launching` write succeeds, a `running` claim releases only after positive
+cessation evidence, and uncertain observations remain `unconfirmed`. A
+corrupted journal fails closed for that resource instead of being reset.
+Leases bind to controller process lifetime (PID/process-start/host-boot
+identity), and dead-owner reclamation requires positive evidence, never file
+deletion or controller restart.
+
+`workflow.py` gates each model-bearing invocation (workflow turns and
+auxiliary model calls; probe-free paths such as git-only fast-forward merges
+are excluded) through a shared control-aware admission loop: idempotent
+enqueue by invocation id, `try_acquire` polling while servicing owner stop and
+live configuration revalidation, cancel-and-reprepare on live changes that
+require it, and a final stop/config check before `mark_launching`. The loop
+persists a bounded private wait record into `run.json`
+(`execution_resource_wait`) and emits structured waiting/acquired/cancelled
+events. The private record includes controller PID, process birth and host boot
+identity; the public read-only projection excludes those process fields.
+
+The read-only status projection (`control_plane/run_activity.py` plus the
+repository evidence mirror) validates the optional wait record and surfaces it
+only while the controller is active and running: terminal state, owner stop,
+inactive, unknown, and contradictory receipt evidence all take precedence,
+and the projection replaces raw evidence with the bounded redacted shape. The
+UI renders a neutral `Waiting for resource` status with the exact resource
+label; CLI status prints the same message. API transport shapes and page
+layouts are unchanged.
+
 ## Observer progress boundary
 
 `control_plane/run_progress.py` adds a bounded, read-only projection to the
@@ -887,7 +925,7 @@ Loads `~/.config/aflow/aflow.toml` plus sibling `workflows.toml` (bootstrapped f
 - The multi-step same-node guard counts only consecutive turns without forward
   plan-snapshot movement. Productive cumulative checkpoint work resets the
   streak; unchanged or regressed state continues toward the configured cap.
-- **`[harness.<name>.profiles.<profile>]`** tables: `model`, optional `effort` per harness profile.
+- **`[harness.<name>.profiles.<profile>]`** tables: `model`, optional `effort`, and optional boolean `exclusive` per harness profile. `exclusive = true` marks the resolved `(harness, model, effort)` combination for the account-local durable FIFO broker (`execution_resources.py`); the profile key itself never enters the derived resource identity.
 - **`[roles]`** and **`[teams.<name>]`** tables: role-to-selector mappings, with team tables allowed to override a subset of the global map and optionally name a `backup_team` for harness recovery chaining. Nested `prompts` tables provide static per-role system guidance; active-team values replace global values for ordinary workflow turns only.
 - **`[manager]`**: Lite and Full role names, a semantic-stall threshold, `skill`, and the read-only `repartition_skill`. Roles are required only for workflows with supervision enabled. `upgrade_to` on a team is a separate one-edge implementation-quality route; both it and `backup_team` are acyclic validated team graphs.
 - **`[error_handling.harness_error_recovery]`**: ordered recovery rules, `max_consecutive_recoveries`, and the bundled fallback skill name used when deterministic matching cannot decide safely.

@@ -288,6 +288,91 @@ If no plan progress occurred:
 
 The run fails if recovery exceeds `max_consecutive_recoveries` or a backup-team chain is invalid.
 
+## Exclusive execution resources
+
+A harness profile can mark one model combination as exclusive, either in
+`aflow.toml` (`[harness.<name>.profiles.<profile>]` with `exclusive = true`)
+or through Settings → Agents & Roles, using the `Exclusive` checkbox on a profile row. The
+mark applies to the profile's resolved combination, not to the profile name.
+
+**Combination identity.** The resource key is derived only from the declared
+`(harness, model, effort)` tuple. Profile name, role, team, project, and
+configuration path are excluded, so two distinct profiles that resolve to the
+same marked combination — including aliases used by different roles or
+projects — share one exclusive resource. Changing a profile's `model` or
+`effort` computes a different key: the edit changes identity, and the new
+combination starts with no history on the old resource. Case is preserved and
+no provider-alias discovery occurs.
+
+**Scope and queueing.** The broker is account-local per host: one
+capacity-one durable FIFO resource per combination under the user's AFlow
+configuration directory, shared by every controller on that account/host,
+including concurrent controllers of one project (for example a project run at
+concurrency two) and all projects. A controller that finds the combination
+busy enqueues a durable claim and polls; it is not rejected. Claims are
+idempotent per invocation, and the wait loop services owner stop and live
+configuration revalidation on every control interval. A live configuration
+change to the selected combination cancels the queued claim and joins the
+destination resource's queue tail. Unchanged polling and prompt-only
+re-preparation retain the existing ticket and wait-start time. Each retry,
+correction, or new invocation takes a fresh tail ticket behind waiting peers.
+Worker and reviewer roles that resolve to the same marked
+combination overlap on the same resource: a running worker blocks a queued
+reviewer of that combination, and vice versa.
+
+**Waiting status.** While a controller waits, its run shows a neutral
+`Waiting for resource` status with the message `Waiting for {harness} /
+{model}[ / effort {effort}] (exclusive)`. Waiting is not a failure and does not
+imply required input; no model launch or new turn occurs while waiting. The
+message and a bounded, redacted wait record (no controller process identity) are
+published read-only in the run status evidence for the UI and CLI. Acquisition
+clears the wait and restores normal active status without remounting populated
+run content. Terminal state, owner stop, and unknown activity always take
+precedence over a stale wait record.
+
+**Upgrade-chain interaction.** A busy selected worker waits for its exclusive
+resource without moving through the `upgrade_to`/`backup_team` chain. Real
+review/repair evidence remains required for normal chain progression; the
+exclusive gate only delays the selected combination.
+
+**Probe exclusion.** Preflight and other probe calls that never make a model
+call do not consume an exclusive resource.
+
+**Two models and aliases.** For example, these two Pi combinations use
+independent resources; the marked alias shares Swift's resource across roles
+and projects on the same account and host. Unmarked profiles stay unrestricted.
+
+```toml
+[harness.pi.profiles.swift]
+model = "xtx/swift-1.5-qwen3.8-27b-mtp"
+effort = "medium"
+exclusive = true
+
+[harness.pi.profiles.other]
+model = "local/another-model"
+effort = "medium"
+exclusive = true
+
+[harness.pi.profiles.swift-review-alias]
+model = "xtx/swift-1.5-qwen3.8-27b-mtp"
+effort = "medium"
+exclusive = true
+```
+
+With project concurrency two, plan A can run the exclusive Swift worker while
+plan B waits. When A releases that invocation and starts a reviewer on a
+different combination, B can start Swift concurrently with A's review. Later
+worker rounds and retries rejoin the queue behind waiting peers. Both plans
+may be reviewing at once, so this permits overlap without promising constant
+worker utilization. Busy selection never advances a worker's upgrade chain.
+
+**Unconfirmed owners.** A claim whose controller died without positive
+cessation evidence stays `unconfirmed`; the broker diagnoses it conservatively
+and the waiting message is suffixed with `previous execution could not be
+confirmed stopped`. A corrupted journal fails closed for that resource instead
+of being reset. Deleting broker journal files or restarting a controller is
+not safe release evidence and must not be used to clear an unconfirmed claim.
+
 ## Disk-backed run state and boundary overrides
 
 Every new `.aflow/runs/<run-id>/run.json` is a schema-version `2` controller

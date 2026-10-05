@@ -517,6 +517,7 @@ describe('RunDashboard', () => {
   })
 
   afterEach(() => {
+    vi.useRealTimers()
     window.history.replaceState(null, '', locationBeforeTest)
     if (clipboardDescriptorBeforeTest) Object.defineProperty(navigator, 'clipboard', clipboardDescriptorBeforeTest)
     else Reflect.deleteProperty(navigator, 'clipboard')
@@ -5522,5 +5523,124 @@ describe('RunDashboard', () => {
     vi.mocked(api.getControlPlaneCapabilities).mockRejectedValue(new Error('team upgrade cycle detected at "base"'))
     renderDashboard()
     expect(await screen.findByText(/team upgrade cycle detected/)).toBeDefined()
+  })
+
+  describe('exclusive resource waiting detail', () => {
+    const exclusiveRun = {
+      run_id: 'run-exclusive-detail',
+      status: 'running',
+      schema_version: 1,
+      ownership: 'control_plane' as const,
+      revision: 1,
+      reason: 'Waiting for codex / gpt-5-codex / effort high (exclusive)',
+      unit_name: 'aflow-run-run-exclusive-detail.service',
+      launch_phase: 'running',
+      workflow_name: 'managed',
+      team: 'base',
+      current_step: 'implement',
+      turns_completed: 2,
+      max_turns: 8,
+      selected_start_step: null,
+      skipped_steps: [] as string[],
+      restarted_from_run_id: null as string | null,
+      started_at: '2024-01-01T00:00:00Z',
+      activity: 'active' as const,
+      evidence: {
+        manifest_created_at: '2024-01-01T00:00:00Z',
+        plan_path: 'plans/in-progress/demo.md',
+        worktree_path: '/workspace/alpha',
+        branch: 'feature/run',
+        execution_resource_wait: {
+          version: 1,
+          resource: 'c'.repeat(64),
+          label: 'codex / gpt-5-codex / effort high',
+          invocation_id: 'inv-exclusive-1',
+          kind: 'workflow',
+          role: 'worker',
+          selector: 'codex.gpt-5-codex',
+          step: 'implement',
+          ticket: 1,
+          wait_started_at: '2024-01-01T00:01:00Z',
+        },
+      },
+    }
+
+    it('shows the neutral waiting label and the exact resource message as the current work', async () => {
+      vi.mocked(api.listControlPlaneRuns).mockResolvedValue({ runs: [exclusiveRun], next_cursor: null, schema_version: 1 })
+      vi.mocked(api.getControlPlaneRun).mockResolvedValue(exclusiveRun)
+      renderDashboard()
+      await waitFor(() => expect(findRunSelection('run-exclusive-detail')).not.toBeNull())
+      fireEvent.click(findRunSelection('run-exclusive-detail')!)
+      const overview = await screen.findByText('Waiting for codex / gpt-5-codex / effort high (exclusive)', { selector: '.run-overview-lead' })
+      expect(overview).toBeDefined()
+      const pills = [...document.querySelectorAll('.status-pill')].map(pill => pill.textContent)
+      expect(pills).toContain('Waiting for resource')
+    })
+
+    it('keeps the detail open and drops the waiting message on a passive refresh after acquisition', async () => {
+      const acquired = {
+        ...exclusiveRun,
+        revision: 2,
+        reason: null,
+        evidence: { ...exclusiveRun.evidence, execution_resource_wait: undefined },
+      }
+      let listCalls = 0
+      vi.mocked(api.listControlPlaneRuns).mockImplementation(async () => {
+        listCalls += 1
+        return { runs: [listCalls === 1 ? exclusiveRun : acquired], next_cursor: null, schema_version: 1 }
+      })
+      vi.mocked(api.getControlPlaneRun)
+        .mockResolvedValueOnce(exclusiveRun)
+        .mockResolvedValue(acquired)
+      renderDashboard()
+      await waitFor(() => expect(findRunSelection('run-exclusive-detail')).not.toBeNull())
+      fireEvent.click(findRunSelection('run-exclusive-detail')!)
+      await screen.findByText('Waiting for codex / gpt-5-codex / effort high (exclusive)', { selector: '.run-overview-lead' })
+
+      // The global history broadcast drives a passive background refresh while
+      // the detail stays open.
+      fireEvent(window, new Event('aflow-history-changed'))
+      await waitFor(() => expect(api.getControlPlaneRun).toHaveBeenCalledTimes(2))
+      const lead = await screen.findByText('Implement · turn 2', { selector: '.run-overview-lead' })
+      expect(lead).toBeDefined()
+      expect(screen.queryByText('Waiting for codex / gpt-5-codex / effort high (exclusive)')).toBeNull()
+    })
+
+    it('keeps stop controls available while the exclusive resource is pending', async () => {
+      vi.mocked(api.listControlPlaneRuns).mockResolvedValue({ runs: [exclusiveRun], next_cursor: null, schema_version: 1 })
+      vi.mocked(api.getControlPlaneRun).mockResolvedValue(exclusiveRun)
+      renderDashboard()
+      await waitFor(() => expect(findRunSelection('run-exclusive-detail')).not.toBeNull())
+      fireEvent.click(findRunSelection('run-exclusive-detail')!)
+      await screen.findByText('Waiting for codex / gpt-5-codex / effort high (exclusive)', { selector: '.run-overview-lead' })
+      await openRunActions()
+      expect(screen.getByRole('menuitem', { name: 'Review stop options…', exact: true })).toBeDefined()
+    })
+
+    it('keeps the previous worker in history instead of exclusive resource waiting current work', async () => {
+      const reviewing = { ...exclusiveRun, current_step: 'review', evidence: {
+        ...exclusiveRun.evidence, execution_resource_wait: {
+          ...exclusiveRun.evidence.execution_resource_wait, role: 'reviewer', step: 'review',
+        },
+      } }
+      vi.mocked(api.listControlPlaneRuns).mockResolvedValue({ runs: [reviewing], next_cursor: null, schema_version: 1 })
+      vi.mocked(api.getControlPlaneRun).mockResolvedValue(reviewing)
+      vi.mocked(api.listRunEvents).mockResolvedValue([
+        { sequence: 1, event_type: 'turn_started', schema_version: 1, timestamp: '2024-01-01T00:00:00Z',
+          data: { turn_number: 1, step_name: 'implement', step_role: 'worker', resolved_selector: 'pi.previous-worker', resolved_model_display: 'previous-worker-model' } },
+        { sequence: 2, event_type: 'turn_finished', schema_version: 1, timestamp: '2024-01-01T00:01:00Z',
+          data: { turn_number: 1, step_name: 'implement', status: 'completed', summary: 'Completed fixture work' } },
+      ])
+      renderDashboard()
+      await waitFor(() => expect(findRunSelection('run-exclusive-detail')).not.toBeNull())
+      fireEvent.click(findRunSelection('run-exclusive-detail')!)
+      await screen.findByText(/Waiting for codex/, { selector: '.run-overview-lead' })
+      await waitFor(() => expect(api.listRunEvents).toHaveBeenCalled())
+      const current = document.querySelector('[data-ui-fidelity-anchor="current-work"]')!
+      expect(current.textContent).not.toContain('pi.previous-worker')
+      expect(current.textContent).not.toContain('previous-worker-model')
+      expect(current.textContent).not.toContain('turn 1')
+      expect(document.querySelector('[data-ui-fidelity-anchor="latest-result"]')?.textContent).toContain('Completed')
+    })
   })
 })

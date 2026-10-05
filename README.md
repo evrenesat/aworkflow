@@ -155,6 +155,13 @@ an explicit stage submits its exact team ID. See the
 [team-family configuration notes](docs/configuration.md#roles-teams-and-harness-profiles)
 for one-level inheritance, conversion limits, and reference-safe deletion.
 
+Profiles can also mark a resolved harness/model/effort combination as
+exclusive (`exclusive = true`, or the `Exclusive` checkbox in Teams
+Settings); marked combinations then share one account-local FIFO resource and
+waiting controllers show a neutral `Waiting for resource` status. See
+[exclusive execution resources](docs/runtime-behavior.md#exclusive-execution-resources)
+for identity, scope, and queueing behavior.
+
 ## Read-only guard reports
 
 The bundled `aflow-guard-development-run` skill treats an explicit `:vr`

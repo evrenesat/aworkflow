@@ -305,6 +305,11 @@ interactive. Display values are bounded, but durable artifact references are
 never truncated, and control bytes are flattened so pasted logs stay safe.
 Engine exit codes and final success/failure messages on stdout are unchanged.
 
+While an exclusive-resource controller is queued, the status message is the
+neutral `Waiting for {harness} / {model}[ / effort {effort}] (exclusive)`
+record; acquisition clears it back to the normal running-turn message.
+Waiting is not a failure and starts no model call.
+
 ## Show
 
 `aflow show` prints workflow graphs and the role/team relationships they use as
@@ -376,3 +381,14 @@ Supported harness adapters:
 | `opencode` | `opencode run --format default --dir <repo-root>` | No |
 | `reasonix` | `reasonix run --dir <repo-root> [--model MODEL] [--effort EFFORT]` | Yes |
 | `pi` | `pi --print --tools read,bash,edit,write,grep,find,ls` | Yes |
+
+A profile table may also set `exclusive = true` (web: the `Exclusive`
+checkbox on the profile row). The mark binds the resolved `(harness, model,
+effort)` combination, not the profile name: marked aliases of the same
+tuple share one account-local exclusive resource across roles and projects,
+while any model or effort edit changes the identity. A controller whose
+combination is busy queues in the durable FIFO broker and reports a neutral
+`Waiting for {harness} / {model}[ / effort {effort}] (exclusive)` status
+instead of failing. See
+[runtime behavior: exclusive execution resources](runtime-behavior.md#exclusive-execution-resources)
+for scope, queueing, chain interaction, and unconfirmed-owner diagnosis.

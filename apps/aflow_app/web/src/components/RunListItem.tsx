@@ -8,6 +8,7 @@ import {
   runDurationText,
   runPlanPresentationForRun,
   runDisplayProjection,
+  executionResourceWaiting,
 } from '../runPresentation'
 import { RunProgress, compactRunProgressText, runProgressAccessibleText, type RunProgressLoadState } from './RunProgress'
 
@@ -92,7 +93,13 @@ export function RunListItem({
   const duration = knownFact(runDurationText(run))
   const activity = knownFact(runActivityText(run))
   const compactProgressFact = run.progress ? compactRunProgressText(run.progress, run) : null
-  const rowActivityFact = compactProgressFact || isTerminalInactiveRun(run) ? null : activity
+  const resourceWait = executionResourceWaiting(run)
+  // A confirmed active controller waiting on an exclusive resource names the
+  // exact resource on the compact line; checkpoint progress does not replace
+  // it while the controller is not executing.
+  const rowActivityFact = resourceWait
+    ? resourceWait.message
+    : compactProgressFact || isTerminalInactiveRun(run) ? null : activity
   const startedAt = formatLocalTimestamp(run.started_at)
   const quietFact = plan.date ?? (startedAt ? `Started ${startedAt}` : null) ?? compactProgressFact
   const accessibleFacts = [plan.label, plan.date, progressLabel, progressLoadLabel, duration, activity].filter((value): value is string => Boolean(value))

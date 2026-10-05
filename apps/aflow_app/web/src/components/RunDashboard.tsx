@@ -52,6 +52,7 @@ import {
   shortRunId,
   statusLabel,
   executionDuration,
+  executionResourceWaiting,
 } from '../runPresentation'
 import { workspaceHref } from '../urlState'
 import { formatMachineChoice, formatMachineLabel } from '../label'
@@ -3298,13 +3299,19 @@ export function RunDashboard({ visible = true, page, onNewRun, onCancelNewRun, o
       : runDisplayProjection(selectedRun).category === 'outcome-unrecorded'
         ? null
         : (() => {
+      // A confirmed active controller waiting on an exclusive resource shows
+      // the exact bounded resource message as the current work; terminal,
+      // stopped, and inactive evidence above keeps its precedence.
+      const resourceWait = executionResourceWaiting(selectedRun)
       const currentWork = postReviewFailure
         ? `Review turn finished; delivery blocked${lastReviewStep ? ` · ${lastReviewStep}` : ''}.`
         : failedReview
         ? `Review stopped${lastReviewStep ? ` · ${lastReviewStep}` : ''}.`
         : isTerminalInactiveRun(selectedRun)
         ? `No current work — ${statusLabel(selectedRun)}.`
-        : canonicalProgress
+        : resourceWait
+          ? resourceWait.message
+          : canonicalProgress
           ? runCurrentWorkText(canonicalProgress, selectedRun.current_step)
           : selectedRun.current_step
             ? [
@@ -3316,7 +3323,13 @@ export function RunDashboard({ visible = true, page, onNewRun, onCancelNewRun, o
             : selectedRun.activity === 'active'
                 ? 'Active work is in progress.'
                 : `${statusLabel(selectedRun)} — current work is not reported.`
-      const executorFacts = failedReview || postReviewFailure
+      // While the confirmed controller is waiting on an exclusive resource the
+      // lead shows the exact bounded resource message (which embeds the queued
+      // combination).  The prior worker/model/turn from completed history is
+      // not the current work, so it is never rendered as executor facts here.
+      const executorFacts = resourceWait
+        ? []
+        : failedReview || postReviewFailure
         ? [lastExecuted?.selector, lastExecuted?.model].filter((value): value is string => Boolean(value))
         : [
         selectedRun.current_step && !isTerminalInactiveRun(selectedRun) ? formatMachineLabel(selectedRun.current_step) : null,
