@@ -245,6 +245,18 @@ def test_exclusive_resource_waiting_journey(control_client, monkeypatch, tmp_pat
                 row.click()
                 current_work = page.locator("[data-ui-fidelity-anchor='current-work'] .run-overview-content")
                 expect(current_work).to_contain_text(WAIT_MESSAGE)
+                # Current work is deliberately usable before the initial
+                # history/configuration/context reads finish. Their loading
+                # notices are not an unchanged background refresh: wait for
+                # this fixture's admitted detail before measuring its scroll.
+                page.get_by_role("button", name="More", exact=True).click()
+                page_menu = page.get_by_role("menu", name="More run page actions", exact=True)
+                expect(page_menu.get_by_role("menuitem", name="Refresh", exact=True)).to_be_enabled()
+                page_menu.press("Escape")
+                expect(page_menu).not_to_be_visible()
+                expect(page.locator('.checkpoint-history[aria-label="Checkpoint history"]')
+                       .get_by_role("button", name="Expand all", exact=True)).to_be_visible()
+                expect(page.locator(".run-dashboard")).not_to_contain_text("Run history is still loading")
                 expect(current_work).not_to_contain_text("controller_pid")
                 expect(current_work).not_to_contain_text("pi.previous-worker")
                 expect(current_work).not_to_contain_text("previous-worker-model")

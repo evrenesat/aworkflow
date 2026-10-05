@@ -30,6 +30,12 @@
 - Waiting-status browser checks retain exact scroll equality and publish
   before/after geometry and screenshots to CI artifacts, including failure
   capture for investigating the intermittent macOS tablet result.
+- macOS CI captures identified an initial-load measurement race: the test
+  took its scroll baseline while history and checkpoint detail still showed
+  loading notices. The unchanged-refresh check now waits for initial dashboard
+  admission and populated checkpoint detail before opening the result and
+  measuring scroll; exact equality, retained focus/disclosure and zero-launch
+  assertions remain in force.
 - The controller persists an `execution_resource_wait` record with private
   controller identity in `run.json`; the bounded, redacted read-only projection surfaces a neutral
   `Waiting for resource` status with the exact resource label only while the
