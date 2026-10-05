@@ -289,16 +289,20 @@ def test_run_process_spawn_failure_releases_claim_without_child(tmp_path: Path) 
 def test_run_process_bind_failure_reaps_child_and_retains_claim(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     store = make_store(tmp_path)
     lease = make_lease(store, "inv-1")
+    bound_pids: list[int] = []
+
+    def reject_binding(resource, invocation_id, controller, child_pid, child_birth, process_group):
+        bound_pids.append(child_pid)
+        return er.Outcome("rejected", reason="not_owner")
+
     monkeypatch.setattr(
         store,
         "register_child",
-        lambda *args, **kwargs: er.Outcome("rejected", reason="not_owner"),
+        reject_binding,
     )
-    pid_file = tmp_path / "child.pid"
     script = write_script(
         tmp_path,
         "child.py",
-        f"import os\nopen({str(pid_file)!r}, 'w').write(str(os.getpid()))\n"
         "import time\n"
         "time.sleep(30)\n",
     )
@@ -307,9 +311,11 @@ def test_run_process_bind_failure_reaps_child_and_retains_claim(tmp_path: Path, 
     assert excinfo.value.stage == "register_child"
     assert isinstance(excinfo.value.__cause__, ResourceLeaseError)
     assert owner_status(tmp_path, RESOURCE) == "unconfirmed"
-    child_pid = int(pid_file.read_text())
+    # Registration may fail before the child interpreter executes its script.
+    # The attempted binding identifies the actual child even in that window.
+    assert len(bound_pids) == 1
     with pytest.raises(ProcessLookupError):
-        os.kill(child_pid, 0)
+        os.kill(bound_pids[0], 0)
 
 
 def test_run_process_owner_stop_retains_claim_while_child_runs(tmp_path: Path) -> None:
@@ -324,12 +330,18 @@ def test_run_process_owner_stop_retains_claim_while_child_runs(tmp_path: Path) -
         "time.sleep(30)\n",
     )
     polls = []
+    child_pid: int | None = None
+    ready_deadline = time.monotonic() + 10
 
     def control() -> None:
+        nonlocal child_pid
         polls.append(1)
-        raise RuntimeError("owner stop requested")
+        ready_pid = pid_file.read_text().strip() if pid_file.exists() else ""
+        if ready_pid.isdecimal():
+            child_pid = int(ready_pid)
+            raise RuntimeError("owner stop requested")
+        assert time.monotonic() < ready_deadline, "local test child did not become ready"
 
-    child_pid: int | None = None
     try:
         with pytest.raises(RuntimeError, match="owner stop"):
             _run_process(
@@ -342,10 +354,17 @@ def test_run_process_owner_stop_retains_claim_while_child_runs(tmp_path: Path) -
         child_pid = int(pid_file.read_text())
         os.kill(child_pid, 0)  # the child must still be running
     finally:
+        if child_pid is None:
+            owner = read_journal(tmp_path, RESOURCE).get("owner") or {}
+            child_pid = owner.get("child_pid")
         if child_pid is not None:
             try:
                 os.kill(child_pid, 9)
             except ProcessLookupError:
+                pass
+            try:
+                os.waitpid(child_pid, 0)
+            except ChildProcessError:
                 pass
 
 

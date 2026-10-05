@@ -24,6 +24,12 @@
 - CI follow-up preserves the three-argument owned-session interface for
   unmarked drivers and passes marked leases through the optional `lifecycle`
   keyword, including keyword-only and `**kwargs` drivers.
+- Process-lifetime tests synchronize owner stop with the local child's
+  readiness signal and identify failed registration through its actual bound
+  PID, retaining the live-child and reaped-child assertions on slower hosts.
+- Waiting-status browser checks retain exact scroll equality and publish
+  before/after geometry and screenshots to CI artifacts, including failure
+  capture for investigating the intermittent macOS tablet result.
 - The controller persists an `execution_resource_wait` record with private
   controller identity in `run.json`; the bounded, redacted read-only projection surfaces a neutral
   `Waiting for resource` status with the exact resource label only while the

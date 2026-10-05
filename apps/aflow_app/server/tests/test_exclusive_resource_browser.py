@@ -11,12 +11,14 @@ control-plane projection (``project_activity``) over the live API.
 from __future__ import annotations
 
 import json
+import os
 import re
+import shutil
 from dataclasses import replace
 from pathlib import Path
 
 import pytest
-from playwright.sync_api import expect, sync_playwright
+from playwright.sync_api import Error as PlaywrightError, expect, sync_playwright
 
 from test_control_plane_api import PROJECT_ID, control_client, live_server
 from test_responsive_browser import (
@@ -149,6 +151,17 @@ def _refresh(page) -> None:
     expect(page.locator(".run-dashboard")).not_to_contain_text("Loading run context")
 
 
+def _scroll_geometry(page) -> dict:
+    return page.evaluate("""() => {
+        const result = document.querySelector('[data-ui-fidelity-anchor="latest-result"]');
+        const rect = result?.getBoundingClientRect();
+        return {scroll: window.scrollY, height: document.documentElement.scrollHeight,
+                viewport: innerHeight, result_top: rect?.top ?? null,
+                result_height: rect?.height ?? null,
+                result_open: Boolean(result?.querySelector('details[open]'))};
+    }""")
+
+
 @pytest.fixture(scope="module")
 def browser():
     """Reuse one browser per engine; contexts and server state stay isolated."""
@@ -248,10 +261,25 @@ def test_exclusive_resource_waiting_journey(control_client, monkeypatch, tmp_pat
 
                 # A refresh while waiting changes nothing: same message, same
                 # scroll position, and no model launch or turn appears.
-                scroll = page.evaluate("window.scrollY")
+                before = _scroll_geometry(page)
                 _refresh(page)
                 expect(current_work).to_contain_text(WAIT_MESSAGE)
-                assert page.evaluate("window.scrollY") == scroll
+                after = _scroll_geometry(page)
+                artifact_dir = Path(os.environ.get("AFLOW_BROWSER_ARTIFACT_DIR", str(shots)))
+                artifact_dir.mkdir(parents=True, exist_ok=True)
+                browser_name = os.environ.get("AFLOW_TEST_BROWSER", "chromium")
+                prefix = f"exclusive-refresh-{browser_name}-{width}x{height}-{theme}"
+                (artifact_dir / f"{prefix}.json").write_text(
+                    json.dumps({"before": before, "after": after}, indent=2), encoding="utf-8"
+                )
+                shutil.copyfile(shots / f"waiting-detail-{width}x{height}-{theme}.png",
+                                artifact_dir / f"{prefix}-before.png")
+                if after["scroll"] != before["scroll"]:
+                    try:
+                        page.screenshot(path=str(artifact_dir / f"{prefix}-failure.png"))
+                    except PlaywrightError as screenshot_error:
+                        print("EXCLUSIVE_SCROLL_SCREENSHOT_ERROR", str(screenshot_error)[:300])
+                assert after["scroll"] == before["scroll"], {"before": before, "after": after}
                 assert node.evaluate("node => node.isConnected")
                 assert focus.evaluate("node => node === document.activeElement")
                 expect(disclosure).to_have_attribute("open", "")
@@ -259,6 +287,8 @@ def test_exclusive_resource_waiting_journey(control_client, monkeypatch, tmp_pat
                 assert _turn_count(root, WAITING_RUN_ID) == 0
                 assert no_launch == []
                 page.screenshot(path=str(shots / f"waiting-refreshed-{width}x{height}-{theme}.png"))
+                shutil.copyfile(shots / f"waiting-refreshed-{width}x{height}-{theme}.png",
+                                artifact_dir / f"{prefix}-after.png")
 
                 # Acquired: the controller picks the resource up, the exact
                 # waiting message disappears, and normal active work returns.
