@@ -12,6 +12,12 @@
   retain the existing continuation behavior. REST/MCP contracts exercise real
   bootstrap, ordinary resume and durable recovery.
 
+- Integration preserves the existing deployed recovery commit: a lost worker
+  is inactive only when nonce-bound wrapper, child and process-group probes
+  all positively confirm absence. Uncertain or present processes still block.
+- Verified locally: 78 focused runtime tests, 153 REST/MCP contract tests,
+  production Ruff checks and Python compilation passed.
+
 Refs https://github.com/evrenesat/aworkflow/issues/71.
 
 ## 2026-10-05 — Storage and evidence hygiene in bundled skills
