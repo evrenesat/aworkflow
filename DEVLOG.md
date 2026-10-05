@@ -1,5 +1,20 @@
 # DEVLOG
 
+## 2026-10-05 — Storage and evidence hygiene in bundled skills
+
+- Added a compact role-appropriate "Storage and evidence hygiene" section to
+  the eight bundled skills (`aflow-plan`, `aflow-execute-plan`,
+  `aflow-execute-checkpoint`, `aflow-review-checkpoint`, `aflow-review-final`,
+  `aflow-review-squash`, `aflow-assistant`, `aflow-manager`): planned output
+  locations and conservative peak/reserve estimates, bounded worker recovery
+  before `AFLOW_STOP`, owned-disposable cleanup boundaries, inspectable compact
+  proof retention, evidence reuse by reviewers, and read-only manager
+  supervision. Existing workflow contracts are unchanged.
+- Instructions are generic: no hostnames, inventories, credentials, incident
+  records, or machine-specific paths in the public bundled skills.
+- Verified: `uv run pytest -q tests/test_skill_store.py tests/test_skill_install.py
+  tests/test_skill_refresh.py` passes; `git diff --check` passes.
+
 ## 2026-10-04 — Canonical worker-artifact integration fixture roots (issue #70)
 
 - Resolve the fixture root before deriving primary-repository and worktree

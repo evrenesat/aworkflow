@@ -7,6 +7,15 @@ description: "Checkpoint-scoped review for AFlow plans. Use when an agent should
 
 Use this skill only for checkpoint-scoped review of work produced under an aflow plan that includes `Git Tracking`. It is meant to be installed as a static skill and driven by prompt context from the workflow engine.
 
+## Storage and evidence hygiene
+
+- Assess storage and evidence hygiene as concrete acceptance where it is material: owned disposable scratch cleaned after successful evidence extraction, failed and unique artifacts retained, verbose output bounded at production.
+- Reuse worker evidence only when its primary log is inspectable and the relevant state is unchanged; do not rerun an unchanged worker check without a reason and do not demand per-review evidence copies.
+- Fix permitted environment prerequisites within review authority, or route one bounded recoverable action; do not repeat unchanged rejection loops for recoverable storage conditions.
+- Never approve missing acceptance to avoid disk failures; a failed, interrupted, or missing required check blocks approval.
+- Keep the cumulative required final verification intact; do not move broad suites into this checkpoint review.
+- Do not invent speculative platform requirements (quotas, dashboards, cloud storage) that the plan does not ask for.
+
 ## Behavior
 
 - Load the active plan before reviewing code or history.

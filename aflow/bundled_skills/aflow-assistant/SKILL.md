@@ -11,6 +11,15 @@ AFlow drives agent CLIs through checkpointed Markdown plans; a workflow step is
 an engine node, a turn is one harness call, and a checkpoint is reviewable plan
 work. Resuming creates a successor run, not a second controller for the old run.
 
+## Storage and evidence hygiene
+
+- Supervise storage recovery using the installed deterministic cleanup helpers and actual measured capacity, not guesses.
+- Keep one controller per logical run and use supported resume; do not repeat retries without changed evidence.
+- When a run reports low space, distinguish a fixable prerequisite (bounded owned cleanup, cache reuse) from genuinely exhausted capacity before requesting an external decision.
+- Ask for the actual free space, the conservative required peak/reserve, and the actions already tried; do not promise unlimited disk capacity or bypass genuine reserves and approval gates.
+- Prefer bounding verbose logs and captures at production; keep evidence links compact rather than repeated full captures.
+- Never authorize deleting other owners' data, active work, unique data, session history, lineage, or proofs required for unresolved failures.
+
 ## Choose the relevant guide
 
 - **Connect, discover, plan, launch, monitor, control, or resume through MCP:**

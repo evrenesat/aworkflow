@@ -9,6 +9,18 @@ Use this skill only to execute an existing aflow plan autonomously. Treat `aflow
 
 The plan file is the source of truth. Do not rely on chat memory when the plan, repository state, test output, or git history disagree.
 
+## Storage and evidence hygiene
+
+- Before heavy writes, measure free bytes and inodes and, where applicable, backing capacity; compare against the plan's stated peak allocation and reserve.
+- Serialize heavy campaigns through the environment's shared lock; do not start a parallel heavy campaign that the lock exists to prevent.
+- If space is low, do not immediately `AFLOW_STOP`: inspect bounded category usage, reuse valid caches and artifacts, and remove only known disposable owned intermediates (or native-manager unused caches) within authorization. Rerun the capacity check and continue in the same attempt.
+- Honor installed native cleanup helpers where available; do not invent destructive recovery, expand disks, or delete other owners' data.
+- Never delete active work, unique data, retained base or release images, models, session history, AFlow lineage, or proofs required for unresolved failures.
+- If no safe recovery suffices, report the actual free space, the conservative required peak/reserve, the actions tried, and the concrete remaining external decision.
+- Keep primary logs, exact commands and results, revision/dirty fingerprints, and hashes inspectable. Bound verbose logs and captures at production. Select compact useful evidence; make no per-review copies or repeated full captures.
+- Clean per-case QEMU writable disks after guest exit/unmount and successful evidence extraction; retain failed or unique images until diagnosed. A task may dispose of scratch it explicitly created as disposable, never inherited operation directories simply because they are old.
+- Reuse valid prior verification and caches; do not run clean builds or full suites merely because a new checkpoint started.
+
 ## Plan Shape
 
 - If the active plan is the original handoff plan with checkpoint headings, execute it checkpoint by checkpoint.

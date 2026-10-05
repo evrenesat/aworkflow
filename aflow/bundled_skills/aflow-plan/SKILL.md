@@ -7,6 +7,16 @@ description: "Create a strict AFlow checkpoint handoff plan for coding work that
 
 Create a generic, self-contained implementation plan organized into durable checkpoints. Plan only; do not implement.
 
+## Storage and evidence hygiene
+
+- For heavy work, specify owned output locations: named scratch/artifact directories, incremental build/test cache reuse, and bounded retention for scratch and proof.
+- State the peak additional allocation and the capacity reserve the work needs. Evidence-backed conservative estimates are acceptable where the plan permits; do not demand an exact measurement of an unbuilt output as a circular prerequisite.
+- Never present generic reference numbers as measured exact inputs; label each estimate and its basis.
+- Distinguish allocated (sparse) size from apparent size, and guest storage from host backing storage. Account for concurrent consumers of the same backing space.
+- Put targeted capacity checks in the checkpoints that perform heavy writes, and keep a single once-per-valid-state full gate in `Final Verification`; do not duplicate broad suites across checkpoints.
+- Specify cleanup: which owned disposable intermediates may be removed, and which unique data, images, models, session history, lineage, and failure proofs must be retained until diagnosed or explicitly released.
+- Prefer bounding verbose logs and captures at production over deleting the sole proof afterward.
+
 ## Core Behavior
 
 - Treat prompt-supplied scope and plan paths as authoritative. If the target is ambiguous, ask.

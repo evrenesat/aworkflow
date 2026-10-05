@@ -7,6 +7,15 @@ description: "Review a completed autonomous AFlow plan, compare the full accumul
 
 Use this skill only for the final review pass of work produced under a aflow plan that includes `Git Tracking`. It is meant to be installed as a static skill and driven by prompt context from the workflow engine.
 
+## Storage and evidence hygiene
+
+- Assess cumulative storage and evidence hygiene as concrete acceptance where it is material: no accumulated owned disposable scratch, failed and unique proofs retained, verbose output bounded at production.
+- Run the declared full regression set once per valid source/test/dependency/configuration/environment state; reuse inspectable primary logs from prior checkpoints and do not rerun unchanged checks without a reason.
+- Fix permitted environment prerequisites within review authority, or route one bounded recoverable action; do not repeat unchanged rejection loops for recoverable storage conditions.
+- Never approve missing acceptance to avoid disk failures; missing, failed, interrupted, or uninspectable required evidence blocks approval.
+- Keep the cumulative `Final Verification` gate intact; do not demand per-review evidence copies, clean builds, or new platform capabilities the plan does not require.
+- The allowed `DEVLOG.md` compaction at squash is bookkeeping, not evidence disposal; primary logs and required proofs stay inspectable.
+
 ## Behavior
 
 - Load the active original aflow plan before reviewing code or history.
