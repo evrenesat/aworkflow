@@ -45,6 +45,10 @@
   releasing the first holder; a process readiness event alone does not flush
   the multiprocessing queue. Joined producers' final receipts and successful
   exits remain part of its exclusion and ordering checks.
+- The settings browser journey waits for an enabled exclusive checkbox before
+  keyboard activation, then asserts the checked state and enabled Save action.
+  A controlled delayed initial read reproduced the prior no-op Space input on
+  a disabled form; persistence, untouched-row and no-launch checks remain.
 - The controller persists an `execution_resource_wait` record with private
   controller identity in `run.json`; the bounded, redacted read-only projection surfaces a neutral
   `Waiting for resource` status with the exact resource label only while the

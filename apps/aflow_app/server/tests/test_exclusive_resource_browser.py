@@ -418,11 +418,17 @@ def test_exclusive_checkbox_save_and_reload(control_client, monkeypatch, tmp_pat
             long_exclusive = long_row.get_by_label(f"Exclusive codex.{long_profile}", exact=True)
             expect(test_exclusive).not_to_be_checked()
             expect(long_exclusive).not_to_be_checked()
+            # Rows can render before all initial settings reads finish. Native
+            # keyboard input does not activate a disabled checkbox.
+            expect(test_exclusive).to_be_enabled()
             test_exclusive.focus()
             test_exclusive.press("Space")
+            expect(test_exclusive).to_be_checked()
+            save_button = page.get_by_role("button", name="Save all changes")
+            expect(save_button).to_be_enabled()
             with page.expect_response(lambda response: response.request.method == "PATCH"
                                       and "/config" in response.url) as saved:
-                page.get_by_role("button", name="Save all changes").click()
+                save_button.click()
             assert saved.value.ok
             assert isinstance(saved.value.json(), dict)
 
