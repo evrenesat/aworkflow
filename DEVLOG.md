@@ -30,6 +30,10 @@
 
 ## 2026-10-05 — Exclusive execution resources: durable FIFO broker and neutral waiting status
 
+- Model-switch admission tests inspect one durable wait snapshot per polling
+  predicate. Cancellation can clear the old wait before requeueing, so reading
+  separate snapshots for the presence guard and resource assertion races that
+  normal transition. Exact resource and pre-admission no-dispatch checks remain.
 - Harness profiles can mark a resolved `(harness, model, effort)` combination
   as exclusive (`exclusive = true` in `aflow.toml` or Settings → Agents & Roles'
   `Exclusive` checkbox). The derived identity excludes profile, role, team,

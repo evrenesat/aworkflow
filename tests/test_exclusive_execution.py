@@ -1026,11 +1026,8 @@ class TestTurnAdmission:
             )
             assert _wait_until(
                 lambda: (
-                    _run_json(run_dir).get("execution_resource_wait")
-                    and _run_json(run_dir)["execution_resource_wait"][
-                        "resource"
-                    ]
-                    == new_resource
+                    (wait := _run_json(run_dir).get("execution_resource_wait"))
+                    and wait["resource"] == new_resource
                 )
             )
             assert calls == []
@@ -3886,11 +3883,8 @@ class TestAuxiliaryAdmission:
             )
             assert _wait_until(
                 lambda: (
-                    _run_json(run_dir).get("execution_resource_wait")
-                    and _run_json(run_dir)["execution_resource_wait"][
-                        "resource"
-                    ]
-                    == new_resource
+                    (wait := _run_json(run_dir).get("execution_resource_wait"))
+                    and wait["resource"] == new_resource
                 )
             )
             assert "manager" not in calls, "no manager dispatch before admission"
@@ -4061,11 +4055,8 @@ class TestAuxiliaryAdmission:
             )
             assert _wait_until(
                 lambda: (
-                    _run_json(run_dir).get("execution_resource_wait")
-                    and _run_json(run_dir)["execution_resource_wait"][
-                        "resource"
-                    ]
-                    == new_resource
+                    (wait := _run_json(run_dir).get("execution_resource_wait"))
+                    and wait["resource"] == new_resource
                 )
             )
             assert "manager-correction" not in calls, (
@@ -4367,11 +4358,8 @@ go = [{ to = "END", when = "DONE" }, { to = "implement" }]
             )
             assert _wait_until(
                 lambda: (
-                    _run_json(run_dir).get("execution_resource_wait")
-                    and _run_json(run_dir)["execution_resource_wait"][
-                        "resource"
-                    ]
-                    == new_resource
+                    (wait := _run_json(run_dir).get("execution_resource_wait"))
+                    and wait["resource"] == new_resource
                 )
             )
             assert "decision" not in calls
