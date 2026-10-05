@@ -62,6 +62,7 @@ from aflow.harnesses.codex import CodexAdapter
 from aflow.harnesses.preflight import NoOpHarnessPreflightProbe
 from aflow.harnesses.session import (
     SessionCapabilities,
+    SessionExecutionResult,
     SessionRequest,
     SessionResult,
     retain_lifecycle_after_failure,
@@ -577,6 +578,68 @@ def resource_store(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
 
 
 class TestTurnAdmission:
+    @pytest.mark.parametrize("seam", ["keyword_only", "kwargs"])
+    def test_owned_session_receives_marked_lease_by_keyword(
+        self, tmp_path: Path, resource_store: ExecutionResourceStore, seam: str
+    ) -> None:
+        config_path, _ = _write_split_config(
+            home_dir=tmp_path,
+            aflow_text=_aflow_toml(),
+            workflows_text=_workflows_toml(steps="work_only"),
+        )
+        plan_path = tmp_path / "plan.md"
+        plan_path.write_text(_VALID_PLAN, encoding="utf-8")
+        resource = _resource_for(config_path, "codex.base")
+        assert resource is not None
+        calls: list[ExecutionLease] = []
+
+        class OwnedDriver:
+            capabilities = SessionCapabilities(session_identity=True)
+
+            def build_invocation(self, request):
+                return HarnessInvocation(
+                    label="owned-keyword-test", argv=("owned-keyword-test",), env={},
+                    prompt_mode="owned-session", system_prompt=request.system_prompt,
+                    user_prompt=request.user_prompt, effective_prompt=request.user_prompt,
+                )
+
+            def finish(self, request, lifecycle):
+                assert isinstance(lifecycle, ExecutionLease)
+                calls.append(lifecycle)
+                # This finite local fake creates no process. Its synchronous
+                # return proves cessation and releases the reserved claim.
+                lifecycle.complete()
+                plan_path.write_text(_VALID_PLAN.replace("[ ]", "[x]"), encoding="utf-8")
+                return SessionExecutionResult(
+                    result=SessionResult(
+                        session_id="owned-keyword-session", selector=request.selector,
+                        model=request.model, effort=request.effort, final_output="DONE",
+                        capabilities=self.capabilities,
+                    ),
+                    raw_transport="local fake completed",
+                )
+
+            def keyword_only(self, request, invocation, control_callback=None, *, lifecycle):
+                return self.finish(request, lifecycle)
+
+            def kwargs(self, request, invocation, control_callback=None, **kwargs):
+                assert set(kwargs) == {"lifecycle"}
+                return self.finish(request, kwargs["lifecycle"])
+
+        driver = OwnedDriver()
+        driver.execute_session = getattr(driver, seam)
+        result = run_workflow(
+            ControllerConfig(repo_root=tmp_path, plan_path=plan_path, max_turns=1),
+            load_workflow_config(config_path), "live", config_dir=config_path,
+            snapshot_config=False, adapter=CodexAdapter(), session_driver=driver,
+            preflight_probe=NoOpHarnessPreflightProbe(),
+        )
+        assert result.status == "completed"
+        assert len(calls) == 1
+        journal = json.loads((tmp_path / "resource-store" / f"{resource}.json").read_text())
+        assert journal["owner"] is None
+        assert journal["queue"] == []
+
     def test_worker_waits_for_busy_resource_then_acquires(
         self, tmp_path: Path, resource_store: ExecutionResourceStore
     ) -> None:

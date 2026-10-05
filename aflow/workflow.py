@@ -15441,7 +15441,10 @@ def _run_workflow_unchecked(
                             execution = execute_session(
                                 turn_session_request, invocation,
                                 _poll_live_control if step.role == "worker" else None,
-                                turn_lease,
+                                # Keep the legacy owned-driver call when no
+                                # resource is marked. Lifecycle-capable drivers
+                                # may expose the new seam as keyword-only.
+                                **({"lifecycle": turn_lease} if turn_lease is not None else {}),
                             )
                             owned_session_result = execution.result
                             completed = subprocess.CompletedProcess(

@@ -21,6 +21,9 @@
   manager launch intent before start/correction accounting. The paired-controller
   matrix uses real IPC-gated local harness children in disposable Git worktrees,
   verifying child binding/reaping, FIFO yielding and independent review overlap.
+- CI follow-up preserves the three-argument owned-session interface for
+  unmarked drivers and passes marked leases through the optional `lifecycle`
+  keyword, including keyword-only and `**kwargs` drivers.
 - The controller persists an `execution_resource_wait` record with private
   controller identity in `run.json`; the bounded, redacted read-only projection surfaces a neutral
   `Waiting for resource` status with the exact resource label only while the
