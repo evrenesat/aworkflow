@@ -9,6 +9,7 @@ import os
 import subprocess
 import sys
 import time
+from queue import Empty
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -1057,7 +1058,15 @@ def test_real_multiprocess_fifo_exclusion_and_independence(tmp_path: Path) -> No
         assert b_started.wait(timeout=60), "second caller never enqueued"
         # The independent resource must be usable while the first is occupied.
         assert c_holding.wait(timeout=60), "independent resource blocked by another"
-        drain()
+        # Event.set does not flush multiprocessing.Queue's feeder thread.
+        # Receive the acquisition receipt while A is still held, preserving
+        # the independence/order assertion without racing queue delivery.
+        deadline = time.monotonic() + 60
+        while not any(record[0] == "C-acquire" for record in records):
+            try:
+                records.append(queue.get(timeout=max(0, deadline - time.monotonic())))
+            except Empty:
+                pytest.fail("independent acquisition receipt was not delivered")
         assert ("C-acquire", 1, "acquired") in records
         assert not any(record[0] == "B-acquire" for record in records)
 
@@ -1077,6 +1086,8 @@ def test_real_multiprocess_fifo_exclusion_and_independence(tmp_path: Path) -> No
                 process.terminate()
                 process.join(timeout=5)
 
+    drain()  # Joined producers have flushed their final queue receipts.
+    assert all(process.exitcode == 0 for process in (a, b, c))
     b_acquire = next(record for record in records if record[0] == "B-acquire")
     assert ("A-enqueue", "queued", 1) in records
     assert ("A-acquire", "acquired") in records

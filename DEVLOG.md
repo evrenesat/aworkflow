@@ -41,6 +41,10 @@
   record. A deterministic real-lock regression covers that transition; the
   subsequent-round fairness check waits for ticket 3 before asserting it,
   while preserving the worker-call and release ordering checks.
+- The independent-process broker test receives its acquisition record before
+  releasing the first holder; a process readiness event alone does not flush
+  the multiprocessing queue. Joined producers' final receipts and successful
+  exits remain part of its exclusion and ordering checks.
 - The controller persists an `execution_resource_wait` record with private
   controller identity in `run.json`; the bounded, redacted read-only projection surfaces a neutral
   `Waiting for resource` status with the exact resource label only while the
