@@ -9,7 +9,6 @@ MCP listener in this module.
 from __future__ import annotations
 
 import json
-import re
 from collections.abc import Callable
 from typing import Annotated, Any, Literal, Mapping
 
@@ -29,6 +28,7 @@ from aflow.control_plane import (
     StartupQuestionRecord,
 )
 from aflow.control_plane.persistence import PersistenceError
+from aflow.mcp_credentials import contains_mcp_credential
 from aflow.daemon import (
     DaemonAuthorizationError,
     DaemonError,
@@ -61,9 +61,6 @@ _OWNER_STOP_TOOL_ANNOTATIONS = {
     **_WRITE_TOOL_ANNOTATIONS,
     "destructiveHint": True,
 }
-_CREDENTIAL_VALUE = re.compile(
-    r"(?i)\bbearer[ \t]+[^\s]+|(?:token|access_token|authorization)=[^&\s]+"
-)
 
 
 def _public_error_code(
@@ -168,18 +165,8 @@ def _bounded_offset(offset: int) -> int:
 
 
 def _reject_credential_arguments(arguments: Mapping[str, object]) -> None:
-    if any(_contains_credential(value) for value in arguments.values()):
+    if any(contains_mcp_credential(value) for value in arguments.values()):
         raise ValueError("credential-like MCP arguments are not allowed")
-
-
-def _contains_credential(value: object) -> bool:
-    if isinstance(value, str):
-        return _CREDENTIAL_VALUE.search(value) is not None
-    if isinstance(value, Mapping):
-        return any(_contains_credential(item) for item in value.values())
-    if isinstance(value, (list, tuple, set, frozenset)):
-        return any(_contains_credential(item) for item in value)
-    return False
 
 
 def _bounded_cursor(cursor: str | None) -> str | None:

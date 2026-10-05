@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 from dataclasses import replace
 import json
+import logging
 from pathlib import Path
 import subprocess
 from types import SimpleNamespace
@@ -2372,6 +2373,260 @@ def test_mcp_plan_authoring_uses_default_template_and_safe_errors(mcp_client) ->
     )
     assert invalid_status["result"]["isError"] is True
     assert "document-body-secret.md" not in invalid_status["result"]["content"][0]["text"]
+
+
+@pytest.mark.parametrize("mcp_path", ["/mcp", "/mcp/"])
+def test_mcp_credential_prose_authoring_parity(mcp_client, mcp_path) -> None:
+    """Ordinary credential-handling prose survives mounted MCP create/read/update."""
+    from aflow.project_settings import ProjectSettings, ProjectSettingsService
+
+    client, root, _, _ = mcp_client
+    settings = ProjectSettingsService(root)
+    settings.save(
+        ProjectSettings(auto_consume_plans=False),
+        expected_revision=settings.read().revision,
+    )
+    headers = {"Authorization": f"Bearer {TOKEN}"}
+    plans_path = f"/api/projects/{PROJECT_ID}/plans"
+    name = "prose-parity.md"
+    plan_file = root / "plans" / "todo" / name
+
+    def mcp_call(tool: str, arguments: dict[str, Any]) -> dict[str, Any]:
+        response = _mcp_request(
+            client, "tools/call", {"name": tool, "arguments": arguments}, path=mcp_path
+        )
+        assert "error" not in response
+        result = response["result"]
+        assert result.get("isError") is not True
+        return result.get("structuredContent")
+
+    # Both exact reported sentences from issue #52 and its owner reproduction.
+    initial = (
+        "Keep bearer credentials out of prompts\n"
+        "Use explicit environment bearer support\n"
+    )
+    created = mcp_call(
+        "create_plan",
+        {"project_id": PROJECT_ID, "name": name, "content": initial},
+    )
+    rest_read = client.get(f"{plans_path}/todo/{name}", headers=headers)
+    assert rest_read.status_code == 200
+    assert rest_read.json() == created
+    mcp_read = mcp_call(
+        "read_plan", {"project_id": PROJECT_ID, "plan_status": "todo", "name": name}
+    )
+    assert mcp_read == rest_read.json()
+    assert plan_file.read_text(encoding="utf-8") == initial
+
+    # Benign variants: mixed case, a comma, an ending period, and an NBSP.
+    updated_content = (
+        "Keep Bearer credentials, out of prompts.\n"
+        "Provide explicit environment bearer support.\n"
+        "Keep bearer\u00a0credentials out of prompts and logs.\n"
+    )
+    updated = mcp_call(
+        "update_plan",
+        {
+            "project_id": PROJECT_ID,
+            "plan_status": "todo",
+            "name": name,
+            "content": updated_content,
+            "expected_revision": created["revision"],
+        },
+    )
+    assert updated["revision"] != created["revision"]
+    assert updated["content"] == updated_content
+    assert client.get(f"{plans_path}/todo/{name}", headers=headers).json() == updated
+    assert mcp_call(
+        "read_plan", {"project_id": PROJECT_ID, "plan_status": "todo", "name": name}
+    ) == updated
+    assert plan_file.read_text(encoding="utf-8") == updated_content
+
+    # An intervening REST edit must make the stale MCP revision conflict.
+    rest_edit = client.put(
+        f"{plans_path}/todo/{name}",
+        headers=headers,
+        json={
+            "content": "Edited over REST.\n",
+            "expected_revision": updated["revision"],
+        },
+    )
+    assert rest_edit.status_code == 200
+    rest_document = rest_edit.json()
+    stale = _mcp_request(
+        client,
+        "tools/call",
+        {
+            "name": "update_plan",
+            "arguments": {
+                "project_id": PROJECT_ID,
+                "plan_status": "todo",
+                "name": name,
+                "content": "Stale MCP prose.\n",
+                "expected_revision": updated["revision"],
+            },
+        },
+        path=mcp_path,
+    )
+    assert stale["result"]["isError"] is True
+    assert stale["result"]["content"][0]["text"] == "revision_conflict"
+    assert client.get(f"{plans_path}/todo/{name}", headers=headers).json() == rest_document
+    assert plan_file.read_text(encoding="utf-8") == "Edited over REST.\n"
+
+
+@pytest.mark.parametrize("mcp_path", ["/mcp", "/mcp/"])
+def test_mcp_credential_payload_rejection(
+    mcp_client, mcp_path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Credential-shaped values are rejected before any operation runs."""
+    from aflow.project_settings import ProjectSettings, ProjectSettingsService
+
+    client, root, units, _ = mcp_client
+    settings = ProjectSettingsService(root)
+    settings.save(
+        ProjectSettings(auto_consume_plans=False),
+        expected_revision=settings.read().revision,
+    )
+    caplog.set_level(logging.DEBUG)
+    baseline_launches = list(units.start_calls)
+    headers = {"Authorization": f"Bearer {TOKEN}"}
+    plans_path = f"/api/projects/{PROJECT_ID}/plans"
+    name = "rejection-target.md"
+    plan_file = root / "plans" / "todo" / name
+
+    negative_forms = {
+        "standalone-alphabetic": "Bearer shortword",
+        "hyphenated": "Bearer fake-token-52",
+        "hyphenated-embedded": "Use Bearer fake-token-52 for the probe.",
+        "explicit-header": "Authorization: Bearer shortword",
+        "serialized-header": '{"Authorization": "Bearer shortword"}',
+        "numeric-embedded": "Use Bearer Ab12 for the probe.",
+        "jwt-embedded": "Set (Bearer abc.def.ghi) here.",
+        "base64-embedded": 'Send "Bearer YWJjZA==" now.',
+        "assignment": "token=secret123",
+        "resource-query": "aflow://projects/x?token=secret123",
+        "nested-list": {"headers": ["Bearer fake-token-52"]},
+    }
+    synthetic_substrings = (
+        "shortword",
+        "fake-token-52",
+        "Ab12",
+        "abc.def.ghi",
+        "YWJjZA==",
+        "secret123",
+    )
+
+    def post_payload(params: dict[str, Any], method: str = "tools/call") -> "object":
+        return client.post(
+            mcp_path,
+            headers=MCP_HEADERS,
+            json={"jsonrpc": "2.0", "id": 1, "method": method, "params": params},
+        )
+
+    def assert_rejected(response: object) -> None:
+        assert response.status_code == 400
+        assert response.json() == {"detail": {"code": "token_payload_rejected"}}
+        for substring in synthetic_substrings:
+            assert substring not in response.text
+        assert units.start_calls == baseline_launches
+
+    def reject_content(sentinel: str) -> None:
+        response = post_payload(
+            {
+                "name": "create_plan",
+                "arguments": {"project_id": PROJECT_ID, "name": name, "content": sentinel},
+            }
+        )
+        assert_rejected(response)
+        assert sentinel not in response.text
+        assert not plan_file.exists()
+
+    for sentinel in negative_forms.values():
+        reject_content(sentinel if isinstance(sentinel, str) else json.dumps(sentinel))
+
+    # A non-content argument carrying a credential is rejected at the payload.
+    assert_rejected(
+        post_payload(
+            {
+                "name": "start_run",
+                "arguments": {
+                    "project_id": PROJECT_ID,
+                    "plan_path": "plans/todo/test-plan.md",
+                    "idempotency_key": "Bearer fake-token-52",
+                },
+            }
+        )
+    )
+
+    # A resource URI carrying a credential query is rejected at the payload.
+    assert_rejected(
+        post_payload(
+            {"uri": "aflow://projects/x/capabilities?token=secret123"},
+            method="resources/read",
+        )
+    )
+
+    # An actual nested map/list JSON argument is rejected by HTTP prevalidation
+    # before schema validation can see the unknown "extra" field.
+    assert_rejected(
+        post_payload(
+            {
+                "name": "create_plan",
+                "arguments": {
+                    "project_id": PROJECT_ID,
+                    "name": name,
+                    "content": "plain prose\n",
+                    "extra": {
+                        "note": "keep bearer credentials out of prompts",
+                        "headers": ["Bearer fake-token-52"],
+                    },
+                },
+            }
+        )
+    )
+    assert not plan_file.exists()
+
+    # Every rejected update leaves the prior plan bytes and revision unchanged.
+    benign = post_payload(
+        {
+            "name": "create_plan",
+            "arguments": {"project_id": PROJECT_ID, "name": name, "content": "plain prose\n"},
+        }
+    )
+    assert benign.status_code == 200
+    created_revision = benign.json()["result"]["structuredContent"]["revision"]
+    before = plan_file.read_bytes()
+    for sentinel in negative_forms.values():
+        content = f"{sentinel}\n" if isinstance(sentinel, str) else json.dumps(sentinel)
+        assert_rejected(
+            post_payload(
+                {
+                    "name": "update_plan",
+                    "arguments": {
+                        "project_id": PROJECT_ID,
+                        "plan_status": "todo",
+                        "name": name,
+                        "content": content,
+                        "expected_revision": created_revision,
+                    },
+                }
+            )
+        )
+        assert plan_file.read_bytes() == before
+        assert (
+            client.get(f"{plans_path}/todo/{name}", headers=headers).json()["revision"]
+            == created_revision
+        )
+
+    # No synthetic value may appear in captured log text.
+    for substring in synthetic_substrings:
+        assert substring not in caplog.text
+
+    audit_path = root.parent / "config_audit.jsonl"
+    if audit_path.exists():
+        audit_text = audit_path.read_text(encoding="utf-8")
+        for substring in synthetic_substrings:
+            assert substring not in audit_text
 
 
 def test_mcp_create_plan_from_run_matches_authenticated_composition(mcp_client) -> None:

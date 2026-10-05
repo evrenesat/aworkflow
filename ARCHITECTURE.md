@@ -1451,6 +1451,7 @@ aflow/
   daemon.py            # shared durable lifecycle and worker support
   process_identity.py  # portable process-birth ownership identity
   mcp_control_plane.py # single UI-server MCP tools and resources
+  mcp_credentials.py   # shared prose-aware MCP credential detector (no I/O)
   manager.py           # interstep manager protocol and decisions
   manager_context.py   # versioned Lite/Full manager context
   hotplug.py           # live worker selector transactions
@@ -1815,7 +1816,15 @@ The REST control-plane routes and the `/mcp` and `/mcp/` mounts delegate to the
 same durable `ControlPlaneService`. The HTTP layer does not own workflow
 processes. Bearer credentials are accepted only in headers, while project
 roots and executable inputs remain server-owned; the MCP mounts never accept
-the browser session cookie. The remote application has no agent-provider
+the browser session cookie. Credential-shaped MCP input is rejected by one
+shared, transport-neutral detector (`aflow/mcp_credentials.py`): the HTTP
+middleware calls it over the decoded JSON payload before FastMCP validates or
+echoes anything, and the shared `_tool_result`/`_resource_result` guards call
+the same helper over tool/resource arguments. The detector is pure (no I/O, no
+server/configuration dependency) so the two guards cannot diverge, and it is a
+conservative syntactic safeguard — ordinary credential-handling prose is
+accepted while token-shaped values, explicit headers, and assignment/query
+forms are rejected without echoing the matched value. The remote application has no agent-provider
 client; provider selection occurs only through configured engine harness
 profiles.
 

@@ -1,5 +1,33 @@
 # DEVLOG
 
+## 2026-10-05 — Shared prose-aware MCP credential filter (issue #52)
+
+- Added pure `aflow/mcp_credentials.py` with `contains_mcp_credential`, the one
+  recursive detector used by both the HTTP prevalidation middleware and the
+  shared `_tool_result`/`_resource_result` guards. It replaces the duplicated
+  `bearer <word>` regexes in `main.py` and `mcp_control_plane.py`.
+- The policy keeps the existing `token=`/`access_token=`/`authorization=`
+  assignment/query rule, rejects explicit `Authorization: Bearer …` headers
+  (including serialized quoted labels), whole `Bearer <value>` strings, and
+  token-shaped candidates carrying digits or internal token punctuation, while
+  accepting ordinary credential-handling prose such as “Keep bearer
+  credentials out of prompts” and “explicit environment bearer support”.
+- `tests/test_mcp_credentials.py` covers each rule, the exact #52 sentences,
+  NBSP/tab/punctuation/mixed-case variants, nested mapping/list/tuple/set
+  recursion, direct `_tool_result`/`_resource_result` benign success and exact
+  `operation_rejected` rejection with zero operation invocation. Mounted
+  `tests/test_mcp.py` adds `test_mcp_credential_prose_authoring_parity` and
+  `test_mcp_credential_payload_rejection` on both `/mcp` and `/mcp/`; the
+  rejection test asserts no synthetic value in responses, captured logs or the
+  fixture audit output, zero unit launches, rejected updates leaving bytes and
+  revision unchanged for every negative form, and an actual nested JSON
+  argument rejected at HTTP prevalidation.
+- Verification (all passing): `uv run pytest tests/test_mcp_credentials.py -q`;
+  `uv run --directory apps/aflow_app/server pytest tests/test_mcp.py -q -k
+  'credential_prose or credential_payload or stateless_http_auth or plan_authoring
+  or trailing_slash'`; `uv run ruff check` over the three touched source files;
+  `git diff --check`.
+
 ## 2026-10-05 — Exclusive execution resources: durable FIFO broker and neutral waiting status
 
 - Harness profiles can mark a resolved `(harness, model, effort)` combination
