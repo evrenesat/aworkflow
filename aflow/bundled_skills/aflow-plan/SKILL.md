@@ -57,16 +57,10 @@ Create a generic, self-contained implementation plan organized into durable chec
 
 Include these sections in substance, adapting headings when that improves clarity:
 
-1. `Summary`
-2. `Git Tracking`
-3. `Done Means`
-4. `Critical Invariants`
-5. `Forbidden Implementations`
-6. `Checkpoints`
-7. `Final Verification`
-8. `Behavioral Acceptance Tests`
-9. `Plan-to-Verification Matrix`
-10. `Assumptions And Defaults`
+`Summary`, `Git Tracking`, `Done Means`, `Critical Invariants`,
+`Forbidden Implementations`, `Checkpoints`, `Final Verification`,
+`Behavioral Acceptance Tests`, `Plan-to-Verification Matrix`, and
+`Assumptions And Defaults`.
 
 Keep the content concise. Omit repetition, background already captured elsewhere in the plan, and instructions owned by execution or review tooling.
 
@@ -159,12 +153,6 @@ When owner-only checks remain, append this after the last checkpoint section:
 ```
 
 ## Global Guidance
-
-### Done Means
-
-- Implementation delivery is complete only when every required checkpoint step and automated gate passes.
-- User acceptance is complete only after the named owner supplies evidence for the listed checks. Pending owner-only checks do not block implementation or review, but defects, failed automated gates, and explicit release or approval gates remain blocking.
-- Final handoffs report both statuses and list pending actions; never claim full acceptance without evidence.
 
 ### Critical Invariants
 
