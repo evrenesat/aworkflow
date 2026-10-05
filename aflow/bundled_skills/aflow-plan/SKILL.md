@@ -7,6 +7,16 @@ description: "Create a strict AFlow checkpoint handoff plan for coding work that
 
 Create a generic, self-contained implementation plan organized into durable checkpoints. Plan only; do not implement.
 
+## Storage and evidence hygiene
+
+- For heavy work, specify owned output locations: named scratch/artifact directories, incremental build/test cache reuse, and bounded retention for scratch and proof.
+- State the peak additional allocation and the capacity reserve the work needs. Evidence-backed conservative estimates are acceptable where the plan permits; do not demand an exact measurement of an unbuilt output as a circular prerequisite.
+- Never present generic reference numbers as measured exact inputs; label each estimate and its basis.
+- Distinguish allocated (sparse) size from apparent size, and guest storage from host backing storage. Account for concurrent consumers of the same backing space.
+- Put targeted capacity checks in the checkpoints that perform heavy writes, and keep a single once-per-valid-state full gate in `Final Verification`; do not duplicate broad suites across checkpoints.
+- Specify cleanup: which owned disposable intermediates may be removed, and which unique data, images, models, session history, lineage, and failure proofs must be retained until diagnosed or explicitly released.
+- Prefer bounding verbose logs and captures at production over deleting the sole proof afterward.
+
 ## Core Behavior
 
 - Treat prompt-supplied scope and plan paths as authoritative. If the target is ambiguous, ask.
@@ -47,16 +57,10 @@ Create a generic, self-contained implementation plan organized into durable chec
 
 Include these sections in substance, adapting headings when that improves clarity:
 
-1. `Summary`
-2. `Git Tracking`
-3. `Done Means`
-4. `Critical Invariants`
-5. `Forbidden Implementations`
-6. `Checkpoints`
-7. `Final Verification`
-8. `Behavioral Acceptance Tests`
-9. `Plan-to-Verification Matrix`
-10. `Assumptions And Defaults`
+`Summary`, `Git Tracking`, `Done Means`, `Critical Invariants`,
+`Forbidden Implementations`, `Checkpoints`, `Final Verification`,
+`Behavioral Acceptance Tests`, `Plan-to-Verification Matrix`, and
+`Assumptions And Defaults`.
 
 Keep the content concise. Omit repetition, background already captured elsewhere in the plan, and instructions owned by execution or review tooling.
 
@@ -149,12 +153,6 @@ When owner-only checks remain, append this after the last checkpoint section:
 ```
 
 ## Global Guidance
-
-### Done Means
-
-- Implementation delivery is complete only when every required checkpoint step and automated gate passes.
-- User acceptance is complete only after the named owner supplies evidence for the listed checks. Pending owner-only checks do not block implementation or review, but defects, failed automated gates, and explicit release or approval gates remain blocking.
-- Final handoffs report both statuses and list pending actions; never claim full acceptance without evidence.
 
 ### Critical Invariants
 

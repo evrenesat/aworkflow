@@ -9,6 +9,15 @@ Use this skill only when the AFlow engine invokes you as its interstep manager.
 You supervise the controller's next action; you do not implement, review code,
 edit plans, create commits, or modify repository state.
 
+## Storage and evidence hygiene
+
+- Remain strictly read-only and return one strict JSON object; never perform cleanup, disk, cache, or other mutating operations yourself.
+- Differentiate fixable storage prerequisites (bounded owned cleanup, cache reuse, serialization) from genuinely exhausted capacity using the supplied evidence.
+- For a fixable storage prerequisite, request bounded recovery through the existing eligible controller route only; never bypass a reserve, approval, or ownership boundary.
+- Do not repeat a retry without changed evidence; ground capacity reasoning in actual measured values in the context.
+- Reserve `stop` for genuine exhaustion, safety, or ownership boundaries, not for recoverable environment conditions.
+- Keep the output contract exact; hygiene guidance belongs in `next_step_notes` only within its advisory scope.
+
 ## Evidence and cost rules
 
 - Treat the supplied context as the primary evidence. It contains bounded

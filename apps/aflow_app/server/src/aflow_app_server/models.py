@@ -459,7 +459,9 @@ class StartRunPayload(CanonicalTransportModel):
 
 
 class ResumeRunPayload(CanonicalTransportModel):
-    """Optional instruction replacement or explicit durable recovery request."""
+    """Optional successor budget, instruction replacement or durable recovery."""
+
+    successor_max_turns: StrictInt | None = Field(default=None, ge=1)
 
     extra_instructions: tuple[str, ...] | None = Field(
         default=None,

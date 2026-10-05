@@ -1426,6 +1426,7 @@ def test_rest_extra_instructions_safe_error_does_not_unmask_other_failures(
     assert set(components["ResumeRunPayload"]["properties"]) == {
         "extra_instructions",
         "recovery",
+        "successor_max_turns",
     }
     assert (
         components["StartRunPayload"]["properties"]["extra_instructions"][
@@ -2057,7 +2058,7 @@ def test_transport_models_match_canonical_control_plane_models() -> None:
     assert set(RunStatusResponse.model_fields) == set(payloads["run"])
     assert set(StartRunResponse.model_fields) == set(payloads["start"])
     assert set(RunControlPayload.model_fields) == set(payloads["control"])
-    assert set(ResumeRunPayload.model_fields) == {"extra_instructions", "recovery"}
+    assert set(ResumeRunPayload.model_fields) == {"extra_instructions", "recovery", "successor_max_turns"}
     assert set(ContextResponse.model_fields) == set(payloads["context"])
     assert set(WorktreePreflightResponse.model_fields) == set(payloads["preflight"])
     assert RunStatusResponse.model_validate({
@@ -2169,7 +2170,7 @@ def test_openapi_documents_control_plane_operations_and_models() -> None:
         "WorktreePreflightResponse",
     }.issubset(schema["components"]["schemas"])
     resume_schema = schema["components"]["schemas"]["ResumeRunPayload"]
-    assert {"extra_instructions", "recovery"} == set(resume_schema["properties"])
+    assert {"extra_instructions", "recovery", "successor_max_turns"} == set(resume_schema["properties"])
     assert "durable-evidence" in resume_schema["properties"]["recovery"]["description"]
 
 
@@ -2983,9 +2984,11 @@ def test_rest_resume_persists_reviewer_start_step_and_replays_once(control_clien
     "resume_mode",
     ("ordinary", "durable_evidence"),
 )
+@pytest.mark.parametrize("successor_budget", [None, 1])
 def test_rest_managed_owner_stop_resume_uses_real_bootstrap(
     control_client,
     resume_mode: str,
+    successor_budget: int | None,
 ) -> None:
     from aflow.config import load_workflow_config
     from aflow.daemon import _worker_prepared
@@ -3011,6 +3014,8 @@ def test_rest_managed_owner_stop_resume_uses_real_bootstrap(
         if resume_mode == "durable_evidence"
         else {}
     )
+    if successor_budget is not None:
+        payload["successor_max_turns"] = successor_budget
     endpoint = f"/api/control-plane/projects/{PROJECT_ID}/runs/{source_id}/resume"
 
     wrong_project = client.post(
@@ -3063,6 +3068,10 @@ def test_rest_managed_owner_stop_resume_uses_real_bootstrap(
         load_workflow_config(daemon._config.config_path),
     )
 
+    if successor_budget is not None:
+        assert prepared.max_turns == successor_budget
+        assert prepared.max_turns_explicit is True
+        assert record["successor_max_turns"] == successor_budget
     assert prepared.reserved_run_id == successor_id
     assert prepared.repo_root == root
     assert prepared.plan_path == plan_path

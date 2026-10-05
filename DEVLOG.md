@@ -3,7 +3,7 @@
 ## 2026-10-05 — Exclusive execution resources: durable FIFO broker and neutral waiting status
 
 - Harness profiles can mark a resolved `(harness, model, effort)` combination
-  as exclusive (`exclusive = true` in `aflow.toml` or the Teams Settings
+  as exclusive (`exclusive = true` in `aflow.toml` or Settings → Agents & Roles'
   `Exclusive` checkbox). The derived identity excludes profile, role, team,
   and project, so marked aliases share one account-local capacity-one FIFO
   resource per host/account, and any model/effort edit changes identity.
@@ -17,14 +17,53 @@
   queued; cancel-and-reprepare on live changes); probe-free paths such as
   git-only fast-forward merges never consume a resource. A busy selected
   worker waits without moving through the upgrade chain.
-- The controller persists a bounded redacted `execution_resource_wait`
-  record in `run.json`; the read-only status projection surfaces a neutral
+- Final-review repairs confirm claim withdrawal before rerouting and order
+  manager launch intent before start/correction accounting. The paired-controller
+  matrix uses real IPC-gated local harness children in disposable Git worktrees,
+  verifying child binding/reaping, FIFO yielding and independent review overlap.
+- The controller persists an `execution_resource_wait` record with private
+  controller identity in `run.json`; the bounded, redacted read-only projection surfaces a neutral
   `Waiting for resource` status with the exact resource label only while the
   controller is active and running, with terminal/stop/unknown precedence.
   The web run rows, All runs, and Current work render the same message;
   acquisition clears it without remounting populated content.
 - Docs: runtime-behavior and cli-usage sections, architecture boundary
   record, and a README configuration pointer.
+
+## 2026-10-05 — Explicit managed successor budgets (issue #71)
+
+- Added optional strict positive `successor_max_turns` to REST and MCP resume.
+  Persist the choice across idempotent replay, uncertain publication and worker
+  boot; reject changed requests and invalid values before reservation.
+- The successor budget supersedes inherited budget choices while preserving
+  source files, explicit role selectors and existing admission/control checks.
+- Regression coverage exercises a real 48-turn source and one-turn successor:
+  rejected review stops before another implementation worker. Omitted budgets
+  retain the existing continuation behavior. REST/MCP contracts exercise real
+  bootstrap, ordinary resume and durable recovery.
+
+- Integration preserves the existing deployed recovery commit: a lost worker
+  is inactive only when nonce-bound wrapper, child and process-group probes
+  all positively confirm absence. Uncertain or present processes still block.
+- Verified locally: 78 focused runtime tests, 153 REST/MCP contract tests,
+  production Ruff checks and Python compilation passed.
+
+Refs https://github.com/evrenesat/aworkflow/issues/71.
+
+## 2026-10-05 — Storage and evidence hygiene in bundled skills
+
+- Added a compact role-appropriate "Storage and evidence hygiene" section to
+  the eight bundled skills (`aflow-plan`, `aflow-execute-plan`,
+  `aflow-execute-checkpoint`, `aflow-review-checkpoint`, `aflow-review-final`,
+  `aflow-review-squash`, `aflow-assistant`, `aflow-manager`): planned output
+  locations and conservative peak/reserve estimates, bounded worker recovery
+  before `AFLOW_STOP`, owned-disposable cleanup boundaries, inspectable compact
+  proof retention, evidence reuse by reviewers, and read-only manager
+  supervision. Existing workflow contracts are unchanged.
+- Instructions are generic: no hostnames, inventories, credentials, incident
+  records, or machine-specific paths in the public bundled skills.
+- Verified: `uv run pytest -q tests/test_skill_store.py tests/test_skill_install.py
+  tests/test_skill_refresh.py` passes; `git diff --check` passes.
 
 ## 2026-10-04 — Canonical worker-artifact integration fixture roots (issue #70)
 

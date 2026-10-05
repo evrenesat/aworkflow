@@ -515,6 +515,7 @@ class ControlPlaneService:
         extra_instructions: tuple[str, ...] | None = None,
         recovery: Mapping[str, object] | RecoveryRequest | None = None,
         caller_scope: str = "rest",
+        successor_max_turns: int | None = None,
     ) -> StartRunResult:
         with self.project_lock(project_id):
             return self._project(project_id).daemon.service.resume(
@@ -523,6 +524,7 @@ class ControlPlaneService:
                 idempotency_key=idempotency_key,
                 extra_instructions=extra_instructions,
                 recovery=recovery,
+                successor_max_turns=successor_max_turns,
             )
 
     def _project(self, project_id: str) -> _ProjectDaemon:

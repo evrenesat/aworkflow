@@ -270,6 +270,11 @@ persists a bounded private wait record into `run.json`
 (`execution_resource_wait`) and emits structured waiting/acquired/cancelled
 events. The private record includes controller PID, process birth and host boot
 identity; the public read-only projection excludes those process fields.
+Withdrawal retries journal-lock contention for a bounded interval and confirms
+claim removal before cancellation events or route changes. A failed withdrawal
+stays a typed resource error. Manager decisions and note corrections persist
+launch intent before start/consumption markers; a failed intent releases only
+the positively unlaunched reservation, preserving uncertain postlaunch owners.
 
 The read-only status projection (`control_plane/run_activity.py` plus the
 repository evidence mirror) validates the optional wait record and surfaces it
@@ -2056,3 +2061,8 @@ and retain every predecessor needed to resolve that lineage through allocation
 and final pruning, then retry only the unfinished delivery without reopening a
 removed worktree or replaying a checkpoint. CI and deployment remain downstream
 of the remote main update.
+
+Managed resume carries optional `successor_max_turns` through REST/MCP, the
+startup record, replay, and worker bootstrap. It supersedes predecessor budget
+choices only; source overrides stay immutable, role/stop/notes validation stays
+active, and controls addressed to the successor retain their normal authority.

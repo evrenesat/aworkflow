@@ -989,14 +989,16 @@ class ExecutionResourceAdmission:
         control_interval: float = 1.0,
         sleeper: Callable[[float], None] | None = None,
         clock: Callable[[], float] | None = None,
+        contention_deadline_seconds: float = 5.0,
     ) -> None:
-        if poll_interval <= 0 or control_interval <= 0:
+        if poll_interval <= 0 or control_interval <= 0 or contention_deadline_seconds <= 0:
             raise ValueError("admission intervals must be positive")
         self._store = store
         self._poll_interval = poll_interval
         self._control_interval = control_interval
         self._sleeper = sleeper or time.sleep
         self._clock = clock or time.monotonic
+        self._contention_deadline_seconds = contention_deadline_seconds
 
     # -- public ------------------------------------------------------------
 
@@ -1182,18 +1184,8 @@ class ExecutionResourceAdmission:
         spec: ClaimSpec,
         controller: ControllerIdentity,
     ) -> None:
-        """Best-effort cancellation of a queued or reserved claim."""
-        try:
-            outcome = self._store.cancel(resource, spec.invocation_id, controller)
-            if outcome.state == "rejected" and outcome.reason == "not_cancellable":
-                # Already reserved (owner): release the unlaunched claim.
-                self._store.record_completion(
-                    resource, spec.invocation_id, controller
-                )
-        except Exception:
-            # Cancellation is best-effort at a control boundary; the claim's
-            # own controller fencing and reconciliation bound the damage.
-            pass
+        """Confirm removal before reporting cancellation or changing routes."""
+        self._withdraw_claim(resource, spec, controller)
 
     def _release_reservation(
         self,
@@ -1201,10 +1193,29 @@ class ExecutionResourceAdmission:
         spec: ClaimSpec,
         controller: ControllerIdentity,
     ) -> None:
-        """Best-effort release of an acquired but unlaunched reservation."""
-        try:
-            self._store.record_completion(
-                resource, spec.invocation_id, controller
-            )
-        except Exception:
-            pass
+        """Remove only an acquired, positively unlaunched reservation."""
+        self._withdraw_claim(resource, spec, controller)
+
+    def _withdraw_claim(
+        self,
+        resource: str,
+        spec: ClaimSpec,
+        controller: ControllerIdentity,
+    ) -> None:
+        deadline = self._clock() + self._contention_deadline_seconds
+        while True:
+            try:
+                outcome = self._store.cancel(resource, spec.invocation_id, controller)
+            except Exception as exc:
+                raise ResourceLeaseError("withdrawal", "store_failure", context=exc) from exc
+            if outcome.state == "cancelled" or (
+                outcome.state == "rejected" and outcome.reason == "unknown_invocation"
+            ):
+                # Unknown invocation is a locked, validated read proving the
+                # claim is absent (including a contended enqueue that never
+                # wrote it). Never turn not_cancellable into an unsafe release
+                # of an invocation which may already have launched.
+                return
+            if outcome.state != "contended" or self._clock() >= deadline:
+                raise ResourceLeaseError("withdrawal", outcome.reason or outcome.state)
+            self._sleeper(min(self._poll_interval, self._control_interval, 0.01))

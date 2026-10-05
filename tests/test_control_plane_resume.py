@@ -1274,3 +1274,170 @@ def test_worker_reloads_edited_defaults_without_a_snapshot_or_stale_step(
             record, manifest, request.repo_root, request.config_path, edited,
         )
     assert blocked.value.code == "prior_work_requires_recovery"
+
+@pytest.mark.parametrize("budget", [None, 1])
+@pytest.mark.parametrize("override_state", ["pending", "accepted"])
+def test_managed_successor_budget_caps_rejected_review(tmp_path, monkeypatch, budget, override_state):
+    """Exercise 48 real source turns, worker boot, and final-review rejection."""
+    config = WorkflowUserConfig(
+        aflow=AflowSection(max_turns=49),
+        roles={"worker": "codex.worker", "reviewer": "codex.worker"},
+        harnesses={"codex": WorkflowHarnessConfig(profiles={
+            "worker": HarnessProfileConfig(model="worker"),
+            "review": HarnessProfileConfig(model="independent-review"),
+        })},
+        workflows={"managed": WorkflowConfig(steps={
+            "implement": WorkflowStepConfig(role="worker", prompts=("p",), go=(
+                GoTransition(to="review", when="DONE"),
+                GoTransition(to="implement"),
+            )),
+            "review": WorkflowStepConfig(role="reviewer", prompts=("p",), go=(
+                GoTransition(to="implement", when="NEW_PLAN_EXISTS"),
+                GoTransition(to="END"),
+            )),
+        }, first_step="implement")},
+        prompts={"p": "Work on {ACTIVE_PLAN_PATH}. Create review repairs at {NEW_PLAN_PATH}."},
+    )
+    units = InMemoryUnitManager()
+    daemon, request = _daemon_for_config(tmp_path, monkeypatch, units, config)
+    root, plan = request.repo_root, request.plan_path
+    plan.write_text("# Plan\n\n### [ ] Checkpoint 1: Work\n" + "- [ ] task\n" * 48)
+    source_id = "forty-eight-turn-source"
+    calls = []
+
+    def source_worker(argv, **kwargs):
+        calls.append(argv)
+        text = plan.read_text().replace("- [ ]", "- [x]", 1)
+        if len(calls) == 48:
+            text = text.replace("### [ ]", "### [x]")
+            compare_and_swap_overrides(root, source_id,
+                RunControlRequest(expected_revision=0, owner_stop=True))
+        plan.write_text(text)
+        return subprocess.CompletedProcess(argv, 0, "done", "")
+
+    source = run_workflow(
+        ControllerConfig(repo_root=root, plan_path=plan, max_turns=49,
+            reserved_run_id=source_id, idempotency_key="source",
+            caller_scope="project:one"),
+        config, "managed", config_dir=root, snapshot_config=False, runner=source_worker,
+    )
+    assert source.status == "owner_stopped"
+    assert len(calls) == 48
+    assert json.loads((source.run_dir / "run.json").read_text())["turns_completed"] == 48
+    # Existing current-generation CAS still rejects stale revisions and budgets below 48.
+    from aflow.control_plane import ControlConflictError, ControlValidationError
+    with pytest.raises(ControlConflictError):
+        daemon.application.controls.apply(source_id, RunControlRequest(expected_revision=0, max_turns=49))
+    with pytest.raises(ControlValidationError):
+        daemon.application.controls.apply(source_id, RunControlRequest(expected_revision=1, max_turns=1))
+    compare_and_swap_overrides(root, source_id,
+        RunControlRequest(expected_revision=1, max_turns=49, owner_stop=False,
+            role_selectors={"reviewer": "codex.review"}))
+    if override_state == "accepted":
+        # Model an already-consumed source override with its original digest and bytes.
+        from aflow.run_state import load_override_request
+        from dataclasses import asdict
+        from aflow.run_state import OverrideResult
+        loaded = load_override_request(source.run_dir / "overrides.toml")
+        payload = json.loads((source.run_dir / "run.json").read_text())
+        payload["override_result"] = asdict(OverrideResult(
+            status="accepted", digest=loaded.digest, message="accepted",
+            source_text=loaded.source_text, max_turns=49,
+            role_selectors={"reviewer": "codex.review"}, applied=True,
+        ))
+        payload["role_selectors"] = {"reviewer": "codex.review"}
+        (source.run_dir / "run.json").write_text(json.dumps(payload))
+    source_before = {p: p.read_bytes() for p in source.run_dir.rglob("*")
+        if p.is_file() and p.name != "events.jsonl"}
+    result = daemon.service.resume(source_id, caller_scope="project:one",
+        idempotency_key="one-review", successor_max_turns=budget)
+    replay = daemon.service.resume(source_id, caller_scope="project:one",
+        idempotency_key="one-review", successor_max_turns=budget)
+    assert replay.run_id == result.run_id
+    assert len(units.start_calls) == 1
+    with pytest.raises(DaemonIdempotencyConflict):
+        daemon.service.resume(source_id, caller_scope="project:one",
+            idempotency_key="one-review", successor_max_turns=2)
+    record = daemon.service._read_record(result.run_id)
+    manifest = daemon.application.repository.get_launch_manifest(result.run_id)
+    prepared, resume = _worker_prepared(record, manifest, root, request.config_path, config)
+    assert prepared.max_turns == (budget or 49)
+    assert prepared.max_turns_explicit is True
+    assert resume.interrupted_step_name == "review"
+    successor_calls = []
+
+    def reject_review(argv, **kwargs):
+        successor_calls.append(argv)
+        if len(successor_calls) > 1:
+            raise RuntimeError("second implementation dispatched")
+        assert "independent-review" in argv
+        turn = root / ".aflow/runs" / result.run_id / "turns/turn-001"
+        prompt = (turn / "effective-prompt.txt").read_text()
+        overlay = Path(prompt.split("Create review repairs at ", 1)[1].split(".md", 1)[0] + ".md")
+        overlay.write_text("# Repair\n\n- [ ] fix review finding\n")
+        return subprocess.CompletedProcess(argv, 0, "rejected", "")
+
+    def execute():
+        return run_workflow(
+            ControllerConfig(repo_root=root, plan_path=plan,
+                max_turns=prepared.max_turns, max_turns_explicit=prepared.max_turns_explicit,
+                start_step=prepared.start_step, reserved_run_id=result.run_id,
+                idempotency_key=prepared.idempotency_key, caller_scope=prepared.caller_scope),
+            config, "managed", config_dir=root, snapshot_config=False,
+            runner=reject_review, resume=resume, allow_existing_launch_manifest=True,
+        )
+    if budget is None:
+        with pytest.raises(RuntimeError, match="second implementation dispatched"):
+            execute()
+        assert len(successor_calls) == 2
+    else:
+        with pytest.raises(WorkflowError, match="max turns limit of 1") as stopped:
+            execute()
+        assert len(successor_calls) == 1
+        payload = json.loads((stopped.value.run_dir / "run.json").read_text())
+        assert payload["turns_completed"] == 1
+        assert payload["effective_max_turns"] == 1
+        assert payload["role_selectors"]["reviewer"] == "codex.review"
+    assert [str(p) for p, contents in source_before.items() if p.read_bytes() != contents] == []
+
+
+@pytest.mark.parametrize("budget", [0, -1, True, 1.5, "1"])
+def test_resume_rejects_invalid_successor_budget_before_reservation(tmp_path, monkeypatch, budget):
+    daemon, request, source_id = _resume_publication_fixture(tmp_path, monkeypatch)
+    before = sorted(str(p) for p in request.repo_root.rglob("*"))
+    with pytest.raises(ValueError, match="positive integer"):
+        daemon.service.resume(source_id, successor_max_turns=budget, idempotency_key="invalid")
+    assert sorted(str(p) for p in request.repo_root.rglob("*")) == before
+    assert daemon.application.units.start_calls == []
+
+def test_successor_budget_survives_uncertain_publication(tmp_path, monkeypatch):
+    daemon, request, source_id = _resume_publication_fixture(tmp_path, monkeypatch)
+    bootstrap_calls = []
+    def bootstrap(**kwargs):
+        bootstrap_calls.append(kwargs["successor_max_turns"])
+        return SimpleNamespace(
+            workflow_name="managed", plan_path=request.plan_path,
+            max_turns=kwargs["successor_max_turns"], max_turns_explicit=True,
+            team=None, start_step="implement", extra_instructions=(),
+            workflow_config=_workflow_config(), resume_context=None,
+        )
+    monkeypatch.setattr("aflow.cli._bootstrap_resume_invocation", bootstrap)
+    recover = daemon.service._recover_resume_record
+    def interrupted(*args, **kwargs):
+        raise RuntimeError("response lost after publication")
+    monkeypatch.setattr(daemon.service, "_recover_resume_record", interrupted)
+    with pytest.raises(RuntimeError, match="response lost"):
+        daemon.service.resume(source_id, caller_scope="project:one",
+            idempotency_key="uncertain-budget", successor_max_turns=1)
+    monkeypatch.setattr(daemon.service, "_recover_resume_record", recover)
+    resumed = daemon.service.resume(source_id, caller_scope="project:one",
+        idempotency_key="uncertain-budget", successor_max_turns=1)
+    replay = daemon.service.resume(source_id, caller_scope="project:one",
+        idempotency_key="uncertain-budget", successor_max_turns=1)
+    assert resumed.run_id == replay.run_id
+    assert len(daemon.application.units.start_calls) == 1
+    record = daemon.service._read_record(resumed.run_id)
+    manifest = daemon.application.repository.get_launch_manifest(resumed.run_id)
+    prepared, _ = _worker_prepared(record, manifest, request.repo_root, request.config_path, _workflow_config())
+    assert prepared.max_turns == 1
+    assert bootstrap_calls == [1, 1, 1]

@@ -18,6 +18,7 @@ from aflow.execution_resources import (
     ControllerIdentity,
     ExecutionLease,
     ExecutionResourceStore,
+    Outcome,
     ProcessEvidence,
     ResourceLeaseError,
 )
@@ -167,6 +168,30 @@ def kill_child(child: subprocess.Popen) -> None:
 
 
 # -- _run_process --------------------------------------------------------------
+
+
+@pytest.mark.parametrize("dispatch", ["process", "injected"])
+def test_failed_launch_intent_releases_known_unlaunched_claim(tmp_path, monkeypatch, dispatch):
+    store = make_store(tmp_path)
+    lease = make_lease(store, "intent-failure")
+    monkeypatch.setattr(store, "mark_launching", lambda *args: Outcome("rejected", reason="journal_io_failure"))
+    calls = []
+
+    def forbidden(*args, **kwargs):
+        calls.append(True)
+        raise AssertionError("dispatch must not precede durable launch intent")
+
+    invocation = make_invocation((sys.executable, "-c", "print('unused')"))
+    with pytest.raises(ResourceLeaseError) as error:
+        if dispatch == "process":
+            monkeypatch.setattr(subprocess, "Popen", forbidden)
+            _run_process(invocation, tmp_path, FakeBanner(), make_state(), lease=lease)
+        else:
+            _run_injected_runner(forbidden, invocation, tmp_path, lease=lease)
+    assert error.value.stage == "mark_launching" and error.value.reason == "journal_io_failure"
+    assert calls == []
+    journal = read_journal(tmp_path, RESOURCE)
+    assert journal["owner"] is None and journal["queue"] == []
 
 
 def test_run_process_success_binds_child_and_releases_claim(tmp_path: Path) -> None:

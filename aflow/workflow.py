@@ -782,9 +782,9 @@ class _ManagerCallExecutor:
                     turn_number=self.state.turns_completed + 1,
                     manager_level=level,
                 )
-            # The invocation-start marker and budget metrics are recorded only
-            # after admission (or the unmarked legacy fast path), and the
-            # dispatch carries the exclusive lease.
+            _mark_auxiliary_launch_intent(manager_lease, self.resource_admission)
+            # The invocation-start marker and budget metrics follow durable
+            # launch intent; the dispatch carries the same idempotent lease.
             _emit_event(self.observer, ManagerStartedEvent.create(
                 decision_number=decision_number, level=level, trigger=boundary.trigger,
                 target_step=boundary.proposed_transition, target_team=target_team,
@@ -1020,6 +1020,7 @@ class _ManagerCallExecutor:
                 # The correction is an independent queue participant: it
                 # acquires its own ticket after the parent decision's lease
                 # has been released, never nesting under it.
+                _mark_auxiliary_launch_intent(correction_lease, self.resource_admission)
                 correction_invoked = True
                 correction_consumed = True
                 correction_result["invocation"] = {
@@ -6089,6 +6090,24 @@ def _reap_owned_process(proc: subprocess.Popen, grace_seconds: float = 5.0) -> N
         pass
 
 
+def _mark_auxiliary_launch_intent(
+    lease: ExecutionLease | None,
+    admission: _AuxiliaryAdmissionContext | None,
+) -> None:
+    """Fence auxiliary accounting and clean up a known non-launch failure."""
+    if lease is None:
+        return
+    try:
+        lease.mark_launching()
+    except ResourceLeaseError:
+        # No process/callback has started. Completion remains nonce-fenced,
+        # and a failed cleanup must also propagate as a typed resource error.
+        lease.complete()
+        if admission is not None:
+            admission.note_released()
+        raise
+
+
 def _run_process(
     invocation: HarnessInvocation,
     repo_root: Path,
@@ -6099,7 +6118,7 @@ def _run_process(
 ) -> subprocess.CompletedProcess[str]:
     if lease is not None:
         # Durable launch intent is persisted before the spawn attempt.
-        lease.mark_launching()
+        _mark_auxiliary_launch_intent(lease, None)
     try:
         proc = subprocess.Popen(
             list(invocation.argv),
@@ -6234,7 +6253,7 @@ def _run_injected_runner(
 ) -> subprocess.CompletedProcess[str]:
     if lease is not None:
         # Durable launch intent is persisted before the runner is invoked.
-        lease.mark_launching()
+        _mark_auxiliary_launch_intent(lease, None)
     kwargs: dict[str, object] = {
         "cwd": str(repo_root),
         "env": {**os.environ, **invocation.env},
@@ -9283,6 +9302,15 @@ def _run_workflow_unchecked(
                 None,
                 state.override_result,
             )
+        if resume.successor_max_turns is not None:
+            # Keep predecessor roles/notes/stop intent with the new budget.
+            # Never rewrite the predecessor override artifact.
+            if state.override_result is not None:
+                state.override_result = replace(state.override_result, max_turns=None)
+            if state.last_accepted_override is not None:
+                state.last_accepted_override = replace(
+                    state.last_accepted_override, max_turns=None
+                )
         state.role_selectors = dict(resume.role_selectors)
         state.current_hotplug_transaction = resume.current_hotplug_transaction
         state.pending_hotplug_transaction = resume.pending_hotplug_transaction
@@ -13215,6 +13243,12 @@ def _run_workflow_unchecked(
                 run_dir=run_paths.run_dir,
             )
 
+        if (
+            required_predecessor_override
+            and resume is not None
+            and resume.successor_max_turns is not None
+        ):
+            request = replace(request, max_turns=None)
         state.pending_override_notes = request.notes
         state.pending_override_target_step = (
             request.next_step if request.notes else None

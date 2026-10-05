@@ -1469,6 +1469,9 @@ def resume_run(
                 payload.extra_instructions if payload is not None else None
             ),
             recovery=payload.recovery if payload is not None else None,
+            successor_max_turns=(
+                payload.successor_max_turns if payload is not None else None
+            ),
             idempotency_key=idempotency_key,
         )
     )

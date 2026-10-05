@@ -11,11 +11,11 @@ from __future__ import annotations
 import json
 import re
 from collections.abc import Callable
-from typing import Any, Literal, Mapping
+from typing import Annotated, Any, Literal, Mapping
 
 from fastmcp import FastMCP
 from fastmcp.exceptions import ResourceError, ToolError
-from pydantic import StrictBool
+from pydantic import Field, StrictBool, StrictInt
 
 from aflow.control_plane import (
     ControlConflictError,
@@ -667,8 +667,13 @@ def create_control_plane_mcp(
         idempotency_key: str,
         extra_instructions: list[str] | None = None,
         recovery: Mapping[str, object] | None = None,
+        successor_max_turns: Annotated[StrictInt, Field(ge=1)] | None = None,
     ) -> dict[str, Any]:
         """Create a continuation or explicit durable-evidence replacement.
+
+        ``successor_max_turns`` is a positive integer budget for the new
+        generation, independent of source turns and inherited budget overrides.
+        Omit it or pass null to preserve existing budget selection.
 
         ``extra_instructions`` accepts at most 8 non-empty strings, each at
         most 512 characters and 4096 characters total; NUL characters are not
@@ -691,6 +696,7 @@ def create_control_plane_mcp(
                         else None
                     ),
                     recovery=recovery,
+                    successor_max_turns=successor_max_turns,
                     idempotency_key=_bounded_idempotency_key(idempotency_key),
                     caller_scope="mcp",
                 )
@@ -702,6 +708,7 @@ def create_control_plane_mcp(
                 "idempotency_key": idempotency_key,
                 "extra_instructions": extra_instructions,
                 "recovery": recovery,
+                "successor_max_turns": successor_max_turns,
             },
         )
 

@@ -1324,11 +1324,16 @@ def _bootstrap_resume_invocation(
     max_turns_arg: int | None,
     extra_instructions_arg: tuple[str, ...],
     extra_instructions_provided: bool,
+    successor_max_turns: int | None = None,
     reset_scope: bool = False,
     rehome_worktree: str | Path | None = None,
     live_loader: Callable[[Path], Any] | None = None,
 ) -> ResumeBootstrap:
     """Resolve one durable run and reconstruct omitted resume identity read-only."""
+    if successor_max_turns is not None and (
+        type(successor_max_turns) is not int or successor_max_turns < 1
+    ):
+        raise ValueError("successor_max_turns must be a positive integer")
     resolved_run_id, _source = resolve_run_id(requested_run_id, repo_root)
     if resolved_run_id is None:
         raise ValueError(
@@ -1615,6 +1620,11 @@ def _bootstrap_resume_invocation(
             or accepted_override_limit is not None
         )
 
+    if successor_max_turns is not None:
+        effective_max_turns = successor_max_turns
+        max_turns_override = True
+        saved_max_turns_explicit = True
+
     effective_extra = extra_instructions_arg if extra_instructions_provided else saved_extra
 
     ordinary_owner_stop = _is_ordinary_owner_stopped_resume(
@@ -1683,6 +1693,10 @@ def _bootstrap_resume_invocation(
         review_repair_step=review_repair_step,
     )
     assert resume_context is not None
+    if successor_max_turns is not None:
+        resume_context = replace(
+            resume_context, successor_max_turns=successor_max_turns
+        )
 
     return ResumeBootstrap(
         resolved_run_id=resolved_run_id,

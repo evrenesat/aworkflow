@@ -658,9 +658,11 @@ def test_mcp_durable_recovery_matches_rest_and_discovery(mcp_client) -> None:
     "resume_mode",
     ("ordinary", "durable_evidence"),
 )
+@pytest.mark.parametrize("successor_budget", [None, 1])
 def test_mcp_managed_owner_stop_resume_uses_real_bootstrap(
     mcp_client,
     resume_mode: str,
+    successor_budget: int | None,
 ) -> None:
     from dataclasses import asdict
 
@@ -689,6 +691,8 @@ def test_mcp_managed_owner_stop_resume_uses_real_bootstrap(
         "run_id": source_id,
         "idempotency_key": request_key,
     }
+    if successor_budget is not None:
+        arguments["successor_max_turns"] = successor_budget
     if resume_mode == "durable_evidence":
         arguments["recovery"] = _recovery_payload()
 
@@ -749,6 +753,10 @@ def test_mcp_managed_owner_stop_resume_uses_real_bootstrap(
         load_workflow_config(daemon._config.config_path),
     )
 
+    if successor_budget is not None:
+        assert prepared.max_turns == successor_budget
+        assert prepared.max_turns_explicit is True
+        assert record["successor_max_turns"] == successor_budget
     assert prepared.reserved_run_id == successor_id
     assert prepared.repo_root == root
     assert prepared.plan_path == plan_path
@@ -2998,6 +3006,7 @@ def test_mcp_extra_instructions_safe_error_does_not_unmask_other_failures(
         "idempotency_key",
         "extra_instructions",
         "recovery",
+        "successor_max_turns",
     }
 
 
@@ -3153,3 +3162,19 @@ def _validated_client_url(value: str) -> str:
     if parsed.query or parsed.username or parsed.password:
         raise ValueError("MCP URL may not contain a credential")
     return value
+
+@pytest.mark.parametrize("budget", [0, -1, True, 1.5, "1"])
+def test_resume_successor_budget_invalid_on_both_transports(mcp_client, budget):
+    client, root, units, monkeypatch = mcp_client
+    before = _lifecycle_record_bytes(root)
+    endpoint = f"/api/control-plane/projects/{PROJECT_ID}/runs/missing/resume"
+    rest = client.post(endpoint, headers={"Idempotency-Key": "invalid-budget"},
+        json={"successor_max_turns": budget})
+    assert rest.status_code == 422
+    mcp = _mcp_request(client, "tools/call", {"name": "resume_run", "arguments": {
+        "project_id": PROJECT_ID, "run_id": "missing",
+        "idempotency_key": "invalid-budget", "successor_max_turns": budget,
+    }})
+    assert mcp["result"]["isError"] is True
+    assert _lifecycle_record_bytes(root) == before
+    assert units.start_calls == []

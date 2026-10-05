@@ -233,6 +233,7 @@ go = [{ to = "END", when = "DONE" }, { to = "work" }]
 def _cross_harness_live_config(*, target: bool, retry_limit: int = 0) -> str:
     if target:
         harnesses = (
+            '[harness.codex.profiles.base]\nmodel = "codex-base"\n'
             '[harness.reasonix.profiles.new]\n'
             'model = "reasonix-new"\n'
             'effort = "high"\n'

@@ -229,8 +229,9 @@ def test_rejects_unproven_review_repair(interrupted_repair, damage):
         bootstrap(interrupted_repair)
 
 
+@pytest.mark.parametrize("lost_worker", [False, True])
 def test_managed_resume_preview_worker_preparation_and_idempotency(
-    interrupted_repair, monkeypatch
+    interrupted_repair, monkeypatch, lost_worker
 ):
     root, plan, config_path, config, source, payload = interrupted_repair
     env = root / "worker.env"
@@ -242,6 +243,20 @@ def test_managed_resume_preview_worker_preparation_and_idempotency(
     monkeypatch.setattr("aflow.daemon.load_workflow_config", lambda _: config)
     units = InMemoryUnitManager()
     write_launch_phase(root, source.name, "failed")
+    if lost_worker:
+        from aflow.control_plane import worker_diagnostics
+        units_dir = source / "units"
+        units_dir.mkdir()
+        for name, value in {
+            "start.json": {"run_id": source.name, "unit": f"aflow-run-{source.name}.service", "wrapper_pid": 99999991, "wrapper_birth": "fixture-wrapper"},
+            "child.json": {"pid": 99999992, "pgid": 99999992, "process_birth": "fixture-child"},
+        }.items():
+            (units_dir / name).write_text(json.dumps({"schema": 1, "nonce": "owned", **value}))
+        monkeypatch.setattr(worker_diagnostics, "process_liveness", lambda _: "absent")
+        def absent_group(*_args):
+            raise ProcessLookupError
+        monkeypatch.setattr(worker_diagnostics.os, "killpg", absent_group)
+        write_launch_phase(root, source.name, "owner_stopped")
     daemon = AflowDaemon(
         DaemonConfig(
             repo_root=root,
