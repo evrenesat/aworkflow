@@ -46,6 +46,7 @@ from aflow.daemon import (
     DurableRecoveryRejection,
     ExtraInstructionsValidationError,
 )
+from aflow.mcp_credentials import contains_mcp_credential
 from aflow.plan_consumer import PlanConsumer
 from aflow.project_admission import ProjectAdmissionError
 from aflow.project_settings import (
@@ -186,11 +187,6 @@ class AccessLogPathFilter(logging.Filter):
 _SECRET_TEXT = re.compile(
     r"(?i)(authorization\s*[:=]\s*bearer\s+|(?:token|secret|password|api[_-]?key)\s*[:=]\s*[\"']?)([^\s\",'&]+)"
 )
-_MCP_CREDENTIAL_TEXT = re.compile(
-    r"(?i)\bbearer[ \t]+[^\s]+|(?:token|access_token|authorization)=[^&\s]+"
-)
-
-
 def _redact_text(value: str) -> str:
     """Keep diagnostic log messages useful without retaining bearer material."""
     return _SECRET_TEXT.sub(r"\1[redacted]", value)
@@ -206,22 +202,12 @@ def _redact_url_credentials(value: str) -> str:
 
 
 def _mcp_payload_contains_credential(body: bytes) -> bool:
-    """Reject bearer-shaped MCP JSON values before a transport can echo them."""
+    """Reject credential-shaped MCP JSON values before a transport can echo them."""
     try:
         payload = json.loads(body)
     except (UnicodeDecodeError, json.JSONDecodeError):
         return False
-    return _contains_credential_value(payload)
-
-
-def _contains_credential_value(value: object) -> bool:
-    if isinstance(value, str):
-        return _MCP_CREDENTIAL_TEXT.search(value) is not None
-    if isinstance(value, dict):
-        return any(_contains_credential_value(item) for item in value.values())
-    if isinstance(value, list):
-        return any(_contains_credential_value(item) for item in value)
-    return False
+    return contains_mcp_credential(payload)
 
 
 class SensitiveDataFilter(logging.Filter):

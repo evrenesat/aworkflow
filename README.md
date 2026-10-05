@@ -383,6 +383,19 @@ arguments, or browser cookies; MCP is header-only. The [secret-free client
 template](apps/aflow_app/server/aflow-control-plane.mcp.example.toml) uses an
 environment-backed token and approves write tools.
 
+Both the HTTP prevalidation and the shared tool/resource guard apply one
+syntactic credential filter (`aflow/mcp_credentials.py`) to every MCP string
+before any operation runs. Ordinary explanatory prose that merely mentions
+credential handling — for example a sentence like “Keep bearer credentials out
+of prompts” — is accepted and persisted unchanged. The filter is a conservative
+syntactic safeguard, not a universal secret scanner: it rejects credential-shaped
+values (an explicit `Authorization` header, a whole `Bearer <value>` string,
+token-shaped candidates with digits or internal token punctuation, and
+`token=`/`access_token=`/`authorization=` assignments), but it cannot certify
+arbitrary unmarked prose as secret-free. Rejected requests return the existing
+safe `token_payload_rejected` / `operation_rejected` codes and never echo the
+matched value.
+
 The shared lifecycle registry exposes these 14 tools:
 
 - `get_capabilities` — list capabilities for every allowlisted project.

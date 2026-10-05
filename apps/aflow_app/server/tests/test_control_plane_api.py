@@ -672,7 +672,7 @@ def _answer_pending(
 
 
 def _commit_fixture_repository(root: Path) -> None:
-    subprocess.run(("git", "add", "-A"), cwd=root, check=True, capture_output=True)
+    subprocess.run(("git", "add", "-f", "-A"), cwd=root, check=True, capture_output=True)
     subprocess.run(
         (
             "git",
