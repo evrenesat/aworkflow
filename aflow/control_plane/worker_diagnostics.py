@@ -1,14 +1,46 @@
 """Read-only projection of owned portable-worker receipts; no recovery actions."""
 
 from dataclasses import replace
+import os
 from pathlib import Path
 
+from aflow.process_identity import process_liveness
 from .models import RunStatus, startup_failure
 from .persistent_units import PersistentUnitManager, _nonce_matches, _read_json, _receipts_for, _terminal_receipt
 
 
 def confirmed_inactive(worker) -> bool:
-    return worker.get("active") is False and ("exit_code" in worker or worker.get("observation") == "stopped" or bool(worker.get("wrapper_error")))
+    return worker.get("active") is False and ("exit_code" in worker or worker.get("observation") == "stopped" or bool(worker.get("wrapper_error")) or worker.get("processes_absent") is True)
+
+
+def _owned_processes_absent(receipts) -> bool:
+    """Prove an orphan has no wrapper, worker or surviving process group.
+
+    Missing birth observations alone are ambiguous. Require positive OS
+    absence, including descendants left behind by a dead group leader.
+    """
+    child = _read_json(receipts.child)
+    if not _nonce_matches(child, receipts.nonce):
+        return False
+    pid, wrapper = child.get("pid"), receipts.start.get("wrapper_pid")
+    if (
+        type(pid) is not int or pid <= 0 or child.get("pgid") != pid
+        or type(wrapper) is not int or wrapper <= 0
+        or not isinstance(child.get("process_birth"), str)
+        or not child["process_birth"]
+        or not isinstance(receipts.start.get("wrapper_birth"), str)
+        or not receipts.start["wrapper_birth"]
+    ):
+        return False
+    if any(process_liveness(value) != "absent" for value in (pid, wrapper)):
+        return False
+    try:
+        os.killpg(pid, 0)
+    except ProcessLookupError:
+        return True
+    except OSError:
+        return False
+    return False
 
 
 def worker_evidence(root: Path, run_id: str, unit: str) -> dict | None:
@@ -21,6 +53,8 @@ def worker_evidence(root: Path, run_id: str, unit: str) -> dict | None:
         return None
     observed = PersistentUnitManager(executable="aflow")._observe(receipts)
     result: dict = {"active": observed.is_active, "observation": observed.result}
+    if observed.result == "ownership_lost" and _owned_processes_absent(receipts):
+        result["processes_absent"] = True
     exit_record = _terminal_receipt(receipts, receipts.exit)
     if exit_record is not None:
         result.update(exit_code=exit_record["returncode"], exited_at=exit_record["at"])
