@@ -993,6 +993,10 @@ class ControllerState:
     pending_override_target_step: str | None = None
     override_source_run_dir: Path | None = None
     override_file_present: bool = False
+    # Exclusive execution resource wait metadata (None when not waiting).
+    # A resumed controller starts with a fresh state, so stale wait data from
+    # a previous run can never survive into a new admission.
+    execution_resource_wait: dict[str, object] | None = None
 
 
 def manager_state_payload(state: ControllerState) -> dict[str, object]:

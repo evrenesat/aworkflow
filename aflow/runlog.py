@@ -1628,6 +1628,10 @@ class RunMetadataWriter:
                 else self.config.max_turns
             )
             payload["override_file_present"] = self.state.override_file_present
+            if self.state.execution_resource_wait is not None:
+                payload["execution_resource_wait"] = dict(
+                    self.state.execution_resource_wait
+                )
             if self.state.live_config_path is not None:
                 payload["live_config_path"] = self.state.live_config_path
             elif isinstance(previous.get("live_config_path"), str):

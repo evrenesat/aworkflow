@@ -30,6 +30,10 @@ class ExecutionEventType(str, Enum):
     HOTPLUG_STAGE_CHANGED = "hotplug_stage_changed"
     HOTPLUG_APPLIED = "hotplug_applied"
     HOTPLUG_FAILED = "hotplug_failed"
+    EXECUTION_RESOURCE_WAITING = "execution_resource_waiting"
+    EXECUTION_RESOURCE_ACQUIRED = "execution_resource_acquired"
+    EXECUTION_RESOURCE_CANCELLED = "execution_resource_cancelled"
+    EXECUTION_RESOURCE_RELEASED = "execution_resource_released"
 
 
 @dataclass(frozen=True)
@@ -432,6 +436,65 @@ class HotplugEvent:
         )
 
 
+@dataclass(frozen=True)
+class ExecutionResourceEvent:
+    """Secret-safe observability for exclusive execution resource admission.
+
+    Emitted at the safe admission boundary: on entry to the wait, on target
+    or reason change while waiting, on acquisition, on claim cancellation,
+    and on release.  The resource is the derived combination key, never a
+    credential or provider endpoint.
+    """
+
+    event_type: Literal[
+        ExecutionEventType.EXECUTION_RESOURCE_WAITING,
+        ExecutionEventType.EXECUTION_RESOURCE_ACQUIRED,
+        ExecutionEventType.EXECUTION_RESOURCE_CANCELLED,
+        ExecutionEventType.EXECUTION_RESOURCE_RELEASED,
+    ]
+    timestamp: datetime
+    phase: str
+    resource: str
+    label: str
+    ticket: int | None = None
+    reason: str | None = None
+    step_name: str | None = None
+    role: str | None = None
+    invocation_id: str | None = None
+
+    @classmethod
+    def create(
+        cls,
+        phase: str,
+        *,
+        resource: str,
+        label: str,
+        ticket: int | None = None,
+        reason: str | None = None,
+        step_name: str | None = None,
+        role: str | None = None,
+        invocation_id: str | None = None,
+    ) -> "ExecutionResourceEvent":
+        event_type = {
+            "waiting": ExecutionEventType.EXECUTION_RESOURCE_WAITING,
+            "acquired": ExecutionEventType.EXECUTION_RESOURCE_ACQUIRED,
+            "cancelled": ExecutionEventType.EXECUTION_RESOURCE_CANCELLED,
+            "released": ExecutionEventType.EXECUTION_RESOURCE_RELEASED,
+        }[phase]
+        return cls(
+            event_type=event_type,
+            timestamp=datetime.now(timezone.utc),
+            phase=phase,
+            resource=resource,
+            label=label,
+            ticket=ticket,
+            reason=reason,
+            step_name=step_name,
+            role=role,
+            invocation_id=invocation_id,
+        )
+
+
 ExecutionEvent = (
     RunStartedEvent
     | StatusChangedEvent
@@ -444,6 +507,7 @@ ExecutionEvent = (
     | RunCompletedEvent
     | RunFailedEvent
     | HotplugEvent
+    | ExecutionResourceEvent
 )
 
 

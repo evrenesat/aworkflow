@@ -41,13 +41,17 @@ __all__ = [
     "ClaimSpec",
     "ControllerIdentity",
     "ExecutionLease",
+    "ExecutionResourceAdmission",
     "ExecutionResourceStore",
     "MAX_JOURNAL_BYTES",
     "MAX_OUTSTANDING_CLAIMS",
     "Outcome",
     "ProcessEvidence",
+    "RevalidationVerdict",
     "ResourceLeaseError",
+    "TurnReprepareRequired",
     "JOURNAL_VERSION",
+    "UNCHANGED",
     "owned_child_binding",
 ]
 
@@ -143,6 +147,42 @@ class ResourceLeaseError(Exception):
         self.reason = reason
         if context is not None:
             self.__cause__ = context
+
+
+class TurnReprepareRequired(Exception):
+    """A live configuration change requires re-preparing the current turn.
+
+    ``retained_invocation_id`` carries the claim identity forward when the
+    queue position must survive the re-prepare (payload-only edits); ``None``
+    re-prepares a fresh invocation that re-enters the destination queue at
+    the tail.
+    """
+
+    def __init__(self, retained_invocation_id: str | None, reason: str) -> None:
+        super().__init__(reason)
+        self.retained_invocation_id = retained_invocation_id
+        self.reason = reason
+
+
+@dataclass(frozen=True)
+class RevalidationVerdict:
+    """Workflow-owned revalidation result for one admission control check.
+
+    ``kind="reprepare"`` with ``retained_invocation_id`` set keeps the claim
+    (and its ticket) across the re-prepare; ``None`` cancels it so the next
+    prepare enqueues a fresh invocation at the tail.
+
+    ``kind="retry"`` asks the engine to yield (with stop handling) and
+    re-run the same final check: the current configuration pair could not be
+    read under a lock-consistent load, so no launch may be decided from it.
+    """
+
+    kind: Literal["unchanged", "reprepare", "retry"]
+    retained_invocation_id: str | None = None
+    reason: str | None = None
+
+
+UNCHANGED = RevalidationVerdict(kind="unchanged")
 
 
 def owned_child_binding(process: Any) -> tuple[int, str | None, int | None]:
@@ -491,6 +531,12 @@ class ExecutionResourceStore:
                 existing = _find_claim(journal, spec.invocation_id)
                 if existing is not None:
                     if _identity_matches(existing, controller) and _spec_matches(existing, spec):
+                        if existing["status"] == "reserved":
+                            # Idempotent re-admission of this caller's own
+                            # unlaunched reservation: a payload-only
+                            # reprepare keeps the claim (and its ticket)
+                            # and must not fall back to waiting on itself.
+                            return Outcome("acquired", ticket=existing["ticket"])
                         return Outcome("queued", ticket=existing["ticket"])
                     return Outcome("rejected", reason="identity_conflict")
                 claims = len(journal["queue"]) + (1 if journal["owner"] is not None else 0)
@@ -828,6 +874,7 @@ class ExecutionLease:
         self._controller = controller
         self._sleeper = sleeper or time.sleep
         self._contention_deadline_seconds = contention_deadline_seconds
+        self._launch_marked = False
 
     # -- transitions ---------------------------------------------------------
 
@@ -847,7 +894,15 @@ class ExecutionLease:
             raise ResourceLeaseError(stage, outcome.reason or outcome.state)
 
     def mark_launching(self) -> None:
-        """Persist durable launch intent before any model-bearing process starts."""
+        """Persist durable launch intent before any model-bearing process starts.
+
+        Idempotent: the durable ``reserved -> launching`` transition happens
+        on the first call only (the controller orders it before
+        ``_start_turn``); later calls at the dispatch seam are no-ops, so a
+        single claim transition is recorded per invocation.
+        """
+        if self._launch_marked:
+            return
         self._require(
             "mark_launching",
             "launching",
@@ -855,6 +910,7 @@ class ExecutionLease:
                 self._resource, self._invocation_id, self._controller
             ),
         )
+        self._launch_marked = True
 
     def bind_child(
         self,
@@ -898,3 +954,257 @@ class ExecutionLease:
                 unconfirmed=True,
             ),
         )
+
+
+class ExecutionResourceAdmission:
+    """Shared control-aware admission loop for exclusive resources.
+
+    Gates one invocation (a workflow turn, or an auxiliary model-bearing
+    call) against the durable FIFO broker:
+
+    * enqueues the claim idempotently (by invocation id),
+    * polls ``try_acquire`` at ``poll_interval`` while servicing controls at
+      least once per ``control_interval`` -- owner stop first, then live
+      configuration revalidation -- including journal-lock contention,
+    * cancels the claim and raises :class:`TurnReprepareRequired` when a
+      live change requires re-preparation,
+    * performs a final stop/config/control check after acquisition and
+      before :meth:`ExecutionLease.mark_launching`, releasing an unlaunched
+      reservation when the route identity changed while a payload-only edit
+      rebuilds within the same reservation (ticket retained),
+    * emits ``on_waiting`` / ``on_acquired`` / ``on_cancelled`` hooks so the
+      controller can persist wait metadata and structured events.
+
+    The engine never parses configuration, calls providers, or rewrites
+    workflow state; those stay in the injected callbacks.  A ``resource`` of
+    ``None`` is unrestricted and returns ``None`` without touching the
+    broker.
+    """
+
+    def __init__(
+        self,
+        store: ExecutionResourceStore,
+        *,
+        poll_interval: float = 0.25,
+        control_interval: float = 1.0,
+        sleeper: Callable[[float], None] | None = None,
+        clock: Callable[[], float] | None = None,
+    ) -> None:
+        if poll_interval <= 0 or control_interval <= 0:
+            raise ValueError("admission intervals must be positive")
+        self._store = store
+        self._poll_interval = poll_interval
+        self._control_interval = control_interval
+        self._sleeper = sleeper or time.sleep
+        self._clock = clock or time.monotonic
+
+    # -- public ------------------------------------------------------------
+
+    def admit(
+        self,
+        *,
+        resource: str | None,
+        spec: ClaimSpec,
+        controller: ControllerIdentity | None,
+        stop_check: Callable[[], None],
+        revalidate: Callable[[bool], RevalidationVerdict],
+        on_waiting: Callable[[str | None, int | None], None] | None = None,
+        on_acquired: Callable[[int | None], None] | None = None,
+        on_cancelled: Callable[[str], None] | None = None,
+    ) -> ExecutionLease | None:
+        """Admit one invocation, returning the lease to launch (or ``None``).
+
+        Raises :class:`ResourceLeaseError` for fail-closed admission failures
+        (no identity, rejected claim), the caller's ``stop_check`` exception
+        (for example an owner stop, after the claim is cancelled), and
+        :class:`TurnReprepareRequired` when the live configuration requires
+        re-preparation (after the claim is cancelled or the unlaunched
+        reservation is released).
+        """
+        if resource is None:
+            return None
+        if controller is None:
+            raise ResourceLeaseError(
+                "admission", "durable controller identity is unavailable"
+            )
+        outcome = self._store.enqueue(resource, spec, controller)
+        if outcome.state == "rejected":
+            raise ResourceLeaseError(
+                "admission", outcome.reason or "claim rejected"
+            )
+        ticket = outcome.ticket
+        acquired = outcome.state == "acquired"
+        last_reason = outcome.reason
+        if not acquired:
+            self._service_controls(resource, spec, controller, stop_check, revalidate, on_cancelled)
+            last_control_at = self._clock()
+            if on_waiting is not None:
+                on_waiting(last_reason, ticket)
+            while not acquired:
+                if self._clock() - last_control_at >= self._control_interval:
+                    self._service_controls(
+                        resource, spec, controller, stop_check, revalidate, on_cancelled
+                    )
+                    last_control_at = self._clock()
+                if ticket is None:
+                    # The enqueue hit journal-lock contention: retry it.
+                    outcome = self._store.enqueue(resource, spec, controller)
+                    if outcome.state == "rejected":
+                        raise ResourceLeaseError(
+                            "admission", outcome.reason or "claim rejected"
+                        )
+                    ticket = outcome.ticket
+                    acquired = outcome.state == "acquired"
+                    last_reason = outcome.reason
+                else:
+                    outcome = self._store.try_acquire(
+                        resource, spec.invocation_id, controller
+                    )
+                    if outcome.state == "rejected":
+                        raise ResourceLeaseError(
+                            "admission", outcome.reason or "acquire rejected"
+                        )
+                    acquired = outcome.state == "acquired"
+                    if not acquired and on_waiting is not None and (
+                        outcome.reason != last_reason
+                    ):
+                        on_waiting(outcome.reason, outcome.ticket)
+                        last_reason = outcome.reason
+                if not acquired:
+                    self._sleeper(self._poll_interval)
+
+        # Final control check after acquisition, before durable launch
+        # intent.  A changed route identity releases the unlaunched
+        # reservation and re-prepares; a payload-only edit re-prepares with
+        # the retained ticket.
+        self._service_controls_final(
+            resource, spec, controller, stop_check, revalidate, on_cancelled
+        )
+        lease = ExecutionLease(
+            self._store, resource, spec.invocation_id, controller
+        )
+        if on_acquired is not None:
+            on_acquired(ticket)
+        # The caller owns durable launch intent: the dispatch seam calls
+        # ``lease.mark_launching()`` immediately before the model-bearing
+        # process starts.  The engine never launches on its own.
+        return lease
+
+    # -- internals ---------------------------------------------------------
+
+    def _service_controls(
+        self,
+        resource: str,
+        spec: ClaimSpec,
+        controller: ControllerIdentity,
+        stop_check: Callable[[], None],
+        revalidate: Callable[[bool], RevalidationVerdict],
+        on_cancelled: Callable[[str], None] | None,
+    ) -> None:
+        """Service owner stop first, then live configuration revalidation."""
+        try:
+            stop_check()
+        except BaseException:
+            self._cancel_claim(resource, spec, controller)
+            raise
+        try:
+            verdict = revalidate(final=False)
+        except BaseException:
+            # Mid-wait revalidation is expected to degrade to UNCHANGED;
+            # anything else is fail-closed with the claim cancelled.
+            self._cancel_claim(resource, spec, controller)
+            raise
+        if verdict.kind == "reprepare":
+            if verdict.retained_invocation_id is None:
+                # The route identity changed: the claim on this resource is
+                # obsolete and must be cancelled so the journal is clean.
+                self._cancel_claim(resource, spec, controller)
+                if on_cancelled is not None:
+                    on_cancelled(verdict.reason or "reprepare")
+            # A retained invocation id keeps the queued claim (and its
+            # ticket): re-admission reuses it idempotently after the turn is
+            # re-prepared with the refreshed configuration.
+            raise TurnReprepareRequired(
+                verdict.retained_invocation_id, verdict.reason or "reprepare"
+            )
+
+    def _service_controls_final(
+        self,
+        resource: str,
+        spec: ClaimSpec,
+        controller: ControllerIdentity,
+        stop_check: Callable[[], None],
+        revalidate: Callable[[bool], RevalidationVerdict],
+        on_cancelled: Callable[[str], None] | None,
+    ) -> None:
+        """Final stop/config/control check before ``mark_launching``."""
+        while True:
+            try:
+                stop_check()
+            except BaseException:
+                self._release_reservation(resource, spec, controller)
+                if on_cancelled is not None:
+                    on_cancelled("stop_before_launch")
+                raise
+            try:
+                verdict = revalidate(final=True)
+            except BaseException:
+                self._release_reservation(resource, spec, controller)
+                if on_cancelled is not None:
+                    on_cancelled("config_failure_before_launch")
+                raise
+            if verdict.kind == "retry":
+                # The current configuration pair was lock-contended: the
+                # reservation stays, the engine yields (with stop handling)
+                # and re-runs the real final check.
+                self._sleeper(self._poll_interval)
+                continue
+            if verdict.kind == "reprepare":
+                if verdict.retained_invocation_id is None:
+                    # The route identity changed: the unlaunched reservation
+                    # is released and the turn re-prepares at the
+                    # destination tail.
+                    self._release_reservation(resource, spec, controller)
+                    if on_cancelled is not None:
+                        on_cancelled(verdict.reason or "reprepare")
+                # A payload-only edit (retained invocation id) rebuilds
+                # within the same reservation: the claim and its ticket are
+                # kept and re-admission reuses the reservation idempotently.
+                raise TurnReprepareRequired(
+                    verdict.retained_invocation_id,
+                    verdict.reason or "reprepare",
+                )
+            return
+
+    def _cancel_claim(
+        self,
+        resource: str,
+        spec: ClaimSpec,
+        controller: ControllerIdentity,
+    ) -> None:
+        """Best-effort cancellation of a queued or reserved claim."""
+        try:
+            outcome = self._store.cancel(resource, spec.invocation_id, controller)
+            if outcome.state == "rejected" and outcome.reason == "not_cancellable":
+                # Already reserved (owner): release the unlaunched claim.
+                self._store.record_completion(
+                    resource, spec.invocation_id, controller
+                )
+        except Exception:
+            # Cancellation is best-effort at a control boundary; the claim's
+            # own controller fencing and reconciliation bound the damage.
+            pass
+
+    def _release_reservation(
+        self,
+        resource: str,
+        spec: ClaimSpec,
+        controller: ControllerIdentity,
+    ) -> None:
+        """Best-effort release of an acquired but unlaunched reservation."""
+        try:
+            self._store.record_completion(
+                resource, spec.invocation_id, controller
+            )
+        except Exception:
+            pass

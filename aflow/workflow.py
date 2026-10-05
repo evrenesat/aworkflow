@@ -32,7 +32,7 @@ from .config import (
     execution_resource_key,
     resolve_team_config,
 )
-from .live_config import load_live_config
+from .live_config import LiveConfigPairLockBusy, load_live_config
 from .manager import (
     ManagerDecisionError,
     ManagerDecisionV1,
@@ -77,8 +77,15 @@ from .git_status import (
     probe_repo_state,
 )
 from .execution_resources import (
+    ClaimSpec,
+    ControllerIdentity,
     ExecutionLease,
+    ExecutionResourceAdmission,
+    ExecutionResourceStore,
+    RevalidationVerdict,
     ResourceLeaseError,
+    TurnReprepareRequired,
+    UNCHANGED,
     owned_child_binding,
 )
 from .harnesses import get_adapter
@@ -164,6 +171,7 @@ from aflow.api.events import (
     TurnFinishedEvent,
     TurnStartedEvent,
     ExecutionEventType,
+    ExecutionResourceEvent,
     HotplugEvent,
 )
 
@@ -173,6 +181,24 @@ BANNER_REFRESH_INTERVAL_SECONDS = 1.0
 MANAGER_INPUT_BUDGET_FAILURE_REASON = (
     "Manager input exceeds its byte budget before provider launch."
 )
+
+
+def _default_execution_resource_store() -> ExecutionResourceStore:
+    """Factory seam for the exclusive-resource broker (constructor injection).
+
+    Tests replace this with a store rooted in a temporary directory; the
+    runtime has no environment variable or configuration override for it.
+    """
+    return ExecutionResourceStore()
+
+
+def _execution_resource_admission_options() -> dict[str, object]:
+    """Timing options for the admission wait loop (constructor injection).
+
+    Returns keyword arguments for :class:`ExecutionResourceAdmission`
+    (``poll_interval``, ``control_interval``, ``sleeper``, ``clock``).
+    """
+    return {}
 
 
 def _manager_budget_diagnostic_metadata(
@@ -3488,6 +3514,56 @@ class ResolvedProfile:
     # Derived internal identity for exclusive combinations; None for every
     # unmarked profile. It is never a user-entered configuration field.
     exclusive_resource: str | None = None
+
+
+def _resource_label(resolved: ResolvedProfile) -> str:
+    """Owner-facing label for an exclusive resource (never a credential)."""
+    model = resolved.model or "default"
+    effort = f" / effort {resolved.effort}" if resolved.effort else ""
+    return f"{resolved.harness_name} / {model}{effort}"
+
+
+def _resource_wait_record(
+    *,
+    resource: str,
+    label: str,
+    ticket: int | None,
+    reason: str | None,
+    step_name: str,
+    role: str,
+    invocation_id: str,
+    kind: str,
+    selector: str,
+    wait_started_at: str,
+    controller: ControllerIdentity | None,
+) -> dict[str, object]:
+    """Durable wait metadata for ``run.json`` (no credentials).
+
+    Version 1 carries the invocation identity, the claim kind and selector,
+    the wait-start time (preserved across unchanged polls and prompt-only
+    re-prepares), and the controller process identity.
+    """
+    record: dict[str, object] = {
+        "version": 1,
+        "resource": resource,
+        "label": label,
+        "invocation_id": invocation_id,
+        "kind": kind,
+        "role": role,
+        "selector": selector,
+        "step": step_name,
+        "ticket": ticket,
+        "wait_started_at": wait_started_at,
+    }
+    if controller is not None:
+        record["controller_pid"] = controller.pid
+        record["controller_birth"] = controller.birth
+        record["controller_boot"] = controller.boot
+    if reason is not None:
+        record["reason"] = reason
+        if reason == "owner_unconfirmed":
+            record["owner_unconfirmed"] = True
+    return record
 
 
 @dataclass(frozen=True)
@@ -9581,6 +9657,9 @@ def _run_workflow_unchecked(
         new_path: Path | None,
     ) -> None:
         state.status_message = "failed"
+        # An admission failure clears any durable wait evidence: a failed
+        # pre-turn is not a waiting run.
+        state.execution_resource_wait = None
         banner.stop(state)
         summary = _format_failure(
             reason=reason,
@@ -12034,6 +12113,8 @@ def _run_workflow_unchecked(
             )
         state.end_reason = "owner_stopped"
         state.status_message = "owner_stopped"
+        # An owner stop clears any durable wait evidence.
+        state.execution_resource_wait = None
         run_metadata.write(
             status="owner_stopped",
             end_reason="owner_stopped",
@@ -12966,6 +13047,308 @@ def _run_workflow_unchecked(
             new_plan_path=new_plan_path,
         )
 
+    # -- Exclusive execution resource admission ---------------------------
+    _resource_store: ExecutionResourceStore | None = None
+    admission_invocation_id: str | None = None
+    admission_wait_started_at: str | None = None
+    _admission_revision_cache: tuple | None = None
+
+    def _exclusive_resource_store() -> ExecutionResourceStore:
+        nonlocal _resource_store
+        if _resource_store is None:
+            _resource_store = _default_execution_resource_store()
+        return _resource_store
+
+    def _emit_resource_event(
+        phase: str,
+        *,
+        resource: str,
+        label: str,
+        ticket: int | None = None,
+        reason: str | None = None,
+        step_name: str | None = None,
+        role: str | None = None,
+        invocation_id: str | None = None,
+    ) -> None:
+        _emit_event(
+            observer,
+            ExecutionResourceEvent.create(
+                phase,
+                resource=resource,
+                label=label,
+                ticket=ticket,
+                reason=reason,
+                step_name=step_name,
+                role=role,
+                invocation_id=invocation_id,
+            ),
+        )
+
+    def _begin_admission_wait() -> str:
+        """Record the wait start once; unchanged polls reuse it."""
+        nonlocal admission_wait_started_at
+        if admission_wait_started_at is None:
+            admission_wait_started_at = (
+                datetime.now(timezone.utc).isoformat()
+            )
+        return admission_wait_started_at
+
+    def _clear_admission_wait_start() -> None:
+        nonlocal admission_wait_started_at
+        admission_wait_started_at = None
+
+    def _persist_execution_resource_wait(
+        record: dict[str, object] | None,
+    ) -> None:
+        if record is not None:
+            # Clear the previous active-turn fields before publishing the
+            # wait: the durable state must never claim a turn is running
+            # while the controller is only waiting.  Completed turn history
+            # is untouched.
+            state.active_turn = 0
+            state.current_turn_started_at = None
+            state.execution_resource_wait = dict(record)
+            message = f"Waiting for {record['label']} (exclusive)"
+            if record.get("reason") == "owner_unconfirmed":
+                message += (
+                    "; previous execution could not be confirmed stopped"
+                )
+            state.status_message = message
+        else:
+            state.execution_resource_wait = None
+            if state.status_message.startswith("Waiting for"):
+                state.status_message = (
+                    f"running turn {turn_number}: step {current_step_name}"
+                )
+        run_metadata.write(
+            status="running",
+            last_snapshot=state.last_snapshot,
+            turns_completed=state.turns_completed,
+            original_plan_path=original_plan_path,
+            current_step_name=current_step_name,
+            active_plan_path=active_plan_path,
+            new_plan_path=new_plan_path,
+        )
+
+    def _admission_live_revision() -> tuple | None:
+        """Cheap change detector for the live configuration pair.
+
+        Returns ``None`` when no live configuration is present (nothing can
+        change) or when the pair cannot be stat'ed (degrade to a full load
+        next time; a load failure is handled by the revalidation verdict).
+        """
+        if live_config_source_path is None:
+            return None
+        try:
+            stat = live_config_source_path.stat()
+        except OSError:
+            return None
+        workflows = live_config_source_path.with_name("workflows.toml")
+        try:
+            wstat = workflows.stat() if workflows.exists() else None
+        except OSError:
+            wstat = None
+        return (
+            stat.st_mtime_ns,
+            stat.st_size,
+            stat.st_ino,
+            (
+                (wstat.st_mtime_ns, wstat.st_size, wstat.st_ino)
+                if wstat is not None
+                else None
+            ),
+        )
+
+    def _step_prompt_fingerprint(
+        step: WorkflowStepConfig,
+        config: WorkflowUserConfig,
+        team_name: str | None,
+    ) -> tuple[str, ...]:
+        """Raw prompt texts that a live edit may change under the route."""
+        parts = [config.prompts.get(key, "") for key in step.prompts]
+        try:
+            parts.append(
+                resolve_role_prompt(
+                    step.role, team_name, config, step_path=step_path
+                )
+            )
+        except WorkflowError:
+            parts.append("")
+        return tuple(parts)
+
+    def _prompt_file_fingerprint(raw_texts: tuple[str, ...] | list[str]) -> str:
+        """Digest of every ``file://`` prompt body the raw texts reference.
+
+        Inline prompts contribute nothing (the result is empty).  Each body
+        is framed with its byte length so per-file boundaries are recorded:
+        re-splitting the same total bytes across two files (``ab`` + ``c``
+        -> ``a`` + ``bc``) changes the digest even though the concatenated
+        bytes are equal.  A missing or unreadable referenced file raises
+        ``WorkflowError`` so a queued turn fails before launch instead of
+        dispatching stale text.
+        """
+        digest = hashlib.sha256()
+        referenced = False
+        for text in raw_texts:
+            file_path = _resolve_prompt_file_path(
+                text, config_dir=prompt_config_dir, working_dir=working_dir
+            )
+            if file_path is None:
+                continue
+            referenced = True
+            try:
+                body = file_path.read_bytes()
+            except OSError as exc:
+                raise WorkflowError(
+                    f"prompt file cannot be read: {file_path}: {exc}"
+                ) from exc
+            digest.update(len(body).to_bytes(8, "big"))
+            digest.update(body)
+        return digest.hexdigest() if referenced else ""
+
+    def _admission_effective_team(
+        refreshed_workflow: WorkflowConfig,
+        pending_override: PendingTeamOverride | None,
+    ) -> str | None:
+        """Effective team under the boundary reload's precedence.
+
+        A ``workflows.toml`` team edit while queued must not silently keep
+        the prepared route: the refreshed workflow's own team wins unless an
+        applicable pending step-team override, an active team override, an
+        accepted owner override, or an explicit run team outranks it — the
+        same order ``_reload_live_configuration_at_boundary`` applies.
+        """
+        if pending_override is not None:
+            return pending_override.target_team
+        if state.current_team_override is not None:
+            return state.current_team_override
+        accepted = _last_accepted_boundary_override()
+        if accepted is not None and accepted.team is not None:
+            return accepted.team
+        if state.team_explicit:
+            return config.team if config.team is not None else state.current_team
+        return refreshed_workflow.team
+
+    def _revalidate_admission_config(
+        *,
+        final: bool,
+        step: WorkflowStepConfig,
+        pending_override: PendingTeamOverride | None,
+        selector: str,
+        resolved: ResolvedProfile,
+        prompt_fingerprint: tuple[str, ...],
+        prompt_files: str,
+    ) -> RevalidationVerdict:
+        """Re-read the live configuration and judge the admitted route.
+
+        The check always resolves the *current* workflow/step from the
+        loaded configuration (never from the captured prepare snapshot)
+        under the effective team re-derived with the boundary reload's
+        precedence, and compares the route identity: step role, selector,
+        resolved profile, and the raw prompt fingerprint.
+
+        Verdicts:
+
+        * unchanged revision (mid-wait only) -> ``UNCHANGED`` (no file
+          access needed),
+        * journal-lock contention -> ``UNCHANGED`` mid-wait (the last
+          accepted route stays) and ``retry`` on the final check (the real
+          lock-consistent load must succeed before any launch),
+        * malformed or otherwise unusable changed configuration -> the
+          ``ConfigError``/``WorkflowError`` propagates: the admission
+          engine cancels the claim and the caller raises the actionable
+          pre-turn/config failure instead of waiting forever behind an
+          occupied resource (owner stop is serviced first),
+        * workflow/step missing, exclusive mark removed, step role,
+          selector, resolved identity, effective team, model, or effort
+          changed -> reprepare without retention,
+        * prompt-only edit -> reprepare retaining the invocation id (the
+          queue position/reservation is preserved); the final check also
+          re-reads referenced ``file://`` prompt bodies so a changed or
+          vanished file is caught before launch,
+        * unrelated edit -> ``UNCHANGED``.
+
+        A final check (after acquisition, before launch) always performs a
+        real lock-consistent load and fails closed on malformed
+        configuration.
+        """
+        nonlocal _admission_revision_cache
+        if live_config_source_path is None:
+            return UNCHANGED
+        revision = _admission_live_revision()
+        if (
+            not final
+            and revision is not None
+            and revision == _admission_revision_cache
+        ):
+            return UNCHANGED
+        try:
+            loaded = load_live_config(live_config_source_path, nonblocking=True)
+        except LiveConfigPairLockBusy:
+            # The current pair cannot be read lock-consistently.  Mid-wait
+            # the last accepted route stays; before launch the engine must
+            # retry the real check (reservation retained, no launch).  The
+            # claim is the owner now, so the queued-wait record is stale
+            # while the final check retries.
+            if final:
+                _clear_admission_wait_start()
+                _persist_execution_resource_wait(None)
+                return RevalidationVerdict("retry", None, "pair_lock_busy")
+            return UNCHANGED
+        # A changed live configuration that cannot be parsed (or whose
+        # route no longer resolves) propagates: waiting behind an occupied
+        # resource with an unusable configuration would never become
+        # dispatchable, so the claim is cancelled and the turn fails
+        # closed at the pre-turn boundary.
+        _admission_revision_cache = revision
+        refreshed = loaded.workflow_config
+        refreshed_workflow = refreshed.workflows.get(workflow_name)
+        new_step = (
+            refreshed_workflow.steps.get(current_step_name)
+            if refreshed_workflow is not None
+            else None
+        )
+        if new_step is None:
+            return RevalidationVerdict("reprepare", None, "route_changed")
+        if new_step.role != step.role:
+            return RevalidationVerdict("reprepare", None, "route_changed")
+        effective_team = _admission_effective_team(
+            refreshed_workflow, pending_override
+        )
+        new_selector, new_resolved = _resolve_step_runtime(
+            new_step,
+            refreshed,
+            team_name=effective_team,
+            step_path=step_path,
+            step_name=current_step_name,
+            run_local_role_selectors=state.role_selectors,
+            pending_team_override=pending_override,
+        )
+        if new_resolved.exclusive_resource is None:
+            return RevalidationVerdict(
+                "reprepare", None, "exclusive_unmarked"
+            )
+        if (new_selector, new_resolved) != (selector, resolved):
+            return RevalidationVerdict(
+                "reprepare", None, "route_changed"
+            )
+        current_raw = _step_prompt_fingerprint(new_step, refreshed, effective_team)
+        if current_raw != prompt_fingerprint:
+            return RevalidationVerdict(
+                "reprepare", admission_invocation_id, "prompt_edited"
+            )
+        if (
+            final
+            and _prompt_file_fingerprint(current_raw) != prompt_files
+        ):
+            # The raw prompt text is unchanged, but a referenced file://
+            # body (or the role prompt's file form) changed: rebuild the
+            # payload while keeping the ticket/resource.
+            return RevalidationVerdict(
+                "reprepare", admission_invocation_id, "prompt_edited"
+            )
+        return UNCHANGED
+
     turn_number = 1
     while True:
         try:
@@ -13790,6 +14173,176 @@ def _run_workflow_unchecked(
                 )
             )
 
+        # Exclusive execution resource gate: exclusive combinations must be
+        # admitted by the durable FIFO broker before the turn starts.
+        # Unmarked profiles keep the legacy fast path (no broker, no event).
+        turn_lease: ExecutionLease | None = None
+        if resolved.exclusive_resource is not None:
+            admission_resource = resolved.exclusive_resource
+            admission_label = _resource_label(resolved)
+            admission_step = step
+            admission_override = (
+                state.pending_step_team_override if consume_team_override else None
+            )
+            admission_selector = selector
+            admission_resolved = resolved
+            try:
+                admission_fingerprint = _step_prompt_fingerprint(
+                    step, workflow_config, active_team_name
+                )
+                admission_prompt_files = _prompt_file_fingerprint(
+                    admission_fingerprint
+                )
+            except WorkflowError as exc:
+                _raise_pre_turn_failure(
+                    reason=exc.summary,
+                    snapshot=snapshot_before,
+                    active_path=active_plan_path,
+                    new_path=new_plan_path,
+                )
+            if admission_invocation_id is None:
+                admission_invocation_id = uuid4().hex
+            invocation_id = admission_invocation_id
+            admission_spec = ClaimSpec(
+                project_root=str(config.repo_root),
+                run_id=str(reserved_run_id),
+                invocation_id=invocation_id,
+                kind="turn",
+                role=step.role,
+                selector=selector,
+            )
+            admission_store = _exclusive_resource_store()
+            admission_controller = admission_store.current_controller_identity()
+            admission = ExecutionResourceAdmission(
+                admission_store, **_execution_resource_admission_options()
+            )
+            try:
+                turn_lease = admission.admit(
+                    resource=admission_resource,
+                    spec=admission_spec,
+                    controller=admission_controller,
+                    stop_check=_honor_owner_stop_before_live_reload,
+                    revalidate=lambda final: _revalidate_admission_config(
+                        final=final,
+                        step=admission_step,
+                        pending_override=admission_override,
+                        selector=admission_selector,
+                        resolved=admission_resolved,
+                        prompt_fingerprint=admission_fingerprint,
+                        prompt_files=admission_prompt_files,
+                    ),
+                    on_waiting=lambda reason, ticket: (
+                        _persist_execution_resource_wait(
+                            _resource_wait_record(
+                                resource=admission_resource,
+                                label=admission_label,
+                                ticket=ticket,
+                                reason=reason,
+                                step_name=current_step_name,
+                                role=step.role,
+                                invocation_id=invocation_id,
+                                kind="turn",
+                                selector=selector,
+                                wait_started_at=_begin_admission_wait(),
+                                controller=admission_controller,
+                            )
+                        ),
+                        _emit_resource_event(
+                            "waiting",
+                            resource=admission_resource,
+                            label=admission_label,
+                            ticket=ticket,
+                            reason=reason,
+                            step_name=current_step_name,
+                            role=step.role,
+                            invocation_id=invocation_id,
+                        ),
+                    ),
+                    on_acquired=lambda ticket: (
+                        _clear_admission_wait_start(),
+                        _persist_execution_resource_wait(None),
+                        _emit_resource_event(
+                            "acquired",
+                            resource=admission_resource,
+                            label=admission_label,
+                            ticket=ticket,
+                            step_name=current_step_name,
+                            role=step.role,
+                            invocation_id=invocation_id,
+                        ),
+                    ),
+                    on_cancelled=lambda reason: (
+                        _clear_admission_wait_start(),
+                        _persist_execution_resource_wait(None),
+                        _emit_resource_event(
+                            "cancelled",
+                            resource=admission_resource,
+                            label=admission_label,
+                            reason=reason,
+                            step_name=current_step_name,
+                            role=step.role,
+                            invocation_id=invocation_id,
+                        ),
+                    ),
+                )
+            except TurnReprepareRequired as reprepare:
+                admission_invocation_id = reprepare.retained_invocation_id
+                # A fresh re-prepare starts a new wait window; a retained
+                # (prompt-only) re-prepare keeps the original wait start.
+                if reprepare.retained_invocation_id is None:
+                    admission_wait_started_at = None
+                continue
+            except OwnerStopRequested:
+                return _finish_owner_stop()
+            except (ConfigError, WorkflowError) as exc:
+                # A changed live configuration that cannot be trusted (a
+                # malformed pair, or a route that no longer resolves) fails
+                # the turn closed at the pre-turn boundary, mid-wait or
+                # post-acquire alike; the admission engine has already
+                # cancelled the claim or released the reservation.
+                _raise_pre_turn_failure(
+                    reason=(
+                        "exclusive execution resource admission "
+                        "revalidation failed: "
+                        f"{getattr(exc, 'summary', None) or exc}"
+                    ),
+                    snapshot=state.last_snapshot,
+                    active_path=active_plan_path,
+                    new_path=new_plan_path,
+                )
+            except ResourceLeaseError as exc:
+                _raise_pre_turn_failure(
+                    reason=(
+                        "exclusive execution resource unavailable: "
+                        f"{exc.reason}"
+                    ),
+                    snapshot=state.last_snapshot,
+                    active_path=active_plan_path,
+                    new_path=new_plan_path,
+                )
+
+            # Durable launch intent is ordered before _start_turn: no turn,
+            # repair, or recovery accounting may exist before the claim is
+            # durably "launching".  A confirmed non-launch may release the
+            # reserved claim; the turn then fails closed with zero
+            # accounting.
+            try:
+                turn_lease.mark_launching()
+            except ResourceLeaseError as exc:
+                try:
+                    turn_lease.complete()
+                except ResourceLeaseError:
+                    pass
+                _raise_pre_turn_failure(
+                    reason=(
+                        "exclusive execution resource launch intent "
+                        f"failed: {exc.reason}"
+                    ),
+                    snapshot=state.last_snapshot,
+                    active_path=active_plan_path,
+                    new_path=new_plan_path,
+                )
+
         turn_dir, turn_started_at = _start_turn(
             turn_number=turn_number,
             step_name=current_step_name,
@@ -13873,6 +14426,7 @@ def _run_workflow_unchecked(
                         execution = execute_session(
                             turn_session_request, invocation,
                             _poll_live_control if step.role == "worker" else None,
+                            turn_lease,
                         )
                         owned_session_result = execution.result
                         completed = subprocess.CompletedProcess(
@@ -13884,12 +14438,15 @@ def _run_workflow_unchecked(
                             control_callback=(
                                 _poll_live_control if step.role == "worker" else None
                             ),
+                            lease=turn_lease,
                         )
                 else:
                     assert runner is not None
                     if step.role == "worker":
                         _poll_live_control()
-                    completed = _run_injected_runner(runner, invocation, execution_repo_root)
+                    completed = _run_injected_runner(
+                        runner, invocation, execution_repo_root, lease=turn_lease
+                    )
             except OwnerStopRequested:
                 return _finish_owner_stop(
                     invocation=invocation,
@@ -13917,6 +14474,23 @@ def _run_workflow_unchecked(
                 )
 
             assert completed is not None
+
+            if turn_lease is not None:
+                # The dispatch helper already completed the lease (or left it
+                # unconfirmed on launch failure); record the release here at
+                # the safe boundary where the turn result is durable.
+                _clear_admission_wait_start()
+                _persist_execution_resource_wait(None)
+                _emit_resource_event(
+                    "released",
+                    resource=admission_resource,
+                    label=admission_label,
+                    step_name=current_step_name,
+                    role=step.role,
+                    invocation_id=invocation_id,
+                )
+                admission_invocation_id = None
+                admission_wait_started_at = None
 
             if recovery_first_worker and turn_session_request is None:
                 _persist_recovery_operation_state("consumed")

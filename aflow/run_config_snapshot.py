@@ -109,6 +109,46 @@ def configuration_pair_lock(pair_dir: Path) -> Iterator[Path]:
         os.close(fd)
 
 
+@contextmanager
+def configuration_pair_lock_nonblocking(pair_dir: Path) -> Iterator[Path | None]:
+    """Acquire the configuration pair lock without blocking.
+
+    Yields ``None`` when the lock is already held (or unavailable on a
+    read-only file system).  Callers inside a control-servicing wait loop
+    must treat a ``None`` yield as "yield to the loop" and keep polling; they
+    must never fall back to an unlocked read.
+    """
+    pair_dir = Path(pair_dir)
+    try:
+        pair_dir.mkdir(parents=True, exist_ok=True)
+        lock_path = pair_dir / PAIR_LOCK_NAME
+        fd = os.open(lock_path, os.O_WRONLY | os.O_CREAT | os.O_NOFOLLOW, 0o600)
+    except OSError as exc:
+        if exc.errno not in (errno.EROFS, errno.EPERM, errno.EACCES):
+            raise
+        existing = pair_dir / PAIR_LOCK_NAME
+        if existing.is_file() and not existing.is_symlink():
+            fd = os.open(existing, os.O_WRONLY | os.O_NOFOLLOW)
+            lock_path = existing
+        else:
+            yield None
+            return
+    import fcntl
+
+    try:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            yield None
+            return
+        try:
+            yield lock_path
+        finally:
+            fcntl.flock(fd, fcntl.LOCK_UN)
+    finally:
+        os.close(fd)
+
+
 def snapshot_directory(repo_root: Path, run_id: str) -> Path:
     return Path(repo_root) / ".aflow" / "runs" / run_id / SNAPSHOT_DIR_NAME
 

@@ -27,12 +27,21 @@ from .run_config_snapshot import (
     RunConfigSnapshot,
     SnapshotError,
     configuration_pair_lock,
+    configuration_pair_lock_nonblocking,
     load_run_config_snapshot,
 )
 
 
 class LiveConfigError(ConfigError):
     """The selected live workflow configuration cannot be used."""
+
+
+class LiveConfigPairLockBusy(LiveConfigError):
+    """The configuration pair lock is held and the caller cannot block.
+
+    Control-servicing wait loops raise this to yield back to polling; they
+    must never fall back to an unlocked configuration read.
+    """
 
 
 LiveConfigSourceKind = Literal[
@@ -235,6 +244,7 @@ def load_live_config(
     default_config_path: str | Path | None = None,
     legacy_origin_base_dir: str | Path | None = None,
     loader: Callable[[Path], WorkflowUserConfig] | None = None,
+    nonblocking: bool = False,
 ) -> LoadedLiveConfig:
     """Load the selected current configuration pair under its pair lock.
 
@@ -242,6 +252,11 @@ def load_live_config(
     behavior for general callers.  This helper checks the selected live file
     again inside the lock so an existing run can never turn a missing source
     into an empty configuration or silently use a copied snapshot.
+
+    With ``nonblocking=True`` the pair lock is acquired without sleeping.  A
+    busy lock raises :class:`LiveConfigPairLockBusy` so a control-servicing
+    wait loop can yield back to polling instead of blocking other controllers
+    or deferring owner-stop handling.
     """
     if isinstance(config_path, LiveConfigSource):
         if source is not None:
@@ -260,20 +275,36 @@ def load_live_config(
         legacy_origin_base_dir=legacy_origin_base_dir,
     )
     parse = loader or load_workflow_config
-    with configuration_pair_lock(selected.config_path.parent):
-        _require_live_file(selected.config_path, source_kind=selected.kind)
-        try:
-            workflow_config = parse(selected.config_path)
-        except ConfigError:
-            raise
-        except OSError as exc:
-            raise LiveConfigError(
-                f"unable to read live workflow configuration {selected.config_path}: {exc}"
-            ) from exc
+    if nonblocking:
+        with configuration_pair_lock_nonblocking(selected.config_path.parent) as lock_path:
+            if lock_path is None:
+                raise LiveConfigPairLockBusy(
+                    f"configuration pair lock is busy: {selected.config_path}"
+                )
+            workflow_config = _parse_live_config_pair(parse, selected)
+    else:
+        with configuration_pair_lock(selected.config_path.parent):
+            workflow_config = _parse_live_config_pair(parse, selected)
     return LoadedLiveConfig(
         workflow_config=_resolve_relative_settings(workflow_config, selected),
         source=selected,
     )
+
+
+def _parse_live_config_pair(
+    parse: Callable[[Path], WorkflowUserConfig],
+    selected: LiveConfigSource,
+) -> WorkflowUserConfig:
+    """Re-check and parse the live file while the pair lock is held."""
+    _require_live_file(selected.config_path, source_kind=selected.kind)
+    try:
+        return parse(selected.config_path)
+    except ConfigError:
+        raise
+    except OSError as exc:
+        raise LiveConfigError(
+            f"unable to read live workflow configuration {selected.config_path}: {exc}"
+        ) from exc
 
 
 def _metadata_live_config_path(metadata: Mapping[str, Any] | None) -> str | None:
