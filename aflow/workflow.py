@@ -8392,6 +8392,15 @@ def _run_workflow_unchecked(
                 None,
                 state.override_result,
             )
+        if resume.successor_max_turns is not None:
+            # Keep predecessor roles/notes/stop intent with the new budget.
+            # Never rewrite the predecessor override artifact.
+            if state.override_result is not None:
+                state.override_result = replace(state.override_result, max_turns=None)
+            if state.last_accepted_override is not None:
+                state.last_accepted_override = replace(
+                    state.last_accepted_override, max_turns=None
+                )
         state.role_selectors = dict(resume.role_selectors)
         state.current_hotplug_transaction = resume.current_hotplug_transaction
         state.pending_hotplug_transaction = resume.pending_hotplug_transaction
@@ -12191,6 +12200,12 @@ def _run_workflow_unchecked(
                 run_dir=run_paths.run_dir,
             )
 
+        if (
+            required_predecessor_override
+            and resume is not None
+            and resume.successor_max_turns is not None
+        ):
+            request = replace(request, max_turns=None)
         state.pending_override_notes = request.notes
         state.pending_override_target_step = (
             request.next_step if request.notes else None

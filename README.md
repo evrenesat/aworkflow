@@ -400,7 +400,13 @@ The shared lifecycle registry exposes these 14 tools:
   automatic inference from inactivity. Omission or `false` retains the normal
   scope check; use the same flag on an idempotent retry. Reconcile real
   historical records only after the deployed API is verified.
-- `resume_run` — create an idempotent continuation of a run.
+- `resume_run` — create an idempotent continuation of a run. Optional
+  `successor_max_turns` sets a positive integer budget for the new generation,
+  independently of predecessor turns or budget overrides. The REST resume body
+  accepts the same field. Omit it or pass `null` to retain existing behavior.
+  A budget of `1` permits one pending review; a rejection stops before another
+  worker starts. Source artifacts and explicit role overrides remain intact.
+  Replaying the same idempotency key requires the same successor budget.
 
 The UI-server registry also exposes these web authoring tools over the same
 authenticated MCP connection:

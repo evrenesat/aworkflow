@@ -2018,3 +2018,8 @@ and retain every predecessor needed to resolve that lineage through allocation
 and final pruning, then retry only the unfinished delivery without reopening a
 removed worktree or replaying a checkpoint. CI and deployment remain downstream
 of the remote main update.
+
+Managed resume carries optional `successor_max_turns` through REST/MCP, the
+startup record, replay, and worker bootstrap. It supersedes predecessor budget
+choices only; source overrides stay immutable, role/stop/notes validation stays
+active, and controls addressed to the successor retain their normal authority.

@@ -1,5 +1,19 @@
 # DEVLOG
 
+## 2026-10-05 — Explicit managed successor budgets (issue #71)
+
+- Added optional strict positive `successor_max_turns` to REST and MCP resume.
+  Persist the choice across idempotent replay, uncertain publication and worker
+  boot; reject changed requests and invalid values before reservation.
+- The successor budget supersedes inherited budget choices while preserving
+  source files, explicit role selectors and existing admission/control checks.
+- Regression coverage exercises a real 48-turn source and one-turn successor:
+  rejected review stops before another implementation worker. Omitted budgets
+  retain the existing continuation behavior. REST/MCP contracts exercise real
+  bootstrap, ordinary resume and durable recovery.
+
+Refs https://github.com/evrenesat/aworkflow/issues/71.
+
 ## 2026-10-05 — Storage and evidence hygiene in bundled skills
 
 - Added a compact role-appropriate "Storage and evidence hygiene" section to

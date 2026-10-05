@@ -857,6 +857,8 @@ class ResumeContext:
     # to avoid an import cycle: it is a ``aflow.budget_resume.BudgetBoundary``
     # descriptor carried only by the shared classifier-validated paths.
     budget_continuation: object | None = None
+    # Explicit managed successor budget supersedes only predecessor budget choices.
+    successor_max_turns: int | None = None
     # Set only by the validated durable resume reconstruction path.  This is
     # an in-process capability marker, not persisted resume input.
     _validated_resume_context_marker: object | None = field(

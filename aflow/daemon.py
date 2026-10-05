@@ -1074,8 +1074,10 @@ class DaemonService:
         idempotency_key: str | None = None,
         extra_instructions: tuple[str, ...] | None = None,
         recovery: Mapping[str, object] | RecoveryRequest | None = None,
+        successor_max_turns: int | None = None,
     ) -> StartRunResult:
         """Launch one validated continuation; the source unit is never restarted."""
+        _validate_successor_max_turns(successor_max_turns)
         if extra_instructions is not None:
             _validate_extra_instructions(extra_instructions)
         try:
@@ -1115,6 +1117,10 @@ class DaemonService:
                 if stored_recovery != normalized_recovery:
                     raise DaemonIdempotencyConflict(
                         "resume idempotency key was reused for a different recovery request"
+                    )
+                if pending.get("successor_max_turns") != successor_max_turns:
+                    raise DaemonIdempotencyConflict(
+                        "resume idempotency key was reused for a different successor budget"
                     )
                 stored_extra_digest = _record_extra_instructions_digest(pending)
                 provided = pending.get("resume_extra_instructions_provided", False)
@@ -1196,6 +1202,7 @@ class DaemonService:
                 normalized_source_run_id,
                 extra_instructions=extra_instructions or (),
                 extra_instructions_provided=extra_instructions is not None,
+                successor_max_turns=successor_max_turns,
             )
             source_manifest = self._application.repository.get_launch_manifest(
                 normalized_source_run_id
@@ -1293,6 +1300,7 @@ class DaemonService:
                     ),
                     recovery=normalized_recovery,
                 )
+                record["successor_max_turns"] = successor_max_turns
                 record["manifest_request_digest"] = normalized_request_digest(manifest)
                 if recovery_intent is not None:
                     record["recovery_intent_digest"] = recovery_intent_digest(
@@ -2217,6 +2225,9 @@ class DaemonService:
                 source_run_id,
                 extra_instructions=resume_extra,
                 extra_instructions_provided=resume_extra_provided,
+                successor_max_turns=_validate_successor_max_turns(
+                    record.get("successor_max_turns")
+                ),
             )
             prepared = PreparedRun(
                 workflow_name=bootstrap.workflow_name,
@@ -2245,6 +2256,9 @@ class DaemonService:
                 validate_run_id(str(record["resumed_from_run_id"])),
                 extra_instructions=resume_extra,
                 extra_instructions_provided=resume_extra_provided,
+                successor_max_turns=_validate_successor_max_turns(
+                    record.get("successor_max_turns")
+                ),
             )
         if recovery_request is not None:
             if source is None:
@@ -3343,6 +3357,7 @@ class DaemonService:
         *,
         extra_instructions: tuple[str, ...] = (),
         extra_instructions_provided: bool = False,
+        successor_max_turns: int | None = None,
     ):
         from aflow.cli import _bootstrap_resume_invocation
 
@@ -3358,6 +3373,7 @@ class DaemonService:
             team_arg=None,
             start_step_arg=None,
             max_turns_arg=None,
+            successor_max_turns=successor_max_turns,
             extra_instructions_arg=extra_instructions,
             extra_instructions_provided=extra_instructions_provided,
             live_loader=load_workflow_config,
@@ -4241,6 +4257,12 @@ def _prepare_recovery_resume_context(
     return dataclass_replace(context, recovery_context=recovery_context)
 
 
+def _validate_successor_max_turns(value: object) -> int | None:
+    if value is not None and (type(value) is not int or value < 1):
+        raise ValueError("successor_max_turns must be a positive integer")
+    return value
+
+
 def _worker_prepared(
     record: Mapping[str, object],
     manifest: LaunchManifest,
@@ -4274,6 +4296,9 @@ def _worker_prepared(
             team_arg=None,
             start_step_arg=None,
             max_turns_arg=None,
+            successor_max_turns=_validate_successor_max_turns(
+                record.get("successor_max_turns")
+            ),
             extra_instructions_arg=extra_instructions,
             extra_instructions_provided=extra_instructions_provided,
             live_loader=load_workflow_config,
