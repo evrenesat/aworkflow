@@ -1,7 +1,9 @@
-# AFLOW-MAINT-20261006 · 07/18 — Extract workflow startup and safe-boundary preparation
+# AFLOW-MAINT-20261006 · 07/18 · Group A — Extract workflow startup and safe-boundary preparation
 
 - Effort ID: `AFLOW-MAINT-20261006`
 - Member: 07 of 18
+- Pairing group: `AFLOW-MAINT-20261006-A`
+- Group position: 07 of 09 (preference among ready members)
 - Effort: AFlow maintainability improvement, initiated 6 October 2026
 - Source findings: A02 (startup and boundary preparation)
 - Priority: P2
@@ -29,9 +31,13 @@ A contributor can follow startup and safe-boundary preparation in small owners w
 
 Required effort predecessors: 02: aflow-maintainability-20261006-02-configuration-crash-recovery.md; 06: aflow-maintainability-20261006-06-supervision-state-codecs.md
 
-No outside implementation prerequisite was identified at authoring; recheck current active work and accepted main before dispatch.
+No additional outside prerequisite is named for this member. Recheck current active work, accepted main and the pairing index before dispatch; a newly overlapping active change is a hold to reconcile, not permission to overwrite it.
 
-These are launch prerequisites, not instructions to implement predecessor plans in this run. Ordinal filenames do not imply serial execution. Shared-file overlap alone is not a dependency: use isolated execution roots, preserve both accepted changes and serialize integration. Do not launch this member from an obsolete main or start another controller for its existing lineage.
+**Pairing boundary — Group A:** Own workflow_startup.py/workflow_boundary.py and their workflow callers. Treat config.py, config_pair.py, live_config.py and run_config_snapshot.py as read-only public boundaries from Group B; 02 must be delivered before using its recovery behavior. Do not reopen the handed-off control-plane projection or server fixture files.
+
+The preferred group position is not an extra dependency. The concierge chooses one ready member from each group; never start this member while its prerequisite is merely implementing or in review. Delivery requires accepted origin/main commits, required CI and applicable live acceptance. Check the [effort pairing index](../notes/aflow-maintainability-20261006-index.md) for the current handoff and hold evidence.
+
+Checkpoint scope lists are upper bounds narrowed by the pairing boundary above. Do not reopen files handed to the other group or add a cross-group production edit without first recording a concrete ordering handoff. Shared domain documentation still updates with each delivery; preserve both sides and serialize integration. Use an isolated execution root and one controller for the member's lineage. These prerequisites do not authorize implementing any other plan in this run.
 
 ## Context Bootstrap
 

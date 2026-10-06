@@ -1,7 +1,9 @@
-# AFLOW-MAINT-20261006 · 06/18 — Make supervision and recovery records explicit and round-trippable
+# AFLOW-MAINT-20261006 · 06/18 · Group A — Make supervision and recovery records explicit and round-trippable
 
 - Effort ID: `AFLOW-MAINT-20261006`
 - Member: 06 of 18
+- Pairing group: `AFLOW-MAINT-20261006-A`
+- Group position: 05 of 09 (preference among ready members)
 - Effort: AFlow maintainability improvement, initiated 6 October 2026
 - Source findings: A04 (manager, scope, overrides, hotplug, provider recovery)
 - Priority: P2
@@ -29,9 +31,13 @@ Manager, repair, override, hotplug and provider-recovery records have explicit t
 
 Required effort predecessors: 05: aflow-maintainability-20261006-05-execution-state-codecs.md
 
-No outside implementation prerequisite was identified at authoring; recheck current active work and accepted main before dispatch.
+Outside prerequisite: inherited-hotplug-completion-repair-20261006.md must be delivered before codec extraction touches hotplug/recovery state. Its controller 20261006t025109z-d5afd011 was implementing a checkpoint repair at the 6 October 2026 08:48 UTC inspection; checked original-plan boxes alone did not establish completion. Recheck accepted commits, publication and delivery gates.
 
-These are launch prerequisites, not instructions to implement predecessor plans in this run. Ordinal filenames do not imply serial execution. Shared-file overlap alone is not a dependency: use isolated execution roots, preserve both accepted changes and serialize integration. Do not launch this member from an obsolete main or start another controller for its existing lineage.
+**Pairing boundary — Group A:** Complete durable supervision/recovery codecs and the scoped CI typing list before Group B members 12 and 16 start. Do not modify control-plane repository/progress projections, canonical public models or server transport fixtures; preserve the compatibility wrappers consumed there. The hotplug repair outside this effort must be delivered first.
+
+The preferred group position is not an extra dependency. The concierge chooses one ready member from each group; never start this member while its prerequisite is merely implementing or in review. Delivery requires accepted origin/main commits, required CI and applicable live acceptance. Check the [effort pairing index](../notes/aflow-maintainability-20261006-index.md) for the current handoff and hold evidence.
+
+Checkpoint scope lists are upper bounds narrowed by the pairing boundary above. Do not reopen files handed to the other group or add a cross-group production edit without first recording a concrete ordering handoff. Shared domain documentation still updates with each delivery; preserve both sides and serialize integration. Use an isolated execution root and one controller for the member's lineage. These prerequisites do not authorize implementing any other plan in this run.
 
 ## Context Bootstrap
 

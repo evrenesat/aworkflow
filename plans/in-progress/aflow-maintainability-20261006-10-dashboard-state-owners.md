@@ -1,7 +1,9 @@
-# AFLOW-MAINT-20261006 · 10/18 — Give the run dashboard explicit history, observation and action owners
+# AFLOW-MAINT-20261006 · 10/18 · Group B — Give the run dashboard explicit history, observation and action owners
 
 - Effort ID: `AFLOW-MAINT-20261006`
 - Member: 10 of 18
+- Pairing group: `AFLOW-MAINT-20261006-B`
+- Group position: 07 of 09 (preference among ready members)
 - Effort: AFlow maintainability improvement, initiated 6 October 2026
 - Source findings: A05 (RunDashboard)
 - Priority: P2
@@ -29,9 +31,13 @@ Users keep the same selected run, drafts, pending actions and quiet refresh beha
 
 Required effort predecessors: 01: aflow-maintainability-20261006-01-verification-baseline.md
 
-Wait for run-history-fast-on-demand-20261005.md to be delivered and verify its current branch/receipt before dispatch. As inspected, successor 20261006t060326z-d4fe4b41 is active. Rebase on that accepted behavior; do not restore the earlier eager history/context path.
+Outside prerequisite: run-history-fast-on-demand-20261005.md must be delivered, including its remaining selected-status/on-demand behavior and browser acceptance. At the 6 October 2026 08:48 UTC inspection, successor 20261006t060326z-d4fe4b41 was owner_stopped after a worker timeout, with checkpoints 3–4 still unchecked. Verify current origin/main, publication receipt and delivery evidence before dispatch; this snapshot is not permission to resume it.
 
-These are launch prerequisites, not instructions to implement predecessor plans in this run. Ordinal filenames do not imply serial execution. Shared-file overlap alone is not a dependency: use isolated execution roots, preserve both accepted changes and serialize integration. Do not launch this member from an obsolete main or start another controller for its existing lineage.
+**Pairing boundary — Group B:** Group B owns dashboard/history hooks, API-client use and browser acceptance after 01's baseline edits. No runtime, persistence or provider implementation belongs here. The external history plan is a hard hold until delivered; do not use this refactor to finish its missing functionality. Other ready Group B members may proceed while it is held.
+
+The preferred group position is not an extra dependency. The concierge chooses one ready member from each group; never start this member while its prerequisite is merely implementing or in review. Delivery requires accepted origin/main commits, required CI and applicable live acceptance. Check the [effort pairing index](../notes/aflow-maintainability-20261006-index.md) for the current handoff and hold evidence.
+
+Checkpoint scope lists are upper bounds narrowed by the pairing boundary above. Do not reopen files handed to the other group or add a cross-group production edit without first recording a concrete ordering handoff. Shared domain documentation still updates with each delivery; preserve both sides and serialize integration. Use an isolated execution root and one controller for the member's lineage. These prerequisites do not authorize implementing any other plan in this run.
 
 ## Context Bootstrap
 

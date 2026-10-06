@@ -1,7 +1,9 @@
-# AFLOW-MAINT-20261006 · 02/18 — Make configuration pair saves recover after process death
+# AFLOW-MAINT-20261006 · 02/18 · Group B — Make configuration pair saves recover after process death
 
 - Effort ID: `AFLOW-MAINT-20261006`
 - Member: 02 of 18
+- Pairing group: `AFLOW-MAINT-20261006-B`
+- Group position: 01 of 09 (preference among ready members)
 - Effort: AFlow maintainability improvement, initiated 6 October 2026
 - Source findings: A01
 - Priority: P1
@@ -29,9 +31,13 @@ After an interrupted settings save, every cooperating AFlow reader sees one comp
 
 Required effort predecessors: None.
 
-No outside implementation prerequisite was identified at authoring; recheck current active work and accepted main before dispatch.
+No additional outside prerequisite is named for this member. Recheck current active work, accepted main and the pairing index before dispatch; a newly overlapping active change is a hold to reconcile, not permission to overwrite it.
 
-These are launch prerequisites, not instructions to implement predecessor plans in this run. Ordinal filenames do not imply serial execution. Shared-file overlap alone is not a dependency: use isolated execution roots, preserve both accepted changes and serialize integration. Do not launch this member from an obsolete main or start another controller for its existing lineage.
+**Pairing boundary — Group B:** Opening member of Group B; compatible with 01. Keep configuration code and new pair-recovery tests here. Put added REST/MCP parity cases in apps/aflow_app/server/tests/test_config_pair_parity.py; do not concurrently rewrite the broad test_control_plane_api.py/test_mcp.py fixture helpers owned by 01. The configuration transaction stays independent of 14's byte primitives.
+
+The preferred group position is not an extra dependency. The concierge chooses one ready member from each group; never start this member while its prerequisite is merely implementing or in review. Delivery requires accepted origin/main commits, required CI and applicable live acceptance. Check the [effort pairing index](../notes/aflow-maintainability-20261006-index.md) for the current handoff and hold evidence.
+
+Checkpoint scope lists are upper bounds narrowed by the pairing boundary above. Do not reopen files handed to the other group or add a cross-group production edit without first recording a concrete ordering handoff. Shared domain documentation still updates with each delivery; preserve both sides and serialize integration. Use an isolated execution root and one controller for the member's lineage. These prerequisites do not authorize implementing any other plan in this run.
 
 ## Context Bootstrap
 
@@ -124,13 +130,13 @@ uv run pytest -q tests/test_config_pair.py tests/test_live_config.py tests/test_
 
 **Context:** Inspect the owners named below with their existing callers/tests and the decisions above. Run `git rev-parse --show-toplevel` before editing.
 
-**Scope:** May create/modify global_config_service.py, project_config_service compatibility helpers, config.py, live_config.py, run_config_snapshot.py and directly affected tests. Must not touch unrelated behavior, live controllers, owner settings or another plan's implementation. Documentation changes are limited to the ownership/behavior changed here.
+**Scope:** May create/modify global_config_service.py, project_config_service compatibility helpers, config.py, live_config.py, run_config_snapshot.py, directly affected configuration tests and new server tests/test_config_pair_parity.py. Must not touch unrelated behavior, live controllers, owner settings or another plan's implementation. Documentation changes are limited to the ownership/behavior changed here.
 
 **Steps:**
 
 - [ ] Replace _commit_pair_locked with a call into the transaction owner while preserving revision validation, ordered PATCH actions, audit outcomes and ordinary OSError rollback behavior.
 - [ ] Trace load_workflow_config callers with rg and move all supported pair reads under the same recovery boundary, without nesting the same flock. Keep current-source selection and nonblocking control-loop behavior.
-- [ ] Add REST/MCP save/read parity coverage and a fresh-process live-config read after a killed save. Update docs/configuration.md, ARCHITECTURE.md and DEVLOG.md with recovery and manual-edit conflict behavior.
+- [ ] Add REST/MCP save/read parity coverage in the new tests/test_config_pair_parity.py server module and a fresh-process live-config read after a killed save; keep broad REST/MCP fixture helpers owned by 01 unchanged. Update docs/configuration.md, ARCHITECTURE.md and DEVLOG.md with recovery and manual-edit conflict behavior.
 
 **Dependencies:** Checkpoint 1 of this plan, plus the plan-level prerequisites.
 
@@ -141,7 +147,7 @@ uv run pytest -q tests/test_config.py tests/test_live_config.py tests/test_run_c
 ```
 
 ```bash
-uv run --project apps/aflow_app/server pytest -q apps/aflow_app/server/tests/test_project_config_service.py apps/aflow_app/server/tests/test_global_config_patch.py apps/aflow_app/server/tests/test_mcp.py -k 'config'
+uv run --project apps/aflow_app/server pytest -q apps/aflow_app/server/tests/test_project_config_service.py apps/aflow_app/server/tests/test_global_config_patch.py apps/aflow_app/server/tests/test_mcp.py apps/aflow_app/server/tests/test_config_pair_parity.py -k 'config'
 ```
 
 **Expected result:** A renamed prompt and its workflow reference recover together; stale revisions and invalid saves preserve exact bytes; REST/MCP still return the same public errors.
@@ -165,7 +171,7 @@ uv run pytest -q tests/test_config_pair.py tests/test_config.py tests/test_live_
 ```
 
 ```bash
-uv run --project apps/aflow_app/server pytest -q apps/aflow_app/server/tests/test_project_config_service.py apps/aflow_app/server/tests/test_global_config_patch.py apps/aflow_app/server/tests/test_guided_config.py apps/aflow_app/server/tests/test_mcp.py
+uv run --project apps/aflow_app/server pytest -q apps/aflow_app/server/tests/test_project_config_service.py apps/aflow_app/server/tests/test_global_config_patch.py apps/aflow_app/server/tests/test_guided_config.py apps/aflow_app/server/tests/test_mcp.py apps/aflow_app/server/tests/test_config_pair_parity.py
 ```
 
 ```bash

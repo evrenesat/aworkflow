@@ -1,7 +1,9 @@
-# AFLOW-MAINT-20261006 · 17/18 — Move provider discovery and explicit session capabilities into adapters
+# AFLOW-MAINT-20261006 · 17/18 · Group A — Move provider discovery and explicit session capabilities into adapters
 
 - Effort ID: `AFLOW-MAINT-20261006`
 - Member: 17 of 18
+- Pairing group: `AFLOW-MAINT-20261006-A`
+- Group position: 06 of 09 (preference among ready members)
 - Effort: AFlow maintainability improvement, initiated 6 October 2026
 - Source findings: A12
 - Priority: P2
@@ -29,9 +31,13 @@ Adding or adjusting a provider's session support no longer requires provider-nam
 
 Required effort predecessors: 01: aflow-maintainability-20261006-01-verification-baseline.md
 
-No outside implementation prerequisite was identified at authoring; recheck current active work and accepted main before dispatch.
+Outside prerequisites: inherited-hotplug-completion-repair-20261006.md and exclusive-stop-and-dead-owner-reclamation-20261006.md must be delivered before provider/session ownership extraction. Their runs were active at the 6 October 2026 08:48 UTC inspection. Recheck exact accepted commits, publication and delivery gates; never take over their active worktrees.
 
-These are launch prerequisites, not instructions to implement predecessor plans in this run. Ordinal filenames do not imply serial execution. Shared-file overlap alone is not a dependency: use isolated execution roots, preserve both accepted changes and serialize integration. Do not launch this member from an obsolete main or start another controller for its existing lineage.
+**Pairing boundary — Group A:** Own provider discovery/session adapters and their workflow seam. Do not modify the Group B server, UI, configuration or control-plane projection files. The external inherited-hotplug and exclusive-resource repairs must be delivered before extracting these ownership-sensitive paths. Prefer this member before 07 when both are ready; 08 strictly requires it.
+
+The preferred group position is not an extra dependency. The concierge chooses one ready member from each group; never start this member while its prerequisite is merely implementing or in review. Delivery requires accepted origin/main commits, required CI and applicable live acceptance. Check the [effort pairing index](../notes/aflow-maintainability-20261006-index.md) for the current handoff and hold evidence.
+
+Checkpoint scope lists are upper bounds narrowed by the pairing boundary above. Do not reopen files handed to the other group or add a cross-group production edit without first recording a concrete ordering handoff. Shared domain documentation still updates with each delivery; preserve both sides and serialize integration. Use an isolated execution root and one controller for the member's lineage. These prerequisites do not authorize implementing any other plan in this run.
 
 ## Context Bootstrap
 

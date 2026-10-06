@@ -1,7 +1,9 @@
-# AFLOW-MAINT-20261006 · 13/18 — Avoid reparsing unchanged event journals
+# AFLOW-MAINT-20261006 · 13/18 · Group B — Avoid reparsing unchanged event journals
 
 - Effort ID: `AFLOW-MAINT-20261006`
 - Member: 13 of 18
+- Pairing group: `AFLOW-MAINT-20261006-B`
+- Group position: 05 of 09 (preference among ready members)
 - Effort: AFlow maintainability improvement, initiated 6 October 2026
 - Source findings: A07
 - Priority: P2
@@ -27,11 +29,15 @@ Repeated event polling and appends by the same process stop reparsing the unchan
 
 ## Dependencies And Integration
 
-Required effort predecessors: 01: aflow-maintainability-20261006-01-verification-baseline.md
+Required effort predecessors: 05: aflow-maintainability-20261006-05-execution-state-codecs.md; 14: aflow-maintainability-20261006-14-persistence-primitives.md
 
-No outside implementation prerequisite was identified at authoring; recheck current active work and accepted main before dispatch.
+No additional outside prerequisite is named for this member. Recheck current active work, accepted main and the pairing index before dispatch; a newly overlapping active change is a hold to reconcile, not permission to overwrite it.
 
-These are launch prerequisites, not instructions to implement predecessor plans in this run. Ordinal filenames do not imply serial execution. Shared-file overlap alone is not a dependency: use isolated execution roots, preserve both accepted changes and serialize integration. Do not launch this member from an obsolete main or start another controller for its existing lineage.
+**Pairing boundary — Group B:** Requires 05 and 14: finish Group A's repository observer and persistence-primitive edits before this member takes the shared repository/persistence files. Keep file_io.py and durable runtime codecs read-only; retain public persistence wrappers and event shapes. Group B member 12 follows this event-journal owner. Scope REST/SSE coverage to existing public service behavior, not runtime resume fixture rewrites.
+
+The preferred group position is not an extra dependency. The concierge chooses one ready member from each group; never start this member while its prerequisite is merely implementing or in review. Delivery requires accepted origin/main commits, required CI and applicable live acceptance. Check the [effort pairing index](../notes/aflow-maintainability-20261006-index.md) for the current handoff and hold evidence.
+
+Checkpoint scope lists are upper bounds narrowed by the pairing boundary above. Do not reopen files handed to the other group or add a cross-group production edit without first recording a concrete ordering handoff. Shared domain documentation still updates with each delivery; preserve both sides and serialize integration. Use an isolated execution root and one controller for the member's lineage. These prerequisites do not authorize implementing any other plan in this run.
 
 ## Context Bootstrap
 

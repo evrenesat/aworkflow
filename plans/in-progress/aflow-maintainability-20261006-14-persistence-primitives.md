@@ -1,7 +1,9 @@
-# AFLOW-MAINT-20261006 · 14/18 — Consolidate small persistence primitives without moving domain locks
+# AFLOW-MAINT-20261006 · 14/18 · Group A — Consolidate small persistence primitives without moving domain locks
 
 - Effort ID: `AFLOW-MAINT-20261006`
 - Member: 14 of 18
+- Pairing group: `AFLOW-MAINT-20261006-A`
+- Group position: 02 of 09 (preference among ready members)
 - Effort: AFlow maintainability improvement, initiated 6 October 2026
 - Source findings: A08
 - Priority: P2
@@ -29,9 +31,13 @@ Run artifacts, publication, admission, backups and resource journals use a small
 
 Required effort predecessors: 01: aflow-maintainability-20261006-01-verification-baseline.md
 
-No outside implementation prerequisite was identified at authoring; recheck current active work and accepted main before dispatch.
+Outside prerequisite: exclusive-stop-and-dead-owner-reclamation-20261006.md must be delivered before migrating execution_resources.py. Run 20261006t083546z-50d6f9e9 was waiting for the exclusive worker at the 6 October 2026 08:48 UTC inspection. Preserve that repair's broker/owner-stop behavior and recheck delivery before dispatch.
 
-These are launch prerequisites, not instructions to implement predecessor plans in this run. Ordinal filenames do not imply serial execution. Shared-file overlap alone is not a dependency: use isolated execution roots, preserve both accepted changes and serialize integration. Do not launch this member from an obsolete main or start another controller for its existing lineage.
+**Pairing boundary — Group A:** Complete all six byte-primitive caller migrations before 05 changes the runlog writer and before Group B member 13 changes control-plane persistence. Keep config pair transaction/locking code out of scope and leave event append ownership to 13. This member is held until the external exclusive stop/dead-owner repair is delivered; 04 remains an independent ready Group A choice after 01.
+
+The preferred group position is not an extra dependency. The concierge chooses one ready member from each group; never start this member while its prerequisite is merely implementing or in review. Delivery requires accepted origin/main commits, required CI and applicable live acceptance. Check the [effort pairing index](../notes/aflow-maintainability-20261006-index.md) for the current handoff and hold evidence.
+
+Checkpoint scope lists are upper bounds narrowed by the pairing boundary above. Do not reopen files handed to the other group or add a cross-group production edit without first recording a concrete ordering handoff. Shared domain documentation still updates with each delivery; preserve both sides and serialize integration. Use an isolated execution root and one controller for the member's lineage. These prerequisites do not authorize implementing any other plan in this run.
 
 ## Context Bootstrap
 
@@ -158,7 +164,7 @@ uv run pytest -q tests/test_file_io.py tests/test_publication.py tests/test_proj
 **Steps:**
 
 - [ ] Migrate selected matching byte writes/reads one caller at a time; preserve backup provenance, control-plane revisions and resource lock/lease ordering.
-- [ ] Keep event append behavior with plan 13's journal owner if already delivered; do not fold append-only journals into atomic replacement primitives.
+- [ ] Leave event append behavior with the current journal owner for the later plan 13 handoff; retain its public wrappers and do not fold append-only journals into atomic replacement primitives.
 - [ ] Delete only now-unused duplicate helpers, keep necessary compatibility wrappers, and update nearest guidance and DEVLOG.md.
 
 **Dependencies:** Checkpoint 2 of this plan, plus the plan-level prerequisites.

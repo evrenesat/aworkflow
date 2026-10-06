@@ -1,7 +1,9 @@
-# AFLOW-MAINT-20261006 · 18/18 — Publish a concise source-grounded maintainability map
+# AFLOW-MAINT-20261006 · 18/18 · Group B — Publish a concise source-grounded maintainability map
 
 - Effort ID: `AFLOW-MAINT-20261006`
 - Member: 18 of 18
+- Pairing group: `AFLOW-MAINT-20261006-B`
+- Group position: 09 of 09 (preference among ready members)
 - Effort: AFlow maintainability improvement, initiated 6 October 2026
 - Source findings: A14; documentation closure for A01–A13
 - Priority: P2
@@ -27,11 +29,15 @@ A contributor or AFlow concierge can locate launch, resume, state, settings, pro
 
 ## Dependencies And Integration
 
-Required effort predecessors: 03: aflow-maintainability-20261006-03-configuration-validation-ownership.md; 04: aflow-maintainability-20261006-04-transport-neutral-resume.md; 05: aflow-maintainability-20261006-05-execution-state-codecs.md; 06: aflow-maintainability-20261006-06-supervision-state-codecs.md; 07: aflow-maintainability-20261006-07-workflow-startup-boundaries.md; 08: aflow-maintainability-20261006-08-workflow-turn-execution.md; 09: aflow-maintainability-20261006-09-workflow-progression-delivery.md; 10: aflow-maintainability-20261006-10-dashboard-state-owners.md; 11: aflow-maintainability-20261006-11-settings-draft-save-owners.md; 12: aflow-maintainability-20261006-12-progress-evidence-pipeline.md; 13: aflow-maintainability-20261006-13-event-journal-read-cost.md; 14: aflow-maintainability-20261006-14-persistence-primitives.md; 15: aflow-maintainability-20261006-15-server-app-composition.md; 16: aflow-maintainability-20261006-16-generated-wire-contracts.md; 17: aflow-maintainability-20261006-17-provider-discovery-boundaries.md
+Required effort predecessors: 01: aflow-maintainability-20261006-01-verification-baseline.md; 02: aflow-maintainability-20261006-02-configuration-crash-recovery.md; 03: aflow-maintainability-20261006-03-configuration-validation-ownership.md; 04: aflow-maintainability-20261006-04-transport-neutral-resume.md; 05: aflow-maintainability-20261006-05-execution-state-codecs.md; 06: aflow-maintainability-20261006-06-supervision-state-codecs.md; 07: aflow-maintainability-20261006-07-workflow-startup-boundaries.md; 08: aflow-maintainability-20261006-08-workflow-turn-execution.md; 09: aflow-maintainability-20261006-09-workflow-progression-delivery.md; 10: aflow-maintainability-20261006-10-dashboard-state-owners.md; 11: aflow-maintainability-20261006-11-settings-draft-save-owners.md; 12: aflow-maintainability-20261006-12-progress-evidence-pipeline.md; 13: aflow-maintainability-20261006-13-event-journal-read-cost.md; 14: aflow-maintainability-20261006-14-persistence-primitives.md; 15: aflow-maintainability-20261006-15-server-app-composition.md; 16: aflow-maintainability-20261006-16-generated-wire-contracts.md; 17: aflow-maintainability-20261006-17-provider-discovery-boundaries.md
 
-No outside implementation prerequisite was identified at authoring; recheck current active work and accepted main before dispatch.
+No additional outside prerequisite is named for this member. Recheck current active work, accepted main and the pairing index before dispatch; a newly overlapping active change is a hold to reconcile, not permission to overwrite it.
 
-These are launch prerequisites, not instructions to implement predecessor plans in this run. Ordinal filenames do not imply serial execution. Shared-file overlap alone is not a dependency: use isolated execution roots, preserve both accepted changes and serialize integration. Do not launch this member from an obsolete main or start another controller for its existing lineage.
+**Pairing boundary — Group B:** Closing member of Group B, not an overlap candidate. Start only after all other 17 effort members are delivered and their integration evidence is current. Reconcile both groups into one source-grounded architecture map; earlier members still document their own changes at delivery.
+
+The preferred group position is not an extra dependency. The concierge chooses one ready member from each group; never start this member while its prerequisite is merely implementing or in review. Delivery requires accepted origin/main commits, required CI and applicable live acceptance. Check the [effort pairing index](../notes/aflow-maintainability-20261006-index.md) for the current handoff and hold evidence.
+
+Checkpoint scope lists are upper bounds narrowed by the pairing boundary above. Do not reopen files handed to the other group or add a cross-group production edit without first recording a concrete ordering handoff. Shared domain documentation still updates with each delivery; preserve both sides and serialize integration. Use an isolated execution root and one controller for the member's lineage. These prerequisites do not authorize implementing any other plan in this run.
 
 ## Context Bootstrap
 

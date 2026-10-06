@@ -1,7 +1,9 @@
-# AFLOW-MAINT-20261006 · 12/18 — Separate evidence reading from progress interpretation
+# AFLOW-MAINT-20261006 · 12/18 · Group B — Separate evidence reading from progress interpretation
 
 - Effort ID: `AFLOW-MAINT-20261006`
 - Member: 12 of 18
+- Pairing group: `AFLOW-MAINT-20261006-B`
+- Group position: 08 of 09 (preference among ready members)
 - Effort: AFlow maintainability improvement, initiated 6 October 2026
 - Source findings: A06
 - Priority: P2
@@ -27,11 +29,15 @@ The same durable evidence produces truthful summary and detail through small rea
 
 ## Dependencies And Integration
 
-Required effort predecessors: 01: aflow-maintainability-20261006-01-verification-baseline.md
+Required effort predecessors: 06: aflow-maintainability-20261006-06-supervision-state-codecs.md; 13: aflow-maintainability-20261006-13-event-journal-read-cost.md
 
-Wait for run-history-fast-on-demand-20261005.md delivery and preserve its compact overview/demand-driven detail contract. This plan owns backend progress structure, not that plan's client paging.
+Outside prerequisite: run-history-fast-on-demand-20261005.md must be delivered with its compact overview/demand-driven detail contract. At the 6 October 2026 08:48 UTC inspection, successor 20261006t060326z-d4fe4b41 was owner_stopped and checkpoints 3–4 remained unchecked. Verify current delivery evidence before dispatch; client paging and recovery of that run remain outside this plan.
 
-These are launch prerequisites, not instructions to implement predecessor plans in this run. Ordinal filenames do not imply serial execution. Shared-file overlap alone is not a dependency: use isolated execution roots, preserve both accepted changes and serialize integration. Do not launch this member from an obsolete main or start another controller for its existing lineage.
+**Pairing boundary — Group B:** Requires 06's delivered codec boundary and 13's delivered event owner (which also requires 05/14). From this point Group B owns progress/evidence/context projection changes in control_plane/repository.py and persistence.py; Group A consumers use their unchanged interfaces. No changes to run-state codecs, runlog, file_io.py or the event append implementation. The external history delivery gate remains mandatory.
+
+The preferred group position is not an extra dependency. The concierge chooses one ready member from each group; never start this member while its prerequisite is merely implementing or in review. Delivery requires accepted origin/main commits, required CI and applicable live acceptance. Check the [effort pairing index](../notes/aflow-maintainability-20261006-index.md) for the current handoff and hold evidence.
+
+Checkpoint scope lists are upper bounds narrowed by the pairing boundary above. Do not reopen files handed to the other group or add a cross-group production edit without first recording a concrete ordering handoff. Shared domain documentation still updates with each delivery; preserve both sides and serialize integration. Use an isolated execution root and one controller for the member's lineage. These prerequisites do not authorize implementing any other plan in this run.
 
 ## Context Bootstrap
 

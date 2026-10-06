@@ -3,112 +3,103 @@
 - Effort ID: `AFLOW-MAINT-20261006`
 - Started: 6 October 2026
 - Members: 18 checkpoint plans, 38 checkpoints
-- Authoring status: queued; no implementation run launched by this conversion.
+- Pairing groups: `AFLOW-MAINT-20261006-A` and `AFLOW-MAINT-20261006-B`; nine members and 19 checkpoints each
+- Authoring status: queued; no implementation run launched by this planning work.
 
 ## Purpose And Source
 
 One coordinated attempt to make AFlow easier to understand and change: smaller cohesive functions/classes/files, explicit ownership and unchanged execution/recovery protections.
 
-Source: [aflow-maintainability-20261006-source-review.md](aflow-maintainability-20261006-source-review.md). Exact source SHA-256: `0f0185752e327adbc4609c8f617e0b6e855454bee9862877da96b16b35b091fe`. Original review revision: `c60a980796ed35c2d31f5a2a75dc5f1219789951`. Conversion source: p100 main `d2a9a5e96fe317191a30a0da2f35c10baaf7fdeb`. The original research copy and its evidence remain preserved.
+Source: [preserved architecture review](aflow-maintainability-20261006-source-review.md). Exact source SHA-256: `0f0185752e327adbc4609c8f617e0b6e855454bee9862877da96b16b35b091fe`. Original review revision: `c60a980796ed35c2d31f5a2a75dc5f1219789951`. Conversion and pairing inspection source: p100 main `d2a9a5e96fe317191a30a0da2f35c10baaf7fdeb`. Preserve the original research copy and evidence.
 
 ## Concierge Recognition And Scope
 
-All and only the 18 executable members use filename prefix `aflow-maintainability-20261006-` in plans/in-progress and declare `Effort ID: AFLOW-MAINT-20261006` (the actual Markdown value is code-formatted). Search the stable ID/prefix, not the word architecture, to distinguish them from older unrelated plans. This index and the source snapshot are non-executable notes and must not be launched.
+All and only the 18 executable members use filename prefix `aflow-maintainability-20261006-` in plans/in-progress and declare this effort ID. Every member also declares exactly one pairing-group ID and a preferred group position. Search these exact identifiers, not the words architecture or maintainability, to distinguish this effort from unrelated plans. This index and the source snapshot are non-executable notes.
 
-Each member has a stable 01–18 number, source-finding IDs, explicit dependencies, scope, unchecked checkpoints, exact local verification and real-surface acceptance. Keep the effort ID in commits, PR descriptions and concise run handoffs. Never infer completion from directory placement.
+Keep member numbers, filenames, source coverage, checkpoints and run lineage stable. Group position is a preference among ready work, not an extra dependency and not an instruction to implement a whole group in one run. Preserve the shared effort ID and group ID in concise handoffs and PR descriptions. Never infer completion from directory placement.
 
-Scheduling at creation: .aflow/project-settings.json has auto_consume_plans=false and max_concurrent_implementations=2. No scheduling/runtime settings are changed. The new files are queued in the requested in-progress stack. Enabling automatic consumption or launching runs is a separate action.
+The current scheduler does not enforce these Markdown group tags or prose cross-plan prerequisites. These are instructions for the dispatching concierge; no runtime queue feature, automatic pairing or resource-policy change is introduced. Filenames deliberately do not use AFlow's linear _Pnn_ series syntax. Automatic plan consumption was false and the project implementation cap was two at inspection; this planning change leaves them unchanged.
 
-Filename numbers are effort member IDs, not AFlow's _Pnn_ sequence syntax; the work is a dependency graph with independent lanes, not one forced serial queue. The current scheduler does not enforce these prose cross-plan prerequisites. The dispatching concierge must check predecessors and outside dependencies before each authorized start; do not enable blind automatic consumption of this bundle.
+## Viability And Limits
 
-## Members
+Two complementary groups are viable with the current worker/reviewer split. The selected xtx-turns team uses an exclusive local pi Swift worker, a non-exclusive cloud Codex Sol 6.1 extra-high checkpoint reviewer and a cloud Astra medium final reviewer. The broker serializes local worker invocations; a cloud review can overlap the other group's implementation. A second controller is useful concurrency, not permission for a second simultaneous local inference invocation.
 
-01. [Make the existing validation baseline dependable](../in-progress/aflow-maintainability-20261006-01-verification-baseline.md) — P1; A10.
+This arrangement removes the accidental single effort-wide queue. It does not make all 81 cross-group combinations start-ready, nor guarantee continuous utilization. A pair is eligible only after every listed predecessor and external hold is delivered. Worker/review durations, repair turns, cloud limits and deployment gates can still leave one resource idle. Equal checkpoint counts are a workload balance aid, not equal-duration estimates. Member 18 is a final join.
 
-    State: queued. Required predecessors: none.
+Production ownership is separated below, with explicit one-way handoffs for the few shared files. Shared documentation still needs ordinary serialized integration. A claim of zero shared files for all 18 original refactors would be false: CI, server fixtures, repository projection and persistence mechanics cross the original boundaries. The delivery gates below remove concurrent edits there without inventing another abstraction or scheduler.
 
-02. [Make configuration pair saves recover after process death](../in-progress/aflow-maintainability-20261006-02-configuration-crash-recovery.md) — P1; A01.
+## Group A — Runtime And Durable State
 
-    State: queued. Required predecessors: none.
+Preferred order: **01 → 14 → 04 → 05 → 06 → 17 → 07 → 08 → 09**. Skip a held preference when another member's actual prerequisites are satisfied; for example, 04 can proceed after 01 while 14 waits for the external resource repair.
 
-03. [Give configuration validation and editing clear owners](../in-progress/aflow-maintainability-20261006-03-configuration-validation-ownership.md) — P2; A11.
+- **A1 / 01** [Make the existing validation baseline dependable](../in-progress/aflow-maintainability-20261006-01-verification-baseline.md) — 2 checkpoints; required effort predecessors: none.
+- **A2 / 14** [Consolidate small persistence primitives without moving domain locks](../in-progress/aflow-maintainability-20261006-14-persistence-primitives.md) — 3 checkpoints; required effort predecessors: 01. Also has an external delivery hold.
+- **A3 / 04** [Move shared resume operations out of the CLI](../in-progress/aflow-maintainability-20261006-04-transport-neutral-resume.md) — 2 checkpoints; required effort predecessors: 01.
+- **A4 / 05** [Give execution identity and metadata one codec per responsibility](../in-progress/aflow-maintainability-20261006-05-execution-state-codecs.md) — 2 checkpoints; required effort predecessors: 04, 14.
+- **A5 / 06** [Make supervision and recovery records explicit and round-trippable](../in-progress/aflow-maintainability-20261006-06-supervision-state-codecs.md) — 2 checkpoints; required effort predecessors: 05. Also has an external delivery hold.
+- **A6 / 17** [Move provider discovery and explicit session capabilities into adapters](../in-progress/aflow-maintainability-20261006-17-provider-discovery-boundaries.md) — 2 checkpoints; required effort predecessors: 01. Also has an external delivery hold.
+- **A7 / 07** [Extract workflow startup and safe-boundary preparation](../in-progress/aflow-maintainability-20261006-07-workflow-startup-boundaries.md) — 2 checkpoints; required effort predecessors: 02, 06.
+- **A8 / 08** [Extract one workflow turn with explicit process and lease ownership](../in-progress/aflow-maintainability-20261006-08-workflow-turn-execution.md) — 2 checkpoints; required effort predecessors: 07, 17.
+- **A9 / 09** [Extract checkpoint progression and completion delivery](../in-progress/aflow-maintainability-20261006-09-workflow-progression-delivery.md) — 2 checkpoints; required effort predecessors: 08.
 
-    State: queued. Required predecessors: 02.
+After the opening baseline, this group owns runtime/resume orchestration, durable state codecs, provider/session mechanics, workflow phases and the initial byte-persistence migration. Configuration services, UI, public wire models and later control-plane read projections stay with Group B. Exact per-member exceptions and handoffs are in each plan.
 
-04. [Move shared resume operations out of the CLI](../in-progress/aflow-maintainability-20261006-04-transport-neutral-resume.md) — P1; A03.
+## Group B — Configuration And Operator Surfaces
 
-    State: queued. Required predecessors: 01.
+Preferred order: **02 → 03 → 11 → 15 → 13 → 16 → 10 → 12 → 18**. Skip a held preference only when the selected member's actual prerequisites are satisfied. In particular, history holds on 10/12 do not hold 03/11/15/13/16.
 
-05. [Give execution identity and metadata one codec per responsibility](../in-progress/aflow-maintainability-20261006-05-execution-state-codecs.md) — P2; A04 (identity, turn, update semantics).
+- **B1 / 02** [Make configuration pair saves recover after process death](../in-progress/aflow-maintainability-20261006-02-configuration-crash-recovery.md) — 2 checkpoints; required effort predecessors: none.
+- **B2 / 03** [Give configuration validation and editing clear owners](../in-progress/aflow-maintainability-20261006-03-configuration-validation-ownership.md) — 2 checkpoints; required effort predecessors: 02.
+- **B3 / 11** [Extract the settings draft owner and save coordinator](../in-progress/aflow-maintainability-20261006-11-settings-draft-save-owners.md) — 2 checkpoints; required effort predecessors: 01, 02.
+- **B4 / 15** [Compose isolated server apps and cohesive routers](../in-progress/aflow-maintainability-20261006-15-server-app-composition.md) — 2 checkpoints; required effort predecessors: 01, 04.
+- **B5 / 13** [Avoid reparsing unchanged event journals](../in-progress/aflow-maintainability-20261006-13-event-journal-read-cost.md) — 2 checkpoints; required effort predecessors: 05, 14.
+- **B6 / 16** [Generate client wire types from server schemas](../in-progress/aflow-maintainability-20261006-16-generated-wire-contracts.md) — 2 checkpoints; required effort predecessors: 01, 06, 15.
+- **B7 / 10** [Give the run dashboard explicit history, observation and action owners](../in-progress/aflow-maintainability-20261006-10-dashboard-state-owners.md) — 3 checkpoints; required effort predecessors: 01. Also has an external delivery hold.
+- **B8 / 12** [Separate evidence reading from progress interpretation](../in-progress/aflow-maintainability-20261006-12-progress-evidence-pipeline.md) — 2 checkpoints; required effort predecessors: 06, 13. Also has an external delivery hold.
+- **B9 / 18** [Publish a concise source-grounded maintainability map](../in-progress/aflow-maintainability-20261006-18-architecture-entry-point.md) — 2 checkpoints; required effort predecessors: 01, 02, 03, 04, 05, 06, 07, 08, 09, 10, 11, 12, 13, 14, 15, 16, 17. Closing join; never pair with unfinished effort work.
 
-    State: queued. Required predecessors: 04.
+This group owns configuration parsing/transactions, server composition, settings/dashboard state, generated wire contracts, and event/progress read projections after Group A's initial migrations. It imports the runtime's existing public boundaries instead of changing codecs, workflow behavior or provider ownership. Member 18 closes the whole effort after both groups finish.
 
-06. [Make supervision and recovery records explicit and round-trippable](../in-progress/aflow-maintainability-20261006-06-supervision-state-codecs.md) — P2; A04 (manager, scope, overrides, hotplug, provider recovery).
+## Shared Boundaries And Required Handoffs
 
-    State: queued. Required predecessors: 05.
+These are deliberate ordering gates to prevent overlapping implementation, distinct from the preferred order above. A predecessor must be delivered, not merely implementing or awaiting review.
 
-07. [Extract workflow startup and safe-boundary preparation](../in-progress/aflow-maintainability-20261006-07-workflow-startup-boundaries.md) — P2; A02 (startup and boundary preparation).
+| Boundary | Required handoff |
+| --- | --- |
+| Baseline CI, UI edits and broad fixture helpers | 01 before dependent UI/server members; 02 uses separate configuration-pair transport tests so the opening pair stays independent. |
+| Runlog byte writes | 14 before 05. The config-pair transaction in 02 remains separate and is never migrated by 14. |
+| REST/MCP resume fixture migration | 04 before 15. Members 13/16 inherit that gate through 05/06. Members 02/03 keep new tests in configuration-focused modules. |
+| Repository observer and persistence implementation | 05 and 14 before 13; 13 before 12. Group A does not reopen those handed-off projection files. |
+| Supervision records and scoped type-check CI | 06 before 12/16. Group B consumes the compatible codecs; 16 preserves the completed type gate when adding schema checks. |
+| Configuration recovery used by runtime/settings | 02 before 07/11. Workflow extraction treats config/live-config implementations as read-only public boundaries. |
+| Whole-effort architecture consolidation | All members 01–17 before 18. |
 
-    State: queued. Required predecessors: 02, 06.
+All members may update the documentation for their own change in the same delivery. Use small domain-scoped edits to ARCHITECTURE.md, DEVLOG.md and nearest guidance, preserve both sides on merge, and serialize publication. These shared documentation paths are not a reason to serialize otherwise independent implementation. If a necessary production edit crosses a group's protected boundary, narrow the change or record an additional concrete delivery handoff before dispatch; do not silently expand the pairing claim.
 
-08. [Extract one workflow turn with explicit process and lease ownership](../in-progress/aflow-maintainability-20261006-08-workflow-turn-execution.md) — P2; A02 (one-turn execution).
+## Pair Selection And Delivery
 
-    State: queued. Required predecessors: 07, 17.
+1. Reconcile existing controllers and delivery evidence first. This bundle is queued; its authors have not launched it. Existing authorized priorities and current capacity take precedence.
+2. Select one ready member from each group, using the preferred orders as a tie-breaker. Check exact predecessor commits on origin/main, publication receipts, exact-SHA CI and applicable live acceptance. Resolve any outside repair/history hold. A checked box or a review in progress is not delivery.
+3. The first compatible pair is **A/01 + B/02**. While A handles 14/04, useful counterparts are B/03 or B/11. After 04, A/05–06 can pair with B/11 or B/15. After the handoffs, A/17/07/08/09 can pair with ready B/13/16/10/12. These are choices, not synchronized rounds.
+4. Give each logical run one workflow-managed execution root, branch and controller. Before launch, record member/group, exact run ID, execution root, branch, integration owner and current stage in the existing delivery handoff. No roots or run IDs are assigned by this planning change. The dispatching concierge owns integration unless the owner assigns someone else.
+5. Keep at most one active effort member per group for these pairings, including review and repair. Let the exclusive worker broker and cloud review phases interleave naturally. When a member finishes delivery, refill that group's slot with another ready member; do not wait for the counterpart plan to finish. Do not weaken a prerequisite, launch a duplicate or switch an exclusive worker to shared mode merely to keep two runs present.
+6. If one group has no ready work, report the concrete hold and continue the other ready work or another already-authorized independent plan. Do not count an idle wait as local/cloud overlap or invent filler checkpoints. Start 18 only after the complete join.
+7. Serialize integration and publication, preserve both groups' intended behavior and run the affected combined checks. Prioritize a failed delivery gate before publishing another result. Record implementation/review, origin/main publication, exact-SHA CI and live acceptance separately.
 
-09. [Extract checkpoint progression and completion delivery](../in-progress/aflow-maintainability-20261006-09-workflow-progression-delivery.md) — P2; A02 (progression and completion).
+No new workflow/team selection is embedded in worker checkpoints. At authorized dispatch, follow current repository lifecycle and team-selection guidance and verify the resolved runtime; the live configuration snapshot below is evidence, not a new launch instruction.
 
-    State: queued. Required predecessors: 08.
+## Live AFlow Snapshot — 6 October 2026, 08:48 UTC
 
-10. [Give the run dashboard explicit history, observation and action owners](../in-progress/aflow-maintainability-20261006-10-dashboard-state-owners.md) — P2; A05 (RunDashboard).
+Read-only inspection of controller processes, run records, event journals, the exclusive-resource journal, plan checkboxes and deployed service identity found:
 
-    State: queued. Required predecessors: 01. Outside prerequisite: Wait for run-history-fast-on-demand-20261005.md to be delivered and verify its current branch/receipt before dispatch. As inspected, successor 20261006t060326z-d4fe4b41 is active. Rebase on that accepted behavior; do not restore the earlier eager history/context path.
+- **Inherited hotplug completion repair:** run `20261006t025109z-d5afd011` was on worker turn 6, implementing checkpoint repair overlay v02 after prior cloud reviews. Its live controller and exact child held the exclusive Swift resource. The original plan's checked boxes did not mean the current repair/review obligations were finished.
+- **Exclusive stop and dead-owner reclamation:** run `20261006t083546z-50d6f9e9` had no completed worker turn and was queued behind that owner. This was a live second controller waiting for local capacity, not an active cloud review.
+- **Fast run history:** successor `20261006t060326z-d4fe4b41` was owner_stopped after a timed-out worker attempt. Checkpoints 1–2 were checked and 3–4 unchecked; no delivery was established. Members 10/12 remain held until the existing owner resolves and delivers that work.
+- Exactly two independent live controllers were identified; their UI launcher/child processes were not counted as extra runs. No run record referenced a member of this maintainability effort.
+- The aflow-ui service was active on release `d2a9a5e96fe317191a30a0da2f35c10baaf7fdeb`. This confirms the service/release identity, not end-to-end health or unfinished feature usability. The older hotplug controller retained its pinned release.
+- Project settings were `auto_consume_plans=false` and `max_concurrent_implementations=2`; local Swift profile exclusive=true, selected cloud checkpoint reviewer exclusive=false. No live configuration, controller, resource claim, plan-consumer setting or deployment was changed by this task.
 
-11. [Extract the settings draft owner and save coordinator](../in-progress/aflow-maintainability-20261006-11-settings-draft-save-owners.md) — P2; A05 (GlobalSettings).
-
-    State: queued. Required predecessors: 01, 02.
-
-12. [Separate evidence reading from progress interpretation](../in-progress/aflow-maintainability-20261006-12-progress-evidence-pipeline.md) — P2; A06.
-
-    State: queued. Required predecessors: 01. Outside prerequisite: Wait for run-history-fast-on-demand-20261005.md delivery and preserve its compact overview/demand-driven detail contract. This plan owns backend progress structure, not that plan's client paging.
-
-13. [Avoid reparsing unchanged event journals](../in-progress/aflow-maintainability-20261006-13-event-journal-read-cost.md) — P2; A07.
-
-    State: queued. Required predecessors: 01.
-
-14. [Consolidate small persistence primitives without moving domain locks](../in-progress/aflow-maintainability-20261006-14-persistence-primitives.md) — P2; A08.
-
-    State: queued. Required predecessors: 01.
-
-15. [Compose isolated server apps and cohesive routers](../in-progress/aflow-maintainability-20261006-15-server-app-composition.md) — P2; A13.
-
-    State: queued. Required predecessors: 01.
-
-16. [Generate client wire types from server schemas](../in-progress/aflow-maintainability-20261006-16-generated-wire-contracts.md) — P2; A09.
-
-    State: queued. Required predecessors: 01, 15.
-
-17. [Move provider discovery and explicit session capabilities into adapters](../in-progress/aflow-maintainability-20261006-17-provider-discovery-boundaries.md) — P2; A12.
-
-    State: queued. Required predecessors: 01.
-
-18. [Publish a concise source-grounded maintainability map](../in-progress/aflow-maintainability-20261006-18-architecture-entry-point.md) — P2; A14; documentation closure for A01–A13.
-
-    State: queued. Required predecessors: 03, 04, 05, 06, 07, 08, 09, 10, 11, 12, 13, 14, 15, 16, 17.
-
-## Dependency Lanes And Integration
-
-- Start-ready repair lane: 01 (verification baseline) and 02 (configuration crash safety) can proceed independently in isolated roots.
-- Configuration: 02 → 03; settings UI 11 follows 01 and 02.
-- Runtime: 01 → 04 → 05 → 06 → 07 → 08 → 09, with 02 also required before 07 and provider plan 17 before 08.
-- Provider boundary: 01 → 17; it can proceed alongside configuration/resume work before turn extraction.
-- Dashboard 10 and progress pipeline 12 follow 01 plus delivered run-history-fast-on-demand-20261005 work.
-- Events 13 and file primitives 14 follow 01 and can proceed independently; reconcile their shared persistence imports deliberately.
-- Server 15 follows 01; generated wire contracts 16 follows 01 and 15.
-- Documentation consolidation 18 follows the implemented owners above; each member still updates its own docs as it goes.
-
-Shared-file coordination: 04–09 and 14 intersect runlog/workflow/state; 10 and 12 depend on accepted on-demand history; 03/11/15/16 meet at configuration/transport; 13/14 meet at persistence. Agree narrow interfaces and integrate serially; shared files alone do not require serial implementation. Use one coordinator as integration owner when execution is authorized, with each logical run in its own workflow-managed branch/worktree. Record exact execution root/run ID in the ongoing handoff, not guessed paths here.
-
-Current unrelated work observed at conversion: run-history successor 20261006t060326z-d4fe4b41 and inherited-hotplug repair 20261006t025109z-d5afd011 had owned worker wrappers. A predecessor's stale running field alone is not an extra controller. Recheck actual processes/receipts before dispatch; no controller was stopped or resumed.
+This is a dated snapshot, not ongoing monitoring. Recheck before dispatch. Members 06 and 17 explicitly wait for hotplug repair delivery; 14 and 17 wait for resource repair delivery. Their downstream consumers inherit those holds. Do not resume, stop or recover these unrelated runs solely from this planning artifact.
 
 ## Source Finding Coverage
 
@@ -129,23 +120,23 @@ Current unrelated work observed at conversion: run-history successor 20261006t06
 | A13 Server composition | 15 |
 | A14 Concise architecture/ownership guidance | 18, incremental docs in every member |
 
-## Current Evidence And Conversion Decisions
+## Current Evidence And Planning Decisions
 
-- The local attached source and p100 plans/research source match byte-for-byte. The p100 working main and origin/main matched at d2a9a5e9 during conversion; the Mac code checkout was older and was not used as current implementation evidence.
+- The original local attachment and preserved p100 research copy matched byte-for-byte. p100 main and origin/main matched at d2a9a5e9 during pairing inspection; the older Mac code checkout was not used as current implementation evidence.
 - The review's missing fixture-plan issue already has git add -f -A in _commit_fixture_repository (e57d69ea/87ba106c). Member 01 verifies that current repair instead of duplicating it.
-- A live p100 lint run still failed with 8 errors and 11 warnings. Member 01 repairs current errors and enables the existing command in CI; this planning conversion does not claim lint is green.
-- No member implementation, crash repair, refactor, browser matrix or deployment was executed by authoring these plans. Parser/structure/link validation proves the handoffs are usable documents only.
+- The original conversion's p100 lint run failed with eight errors and eleven warnings. Member 01 owns that repair and the existing lint command's CI gate; this planning change does not claim lint is green.
+- Repartitioning preserves all 18 member identities, all 38 checkpoints and all 121 implementation steps. It adds group ownership and concrete handoff prerequisites; it does not mark implementation, browser acceptance or deployment complete.
 
 ## Explicit Later / Out Of Scope
 
-Concierge implementation decomposition and broad manager-context decomposition remain later candidates from the review, not hidden extra checkpoints. No new product features, state store, scheduler, deployment boundary, UI redesign, storage-format campaign or universal framework is authorized here. Legacy imports/wire shapes stay compatible through explicit facades; each optional removal needs demonstrated compatibility evidence in its owning scope.
+Concierge implementation decomposition and broad manager-context decomposition remain later candidates from the review. No new product feature, scheduler, automatic group dispatcher, state store, deployment boundary, UI redesign, storage-format campaign or universal framework is authorized here. Legacy imports/wire shapes stay compatible through explicit facades. Local inference tuning and recovery of the current unrelated runs are outside this planning revision.
 
 ## Acceptance And Durable Tracking
 
-At authoring completion, require exactly 18 parseable unchecked member plans in p100 plans/in-progress, all sharing this effort ID, plus this index and preserved source snapshot; validate dependency acyclicity and member links, then commit/push a discoverable GitHub record. Reference copies may be synchronized to the Mac for clickable review, without overwriting unrelated plans.
+Require exactly 18 parseable unchecked member plans in p100 plans/in-progress, exactly one of the two group IDs in every member, nine members/19 checkpoints per group, acyclic prerequisites, valid source/index/member links and preserved source bytes. Preserve filenames and the original checkpoint ledger. Commit/push the revised plan documents to the existing discoverable GitHub record, and synchronize only this effort's reference files to the Mac.
 
-During execution, track implementation/review, publication to origin/main, exact-SHA CI and live activation separately for each member. A member is delivered only when its required acceptance and existing delivery gates pass. Keep failed required checks and deferred manual checks visible. The later concierge may update statuses/links as evidence arrives; it must not treat this authoring snapshot as current run state.
+Before implementation, read current repository guidance for lifecycle, worktree, source installation and delivery ownership. During implementation, a member is delivered only when required acceptance and existing publication/CI/live gates pass. Keep failed required checks and unverified manual checks visible. The concierge may update this index with evidence; authoring status is not a live run-status source.
 
 ## Planning Verification
 
-Authoring validation uses the existing aflow.plan parser, checks the 18-member/38-checkpoint count, blank runtime-owned Git Tracking fields, unchecked meaningful steps, mandatory sections, exact shared ID, non-cyclic prerequisites and linked source/member existence. It also verifies only plan documents and the planning DEVLOG entry are staged. Current production lint failure is recorded above and belongs to member 01.
+Use the existing aflow.plan parser to validate every plan, empty runtime-owned Git Tracking fields, unchecked meaningful steps and the unchanged 18-member/38-checkpoint/121-step totals. Validate exact group membership/counts, dependency acyclicity, all cross-group shared-boundary ordering rules, the eligibility of opening pair 01/02 and the final 18 join. Check relative links, git diff --check, source SHA-256 and that only these documents plus the planning DEVLOG entry changed. This is document/coordination validation, not production test or deployment evidence.
