@@ -1,5 +1,25 @@
 # DEVLOG
 
+## 2026-10-06 — CLI fallback fixture isolates ROOT cwd (issue #69)
+
+- `tests/test_concierge_chat_tick.py`: `TickTestCase.setUp` now captures
+  `ROOT` in the existing `_orig` dictionary and points it at the per-test
+  temporary directory, so supervised CLI fallback children launch from a
+  test-owned working directory instead of the production checkout path
+  (which does not exist on CI). The existing restoration loop restores
+  `ROOT` before the temporary directory is cleaned up; `CLI_FALLBACK`
+  restoration in the fallback tests' `finally` blocks is unchanged.
+- `test_fallback_child_runs_same_chat_args_and_stdin` now also has the real
+  shell child write `pwd -P` to a separate `child-cwd.txt` and asserts the
+  resolved child cwd equals the resolved fixture directory (resolved paths
+  keep the assertion portable across macOS temporary-path aliases). All
+  existing arguments/stdin assertions and both budget tests' real-child
+  execution are preserved unchanged.
+- No production, configuration or CI changes.
+- Verification (all passing): `uv run pytest -q
+  tests/test_concierge_chat_tick.py`; `uv run ruff check
+  tests/test_concierge_chat_tick.py`; `git diff --check`.
+
 ## 2026-10-05 — Shared prose-aware MCP credential filter (issue #52)
 
 - Added pure `aflow/mcp_credentials.py` with `contains_mcp_credential`, the one

@@ -206,7 +206,7 @@ def _old_started(seconds_ago: float) -> str:
 
 
 class TickTestCase(unittest.IsolatedAsyncioTestCase):
-    """Base: loads the adapter once and isolates state/socket/clock per test."""
+    """Base: loads the adapter once and isolates state/socket/clock/cwd per test."""
 
     @classmethod
     def setUpClass(cls):
@@ -221,9 +221,10 @@ class TickTestCase(unittest.IsolatedAsyncioTestCase):
         (self.state / "mandate.json").write_text("{}")
         self.socket_path = tmp_path / "server.sock"
         self._orig = {name: getattr(self.tick, name)
-                      for name in ("STATE", "SOCKET", "_now", "_sleep", "_recv",
-                                   "_new_nonce")}
+                      for name in ("STATE", "SOCKET", "ROOT", "_now", "_sleep",
+                                   "_recv", "_new_nonce")}
         self.tick.STATE = self.state
+        self.tick.ROOT = tmp_path
         self.tick.SOCKET = self.socket_path
         self.tick._now = self.clock.now
         self.tick._sleep = self.clock.sleep
@@ -668,8 +669,11 @@ class CliFallbackTests(TickTestCase):
     def test_fallback_child_runs_same_chat_args_and_stdin(self):
         tick = self.tick
         out = Path(self._tmp.name) / "child-args.txt"
+        cwd_out = Path(self._tmp.name) / "child-cwd.txt"
         child = self._write_child(
-            f'cat > "{out}"\nprintf "%s\\n" "$@" >> "{out}"\n')
+            f'cat > "{out}"\n'
+            f'printf "%s\\n" "$@" >> "{out}"\n'
+            f'pwd -P > "{cwd_out}"\n')
         original = tick.CLI_FALLBACK
         tick.CLI_FALLBACK = str(child)
         try:
@@ -685,6 +689,8 @@ class CliFallbackTests(TickTestCase):
         self.assertIn(PROMPT, recorded)
         self.assertIn(tick.THREAD, recorded)
         self.assertIn('model_reasoning_effort="xhigh"', recorded)
+        self.assertEqual(Path(cwd_out.read_text().strip()).resolve(),
+                         Path(self._tmp.name).resolve())
 
     def test_fallback_child_reaped_within_remaining_budget(self):
         tick = self.tick
