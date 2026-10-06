@@ -1925,10 +1925,15 @@ def _wait_until(predicate, timeout: float = 20.0) -> bool:
 def _occupy_resource(
     store: ExecutionResourceStore, resource: str, role: str = "worker",
 ) -> tuple[ControllerIdentity, str]:
-    """Enqueue a foreign claim and poll until it owns the resource."""
-    real = store.current_controller_identity()
-    assert real is not None, "controller identity must be available in tests"
-    identity = ControllerIdentity(pid=999999, birth="foreign-birth", boot=real.boot)
+    """Enqueue a foreign claim and poll until it owns the resource.
+
+    The simulated busy owner must use a provably live, birth-matching
+    controller identity: admission now reconciles proven-dead owners
+    automatically, and a dead owner identity would be reclaimed instead of
+    keeping the resource busy.
+    """
+    identity = store.current_controller_identity()
+    assert identity is not None, "controller identity must be available in tests"
     invocation_id = "foreign-invocation"
     spec = ClaimSpec(
         project_root="/foreign", run_id="foreign-run",

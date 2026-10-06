@@ -373,7 +373,17 @@ including concurrent controllers of one project (for example a project run at
 concurrency two) and all projects. A controller that finds the combination
 busy enqueues a durable claim and polls; it is not rejected. Claims are
 idempotent per invocation, and the wait loop services owner stop and live
-configuration revalidation on every control interval. A live configuration
+configuration revalidation on every control interval. While waiting, the loop
+also performs the broker's bounded safe reconciliation of the exact resource
+at most once per control interval (including the first wait), after those
+controls and before the next acquisition attempt. A proven-dead owner — its
+controller gone with the bound child process and process group positively
+confirmed absent, or the confirmed host-reboot proof — and dead queued
+predecessors are reclaimed automatically, so the FIFO head acquires without
+any operator invoking the reconciler. A reconciliation result is never
+ownership: unchanged, contended, and revision-changed results keep normal
+waiting, and a corrupt journal still fails closed for that resource instead
+of being reset. A live configuration
 change to the selected combination cancels the queued claim and joins the
 destination resource's queue tail. Unchanged polling and prompt-only
 re-preparation retain the existing ticket and wait-start time. Each retry,
@@ -431,8 +441,13 @@ worker utilization. Busy selection never advances a worker's upgrade chain.
 **Unconfirmed owners.** A claim whose controller died without positive
 cessation evidence stays `unconfirmed`; the broker diagnoses it conservatively
 and the waiting message is suffixed with `previous execution could not be
-confirmed stopped`. A corrupted journal fails closed for that resource instead
-of being reset. Deleting broker journal files or restarting a controller is
+confirmed stopped`. Automatic reclamation distinguishes controller loss from
+provider cessation: a dead controller whose bound child is alive, whose child
+PID was reused, whose process group is alive or unobservable, or which never
+bound a child keeps the resource occupied. Only positive cessation of the
+controller, child, and group (or the confirmed host-reboot proof) frees it.
+A corrupted journal fails closed for that resource instead of being reset.
+Deleting broker journal files or restarting a controller is
 not safe release evidence and must not be used to clear an unconfirmed claim.
 
 ## Disk-backed run state and boundary overrides

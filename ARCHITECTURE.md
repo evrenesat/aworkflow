@@ -308,7 +308,20 @@ auxiliary model calls; probe-free paths such as git-only fast-forward merges
 are excluded) through a shared control-aware admission loop: idempotent
 enqueue by invocation id, `try_acquire` polling while servicing owner stop and
 live configuration revalidation, cancel-and-reprepare on live changes that
-require it, and a final stop/config check before `mark_launching`. The loop
+require it, and a final stop/config check before `mark_launching`. While
+waiting, the loop also runs the store's bounded safe reconciliation for the
+exact resource at most once per control interval (including the initial
+wait), after stop/config controls and before the next acquisition attempt:
+a proven-dead owner (controller gone with the bound child and process group
+positively absent, or the confirmed host-reboot proof) or a dead queued
+predecessor is reclaimed automatically, and a fresh `try_acquire` advances
+the FIFO head without operator intervention. Controller loss alone never
+reclaims: a surviving, reused, unobservable, or unbound child keeps the
+resource occupied, because provider cessation — not controller death — is the
+release condition. A reconciliation result is not ownership; unchanged,
+contended, and revision-changed results keep normal waiting, and a rejected
+store operation (for example a corrupt journal) fails closed without ever
+rewriting the journal. The loop
 persists a bounded private wait record into `run.json`
 (`execution_resource_wait`) and emits structured waiting/acquired/cancelled
 events. The private record includes controller PID, process birth and host boot

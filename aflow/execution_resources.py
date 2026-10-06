@@ -966,6 +966,12 @@ class ExecutionResourceAdmission:
     * polls ``try_acquire`` at ``poll_interval`` while servicing controls at
       least once per ``control_interval`` -- owner stop first, then live
       configuration revalidation -- including journal-lock contention,
+    * during the wait, runs the store's bounded safe reconciliation for the
+      exact resource at most once per ``control_interval`` (including the
+      initial wait), after controls and before the next acquisition attempt;
+      a proven-dead owner or dead queued predecessor is reclaimed and a
+      fresh ``try_acquire`` follows, while unchanged/contended/revision
+      results keep normal waiting,
     * cancels the claim and raises :class:`TurnReprepareRequired` when a
       live change requires re-preparation,
     * performs a final stop/config/control check after acquisition and
@@ -1039,6 +1045,7 @@ class ExecutionResourceAdmission:
         last_reason = outcome.reason
         if not acquired:
             self._service_controls(resource, spec, controller, stop_check, revalidate, on_cancelled)
+            self._reconcile_dead_owner(resource)
             last_control_at = self._clock()
             if on_waiting is not None:
                 on_waiting(last_reason, ticket)
@@ -1047,6 +1054,7 @@ class ExecutionResourceAdmission:
                     self._service_controls(
                         resource, spec, controller, stop_check, revalidate, on_cancelled
                     )
+                    self._reconcile_dead_owner(resource)
                     last_control_at = self._clock()
                 if ticket is None:
                     # The enqueue hit journal-lock contention: retry it.
@@ -1099,6 +1107,26 @@ class ExecutionResourceAdmission:
         return lease
 
     # -- internals ---------------------------------------------------------
+
+    def _reconcile_dead_owner(self, resource: str) -> None:
+        """Run one bounded safe reconciliation of the exact resource.
+
+        Called at most once per ``control_interval`` while waiting, after
+        stop/config controls and before the next acquisition attempt.  The
+        store samples process/group evidence without holding the journal
+        lock and fences the write behind a locked revision recheck, so the
+        result is advisory: ``reclaimed`` only lets the next
+        ``try_acquire`` run, while ``unchanged``, ``contended`` and
+        ``revision_changed`` keep normal waiting.  A rejected store
+        operation (for example a corrupt journal) fails closed with a typed
+        resource error and never rewrites the journal.  A reconciliation
+        result is not ownership and cannot launch a provider.
+        """
+        outcome = self._store.reconcile(resource)
+        if outcome.state == "rejected":
+            raise ResourceLeaseError(
+                "admission", outcome.reason or "reconciliation_rejected"
+            )
 
     def _service_controls(
         self,

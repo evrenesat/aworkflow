@@ -290,16 +290,32 @@ def _resource_for(
     return resolved.exclusive_resource
 
 
-def _foreign_identity(store: ExecutionResourceStore) -> ControllerIdentity:
+def _foreign_identity(
+    store: ExecutionResourceStore, *, live: bool = True
+) -> ControllerIdentity:
+    """Identity of a simulated busy owner.
+
+    By default it is a provably live, birth-matching controller identity:
+    admission now reconciles proven-dead owners automatically, and a dead
+    owner identity would be (correctly) reclaimed instead of keeping the
+    resource busy.  ``live=False`` returns a stable synthetic identity for
+    tests that inject their own "controller is dead" evidence for the real
+    controller PID; such peers never pass through the admission loop.
+    """
+    if not live:
+        real = store.current_controller_identity()
+        assert real is not None, "controller identity must be available in tests"
+        return ControllerIdentity(pid=999999, birth="foreign-birth", boot=real.boot)
     real = store.current_controller_identity()
     assert real is not None, "controller identity must be available in tests"
-    return ControllerIdentity(pid=999999, birth="foreign-birth", boot=real.boot)
+    return real
 
 
 def _foreign_enqueue(
-    store: ExecutionResourceStore, resource: str, role: str = "worker"
+    store: ExecutionResourceStore, resource: str, role: str = "worker", *,
+    live: bool = True,
 ) -> tuple[ControllerIdentity, str]:
-    identity = _foreign_identity(store)
+    identity = _foreign_identity(store, live=live)
     invocation_id = "foreign-invocation"
     spec = ClaimSpec(
         project_root="/foreign",
@@ -2474,6 +2490,466 @@ class TestTurnAdmission:
 
 
 # ---------------------------------------------------------------------------
+# Automatic reconciliation during admission (issue #76)
+# ---------------------------------------------------------------------------
+
+_RECONCILE_BOOT = "boot:issue-76-test"
+
+
+class _ReconcileWorld:
+    """Durable store with mutable fake liveness evidence and a fixed boot."""
+
+    def __init__(
+        self,
+        tmp_path: Path,
+        *,
+        liveness: dict[int, str] | None = None,
+        group: str = "absent",
+    ) -> None:
+        self.root = tmp_path / "store"
+        self.liveness = liveness if liveness is not None else {}
+        self.births: dict[int, str] = {}
+        self.reconcile_calls: list[str] = []
+        self.store = ExecutionResourceStore(
+            self.root,
+            process_evidence=self._evidence,
+            group_evidence=lambda _pgid: group,  # type: ignore[arg-type]
+            boot_provider=lambda: _RECONCILE_BOOT,
+        )
+        original_reconcile = self.store.reconcile
+
+        def counting_reconcile(resource: str, **kwargs: object):
+            self.reconcile_calls.append(resource)
+            return original_reconcile(resource, **kwargs)
+
+        self.store.reconcile = counting_reconcile
+
+    def _evidence(self, pid: int) -> ProcessEvidence:
+        state = self.liveness.get(pid, "present")
+        birth = self.births.get(pid) if state == "present" else None
+        return ProcessEvidence(liveness=state, birth=birth)  # type: ignore[arg-type]
+
+    @property
+    def resource(self) -> str:
+        return execution_resource_key("codex", "issue-76", None)
+
+    def foreign_identity(self, pid: int) -> ControllerIdentity:
+        return ControllerIdentity(
+            pid=pid, birth=f"linux-start-ticks:{pid}", boot=_RECONCILE_BOOT
+        )
+
+    def start_owner(
+        self,
+        pid: int = 424200,
+        *,
+        status: str = "running",
+        child_pid: int | None = 424201,
+        child_birth: str | None = "linux-start-ticks:424201",
+        process_group: int | None = 424201,
+    ) -> None:
+        owner = self.foreign_identity(pid)
+        spec = ClaimSpec(
+            project_root="/foreign",
+            run_id="foreign-run",
+            invocation_id="foreign-invocation",
+            kind="turn",
+            role="worker",
+            selector="codex.base",
+        )
+        store = self.store
+        assert store.enqueue(self.resource, spec, owner).state == "queued"
+        assert (
+            store.try_acquire(self.resource, "foreign-invocation", owner).state
+            == "acquired"
+        )
+        if status in ("launching", "running"):
+            assert (
+                store.mark_launching(self.resource, "foreign-invocation", owner).state
+                == "launching"
+            )
+        if status == "running":
+            assert (
+                store.register_child(
+                    self.resource,
+                    "foreign-invocation",
+                    owner,
+                    child_pid,
+                    child_birth,
+                    process_group,
+                ).state
+                == "running"
+            )
+
+    def journal(self) -> dict:
+        return json.loads(
+            (self.root / f"{self.resource}.json").read_text(encoding="utf-8")
+        )
+
+    def admit_waiter(
+        self,
+        *,
+        stop_check: Callable[[], None] | None = None,
+        on_acquired: Callable[[int | None], None] | None = None,
+        control_interval: float = 1.0,
+    ) -> tuple["ExecutionResourceAdmission", list[float], ControllerIdentity, ClaimSpec]:
+        clock: list[float] = [0.0]
+        controller = self.store.current_controller_identity()
+        assert controller is not None
+        spec = ClaimSpec(
+            project_root="/local",
+            run_id="local-run",
+            invocation_id="waiter",
+            kind="turn",
+            role="worker",
+            selector="codex.base",
+        )
+        admission = ExecutionResourceAdmission(
+            self.store,
+            poll_interval=0.25,
+            control_interval=control_interval,
+            sleeper=lambda seconds: clock.__setitem__(0, clock[0] + seconds),
+            clock=lambda: clock[0],
+        )
+        return admission, clock, controller, spec
+
+
+class TestAutomaticReconcileAdmission:
+    def test_automatic_reconcile_dead_owner_advances_fifo(self, tmp_path: Path) -> None:
+        world = _ReconcileWorld(tmp_path, liveness={424200: "absent", 424201: "absent"})
+        world.start_owner()
+        admission, _clock, controller, spec = world.admit_waiter()
+
+        lease = admission.admit(
+            resource=world.resource,
+            spec=spec,
+            controller=controller,
+            stop_check=lambda: None,
+            revalidate=lambda final: UNCHANGED,
+        )
+        assert lease is not None
+        # One bounded reconciliation of the exact resource was enough: the
+        # proven-dead owner was reclaimed and a fresh try_acquire won.
+        assert world.reconcile_calls == [world.resource]
+        journal = world.journal()
+        assert journal["owner"]["invocation_id"] == "waiter"
+        assert journal["queue"] == []
+
+    def test_automatic_reconcile_dead_queued_predecessor_is_removed(
+        self, tmp_path: Path
+    ) -> None:
+        world = _ReconcileWorld(tmp_path)
+        world.start_owner()
+        dead_predecessor = world.foreign_identity(424300)
+        world.liveness[424300] = "absent"
+        assert (
+            world.store.enqueue(
+                world.resource,
+                ClaimSpec(
+                    "/predecessor", "pred-run", "predecessor", "turn", "worker",
+                    "codex.base",
+                ),
+                dead_predecessor,
+            ).state
+            == "queued"
+        )
+
+        def sleeper(seconds: float) -> None:
+            clock[0] += seconds
+            if clock[0] >= 1.0:
+                # The owner dies while the waiter is queued: the next
+                # control-interval reconciliation must reclaim it.
+                world.liveness[424200] = "absent"
+                world.liveness[424201] = "absent"
+
+        clock: list[float] = [0.0]
+        controller = world.store.current_controller_identity()
+        assert controller is not None
+        spec = ClaimSpec(
+            "/local", "local-run", "waiter", "turn", "worker", "codex.base"
+        )
+        admission = ExecutionResourceAdmission(
+            world.store,
+            poll_interval=0.25,
+            control_interval=1.0,
+            sleeper=sleeper,
+            clock=lambda: clock[0],
+        )
+        lease = admission.admit(
+            resource=world.resource,
+            spec=spec,
+            controller=controller,
+            stop_check=lambda: None,
+            revalidate=lambda final: UNCHANGED,
+        )
+        assert lease is not None
+        journal = world.journal()
+        assert journal["owner"]["invocation_id"] == "waiter"
+        assert journal["queue"] == []
+        assert len(world.reconcile_calls) == 2
+        assert all(item == world.resource for item in world.reconcile_calls)
+
+    @pytest.mark.parametrize("state", ["present", "unknown"])
+    def test_automatic_reconcile_live_or_unknown_owner_remains_held(
+        self, tmp_path: Path, state: str
+    ) -> None:
+        world = _ReconcileWorld(tmp_path, liveness={424200: state})
+        world.start_owner()
+        admission, clock, controller, spec = world.admit_waiter()
+
+        class OwnerStop(Exception):
+            pass
+
+        def stop_check() -> None:
+            if clock[0] >= 2.5:
+                raise OwnerStop
+
+        with pytest.raises(OwnerStop):
+            admission.admit(
+                resource=world.resource,
+                spec=spec,
+                controller=controller,
+                stop_check=stop_check,
+                revalidate=lambda final: UNCHANGED,
+            )
+        journal = world.journal()
+        assert journal["owner"]["invocation_id"] == "foreign-invocation"
+        assert journal["queue"] == [], "the stopped claim must be cancelled"
+
+    def test_automatic_reconcile_controller_gone_child_alive_remains_held(
+        self, tmp_path: Path
+    ) -> None:
+        world = _ReconcileWorld(tmp_path, liveness={424200: "absent", 424201: "present"})
+        world.births[424201] = "linux-start-ticks:424201"
+        world.start_owner()
+        admission, clock, controller, spec = world.admit_waiter()
+
+        class OwnerStop(Exception):
+            pass
+
+        def stop_check() -> None:
+            if clock[0] >= 2.5:
+                raise OwnerStop
+
+        with pytest.raises(OwnerStop):
+            admission.admit(
+                resource=world.resource,
+                spec=spec,
+                controller=controller,
+                stop_check=stop_check,
+                revalidate=lambda final: UNCHANGED,
+            )
+        assert (
+            world.journal()["owner"]["invocation_id"] == "foreign-invocation"
+        ), "controller loss without provider cessation must stay occupied"
+
+    def test_automatic_reconcile_missing_child_binding_remains_held(
+        self, tmp_path: Path
+    ) -> None:
+        world = _ReconcileWorld(tmp_path, liveness={424200: "absent"})
+        world.start_owner()
+        path = world.root / f"{world.resource}.json"
+        journal = world.journal()
+        journal["owner"]["child_pid"] = None
+        path.write_text(json.dumps(journal), encoding="utf-8")
+        admission, clock, controller, spec = world.admit_waiter()
+
+        class OwnerStop(Exception):
+            pass
+
+        def stop_check() -> None:
+            if clock[0] >= 2.5:
+                raise OwnerStop
+
+        with pytest.raises(OwnerStop):
+            admission.admit(
+                resource=world.resource,
+                spec=spec,
+                controller=controller,
+                stop_check=stop_check,
+                revalidate=lambda final: UNCHANGED,
+            )
+        assert world.journal()["owner"]["invocation_id"] == "foreign-invocation"
+
+    def test_automatic_reconcile_reused_child_pid_surviving_group_remains_held(
+        self, tmp_path: Path
+    ) -> None:
+        world = _ReconcileWorld(
+            tmp_path,
+            liveness={424200: "absent", 424201: "present"},
+            group="present",
+        )
+        world.births[424201] = "linux-start-ticks:9999"
+        world.start_owner()
+        admission, clock, controller, spec = world.admit_waiter()
+
+        class OwnerStop(Exception):
+            pass
+
+        def stop_check() -> None:
+            if clock[0] >= 2.5:
+                raise OwnerStop
+
+        with pytest.raises(OwnerStop):
+            admission.admit(
+                resource=world.resource,
+                spec=spec,
+                controller=controller,
+                stop_check=stop_check,
+                revalidate=lambda final: UNCHANGED,
+            )
+        assert world.journal()["owner"]["invocation_id"] == "foreign-invocation"
+
+    def test_automatic_reconcile_revision_change_keeps_waiting_and_fifo(
+        self, tmp_path: Path
+    ) -> None:
+        world = _ReconcileWorld(tmp_path, liveness={424200: "absent", 424201: "absent"})
+        world.start_owner()
+        bumped = [False]
+        original_evidence = world.store._process_evidence  # type: ignore[attr-defined]
+
+        def sampling_evidence(pid: int) -> ProcessEvidence:
+            if pid == 424200 and not bumped[0]:
+                bumped[0] = True
+                peer = world.foreign_identity(424400)
+                world.store.enqueue(
+                    world.resource,
+                    ClaimSpec(
+                        "/peer", "peer-run", "peer", "turn", "worker", "codex.base"
+                    ),
+                    peer,
+                )
+            return original_evidence(pid)
+
+        world.store._process_evidence = sampling_evidence  # type: ignore[attr-defined]
+        admission, _clock, controller, spec = world.admit_waiter()
+
+        lease = admission.admit(
+            resource=world.resource,
+            spec=spec,
+            controller=controller,
+            stop_check=lambda: None,
+            revalidate=lambda final: UNCHANGED,
+        )
+        assert lease is not None
+        # The first pass saw the journal change while sampling and refused to
+        # write; the next control interval reclaimed the owner, and the
+        # waiter's earlier ticket still precedes the late peer.
+        assert len(world.reconcile_calls) == 2
+        journal = world.journal()
+        assert journal["owner"]["invocation_id"] == "waiter"
+        assert [claim["invocation_id"] for claim in journal["queue"]] == ["peer"]
+
+    def test_automatic_reconcile_lock_contention_keeps_waiting(self, tmp_path: Path) -> None:
+        world = _ReconcileWorld(tmp_path, liveness={424200: "absent", 424201: "absent"})
+        world.start_owner()
+        lock_fd: list[int] = []
+        lock_held_once = [False]
+        original_evidence = world.store._process_evidence  # type: ignore[attr-defined]
+
+        def sampling_evidence(pid: int) -> ProcessEvidence:
+            # Contend the journal lock only during the first sampling pass;
+            # a permanent holder would be a different (and unfair) scenario.
+            if pid == 424200 and not lock_held_once[0]:
+                lock_held_once[0] = True
+                descriptor = os.open(
+                    world.root / f"{world.resource}.lock", os.O_RDWR | os.O_CREAT
+                )
+                fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                lock_fd.append(descriptor)
+            return original_evidence(pid)
+
+        world.store._process_evidence = sampling_evidence  # type: ignore[attr-defined]
+
+        clock: list[float] = [0.0]
+
+        def sleeper(seconds: float) -> None:
+            clock[0] += seconds
+            while lock_fd:
+                descriptor = lock_fd.pop()
+                fcntl.flock(descriptor, fcntl.LOCK_UN)
+                os.close(descriptor)
+
+        controller = world.store.current_controller_identity()
+        assert controller is not None
+        spec = ClaimSpec(
+            "/local", "local-run", "waiter", "turn", "worker", "codex.base"
+        )
+        admission = ExecutionResourceAdmission(
+            world.store,
+            poll_interval=0.25,
+            control_interval=1.0,
+            sleeper=sleeper,
+            clock=lambda: clock[0],
+        )
+        lease = admission.admit(
+            resource=world.resource,
+            spec=spec,
+            controller=controller,
+            stop_check=lambda: None,
+            revalidate=lambda final: UNCHANGED,
+        )
+        assert lease is not None
+        assert world.journal()["owner"]["invocation_id"] == "waiter"
+        assert len(world.reconcile_calls) == 2
+
+    def test_automatic_reconcile_corrupt_journal_fails_closed(self, tmp_path: Path) -> None:
+        world = _ReconcileWorld(tmp_path, liveness={424200: "absent", 424201: "absent"})
+        world.start_owner()
+        path = world.root / f"{world.resource}.json"
+        original_evidence = world.store._process_evidence  # type: ignore[attr-defined]
+
+        def sampling_evidence(pid: int) -> ProcessEvidence:
+            if pid == 424200:
+                path.write_text("{not json", encoding="utf-8")
+            return original_evidence(pid)
+
+        world.store._process_evidence = sampling_evidence  # type: ignore[attr-defined]
+        admission, _clock, controller, spec = world.admit_waiter()
+
+        with pytest.raises(ResourceLeaseError) as excinfo:
+            admission.admit(
+                resource=world.resource,
+                spec=spec,
+                controller=controller,
+                stop_check=lambda: None,
+                revalidate=lambda final: UNCHANGED,
+            )
+        assert excinfo.value.stage == "admission"
+        assert excinfo.value.reason == "malformed_journal"
+        # The corrupt journal is never rebuilt or reset.
+        assert path.read_text(encoding="utf-8") == "{not json"
+
+    def test_automatic_reconcile_cadence_and_owner_stop_responsiveness(
+        self, tmp_path: Path
+    ) -> None:
+        world = _ReconcileWorld(tmp_path)
+        world.start_owner()
+        admission, clock, controller, spec = world.admit_waiter()
+
+        class OwnerStop(Exception):
+            pass
+
+        def stop_check() -> None:
+            if clock[0] >= 3.0:
+                raise OwnerStop
+
+        with pytest.raises(OwnerStop):
+            admission.admit(
+                resource=world.resource,
+                spec=spec,
+                controller=controller,
+                stop_check=stop_check,
+                revalidate=lambda final: UNCHANGED,
+            )
+        # Initial reconciliation plus one per control interval, never more:
+        # t=0, t=1, t=2; the stop at t=3 is serviced before any further pass.
+        assert world.reconcile_calls == [world.resource] * 3
+        journal = world.journal()
+        assert journal["owner"]["invocation_id"] == "foreign-invocation"
+        assert journal["queue"] == [], "the stopped claim must be cancelled"
+
+
+# ---------------------------------------------------------------------------
 # Final-only paired controller matrix (checkpoint 7 / final verification)
 # ---------------------------------------------------------------------------
 
@@ -3976,11 +4452,11 @@ class TestAuxiliaryAdmission:
                     # the decision holds its lease*: it takes the resource the
                     # instant the decision releases, deterministically
                     # blocking the follow-on note correction.
-                    real = resource_store.current_controller_identity()
-                    assert real is not None
-                    fid = ControllerIdentity(
-                        pid=888888, birth="foreign-birth", boot=real.boot
-                    )
+                    # Live identity: the correction's admission loop now
+                    # reconciles proven-dead owners automatically, so a dead
+                    # blocker would be reclaimed and never block.
+                    fid = resource_store.current_controller_identity()
+                    assert fid is not None
                     finv = "foreign-correction-block"
                     spec = ClaimSpec(
                         project_root="/foreign", run_id="foreign-run",
@@ -5577,9 +6053,12 @@ go = [{ to = "END", when = "DONE" }, { to = "implement" }]
             assert source_driver.entry_status == "launching"
             assert target.starts == 0, "target must not start before release"
             controller_pid = owner["controller"]["pid"]
-            # The waiting peer queues behind the executing handover.
+            # The waiting peer queues behind the executing handover.  The
+            # peer uses a synthetic identity because the injected evidence
+            # below reports the real controller PID as dead.
             peer_identity, peer_invocation = _foreign_enqueue(
-                resource_store, _HANDOVER_SOURCE_RESOURCE, role="worker"
+                resource_store, _HANDOVER_SOURCE_RESOURCE, role="worker",
+                live=False,
             )
             # Injected observations: the controller is dead but the child is
             # alive, so reconcile must keep the owner occupied.
@@ -5801,8 +6280,11 @@ go = [{ to = "END", when = "DONE" }, { to = "implement" }]
             assert started.wait(timeout=30), "handover callback never started"
             owner = _journal_owner(tmp_path, _HANDOVER_SOURCE_RESOURCE)
             assert owner is not None and owner["status"] == "running"
+            # Synthetic peer identity: the injected evidence below reports
+            # the real controller PID as dead.
             peer_identity, peer_invocation = _foreign_enqueue(
-                resource_store, _HANDOVER_SOURCE_RESOURCE, role="worker"
+                resource_store, _HANDOVER_SOURCE_RESOURCE, role="worker",
+                live=False,
             )
             release.set()
             thread.join(timeout=30)
