@@ -9069,6 +9069,29 @@ def _run_workflow_unchecked(
         # The successor opens the next scope, but the verified predecessor
         # remains immutable lineage and must not be pruned by keep_runs.
         preserved_resume_run_ids.add(resume.resumed_from_run_id)
+    if resume is not None and resume.review_repair_step is not None:
+        # Keep the validated predecessor chain through its rejection receipt
+        # owner, including successive interruptions before a repair finalizes.
+        preserved_resume_run_ids.add(resume.resumed_from_run_id)
+        repair_scope = resume.active_implementation_scope
+        rejections = [
+            record for record in resume.review_rejection_history
+            if repair_scope is not None and record.scope_id == repair_scope.scope_id
+        ]
+        if rejections:
+            receipt_owner = max(rejections, key=lambda record: record.rejection_number).source_run_id
+            source_id = resume.resumed_from_run_id
+            visited: set[str] = set()
+            while source_id not in visited:
+                visited.add(source_id)
+                preserved_resume_run_ids.add(source_id)
+                if source_id == receipt_owner:
+                    break
+                source = load_run_json(config.repo_root / ".aflow" / "runs" / source_id) or {}
+                parent_id = source.get("resumed_from_run_id")
+                if not isinstance(parent_id, str) or parent_id in {".", ".."} or Path(parent_id).name != parent_id:
+                    break
+                source_id = parent_id
     if resume is not None and resume.pending_cumulative_review is not None:
         # The cumulative worker result is the reviewer's immutable evidence.
         preserved_resume_run_ids.add(resume.resumed_from_run_id)

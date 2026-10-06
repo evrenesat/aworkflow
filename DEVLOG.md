@@ -1,5 +1,23 @@
 # DEVLOG
 
+## 2026-10-06 — Resume interrupted rejected-checkpoint repairs (issue #74)
+
+- Bind a pending checkpoint repair to the retained scope, captured original
+  checkpoint bytes, exact rejection and reviewed attempt, owned overlay,
+  terminal worker receipt and consumable designated repair override before
+  treating the original snapshot as scope progression. Preserve the envelope,
+  rejection count/history, original ledger, dirty edits and predecessor receipts.
+- Retain the immutable predecessor chain when successor startup prunes older
+  runs, including repeated interruptions before the next repair turn finalizes.
+  Fully checked overlays, forged attribution, live sources and unresolved
+  partition/control state continue to fail closed.
+- Regression fixtures run real implementation/reviewer turns through two
+  rejections and a terminal AFLOW_STOP, then verify read-only preview,
+  managed bootstrap/idempotency and actual upgraded repair/reviewer dispatch
+  in both in-place and worktree execution, with checkpoint and flat overlays.
+- Verification: targeted resume, repair-upgrade and managed-resume suites;
+  production Ruff, compileall and git diff --check.
+
 ## 2026-10-06 — CLI fallback fixture isolates ROOT cwd (issue #69)
 
 - `tests/test_concierge_chat_tick.py`: `TickTestCase.setUp` now captures

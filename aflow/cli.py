@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import argparse
-from dataclasses import dataclass, replace
+from dataclasses import asdict, dataclass, replace
 import hashlib
 import json
 from pathlib import Path, PurePosixPath
@@ -41,7 +41,7 @@ from .review_repair_resume import pending_review_repair_step
 from .manager_context import scoped_reviewer_rejection_count
 from .live_config import load_live_config, load_live_config_for_run
 from .resume_relocation import ResumeRelocation, prepare_resume_relocation
-from .plan import PlanParseError, PlanSnapshot, load_plan, parse_plan_text
+from .plan import PlanParseError, PlanSnapshot, load_plan, parse_plan_text, plan_step_checklist_is_complete
 from .skill_installer import InstallerError, install_skills
 from .skill_installer import DEFAULT_BUNDLED_SKILL_NAMES
 from .run_state import (
@@ -3498,6 +3498,225 @@ def _resume_scope_routing_blocker(
         )
 
 
+def _resume_pending_checkpoint_repair(
+    *,
+    run_id: str,
+    run_dir: Path,
+    prev_run: Mapping[str, object],
+    plan_path: Path,
+    relocation: ResumeRelocation | None,
+    scope: ActiveImplementationScope | None,
+    scope_envelope_bytes: bytes | None,
+    manager_fields: Mapping[str, object],
+    workflow_steps: Mapping[str, object] | None,
+    pending_finalized_turn: PendingFinalizedTurn | None,
+) -> str | None:
+    """Retain a rejected scope only when its owned repair was interrupted.
+
+    Implementation checkmarks advance the original snapshot before review.
+    A receipt-backed rejection keeps that scope open; it is not progression
+    authority. The existing manager override remains responsible for selecting
+    the designated repair worker.
+    """
+    if scope is None or scope_envelope_bytes is None or scope.awaiting_review or workflow_steps is None:
+        return None
+    snapshot = _resume_plan_snapshot(prev_run.get("last_snapshot"))
+    if (
+        snapshot is None
+        or scope.checkpoint_index is None
+        or snapshot.current_checkpoint_index != scope.checkpoint_index + 1
+        or prev_run.get("status") != "failed"
+        or pending_finalized_turn is not None
+    ):
+        return None
+    if any(
+        value is not None
+        for value in (
+            scope.current_partition_generation_id,
+            scope.current_partition_candidate_sha256,
+            scope.current_partition_id,
+            manager_fields.get("pending_repartition"),
+            prev_run.get("current_hotplug_transaction"),
+            prev_run.get("pending_hotplug_transaction"),
+        )
+    ):
+        return None
+    notes = manager_fields.get("pending_manager_notes")
+    boundary = manager_fields.get("pending_boundary_decision")
+    if (notes is not None and not getattr(notes, "consumed", False)) or (
+        boundary is not None
+        and not (getattr(boundary, "applied", False) and getattr(boundary, "consumed", False))
+    ):
+        return None
+
+    completed = prev_run.get("turns_completed")
+    active = prev_run.get("active_turn")
+    if type(completed) is not int or completed < 0 or type(active) is not int or active != completed + 1:
+        return None
+    rejections = [
+        record for record in manager_fields.get("review_rejection_history", ())
+        if record.scope_id == scope.scope_id
+    ]
+    latest_number = max((record.rejection_number for record in rejections), default=0)
+    latest = [record for record in rejections if record.rejection_number == latest_number]
+    if len(latest) != 1:
+        return None
+    rejection = latest[0]
+    if rejection.checkpoint_index != scope.checkpoint_index or rejection.checkpoint_name != scope.checkpoint_name:
+        return None
+    attempts = manager_fields.get("implementation_attempts", {}).get(scope.scope_id, ())
+    reviewed = [
+        attempt for attempt in attempts
+        if attempt.attempt_ordinal == rejection.reviewed_attempt_ordinal
+        and attempt.turn_number == rejection.reviewed_implementation_turn_number
+        and attempt.selector == rejection.reviewed_worker_selector
+        and attempt.team == rejection.reviewed_worker_team
+        and attempt.role == "worker"
+    ]
+    if len(reviewed) != 1 or reviewed[0] != attempts[-1]:
+        return None
+
+    repo_root = Path(str(prev_run.get("repo_root")))
+    def identity(value: object) -> Path | None:
+        path = _resume_result_path(value, relocation=relocation)
+        return (path if path.is_absolute() else repo_root / path).resolve() if path is not None else None
+
+    overlay = identity(prev_run.get("active_plan_path"))
+    if (
+        overlay is None
+        or overlay == plan_path.resolve()
+        or overlay.parent != plan_path.resolve().parent
+        or identity(rejection.repair_plan_path) != overlay
+        or re.fullmatch(re.escape(plan_path.stem) + r"-cp\d+-v\d+" + re.escape(plan_path.suffix or ".md"), overlay.name) is None
+    ):
+        return None
+    turns = run_dir / "turns"
+    if run_dir.is_symlink() or turns.is_symlink() or not turns.is_dir():
+        return None
+    for child in turns.iterdir():
+        match = re.fullmatch(r"turn-(\d+)", child.name)
+        if child.is_symlink() or (match is not None and int(match.group(1)) > active):
+            return None
+    review_run_dir = run_dir
+    if completed:
+        if rejection.source_run_id != run_id or rejection.review_turn_number != completed:
+            return None
+    else:
+        # A successor may stop again before finalizing its first repair turn.
+        # Bind its inherited rejection to the same recorded receipt owner.
+        ancestor = prev_run
+        visited = {run_id}
+        while review_run_dir.name != rejection.source_run_id:
+            parent_id = ancestor.get("resumed_from_run_id")
+            if not isinstance(parent_id, str) or parent_id in {".", ".."} or Path(parent_id).name != parent_id or parent_id in visited:
+                return None
+            visited.add(parent_id)
+            review_run_dir = run_dir.parent / parent_id
+            if review_run_dir.is_symlink() or not review_run_dir.is_dir():
+                return None
+            ancestor = _resume_read_json_object(review_run_dir / "run.json", label="checkpoint repair predecessor", run_id=run_id)
+            ancestor_scope = ancestor.get("active_implementation_scope")
+            if (
+                ancestor.get("status") != "failed"
+                or ancestor.get("active_plan_path") != prev_run.get("active_plan_path")
+                or ancestor.get("last_snapshot") != prev_run.get("last_snapshot")
+                or not isinstance(ancestor_scope, Mapping)
+                or ancestor_scope.get("scope_id") != scope.scope_id
+                or ancestor_scope.get("envelope_artifact_sha256") != scope.envelope_artifact_sha256
+            ):
+                return None
+            if review_run_dir.name != rejection.source_run_id and (
+                ancestor.get("turns_completed") != 0 or ancestor.get("active_turn") != 1
+            ):
+                return None
+        if ancestor.get("turns_completed") != rejection.review_turn_number:
+            return None
+    review_path = review_run_dir / "turns" / f"turn-{rejection.review_turn_number:03d}" / "result.json"
+    if review_path.parent.is_symlink() or review_path.parent.parent.is_symlink():
+        return None
+    review = _resume_read_json_object(review_path, label="checkpoint rejection receipt", run_id=run_id)
+    repair = _resume_read_json_object(turns / f"turn-{active:03d}" / "result.json", label="interrupted checkpoint repair receipt", run_id=run_id)
+    step_name = prev_run.get("current_step_name")
+    step = workflow_steps.get(step_name)
+    reviewer = workflow_steps.get(review.get("step_name"))
+    if (
+        step is None or step.role != "worker"
+        or reviewer is None or reviewer.role != "reviewer"
+        or review.get("turn_number") != rejection.review_turn_number
+        or review.get("status") not in {"running", "completed"}
+        or type(review.get("returncode")) is not int
+        or review.get("returncode") != 0
+        or review.get("step_name") != rejection.review_step_name
+        or review.get("step_role") != "reviewer"
+        or review.get("selector") != rejection.reviewer_selector
+        or review.get("review_rejection") != asdict(rejection)
+        or review.get("conditions") != {"DONE": False, "NEW_PLAN_EXISTS": True, "MAX_TURNS_REACHED": False}
+        or review.get("chosen_transition") != step_name
+        or _resume_plan_snapshot(review.get("snapshot_before")) != snapshot
+        or _resume_plan_snapshot(review.get("snapshot_after")) != snapshot
+        or identity(review.get("original_plan_path")) != plan_path.resolve()
+        or identity(review.get("new_plan_path")) != overlay
+        or repair.get("turn_number") != active
+        or repair.get("step_name") != step_name
+        or repair.get("step_role") != "worker"
+        or repair.get("status") != "harness-failed"
+        or repair.get("chosen_transition") is not None
+        or repair.get("snapshot_after") is not None
+        or _resume_plan_snapshot(repair.get("snapshot_before")) != snapshot
+        or identity(repair.get("original_plan_path")) != plan_path.resolve()
+        or identity(repair.get("active_plan_path")) != overlay
+    ):
+        return None
+    owned_original = _resume_owned_plan_path(plan_path, prev_run, run_id=run_id)
+    owned_overlay = _resume_owned_plan_path(overlay, prev_run, run_id=run_id)
+    if (
+        owned_original.is_symlink()
+        or owned_overlay.is_symlink()
+        or not owned_overlay.is_file()
+        or not owned_overlay.read_text(encoding="utf-8").strip()
+        or plan_step_checklist_is_complete(owned_overlay)
+        or load_plan(owned_original).snapshot != snapshot
+    ):
+        return None
+    from .workflow import _target_plan_identity
+    target_identity = _target_plan_identity(overlay)
+    override = manager_fields.get("pending_step_team_override")
+    if override is None and repair.get("selector") != reviewed[0].selector:
+        return None
+    if override is not None and (
+        override.consumed
+        or override.scope_id != scope.scope_id
+        or override.target_step != step_name
+        or override.role != "worker"
+        or override.selector != repair.get("selector")
+        or override.checkpoint_identity != override.target_plan_identity
+        or not isinstance(override.target_plan_identity, str)
+        or override.target_plan_identity != target_identity
+        or any(value is not None for value in (
+            override.repartition_generation_id,
+            override.repartition_candidate_sha256,
+            override.repartition_partition_id,
+        ))
+    ):
+        return None
+    if not _resume_path_matches(scope.original_plan_path, plan_path):
+        return None
+    envelope, captured_text = _resume_scope_envelope_texts(
+        run_dir, scope_envelope_bytes, run_id=run_id, plan_path=plan_path,
+    )
+    if (
+        envelope.checkpoint_index != scope.checkpoint_index
+        or envelope.checkpoint_name != scope.checkpoint_name
+        or _resume_normalized_checkpoint_bytes(captured_text, checkpoint_index=scope.checkpoint_index)
+        != _resume_normalized_checkpoint_bytes(owned_original.read_text(encoding="utf-8"), checkpoint_index=scope.checkpoint_index)
+    ):
+        return None
+    section = load_plan(owned_original).sections[scope.checkpoint_index - 1]
+    if section.name != scope.checkpoint_name or not section.heading_checked or section.unchecked_step_count:
+        return None
+    return step_name
+
+
 def _reconcile_verified_resume_scope(
     *,
     run_id: str,
@@ -4000,6 +4219,16 @@ def _reconstruct_resume_context(
         manager_fields["pending_step_team_override"] = None
         manager_fields["pending_boundary_decision"] = None
 
+    if not reset_scope and not terminal_completion_only and not terminal_integration_only:
+        checkpoint_repair_step = _resume_pending_checkpoint_repair(
+            run_id=run_id, run_dir=run_dir, prev_run=prev_run, plan_path=plan_path,
+            relocation=relocation, scope=active_scope, scope_envelope_bytes=scope_envelope_bytes,
+            manager_fields=manager_fields,
+            workflow_steps=workflow_steps, pending_finalized_turn=pending_finalized_turn,
+        )
+        if checkpoint_repair_step is not None:
+            review_repair_step = checkpoint_repair_step
+
     has_owner_stopped_pending_review = (
         not reset_scope
         and _owner_stopped_review_step(
@@ -4032,6 +4261,7 @@ def _reconstruct_resume_context(
         and not terminal_completion_only
         and not terminal_integration_only
         and pending_cumulative_review is None
+        and review_repair_step is None
         and not has_owner_stopped_pending_review
         and budget_boundary is None
     ):

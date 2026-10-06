@@ -75,6 +75,14 @@ observer preview, not a permission: history list pages skip it
 one project-wide admission scan per row, so list rows omit the field instead of
 reporting a fabricated `false`. Selected-run detail and every mutation keep the
 full preview and recheck admission.
+Interrupted checkpoint repair admission binds the retained scope to its latest
+rejection receipt, exact reviewed attempt, pending overlay and terminal worker
+receipt before considering original-plan progression. It preserves the scope
+envelope, rejection history and designated repair override in the successor;
+original implementation checkmarks alone cannot close the rejected checkpoint.
+Only pending, incomplete repair checklists with consumable routing qualify;
+completed overlays or unresolved control state retain their recovery refusal.
+The receipt owner stays in run history even under a small keep_runs setting.
 The same lock also admits only one unresolved run claim for a validated plan
 path across daemon and direct controllers, including linked worktrees. A
 released pending startup question retains its claim; confirmed inactive runs
