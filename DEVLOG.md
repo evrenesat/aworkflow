@@ -1,5 +1,32 @@
 # DEVLOG
 
+## 2026-10-06 — Give the macOS Python 3.12 dashboard CI job a 35-minute budget (Refs evrenesat/aworkflow#78)
+
+- On exact SHA `2f15a235b624e7553a456c7bc4e71d02c87fac2e`, CI run
+  37538357182 job 112524953238 (macOS, Python 3.12 dashboard) passed 724 web
+  tests, reached ~91% of the server tests at 22:26:22 UTC, and was cancelled
+  by the 25-minute job limit at 22:31:05 with no recorded assertion failure.
+  The same matrix job passed in 21m27s on the preceding `b0b7e7f6`, and
+  `c01fb1da` also needed a timeout retry, so the evidence is inadequate
+  timing margin rather than a specific slow-test defect.
+- `.github/workflows/ci.yml`: the dashboard `timeout-minutes` is now
+  `${{ matrix.python-version == '3.12' && 35 || 25 }}`, so macOS 3.12 gains
+  the same 35-minute budget Ubuntu 3.12 already had (Ubuntu 3.12 additionally
+  runs the WebKit suite); both 3.13 jobs remain at 25 minutes. The matrix,
+  `UV_PYTHON` pinning, browser installs, the Linux 3.12 WebKit invocation,
+  artifact upload, and every other job are unchanged.
+- The dashboard `Run server tests` step now runs
+  `uv run pytest -q --durations=20`, printing at most 20 slow-test durations
+  as diagnostics. Durations do not alter test selection or outcomes; a
+  failing pytest command still fails CI. Rationale: if the 35-minute budget
+  is again insufficient, per-test durations localize the remaining cost
+  without re-running broad suites for this YAML-only change.
+- Delivery remains pending the exact-SHA CI run on `origin/main` and matching
+  live p100 SHA/health/readiness; 35 minutes is a conservative finite
+  allowance based on observed 21-25+ minute runtimes, not a measured
+  completion time. If it still times out, preserve duration evidence and
+  diagnose rather than raising the budget again.
+
 ## 2026-10-06 — Managed-resume worker fixtures bind the worker bootstrap to their admitted application (issue #55)
 
 - Root cause of the issue #55 macOS CI failures: a test-only composition

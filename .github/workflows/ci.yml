@@ -55,8 +55,10 @@ jobs:
   dashboard:
     name: Dashboard (${{ matrix.os }}, Python ${{ matrix.python-version }})
     runs-on: ${{ matrix.os }}
-    # Ubuntu Python 3.12 also runs the WebKit suite.
-    timeout-minutes: ${{ matrix.os == 'ubuntu-latest' && matrix.python-version == '3.12' && 35 || 25 }}
+    # Python 3.12 jobs get 35 minutes: Ubuntu 3.12 also runs the WebKit suite,
+    # and observed macOS 3.12 server-suite runtimes (21-25+ minutes) need the
+    # extra margin (Refs evrenesat/aworkflow#78). All other cases stay at 25.
+    timeout-minutes: ${{ matrix.python-version == '3.12' && 35 || 25 }}
     # The dashboard server requires Python >=3.12; pin uv to the declared job
     # interpreter so its environment cannot silently use another installed minor.
     env:
@@ -118,7 +120,7 @@ jobs:
         working-directory: apps/aflow_app/server
         run: |
           uv run playwright install --with-deps chromium
-          uv run pytest -q
+          uv run pytest -q --durations=20
 
       - name: Install WebKit and run responsive browser checks
         if: matrix.os == 'ubuntu-latest' && matrix.python-version == '3.12'
