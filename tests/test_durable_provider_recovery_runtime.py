@@ -609,7 +609,7 @@ def test_recovery_consumption_and_session_identity_share_one_durable_snapshot(
 
     def crash_after_combined(self, *args, **kwargs):
         if is_combined_consumption_write(self):
-            result = original_write(self, *args, **kwargs)
+            original_write(self, *args, **kwargs)
             after_combined.update(
                 json.loads(self.paths.run_json.read_text(encoding="utf-8"))
             )

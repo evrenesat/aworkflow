@@ -18,9 +18,9 @@ from aflow.control_plane.units import InMemoryUnitManager, UnitState
 from test_control_plane_api import (
     PROJECT_ID,
     _commit_fixture_repository,
-    control_client,
+    control_client as control_client,
     live_server,
-)  # noqa: F401
+)
 from test_responsive_browser import (
     _assert_global_run_row,
     _assert_no_horizontal_overflow,

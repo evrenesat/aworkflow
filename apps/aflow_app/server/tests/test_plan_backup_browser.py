@@ -9,7 +9,7 @@ from pathlib import Path
 from playwright.sync_api import expect, sync_playwright
 
 from aflow.workflow import _backup_original_plan
-from test_control_plane_api import PROJECT_ID, TOKEN, control_client, live_server  # noqa: F401
+from test_control_plane_api import PROJECT_ID, TOKEN, control_client as control_client, live_server
 from test_responsive_browser import _browser
 
 

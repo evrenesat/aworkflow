@@ -1296,8 +1296,8 @@ def test_managed_nonportable_ancestor_successor_repairs_then_reviews(stopped_rep
         assert daemon.service.run_status(successor.name).evidence["can_resume"] is True
         result = daemon.service.resume(successor.name, caller_scope="project:one", idempotency_key="nonportable-ancestor")
         assert len(units.start_calls) == 1
-        record = daemon.service._read_record(result.run_id)
-        manifest = daemon.application.repository.get_launch_manifest(result.run_id)
+        daemon.service._read_record(result.run_id)
+        daemon.application.repository.get_launch_manifest(result.run_id)
         before_successor = _stopped_source_files(second_case)
         before_source = files(source)
         original = (Path(payload.get("execution_repo_root") or root) / plan.name).read_bytes()

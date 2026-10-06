@@ -23,7 +23,6 @@ from aflow.run_state import (
     FrozenRunIdentity,
     ImplementationAttempt,
     OverrideLoadResult,
-    OverrideResult,
     PendingBoundaryDecision,
     PendingFinalizedTurn,
     PendingManagerNotes,
@@ -5506,7 +5505,6 @@ class RunlogSingleRunDirTests(unittest.TestCase):
                 for run_dir in runs_root.iterdir():
                     if run_dir.is_dir():
                         turns_dir = run_dir / 'turns'
-                        turns_content = list(turns_dir.iterdir()) if turns_dir.exists() else []
                         assert turns_dir.exists(), f"turns/ should exist in {run_dir}"
                 if call_count[0] >= 3:
                     _write_plan(plan_path, _COMPLETE_PLAN)
@@ -12376,7 +12374,6 @@ class WorkflowLifecycleRuntimeTests(unittest.TestCase):
             wf_config = _make_worktree_wf_config(worktree_root=str(worktree_root))
 
             def first_runner(argv, **kwargs):
-                cwd = Path(kwargs['cwd'])
                 return subprocess.CompletedProcess(argv, 1, 'failed', 'first run failed')
 
             with pytest.raises(WorkflowError) as first_ctx:
@@ -12394,7 +12391,6 @@ class WorkflowLifecycleRuntimeTests(unittest.TestCase):
             wt_count_before = wt_list_before.count('worktree ')
 
             def second_runner(argv, **kwargs):
-                cwd = Path(kwargs['cwd'])
                 return subprocess.CompletedProcess(argv, 1, 'failed', 'resumed run failed')
 
             resume_ctx = ResumeContext(
@@ -12458,7 +12454,6 @@ class WorkflowLifecycleRuntimeTests(unittest.TestCase):
             assert resume_marker in primary_plan_text
 
             def second_runner(argv, **kwargs):
-                cwd = Path(kwargs['cwd'])
                 return subprocess.CompletedProcess(argv, 1, 'failed', 'resumed run failed')
 
             run_json = json.loads((first_ctx.value.run_dir / 'run.json').read_text(encoding='utf-8'))
@@ -12529,7 +12524,7 @@ class WorkflowLifecycleRuntimeTests(unittest.TestCase):
                 teardown=('merge', 'rm_worktree'),
             )
 
-            result2 = run_workflow(
+            run_workflow(
                 ControllerConfig(repo_root=repo_root, plan_path=plan_path, max_turns=3),
                 wf_config, 'wt_wf', config_dir=repo_root,
                     snapshot_config=False,
@@ -13732,7 +13727,7 @@ class StopMarkerTests(unittest.TestCase):
                 )
                 return subprocess.CompletedProcess(argv, 1, "failed", "failed")
 
-            with pytest.raises(WorkflowError) as failed:
+            with pytest.raises(WorkflowError):
                 run_workflow(
                     ControllerConfig(
                         repo_root=repo_root,

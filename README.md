@@ -671,12 +671,14 @@ normal operation:
 uv tool install -e . --force
 aflow run path/to/plan.md
 aflow ui --help
-uv run ruff check aflow apps/aflow_app/server/src
+uv run ruff check aflow tests apps/aflow_app/server/src apps/aflow_app/server/tests
 uv run pytest -q
 ```
 
-CI checks only production Python for unused imports, redefinitions, unresolved
-names, and unused locals.
+The explicit Ruff command above is the Python lint baseline gate: it covers
+root production code, root tests, and the remote app server source and tests
+under the unchanged selected rules (unused imports, redefinitions, unresolved
+names, unused locals). CI checks only production Python.
 
 `uv run pytest -q` is the supported root test command on Linux and macOS. Linux
 runs the systemd deployment tests; macOS skips that Linux-only module and runs

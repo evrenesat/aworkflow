@@ -1,82 +1,87 @@
 from __future__ import annotations
-import io
-import json
+import io as io
+import json as json
 from pathlib import Path
-from datetime import datetime, timezone
+from datetime import datetime as datetime, timezone as timezone
 import os
 import shutil
 import subprocess
 import sys
-import tempfile
+import tempfile as tempfile
 import textwrap
-import time
-from contextlib import redirect_stderr, redirect_stdout
-from importlib import resources
-from unittest.mock import patch
+import time as time
+from contextlib import redirect_stderr as redirect_stderr, redirect_stdout as redirect_stdout
+from importlib import resources as resources
+from unittest.mock import patch as patch
 
 unittest = sys.modules["unittest"]
 
 from aflow.config import (
-    AflowSection,
-    ConfigError,
-    GoTransition,
-    HarnessProfileConfig,
-    TeamConfig,
-    WorkflowConfig,
-    WorkflowHarnessConfig,
-    WorkflowStepConfig,
-    WorkflowUserConfig,
-    bootstrap_config,
-    find_placeholders,
-    load_workflow_config,
-    validate_workflow_config,
+    AflowSection as AflowSection,
+    ConfigError as ConfigError,
+    GoTransition as GoTransition,
+    HarnessProfileConfig as HarnessProfileConfig,
+    TeamConfig as TeamConfig,
+    WorkflowConfig as WorkflowConfig,
+    WorkflowHarnessConfig as WorkflowHarnessConfig,
+    WorkflowStepConfig as WorkflowStepConfig,
+    WorkflowUserConfig as WorkflowUserConfig,
+    bootstrap_config as bootstrap_config,
+    find_placeholders as find_placeholders,
+    load_workflow_config as load_workflow_config,
+    validate_workflow_config as validate_workflow_config,
 )
 from aflow.workflow import (
-    WorkflowError,
-    _backup_active_followup_plan,
-    _backup_original_plan,
-    _run_process,
-    derive_readme_content,
-    evaluate_condition,
-    generate_new_plan_path,
-    move_completed_plan_to_done,
-    pick_transition,
-    render_prompt,
-    render_step_prompts,
-    resolve_profile,
-    resolve_role_selector,
-    run_workflow,
+    WorkflowError as WorkflowError,
+    _backup_active_followup_plan as _backup_active_followup_plan,
+    _backup_original_plan as _backup_original_plan,
+    _run_process as _run_process,
+    derive_readme_content as derive_readme_content,
+    evaluate_condition as evaluate_condition,
+    generate_new_plan_path as generate_new_plan_path,
+    move_completed_plan_to_done as move_completed_plan_to_done,
+    pick_transition as pick_transition,
+    render_prompt as render_prompt,
+    render_step_prompts as render_step_prompts,
+    resolve_profile as resolve_profile,
+    resolve_role_selector as resolve_role_selector,
+    run_workflow as run_workflow,
 )
 from aflow.cli import (
-    _confirm_startup_recovery,
-    _maybe_move_completed_plan_to_done,
-    _parse_run_args,
-    _pick_workflow_step,
-    _resolve_run_arguments,
-    build_parser,
-    main,
-    RUN_HELP,
+    _confirm_startup_recovery as _confirm_startup_recovery,
+    _maybe_move_completed_plan_to_done as _maybe_move_completed_plan_to_done,
+    _parse_run_args as _parse_run_args,
+    _pick_workflow_step as _pick_workflow_step,
+    _resolve_run_arguments as _resolve_run_arguments,
+    build_parser as build_parser,
+    main as main,
+    RUN_HELP as RUN_HELP,
 )
-from aflow.harnesses.claude import ClaudeAdapter
-from aflow.harnesses.codex import CodexAdapter
-from aflow.harnesses.copilot import CopilotAdapter
-from aflow.harnesses.gemini import GeminiAdapter
-from aflow.harnesses.kiro import KiroAdapter
-from aflow.harnesses.muse import MuseAdapter
-from aflow.harnesses.opencode import OpencodeAdapter
-from aflow.harnesses.pi import PiAdapter
-from aflow.harnesses.base import HarnessInvocation
-from aflow.plan import PlanParseError, PlanSnapshot, load_plan, load_plan_tolerant
+from aflow.harnesses.claude import ClaudeAdapter as ClaudeAdapter
+from aflow.harnesses.codex import CodexAdapter as CodexAdapter
+from aflow.harnesses.copilot import CopilotAdapter as CopilotAdapter
+from aflow.harnesses.gemini import GeminiAdapter as GeminiAdapter
+from aflow.harnesses.kiro import KiroAdapter as KiroAdapter
+from aflow.harnesses.muse import MuseAdapter as MuseAdapter
+from aflow.harnesses.opencode import OpencodeAdapter as OpencodeAdapter
+from aflow.harnesses.pi import PiAdapter as PiAdapter
+from aflow.harnesses.base import HarnessInvocation as HarnessInvocation
+from aflow.plan import (
+    PlanParseError as PlanParseError,
+    PlanSnapshot as PlanSnapshot,
+    load_plan as load_plan,
+    load_plan_tolerant as load_plan_tolerant,
+)
 from aflow.run_state import (
-    ControllerConfig,
-    ControllerState,
-    ExecutionContext,
-    ResumeContext,
-    RetryContext,
-    TurnRecord,
+    ControllerConfig as ControllerConfig,
+    ControllerState as ControllerState,
+    ExecutionContext as ExecutionContext,
+    ResumeContext as ResumeContext,
+    RetryContext as RetryContext,
+    TurnRecord as TurnRecord,
 )
-from aflow.runlog import prune_old_runs
-import pytest
+from aflow.runlog import prune_old_runs as prune_old_runs
+import pytest as pytest
 
 
 def _write_plan(path: Path, text: str) -> None:

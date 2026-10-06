@@ -472,7 +472,6 @@ class SameStepCapWorkflowTests(unittest.TestCase):
             assert 'same-step cap' in str(ctx.value).lower()
             assert 'implement' in str(ctx.value)
             assert '5' in str(ctx.value)
-            implement_count = sum(1 for s in call_steps if 'codex' in s or True)
             assert len(call_steps) < 20
 
     def test_multi_step_same_step_cap_fails_before_exceeding_limit(self) -> None:

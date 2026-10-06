@@ -34,6 +34,44 @@
   unchanged.
 - Refs evrenesat/aworkflow#55
 
+## 2026-10-06 — Repair the server browser-test lint baseline (Refs evrenesat/aworkflow#78)
+
+- `apps/aflow_app/server/tests`: the eleven `*_browser.py` modules import the
+  shared `control_client` fixture from `test_control_plane_api` purely for
+  pytest fixture discovery. Made those re-exports explicit with redundant
+  aliases (`control_client as control_client`) so Ruff no longer reports
+  F401/F811, replacing the now-redundant per-line `# noqa: F401` suppressions
+  and the three `# noqa: F811` parameter suppressions in
+  `test_run_progress_browser.py`. The exact
+  fixture name, lifetime, and collection are unchanged (134 collected node
+  IDs identical before/after; `pytest --setup-plan` shows the original
+  `control_client` fixture graph).
+- Removed genuinely unused imports in the reported modules (`os` in
+  `test_launch_confirmation_browser.py`, `TOKEN` in
+  `test_launch_confirmation_browser.py` and `test_settings_reload_browser.py`).
+- Documented the explicit broad Python lint command
+  (`uv run ruff check aflow tests apps/aflow_app/server/src
+  apps/aflow_app/server/tests`) in the README validation section. No rule,
+  exclusion, fixture, assertion, or runtime changes. That broad command now
+  exits 0.
+
+## 2026-10-06 — Repair the Python test lint baseline (Refs evrenesat/aworkflow#78)
+
+- `tests/_support.py`: made the intentional shared export surface explicit to
+  Ruff with redundant aliases (`io as io`, `X as X`, ...). The dynamic
+  `__all__` and every runtime name are unchanged; the exported-name capture is
+  byte-identical before/after.
+- Removed genuinely unused local imports at the individual reported test sites
+  and dropped unused result bindings (F841) while preserving every evaluated
+  call, setup side effect, context manager behavior, and assertion. No noqa
+  additions, no rule/exclusion changes, no assertion removals, no fixture or
+  collection changes.
+- Evidence in `tmp/issue78-python-lint/`: before/after export captures, before
+  Ruff JSON (98 findings at base bef7fda6), and the focused pytest log (762
+  passed, 225 subtests; plus 172 passed in the adjacent
+  `tests/test_resume_checkpoint_repair.py` site repair). `uv run ruff check
+  tests` now exits 0.
+
 ## 2026-10-06 — Prevent self-matching verification waits
 
 - Execution and review skills now require command exit evidence, foreground or

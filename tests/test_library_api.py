@@ -25,15 +25,7 @@ from aflow.api import (
     prepare_startup,
     prepare_startup_with_answer,
 )
-from aflow.config import (
-    AflowSection,
-    load_workflow_config,
-    WorkflowConfig,
-    WorkflowHarnessConfig,
-    WorkflowStepConfig,
-    WorkflowUserConfig,
-)
-from aflow.plan import load_plan
+from aflow.config import load_workflow_config
 
 
 def _write_config(home_dir: Path, text: str) -> Path:
@@ -708,8 +700,6 @@ class LibraryStartupTests(unittest.TestCase):
         self.assertEqual(result.start_step, "step2")
 
     def test_prepare_startup_recovery_then_step_selection(self) -> None:
-        from aflow.plan import PlanParseError
-
         config_text = (
             '[aflow]\ndefault_workflow = "test"\n\n'
             '[workflow.test.steps.step1]\nrole = "architect"\nprompts = ["p"]\ngo = [{to = "step2"}]\n\n'

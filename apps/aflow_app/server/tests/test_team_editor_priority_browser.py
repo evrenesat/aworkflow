@@ -10,7 +10,7 @@ import re
 import pytest
 from playwright.sync_api import Page, expect, sync_playwright
 
-from test_control_plane_api import control_client, live_server  # noqa: F401
+from test_control_plane_api import control_client as control_client, live_server
 from test_responsive_browser import (
     _assert_header_and_flow,
     _browser,

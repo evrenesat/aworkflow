@@ -5,7 +5,7 @@ import pytest
 import sys
 from pathlib import Path
 from playwright.sync_api import expect, sync_playwright
-from test_control_plane_api import control_client, live_server, TOKEN, PROJECT_ID  # noqa: F401
+from test_control_plane_api import control_client as control_client, live_server, TOKEN, PROJECT_ID
 
 
 HARNESS_EXECUTABLES = (

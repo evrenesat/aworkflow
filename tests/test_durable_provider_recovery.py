@@ -257,9 +257,6 @@ def test_valid_recovery_persists_successor_provenance_without_source_mutation(
         tmp_path, monkeypatch, source_status=source_status
     )
     before = _source_bytes(source_dir)
-    launch_files_before = sorted(
-        path.name for path in (daemon._config.repo_root / ".aflow" / "launches").glob("*.json")
-    )
     target_calls: list[str] = []
 
     def fail_if_provider_is_consulted(*args, **kwargs):

@@ -310,7 +310,7 @@ class PlanParserFenceTests(unittest.TestCase):
         assert not is_handoff_pristine_for_base_refresh(metadata, sections)
 
     def test_parse_git_tracking_metadata_extract_fields_outside_fence(self) -> None:
-        from aflow.plan import parse_git_tracking_metadata, GitTrackingMetadata
+        from aflow.plan import parse_git_tracking_metadata
         text = textwrap.dedent('''\
             # Plan
 

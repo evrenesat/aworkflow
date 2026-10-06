@@ -20,7 +20,7 @@ from pathlib import Path
 import pytest
 from playwright.sync_api import Error as PlaywrightError, expect, sync_playwright
 
-from test_control_plane_api import PROJECT_ID, control_client, live_server
+from test_control_plane_api import PROJECT_ID, control_client as control_client, live_server
 from test_responsive_browser import (
     _assert_action_hit_test,
     _assert_document_moves,

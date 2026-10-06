@@ -6,7 +6,7 @@ from aflow.api.models import StartupQuestion, StartupQuestionKind
 from aflow.control_plane import LaunchManifest, create_launch_manifest
 from aflow.control_plane.units import UnitState
 from playwright.sync_api import expect, sync_playwright
-from test_control_plane_api import control_client, live_server, TOKEN, PROJECT_ID  # noqa: F401
+from test_control_plane_api import control_client as control_client, live_server, TOKEN, PROJECT_ID
 from test_responsive_browser import (
     _assert_action_hit_test,
     _assert_document_moves,
