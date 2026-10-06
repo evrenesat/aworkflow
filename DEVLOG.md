@@ -1,5 +1,16 @@
 # DEVLOG
 
+## 2026-10-06 — Prevent self-matching verification waits
+
+- Execution and review skills now require command exit evidence, foreground or
+  exact-child/session waiting, and supported timeout options. They explain why
+  broad command-text polling can match itself and keep a finished test waiting.
+- Assistant and observer guidance distinguish liveness, concrete progress and
+  inference utilization; authorized recovery must verify the exact owned wait
+  and resumed progress while preserving controller and lease ownership.
+- Skill-only documentation change; no runtime, scheduling or admission change.
+  Validate skill documents, inspect scope/authority, and verify installed bytes.
+
 ## 2026-10-06 — Resume interrupted rejected-checkpoint repairs (issue #74)
 
 - Bind a pending checkpoint repair to the retained scope, captured original

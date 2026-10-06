@@ -72,6 +72,29 @@ repository files.
    explicitly requested guard skill only when available; ordinary operation
    does not automatically create a guardian, scheduler, or recovery loop.
 
+## Progress and tool-wait supervision
+
+- A live controller establishes ownership, not useful progress. At the agreed
+  check cadence, use bounded evidence of edits, test output/exit status, review
+  results or delivery. Quiet but advancing tests are normal; repeated reads or
+  unchanged polling after a recorded command exit need investigation.
+- For a suspected stuck wait, inspect the exact child/session and its completion
+  evidence. `pgrep -f` can match the waiting shell itself; long sleeps can hide
+  an immediate usage error or a finished test. Prefer foreground/session-based
+  completion and preserve the actual command's exit status.
+- Stay within the assignment's authority. An observer reports the diagnosis.
+  An authorized recovery coordinator may interrupt only a proven redundant,
+  task-owned wait after verifying its PID/birth, ancestry and execution root;
+  preserve the controller/provider and verify that useful work resumes. Never
+  signal a process group identified only by command text or bypass a lease.
+- During explicitly authorized active manual supervision, use the agreed shorter
+  interval rather than waiting for the next background heartbeat. Preserve the
+  existing schedule and session deadline; do not create another monitor.
+- Distinguish whole-worker resource occupancy from inference utilization.
+  Tests and shell waits can hold an exclusive harness lease without using the
+  model. Fast worker handoffs do not demonstrate continuous GPU utilization;
+  request-level yielding requires runtime support, not manual lease release.
+
 ## Typical interactive journey
 
 1. Discover tools and registered projects, inspect project capabilities, and

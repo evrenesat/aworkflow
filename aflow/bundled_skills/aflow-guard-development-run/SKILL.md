@@ -194,13 +194,24 @@ For an `aflowd` run:
    `aflow-run-<run-id>.service` unit when host access is available.
 3. Do not run the legacy process snapshot or broad `pgrep` searches.
 
-Capability discovery belongs to guard setup, not every tick. On a healthy
-daemon-owned tick, call only `get_run`. If status or revision changed, use
-the next tick for at most one cursor-bounded `get_run_events` request. Never
-load Full context.
+Capability discovery belongs to guard setup, not every tick. Default to
+`get_run` on an unchanged daemon-owned tick. A status/revision change or a
+suspected stalled wait permits one bounded read of incremental events, lite
+context or the exact referenced child result during that tick. Use it to
+establish progress or diagnose the anomaly; do not repeatedly reread unchanged
+transcripts. Never load Full context.
 
-Treat canonical `running` state plus its matching owner as healthy. Treat
-`needs_attention`, legacy/interrupted daemon ownership, a missing owner, or
+Canonical `running` state plus its matching owner proves liveness, not progress.
+At the existing observation cadence, inspect bounded progress evidence when a
+turn exceeds its expected duration or reports repetitive waits: recent edits,
+test output/exit status, review results and delivery evidence. Do not label a
+quiet but advancing test as stalled. A wait still running after its exact child
+finished is an anomaly; `pgrep -f` may match the polling shell itself, and fixed
+sleeps may conceal immediate command failure. Report the exact evidence and
+proposed recovery once; this observer skill does not authorize interruption or
+changing the run. Keep the existing heartbeat and read-only boundaries.
+
+Treat `needs_attention`, legacy/interrupted daemon ownership, a missing owner, or
 remote/durable disagreement as a new anomaly: report once and pause without
 mutation.
 

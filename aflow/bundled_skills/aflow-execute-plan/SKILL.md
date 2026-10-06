@@ -9,6 +9,27 @@ Use this skill only to execute an existing aflow plan autonomously. Treat `aflow
 
 The plan file is the source of truth. Do not rely on chat memory when the plan, repository state, test output, or git history disagree.
 
+## Test and command completion
+
+- Prefer foreground commands and the execution tool's process/session handle.
+  Read the command's actual exit status and bounded output before deciding to
+  wait, retry, or report success. A launcher exit or a successful `tail` is not
+  the test result; preserve the tested command's status when piping output.
+- If background execution is necessary, retain the exact child handle/PID and
+  collect its exit status (`wait "$child_pid"` only from its owning shell).
+  Across tool calls, use a supported persistent session or an owned completion
+  receipt tied to that invocation; a vanished PID alone does not prove success.
+- Never use broad `pgrep -f` command-text matching to decide whether your test
+  finished: it can match the polling shell itself or another run. Do not use
+  fixed long sleeps or detached `nohup` polling in place of child completion.
+- Use only timeout options supported by the installed runner. A usage error
+  means the command already failed; diagnose it immediately. Prefer an existing
+  execution-tool timeout or a verified platform timeout wrapper when needed.
+- Once required checks have finished, record the result and continue the
+  handoff. Do not rerun matching successful checks merely to fill a wait.
+  A whole-harness exclusive resource remains occupied during shell/test waits;
+  never manually release its lease while the harness can still issue requests.
+
 ## Storage and evidence hygiene
 
 - Before heavy writes, measure free bytes and inodes and, where applicable, backing capacity; compare against the plan's stated peak allocation and reserve.

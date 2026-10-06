@@ -7,6 +7,27 @@ description: "Final no-squash review for a completed checkpointed AFlow handoff.
 
 Use this skill only for the final review pass of work produced under an aflow plan that includes `Git Tracking`. It is meant to be installed as a static skill and driven by prompt context from the workflow engine.
 
+## Test and command completion
+
+- Prefer foreground commands and the execution tool's process/session handle.
+  Read the command's actual exit status and bounded output before deciding to
+  wait, retry, or report success. A launcher exit or a successful `tail` is not
+  the test result; preserve the tested command's status when piping output.
+- If background execution is necessary, retain the exact child handle/PID and
+  collect its exit status (`wait "$child_pid"` only from its owning shell).
+  Across tool calls, use a supported persistent session or an owned completion
+  receipt tied to that invocation; a vanished PID alone does not prove success.
+- Never use broad `pgrep -f` command-text matching to decide whether your test
+  finished: it can match the polling shell itself or another run. Do not use
+  fixed long sleeps or detached `nohup` polling in place of child completion.
+- Use only timeout options supported by the installed runner. A usage error
+  means the command already failed; diagnose it immediately. Prefer an existing
+  execution-tool timeout or a verified platform timeout wrapper when needed.
+- Once required checks have finished, record the result and continue the
+  handoff. Do not rerun matching successful checks merely to fill a wait.
+  A whole-harness exclusive resource remains occupied during shell/test waits;
+  never manually release its lease while the harness can still issue requests.
+
 ## Storage and evidence hygiene
 
 - Assess cumulative storage and evidence hygiene as concrete acceptance where it is material: no accumulated owned disposable scratch, failed and unique proofs retained, verbose output bounded at production.
