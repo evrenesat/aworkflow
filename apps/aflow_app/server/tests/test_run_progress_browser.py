@@ -17,7 +17,7 @@ from test_control_plane_api import (
     _seed_issue35_progress_fixture,
     live_server,
 )
-from test_control_plane_api import control_client  # noqa: F401
+from test_control_plane_api import control_client as control_client
 from test_responsive_browser import _browser, _login
 from test_responsive_browser import (
     _assert_document_moves,
@@ -1193,7 +1193,7 @@ def _global_run_row(page, run_id: str):
 
 
 def test_checkpoint_history_review_evidence_and_generation_refresh(
-    control_client,  # noqa: F811
+    control_client,
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
@@ -1444,7 +1444,7 @@ def test_checkpoint_history_review_evidence_and_generation_refresh(
     ids=("desktop", "mobile-390"),
 )
 def test_run_progress_transport_and_browser_parity(
-    control_client,  # noqa: F811
+    control_client,
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
     width: int,
@@ -1548,7 +1548,7 @@ def test_run_progress_transport_and_browser_parity(
     ),
 )
 def test_canonical_run_progress_visual_journey(
-    control_client,  # noqa: F811
+    control_client,
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
     width: int,

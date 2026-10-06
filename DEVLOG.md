@@ -1,5 +1,26 @@
 # DEVLOG
 
+## 2026-10-06 — Repair the server browser-test lint baseline (Refs evrenesat/aworkflow#78)
+
+- `apps/aflow_app/server/tests`: the eleven `*_browser.py` modules import the
+  shared `control_client` fixture from `test_control_plane_api` purely for
+  pytest fixture discovery. Made those re-exports explicit with redundant
+  aliases (`control_client as control_client`) so Ruff no longer reports
+  F401/F811, replacing the now-redundant per-line `# noqa: F401` suppressions
+  and the three `# noqa: F811` parameter suppressions in
+  `test_run_progress_browser.py`. The exact
+  fixture name, lifetime, and collection are unchanged (134 collected node
+  IDs identical before/after; `pytest --setup-plan` shows the original
+  `control_client` fixture graph).
+- Removed genuinely unused imports in the reported modules (`os` in
+  `test_launch_confirmation_browser.py`, `TOKEN` in
+  `test_launch_confirmation_browser.py` and `test_settings_reload_browser.py`).
+- Documented the explicit broad Python lint command
+  (`uv run ruff check aflow tests apps/aflow_app/server/src
+  apps/aflow_app/server/tests`) in the README validation section. No rule,
+  exclusion, fixture, assertion, or runtime changes. That broad command now
+  exits 0.
+
 ## 2026-10-06 — Repair the Python test lint baseline (Refs evrenesat/aworkflow#78)
 
 - `tests/_support.py`: made the intentional shared export surface explicit to

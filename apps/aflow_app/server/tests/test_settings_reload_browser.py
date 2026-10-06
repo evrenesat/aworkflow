@@ -10,7 +10,7 @@ import pytest
 
 from playwright.sync_api import sync_playwright
 
-from test_control_plane_api import PROJECT_ID, TOKEN, control_client, live_server  # noqa: F401
+from test_control_plane_api import PROJECT_ID, control_client as control_client, live_server
 from test_responsive_browser import _browser, _login, _seed_team_family_fixture, _select_settings_section
 from ui_demo_fidelity import capture_refresh_probe, install_refresh_probe, read_refresh_probe_mutations
 

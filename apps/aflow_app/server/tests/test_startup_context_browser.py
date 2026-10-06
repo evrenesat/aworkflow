@@ -16,7 +16,7 @@ from aflow.api.models import StartupQuestion, StartupQuestionKind
 from test_control_plane_api import (
     PROJECT_ID,
     _commit_fixture_repository,
-    control_client,  # noqa: F401
+    control_client as control_client,
     live_server,
 )
 from test_responsive_browser import (
