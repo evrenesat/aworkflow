@@ -1,5 +1,24 @@
 # DEVLOG
 
+## 2026-10-06 — Queue one AFlow maintainability effort
+
+- Convert the 2026-10-05 architecture review into 18 self-contained AFlow
+  checkpoint plans (38 checkpoints), grouped under effort ID
+  AFLOW-MAINT-20261006 with one source-mapped index and explicit dependencies.
+- Preserve the review bytes; account for the already-delivered fixture fix
+  and the active on-demand history work. Queue the plans on p100 without
+  launching runs or changing its disabled automatic-consumption setting.
+- This is plan authoring, not implementation or deployed acceptance. Current
+  web lint still reports eight errors and eleven warnings; plan 01 owns repair.
+- Reorganize the same 18 plans into two named groups of nine members and
+  19 checkpoints each. Record exact shared-file delivery handoffs, independent
+  pair choices and the final documentation join for local-worker/cloud-review
+  overlap; preserve all original checkpoint work.
+- Verify the current two-controller/exclusive-worker setup and record dated
+  hotplug/resource-repair and stopped-history holds. Update planning only;
+  no runtime, controller or scheduling settings change.
+- Index: [AFlow maintainability effort](plans/notes/aflow-maintainability-20261006-index.md).
+
 ## 2026-10-06 — Resume interrupted rejected-checkpoint repairs (issue #74)
 
 - Bind a pending checkpoint repair to the retained scope, captured original
