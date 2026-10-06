@@ -1,5 +1,39 @@
 # DEVLOG
 
+## 2026-10-06 — Managed-resume worker fixtures bind the worker bootstrap to their admitted application (issue #55)
+
+- Root cause of the issue #55 macOS CI failures: a test-only composition
+  mismatch, not a production defect. `tests/test_budget_exit_recovery.py`
+  admits runs through a fixture daemon whose `InMemoryUnitManager` proves
+  the exact source unit inactive, but `aflow.daemon.worker_main()`
+  recomposes the control plane with the default `SystemdUnitManager`. On
+  macOS the unavailable systemctl makes the fresh ownership guard fail
+  closed ("current managed inactivity is not proven for the exact source
+  unit"), stopping the seven integration cases before the successor
+  provider invocation; on a live systemd host the same missing unit reads
+  `inactive`/`dead`, masking the platform leak.
+- `tests/test_budget_exit_recovery.py`: new `_worker_boot_composition()`
+  binds `aflow.daemon.compose_control_plane` to the exact fixture daemon's
+  application during each real `worker_main()` invocation, verifies the
+  requested repo/config identity, and fails loudly if the scoped boot
+  consults `SystemdUnitManager.get` on any host. Applied to the
+  drift/clean durable-recovery case (each half receives its own
+  application), both historical-shape MCP dispatch variants, and all four
+  retained-worker-control variants. New
+  `test_worker_boot_refuses_unknown_source_unit_despite_nonce` proves the
+  fresh ownership guard still rejects an unknown exact source unit after a
+  valid reservation with zero provider dispatch. The scoped native-query
+  guard raises `pytest.fail.Exception` (a `BaseException`, not an
+  `Exception`), so fail-closed production handlers cannot swallow it into
+  an expected ownership rejection on any host. Production behavior is
+  unchanged; no production files modified.
+- Verification: native-guard acceptance probe exits 0 with restoration
+  asserted; `uv run pytest -q tests/test_budget_exit_recovery.py` 37
+  passed; scoped `uv run ruff check` and `git diff --check` pass. Adjacent
+  `tests/test_resume_checkpoint_repair.py` 172-pass evidence reused
+  unchanged.
+- Refs evrenesat/aworkflow#55
+
 ## 2026-10-06 — Prevent self-matching verification waits
 
 - Execution and review skills now require command exit evidence, foreground or

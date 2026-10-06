@@ -14,7 +14,9 @@ import json
 import os
 import subprocess
 import tempfile
+from contextlib import contextmanager
 from pathlib import Path
+from typing import Iterator
 from unittest.mock import patch
 
 import pytest
@@ -696,7 +698,12 @@ from aflow.cli import (
     _detect_resume_candidate,
     _resume_candidate_mismatch_reason,
 )
-from aflow.control_plane import InMemoryUnitManager, write_launch_phase
+from aflow.control_plane import (
+    InMemoryUnitManager,
+    SystemdUnitManager,
+    UnitState,
+    write_launch_phase,
+)
 from aflow.daemon import (
     AflowDaemon,
     DaemonConfig,
@@ -2963,6 +2970,62 @@ def _replace_evidence(status, worker: dict):
     )
 
 
+@contextmanager
+def _worker_boot_composition(
+    daemon: AflowDaemon,
+    *,
+    repo_root: Path,
+    config_path: Path,
+) -> Iterator[None]:
+    """Point one real worker_main() boot at this fixture daemon's application.
+
+    worker_main() recomposes the control plane from the requested
+    repo_root/config_path; without this binding the recomposition falls back
+    to the native SystemdUnitManager, whose observations differ by host
+    (unavailable on macOS; a missing unit reads inactive/dead on a live
+    systemd host).  The fixture daemon's admitted application (its
+    InMemoryUnitManager and repository) must be the same application the
+    worker bootstrap observes, matching the _worker_boot_env boundary in
+    tests/test_resume_checkpoint_repair.py.  The binding verifies the
+    requested identity and makes any native SystemdUnitManager.get
+    consultation inside the scoped boot fail loudly on every host.  The
+    context restores both bindings on exit, so later tests and the clean
+    half of a two-daemon case each compose their own application.
+    """
+    expected_repo = Path(repo_root).resolve()
+    expected_config = Path(config_path).resolve()
+
+    def bound_compose(requested_root, *, config_path, units=None):
+        assert Path(requested_root).resolve() == expected_repo, (
+            f"worker composition requested {requested_root}, "
+            f"fixture owns {expected_repo}"
+        )
+        assert Path(config_path).resolve() == expected_config, (
+            f"worker composition requested {config_path}, "
+            f"fixture owns {expected_config}"
+        )
+        assert units is None, (
+            "worker bootstrap must observe the fixture daemon's units"
+        )
+        return daemon.application
+
+    def native_get(*_args, **_kwargs):
+        # pytest.fail.Exception derives from BaseException, not Exception,
+        # so fail-closed production handlers cannot convert this test-only
+        # guard into an expected ownership rejection.
+        pytest.fail(
+            "scoped worker boot consulted native SystemdUnitManager.get"
+        )
+
+    patcher = pytest.MonkeyPatch()
+    patcher.setattr("aflow.daemon.compose_control_plane", bound_compose)
+    patcher.setattr(SystemdUnitManager, "get", native_get)
+    try:
+        yield
+    finally:
+        patcher.undo()
+
+
 def test_daemon_durable_recovery_admits_completed_budget_exit(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -3215,11 +3278,14 @@ def test_durable_recovery_binds_worktree_active_plan_and_rejects_drift(
             _validate_recovery_evidence_for_worker(repo_root, intent)
         assert rejected.value.code == "recovery_evidence_unavailable"
 
-        assert worker_main(
-            repo_root=repo_root,
-            config_path=config_path,
-            run_id=continuation.run_id,
-        ) == 1
+        with _worker_boot_composition(
+            daemon, repo_root=repo_root, config_path=config_path
+        ):
+            assert worker_main(
+                repo_root=repo_root,
+                config_path=config_path,
+                run_id=continuation.run_id,
+            ) == 1
         assert not provider_log.exists(), "drifted plan reached a provider"
         # Recovery mutated no source evidence and no workspace files.
         assert _run_dir_bytes(source_dir) == source_before
@@ -3273,11 +3339,15 @@ def test_durable_recovery_binds_worktree_active_plan_and_rejects_drift(
         monkeypatch.setenv(
             "PATH", str(clean_fake_bin) + os.pathsep + os.environ.get("PATH", "")
         )
-        assert worker_main(
-            repo_root=clean_repo,
-            config_path=clean_config,
-            run_id=clean_continuation.run_id,
-        ) == 0
+        with _worker_boot_composition(
+            clean_daemon,
+            repo_root=clean_repo, config_path=clean_config,
+        ):
+            assert worker_main(
+                repo_root=clean_repo,
+                config_path=clean_config,
+                run_id=clean_continuation.run_id,
+            ) == 0
 
         calls = [
             json.loads(line)
@@ -3313,6 +3383,73 @@ def test_durable_recovery_binds_worktree_active_plan_and_rejects_drift(
         assert "merge_status" not in successor_run_json
         # The source stayed immutable through admission and the successor boot.
         assert _run_dir_bytes(clean_source_dir) == clean_source_before
+
+
+def test_worker_boot_refuses_unknown_source_unit_despite_nonce(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A valid reservation nonce is not proof of inactivity for unknown ownership.
+
+    After admission reserves the successor, the exact source unit is
+    observed as ``unknown`` in the fixture's unit manager.  The
+    nonce-bearing real worker boot must refuse before any provider
+    dispatch; monkeypatch teardown restores the fixture isolation.
+    """
+    from aflow.daemon import worker_main
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        root = Path(tmpdir).resolve()
+        repo_root, plan_path, config_path, result = _make_source_pre_turn_cap(root)
+        source_dir = result.run_dir
+        source_before = _run_dir_bytes(source_dir)
+        wf_config = load_workflow_config(config_path)
+        _attach_launch_evidence(repo_root, source_dir.name, "completed")
+        daemon = _make_daemon(tmp_path, monkeypatch, repo_root, config_path, wf_config)
+        _patch_inactive_worker_evidence(
+            monkeypatch, daemon.application.repository
+        )
+
+        continuation = daemon.service.resume(
+            source_dir.name,
+            caller_scope="local",
+            idempotency_key="recover-unknown-source-unit",
+            recovery={
+                "mode": "durable_evidence",
+                "worker_selector": "codex.base",
+            },
+        )
+        assert continuation.created is True
+        reservation = daemon.service._admission.reservation(continuation.run_id)
+        assert reservation is not None
+        # The exact source unit becomes unknown after the valid reservation;
+        # the fresh ownership guard must re-observe it at worker boot.
+        unit_name = f"aflow-run-{source_dir.name}.service"
+        daemon.application.units.units[unit_name] = UnitState(
+            name=unit_name, active_state="unknown", sub_state="unknown",
+        )
+        assert (
+            daemon.application.units.get(unit_name).active_state == "unknown"
+        )
+
+        provider_log = root / "provider-calls.jsonl"
+        fake_bin = _fake_provider_bin(root, provider_log)
+        monkeypatch.setenv(
+            "PATH", str(fake_bin) + os.pathsep + os.environ.get("PATH", "")
+        )
+        monkeypatch.setenv(
+            "AFLOW_ADMISSION_RESERVATION_NONCE", reservation.nonce
+        )
+        with _worker_boot_composition(
+            daemon, repo_root=repo_root, config_path=config_path
+        ):
+            assert worker_main(
+                repo_root=repo_root,
+                config_path=config_path,
+                run_id=continuation.run_id,
+            ) == 1
+        assert not provider_log.exists(), "unknown ownership reached a provider"
+        # The refusal mutates no source evidence.
+        assert _run_dir_bytes(source_dir) == source_before
 
 
 def test_mcp_durable_recovery_dispatch_of_historical_shape(
@@ -3506,11 +3643,14 @@ def test_mcp_durable_recovery_dispatch_of_historical_shape(
 
         from aflow.daemon import worker_main
 
-        worker_returncode = worker_main(
-            repo_root=repo_root,
-            config_path=config_path,
-            run_id=successor_run_id,
-        )
+        with _worker_boot_composition(
+            daemon, repo_root=repo_root, config_path=config_path
+        ):
+            worker_returncode = worker_main(
+                repo_root=repo_root,
+                config_path=config_path,
+                run_id=successor_run_id,
+            )
         assert worker_returncode == 0, "successor worker boot failed"
 
         calls = [
@@ -3768,8 +3908,11 @@ def test_budget_only_retained_worker_control_reaches_managed_review(
         reservation = daemon.service._admission.reservation(successor)
         assert reservation is not None
         monkeypatch.setenv("AFLOW_ADMISSION_RESERVATION_NONCE", reservation.nonce)
-        assert worker_main(repo_root=repo_root, config_path=config_path,
-                           run_id=successor) == 1  # deliberate reviewer stop
+        with _worker_boot_composition(
+            daemon, repo_root=repo_root, config_path=config_path
+        ):
+            assert worker_main(repo_root=repo_root, config_path=config_path,
+                               run_id=successor) == 1  # deliberate reviewer stop
         provider_calls = [json.loads(line) for line in provider_log.read_text().splitlines()]
         assert len(provider_calls) == 1
         first = provider_calls[0]
