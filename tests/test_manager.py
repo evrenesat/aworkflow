@@ -1528,7 +1528,6 @@ def test_manager_prompt_accepts_40_kib_and_rejects_one_more_utf8_byte() -> None:
 
 def test_v3_prompt_boundary_uses_exact_final_wire_serialization() -> None:
     from aflow.manager import (
-        MANAGER_INLINE_CONTEXT_MAX_BYTES,
         MANAGER_INLINE_CONTEXT_TARGET_BYTES,
         ManagerInlineContextLimitError,
         manager_prompt_metrics,

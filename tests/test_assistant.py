@@ -635,7 +635,6 @@ class AflowAnalyzeCliTests(unittest.TestCase):
     def test_aflow_analyze_fails_without_run_id(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             repo_root = Path(tmpdir)
-            runs_root = repo_root / ".aflow" / "runs"
             env = self._get_env()
             result = subprocess.run(
                 [sys.executable, "-m", "aflow", "analyze", "--repo-root", str(repo_root)],

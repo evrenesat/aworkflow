@@ -3872,7 +3872,6 @@ p = "do it"
             assert result == 1
 
     def test_cli_workflow_override(self) -> None:
-        import aflow.cli as cli_module
         with tempfile.TemporaryDirectory() as tmpdir:
             home_dir = Path(tmpdir).resolve()
             _write_config(home_dir, '[aflow]\ndefault_workflow = "simple"\n\n[workflow.simple.steps.implement_plan]\nrole = "architect"\nprompts = ["p"]\ngo = [{ to = "END" }]\n\n[workflow.other.steps.review]\nrole = "architect"\nprompts = ["p"]\ngo = [{ to = "END" }]\n\n[harness.opencode.profiles.default]\nmodel = "m"\n\n[roles]\narchitect = "opencode.default"\n\n[prompts]\np = "do it"\n')
@@ -4235,7 +4234,7 @@ architect = "opencode.default"
 [prompts]
 p = "do it"
 '''
-            config_path = _write_config(home_dir, config_text)
+            _write_config(home_dir, config_text)
             plan_path = Path(tmpdir) / 'plan.md'
             _write_plan(plan_path, '# Plan\n\n### [ ] Checkpoint 1: One\n- [ ] step\n')
 
@@ -4455,7 +4454,6 @@ class WorkflowStartupFlowTests(unittest.TestCase):
             )
             original_cwd = Path.cwd()
             import io
-            import aflow.cli as cli_module
             stderr_capture = io.StringIO()
             try:
                 with patch.dict(os.environ, env, clear=True):
@@ -4506,7 +4504,6 @@ class WorkflowStartupFlowTests(unittest.TestCase):
             )
             original_cwd = Path.cwd()
             import io
-            import aflow.cli as cli_module
             stderr_capture = io.StringIO()
             try:
                 with patch.dict(os.environ, env, clear=True):
@@ -4550,7 +4547,6 @@ class WorkflowStartupFlowTests(unittest.TestCase):
             )
             original_cwd = Path.cwd()
             import io
-            import aflow.cli as cli_module
             stdout_capture = io.StringIO()
             stderr_capture = io.StringIO()
             stdout_capture.isatty = lambda: True  # type: ignore[attr-defined]
@@ -4613,7 +4609,6 @@ class WorkflowStartupFlowTests(unittest.TestCase):
                 completed_plan_path=completed_plan_path,
             )
             original_cwd = Path.cwd()
-            import aflow.cli as cli_module
             try:
                 with patch.dict(os.environ, env, clear=True):
                     os.chdir(repo_root)
@@ -4657,7 +4652,6 @@ class WorkflowStartupFlowTests(unittest.TestCase):
             )
             original_cwd = Path.cwd()
             import io
-            import aflow.cli as cli_module
             stderr_capture = io.StringIO()
             try:
                 with patch.dict(os.environ, env, clear=True):
@@ -4701,7 +4695,6 @@ class WorkflowStartupFlowTests(unittest.TestCase):
             )
             original_cwd = Path.cwd()
             import io
-            import aflow.cli as cli_module
             stderr_capture = io.StringIO()
             try:
                 with patch.dict(os.environ, env, clear=True):
@@ -4743,7 +4736,6 @@ class WorkflowStartupFlowTests(unittest.TestCase):
             )
             original_cwd = Path.cwd()
             import io
-            import aflow.cli as cli_module
             stderr_capture = io.StringIO()
             try:
                 with patch.dict(os.environ, env, clear=True):
@@ -4782,7 +4774,6 @@ class WorkflowStartupFlowTests(unittest.TestCase):
             )
             original_cwd = Path.cwd()
             import io
-            import aflow.cli as cli_module
             stderr_capture = io.StringIO()
             try:
                 with patch.dict(os.environ, env, clear=True):
@@ -4839,7 +4830,6 @@ class WorkflowStartupFlowTests(unittest.TestCase):
             )
             original_cwd = Path.cwd()
             import io
-            import aflow.cli as cli_module
             import aflow.api.startup as startup_module
             original_startup_probe = startup_module.probe_worktree
             stderr_capture = io.StringIO()
@@ -4898,7 +4888,6 @@ class WorkflowStartupFlowTests(unittest.TestCase):
             )
             original_cwd = Path.cwd()
             import io
-            import aflow.cli as cli_module
             import aflow.api.startup as startup_module
             original_startup_probe = startup_module.probe_worktree
             stderr_capture = io.StringIO()
@@ -4960,7 +4949,6 @@ class WorkflowStartupFlowTests(unittest.TestCase):
             )
             original_cwd = Path.cwd()
             import io
-            import aflow.cli as cli_module
             import aflow.api.startup as startup_module
             original_startup_probe = startup_module.probe_worktree
             stderr_capture = io.StringIO()
@@ -5068,7 +5056,6 @@ class WorkflowStartupFlowTests(unittest.TestCase):
             )
             original_cwd = Path.cwd()
             import io
-            import aflow.cli as cli_module
             stderr_capture = io.StringIO()
             try:
                 with patch.dict(os.environ, env, clear=True):

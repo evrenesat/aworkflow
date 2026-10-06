@@ -1,5 +1,22 @@
 # DEVLOG
 
+## 2026-10-06 — Repair the Python test lint baseline (Refs evrenesat/aworkflow#78)
+
+- `tests/_support.py`: made the intentional shared export surface explicit to
+  Ruff with redundant aliases (`io as io`, `X as X`, ...). The dynamic
+  `__all__` and every runtime name are unchanged; the exported-name capture is
+  byte-identical before/after.
+- Removed genuinely unused local imports at the individual reported test sites
+  and dropped unused result bindings (F841) while preserving every evaluated
+  call, setup side effect, context manager behavior, and assertion. No noqa
+  additions, no rule/exclusion changes, no assertion removals, no fixture or
+  collection changes.
+- Evidence in `tmp/issue78-python-lint/`: before/after export captures, before
+  Ruff JSON (98 findings at base bef7fda6), and the focused pytest log (762
+  passed, 225 subtests; plus 172 passed in the adjacent
+  `tests/test_resume_checkpoint_repair.py` site repair). `uv run ruff check
+  tests` now exits 0.
+
 ## 2026-10-06 — Prevent self-matching verification waits
 
 - Execution and review skills now require command exit evidence, foreground or
