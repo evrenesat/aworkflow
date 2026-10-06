@@ -11,6 +11,196 @@
 - Skill-only documentation change; no runtime, scheduling or admission change.
   Validate skill documents, inspect scope/authority, and verify installed bytes.
 
+## 2026-10-06 — Fresh managed inactivity now requires an affirmative terminal unit observation (issue #55, cp01-v04)
+
+- `aflow/daemon.py`: `DaemonService._managed_inactivity_check()` no longer
+  treats `is_active == False` as an inactivity answer. A present exact unit
+  must affirm a terminal inactive observation (`inactive`/`failed`
+  active_state) before the admission preview authority is consulted;
+  `unknown`, transitional (`activating`, `deactivating`, `reloading`),
+  active, foreign, empty/malformed, and unavailable observations all fail
+  closed, and historical owner-stop status never overrides a current
+  nonterminal observation. The read-only `can_resume` preview now reuses the
+  same fresh identity-bound query, so preview, reservation/replay, and
+  nonce-bearing worker boot all apply one rule to the exact source and every
+  managed-stopped ancestor. `UnitState.is_active` and the unit manager are
+  unchanged.
+- `tests/test_resume_checkpoint_repair.py`: permanent regressions prove that
+  observed `unknown`/`activating`/`deactivating` source units (transitional
+  modeled with a live MainPID) give `can_resume=False` and refuse resume
+  before allocation in both in-place and worktree modes; that a
+  nonterminal/unknown exact unit after a successful reservation makes
+  nonce-bearing `worker_main()` return 1 with zero provider dispatch; that a
+  stopped successor with an unknown/transitional exact ancestor refuses
+  preview/resume before allocation and refuses worker-boot dispatch after
+  reservation; and that present exact `inactive` and `failed` units under
+  matching managed-stop authority stay admitted. Existing absent-unit
+  nonportable source/ancestor positives, portable receipt blocking, pending
+  stop, issue #74 lineage, idempotency, and integration compatibility
+  coverage are preserved.
+- `ARCHITECTURE.md` and `docs/runtime-behavior.md`: the fresh-inactivity
+  explanations now require an affirmative terminal observed state and state
+  that unknown/transitional observations are never converted into
+  inactivity. Refs evrenesat/aworkflow#55
+
+## 2026-10-06 — Managed-stop inactivity is now proven by fresh identity-bound queries (issue #55, cp01-v03)
+
+- `aflow/cli.py`: the checkpoint-repair resume path no longer accepts a
+  caller-supplied boolean `managed_ownership_validated` as inactivity proof.
+  `_bootstrap_resume_invocation` and `_resume_pending_checkpoint_repair()`
+  now take an optional `managed_inactivity_check: Callable[[str], bool]`
+  bound to the exact daemon application. The common rule, applied to the
+  exact source and every managed-stopped ancestor, is: (1) any portable
+  worker evidence that is not `confirmed_inactive()` always blocks;
+  (2) otherwise a managed query must succeed when one is available, proving
+  the exact source unit is inactive (identity- and ownership-bound via the
+  live `UnitManager` plus the same stop preview rule);
+  (3) without a managed query the CLI refuses managed-stopped sources with
+  no portable receipts, directing callers to managed resume. A failed,
+  timed-out, or unobservable query fails closed. A consumed reservation
+  nonce proves nothing about unit inactivity: the same query runs again at
+  worker boot before any provider dispatch.
+- `aflow/daemon.py`: `DaemonService` gained `_managed_inactivity_check()`
+  which re-observes the exact `aflow-run-{id}.service` unit through its live
+  `UnitManager` and applies the stop-preview inactivity rule, failing closed
+  on any observation problem. `_resume_bootstrap` (preview/reservation) and
+  `_worker_prepared` (worker boot, via `worker_main`) now thread this
+  authority into the shared bootstrap, so preview, reservation, and worker
+  boot all re-verify the exact source and managed-stopped ancestors.
+- `tests/test_resume_checkpoint_repair.py`: new permanent regressions prove
+  a nonportable managed-stopped source (no portable receipts) is admitted by
+  the fresh managed query and a real `worker_main()` boot (consumed
+  reservation nonce) repairs the interrupted checkpoint then reaches review
+  while preserving source bytes, original plan, scope, rejection history,
+  lineage, worktree and dirty edits; an exact source unit that becomes active
+  after a successful reservation is refused before any provider dispatch;
+  a stopped successor with its own inactive receipts and a nonportable
+  ancestor is admitted by the managed path (CLI refuses the same evidence
+  without authority); and nonportable ancestors that are freshly active,
+  foreign-owned, or present with untrusted receipts refuse before allocation
+  with zero unit starts and immutable sources.
+- `tests/test_control_plane_resume.py`: the legacy-resume test now expects
+  the inactivity gate refusal (the gate precedes the schema check), and the
+  budget test's direct `_worker_prepared()` call supplies an explicit fresh
+  test authority because its stopped source has no portable receipts.
+- No checkpoint commits; all changes are left uncommitted on the inherited
+  dirty baseline (inherited diff SHA-256
+  `9874989a5f9223c4924b3083f8d28cf4db53e140fcdbf214e12fe6e24c40f004`).
+  Focused verification: 183 passed
+  (`tests/test_resume_checkpoint_repair.py tests/test_control_plane_resume.py`),
+  104 passed across the related compatibility modules
+  (`test_resume_pending_review.py`, `test_worker_diagnostics.py`,
+  `test_control_plane_capabilities.py`, `test_control_plane_reconciliation.py`,
+  `test_control_plane_repository.py`, `test_control_plane_services.py`),
+  `ruff check` clean, `git diff --check` clean.
+
+## 2026-10-06 — Resume managed-stop killed pending final checkpoint repairs (issue #55)
+
+- `aflow/cli.py`: a managed owner stop that kills the controller mid-repair
+  turn leaves run metadata `running`, a complete final-checkpoint snapshot,
+  and an unfinalized `starting` worker repair receipt. The checkpoint-repair
+  resume classifier now admits exactly that proven shape: managed-stop launch
+  phase plus run-journal stop event, cleared stop intent, the rejected
+  checkpoint's envelope/rejection/reviewed-attempt bindings, and the active
+  `starting` receipt bound to the pending designated repair override (no
+  fabricated terminal receipt). The complete-snapshot refusal is opened only
+  by this pre-classifier and the authoritative classifier remains the single
+  admission gate; a pre-classifier pass that the authoritative classifier
+  rejects fails closed instead of falling through to ordinary resume paths.
+  The review receipt's `DONE` condition now mirrors snapshot completeness, so
+  final-checkpoint repairs with a complete original plan are admitted while
+  non-final interrupted repairs keep the exact issue #74 behavior. Daemon
+  admission needed no changes: `owner_stopped` was already an admissible
+  status, and the CLI bootstrap was the single missing gate. The interactive
+  `aflow run` detection path stays conservative.
+- `tests/test_resume_checkpoint_repair.py`: new source-shape fixture runs a
+  real workflow in a child controller (in-place and worktree), applies a real
+  managed owner stop through the daemon, and SIGKILLs the controller inside
+  the repair turn, then verifies the produced `running`/`starting` evidence.
+  Coverage: pending-repair scope preservation with immutable source bytes,
+  successor repair-then-review dispatch with lineage/worktree/dirty-edit
+  survival, managed resume idempotency, pending stop intent blocking and
+  clearing admission, active unit blocking, and nine focused negative
+  damages (missing/external overlay, missing envelope, changed original,
+  forged rejection, finalized repair, malformed turn identity, extra turn,
+  contradictory status).
+- Defect repairs (both reproduced in `.issue55-stop-proof/test_review_probes.py`
+  before the fix): (1) `_managed_owner_stop_evidence()` alone was treated as
+  inactivity proof, so CLI bootstrap could allocate a successor for a stopped
+  source whose portable worker ownership was unknown (`active=None,
+  observation=untrusted_receipts`) or live. `_bootstrap_resume_invocation`
+  now refuses any non-`confirmed_inactive` portable worker evidence before
+  allocation, so the CLI public path, managed preview, and managed resume all
+  fail closed; the CLI refusal directs callers to managed resume. (2) The
+  `_resume_pending_checkpoint_repair()` lineage walk required every ancestor
+  to be `failed`, so a valid stopped first-turn successor (zero completed
+  turns) was unrepairable. The walk now admits proven managed-stopped
+  ancestors, refuses unproven stopped ancestors without converting them into
+  failed evidence, and preserves the issue #74 failed contract.
+- `tests/test_resume_checkpoint_repair.py`: new permanent regressions convert
+  the probe scenarios into assertions of the repaired behavior: unknown
+  portable ownership refusal (managed preview/resume/CLI bootstrap, zero
+  allocations, immutable source), live ownership refusal, confirmed-inactive
+  receipts repairing then reviewing, a stopped first-turn successor repairing
+  then reviewing with inherited rejection/overlay/worktree/dirty edits
+  (in-place and worktree, child-controller second stop), and mixed
+  stopped/failed lineage admission plus unproven-stopped-ancestor refusal.
+- `tests/test_resume_pending_review.py`: the pending-review fixture now writes
+  a fully valid terminal unit receipt (with `at`), so the ownership gate sees
+  proven inactive ownership for the pending-review contract.
+- Docs: `ARCHITECTURE.md` and `docs/runtime-behavior.md` describe the
+  stopped-shape admission, the ownership gate, and successor behavior.
+- Verification: `uv run pytest -q tests/test_resume_checkpoint_repair.py
+  tests/test_control_plane_resume.py` (151 passed) plus the resume, repair,
+  exclusive-execution, CLI and guard-daemon suites (354 passed); Ruff, git
+  diff --check. See `.issue55-stop-proof/verification.log`.
+
+Refs evrenesat/aworkflow#55
+
+### 2026-10-06 — cp01-v02: common stopped-run inactivity ownership rule
+
+- Defect repair (reproduced in `.issue55-stop-proof/test_review_v02_probes.py`
+  before the fix): two directly related paths still admitted a stopped run
+  without current inactivity proof. (1) `_bootstrap_resume_invocation()`
+  checked portable ownership only when `worker_evidence()` returned a mapping;
+  a managed-stopped source with no portable receipts (no units directory)
+  passed even when its managed unit was active. The CLI now refuses a
+  managed-stopped source without portable receipts and directs the caller to
+  managed resume; the managed caller passes `managed_ownership_validated=True`
+  after validating unit state, preserving legitimate managed nonportable
+  resumes. (2) The `_resume_pending_checkpoint_repair()` ancestor walk admitted
+  stopped ancestors using `_managed_owner_stop_evidence()` alone; it now
+  requires confirmed-inactive portable evidence for every managed-stopped
+  ancestor. Absence of trusted receipts is never converted into confirmed
+  inactivity.
+- `aflow/cli.py`: added `managed_ownership_validated` parameter to
+  `_bootstrap_resume_invocation()`; the no-portable-receipt refusal applies
+  only to the stopped-repair shape (failed sources and other terminal shapes
+  keep their existing contract). The ancestor walk in
+  `_resume_pending_checkpoint_repair()` now calls `worker_evidence()` and
+  `confirmed_inactive()` for each managed-stopped ancestor.
+- `aflow/daemon.py`: `_resume_bootstrap()` and `_worker_prepared()` pass
+  `managed_ownership_validated=True` to preserve managed nonportable resumes.
+- `tests/test_resume_checkpoint_repair.py`: the `stopped_repair` fixture now
+  writes stopped unit receipts (the normal shape after a clean managed stop);
+  `_stop_stopped_successor()` writes receipts for each new stopped run. New
+  permanent regressions: (a) no portable receipts + stopped source → CLI
+  refuses actionably; (b) no portable receipts + active managed unit → both
+  managed and CLI refuse with zero dispatch; (c) stopped successor with
+  confirmed-inactive receipts + ancestor with no receipts → refuse; (d)
+  stopped successor with confirmed-inactive receipts + ancestor with untrusted
+  receipts → refuse. Existing negative tests updated to clear fixture receipts
+  before simulating unknown/live ownership.
+- Docs: `ARCHITECTURE.md` and `docs/runtime-behavior.md` describe the common
+  ownership rule, the CLI limitation for no-portable-receipt stopped sources,
+  and the ancestor inactivity requirement.
+- Verification: `uv run pytest -q tests/test_resume_checkpoint_repair.py
+  tests/test_control_plane_resume.py` (171 passed); `uv run ruff check
+  aflow/cli.py aflow/review_repair_resume.py aflow/daemon.py` (clean);
+  `git diff --check` (clean).
+
+Refs evrenesat/aworkflow#55
+
 ## 2026-10-06 — Resume interrupted rejected-checkpoint repairs (issue #74)
 
 - Bind a pending checkpoint repair to the retained scope, captured original

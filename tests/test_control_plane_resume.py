@@ -1140,7 +1140,12 @@ def test_daemon_rejects_legacy_resume_before_reserving_continuation(
     launches_root = repo_root / ".aflow" / "launches"
     launches_before = sorted(path.name for path in launches_root.iterdir())
 
-    with pytest.raises(ValueError, match="unsupported resume state schema"):
+    # The managed inactivity gate now refuses this unobservable legacy
+    # source before any reservation, replacing the later schema failure.
+    with pytest.raises(
+        ValueError,
+        match="current managed inactivity is not proven for the exact source unit",
+    ):
         daemon.service.resume(
             source_id,
             caller_scope="project:one",
@@ -1360,7 +1365,13 @@ def test_managed_successor_budget_caps_rejected_review(tmp_path, monkeypatch, bu
             idempotency_key="one-review", successor_max_turns=2)
     record = daemon.service._read_record(result.run_id)
     manifest = daemon.application.repository.get_launch_manifest(result.run_id)
-    prepared, resume = _worker_prepared(record, manifest, root, request.config_path, config)
+    # The daemon worker's managed inactivity authority is supplied by the
+    # daemon; this direct preparation call carries an explicit fresh test
+    # authority because the stopped source has no portable receipts.
+    prepared, resume = _worker_prepared(
+        record, manifest, root, request.config_path, config,
+        managed_inactivity_check=lambda run_id: True,
+    )
     assert prepared.max_turns == (budget or 49)
     assert prepared.max_turns_explicit is True
     assert resume.interrupted_step_name == "review"

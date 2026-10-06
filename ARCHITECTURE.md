@@ -67,9 +67,12 @@ its slot until inactivity is proven. Manual capacity conflicts carry the
 The same lock also admits only one unresolved successor per predecessor,
 using reservation and persisted lineage evidence. Exact retries reuse their
 claim; another successor waits until the first is authoritatively inactive.
-The daemon's read-only `can_resume` hint uses the same predecessor inactivity
-check as locked admission; a stopped or missing unit with running controller
-metadata remains uncertain and cannot be offered for resume. The hint is an
+The daemon's read-only `can_resume` hint reuses the same fresh identity-bound
+managed inactivity query as locked admission; a present exact unit must affirm
+a terminal inactive observation (`inactive`/`failed` active_state) before the
+admission authority is consulted, and `unknown`, transitional, active, foreign,
+or unavailable observations all fail closed. A stopped or missing unit with
+running controller metadata remains uncertain and cannot be offered for resume. The hint is an
 observer preview, not a permission: history list pages skip it
 (`include_resume_preview=False` in `DaemonService.run_status`) because it costs
 one project-wide admission scan per row, so list rows omit the field instead of
@@ -82,6 +85,38 @@ envelope, rejection history and designated repair override in the successor;
 original implementation checkmarks alone cannot close the rejected checkpoint.
 Only pending, incomplete repair checklists with consumable routing qualify;
 completed overlays or unresolved control state retain their recovery refusal.
+A managed owner stop that kills the controller mid-repair turn is admitted by
+the same classifier (issue #55): the launch phase records the managed
+`owner_stopped` transition, the run journal contains the stop event, the stop
+intent is cleared, and the run metadata stays `running` with a complete
+final-checkpoint snapshot, the rejected checkpoint's envelope, and an
+unfinalized `starting` worker repair receipt (no fabricated terminal receipt).
+The successor reuses the worktree, scope, rejection history, overlay, and
+dirty edits, runs the pending repair worker, then requires review before any
+scope advancement. CLI bootstrap, daemon admission, and managed resume share
+this rule; the interactive detection path stays conservative.
+Stop phase, journaled stop event, and cleared intent identify the managed
+stop but never override current ownership evidence: bootstrap refuses a
+portable source whose unit receipts are missing, untrusted, or live, before
+any successor allocation, and the CLI refusal directs callers to managed
+resume. A managed-stopped source with no portable receipts at all also
+refuses from the CLI because the stopped-repair shape requires current
+inactivity proof; the managed caller instead supplies a fresh
+identity-bound inactivity query that bootstrap re-runs for the exact source
+and every managed-stopped ancestor at preview, reservation, and worker boot
+(a reservation nonce never substitutes for a fresh answer), so legitimate
+managed nonportable resumes are preserved. A present exact unit must affirm a
+terminal inactive observation (`inactive`/`failed` active_state); `unknown`,
+transitional (for example `activating` with a live MainPID), active, foreign,
+or malformed observations are not inactivity answers and never fall back on
+historical owner-stop status. A stopped first-turn successor
+stays repairable because the inherited receipt owner may be a proven
+managed-stopped source admitted under that same common rule (confirmed-
+inactive portable evidence, or a fresh managed inactivity proof when no
+portable receipts exist; a failed source under the issue #74 contract also
+stays admissible); stopped ancestors that fail the rule are rejected
+without being converted into failed evidence. Absence of trusted receipts
+is never converted into confirmed inactivity.
 The receipt owner stays in run history even under a small keep_runs setting.
 The same lock also admits only one unresolved run claim for a validated plan
 path across daemon and direct controllers, including linked worktrees. A

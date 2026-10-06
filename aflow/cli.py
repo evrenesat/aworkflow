@@ -8,6 +8,7 @@ from pathlib import Path, PurePosixPath
 import re
 import subprocess
 import sys
+import tomllib
 from typing import Any, Callable, Mapping
 
 from .api import (
@@ -1309,6 +1310,26 @@ def _accepted_budget_override_max_turns(
     return None
 
 
+def _managed_inactivity_proven(
+    check: Callable[[str], bool] | None, run_id: str
+) -> bool:
+    """Require one fresh affirmative managed inactivity answer for a run.
+
+    Managed callers supply an identity-bound query bound to their selected
+    project root.  Exceptions, unavailable observations, and identity
+    mismatches all fail closed; only a fresh ``True`` answer proves
+    inactivity, and the answer is never cached or persisted.  A saved
+    reservation, consumed nonce, or historical stop never substitutes for
+    a fresh answer.
+    """
+    if check is None:
+        return False
+    try:
+        return check(run_id) is True
+    except Exception:
+        return False
+
+
 def _bootstrap_resume_invocation(
     *,
     repo_root: Path,
@@ -1328,6 +1349,7 @@ def _bootstrap_resume_invocation(
     reset_scope: bool = False,
     rehome_worktree: str | Path | None = None,
     live_loader: Callable[[Path], Any] | None = None,
+    managed_inactivity_check: Callable[[str], bool] | None = None,
 ) -> ResumeBootstrap:
     """Resolve one durable run and reconstruct omitted resume identity read-only."""
     if successor_max_turns is not None and (
@@ -1348,6 +1370,54 @@ def _bootstrap_resume_invocation(
     if not isinstance(prev_run, dict):
         raise ValueError(
             f"error: run '{resolved_run_id.name}' does not contain readable or valid run metadata."
+        )
+
+    # A portable source unit may only be resumed when its ownership is proven
+    # inactive.  A units directory without trusted start/terminal receipts is
+    # an unknown observation, and live controller/worker/provider activity is
+    # active ownership; a present portable observation that fails
+    # confirmed_inactive() always blocks, and no unit observation overrides
+    # it.  The CLI cannot observe unit state durably, so it refuses before any
+    # successor allocation and directs the caller to managed resume, which
+    # verifies unit ownership.  A managed-stopped source without portable
+    # receipts also refuses from the CLI because the stopped-repair shape
+    # requires current inactivity proof; a managed caller instead supplies a
+    # fresh identity-bound inactivity query for the exact source (and its
+    # stopped ancestors), which must succeed at every preview, reservation,
+    # and worker boot.  A saved reservation or nonce never replaces that fresh
+    # evidence.  Failed sources and other terminal shapes without portable
+    # receipts keep their existing contract.
+    from .control_plane.worker_diagnostics import (
+        confirmed_inactive,
+        worker_evidence,
+    )
+
+    worker = worker_evidence(repo_root, run_id, f"aflow-run-{run_id}.service")
+    if worker is not None and not confirmed_inactive(worker):
+        raise ValueError(
+            f"error: run '{run_id}' portable worker ownership is not confirmed "
+            "inactive; unknown or live controller/worker/provider activity "
+            "cannot be resumed from the CLI. Use managed resume through the "
+            "AFlow control plane, which verifies unit ownership before "
+            "allocating a successor."
+        )
+    if managed_inactivity_check is not None:
+        if not _managed_inactivity_proven(managed_inactivity_check, run_id):
+            raise ValueError(
+                f"error: run '{run_id}' current managed inactivity is not "
+                "proven for the exact source unit; an active, foreign, or "
+                "unobservable unit cannot be resumed. No successor was "
+                "allocated."
+            )
+    elif worker is None and _managed_owner_stop_evidence(
+        run_dir, prev_run, run_id=run_id
+    ):
+        raise ValueError(
+            f"error: run '{run_id}' has no portable worker receipts and "
+            "is a managed-stopped source; the CLI cannot confirm unit "
+            "ownership. Use managed resume through the AFlow control "
+            "plane, which verifies unit ownership before allocating a "
+            "successor."
         )
 
     frozen_run_identity = _decode_frozen_run_identity(prev_run, resolved_run_id)
@@ -1640,6 +1710,20 @@ def _bootstrap_resume_invocation(
         )
         is not None
     )
+    # Issue #55: a managed owner stop that SIGKILLed the controller mid-repair
+    # turn leaves run.json "running" with a complete final-checkpoint snapshot
+    # and an unfinalized "starting" worker repair receipt.  The lightweight
+    # pre-classifier only opens the complete-snapshot refusal below; the full
+    # classifier in _reconstruct_resume_context remains authoritative and the
+    # bootstrap fails closed if the two ever disagree.
+    has_stopped_pending_repair = (
+        _stopped_checkpoint_repair_step(
+            run_dir,
+            prev_run,
+            workflow_steps=workflow_spec.steps,
+        )
+        is not None
+    )
     mismatch_reason = _resume_candidate_mismatch_reason(
         prev_run,
         workflow_spec,
@@ -1660,6 +1744,7 @@ def _bootstrap_resume_invocation(
         allow_owner_stopped_pending_review=has_owner_stopped_pending_review,
         allow_budget_continuation=budget_boundary is not None,
         allow_review_repair=review_repair_step is not None,
+        allow_stopped_repair=has_stopped_pending_repair,
         team_explicit=saved_team_explicit,
         max_turns_explicit=saved_max_turns_explicit,
         run_dir=run_dir,
@@ -1691,8 +1776,18 @@ def _bootstrap_resume_invocation(
         effective_max_turns=effective_max_turns,
         budget_boundary=budget_boundary,
         review_repair_step=review_repair_step,
+        managed_inactivity_check=managed_inactivity_check,
     )
     assert resume_context is not None
+    if has_stopped_pending_repair and resume_context.review_repair_step is None:
+        # The pre-classifier opened the complete-snapshot refusal, but the
+        # authoritative classifier found the repair evidence invalid.  Fail
+        # closed instead of falling through to ordinary resume paths.
+        raise ValueError(
+            f"error: run '{resolved_run_id.name}' has proven managed-stop "
+            "repair evidence that no longer validates; the source run was not "
+            "modified and no successor was started."
+        )
     if successor_max_turns is not None:
         resume_context = replace(
             resume_context, successor_max_turns=successor_max_turns
@@ -1746,6 +1841,7 @@ def _resume_candidate_mismatch_reason(
     allow_owner_stopped_pending_review: bool = False,
     allow_budget_continuation: bool = False,
     allow_review_repair: bool = False,
+    allow_stopped_repair: bool = False,
     team_explicit: bool | None = None,
     max_turns_explicit: bool | None = None,
     run_dir: Path | None = None,
@@ -1812,6 +1908,7 @@ def _resume_candidate_mismatch_reason(
         and not terminal_completion_only
         and not allow_owner_stopped_pending_review
         and not allow_budget_continuation
+        and not allow_stopped_repair
     ):
         if run_dir is not None:
             try:
@@ -1839,6 +1936,7 @@ def _resume_candidate_mismatch_reason(
         and not allow_budget_continuation
         and not _completed_manager_budget_boundary_pending(prev_run, current_repo_root)
         and not allow_review_repair
+        and not allow_stopped_repair
     ):
         return "its last saved plan snapshot was already complete"
 
@@ -1985,6 +2083,131 @@ def _owner_stopped_review_step(
         or result.get("chosen_transition") != current_step_name
         or result.get("returncode") != 0
         or not isinstance(result.get("snapshot_after"), Mapping)
+    ):
+        return None
+    return current_step_name
+
+
+def _managed_owner_stop_evidence(
+    run_dir: Path,
+    prev_run: Mapping[str, object],
+    *,
+    run_id: str,
+) -> bool:
+    """Verify durable managed-stop evidence without trusting status text.
+
+    A managed owner stop is durable only when the control plane recorded the
+    owner-stopped launch phase, journaled the stop event, and the owner stop
+    intent was later cleared through supported control. A SIGKILLed controller
+    may leave ``run.json`` as ``running``; those artifacts are authoritative
+    instead. A pending, active, or unacknowledged stop is never evidence.
+    """
+    if prev_run.get("status") not in {"running", "owner_stopped"}:
+        return False
+    phase_path = run_dir.parent.parent / "launches" / f"{run_id}.state.json"
+    if phase_path.is_symlink() or not phase_path.is_file():
+        return False
+    try:
+        phase = json.loads(phase_path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+        return False
+    if (
+        not isinstance(phase, Mapping)
+        or phase.get("run_id") != run_id
+        or phase.get("phase") != "owner_stopped"
+    ):
+        return False
+    events_path = run_dir / "events.jsonl"
+    if events_path.is_symlink() or not events_path.is_file():
+        return False
+    try:
+        raw_events = events_path.read_bytes()
+    except OSError:
+        return False
+    journaled = False
+    for line in raw_events.splitlines():
+        if not line.strip():
+            continue
+        try:
+            event = json.loads(line)
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            continue
+        if isinstance(event, Mapping) and event.get("event_type") == "owner_stopped":
+            journaled = True
+            break
+    if not journaled:
+        return False
+    overrides_path = run_dir / "overrides.toml"
+    if overrides_path.is_symlink() or not overrides_path.is_file():
+        return False
+    try:
+        overrides = tomllib.loads(overrides_path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, tomllib.TOMLDecodeError):
+        return False
+    return overrides.get("owner_stop") is False
+
+
+def _stopped_checkpoint_repair_step(
+    run_dir: Path,
+    prev_run: Mapping[str, object],
+    *,
+    workflow_steps: Mapping[str, object] | None = None,
+) -> str | None:
+    """Recognize a proven managed-stop interrupted checkpoint repair.
+
+    Returns the interrupted worker step when durable managed-stop evidence,
+    a retained scope, the original checkpoint's complete snapshot (or an
+    explicit cursor advance), and an unfinalized worker repair turn all agree.
+    It never invents a failed receipt: the interrupted turn must remain
+    ``starting`` with no post-snapshot, and the owner stop intent must be
+    cleared. Any missing or contradictory artifact returns ``None``.
+    """
+    if not _managed_owner_stop_evidence(run_dir, prev_run, run_id=run_dir.name):
+        return None
+    snapshot = _resume_plan_snapshot(prev_run.get("last_snapshot"))
+    if snapshot is None:
+        return None
+    scope = prev_run.get("active_implementation_scope")
+    if not isinstance(scope, Mapping):
+        return None
+    index = scope.get("checkpoint_index")
+    if not isinstance(index, int) or isinstance(index, bool) or index < 1:
+        return None
+    if not (
+        snapshot.is_complete is True
+        or snapshot.current_checkpoint_index == index + 1
+    ):
+        return None
+    current_step_name = prev_run.get("current_step_name")
+    if not isinstance(current_step_name, str) or not current_step_name.strip():
+        return None
+    if workflow_steps is not None:
+        step = workflow_steps.get(current_step_name)
+        if step is None or getattr(step, "role", None) != "worker":
+            return None
+    turns_completed = prev_run.get("turns_completed")
+    active_turn = prev_run.get("active_turn")
+    if (
+        not isinstance(turns_completed, int)
+        or isinstance(turns_completed, bool)
+        or turns_completed < 0
+        or not isinstance(active_turn, int)
+        or isinstance(active_turn, bool)
+        or active_turn != turns_completed + 1
+    ):
+        return None
+    result_path = run_dir / "turns" / f"turn-{active_turn:03d}" / "result.json"
+    try:
+        result = json.loads(result_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    if (
+        not isinstance(result, Mapping)
+        or result.get("turn_number") != active_turn
+        or result.get("status") != "starting"
+        or result.get("snapshot_after") is not None
+        or result.get("step_role") != "worker"
+        or result.get("step_name") != current_step_name
     ):
         return None
     return current_step_name
@@ -3510,6 +3733,7 @@ def _resume_pending_checkpoint_repair(
     manager_fields: Mapping[str, object],
     workflow_steps: Mapping[str, object] | None,
     pending_finalized_turn: PendingFinalizedTurn | None,
+    managed_inactivity_check: Callable[[str], bool] | None = None,
 ) -> str | None:
     """Retain a rejected scope only when its owned repair was interrupted.
 
@@ -3518,15 +3742,41 @@ def _resume_pending_checkpoint_repair(
     authority. The existing manager override remains responsible for selecting
     the designated repair worker.
     """
+    from .control_plane.worker_diagnostics import (
+        confirmed_inactive,
+        worker_evidence,
+    )
+
     if scope is None or scope_envelope_bytes is None or scope.awaiting_review or workflow_steps is None:
         return None
     snapshot = _resume_plan_snapshot(prev_run.get("last_snapshot"))
+    # Issue #55: a proven managed owner stop may have SIGKILLed the controller
+    # mid-repair turn.  The run then records "running" with an unfinalized
+    # "starting" repair receipt and, for a final checkpoint, a complete
+    # original snapshot.  That shape is admitted only with durable managed-stop
+    # evidence; the failed harness-failed shape keeps its exact prior rules.
+    stopped = _managed_owner_stop_evidence(run_dir, prev_run, run_id=run_id)
     if (
         snapshot is None
         or scope.checkpoint_index is None
-        or snapshot.current_checkpoint_index != scope.checkpoint_index + 1
-        or prev_run.get("status") != "failed"
-        or pending_finalized_turn is not None
+        or (
+            prev_run.get("status") == "failed"
+            and (
+                pending_finalized_turn is not None
+                or snapshot.current_checkpoint_index != scope.checkpoint_index + 1
+            )
+        )
+        or (
+            prev_run.get("status") != "failed"
+            and not (
+                stopped
+                and pending_finalized_turn is None
+                and (
+                    snapshot.is_complete is True
+                    or snapshot.current_checkpoint_index == scope.checkpoint_index + 1
+                )
+            )
+        )
     ):
         return None
     if any(
@@ -3616,8 +3866,41 @@ def _resume_pending_checkpoint_repair(
                 return None
             ancestor = _resume_read_json_object(review_run_dir / "run.json", label="checkpoint repair predecessor", run_id=run_id)
             ancestor_scope = ancestor.get("active_implementation_scope")
+            # An inherited receipt owner may be a failed source under the
+            # issue 74 contract or a proven managed-stopped source whose
+            # metadata still records "running" (issue 55).  A stopped ancestor
+            # without durable stop evidence is never converted into failed
+            # evidence; every other binding check is unchanged.
+            if ancestor.get("status") == "failed":
+                ancestor_admitted = True
+            elif _managed_owner_stop_evidence(review_run_dir, ancestor, run_id=parent_id):
+                # A managed-stopped ancestor is admitted under the same
+                # common rule as the source: a present portable observation
+                # that fails confirmed_inactive() always blocks, and no unit
+                # observation overrides it; a managed caller's fresh query
+                # must then prove current inactivity for the exact ancestor;
+                # without a query, confirmed-inactive portable receipts are
+                # required.  A bare historical stop is never converted into
+                # inactivity authority, and absence of trusted receipts is
+                # never converted into confirmed inactivity.
+                ancestor_worker = worker_evidence(
+                    repo_root, parent_id, f"aflow-run-{parent_id}.service"
+                )
+                if ancestor_worker is not None and not confirmed_inactive(ancestor_worker):
+                    ancestor_admitted = False
+                elif managed_inactivity_check is not None:
+                    ancestor_admitted = _managed_inactivity_proven(
+                        managed_inactivity_check, parent_id
+                    )
+                else:
+                    ancestor_admitted = (
+                        ancestor_worker is not None
+                        and confirmed_inactive(ancestor_worker)
+                    )
+            else:
+                ancestor_admitted = False
             if (
-                ancestor.get("status") != "failed"
+                not ancestor_admitted
                 or ancestor.get("active_plan_path") != prev_run.get("active_plan_path")
                 or ancestor.get("last_snapshot") != prev_run.get("last_snapshot")
                 or not isinstance(ancestor_scope, Mapping)
@@ -3650,7 +3933,14 @@ def _resume_pending_checkpoint_repair(
         or review.get("step_role") != "reviewer"
         or review.get("selector") != rejection.reviewer_selector
         or review.get("review_rejection") != asdict(rejection)
-        or review.get("conditions") != {"DONE": False, "NEW_PLAN_EXISTS": True, "MAX_TURNS_REACHED": False}
+        # NEW_PLAN_EXISTS is the rejection evidence; DONE mirrors whether the
+        # original snapshot was already complete, which only happens for a
+        # final checkpoint (issue #55 stopped shape).
+        or review.get("conditions") != {
+            "DONE": snapshot.is_complete is True,
+            "NEW_PLAN_EXISTS": True,
+            "MAX_TURNS_REACHED": False,
+        }
         or review.get("chosen_transition") != step_name
         or _resume_plan_snapshot(review.get("snapshot_before")) != snapshot
         or _resume_plan_snapshot(review.get("snapshot_after")) != snapshot
@@ -3659,7 +3949,7 @@ def _resume_pending_checkpoint_repair(
         or repair.get("turn_number") != active
         or repair.get("step_name") != step_name
         or repair.get("step_role") != "worker"
-        or repair.get("status") != "harness-failed"
+        or repair.get("status") != ("harness-failed" if not stopped else "starting")
         or repair.get("chosen_transition") is not None
         or repair.get("snapshot_after") is not None
         or _resume_plan_snapshot(repair.get("snapshot_before")) != snapshot
@@ -4044,6 +4334,7 @@ def _reconstruct_resume_context(
     effective_max_turns: int | None = None,
     budget_boundary: object | None = None,
     review_repair_step: str | None = None,
+    managed_inactivity_check: Callable[[str], bool] | None = None,
 ) -> ResumeContext | None:
     """Decode all durable resume state from one already-loaded run payload."""
     run_id = resolved_run_id.name
@@ -4225,6 +4516,7 @@ def _reconstruct_resume_context(
             relocation=relocation, scope=active_scope, scope_envelope_bytes=scope_envelope_bytes,
             manager_fields=manager_fields,
             workflow_steps=workflow_steps, pending_finalized_turn=pending_finalized_turn,
+            managed_inactivity_check=managed_inactivity_check,
         )
         if checkpoint_repair_step is not None:
             review_repair_step = checkpoint_repair_step

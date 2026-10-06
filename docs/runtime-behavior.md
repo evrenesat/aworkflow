@@ -156,6 +156,68 @@ boundary. For an actual run, inspect the saved run metadata, finalized worker
 receipt, scope envelope/evidence, manager boundary, unit start/exit receipts,
 and current Git identity read-only before requesting recovery.
 
+## Resuming a Managed-Stop Killed Pending Checkpoint Repair (issue #55)
+
+A managed owner stop (`owner_stopped`) can kill the controller in the middle
+of a pending checkpoint repair turn, for example immediately after the
+reviewer rejected the final checkpoint. The controller never finalizes that
+turn, so the run metadata stays `running`, the original plan snapshot is
+already complete (final checkpoint checked), and the worker repair receipt is
+an unfinalized `starting` record without a post-snapshot. This is a pending
+checkpoint repair, not a complete run, and resume admission accepts exactly
+that proven shape:
+
+- The launch phase records the managed `owner_stopped` transition, the run
+  journal contains the `owner_stopped` event, the durable stop intent has been
+  cleared through supported control, and the run status is `running` (or
+  `owner_stopped`).
+- The complete snapshot is bound to the rejected checkpoint's envelope bytes,
+  rejection history, reviewed attempt, owned repair overlay, and the exact
+  active `starting` worker repair receipt (turn identity, role, and selector
+  all match the pending designated repair override). The review receipt's
+  `DONE` condition may be true because the final checkpoint is already
+  checked; `NEW_PLAN_EXISTS` remains the rejection evidence.
+- The same fail-closed evidence rules as interrupted failed repairs apply:
+  changed originals, fully checked overlays, forged attribution, pending stop
+  intent, active units, or unresolved partition/control state are rejected,
+  and the source run is never modified.
+- Stop evidence identifies ownership but does not prove it. A portable
+  source whose unit receipts are missing, untrusted, or live is refused
+  before any successor allocation in CLI bootstrap, managed preview, and
+  managed resume; the CLI refusal directs callers to managed resume, which
+  verifies unit ownership. A managed-stopped source with no portable
+  receipts at all also refuses from the CLI because the stopped-repair shape
+  requires current inactivity proof; the managed caller instead supplies a
+  fresh identity-bound inactivity query that bootstrap re-runs for the exact
+  source and every managed-stopped ancestor at preview, reservation, and
+  worker boot, so legitimate managed nonportable resumes are preserved. A
+  consumed reservation nonce never replaces that fresh answer, and a source
+  unit that becomes active, unknown, or transitional after reservation is
+  refused before any provider dispatch. A present exact unit must affirm a
+  terminal inactive state (`inactive`/`failed`); unknown, transitional, and
+  active observations are never converted into inactivity from `is_active ==
+  False` alone. Proven inactive receipts (for example a matching `stopped`
+  receipt) keep the stopped repair admitted.
+- A stopped first-turn successor (zero completed turns, starting turn 1,
+  inherited rejection) stays repairable: its inherited receipt owner may be a
+  proven managed-stopped source admitted under the same common rule
+  (confirmed-inactive portable evidence, or a fresh managed inactivity proof
+  when no portable receipts exist), and mixed stopped/failed lineages stay
+  valid under the issue #74 contract. Stopped ancestors that fail the rule
+  (active, foreign, unknown, transitional, unobservable, or present with
+  untrusted receipts) are refused before allocation; absence of trusted
+  receipts is never converted into confirmed inactivity. The successor repairs first, then requires review, with
+  lineage, overlay, worktree, and dirty edits preserved.
+
+The successor reuses the existing worktree and branch, the original checkpoint
+scope, the rejection history, the captured envelope, the dirty repair edits,
+and the exact repair overlay. It starts the pending repair worker with the
+currently configured role, then requires the configured reviewer before any
+scope advancement; nothing is merged without approval. Canonical run status,
+managed resume, and the successor bootstrap all use this same admission. The
+interactive `aflow run` detection path deliberately keeps the conservative
+failed-repair behavior.
+
 ## Manager Contexts and Evidence Budget
 
 Manager contexts are versioned. Selectors below 4 rebuild historical schema

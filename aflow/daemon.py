@@ -1573,10 +1573,7 @@ class DaemonService:
         ):
             return False
         try:
-            observed = self._application.units.get(_unit_name(status.run_id))
-            if observed is not None and (observed.name != _unit_name(status.run_id) or observed.is_active):
-                return False
-            if not self._admission.predecessor_inactive_for_preview(status.run_id):
+            if not self._managed_inactivity_check()(status.run_id):
                 return False
             self._resume_bootstrap(status.run_id)
         except Exception:
@@ -3351,6 +3348,45 @@ class DaemonService:
             repo_root=self._config.repo_root,
         )
 
+    def _managed_inactivity_check(self) -> Callable[[str], bool]:
+        """Bind a fresh exact-run inactivity query to this daemon's project.
+
+        The query re-observes the exact canonical unit of the selected
+        repository and requires an affirmative terminal inactive observation
+        (``inactive`` or ``failed``) before consulting the admission preview
+        authority, which requires identity-matched current inactivity
+        evidence.  ``unknown``, transitional (``activating``, ``deactivating``,
+        ``reloading``), active, foreign, empty or malformed, and unavailable
+        observations all fail closed; ``is_active == False`` alone is not an
+        inactivity answer, and historical owner-stop status never overrides a
+        current nonterminal observation.  Exceptions, unavailable
+        observations, and identity mismatches all fail closed.  The answer is
+        computed afresh on every call and is never cached or persisted; a
+        successful reservation, a consumed nonce, or a saved boolean never
+        substitutes for a fresh answer.
+        """
+        application = self._application
+        admission = self._admission
+
+        def check(run_id: str) -> bool:
+            try:
+                validated = validate_run_id(run_id)
+                unit_name = _unit_name(validated)
+                observed = application.units.get(unit_name)
+                if observed is not None and (
+                    observed.name != unit_name
+                    or observed.active_state not in {"inactive", "failed"}
+                ):
+                    return False
+                return (
+                    admission.predecessor_inactive_for_preview(validated)
+                    is True
+                )
+            except Exception:
+                return False
+
+        return check
+
     def _resume_bootstrap(
         self,
         source_run_id: str,
@@ -3377,6 +3413,7 @@ class DaemonService:
             extra_instructions_arg=extra_instructions,
             extra_instructions_provided=extra_instructions_provided,
             live_loader=load_workflow_config,
+            managed_inactivity_check=self._managed_inactivity_check(),
         )
 
     def _assert_record_caller(
@@ -3608,6 +3645,9 @@ def worker_main(
                 source_run_id=resumed_from_run_id,
             ).nonce
         stage = "prepared_request"
+        # The parent nonce never replaces fresh predecessor evidence: the
+        # exact source unit is re-observed through the same identity-bound
+        # managed query the daemon uses at preview and reservation time.
         prepared, resume = _worker_prepared(
             record,
             manifest,
@@ -3615,6 +3655,7 @@ def worker_main(
             config,
             workflow_config,
             extra_instructions=extra_instructions,
+            managed_inactivity_check=service._managed_inactivity_check(),
         )
         stage = "live_configuration_validation"
         stage = "controller_entry"
@@ -4271,6 +4312,7 @@ def _worker_prepared(
     workflow_config: WorkflowUserConfig,
     *,
     extra_instructions: tuple[str, ...] = (),
+    managed_inactivity_check: Callable[[str], bool] | None = None,
 ) -> tuple[PreparedRun, object | None]:
     run_id = validate_run_id(str(record["run_id"]))
     if record.get("mode") == "resume":
@@ -4302,6 +4344,7 @@ def _worker_prepared(
             extra_instructions_arg=extra_instructions,
             extra_instructions_provided=extra_instructions_provided,
             live_loader=load_workflow_config,
+            managed_inactivity_check=managed_inactivity_check,
         )
         prepared = PreparedRun(
             workflow_name=bootstrap.workflow_name,

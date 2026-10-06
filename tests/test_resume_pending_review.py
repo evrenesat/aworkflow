@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 from dataclasses import replace
+from datetime import datetime, timezone
 from pathlib import Path
 import shutil
 import subprocess
@@ -252,6 +253,7 @@ def pending_review_run(tmp_path: Path) -> dict[str, object]:
                 "run_id": source.name,
                 "nonce": "fixture-nonce",
                 "returncode": 1,
+                "at": datetime.now(timezone.utc).isoformat(),
             }
         )
         + "\n",
