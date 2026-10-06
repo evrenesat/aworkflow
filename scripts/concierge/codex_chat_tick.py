@@ -172,17 +172,32 @@ async def abandon_connection(ws, deadline: TickDeadline) -> None:
         ws.transport.abort()
 
 
-async def reconnect(old_ws, deadline: TickDeadline):
-    """Reconnect read-only within the same deadline; never more often than 5s."""
+async def reconnect(old_ws, deadline: TickDeadline, pacing: dict):
+    """Reconnect read-only within the same deadline; never more often than 5s.
+
+    Pacing is measured between consecutive connection attempts (successful or
+    failed), not only between failed opens, so a peer that accepts and then
+    immediately closes cannot trigger sub-second reconnect storms.
+    """
     await abandon_connection(old_ws, deadline)
     while True:
+        deadline.require()
+        elapsed = _now() - pacing.get("last_attempt", 0.0)
+        if elapsed < RECONNECT_MIN_INTERVAL_SECONDS:
+            await _sleep(min(RECONNECT_MIN_INTERVAL_SECONDS - elapsed,
+                             deadline.require()))
+        pacing["last_attempt"] = _now()
         try:
             return await open_connection(deadline)
         except (OSError, asyncio.TimeoutError, websockets.exceptions.WebSocketException,
                 RuntimeError):
             if deadline.exhausted():
                 raise TickDeadlineExceeded("tick deadline exhausted")
-            await _sleep(min(RECONNECT_MIN_INTERVAL_SECONDS, deadline.require()))
+
+
+def _is_rpc_rejection(exc: RuntimeError) -> bool:
+    """True only for a JSON-RPC error reply from RPC.call, never for invariant failures."""
+    return " rejected (code" in str(exc)
 
 
 def _new_nonce() -> str:
@@ -295,7 +310,7 @@ def _retry_interval(deadline: TickDeadline) -> float:
 
 
 async def _await_owned_terminal(ws, rpc: RPC, deadline: TickDeadline,
-                                turn_id: str) -> str | None:
+                                turn_id: str, pacing: dict) -> str | None:
     """Keep foreground supervision until this exact turn stops or time expires."""
     original_ws = ws
     try:
@@ -312,7 +327,7 @@ async def _await_owned_terminal(ws, rpc: RPC, deadline: TickDeadline,
             except (OSError, asyncio.TimeoutError,
                     websockets.exceptions.WebSocketException):
                 try:
-                    ws, rpc = await reconnect(ws, deadline)
+                    ws, rpc = await reconnect(ws, deadline, pacing)
                 except (TickDeadlineExceeded, OSError, asyncio.TimeoutError,
                         websockets.exceptions.WebSocketException):
                     if deadline.exhausted():
@@ -328,7 +343,8 @@ async def _await_owned_terminal(ws, rpc: RPC, deadline: TickDeadline,
 
 
 async def _interrupt_and_wait(ws, rpc: RPC, deadline: TickDeadline,
-                              receipt: dict, turn_id: str) -> str | None:
+                              receipt: dict, turn_id: str,
+                              pacing: dict) -> str | None:
     """Request interruption once; an acknowledgment doesn't prove termination."""
     request_state = "not_attempted"
     if not deadline.exhausted():
@@ -347,14 +363,15 @@ async def _interrupt_and_wait(ws, rpc: RPC, deadline: TickDeadline,
                    interrupt_request_state=request_state, termination_confirmed=False,
                    recorded_at=utc())
     store(receipt)
-    terminal = await _await_owned_terminal(ws, rpc, deadline, turn_id)
+    terminal = await _await_owned_terminal(ws, rpc, deadline, turn_id, pacing)
     if terminal is not None:
         receipt["termination_confirmed"] = True
     return terminal
 
 
 async def _recover_prior_timed_out_tick(rpc: RPC, deadline: TickDeadline,
-                                        receipt: dict) -> int | None:
+                                        receipt: dict,
+                                        pacing: dict) -> int | None:
     """Act only on the previously persisted nonce plus compatible exact ID."""
     previous = STATE / "scheduler-wakeup-previous.json"
     old = json.loads(previous.read_text()) if previous.exists() else {}
@@ -375,7 +392,8 @@ async def _recover_prior_timed_out_tick(rpc: RPC, deadline: TickDeadline,
     if turn.get("status") == "inProgress":
         receipt.update(client_message_id=old_nonce, started_at=old_started,
                        recovery_of_previous_tick=True)
-        terminal = await _interrupt_and_wait(rpc.ws, rpc, deadline, receipt, turn["id"])
+        terminal = await _interrupt_and_wait(rpc.ws, rpc, deadline, receipt,
+                                             turn["id"], pacing)
         if terminal is not None:
             return _finish(receipt, terminal)
         receipt.update(status="previous_tick_termination_unconfirmed", recorded_at=utc())
@@ -386,7 +404,8 @@ async def _recover_prior_timed_out_tick(rpc: RPC, deadline: TickDeadline,
 
 async def _attempt_and_supervise(args, prompt: str, receipt: dict, ws, rpc: RPC,
                                  deadline: TickDeadline, message_id: str,
-                                 goal_status: str | None) -> int:
+                                 goal_status: str | None,
+                                 pacing: dict) -> int:
     start_request_id = rpc.next_id()
     accepted_turn_id = None
     try:
@@ -453,6 +472,10 @@ async def _attempt_and_supervise(args, prompt: str, receipt: dict, ws, rpc: RPC,
                 if status in TERMINAL_STATUSES:
                     return _finish(receipt, status)
                 if not warned and _now() - deadline.started >= ADVISORY_SECONDS:
+                    # Consume the advisory-attempt flag before dispatching, so a
+                    # failed send, rejected response, lost reply, or reconnect can
+                    # never dispatch the advisory a second time.
+                    warned = True
                     try:
                         await rpc.call("turn/steer", {
                             "threadId": THREAD, "expectedTurnId": owned_turn_id,
@@ -464,9 +487,18 @@ async def _attempt_and_supervise(args, prompt: str, receipt: dict, ws, rpc: RPC,
                     except RuntimeError:
                         # Completion can win the race with this advisory request.
                         pass
-                    warned = True
         except TickDeadlineExceeded:
             break
+        except RuntimeError as exc:
+            if not _is_rpc_rejection(exc):
+                # Explicit host/thread/goal invariant failures are never swallowed
+                # or treated as ownership proof.
+                raise
+            # A rejected ownership/status read is uncertainty, never completion or
+            # absence: retain the original nonce/accepted ID/start intent (or the
+            # proven-owned turn) and continue bounded observation on the existing
+            # retry intervals. Never interrupt an unproven turn.
+            pass
         except (OSError, asyncio.TimeoutError, websockets.exceptions.WebSocketException):
             # Reconnect and RPC exceptions preserve ownership and timing receipts
             # rather than dropping into immediate outer failure.
@@ -474,7 +506,7 @@ async def _attempt_and_supervise(args, prompt: str, receipt: dict, ws, rpc: RPC,
                            turn_id=owned_turn_id or accepted_turn_id,
                            recorded_at=utc())
             store(receipt)
-            ws, rpc = await reconnect(ws, deadline)
+            ws, rpc = await reconnect(ws, deadline, pacing)
         await _sleep(_retry_interval(deadline))
 
     # Final cleanup window: prefer buffered/fresh terminal evidence.
@@ -484,13 +516,16 @@ async def _attempt_and_supervise(args, prompt: str, receipt: dict, ws, rpc: RPC,
             status = await _owned_turn_status(rpc, deadline, owned_turn_id)
             if status in TERMINAL_STATUSES:
                 terminal = status
-        except (OSError, asyncio.TimeoutError,
+        except (OSError, asyncio.TimeoutError, RuntimeError,
                 websockets.exceptions.WebSocketException, TickDeadlineExceeded):
+            # A rejected final cleanup read must not escape before the single
+            # exact-owned interrupt/terminal-observation path.
             terminal = None
     if terminal is not None:
         return _finish(receipt, terminal)
     if owned_turn_id is not None:
-        terminal = await _interrupt_and_wait(ws, rpc, deadline, receipt, owned_turn_id)
+        terminal = await _interrupt_and_wait(ws, rpc, deadline, receipt,
+                                             owned_turn_id, pacing)
         if terminal is not None:
             return _finish(receipt, terminal)
     if receipt.get("interrupt_request_state") == "acknowledged":
@@ -511,7 +546,7 @@ async def _attempt_and_supervise(args, prompt: str, receipt: dict, ws, rpc: RPC,
 
 
 async def _observe(args, prompt: str, receipt: dict, ws, rpc: RPC,
-                   deadline: TickDeadline) -> int:
+                   deadline: TickDeadline, pacing: dict) -> int:
     thread = (await rpc.call("thread/read",
                              {"threadId": THREAD, "includeTurns": False},
                              deadline))["thread"]
@@ -527,7 +562,8 @@ async def _observe(args, prompt: str, receipt: dict, ws, rpc: RPC,
         print(json.dumps(receipt))
         return 0
     if thread["status"]["type"] == "active":
-        recovered = await _recover_prior_timed_out_tick(rpc, deadline, receipt)
+        recovered = await _recover_prior_timed_out_tick(rpc, deadline, receipt,
+                                                        pacing)
         if recovered is not None:
             return recovered
         receipt["status"] = "skipped_existing_active_turn"
@@ -557,7 +593,7 @@ async def _observe(args, prompt: str, receipt: dict, ws, rpc: RPC,
                    saved_goal_status=after)
     store(receipt)
     return await _attempt_and_supervise(args, prompt, receipt, ws, rpc, deadline,
-                                        message_id, after)
+                                        message_id, after, pacing)
 
 
 async def observe_or_run(args, prompt: str, started: float) -> int:
@@ -567,8 +603,9 @@ async def observe_or_run(args, prompt: str, started: float) -> int:
                "status": "inspecting", "wakeup_id": args.wakeup_id}
     store(receipt)
     ws, rpc = await open_connection(deadline)
+    pacing = {"last_attempt": _now()}
     try:
-        return await _observe(args, prompt, receipt, ws, rpc, deadline)
+        return await _observe(args, prompt, receipt, ws, rpc, deadline, pacing)
     except TickDeadlineExceeded:
         receipt.update(status="ownership_unresolved_at_deadline",
                        turn_id=receipt.get("turn_id"),

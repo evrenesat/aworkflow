@@ -770,7 +770,8 @@ class SendDeadlineTests(TickTestCase):
             try:
                 with mock.patch.object(ClientConnection, "send", blocked_send):
                     code = await self.tick._attempt_and_supervise(
-                        _args(self.tick), PROMPT, receipt, ws, rpc, deadline, NONCE, "paused")
+                        _args(self.tick), PROMPT, receipt, ws, rpc, deadline,
+                        NONCE, "paused", {"last_attempt": 0.0})
             finally:
                 ws.transport.abort()
         self.assertEqual(code, 1)
@@ -964,6 +965,287 @@ class FlockLifecycleTests(unittest.TestCase):
                             "lock must be released after completion")
         finally:
             tmp.cleanup()
+
+
+# --- acceptance 11: reconnect pacing across successful-then-disconnect cycles ---
+
+class ReconnectPacingTests(TickTestCase):
+    async def test_repeated_disconnects_paced_minimum_five_seconds(self):
+        """Peer accepts init then drops ownership reads; every gap >= 5s."""
+        tick = self.tick
+        conn_times = []
+
+        class DropOnHistory(FakeCodex):
+            async def serve(self, ws):
+                self.connections += 1
+                conn_times.append(tick._now())
+                async for raw in ws:
+                    req = json.loads(raw)
+                    if req.get("method") in ("thread/turns/list",
+                                             "thread/items/list"):
+                        await ws.close()
+                        return
+                    await self.handle_one(ws, req)
+
+        fake = DropOnHistory(tick)
+        code, receipt, fake = await self.run_tick(fake)
+
+        # Bounded exit within deadline
+        self.assertEqual(code, 1)
+        self.assertLessEqual(self.clock.value, 1000.0 + 780.0 + 1.0)
+
+        # Multiple connections occurred (pacing prevents the 180-conn burst)
+        self.assertGreater(len(conn_times), 2)
+
+        # Every reconnect gap >= 5s
+        for i in range(1, len(conn_times)):
+            gap = conn_times[i] - conn_times[i - 1]
+            self.assertGreaterEqual(gap, 5.0 - 0.01,
+                                    f"reconnect gap {i} was {gap:.2f}s")
+
+        # One start at most
+        self.assertLessEqual(len(fake.starts), 1)
+
+        # No unproven interrupt
+        self.assertFalse(fake.interrupts)
+
+        # Retained nonce
+        self.assertEqual(receipt["client_message_id"], NONCE)
+
+    async def test_failed_open_paced_without_blocking_initial(self):
+        """Failed open in reconnect is paced; initial open is not blocked."""
+        tick = self.tick
+        conn_times = []
+
+        class FailSecond(FakeCodex):
+            async def serve(self, ws):
+                self.connections += 1
+                conn_times.append(tick._now())
+                if self.connections == 2:
+                    # Second connection: fail immediately
+                    await ws.close()
+                    return
+                if self.connections == 1:
+                    # First connection: normal until history read, then drop
+                    async for raw in ws:
+                        req = json.loads(raw)
+                        if req.get("method") in ("thread/turns/list",
+                                                 "thread/items/list"):
+                            await ws.close()
+                            return
+                        await self.handle_one(ws, req)
+                else:
+                    # Third and later: normal, turn completes
+                    await super().serve(ws)
+
+        fake = FailSecond(tick)
+        fake.turn_status_fn = (lambda: "completed" if fake.connections >= 3
+                               else "inProgress")
+        code, receipt, fake = await self.run_tick(fake)
+
+        # Bounded exit
+        self.assertLessEqual(self.clock.value, 1000.0 + 780.0 + 1.0)
+
+        # At least 3 connections: initial, failed, recovery
+        self.assertGreaterEqual(len(conn_times), 3)
+
+        # Initial open was not blocked (first connection near start)
+        self.assertLess(conn_times[0], 1000.0 + 1.0)
+
+        # Gap between initial and failed open >= 5s
+        self.assertGreaterEqual(conn_times[1] - conn_times[0], 5.0 - 0.01)
+
+        # Gap between failed and recovery >= 5s
+        self.assertGreaterEqual(conn_times[2] - conn_times[1], 5.0 - 0.01)
+
+        # One start at most
+        self.assertLessEqual(len(fake.starts), 1)
+
+        # No unproven interrupt
+        self.assertFalse(fake.interrupts)
+
+
+class RejectFirstN(FakeCodex):
+    """Reject the first N calls to one method with a JSON-RPC error reply.
+
+    A rejected read is exactly what RPC.call turns into a RuntimeError for a
+    JSON-RPC error response; the production adapter must treat it as
+    uncertainty, not completion or absence.
+    """
+
+    def __init__(self, tick, method, n=1, **kwargs) -> None:
+        super().__init__(tick, **kwargs)
+        self.reject_method = method
+        self.reject_n = n
+        self._reject_counts: dict = {}
+
+    async def handle_one(self, ws, req) -> None:
+        method = req.get("method")
+        if method == self.reject_method:
+            count = self._reject_counts.get(method, 0)
+            if count < self.reject_n:
+                self._reject_counts[method] = count + 1
+                await ws.send(json.dumps({
+                    "id": req.get("id"),
+                    "error": {"code": -32603,
+                              "message": "CANARY-ERR transient read rejection"}}))
+                return
+        await super().handle_one(ws, req)
+
+
+class RejectedReadTests(TickTestCase):
+    async def test_rejected_ownership_read_retains_ids_and_completes(self):
+        """Reject one accepted-turn ownership items read, then expose completion.
+
+        No exception escapes; one start; accepted ID/nonce retained; eventual
+        success; no unproven interrupt.
+        """
+        tick = self.tick
+        fake = RejectFirstN(tick, "thread/items/list", n=1)
+        state = {"done": False}
+
+        def status_fn():
+            # Complete once the (successful) ownership items read has happened.
+            if fake.items_calls.get(OWNED_TURN, 0) >= 1:
+                state["done"] = True
+            return "completed" if state["done"] else "inProgress"
+
+        fake.turn_status_fn = status_fn
+        code, receipt, fake = await self.run_tick(fake)
+
+        self.assertEqual(code, 0)
+        self.assertEqual(receipt["status"], "completed")
+        self.assertEqual(receipt["turn_id"], OWNED_TURN)
+        self.assertEqual(receipt["client_message_id"], NONCE)
+        self.assertEqual(len(fake.starts), 1)
+        self.assertFalse(fake.interrupts)
+        self.assertFalse(fake.steers)
+
+    async def test_persistent_ownership_rejection_unresolved_at_deadline(self):
+        """Ownership reads always rejected: truthful unresolved exit, zero
+        interrupts/steers, one start, nonce retained, bounded by the deadline.
+        """
+        tick = self.tick
+        fake = RejectFirstN(tick, "thread/items/list", n=10 ** 9)
+        code, receipt, fake = await self.run_tick(fake)
+
+        self.assertEqual(code, 1)
+        self.assertEqual(receipt["status"], "ownership_unresolved_at_deadline")
+        self.assertEqual(receipt["client_message_id"], NONCE)
+        self.assertLessEqual(len(fake.starts), 1)
+        self.assertFalse(fake.interrupts)
+        self.assertFalse(fake.steers)
+        self.assertLessEqual(self.clock.value, 1000.0 + 780.0 + 1.0)
+
+    async def test_rejected_periodic_status_read_continues_supervision(self):
+        """Reject one periodic status read after nonce proof, then return
+        terminal: supervision continues past the rejection and ends on exact
+        terminal evidence with original IDs and one start; the wrapper does not
+        return at the rejecting read.
+        """
+        tick = self.tick
+        fake = RejectFirstN(tick, "thread/turns/list", n=1)
+
+        def status_fn():
+            # Complete once the rejected periodic read has already happened.
+            if fake._reject_counts.get("thread/turns/list", 0) >= 1:
+                return "completed"
+            return "inProgress"
+
+        fake.turn_status_fn = status_fn
+        code, receipt, fake = await self.run_tick(fake)
+
+        self.assertEqual(code, 0)
+        self.assertEqual(receipt["status"], "completed")
+        self.assertEqual(receipt["turn_id"], OWNED_TURN)
+        self.assertEqual(receipt["client_message_id"], NONCE)
+        self.assertEqual(len(fake.starts), 1)
+        self.assertFalse(fake.interrupts)
+        self.assertFalse(fake.steers)
+        # Continued well past the rejecting read; not stuck, bounded by deadline.
+        self.assertLess(self.clock.value, 1000.0 + 780.0)
+
+    async def test_rejected_final_cleanup_status_read(self):
+        """Reject the final cleanup status read for a proven-owned active turn:
+        single interrupt, terminal/deadline observer, original timing/IDs, and
+        acknowledgment reported separately from confirmed termination.
+        """
+        tick = self.tick
+
+        class RejectCleanupStatus(FakeCodex):
+            async def handle_one(self, ws, req) -> None:
+                method = req.get("method")
+                if method == "thread/turns/list" and not self.interrupts \
+                        and self.tick._now() >= 1000.0 + 780.0 - 5.0:
+                    await ws.send(json.dumps({
+                        "id": req.get("id"),
+                        "error": {"code": -32603,
+                                  "message": "CANARY-ERR cleanup read rejection"}}))
+                    return
+                await super().handle_one(ws, req)
+
+        fake = RejectCleanupStatus(tick)
+        fake.turn_status_fn = lambda: "inProgress"  # never terminal
+        code, receipt, fake = await self.run_tick(fake)
+
+        self.assertEqual(code, 1)
+        self.assertEqual(receipt["status"], "interrupt_requested_at_tick_deadline")
+        self.assertEqual(receipt["interrupt_request_state"], "acknowledged")
+        self.assertFalse(receipt.get("termination_confirmed", False))
+        self.assertEqual(receipt["turn_id"], OWNED_TURN)
+        self.assertEqual(receipt["client_message_id"], NONCE)
+        self.assertEqual(len(fake.interrupts), 1)
+        self.assertEqual(len(fake.starts), 1)
+        self.assertLessEqual(self.clock.value, 1000.0 + 780.0 + 1.0)
+
+
+class AdvisoryOnReconnectTests(TickTestCase):
+    async def test_minute12_advisory_not_retried_after_lost_reply(self):
+        """Accept the first minute-12 advisory and close before replying, then
+        reconnect and continue the same owned turn to completion: exactly one
+        steer for the proven turn, one start, no deadline reset, no second
+        interrupt, and reconnect gaps remain at least five seconds.
+        """
+        tick = self.tick
+
+        class AdvisoryThenDrop(FakeCodex):
+            def __init__(self, t, **kwargs) -> None:
+                super().__init__(t, **kwargs)
+                self.conn_times = []
+
+            async def serve(self, ws) -> None:
+                self.connections += 1
+                self.conn_times.append(self.tick._now())
+                async for raw in ws:
+                    req = json.loads(raw)
+                    if req.get("method") == "turn/steer":
+                        self.steers.append(req.get("params"))
+                        # Accept the advisory but close before replying.
+                        await ws.close()
+                        return
+                    await self.handle_one(ws, req)
+
+        fake = AdvisoryThenDrop(tick)
+        # Complete once we have reconnected (second connection).
+        fake.turn_status_fn = (lambda: "completed" if fake.connections >= 2
+                               else "inProgress")
+        code, receipt, fake = await self.run_tick(fake)
+
+        self.assertEqual(code, 0)
+        self.assertEqual(receipt["status"], "completed")
+        self.assertEqual(receipt["turn_id"], OWNED_TURN)
+        self.assertEqual(receipt["client_message_id"], NONCE)
+        self.assertEqual(len(fake.starts), 1)
+        self.assertEqual(len(fake.steers), 1)
+        self.assertEqual(fake.steers[0]["expectedTurnId"], OWNED_TURN)
+        self.assertFalse(fake.interrupts)
+        # No deadline reset: bounded within the original service-start budget.
+        self.assertLessEqual(self.clock.value, 1000.0 + 780.0 + 1.0)
+        # Reconnect gaps remain at least five seconds.
+        for i in range(1, len(fake.conn_times)):
+            gap = fake.conn_times[i] - fake.conn_times[i - 1]
+            self.assertGreaterEqual(gap, 5.0 - 0.01,
+                                    f"reconnect gap {i} was {gap:.2f}s")
 
 
 if __name__ == "__main__":
