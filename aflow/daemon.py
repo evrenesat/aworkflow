@@ -3501,18 +3501,32 @@ class DaemonService:
         if path.is_symlink():
             raise DaemonError("startup record may not be a symlink")
         encoded = _record_bytes(record)
+        descriptor, temporary_name = tempfile.mkstemp(
+            prefix=f".{path.name}.", suffix=".tmp", dir=path.parent
+        )
+        temporary = Path(temporary_name)
         try:
-            fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-        except FileExistsError as exc:
-            raise DaemonError("startup record identity is already reserved") from exc
-        try:
-            with os.fdopen(fd, "wb", closefd=False) as handle:
+            with os.fdopen(descriptor, "wb") as handle:
                 handle.write(encoded)
                 handle.flush()
                 os.fsync(handle.fileno())
+            # A hard link publishes the complete record under the final name
+            # only when the identity is not already reserved.  Publishing in
+            # place (create-then-write) exposed an empty window that a
+            # concurrent admission reader misread as unreadable state
+            # (``project_admission_error``) instead of a plan-claim conflict.
+            try:
+                os.link(temporary, path)
+            except FileExistsError as exc:
+                raise DaemonError(
+                    "startup record identity is already reserved"
+                ) from exc
+            _fsync_directory(path.parent)
         finally:
-            os.close(fd)
-        _fsync_directory(path.parent)
+            try:
+                temporary.unlink()
+            except FileNotFoundError:
+                pass
 
     def _write_record(self, record: Mapping[str, object]) -> None:
         path = self._record_path(str(record["run_id"]))

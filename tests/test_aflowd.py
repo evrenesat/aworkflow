@@ -8,6 +8,7 @@ import importlib.util
 import multiprocessing
 from pathlib import Path
 import json
+import os
 import subprocess
 import sys
 from threading import Barrier, Event
@@ -28,6 +29,7 @@ from aflow.control_plane import (
     RepositoryNotFoundError,
     InMemoryUnitManager,
     LaunchManifest,
+    RunRepository,
     RunStatus,
     UnitState,
     append_run_event,
@@ -1031,6 +1033,59 @@ def test_distinct_start_keys_cannot_launch_the_same_plan_concurrently(
     )
     assert other.status == "running"
     assert ProjectAdmission(request.repo_root, unit_manager=units).snapshot().occupied_count == 2
+
+
+def test_startup_record_publish_is_atomic_and_complete(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A startup record is published only as complete content.
+
+    The macOS CI admission failure (issue #76) came from a concurrent loser
+    observing the empty window between the O_EXCL create and the write of
+    ``.aflow/start-requests/<id>.json``.  That empty file read as unreadable
+    admission state -- a base ``project_admission_error`` -- instead of the
+    intended ``project_plan_claim_conflict``.  The publish must therefore never
+    expose a partial/empty record at the final name: a failed publish leaves
+    no file, and a successful one is immediately and completely readable by
+    the control-plane reader the admission evidence scan relies on.
+    """
+    units = InMemoryUnitManager()
+    daemon, request = _daemon(tmp_path, monkeypatch, units)
+    service = daemon.service
+    run_id = "20261007T000000Z-cccccccc"
+    record = {"schema_version": 1, "run_id": run_id, "state": "preparing"}
+    path = service._record_path(run_id)
+
+    # A publish that fails while writing must not leave an empty/partial
+    # record at the final name (the old create-then-write left one).
+    real_fdopen = os.fdopen
+
+    def failing_fdopen(fd, *args, **kwargs):
+        handle = real_fdopen(fd, *args, **kwargs)
+
+        def refuse(data):
+            raise OSError("injected startup-record publish failure")
+
+        handle.write = refuse
+        return handle
+
+    monkeypatch.setattr(os, "fdopen", failing_fdopen)
+    try:
+        with pytest.raises(OSError):
+            service._create_record(record)
+    finally:
+        monkeypatch.setattr(os, "fdopen", real_fdopen)
+    assert not path.exists(), "a failed publish must not expose a partial record"
+
+    # A successful publish is immediately and completely readable by the
+    # reader the admission evidence scan uses.
+    service._create_record(record)
+    assert path.is_file()
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    assert payload["run_id"] == run_id
+    repository = RunRepository(request.repo_root)
+    assert repository._startup_record(run_id)["run_id"] == run_id
+    assert service._read_record(run_id)["run_id"] == run_id
 
 
 def test_distinct_processes_starting_one_plan_publish_one_launch(

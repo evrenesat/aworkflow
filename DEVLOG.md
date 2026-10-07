@@ -1,5 +1,51 @@
 # DEVLOG
 
+## 2026-10-07 — issue #76 release repair CP2: atomic same-plan startup-record publish
+
+- CI 37611601058 also failed
+  `test_distinct_start_keys_cannot_launch_the_same_plan_concurrently` on both
+  native macOS jobs: the loser got a base `project_admission_error`
+  (`safe_message` "startup record is unreadable") instead of the intended
+  `project_plan_claim_conflict`. Linux passed, so the defect is a
+  platform-scheduling-dependent race, not a logic bug.
+- Root cause (demonstrated deterministically, not inferred from the outer
+  code): the winner's `DaemonService._create_record` published
+  `.aflow/start-requests/<run_id>.json` non-atomically — `os.open(O_CREAT|O_EXCL)`
+  created an empty file at the final name, then wrote it. The launch manifest
+  (`launches/<run_id>.json`) is published atomically first, which makes the
+  run_id visible to the loser's admission evidence scan
+  (`_all_run_evidence` -> `get_run_status` -> `_startup_record`). A concurrent
+  loser reading the in-progress empty record got `RepositorySchemaError`
+  ("startup record is unreadable"), which `_all_run_evidence` wrapped into the
+  base `ProjectAdmissionSafetyError` (`project_admission_error`) before the
+  reservation-based `ProjectPlanClaimConflict` check could run. On macOS the
+  APFS/scheduling window reliably overlapped (2/2 jobs); on Linux it is rare.
+  This is a separate admission artifact-publish race, not the CP1 Darwin
+  process-identity cause.
+- Fix (owning boundary, `aflow/daemon.py` `_create_record`): publish the
+  startup record atomically — write the full record to a temp file in the same
+  directory, then `os.link` it onto the final name (a hard link is atomic
+  no-replace, preserving the "identity is already reserved" conflict). The
+  final name is now created only with complete content, so a concurrent reader
+  observes either no record or a complete one; a failed publish leaves no
+  partial/empty file. The manifest and `launches/<id>.state.json` already use
+  atomic temp+replace/link; no reader was weakened, so a genuinely
+  malformed/unreadable record still fails closed with the safety error.
+- New deterministic regression
+  `test_startup_record_publish_is_atomic_and_complete`
+  (`tests/test_aflowd.py`) pins the demonstrated contract: an injected
+  mid-write failure leaves no file at the final name (the old
+  create-then-write left an empty one), and a successful publish is
+  immediately and completely readable by both the daemon reader and the
+  control-plane reader the admission evidence scan uses.
+- Verification: focused suites (`test_aflowd.py` 48 passed,
+  `test_project_admission.py` 49 passed, control-plane/persistence 444 passed)
+  plus a 60-iteration barrier stress of the real threaded concurrent start
+  where every loser got `project_plan_claim_conflict` (no
+  `project_admission_error`). The native macOS CI run of the CP2 commit
+  remains the required release gate for the real-scheduling validation; the
+  defect is proven by the deterministic reproduction, not by Linux timing.
+
 ## 2026-10-07 — issue #76 release repair CP1: truthful bounded macOS process cessation
 
 - CI 37611601058 failed nine stop/teardown tests on both native macOS
