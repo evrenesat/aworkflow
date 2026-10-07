@@ -3729,6 +3729,7 @@ class WorkflowRuntimeTests(unittest.TestCase):
             predecessor_result.write_text(
                 json.dumps({
                     "turn_number": 3,
+                    "status": "completed",
                     "step_role": "worker",
                     "stdout": "predecessor-sentinel-44aa",
                 }),

@@ -3004,6 +3004,20 @@ def _scope_envelope_reference(
     return artifact_path, artifact_sha256, canonical_sha256
 
 
+def _scope_envelope_tuple(
+    scope: ActiveImplementationScope,
+) -> tuple[str, str, str] | None:
+    """Return the scope's exact envelope reference, or None when incomplete."""
+    values = (
+        scope.envelope_artifact_path,
+        scope.envelope_artifact_sha256,
+        scope.envelope_canonical_sha256,
+    )
+    if all(isinstance(value, str) and value for value in values):
+        return values  # type: ignore[return-value]
+    return None
+
+
 def _validate_scope_envelope_bytes(
     scope: ActiveImplementationScope,
     artifact_bytes: bytes,
@@ -4547,6 +4561,1003 @@ def _latest_approved_checkpoint_index(plan_text: str) -> int | None:
     return max(approved_indices) if approved_indices else None
 
 
+def _worker_receipt_is_finalized_worker(
+    result: Mapping[str, object],
+    *,
+    turn_number: int,
+    step_name: str | None,
+    expected_plan: str | None,
+    allowed_active_plans: set[Path] | None = None,
+) -> bool:
+    """Producer-supported validation of a successfully finalized worker receipt.
+
+    A JSON object or file existence alone proves nothing. The receipt must name
+    the exact requested turn and worker step, be a worker role, and be
+    successfully finalized: a ``completed`` status with an integer, non-boolean
+    zero return code, decoded before/after snapshot evidence, and a produced
+    nonblank selected transition. When an original-plan identity is known, the
+    receipt must match it. The receipt's nonempty ``active_plan_path`` must name
+    the original plan for an original worker or the exact historical repair
+    overlay produced by the rejection that reviewed this repair worker's
+    predecessor; an unrelated, missing, or malformed active plan is a refusal.
+    A repair worker's consumed overlay therefore need not equal the original
+    plan or still exist, but it must be the one the scope's producing
+    rejection/attempt relationship establishes.
+    """
+    if result.get("turn_number") != turn_number:
+        return False
+    if step_name is not None and result.get("step_name") != step_name:
+        return False
+    if result.get("step_role") != "worker":
+        return False
+    if result.get("status") != "completed":
+        return False
+    returncode = result.get("returncode")
+    if (
+        not isinstance(returncode, int)
+        or isinstance(returncode, bool)
+        or returncode != 0
+    ):
+        return False
+    if _snapshot_from_review_result(result.get("snapshot_before")) is None:
+        return False
+    if _snapshot_from_review_result(result.get("snapshot_after")) is None:
+        return False
+    transition = result.get("chosen_transition")
+    if not isinstance(transition, str) or not transition.strip():
+        return False
+    if expected_plan is not None:
+        original = result.get("original_plan_path")
+        if (
+            not isinstance(original, str)
+            or not original.strip()
+            or Path(original) != Path(expected_plan)
+        ):
+            return False
+    active = result.get("active_plan_path")
+    if not isinstance(active, str) or not active.strip():
+        return False
+    if allowed_active_plans is not None and Path(active) not in allowed_active_plans:
+        return False
+    return True
+
+
+def _owned_worker_attempt_recorded(
+    metadata: Mapping[str, object] | None,
+    *,
+    scope_id: str | None,
+    turn_number: int,
+    step_name: str | None,
+    attempt_ordinal: int | None,
+) -> bool:
+    """Verify the owner's recorded attempts establish the selected worker attempt.
+
+    The owner must record worker attempts under the same immutable scope,
+    and the turn/step/role candidates for the selected local turn must
+    establish it with unique, non-contradictory evidence. The first plausible
+    row never succeeds on its own, and a contradictory candidate is never
+    skipped to fall back to weaker evidence.
+
+    A candidate's present ordinal must be a positive non-boolean integer; a
+    malformed present value is not a legacy absence and cannot establish the
+    attempt. A candidate ordinal equal to the selected scope-local ordinal is
+    the strong match; a lower ordinal at the same local turn is an earlier
+    inherited attempt (resumed runs reset local turn numbers, so the local
+    turn alone is not global attempt identity) and is distinct, not a
+    candidate; a higher ordinal means the owner records a later worker at
+    this local turn/step, so the selected sequence is stale or conflicting.
+    When no ordinal-carrying candidate exists, a genuine absence of ordinals
+    establishes the attempt only when exactly one candidate remains.
+    """
+    if scope_id is None:
+        return True
+    if metadata is None:
+        return False
+    attempts_map = metadata.get("implementation_attempts")
+    if not isinstance(attempts_map, Mapping):
+        return False
+    attempts = attempts_map.get(scope_id, [])
+    if not isinstance(attempts, (list, tuple)):
+        return False
+    candidates = [
+        attempt
+        for attempt in attempts
+        if isinstance(attempt, Mapping)
+        and attempt.get("role") == "worker"
+        and attempt.get("turn_number") == turn_number
+        and (step_name is None or attempt.get("step_name") == step_name)
+    ]
+    if not candidates:
+        return False
+    strong = 0
+    absent = 0
+    for attempt in candidates:
+        recorded_ordinal = attempt.get("attempt_ordinal")
+        if recorded_ordinal is None:
+            absent += 1
+            continue
+        if (
+            not isinstance(recorded_ordinal, int)
+            or isinstance(recorded_ordinal, bool)
+            or recorded_ordinal < 1
+        ):
+            # A present but malformed ordinal is not legacy absence; the
+            # candidate cannot establish the selected attempt.
+            return False
+        if attempt_ordinal is None or recorded_ordinal > attempt_ordinal:
+            # A valid ordinal that is not the selected one (or a later worker
+            # at this local turn/step) contradicts the selected attempt
+            # sequence; do not skip it to use weaker evidence.
+            return False
+        if recorded_ordinal == attempt_ordinal:
+            strong += 1
+        # A lower ordinal is an earlier inherited attempt distinguished by
+        # its ordinal; it is distinct, not a candidate for this selection.
+    if attempt_ordinal is None:
+        return absent == 1 and strong == 0
+    return (strong == 1 and absent == 0) or (strong == 0 and absent == 1)
+
+
+def _chain_predecessor_kind(run_dir: Path) -> tuple[str, str | None]:
+    """Classify a run's predecessor link for a source-first chain walk.
+
+    Returns ``("end", None)`` for a terminal run (no run.json or no
+    ``resumed_from_run_id``), ``("next", id)`` for a valid owned predecessor,
+    and ``("bad", None)`` for a present-but-malformed link (foreign, traversal).
+    """
+    metadata = load_run_json(run_dir)
+    if metadata is None:
+        return ("end", None)
+    parent_id = metadata.get("resumed_from_run_id")
+    if parent_id is None:
+        return ("end", None)
+    if (
+        not isinstance(parent_id, str)
+        or parent_id in {".", ".."}
+        or Path(parent_id).name != parent_id
+    ):
+        return ("bad", None)
+    return ("next", parent_id)
+
+
+def _worker_owner_chain(
+    repo_root: Path,
+    start_run_id: str,
+    *,
+    seed_predecessor: str | None = None,
+) -> list[tuple[str, bool]] | None:
+    """Return the ordered candidate run ids for a source-first worker walk.
+
+    The source run is listed first, followed by its owned
+    ``resumed_from_run_id`` predecessors. Each entry is ``(run_id, dir_exists)``.
+    A missing source run directory cannot be read for a turn file, so the chain
+    is seeded from ``seed_predecessor`` when provided. The walk stops at a
+    terminal run (no predecessor) and is ``None`` when any id is foreign,
+    path-traversing, the link is malformed, the lineage is cyclic, or a run
+    directory is an existing symlink (a present link is not absence and never
+    supplies owned lineage evidence).
+    """
+    chain: list[tuple[str, bool]] = []
+    current_id: str | None = start_run_id
+    seeded = False
+    visited: set[str] = set()
+    while current_id is not None:
+        if (
+            not isinstance(current_id, str)
+            or not current_id
+            or current_id in {".", ".."}
+            or Path(current_id).name != current_id
+        ):
+            return None
+        if current_id in visited:
+            return None
+        visited.add(current_id)
+        run_dir = repo_root / ".aflow" / "runs" / current_id
+        if run_dir.is_symlink():
+            # A present run-directory symlink is not owned lineage evidence;
+            # refuse before classifying existence, seeding, or following its
+            # metadata to an unrelated worker owner.
+            return None
+        dir_exists = run_dir.is_dir()
+        chain.append((current_id, dir_exists))
+        if current_id == start_run_id and not dir_exists and not seeded:
+            if seed_predecessor is None:
+                return None
+            current_id = seed_predecessor
+            seeded = True
+            continue
+        kind, predecessor = _chain_predecessor_kind(run_dir)
+        if kind == "bad":
+            return None
+        if kind == "end":
+            break
+        current_id = predecessor
+    return chain
+
+
+def _scope_worker_attempts(
+    owner_meta: Mapping[str, object] | None,
+    scope_id: str | None,
+) -> list[Mapping[str, object]]:
+    """Return the owner's recorded worker attempts under one immutable scope."""
+    if owner_meta is None:
+        return []
+    attempts_map = owner_meta.get("implementation_attempts")
+    if not isinstance(attempts_map, Mapping):
+        return []
+    attempts = attempts_map.get(scope_id, [])
+    if not isinstance(attempts, (list, tuple)):
+        return []
+    return [
+        attempt
+        for attempt in attempts
+        if isinstance(attempt, Mapping) and attempt.get("role") == "worker"
+    ]
+
+
+def _resolved_plan_identity(path: object, repo_root: Path) -> str | None:
+    """Normalize one recorded plan path to a comparable identity.
+
+    Relative identities are resolved against the repository, so equivalent
+    relative and absolute spellings of the same overlay compare equal while
+    genuinely foreign paths do not.
+    """
+    if not (isinstance(path, str) and path.strip()):
+        return None
+    candidate = Path(path)
+    if not candidate.is_absolute():
+        candidate = repo_root / candidate
+    return os.path.normpath(str(candidate))
+
+
+def _producing_rejection_review_validates(
+    repo_root: Path,
+    rejection: Mapping[str, object],
+    *,
+    owner_run_id: str | None,
+    worker_turn_number: int | None,
+    scope_checkpoint_index: int | None,
+    scope_checkpoint_name: str | None,
+    worker_step_name: str | None = None,
+    scope_original_plan: str | None = None,
+    selected_rejection: Mapping[str, object] | None = None,
+    predecessor_ordinal: int | None = None,
+) -> bool:
+    """Bind a producing rejection to its actual owned reviewer receipt.
+
+    The rejection's ``source_run_id`` must be the owner run itself or an
+    owned ``resumed_from_run_id`` predecessor in the recorded lineage, and
+    that run must hold a finalized reviewer receipt at the recorded
+    ``review_turn_number`` / ``review_step_name`` (owned turn directories, a
+    regular non-symlink receipt, reviewer role, completed status with an
+    integer non-boolean zero return code). That receipt must additionally
+    carry the finalized rejection it actually produced: a ``review_rejection``
+    whose recorded identities (scope, rejection number, producing
+    source/step/turn, checkpoint identity, reviewer selector, reviewed
+    predecessor turn/selector/team and ordinal, and historical repair overlay)
+    agree with the selected owner-history rejection under validation, a
+    decoded post-snapshot, a produced transition, and a ``new_plan_path``
+    equal to that overlay. The receipt's actual selector must be the producing
+    reviewer, and its original plan the immutable scope original plan. The
+    producer-supported finalization requires valid decoded before/after
+    snapshots that agree, ``NEW_PLAN_EXISTS=true``,
+    ``MAX_TURNS_REACHED=false``, ``DONE`` equal to the original snapshot's
+    completion, and the produced transition to the selected repair worker's
+    actual step. The rejection's checkpoint identity must agree with the
+    selected immutable awaiting scope when both sides carry it. A local
+    producing review must precede the selected worker in the same run. A
+    missing required identity or contradictory present identity is a
+    refusal; a genuinely ordinal-absent owner-history record stays
+    admissible when the uniquely recorded predecessor and producing receipt
+    establish the same relationship (never raw rejection-object equality).
+    """
+    source_run_id = rejection.get("source_run_id")
+    if not (
+        isinstance(source_run_id, str)
+        and source_run_id
+        and source_run_id not in {".", ".."}
+        and Path(source_run_id).name == source_run_id
+    ):
+        return False
+    if owner_run_id is not None:
+        chain = _worker_owner_chain(repo_root, owner_run_id)
+        if chain is None or source_run_id not in {run_id for run_id, _ in chain}:
+            # The claimed source is not the owner run or an owned ancestor in
+            # the recorded lineage; it cannot own the producing review.
+            return False
+    review_turn = rejection.get("review_turn_number")
+    if (
+        not isinstance(review_turn, int)
+        or isinstance(review_turn, bool)
+        or review_turn < 1
+    ):
+        return False
+    review_step = rejection.get("review_step_name")
+    if not (isinstance(review_step, str) and review_step.strip()):
+        return False
+    rejection_checkpoint = rejection.get("checkpoint_index")
+    if (
+        scope_checkpoint_index is not None
+        and isinstance(rejection_checkpoint, int)
+        and not isinstance(rejection_checkpoint, bool)
+        and rejection_checkpoint != scope_checkpoint_index
+    ):
+        # The producing rejection names a checkpoint that is not the selected
+        # immutable awaiting scope's checkpoint.
+        return False
+    rejection_checkpoint_name = rejection.get("checkpoint_name")
+    if (
+        isinstance(rejection_checkpoint_name, str)
+        and rejection_checkpoint_name.strip()
+        and isinstance(scope_checkpoint_name, str)
+        and scope_checkpoint_name.strip()
+        and rejection_checkpoint_name != scope_checkpoint_name
+    ):
+        return False
+    source_run_dir = repo_root / ".aflow" / "runs" / source_run_id
+    if source_run_dir.is_symlink() or not source_run_dir.is_dir():
+        return False
+    turns_dir = source_run_dir / "turns"
+    if turns_dir.is_symlink() or not turns_dir.is_dir():
+        return False
+    turn_dir = turns_dir / f"turn-{review_turn:03d}"
+    if turn_dir.is_symlink() or not turn_dir.is_dir():
+        return False
+    result_path = turn_dir / "result.json"
+    if result_path.is_symlink() or not result_path.is_file():
+        return False
+    try:
+        result = json.loads(result_path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError):
+        return False
+    if not isinstance(result, dict):
+        return False
+    returncode = result.get("returncode")
+    if (
+        result.get("turn_number") != review_turn
+        or result.get("step_name") != review_step
+        or result.get("step_role") != "reviewer"
+        or result.get("status") != "completed"
+        or not isinstance(returncode, int)
+        or isinstance(returncode, bool)
+        or returncode != 0
+    ):
+        # The claimed producing receipt is not a finalized reviewer receipt
+        # for the recorded step/turn with a producer-supported zero return
+        # code; the relationship is not established.
+        return False
+    # A completed reviewer status at the named step/turn alone proves nothing:
+    # the receipt must also carry the finalized rejection it actually produced,
+    # correlated field by field with the selected owner-history rejection
+    # (never raw object equality, so a genuinely ordinal-absent owner-history
+    # record stays admissible), plus the producer-supported finalization
+    # evidence. Missing or contradictory finalization evidence is a refusal,
+    # not an allocation.
+    receipt_rejection = result.get("review_rejection")
+    if not isinstance(receipt_rejection, Mapping):
+        return False
+    if selected_rejection is not None:
+        for field in (
+            "scope_id",
+            "rejection_number",
+            "source_run_id",
+            "review_turn_number",
+            "review_step_name",
+            "reviewer_selector",
+            "checkpoint_index",
+            "checkpoint_name",
+            "reviewed_implementation_turn_number",
+            "reviewed_worker_selector",
+            "reviewed_worker_team",
+        ):
+            receipt_value = receipt_rejection.get(field)
+            selected_value = selected_rejection.get(field)
+            if field in (
+                "scope_id",
+                "rejection_number",
+                "source_run_id",
+                "review_turn_number",
+                "review_step_name",
+                "reviewer_selector",
+                "checkpoint_index",
+                "checkpoint_name",
+                "reviewed_implementation_turn_number",
+            ) and receipt_value is None:
+                # A required rejection identity is missing from the actual
+                # producing receipt; the correlation is not established.
+                return False
+            if receipt_value is not None and receipt_value != selected_value:
+                # The actual receipt's recorded rejection contradicts the
+                # selected owner-history relationship.
+                return False
+            if selected_value is not None and receipt_value is None:
+                # The selected relationship carries an identity the actual
+                # receipt's recorded rejection does not.
+                return False
+        receipt_ordinal = receipt_rejection.get("reviewed_attempt_ordinal")
+        if not (
+            isinstance(receipt_ordinal, int)
+            and not isinstance(receipt_ordinal, bool)
+            and receipt_ordinal >= 1
+        ):
+            return False
+        if predecessor_ordinal is not None:
+            # A present reviewed ordinal must agree with the selected
+            # predecessor; a genuinely ordinal-absent owner-history record
+            # stays admissible because the uniquely recorded predecessor and
+            # the producing receipt establish the same relationship.
+            if receipt_ordinal != predecessor_ordinal:
+                return False
+        elif selected_rejection.get("reviewed_attempt_ordinal") != receipt_ordinal:
+            return False
+    # Producer-supported finalization: the original snapshot does not change
+    # during a scoped rejection, so the decoded before/after snapshots must
+    # agree.
+    snapshot_before = _snapshot_from_review_result(result.get("snapshot_before"))
+    if snapshot_before is None:
+        return False
+    snapshot_after = _snapshot_from_review_result(result.get("snapshot_after"))
+    if snapshot_after is None or snapshot_after != snapshot_before:
+        return False
+    conditions = result.get("conditions")
+    if not isinstance(conditions, Mapping):
+        return False
+    if (
+        conditions.get("NEW_PLAN_EXISTS") is not True
+        or conditions.get("MAX_TURNS_REACHED") is not False
+        or conditions.get("DONE") is not snapshot_before.is_complete
+    ):
+        return False
+    transition = result.get("chosen_transition")
+    if not isinstance(transition, str) or not transition.strip():
+        return False
+    if worker_step_name is not None and transition != worker_step_name:
+        # The produced transition must target the selected repair worker's
+        # actual step; a review-to-review or foreign transition is not the
+        # repair relationship under validation.
+        return False
+    reviewer_selector = rejection.get("reviewer_selector")
+    if isinstance(reviewer_selector, str) and reviewer_selector.strip():
+        if result.get("selector") != reviewer_selector:
+            # The actual receipt's selector must be the producing reviewer.
+            return False
+    scope_original = _resolved_plan_identity(scope_original_plan, repo_root)
+    if scope_original is not None:
+        receipt_original = _resolved_plan_identity(
+            result.get("original_plan_path"), repo_root
+        )
+        if receipt_original is None or receipt_original != scope_original:
+            # The actual receipt must review the immutable scope original
+            # plan; a foreign original plan breaks the correlation.
+            return False
+    # Bind the produced overlay: the receipt rejection's repair path, the
+    # selected rejection's repair path, and the receipt's new plan must all be
+    # the same historical overlay, resolved against the repository (equivalent
+    # relative/absolute spellings agree). The consumed overlay need not still
+    # exist; the recorded path is the identity.
+    repair = _resolved_plan_identity(rejection.get("repair_plan_path"), repo_root)
+    if repair is None:
+        return False
+    receipt_repair = _resolved_plan_identity(
+        receipt_rejection.get("repair_plan_path"), repo_root
+    )
+    if receipt_repair is None or receipt_repair != repair:
+        return False
+    new_plan = _resolved_plan_identity(result.get("new_plan_path"), repo_root)
+    if new_plan is None or new_plan != repair:
+        return False
+    if (
+        owner_run_id is not None
+        and source_run_id == owner_run_id
+        and worker_turn_number is not None
+        and review_turn >= worker_turn_number
+    ):
+        # A local producing review must precede the selected worker in that
+        # run; a review at or after the worker cannot have produced it.
+        return False
+    return True
+
+
+def _selected_worker_allowed_plans(
+    owner_meta: Mapping[str, object] | None,
+    repo_root: Path,
+    *,
+    expected_plan: str | None,
+    scope_id: str | None,
+    attempt_ordinal: int | None,
+    owner_run_id: str | None = None,
+    worker_turn_number: int | None = None,
+    scope_checkpoint_index: int | None = None,
+    scope_checkpoint_name: str | None = None,
+    worker_step_name: str | None = None,
+    scope_original_plan: str | None = None,
+    required_run_ids: set[str] | None = None,
+) -> set[Path] | None:
+    """Return the exact plan identity allowed as the selected worker's active plan.
+
+    The selected attempt is bound to the rejection that actually produced it
+    through the scope-local attempt sequence. An original worker (the scope's
+    first attempt) must name the original plan; a repair worker must name the
+    exact historical repair overlay recorded by the unique rejection that
+    reviewed its predecessor attempt. The producing rejection is established
+    by its ``reviewed_attempt_ordinal`` matching the predecessor's ordinal;
+    legacy records without an ordinal may use the diagnostic reviewed turn
+    number only when it uniquely identifies the predecessor in the scope's
+    attempt sequence. The selected repair must have its predecessor recorded
+    in the scope's attempt sequence (a missing predecessor is a refusal, not
+    a skip), and the producing rejection must be bound to its actual owned
+    producing review: an owned source run in the recorded lineage holding a
+    finalized reviewer receipt at the recorded step/turn, agreeing with the
+    selected immutable scope's checkpoint identity. A missing, ambiguous, or
+    contradictory producing relationship (or a predecessor whose recorded
+    turn/identity the rejection does not match) is a refusal. Consumed
+    overlay files need not still exist; the recorded path is the identity.
+
+    When ``required_run_ids`` is provided, the selected producing rejection's
+    ``source_run_id`` is added to it only after the existing
+    relationship/producing-receipt validation succeeds; the ordinal and the
+    legacy ordinal-absent selection share that single collection point, and a
+    refusal publishes nothing.
+    """
+    if not (isinstance(expected_plan, str) and expected_plan.strip()):
+        return None
+    original = Path(expected_plan)
+    rejections: list[Mapping[str, object]] = []
+    if owner_meta is not None:
+        history = owner_meta.get("review_rejection_history")
+        if isinstance(history, (list, tuple)):
+            for record in history:
+                if not isinstance(record, Mapping):
+                    continue
+                if scope_id is not None and record.get("scope_id") != scope_id:
+                    continue
+                rejections.append(record)
+    if attempt_ordinal is None:
+        # Without a scope-local ordinal the producing relationship cannot be
+        # established once the scope has recorded rejections; only a scope
+        # with no rejections establishes the original plan.
+        return {original} if not rejections else None
+    if attempt_ordinal < 1:
+        return None
+    if attempt_ordinal == 1:
+        # The scope's first worker is the original worker: it names the
+        # original plan, never an overlay.
+        return {original}
+    predecessor_ordinal = attempt_ordinal - 1
+    producing: list[Mapping[str, object]] = []
+    for record in rejections:
+        ordinal = record.get("reviewed_attempt_ordinal")
+        if (
+            isinstance(ordinal, int)
+            and not isinstance(ordinal, bool)
+            and ordinal == predecessor_ordinal
+        ):
+            producing.append(record)
+    if not producing:
+        # Legacy records omit the ordinal; the diagnostic reviewed turn number
+        # may be used only when it uniquely identifies the predecessor worker
+        # in the scope's attempt sequence.
+        attempts = _scope_worker_attempts(owner_meta, scope_id)
+        for record in rejections:
+            ordinal = record.get("reviewed_attempt_ordinal")
+            if (
+                isinstance(ordinal, int)
+                and not isinstance(ordinal, bool)
+                and ordinal >= 1
+            ):
+                # A valid ordinal that is not the predecessor's does not
+                # produce this worker and is not a legacy candidate.
+                continue
+            turn = record.get("reviewed_implementation_turn_number")
+            if (
+                not isinstance(turn, int)
+                or isinstance(turn, bool)
+                or turn < 1
+            ):
+                continue
+            matches = [
+                attempt
+                for attempt in attempts
+                if attempt.get("turn_number") == turn
+            ]
+            if len(matches) == 1:
+                producing.append(record)
+    if len(producing) != 1:
+        return None
+    rejection = producing[0]
+    repair = rejection.get("repair_plan_path")
+    if not (isinstance(repair, str) and repair.strip()):
+        return None
+    # The selected repair must be bound to its predecessor in the scope-local
+    # attempt sequence; a missing predecessor is a refusal, never a skip.
+    attempts = _scope_worker_attempts(owner_meta, scope_id)
+    ordinal_present = (
+        isinstance(rejection.get("reviewed_attempt_ordinal"), int)
+        and not isinstance(rejection.get("reviewed_attempt_ordinal"), bool)
+        and rejection.get("reviewed_attempt_ordinal") >= 1
+    )
+    if ordinal_present:
+        predecessors = [
+            attempt
+            for attempt in attempts
+            if (
+                isinstance(attempt.get("attempt_ordinal"), int)
+                and not isinstance(attempt.get("attempt_ordinal"), bool)
+                and attempt.get("attempt_ordinal") == predecessor_ordinal
+            )
+        ]
+        if len(predecessors) != 1:
+            # The recorded predecessor worker is missing (or ambiguous) in
+            # the scope's attempt sequence; the relationship is not
+            # established.
+            return None
+        predecessor = predecessors[0]
+    else:
+        # Legacy absence: the diagnostic reviewed turn number identifies the
+        # predecessor; the producing branch already required exactly one
+        # matching attempt.
+        reviewed_turn = rejection.get("reviewed_implementation_turn_number")
+        predecessors = [
+            attempt
+            for attempt in attempts
+            if attempt.get("turn_number") == reviewed_turn
+        ]
+        if len(predecessors) != 1:
+            return None
+        predecessor = predecessors[0]
+    # Cross-check the producing rejection against the recorded predecessor
+    # attempt: the reviewed turn, selector, and team must agree when both
+    # sides carry the evidence.
+    reviewed_turn = rejection.get("reviewed_implementation_turn_number")
+    if (
+        isinstance(reviewed_turn, int)
+        and not isinstance(reviewed_turn, bool)
+        and reviewed_turn != predecessor.get("turn_number")
+    ):
+        return None
+    reviewed_selector = rejection.get("reviewed_worker_selector")
+    if reviewed_selector is not None and reviewed_selector != predecessor.get("selector"):
+        return None
+    reviewed_team = rejection.get("reviewed_worker_team")
+    if reviewed_team is not None and reviewed_team != predecessor.get("team"):
+        return None
+    # Bind the producing rejection to its actual owned producing review in
+    # the recorded lineage, not only to matching ordinal/path metadata: the
+    # receipt's recorded rejection must correlate field by field with the
+    # selected owner-history relationship, and its finalization (snapshots,
+    # conditions, transition, selector, original plan, overlay identity) must
+    # be producer-supported.
+    predecessor_ordinal_value = predecessor.get("attempt_ordinal")
+    if not _producing_rejection_review_validates(
+        repo_root,
+        rejection,
+        owner_run_id=owner_run_id,
+        worker_turn_number=worker_turn_number,
+        scope_checkpoint_index=scope_checkpoint_index,
+        scope_checkpoint_name=scope_checkpoint_name,
+        worker_step_name=worker_step_name,
+        scope_original_plan=scope_original_plan,
+        selected_rejection=rejection,
+        predecessor_ordinal=(
+            int(predecessor_ordinal_value)
+            if isinstance(predecessor_ordinal_value, int)
+            and not isinstance(predecessor_ordinal_value, bool)
+            and predecessor_ordinal_value >= 1
+            else None
+        ),
+    ):
+        return None
+    if required_run_ids is not None:
+        # The producing rejection's source run is validated above as an owned
+        # run in the recorded lineage holding the actual producing receipt;
+        # it is a physical retention dependency of the selected worker, for
+        # both the ordinal and the legacy ordinal-absent selection.
+        source_run_id = rejection.get("source_run_id")
+        if isinstance(source_run_id, str) and source_run_id:
+            required_run_ids.add(source_run_id)
+    candidate = Path(repair)
+    if not candidate.is_absolute():
+        candidate = repo_root / candidate
+    return {candidate}
+
+
+def _owner_scope_identity_matches(
+    owner_meta: Mapping[str, object] | None,
+    *,
+    scope_id: str | None,
+    checkpoint_index: int | None,
+    checkpoint_name: str | None,
+    original_plan: str | None,
+    envelope: tuple[str, str, str] | None,
+) -> bool:
+    """Bind the owner's active scope to the selected immutable awaiting scope.
+
+    The owner must record the same immutable scope identity as the selected
+    awaiting scope: scope id, checkpoint index and name, original-plan path,
+    and (when the selected scope carries one) the exact scope envelope
+    reference. An attempts map key alone does not prove matching scope
+    ownership; a contradictory owner scope identity is a refusal.
+    """
+    if scope_id is None:
+        return True
+    if owner_meta is None:
+        return False
+    data = owner_meta.get("active_implementation_scope")
+    if not isinstance(data, Mapping):
+        return False
+    if data.get("scope_id") != scope_id:
+        return False
+    if (
+        checkpoint_index is not None
+        and data.get("checkpoint_index") != checkpoint_index
+    ):
+        return False
+    if (
+        checkpoint_name is not None
+        and data.get("checkpoint_name") != checkpoint_name
+    ):
+        return False
+    if (
+        original_plan is not None
+        and data.get("original_plan_path") != original_plan
+    ):
+        return False
+    if envelope is not None:
+        artifact_path, artifact_sha, canonical_sha = envelope
+        if (
+            data.get("envelope_artifact_path") != artifact_path
+            or data.get("envelope_artifact_sha256") != artifact_sha
+            or data.get("envelope_canonical_sha256") != canonical_sha
+        ):
+            return False
+    return True
+
+
+def _owner_scope_envelope_validates(
+    run_dir: Path,
+    owner_meta: Mapping[str, object] | None,
+) -> bool:
+    """Validate the owner's scope envelope artifact bytes through the shared reader.
+
+    Equal reference strings alone do not validate the owner's artifact: the
+    owner's recorded scope must decode as a complete envelope reference, its
+    artifact must be an owned regular file inside the owner run, and the exact
+    bytes must hash and parse to the recorded scope identity (scope id,
+    checkpoint index/name, digest, canonical hash) through the existing
+    scope/envelope validation.
+    """
+    if owner_meta is None:
+        return False
+    data = owner_meta.get("active_implementation_scope")
+    if not isinstance(data, Mapping):
+        return False
+    try:
+        scope = ActiveImplementationScope(
+            scope_id=data.get("scope_id"),
+            original_plan_path=data.get("original_plan_path"),
+            checkpoint_index=data.get("checkpoint_index"),
+            checkpoint_name=data.get("checkpoint_name"),
+            opened_turn_number=data.get("opened_turn_number"),
+            envelope_artifact_path=data.get("envelope_artifact_path"),
+            envelope_artifact_sha256=data.get("envelope_artifact_sha256"),
+            envelope_canonical_sha256=data.get("envelope_canonical_sha256"),
+        )
+        reference = _scope_envelope_reference(scope)
+        if reference is None:
+            return False
+        artifact_path = reference[0]
+        candidate = run_dir / artifact_path
+        source_root = run_dir.resolve()
+        resolved = candidate.resolve(strict=True)
+        resolved.relative_to(source_root)
+        if not resolved.is_file():
+            return False
+        artifact_bytes = resolved.read_bytes()
+    except (WorkflowError, OSError, ValueError, TypeError):
+        return False
+    try:
+        _validate_scope_envelope_bytes(scope, artifact_bytes)
+    except (WorkflowError, OSError, ValueError, TypeError):
+        return False
+    return True
+
+
+def _bind_worker_receipt(
+    repo_root: Path,
+    start_run_id: str,
+    turn_number: int,
+    *,
+    seed_predecessor: str | None = None,
+    scope_id: str | None = None,
+    step_name: str | None = None,
+    attempt_ordinal: int | None = None,
+    scope_checkpoint_index: int | None = None,
+    scope_checkpoint_name: str | None = None,
+    scope_original_plan: str | None = None,
+    scope_envelope: tuple[str, str, str] | None = None,
+    strict: bool = False,
+    required_run_ids: set[str] | None = None,
+) -> tuple[str, Path] | None:
+    """Source-first binding of the worker receipt owner for one local turn.
+
+    The source run is checked before its ``resumed_from_run_id`` chain, so a
+    valid new local repair worker wins without an unrelated ancestor owning the
+    same local turn. ``seed_predecessor`` seeds the chain when the source run
+    directory is absent (the prompt-reference path).
+
+    Every traversed ownership path is contained and owned in both modes: the
+    run directory, its ``turns`` parent directory, and the selected turn
+    directory are regular owned directories (a symlinked ``turns`` parent is an
+    escape and refuses), and the receipt is a regular owned file. A foreign run
+    id, a cyclic lineage, or an unreadable/malformed receipt is a refusal in
+    both modes, and a candidate that is a worker-role receipt but fails its
+    checks is never silently replaced by an older worker.
+
+    In ``strict`` mode (the proven failed-pending-review route) the receipt must
+    be a successfully finalized worker for the exact selected step/turn with a
+    produced finalization, and the owner's recorded attempts under the same
+    immutable scope must establish the selected step/role/turn and scope-local
+    ordinal. In the legacy review-recovery mode the historical looser worker
+    receipt check (exact turn, worker role, completed, plan identity) applies so
+    unrelated legacy routes are not given new scope/finalization requirements.
+
+    A reviewer receipt at this local turn is a legitimate review-only
+    intermediate: the walk continues to its owned predecessor.
+
+    When ``required_run_ids`` is provided, the validated physical dependencies
+    of the selected worker are published to it only after the worker receipt
+    and owner-attempt validation fully succeed: the worker owner, the
+    validated producing rejection's source run (for a repair), and the owned
+    links connecting the source run to those owners from the existing chain
+    walk. A refusal publishes nothing, so no partially validated dependency
+    set can be preserved.
+    """
+    expected_plan: str | None = None
+    source_meta = load_run_json(repo_root / ".aflow" / "runs" / start_run_id)
+    if source_meta is not None:
+        recorded_plan = source_meta.get("original_plan_path")
+        if isinstance(recorded_plan, str) and recorded_plan.strip():
+            expected_plan = recorded_plan
+    chain = _worker_owner_chain(
+        repo_root, start_run_id, seed_predecessor=seed_predecessor
+    )
+    if chain is None:
+        return None
+    collected: set[str] = set()
+
+    def publish_dependencies(owner_id: str) -> None:
+        if required_run_ids is None:
+            return
+        chain_ids = [rid for rid, _ in chain]
+        farthest = max(
+            (
+                chain_ids.index(rid)
+                for rid in {owner_id, *collected}
+                if rid in chain_ids
+            ),
+            default=0,
+        )
+        required_run_ids.update(chain_ids[: farthest + 1])
+        required_run_ids.update(collected)
+
+    for run_id, dir_exists in chain:
+        if not dir_exists:
+            continue
+        run_dir = repo_root / ".aflow" / "runs" / run_id
+        turns_dir = run_dir / "turns"
+        if turns_dir.is_symlink():
+            # A symlinked ``turns`` parent escapes the owned run; refuse rather
+            # than follow it or substitute an older worker.
+            return None
+        if not turns_dir.is_dir():
+            continue
+        turn_dir = turns_dir / f"turn-{turn_number:03d}"
+        if turn_dir.is_symlink():
+            # A symlinked turn directory is an untrustworthy candidate; refuse
+            # rather than follow it or substitute an older worker.
+            return None
+        if not turn_dir.is_dir():
+            continue
+        result_path = turn_dir / "result.json"
+        if result_path.is_symlink():
+            return None
+        if not result_path.is_file():
+            continue
+        try:
+            result = json.loads(result_path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeError, json.JSONDecodeError):
+            return None
+        if not isinstance(result, dict):
+            return None
+        if result.get("step_role") == "worker":
+            if strict:
+                binding_plan = scope_original_plan or expected_plan
+                metadata_path = run_dir / "run.json"
+                owner_meta = (
+                    load_run_json(run_dir)
+                    if metadata_path.is_file()
+                    and not metadata_path.is_symlink()
+                    else None
+                )
+                if not _owner_scope_identity_matches(
+                    owner_meta,
+                    scope_id=scope_id,
+                    checkpoint_index=scope_checkpoint_index,
+                    checkpoint_name=scope_checkpoint_name,
+                    original_plan=scope_original_plan,
+                    envelope=scope_envelope,
+                ):
+                    return None
+                if scope_envelope is not None and not _owner_scope_envelope_validates(
+                    run_dir, owner_meta
+                ):
+                    # Equal reference strings alone do not validate the
+                    # owner's envelope artifact; the exact bytes must decode
+                    # and hash through the shared envelope reader.
+                    return None
+                allowed_active_plans = _selected_worker_allowed_plans(
+                    owner_meta,
+                    repo_root,
+                    expected_plan=binding_plan,
+                    scope_id=scope_id,
+                    attempt_ordinal=attempt_ordinal,
+                    owner_run_id=run_id,
+                    worker_turn_number=turn_number,
+                    scope_checkpoint_index=scope_checkpoint_index,
+                    scope_checkpoint_name=scope_checkpoint_name,
+                    worker_step_name=step_name,
+                    scope_original_plan=binding_plan,
+                    required_run_ids=collected,
+                )
+                if allowed_active_plans is None:
+                    # The selected attempt has no unique, non-contradictory
+                    # producing rejection/attempt relationship; a malformed
+                    # worker-role candidate is a refusal, never a silent
+                    # substitution with an older worker.
+                    return None
+                if not _worker_receipt_is_finalized_worker(
+                    result,
+                    turn_number=turn_number,
+                    step_name=step_name,
+                    expected_plan=binding_plan,
+                    allowed_active_plans=allowed_active_plans,
+                ):
+                    # A malformed or unfinalized worker-role candidate is a
+                    # refusal, never a silent substitution with an older worker.
+                    return None
+                if not _owned_worker_attempt_recorded(
+                    owner_meta,
+                    scope_id=scope_id,
+                    turn_number=turn_number,
+                    step_name=step_name,
+                    attempt_ordinal=attempt_ordinal,
+                ):
+                    return None
+                publish_dependencies(run_id)
+                return run_id, result_path
+            if not (
+                result.get("turn_number") == turn_number
+                and result.get("status") == "completed"
+                and (
+                    expected_plan is None
+                    or (
+                        isinstance(result.get("original_plan_path"), str)
+                        and result.get("original_plan_path", "").strip()
+                        and Path(result["original_plan_path"]) == Path(expected_plan)
+                    )
+                )
+            ):
+                # A malformed worker-role candidate is a refusal, never a
+                # silent substitution with an older worker.
+                return None
+            publish_dependencies(run_id)
+            return run_id, result_path
+        # A reviewer (or other non-worker) receipt at this local turn is a
+        # legitimate review-only intermediate run: continue to its owned
+        # predecessor rather than misreading it as a worker.
+    return None
+
+
 def _review_worker_artifact_reference(
     state: ControllerState,
     *,
@@ -4554,51 +5565,67 @@ def _review_worker_artifact_reference(
     repo_root: Path,
     run_dir: Path,
     resumed_from_run_id: str | None = None,
+    scope_id: str | None = None,
+    scope_checkpoint_index: int | None = None,
+    scope_checkpoint_name: str | None = None,
+    scope_original_plan: str | None = None,
+    scope_envelope: tuple[str, str, str] | None = None,
+    strict: bool = False,
 ) -> tuple[str, Path | None]:
     """Return the selected worker result's reference and its concrete location.
 
-    The reference text is unchanged from the historical selection; the
-    location is the exact absolute file the reference designates, or None
-    when the existing state cannot bind it to one readable source.
+    For an ordinary review (no ``resumed_from_run_id``) the historical recovery
+    routes apply: the in-memory turn-history record, then the current run's
+    turn file, then an explicit (possibly missing) plain-turn reference. For a
+    resume the shared source-first binding designates the exact worker receipt;
+    the current run is checked before its ``resumed_from_run_id`` chain, and
+    unbindable evidence stays explicitly unavailable: it never falls back to the
+    historical single-hop predecessor reviewer file.
     """
-    for record in reversed(state.turn_history):
-        if (
-            record.turn_number == attempt.turn_number
-            and record.step_role == "worker"
-            and record.turn_dir is not None
-        ):
-            candidate = record.turn_dir / "result.json"
+    turn_label = f"turn-{attempt.turn_number:03d}"
+    if resumed_from_run_id is None:
+        for record in reversed(state.turn_history):
+            if (
+                record.turn_number == attempt.turn_number
+                and record.step_role == "worker"
+                and record.turn_dir is not None
+            ):
+                candidate = record.turn_dir / "result.json"
+                try:
+                    return str(candidate.relative_to(repo_root)), candidate
+                except ValueError:
+                    break
+        current_result = run_dir / "turns" / turn_label / "result.json"
+        if current_result.is_file():
             try:
-                return str(candidate.relative_to(repo_root)), candidate
+                return str(current_result.relative_to(repo_root)), current_result
             except ValueError:
-                break
-    current_result = (
-        run_dir / "turns" / f"turn-{attempt.turn_number:03d}" / "result.json"
+                pass
+        return (
+            f"turns/{turn_label}/result.json",
+            run_dir / "turns" / turn_label / "result.json",
+        )
+    bound = _bind_worker_receipt(
+        repo_root,
+        run_dir.name,
+        attempt.turn_number,
+        seed_predecessor=resumed_from_run_id,
+        scope_id=scope_id,
+        step_name=attempt.step_name,
+        attempt_ordinal=attempt.attempt_ordinal,
+        scope_checkpoint_index=scope_checkpoint_index,
+        scope_checkpoint_name=scope_checkpoint_name,
+        scope_original_plan=scope_original_plan,
+        scope_envelope=scope_envelope,
+        strict=strict,
     )
-    if current_result.is_file():
-        try:
-            return str(current_result.relative_to(repo_root)), current_result
-        except ValueError:
-            pass
-    source_run_id = resumed_from_run_id
-    if source_run_id:
-        # Pair the resumed-from fallback with its validated predecessor under
-        # the primary repository; a malformed source identity binds nothing.
-        source_name = Path(source_run_id)
-        location: Path | None = (
-            repo_root
-            / ".aflow" / "runs" / source_run_id / "turns"
-            / f"turn-{attempt.turn_number:03d}" / "result.json"
-            if source_name.name == source_run_id and source_run_id not in {".", ".."}
-            else None
-        )
-        prefix = f"resumed-from/{source_run_id}/"
-    else:
-        location = (
-            run_dir / "turns" / f"turn-{attempt.turn_number:03d}" / "result.json"
-        )
-        prefix = ""
-    return f"{prefix}turns/turn-{attempt.turn_number:03d}/result.json", location
+    if bound is not None:
+        owner, location = bound
+        return f"resumed-from/{owner}/turns/{turn_label}/result.json", location
+    return (
+        f"resumed-from/{resumed_from_run_id}/turns/{turn_label}/result.json",
+        None,
+    )
 
 
 def _recovered_review_target(
@@ -4840,6 +5867,15 @@ def _render_checkpoint_review_context(
                 run_dir=run_dir,
                 resumed_from_run_id=(
                     resume.resumed_from_run_id if resume is not None else None
+                ),
+                scope_id=scope.scope_id,
+                scope_checkpoint_index=scope.checkpoint_index,
+                scope_checkpoint_name=scope.checkpoint_name,
+                scope_original_plan=scope.original_plan_path,
+                scope_envelope=_scope_envelope_tuple(scope),
+                strict=(
+                    resume is not None
+                    and resume.failed_pending_review_step is not None
                 ),
             )
             target = _CheckpointReviewPromptTarget(
@@ -9151,6 +10187,44 @@ def _run_workflow_unchecked(
         # The validated budget boundary binds the successor to the source
         # run's immutable receipts; keep that lineage available.
         preserved_resume_run_ids.add(resume.resumed_from_run_id)
+    if resume is not None and resume.failed_pending_review_step is not None:
+        # Issue #79: the failed-review predecessor carries the immutable
+        # worker artifact that the resumed reviewer's prompt references; keep
+        # it accessible through keep_runs=1 pruning.  The strict binding
+        # publishes its validated physical dependencies (the worker owner, the
+        # producing rejection's source run when the selected worker is a
+        # repair, and the owned links connecting the resumed-from run to those
+        # owners), so retention follows the same validated relationship that
+        # admission used, including a genuinely ordinal-absent legacy history.
+        preserved_resume_run_ids.add(resume.resumed_from_run_id)
+        scope = resume.active_implementation_scope
+        if scope is not None:
+            attempts = resume.implementation_attempts.get(scope.scope_id, ())
+            worker_attempts = [a for a in attempts if a.role == "worker"]
+            if worker_attempts:
+                last_worker = worker_attempts[-1]
+                bound_dependencies: set[str] = set()
+                bound = _bind_worker_receipt(
+                    config.repo_root,
+                    resume.resumed_from_run_id,
+                    last_worker.turn_number,
+                    scope_id=scope.scope_id,
+                    step_name=last_worker.step_name,
+                    attempt_ordinal=last_worker.attempt_ordinal,
+                    scope_checkpoint_index=scope.checkpoint_index,
+                    scope_checkpoint_name=scope.checkpoint_name,
+                    scope_original_plan=scope.original_plan_path,
+                    scope_envelope=_scope_envelope_tuple(scope),
+                    strict=True,
+                    required_run_ids=bound_dependencies,
+                )
+                if bound is not None:
+                    # The validated dependency set already includes every owned
+                    # intermediate link from the resumed-from run to the worker
+                    # owner and, for a repair, the producing rejection's source
+                    # run; preservation never grants eligibility or substitutes
+                    # for the validation that produced it.
+                    preserved_resume_run_ids.update(bound_dependencies)
     if terminal_completion_resume and resume is not None:
         preserved_resume_run_ids.update(terminal_delivery_lineage)
     if (

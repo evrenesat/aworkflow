@@ -803,6 +803,11 @@ class ResumeContext:
     pending_finalized_turn: PendingFinalizedTurn | None = None
     pending_cumulative_review: PendingCumulativeReview | None = None
     review_repair_step: str | None = None
+    # A failed terminal source whose last turn is a proven finalized
+    # unsuccessful reviewer receipt with the original awaiting-review scope
+    # (issue #79).  The successor starts at that reviewer; it never re-runs
+    # the completed implementation first.
+    failed_pending_review_step: str | None = None
     frozen_run_identity: FrozenRunIdentity | None = None
     live_config_path: str | None = None
     team_explicit: bool | None = None

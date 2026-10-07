@@ -936,6 +936,594 @@ revalidation, TERM-first bounded escalation (issue #76)
   managed-stop FIFO test (owner teardown raced the waiter's acquisition),
   which the CP2 repair entry above fixes.
 
+
+## 2026-10-07 — Refuse symlinked intermediate runs before failed-review admission (issue #79 v15)
+
+- Defect remaining after v14, demonstrated by
+  `.issue79-proof/reviewer-v15-lineage.py`: in an A→B→C failed-review chain
+  (A original worker turn 1 plus failed review, B and C review-only
+  failures), moving B's physical run directory out and placing a directory
+  symlink at B's recorded run location was admitted at CLI bootstrap and
+  managed preview/resume. `_worker_owner_chain` computed
+  `dir_exists = is_dir() and not is_symlink()` — true for a symlink to a
+  directory — marked the link absent, then followed the linked `run.json`
+  through `resumed_from_run_id` to A, so admission bound A's worker receipt
+  through an unowned physical dependency, allocated one successor/unit, and
+  dispatched a reviewer.
+- Fix: `aflow/workflow.py` `_worker_owner_chain` now refuses an existing
+  run-directory symlink in the walk before classifying existence, applying
+  the absent-source seed, or calling `_chain_predecessor_kind`. A present
+  link is not absence and never supplies owned lineage evidence; the
+  genuinely-absent current-run prompt-reference seed path, the metadata-link
+  refusal, and all other lineage gates are unchanged. No new reader,
+  abstraction, fallback, or persistence.
+- Tests: `tests/test_control_plane_resume.py`
+  `test_daemon_resume_failed_pending_review_symlinked_intermediate_refuses`
+  asserts CLI refusal, managed preview `can_resume=false`, managed refusal,
+  zero new run/manifest/unit/provider allocations, and unchanged A/C
+  artifacts for the symlinked intermediate, paired with the owned control
+  admitted at review/budget40, selecting A's exact readable worker, retaining
+  the chain under `keep_runs=1`, and replaying one successor/unit on the same
+  key.
+- Docs: `docs/runtime-behavior.md` and `ARCHITECTURE.md` record that a run
+  directory existing only as a symlink (including an intermediate chain run)
+  is refused before its `run.json` is followed.
+
+## 2026-10-07 — Retain the validated binding's producer dependencies, ordinal and legacy (issue #79 v14)
+
+- Defect remaining after v13, demonstrated by
+  `.issue79-proof/review-v14-retention.py` at `keep_runs=1` for a genuinely
+  ordinal-absent owner-history record: the A→B→C→D sequence (A original worker
+  turn 1 plus completed repair turn 3 / ordinal 2, B a genuine rejection of
+  that unique predecessor turn then an interrupted repair, C completes the
+  repair as local turn 1 / ordinal 3 then fails at review) admitted D through
+  CLI and managed preview, prepared review/budget40, and created one
+  successor/unit. But the v13 retention block extended the preserved chain to
+  the producer with a separate ordinal-only scan of the owner's
+  `review_rejection_history` (`reviewed_attempt_ordinal = worker ordinal − 1`),
+  so when the ordinal was genuinely absent the producer B was pruned, D's
+  prompt reported `Worker artifact unavailable`, and a subsequent real
+  bootstrap refused with a binding error. The ordinal-bearing control at
+  `keep_runs=1` was retained only by that duplicated, unvalidated scan.
+- Fix: `aflow/workflow.py` extends the existing strict binding to publish the
+  physical dependencies it already validates. `_selected_worker_allowed_plans`
+  adds the selected producing rejection's `source_run_id` to an internal
+  collector only after the existing relationship/producing-receipt validation
+  succeeds, sharing one collection point for the ordinal and the legacy
+  ordinal-absent selection. `_bind_worker_receipt` takes an optional
+  `required_run_ids` collector and, only after the worker receipt and
+  owner-attempt validation fully succeed, publishes the worker owner, the
+  validated producer, and the owned links connecting the resumed-from run to
+  those owners from the existing chain walk; a refusal publishes nothing. The
+  `failed_pending_review_step` preservation block now passes that collector to
+  the strict binding and adds the validated set to `preserved_resume_run_ids`
+  before `create_run_paths`, replacing the duplicate ordinal-only producer
+  scan and its redundant walks. No new selection rule, no loosened validation,
+  no global pruning disable; preservation never grants eligibility or
+  substitutes for validation, and the now-orphaned `_resume_predecessor_id`
+  helper is removed.
+- Regression: `tests/test_control_plane_resume.py` adds
+  `_inherited_repair_source` (a source that completes an original and a repair
+  worker before its reviewer failure, giving a unique predecessor turn) and
+  `test_daemon_resume_failed_pending_review_inherited_producer_retained`,
+  parameterized for `keep_runs=[20, 1]` and `history=["ordinal", "legacy"]`.
+  It produces A/B/C normally with a unique predecessor turn, omits only the
+  disposable legacy history's ordinal, and asserts actual CLI/managed
+  preparation, the exact readable worker, producer retention/bytes, review
+  first, budget40, one same-key successor/unit, and an executed further retry
+  after reviewer failure. The existing local-collision and negative controls
+  are unchanged.
+- Focused verification: 146 `failed_pending_review` tests, 92
+  resume/owner/budget tests, 11 `worker_artifact` tests, Ruff, the v13
+  retention (both keep_runs), the four v14 observations (ordinal and legacy at
+  keep_runs 20 and 1, all retaining the producer, keeping the artifact
+  readable, and `next_retry_refuses=false`), and all carried v07–v12
+  diagnostics pass.
+
+## 2026-10-07 — Preserve the producing rejection's source run through keep_runs=1 (issue #79 v13)
+
+- Defect demonstrated by `.issue79-proof/review-v13-retention.py` with
+  `keep_runs=1`: the A→B→C→D sequence (A original worker, B rejection +
+  interrupted repair, C completes repair as local turn 1 / ordinal 2 then
+  fails at review) admitted D through CLI and managed preview, prepared
+  review/budget40, and created one successor/unit. However, D's runtime
+  deleted B before the reviewer dispatched: the prompt reported
+  `Worker artifact unavailable`, `producer_retained=false`, and a subsequent
+  real bootstrap from D refused with a binding error. With `keep_runs=20`
+  the same sequence retained B and all assertions passed. The retention
+  chain walked from the resumed-from run up to the worker owner (C) and
+  stopped, never extending to the producing rejection's source run (B).
+- Fix: `aflow/workflow.py` extends the existing `failed_pending_review_step`
+  preservation block. After the chain walk to the worker owner, when the
+  selected worker is a repair (attempt ordinal > 1), the owner's
+  `review_rejection_history` is scanned for the unique producing rejection
+  (scope-local ordinal = worker ordinal − 1). Its `source_run_id` is then
+  walked from the worker owner through owned predecessors, adding every
+  intermediate link to `preserved_resume_run_ids` before
+  `create_run_paths`. No new selection rule, no loosened validation, no
+  global pruning disable; the strict binding already validated this
+  producer during `_bind_worker_receipt`. (Superseded by v14: the ordinal-only
+  producer scan and its redundant walks were replaced by the strict binding
+  publishing its validated producer dependencies, so a genuinely
+  ordinal-absent legacy producer is retained through the same validated
+  relationship.)
+- Regression: `tests/test_control_plane_resume.py` adds
+  `test_daemon_resume_failed_pending_review_producer_retained`,
+  parameterized for `keep_runs=[20, 1]`. It runs the full A/B/C/D sequence
+  through real `run_workflow`, managed preview/resume/manifest/
+  worker-preparation, an intentional D reviewer failure, and a subsequent
+  real retry, asserting exact worker prompt path/bytes, producer
+  receipt/bytes, no worker before review, budget40, one idempotent
+  successor/unit, and `next_retry_refuses=false`.
+- Focused verification: 142 `failed_pending_review` tests, 88
+  resume/owner/budget tests, 11 `worker_artifact` tests, Ruff, v13
+  retention (both keep_runs), and all carried v07–v12 diagnostics pass.
+
+## 2026-10-07 — Correlate the producing receipt with its selected relationship (issue #79 v12)
+
+- Defect remaining after v11, demonstrated admitted on resume from B
+  (CLI bootstrap and managed preview true, one run/successor and unit, review
+  prepared at budget40, reviewer dispatched with the exact repair receipt) by
+  `.issue79-proof/reviewer-v12-diagnostics.py`: the producing-review helper
+  correlated the receipt's recorded rejection only by repair path, accepted
+  any decoded post-snapshot and any nonblank transition, and ignored the
+  other required receipt relationships. Eleven independent producer-backed
+  mutations of only B's disposable producing-review receipt
+  (`turns/turn-001/result.json`) each still admitted: the recorded rejection's
+  scope, source run, reviewed predecessor ordinal, or checkpoint foreign;
+  the receipt's selector or original plan foreign; its `snapshot_before`
+  removed; its `snapshot_after` total checkpoint count increased; its
+  `chosen_transition` set to `review` instead of the repair worker's step;
+  its `NEW_PLAN_EXISTS` condition false; and its return code boolean false.
+  Separately, the existing relative-path contract compared raw `Path`
+  values, so the equivalent absolute spelling of the same overlay
+  (`local_receipt_equivalent_repair`) refused.
+- Fix: `aflow/workflow.py` completes the existing shared strict binding in
+  `_producing_rejection_review_validates()` (no new recovery path, no
+  admission-policy change, no persistence). The receipt's recorded
+  `review_rejection` is now correlated field by field with the selected
+  owner-history rejection — scope, rejection number, producing
+  source/step/turn, checkpoint identity, reviewer selector, reviewed
+  predecessor turn/selector/team, and historical repair — never raw object
+  equality, so a genuinely ordinal-absent owner-history record stays
+  admissible when the uniquely recorded predecessor and producing receipt
+  establish the same relationship. A present reviewed ordinal must agree
+  with the selected predecessor. The receipt's actual selector must be the
+  producing reviewer and its original plan the immutable scope original
+  plan. The finalization must be producer-supported: an integer non-boolean
+  zero return code, decoded before/after snapshots that agree (the original
+  snapshot does not change during a scoped rejection),
+  `NEW_PLAN_EXISTS=true`, `MAX_TURNS_REACHED=false`, `DONE` equal to the
+  original snapshot's completion, and the produced transition to the selected
+  repair worker's actual step. The receipt rejection's repair path, the
+  selected rejection's repair path, and the `new_plan_path` are compared as
+  repository-resolved identities, so equivalent relative/absolute spellings
+  of the same overlay admit while genuinely foreign paths refuse. The caller
+  passes the existing selected worker step, scope original plan, selected
+  rejection, and predecessor ordinal; the same binding drives CLI bootstrap
+  and managed preview/resume through `_bind_worker_receipt()`.
+- Valid local, ordinal-absent, and equivalent-repair controls still resume at
+  review with the exact worker, budget40, lineage, retention, and same-key
+  idempotency. New producer-backed CLI and managed regressions cover the
+  eleven demonstrated receipt mutations with real negative preview/refusal
+  and allocation/source invariants, plus the equivalent-repair admission
+  control with the exact worker artifact.
+
+## 2026-10-07 — Bind the producing receipt to its finalized rejection (issue #79 v11)
+
+- Defect remaining after v10, demonstrated admitted on resume from B
+  (managed preview true, one successor and unit, review prepared at budget40,
+  reviewer dispatched with the exact repair receipt) by
+  `.issue79-proof/reviewer-v11-diagnostics.py`: the new producing-review
+  helper accepted the named completed reviewer receipt without checking the
+  rejection and finalization it actually produced. Four independent
+  producer-backed mutations of only B's disposable producing-review receipt
+  (`turns/turn-001/result.json`) each still admitted: its `review_rejection`
+  removed, its recorded `repair_plan_path` changed to a foreign overlay, its
+  `snapshot_after` set to null, and its `chosen_transition` set to null.
+- Fix: `aflow/workflow.py` completes the existing shared strict binding in
+  `_producing_rejection_review_validates()` (no new recovery path, no
+  admission-policy change, no persistence). A completed reviewer status at the
+  named step/turn alone no longer proves the relationship. The producing
+  receipt must additionally carry the finalized rejection it actually
+  produced: a `review_rejection` naming the same repair overlay as the
+  rejection under validation (only that field is compared, never raw object
+  equality, so a genuinely ordinal-absent owner-history record stays
+  admissible), a decoded post-snapshot, a produced nonblank transition, and a
+  `new_plan_path` equal to that overlay (resolved against the repository; the
+  consumed overlay need not still exist). Missing or contradictory finalization
+  evidence refuses cleanly before any successor, manifest, unit, or provider is
+  allocated. The same validated decision drives CLI bootstrap and managed
+  preview/resume through `_bind_worker_receipt()`.
+- Valid local and ordinal-absent producing-rejection controls still resume at
+  review with the exact worker, budget40, lineage, retention, and same-key
+  idempotency. New producer-backed CLI and managed regressions cover the four
+  demonstrated producing-receipt mutations with real negative preview/refusal
+  and allocation/source invariants.
+
+## 2026-10-07 — Bind the selected repair to its producing review (issue #79 v10)
+
+- Defect remaining after v09, demonstrated admitted on resume from B
+  (managed preview true, one successor and unit, review prepared at budget40,
+  reviewer dispatched with the exact repair receipt) by
+  `.issue79-proof/reviewer-v10-diagnostics.py`: the selected repair's
+  producing rejection was authorized from ordinal/path metadata without
+  binding the relationship to the actual owned producing review. Five
+  independent producer-backed mutations each still admitted: the
+  rejection's `source_run_id` foreign to the recorded lineage, its
+  `review_step_name` not the producing reviewer step, its
+  `review_turn_number` with no producing receipt, its `checkpoint_index`
+  not the awaiting scope's checkpoint, and the recorded predecessor worker
+  removed from the scope's attempt sequence.
+- Fix: `aflow/workflow.py` completes the existing shared strict binding (no
+  new recovery path, no admission-policy change, no persistence). The
+  selected repair must have its predecessor recorded in the scope's
+  attempt sequence — a missing or ambiguous predecessor is a refusal, never
+  a skip; a legacy rejection without an ordinal may use its reviewed turn
+  number only when it uniquely identifies the predecessor. The new
+  `_producing_rejection_review_validates()` helper binds the producing
+  rejection to its actual owned producing review: the `source_run_id` must
+  be the worker's owner run or an owned `resumed_from_run_id` ancestor in
+  the recorded lineage, that run must hold a finalized completed reviewer
+  receipt (owned `turns`/turn directories, an owned regular receipt) at the
+  recorded `review_turn_number`/`review_step_name`, the rejection's
+  checkpoint identity must agree with the selected immutable awaiting scope
+  when both sides carry it, and a local producing review must precede the
+  selected worker in that run. The same validated decision drives CLI
+  bootstrap and managed preview/resume through `_bind_worker_receipt()`;
+  missing or contradictory producing relationship evidence refuses cleanly
+  before any successor, manifest, unit, or provider is allocated.
+- Valid original, inherited, local, twice-repaired, and ordinal-absent
+  legacy producing-rejection controls still resume at review with the exact
+  worker, budget40, lineage, retention, and same-key idempotency. New
+  producer-backed CLI and managed regressions cover the five demonstrated
+  mutations with real negative preview/refusal and allocation/source
+  invariants, plus the ordinal-absent local control through the actual
+  successor's first reviewer naming the exact local worker receipt.
+
+## 2026-10-07 — Bind repair identity, owner scope, and owner attempt (issue #79 v09)
+
+- Defects remaining after v08: four bounded semantic gaps, each demonstrated
+  admitted on resume from B (managed preview true, one successor and unit,
+  review prepared at budget40) by
+  `.issue79-proof/reviewer-v09-diagnostics.py`. (1) Repair identity: a repair
+  worker was admitted if it named the original plan, a stale same-scope
+  overlay from an earlier repair, or any unrelated plan, because the allowed
+  active plans were the set of all overlays established by the scope's
+  rejection history rather than the exact overlay produced by the rejection
+  for which the worker is the repair. (2) Owner scope: the owner's active
+  scope was compared only on scope id, checkpoint name, original-plan path,
+  and envelope reference, never on checkpoint index, and the envelope
+  artifact's bytes were never validated against the recorded hash, scope,
+  checkpoint, digest, and canonical form. (3) Owner attempt: the first
+  plausible recorded row won — a stale ordinal, a higher contradictory
+  ordinal, an ambiguous legacy duplicate, or a mixed malformed-and-absent
+  record all passed because no recorded row was required to be the unique
+  strong match. (4) Debug dependency: an unconditional `open("/tmp/dbg.txt",
+  "a")` in the CLI's resume reconstruction raised `PermissionError` for every
+  resume route whenever that scratch path was unwritable.
+- Fix: `aflow/workflow.py` tightens the existing strict binding (no new
+  recovery path, no admission-policy change, no persistence).
+  `_selected_worker_allowed_plans()` (replacing
+  `_established_scope_plan_paths()`) binds the selected worker's active plan
+  to the original plan for an original worker, or to the exact overlay
+  produced by the unique rejection for which the worker is the repair for a
+  repair worker (the rejection whose reviewed ordinal is exactly one less
+  than the worker's ordinal and whose reviewed worker identity matches the
+  predecessor turn; a missing, ambiguous, or contradictory rejection record
+  refuses). `_owner_scope_identity_matches()` now compares the scope's
+  checkpoint index, and the new `_owner_scope_envelope_validates()` resolves
+  the envelope artifact within the owner's run directory and validates its
+  bytes through the shared scope-envelope validator (hash, scope id,
+  checkpoint index and name, plan digest, canonical encoding). Both are
+  applied in strict `_bind_worker_receipt()` mode. `_owned_worker_attempt_recorded()`
+  now requires a unique strong match among the scope's recorded attempts:
+  exactly one well-formed ordinal equal to the selected ordinal with no
+  other recorded ordinal, or, for a legacy owner, exactly one ordinal-less
+  attempt with no recorded ordinal anywhere; a malformed present ordinal,
+  a recorded ordinal higher than the selected one, an ambiguous legacy
+  duplicate, and an owner with no matching worker attempt all refuse. The
+  higher-ordinal contradiction check preserves the v07 rule that an earlier
+  inherited attempt with a lower ordinal is ignored when the source records
+  the exact selected attempt. `aflow/cli.py` removes the debug-file write
+  from `_reconstruct_resume_context()` and passes the scope's checkpoint
+  index and envelope to the strict binding. The same validated decision
+  drives admission, prompt path, and retention.
+- Tests: `tests/test_control_plane_resume.py` adds
+  `test_daemon_resume_failed_pending_review_v09_binding_refuses`,
+  parametrized over the seven demonstrated mutations (owner checkpoint
+  index, owner envelope bytes, owner conflicting duplicate ordinal, owner
+  ambiguous legacy duplicate, repair worker naming the original plan, repair
+  worker naming the stale first overlay after two real local repairs, and a
+  mismatched rejection ordinal); each refuses at managed preview/resume
+  before any successor, manifest, start request, unit, or provider, with
+  preserved A/B source bytes (only the append-only audit journal may grow)
+  and zero new runs. `test_daemon_resume_failed_pending_review_v09_controls_admit`
+  keeps the two valid producers admitted (two real local repairs selecting
+  worker turn 4, ordinal 3, bound to the second consumed overlay; and a
+  unique legacy owner attempt with no ordinal) and asserts the exact
+  selected worker receipt and its exact intended active plan.
+  `test_daemon_resume_failed_pending_review_debug_file_independent` denies
+  every `open` of `/tmp/dbg.txt` inside `aflow.cli` and asserts the same
+  valid review-first bootstrap still succeeds. The v07 and v08 negative
+  tests are repaired: the broad `except Exception: pass` swallowing the
+  daemon setup and the preview-exception-only evidence is removed, the
+  symlinked-metadata mutation is isolated to its `RepositoryError` boundary,
+  and every other mutation now requires a successful daemon setup, a real
+  `can_resume=false` managed preview, a raising clean refusal, zero unit
+  starts, zero new runs, and preserved source bytes (only the append-only
+  journal may grow). A focused probe
+  (`.issue79-proof/reviewer-v09-auxiliary.py`) confirms both repaired
+  negative tests now fail on an injected independent preview regression
+  instead of passing on a swallowed exception.
+- Docs: `docs/runtime-behavior.md` and `ARCHITECTURE.md` record the
+  exact-producing-overlay repair binding, the owner checkpoint-index and
+  envelope-bytes validation, the unique-strong-match owner attempt rule,
+  and the removed debug-file dependency. The v07 source-first repair
+  behavior and the v08 finalized-worker/active-plan/owner-identity behavior
+  are preserved and re-verified.
+
+## 2026-10-07 — Validate worker finalization, active-plan, and owner scope identity (issue #79 v08)
+
+- Defects remaining after v07: three semantic gaps in the strict failed-review
+  worker binding. (1) Snapshots were only checked as JSON objects, so an
+  empty `snapshot_after={}` or a malformed `snapshot_before` (a non-object such
+  as `[1]`) passed as finalized; the produced `chosen_transition` was only
+  checked for presence, so a blank string `"   "` passed. (2) The receipt's
+  `active_plan_path` was ignored entirely, so an unrelated
+  `active_plan_path=<root>/foreign-plan.md` with no original-plan or repair
+  evidence was admitted. (3) Owner scope/ordinal evidence was only partially
+  validated: a present but malformed `attempt_ordinal` (a non-integer such as
+  `"999"` or a boolean `true`) was treated as a legacy absence, and the owner's
+  active-scope checkpoint name was never compared to the selected immutable
+  awaiting scope, so a contradictory `checkpoint_name` was admitted. Each of
+  these was demonstrated admitted on resume from B (managed preview true, one
+  successor and unit, review prepared at budget40) by
+  `.issue79-proof/reviewer-v08-diagnostics.py`.
+- Fix: `aflow/workflow.py` tightens the existing strict binding (no new
+  recovery path, no admission-policy change, no persistence).
+  `_worker_receipt_is_finalized_worker()` now decodes both worker snapshots
+  with `_snapshot_from_review_result()` (an empty or malformed mapping is
+  invalid), requires a nonblank string produced transition, and — with a new
+  `allowed_active_plans` parameter — binds the receipt's nonempty
+  `active_plan_path` to the original plan for an original worker or the
+  historical repair overlay established by that scope's recorded rejection/
+  repair evidence for a repair worker (an unrelated, missing, or malformed
+  active plan refuses; a consumed overlay need not exist or equal the original
+  plan). `_owned_worker_attempt_recorded()` now refuses a present but malformed
+  `attempt_ordinal` (non-integer, boolean, or below 1) instead of treating it
+  as a legacy absence. New `_established_scope_plan_paths()` collects the
+  original plan plus the scope's repair overlays; new
+  `_owner_scope_identity_matches()` binds the owner's active scope to the
+  selected immutable awaiting scope (scope id, checkpoint name, original-plan
+  path, and, when present, the exact envelope reference), so an attempts-map
+  key alone does not prove matching scope ownership. `_bind_worker_receipt()`
+  strict mode loads the owner metadata, checks scope identity, computes the
+  allowed active plans, and applies the finalized-worker and owner-attempt
+  checks; the ordinary/legacy review-recovery path is unchanged. `aflow/cli.py`
+  `_failed_pending_review_step()` extracts the scope's checkpoint name,
+  original plan, and envelope and passes them to the strict binding. The same
+  validated decision drives admission, prompt path, and retention.
+- Tests: `tests/test_control_plane_resume.py` adds
+  `test_daemon_resume_failed_pending_review_v08_binding_refuses`, parametrized
+  over the seven demonstrated mutations (empty post-snapshot, malformed
+  before-snapshot, blank transition, foreign active plan, non-integer ordinal,
+  boolean ordinal, and foreign owner checkpoint name); each refuses at managed
+  preview/resume before any successor, manifest, start request, unit, or
+  provider, with preserved A/B source bytes and zero new runs, and does not
+  treat a swallowed preview exception as the sole passing evidence (the resume
+  must refuse). The carried-forward local-repair, repeated-review-only, and
+  inherited-worker positives remain the over-refusal guards.
+- Docs: `docs/runtime-behavior.md` and `ARCHITECTURE.md` record the decoded
+  snapshot and nonblank transition requirement, the active-plan binding,
+  the owner scope-identity comparison, and the malformed-present-ordinal
+  refusal. The v07 source-first repair behavior (valid local repair and
+  inherited workers) is preserved and re-verified.
+
+## 2026-10-07 — Complete scoped worker receipt finalization and containment (issue #79 v07)
+
+- Defects in the v06 shared binding: (1) it accepted foreign scope/attempt
+  ownership and incomplete or contradictory worker finalization — a worker
+  receipt naming an unrelated step, a completed receipt with
+  `snapshot_after=null`, a completed receipt with `chosen_transition=null`, a
+  nonzero completed `returncode`, an owner whose attempts/active scope were
+  re-keyed to a foreign scope, and a conflicting scope-local ordinal all
+  passed managed preview and dispatched a reviewer with that exact invalid
+  receipt; and (2) it followed a symlinked `turns` parent outside the owned
+  run, so a selected turn whose `turns` directory was a symlink escaped the
+  owned run. The v06 helper checked only role, completed status, local turn,
+  and raw original-plan path; it never bound the selected scope/attempt,
+  successful return code, produced snapshots/transition, or the `turns`
+  parent, and it left the binding call inside a predecessor-only guard.
+- Fix: `aflow/workflow.py` replaces `_worker_receipt_is_valid()` with
+  `_worker_receipt_is_finalized_worker()`, which requires a successfully
+  finalized worker receipt (integer, non-boolean zero return code, decoded
+  before/after snapshot evidence, and a produced selected transition) plus an
+  exact step/role/turn and original-plan identity. `_bind_worker_receipt()`
+  gains an optional `strict` mode (the proven failed-pending-review route):
+  in strict mode it validates the `turns` parent, the selected-turn directory,
+  the regular receipt and metadata files (a symlinked `turns` parent, turn,
+  result, or metadata file refuses), and — through the new
+  `_owned_worker_attempt_recorded()` helper — requires the owner's recorded
+  attempts under the same immutable scope to establish the selected
+  step/role/turn/ordinal (a missing owner attempt under the resumed scope, a
+  foreign re-keyed scope, or a conflicting ordinal refuses rather than falling
+  back to a weaker legacy check). Ordinary/legacy review recovery keeps the
+  original loose turn/role/status/plan check (`strict=False`) so its behavior
+  is unchanged. `aflow/cli.py` moves the binding out of the predecessor-only
+  guard so every proven failed-review source (including an initial source
+  without a predecessor) is bound, and refuses a source whose owner records no
+  worker attempt under the resumed scope. The same strict binding drives
+  admission, the exact prompt path, and retention.
+- Tests: `tests/test_control_plane_resume.py` adds
+  `test_daemon_resume_failed_pending_review_v07_worker_binding_refuses` (the
+  seven demonstrated mutations plus a missing owner attempt and a symlinked
+  metadata file; each refuses at managed preview/resume or repository
+  reconciliation before any successor, manifest, start request, unit, or
+  provider, with preserved A/B source bytes and zero new runs). `test_cli.py`
+  adds `test_bootstrap_failed_pending_review_inherited_worker_stays_admitted`
+  (A produces the checkpoint-1 worker and a failed reviewer; B resumes
+  review-first; the managed successor C is admitted at budget40 and names A's
+  exact inherited worker receipt, with A/B source bytes preserved and the two
+  source runs independent) as the over-refusal guard; the complementary
+  local-repair-worker positive control remains
+  `test_daemon_resume_failed_pending_review_local_repair_worker`.
+- Docs: `docs/runtime-behavior.md`, `ARCHITECTURE.md`, and this DEVLOG record
+  the finalized-worker binding, the owner-attempt and scope-ordinal
+  requirement, the `turns`-parent symlink escape, and the removal of the
+  predecessor-only guard. The v06 source-first repair behavior (valid local
+  repair and inherited workers) is preserved and re-verified.
+
+## 2026-10-07 — Validate the latest scoped worker owner, including workers in the source run (issue #79 v06)
+
+- Defects in the v05 binding: (1) admission started at the source run's
+  `resumed_from_run_id` (its predecessor), so a genuine new local repair
+  worker in the source run was skipped and the resume was refused; and (2) the
+  ancestor lookup accepted any JSON object with `step_role == 'worker'` at the
+  selected local turn number, admitting foreign-plan, non-finalized,
+  wrong-turn, and symlinked receipts. The two cases were handled with
+  different rules, so valid local workers and invalid inherited receipts could
+  not be decided consistently.
+- Fix: `aflow/workflow.py` replaces `_find_worker_receipt_owner()` with a single
+  source-first rule. `_bind_worker_receipt()` checks the source run before
+  following the `resumed_from_run_id` chain; `_worker_receipt_is_valid()`
+  requires producer-supported, successful, finalized worker evidence with an
+  exact turn/step/role and original-plan identity (a JSON object or file
+  existence proves nothing); and `_resume_predecessor_id()` validates the owned
+  predecessor run ID, refusing symlinked, foreign, or cyclic lineage. A
+  malformed candidate worker is refused rather than replaced by an older
+  worker, and an intermediate review-only run carrying a reviewer receipt at
+  the same local turn is walked through to its owned predecessor. The same
+  validated decision drives `_review_worker_artifact_reference` (no historical
+  single-hop reviewer-file fallback), the `preserved_resume_run_ids`
+  retention, and `aflow/cli.py` admission. Invalid or ambiguous evidence
+  refuses before any successor, manifest, unit, or provider is allocated.
+- Tests: `tests/test_control_plane_resume.py` adds
+  `test_daemon_resume_failed_pending_review_local_repair_worker` (A → B
+  review rejection → real B repair worker at scope-local ordinal 2 → genuine B
+  reviewer failure → C, through real bootstrap, managed preview/resume/
+  manifest/`_worker_prepared` with same-key idempotency and budget40, review
+  first, the exact latest B worker receipt, ordinary remaining-checkpoint
+  progression to a successful outcome, and B source preservation under
+  `keep_runs=20`/`1`),
+  `test_daemon_resume_failed_pending_review_worker_owner_refuses` (foreign
+  plan, non-finalized status, wrong turn number, symlinked turn directory,
+  non-object receipt, and malformed JSON each refuse at managed preview/resume
+  with no allocation or provider and preserved A/B source bytes), and extends
+  `test_daemon_resume_failed_pending_review_repeated_failure_selects_worker_receipt`
+  to also cover managed C preview/resume/manifest/`_worker_prepared`, same-key
+  replay, B artifact preservation, and successful ordinary progression under
+  both retention settings while keeping the exact A worker identity/byte
+  assertions.
+- Docs: `docs/runtime-behavior.md`, `ARCHITECTURE.md`, and this DEVLOG record
+  the source-first receipt validation, the refusal before allocation, and the
+  removal of the single-hop reviewer-file fallback.
+
+## 2026-10-07 — Bind and retain the actual worker receipt through repeated failed-review resumes (issue #79 v05)
+
+- Defect: after a resumed reviewer fails again, a second resume selected the
+  immediate predecessor's reviewer result as the worker artifact. With
+  `keep_runs=1`, it also deleted the original worker's run before review.
+  Both effects stemmed from assuming the immediate predecessor owns the
+  inherited worker attempt.
+- Fix: `aflow/workflow.py` gains `_find_worker_receipt_owner()`, which walks
+  the `resumed_from_run_id` chain to find the run that owns a finalized
+  worker receipt at the given turn number. `_review_worker_artifact_reference`
+  uses this binding for the prompt's artifact reference/location; the
+  `preserved_resume_run_ids` section for `failed_pending_review_step` uses
+  the same binding to preserve every predecessor up to the worker owner.
+  `aflow/cli.py` `_failed_pending_review_step` gains an admission-level check
+  that verifies the worker receipt can be bound through the chain before
+  admitting the successor; a missing, foreign, cyclic, or symlinked lineage
+  refuses cleanly with no allocation or provider call.
+- Tests: `tests/test_control_plane_resume.py` adds
+  `test_daemon_resume_failed_pending_review_repeated_failure_selects_worker_receipt`
+  (A → failed-review B → C, parameterized `keep_runs=20`/`1`, asserting the
+  prompt's exact selected file is A's worker receipt with `step_role ==
+  'worker'` and byte-identical producer bytes, and A/B source artifacts remain
+  available and unchanged),
+  `test_daemon_resume_failed_pending_review_repair_worker_precedence`
+  (a newer same-scope repair worker takes precedence over an ancestor
+  worker), and
+  `test_daemon_resume_failed_pending_review_missing_lineage_refuses`
+  (missing worker lineage refuses at admission without allocation or
+  provider calls).
+- Docs: `docs/runtime-behavior.md` documents the worker-owner binding and
+  chain-walking preservation.
+
+## 2026-10-07 — Resume a failed reviewer at the pending review instead of the first implementation step (issue #79)
+
+- Defect: when a worker completed its checkpoint, the controller advanced to
+  the configured reviewer, and the reviewer harness failed, the run ended
+  `failed` with `current_step_name` on the reviewer and the original
+  implementation scope still awaiting review. Resume then fell back to the
+  workflow's first implementation step (or, for a complete single-checkpoint
+  snapshot, was rejected by the candidate mismatch check), so the successor
+  re-ran the already-completed implementation first. For multi-checkpoint
+  sources the scope-reconciliation path refused the resume outright.
+- Root cause: `_bootstrap_resume_invocation`/`_reconstruct_resume_context`
+  had no route for a failed terminal source whose last turn is a finalized
+  unsuccessful reviewer receipt. `_interrupted_resume_step` only handles
+  `environment_preflight`, so the effective start step was the workflow's
+  first step, and `_reconcile_verified_resume_scope` treated the retained
+  awaiting-review scope as a reconciliation blocker.
+- Fix: `aflow/cli.py` gains `_failed_pending_review_step()`, which accepts
+  the route only when every artifact agrees — failed status with no
+  terminal `end_reason`, the saved current step is the configured reviewer,
+  `active_turn == turns_completed + 1`, a finalized `harness-failed` (or
+  producer-supported `owner-stopped`) reviewer receipt whose turn/step/role
+  match the metadata, and the original awaiting-review scope with a positive
+  checkpoint index. `ResumeContext` carries the new
+  `failed_pending_review_step` field; the bootstrap selects it as the start
+  step, suppresses the already-complete-snapshot candidate rejection only
+  for this proven shape, and bypasses the cumulative-review and
+  scope-reconciliation paths that would close the retained scope. The route
+  yields to the repair, budget, owner-stopped, and cumulative-review routes;
+  once the candidate shape is recognized, any missing, malformed,
+  unreadable, or contradictory evidence is a clean resume refusal before any
+  successor is allocated, while sources outside the candidate shape keep the
+  legacy admission behavior (including its clean refusals) and never
+  dispatch a provider.
+- Tests: `tests/test_control_plane_resume.py` adds a daemon-level positive
+  case (producer-backed via the real controller, both single- and
+  multi-checkpoint plans) proving the successor starts at the reviewer with
+  zero worker invocations, the inherited turn budget, an idempotent resume
+  receipt, and untouched source artifacts. A second daemon-level test covers
+  `keep_runs=1` retention, conditional review transitions for remaining
+  checkpoints, and the rejection → repair → approval progression. `tests/test_cli.py`
+  adds `TestFailedPendingReviewResumeRouting` with positive controls
+  (including a genuine producer-backed source whose original checkpoint
+  remains unchecked) and producer-backed negative mutations
+  (missing/mismatched/unfinalized/unknown-status receipt, non-reviewer role
+  or step, turn-count mismatch, absent awaiting scope, active source,
+  unresolved hotplug, wrong/missing/blank/non-string receipt plan
+  identities, invalid/inconsistent post-snapshot, turn-directory and result
+  symlink escapes) that must not acquire the route. A managed daemon-level
+  identity-negative test proves the invalid receipt produces a clean refusal
+  through managed admission with zero successor unit starts and no provider.
+  A relocation case maps the historical receipt identities through a
+  `ResumeRelocation` and requires the pending review to be recovered against
+  the current authorized plan, while an unmapped or out-of-lineage plan is
+  refused. Both failed on the baseline and pass with the fix.
+- Receipt binding: the route validates that `turns` and the selected turn
+  directory are owned directories (not symlink escapes), `result.json` is an
+  owned regular file, the receipt's `original_plan_path` and
+  `active_plan_path` are both required nonempty strings that match the
+  current authorized plan after relocation mapping (a missing, blank,
+  non-string, unmapped, or foreign identity is a clean refusal, never
+  permission to skip the comparison), the saved snapshot may be the same
+  awaiting scope with the original checkpoint unchecked, in which case its
+  checkpoint name must equal the scope's immutable checkpoint name, and the
+  produced
+  `snapshot_after` decodes to a valid snapshot consistent with the source's
+  `last_snapshot`.
+- Retention: the failed-review predecessor is added to the preserved resume
+  run-ID set before `create_run_paths` so `keep_runs=1` does not delete it
+  before the first review or during successor completion.
+- Docs: `docs/runtime-behavior.md` documents the new admission shape,
+  receipt binding, and retention; `ARCHITECTURE.md` records the routing
+  precedence.
+
 ## 2026-10-06 — Give the macOS Python 3.12 dashboard CI job a 35-minute budget (Refs evrenesat/aworkflow#78)
 
 - On exact SHA `2f15a235b624e7553a456c7bc4e71d02c87fac2e`, CI run

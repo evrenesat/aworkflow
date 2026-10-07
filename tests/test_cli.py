@@ -1,6 +1,7 @@
 from tests._support import *  # noqa: F401,F403
 from dataclasses import asdict, replace
 import hashlib
+import pytest
 import re
 from typing import Mapping
 from unittest.mock import Mock
@@ -6851,3 +6852,1047 @@ class DirtyWorktreeCliTests(unittest.TestCase):
                     os.environ["HOME"] = original_home
         assert result == 1
         assert "dirty" in stderr_capture.getvalue().lower()
+
+
+class TestFailedPendingReviewResumeRouting:
+    """issue #79: a finalized failed reviewer resumes at the pending review.
+
+    Every source below is produced by the real controller (the worker
+    completes checkpoint 1, the configured reviewer exits nonzero) so the
+    routing evidence is producer-backed.  One checkpoint always remains so
+    the complete-snapshot routes cannot explain the outcome.  Negative
+    mutations must never acquire the review-first route.
+    """
+
+    @staticmethod
+    def _producer_source(
+        tmp_path: Path, *, complete_checkpoint: bool = True
+    ) -> tuple[Path, Path, WorkflowUserConfig]:
+        repo_root = tmp_path / "repo"
+        repo_root.mkdir()
+        plan_path = repo_root / "plan.md"
+        plan_path.write_text(
+            "# Plan\n\n"
+            "### [ ] Checkpoint 1: First\n- [ ] step\n"
+            "### [ ] Checkpoint 2: Next\n- [ ] next step\n",
+            encoding="utf-8",
+        )
+        config_path = repo_root / "aflow.toml"
+        config_path.write_text("# failed pending review fixture\n", encoding="utf-8")
+        workflow_config = WorkflowUserConfig(
+            roles={"worker": "codex.high", "reviewer": "codex.high"},
+            harnesses={
+                "codex": WorkflowHarnessConfig(
+                    profiles={"high": HarnessProfileConfig(model="high-model")}
+                )
+            },
+            workflows={
+                "live": WorkflowConfig(
+                    steps={
+                        "implement": WorkflowStepConfig(
+                            role="worker",
+                            prompts=("implement",),
+                            go=(GoTransition(to="review"),),
+                        ),
+                        "review": WorkflowStepConfig(
+                            role="reviewer",
+                            prompts=("review",),
+                            go=(GoTransition(to="END"),),
+                        ),
+                    },
+                    first_step="implement",
+                )
+            },
+            prompts={
+                "implement": "Implement the checkpoint.",
+                "review": "Review the completed worker turn.",
+            },
+        )
+
+        def source_runner(
+            argv: list[str], **kwargs: object
+        ) -> subprocess.CompletedProcess[str]:
+            if "Implement" in str(kwargs.get("input", "")):
+                if complete_checkpoint:
+                    checkpoint_one = "### [x] Checkpoint 1: First"
+                else:
+                    # The worker performs the step but leaves the original
+                    # checkpoint header unchecked, so approval is never
+                    # inferred from a completed checkpoint marker.
+                    checkpoint_one = "### [ ] Checkpoint 1: First"
+                plan_path.write_text(
+                    "# Plan\n"
+                    f"{checkpoint_one}\n"
+                    "- [x] step\n"
+                    "### [ ] Checkpoint 2: Next\n- [ ] next step\n",
+                    encoding="utf-8",
+                )
+                return subprocess.CompletedProcess(argv, 0, "worker output\n", "")
+            return subprocess.CompletedProcess(argv, 3, "", "reviewer provider failed\n")
+
+        run_dir = None
+        try:
+            run_workflow(
+                ControllerConfig(
+                    repo_root=repo_root,
+                    plan_path=plan_path,
+                    max_turns=40,
+                    reserved_run_id="failed-pending-review-source",
+                    idempotency_key="source-key",
+                    caller_scope="project:one",
+                ),
+                workflow_config,
+                "live",
+                config_dir=repo_root,
+                snapshot_config=False,
+                runner=source_runner,
+            )
+        except WorkflowError as exc:
+            run_dir = exc.run_dir
+        if run_dir is None:
+            raise AssertionError("producer source did not fail at the reviewer")
+        metadata = json.loads((run_dir / "run.json").read_text(encoding="utf-8"))
+        assert metadata["status"] == "failed"
+        assert metadata["current_step_name"] == "review"
+        assert metadata["active_implementation_scope"]["awaiting_review"] is True
+        return repo_root, plan_path, workflow_config
+
+    @staticmethod
+    def _bootstrap_for(
+        repo_root: Path, workflow_config: WorkflowUserConfig, run_id: str
+    ):
+        import aflow.cli as cli_module
+
+        return cli_module._bootstrap_resume_invocation(
+            repo_root=repo_root,
+            config_path=str(repo_root / "aflow.toml"),
+            config_path_is_explicit=True,
+            workflow_config=workflow_config,
+            requested_run_id=run_id,
+            workflow_arg=None,
+            plan_file_arg=None,
+            team_arg=None,
+            start_step_arg=None,
+            max_turns_arg=None,
+            extra_instructions_arg=(),
+            extra_instructions_provided=False,
+        )
+
+    @staticmethod
+    def _bootstrap(repo_root: Path, workflow_config: WorkflowUserConfig):
+        import aflow.cli as cli_module
+
+        return cli_module._bootstrap_resume_invocation(
+            repo_root=repo_root,
+            config_path=str(repo_root / "aflow.toml"),
+            config_path_is_explicit=True,
+            workflow_config=workflow_config,
+            requested_run_id="failed-pending-review-source",
+            workflow_arg=None,
+            plan_file_arg=None,
+            team_arg=None,
+            start_step_arg=None,
+            max_turns_arg=None,
+            extra_instructions_arg=(),
+            extra_instructions_provided=False,
+        )
+
+    @staticmethod
+    def _mutate_run(run_dir: Path, mutate) -> Path:
+        run_json_path = run_dir / "run.json"
+        payload = json.loads(run_json_path.read_text(encoding="utf-8"))
+        mutate(payload)
+        run_json_path.write_text(
+            json.dumps(payload, sort_keys=True), encoding="utf-8"
+        )
+        return run_dir
+
+    @staticmethod
+    def _assert_no_review_route(bootstrap) -> None:
+        # The issue-79 route must not be acquired; legacy routes (for
+        # example an interrupted running source resuming at its interrupted
+        # step) remain authoritative and unchanged.
+        assert bootstrap.resume_context.failed_pending_review_step is None
+
+    @staticmethod
+    def _assert_source_preserved(
+        run_dir: Path, before_artifacts: Mapping[str, bytes]
+    ) -> None:
+        # The refusal mutates no source artifact.  events.jsonl is the
+        # documented append-only audit: it may only grow, never rewrite.
+        for relative_path, artifact_bytes in before_artifacts.items():
+            after = (run_dir / relative_path).read_bytes()
+            if relative_path == "events.jsonl":
+                assert after.startswith(artifact_bytes)
+            else:
+                assert after == artifact_bytes
+
+    def test_bootstrap_failed_pending_review_selects_reviewer(self, tmp_path: Path) -> None:
+        repo_root, _plan_path, workflow_config = self._producer_source(tmp_path)
+        bootstrap = self._bootstrap(repo_root, workflow_config)
+        assert bootstrap.start_step == "review"
+        assert bootstrap.resume_context.failed_pending_review_step == "review"
+        assert bootstrap.resume_context.interrupted_step_name == "review"
+        assert bootstrap.max_turns == 40
+
+    def test_bootstrap_failed_pending_review_selects_reviewer_unchecked_checkpoint(
+        self, tmp_path: Path
+    ) -> None:
+        """A genuine failed reviewer with the original checkpoint still unchecked resumes at the pending review.
+
+        The worker completed the step but left the checkpoint header unchecked;
+        the proven pending review must be recovered without a preceding worker
+        and without inferring approval from step completion.
+        """
+        repo_root, _plan_path, workflow_config = self._producer_source(
+            tmp_path, complete_checkpoint=False
+        )
+        run_dir = repo_root / ".aflow" / "runs" / "failed-pending-review-source"
+        metadata = json.loads((run_dir / "run.json").read_text(encoding="utf-8"))
+        snapshot = metadata["last_snapshot"]
+        assert snapshot["current_checkpoint_index"] == 1
+        assert snapshot["is_complete"] is False
+        assert snapshot["current_checkpoint_unchecked_step_count"] == 0
+        assert metadata["active_implementation_scope"]["awaiting_review"] is True
+
+        bootstrap = self._bootstrap(repo_root, workflow_config)
+        assert bootstrap.start_step == "review"
+        assert bootstrap.resume_context.failed_pending_review_step == "review"
+        assert bootstrap.resume_context.interrupted_step_name == "review"
+        assert bootstrap.max_turns == 40
+
+    @staticmethod
+    def _run_first_reviewer_worker_ref(
+        repo_root: Path,
+        plan_path: Path,
+        workflow_config: WorkflowUserConfig,
+        resume_context,
+        reserved_run_id: str,
+    ) -> Path | None:
+        """Run one successor reviewer turn and capture the worker ref it names.
+
+        The first reviewer prompt names the exact worker receipt it was bound
+        to (``path (read this exact file):``); that is the shared binding's
+        selected owner. A failing reviewer is enough to materialize the prompt.
+        """
+        selected: list[Path] = []
+
+        def runner(
+            argv: list[str], **kwargs: object
+        ) -> subprocess.CompletedProcess[str]:
+            prompt = str(kwargs.get("input", ""))
+            for line in prompt.splitlines():
+                if "path (read this exact file):" in line:
+                    value = line.split(": ", 1)[1]
+                    selected.append(Path(value.split(". This is the read location", 1)[0]))
+            return subprocess.CompletedProcess(argv, 3, "", "reviewer failed\n")
+
+        try:
+            run_workflow(
+                ControllerConfig(
+                    repo_root=repo_root,
+                    plan_path=plan_path,
+                    max_turns=40,
+                    start_step="review",
+                    reserved_run_id=reserved_run_id,
+                    keep_runs=20,
+                ),
+                workflow_config,
+                "live",
+                config_dir=repo_root,
+                snapshot_config=False,
+                runner=runner,
+                resume=resume_context,
+            )
+        except WorkflowError:
+            pass
+        return selected[0] if selected else None
+
+    def test_bootstrap_failed_pending_review_inherited_worker_stays_admitted(
+        self, tmp_path: Path
+    ) -> None:
+        """Issue #79 v07: a valid inherited worker source stays admitted.
+
+        A produces the checkpoint-1 worker and a failed reviewer; B resumes
+        review-first and its reviewer fails, so the true worker is A's turn-001
+        receipt (inherited through the owned lineage).  The managed successor C
+        must be admitted at the pending review with budget40 and name A's exact
+        worker receipt, with A and B source bytes preserved and the two source
+        runs independent.  The stricter shared binding (finalization + owner
+        ordinal + no recorded-attempt refusal) must not over-refuse a valid
+        source.  The complementary local-repair-worker positive control is
+        covered by
+        ``test_daemon_resume_failed_pending_review_local_repair_worker``.
+        """
+        repo_root, plan_path, workflow_config = self._producer_source(tmp_path)
+        a_dir = repo_root / ".aflow" / "runs" / "failed-pending-review-source"
+        b_boot = self._bootstrap(repo_root, workflow_config)
+        assert b_boot.start_step == "review"
+
+        runner = lambda argv, **kw: subprocess.CompletedProcess(
+            argv, 3, "", "reviewer failed\n"
+        )
+
+        try:
+            run_workflow(
+                ControllerConfig(
+                    repo_root=repo_root,
+                    plan_path=plan_path,
+                    max_turns=40,
+                    start_step=b_boot.start_step,
+                    reserved_run_id="review-b",
+                    keep_runs=20,
+                ),
+                workflow_config,
+                "live",
+                config_dir=repo_root,
+                snapshot_config=False,
+                runner=runner,
+                resume=b_boot.resume_context,
+            )
+        except WorkflowError as exc:
+            b_dir = exc.run_dir
+        else:  # pragma: no cover - B must fail at the reviewer
+            raise AssertionError("B reviewer did not fail")
+        assert b_dir != a_dir, "the two source runs must be independent"
+        b_meta = json.loads((b_dir / "run.json").read_text(encoding="utf-8"))
+        assert b_meta["status"] == "failed"
+
+        before_a = {
+            p.relative_to(a_dir).as_posix(): p.read_bytes()
+            for p in a_dir.rglob("*") if p.is_file()
+        }
+        before_b = {
+            p.relative_to(b_dir).as_posix(): p.read_bytes()
+            for p in b_dir.rglob("*") if p.is_file()
+        }
+
+        # C is admitted from B at the pending review with budget40.
+        c_boot = self._bootstrap_for(repo_root, workflow_config, b_dir.name)
+        assert c_boot.start_step == "review"
+        assert c_boot.resume_context.failed_pending_review_step == "review"
+        assert c_boot.max_turns == 40
+
+        # C's first reviewer names A's exact inherited worker receipt.
+        worker_ref = self._run_first_reviewer_worker_ref(
+            repo_root, plan_path, workflow_config, c_boot.resume_context, "review-c"
+        )
+        assert worker_ref == (a_dir / "turns" / "turn-001" / "result.json")
+
+        # A and B source bytes are preserved (events.jsonl may only grow).
+        for rel, data in before_a.items():
+            after = (a_dir / rel).read_bytes()
+            if rel != "events.jsonl":
+                assert after == data, f"A artifact {rel} changed"
+        for rel, data in before_b.items():
+            after = (b_dir / rel).read_bytes()
+            if rel != "events.jsonl":
+                assert after == data, f"B artifact {rel} changed"
+
+    @pytest.mark.parametrize(
+        "mutation",
+        [
+            "local_rejection_foreign_source",
+            "local_rejection_wrong_review_step",
+            "local_rejection_wrong_review_turn",
+            "local_rejection_foreign_checkpoint",
+            "local_rejection_missing_predecessor",
+        ],
+    )
+    def test_bootstrap_failed_pending_review_v10_producing_review_refuses(
+        self, tmp_path: Path, mutation: str
+    ) -> None:
+        """Issue #79 v10: the CLI bootstrap refuses the same invalid producing-review evidence.
+
+        B performs one real rejection and repair worker before the failing
+        review (through the shared progression fixture whose reviewer step
+        routes a scoped rejection to a repair worker), so the selected local
+        worker is bound to its producing rejection. Each mutation breaks one
+        dimension of that producing relationship (foreign source run, wrong
+        review step, absent review turn, foreign checkpoint, missing
+        predecessor worker). The CLI bootstrap must refuse cleanly before
+        any successor is allocated, with no new run and B source bytes
+        preserved.
+        """
+        from tests.test_control_plane_resume import _bootstrap_cli, _progression_source
+
+        repo_root, plan_path, config_path, workflow_config, a_dir = _progression_source(
+            tmp_path / "repo"
+        )
+        b_boot = _bootstrap_cli(repo_root, config_path, workflow_config, a_dir.name)
+        assert b_boot.start_step == "review"
+        b_calls: list[str] = []
+
+        def b_runner(
+            argv: list[str], **kwargs: object
+        ) -> subprocess.CompletedProcess[str]:
+            prompt = str(kwargs["input"])
+            b_calls.append("worker" if "Implement " in prompt else "reviewer")
+            if len(b_calls) == 1:
+                overlay = Path(prompt.split("repair at ", 1)[1].split()[0].rstrip("."))
+                overlay.write_text("# Repair\n\n- [ ] fix\n", encoding="utf-8")
+                return subprocess.CompletedProcess(argv, 0, "repair needed", "")
+            if b_calls[-1] == "worker":
+                active = Path(prompt.split("Implement ", 1)[1].rstrip("."))
+                active.write_text(
+                    active.read_text(encoding="utf-8").replace("[ ]", "[x]"),
+                    encoding="utf-8",
+                )
+                return subprocess.CompletedProcess(argv, 0, "repair done", "")
+            return subprocess.CompletedProcess(
+                argv, 3, "", "expected reviewer failure\n"
+            )
+
+        try:
+            run_workflow(
+                ControllerConfig(
+                    repo_root=repo_root, plan_path=plan_path, max_turns=40,
+                    start_step=b_boot.start_step, reserved_run_id="review-b",
+                    keep_runs=20,
+                ),
+                workflow_config, "live", config_dir=repo_root,
+                snapshot_config=False, runner=b_runner,
+                resume=b_boot.resume_context,
+            )
+        except WorkflowError as exc:
+            b_dir = exc.run_dir
+        else:  # pragma: no cover - B must fail at the reviewer
+            raise AssertionError("B did not fail at review")
+        assert b_calls == ["reviewer", "worker", "reviewer"]
+
+        meta_path = b_dir / "run.json"
+        meta = json.loads(meta_path.read_text(encoding="utf-8"))
+        scope_id = meta["active_implementation_scope"]["scope_id"]
+        if mutation == "local_rejection_foreign_source":
+            meta["review_rejection_history"][-1]["source_run_id"] = "foreign-run"
+        elif mutation == "local_rejection_wrong_review_step":
+            meta["review_rejection_history"][-1]["review_step_name"] = "implement"
+        elif mutation == "local_rejection_wrong_review_turn":
+            meta["review_rejection_history"][-1]["review_turn_number"] = 999
+        elif mutation == "local_rejection_foreign_checkpoint":
+            meta["review_rejection_history"][-1]["checkpoint_index"] = 2
+        elif mutation == "local_rejection_missing_predecessor":
+            meta["implementation_attempts"][scope_id] = (
+                meta["implementation_attempts"][scope_id][1:]
+            )
+        else:  # pragma: no cover - parametrize covers every case
+            raise AssertionError(f"unhandled mutation {mutation!r}")
+        meta_path.write_text(json.dumps(meta), encoding="utf-8")
+
+        runs_root = repo_root / ".aflow" / "runs"
+        before_runs = sorted(path.name for path in runs_root.iterdir())
+        source_artifacts = {
+            path.relative_to(b_dir).as_posix(): path.read_bytes()
+            for path in sorted(b_dir.rglob("*"))
+            if path.is_file()
+        }
+        with pytest.raises(ValueError, match="pending-review evidence"):
+            self._bootstrap_for(repo_root, workflow_config, "review-b")
+        assert sorted(p.name for p in runs_root.iterdir()) == before_runs
+        self._assert_source_preserved(b_dir, source_artifacts)
+
+    @pytest.mark.parametrize(
+        "mutation",
+        [
+            "local_review_missing_rejection",
+            "local_review_foreign_repair",
+            "local_review_missing_post_snapshot",
+            "local_review_missing_transition",
+        ],
+    )
+    def test_bootstrap_failed_pending_review_v11_producing_receipt_refuses(
+        self, tmp_path: Path, mutation: str
+    ) -> None:
+        """Issue #79 v11: the CLI bootstrap refuses the same invalid producing-receipt evidence.
+
+        B performs one real rejection and repair worker before the failing
+        review (through the shared progression fixture whose reviewer step
+        routes a scoped rejection to a repair worker), so the selected local
+        worker is bound to its producing rejection. Each mutation breaks one
+        dimension of the producing review receipt's actual finalization
+        evidence (removed ``review_rejection``, foreign recorded repair path,
+        removed post-snapshot, removed produced transition). The CLI bootstrap
+        must refuse cleanly before any successor is allocated, with no new run
+        and B source bytes preserved.
+        """
+        from tests.test_control_plane_resume import _bootstrap_cli, _progression_source
+
+        repo_root, plan_path, config_path, workflow_config, a_dir = _progression_source(
+            tmp_path / "repo"
+        )
+        b_boot = _bootstrap_cli(repo_root, config_path, workflow_config, a_dir.name)
+        assert b_boot.start_step == "review"
+        b_calls: list[str] = []
+
+        def b_runner(
+            argv: list[str], **kwargs: object
+        ) -> subprocess.CompletedProcess[str]:
+            prompt = str(kwargs["input"])
+            b_calls.append("worker" if "Implement " in prompt else "reviewer")
+            if len(b_calls) == 1:
+                overlay = Path(prompt.split("repair at ", 1)[1].split()[0].rstrip("."))
+                overlay.write_text("# Repair\n\n- [ ] fix\n", encoding="utf-8")
+                return subprocess.CompletedProcess(argv, 0, "repair needed", "")
+            if b_calls[-1] == "worker":
+                active = Path(prompt.split("Implement ", 1)[1].rstrip("."))
+                active.write_text(
+                    active.read_text(encoding="utf-8").replace("[ ]", "[x]"),
+                    encoding="utf-8",
+                )
+                return subprocess.CompletedProcess(argv, 0, "repair done", "")
+            return subprocess.CompletedProcess(
+                argv, 3, "", "expected reviewer failure\n"
+            )
+
+        try:
+            run_workflow(
+                ControllerConfig(
+                    repo_root=repo_root, plan_path=plan_path, max_turns=40,
+                    start_step=b_boot.start_step, reserved_run_id="review-b",
+                    keep_runs=20,
+                ),
+                workflow_config, "live", config_dir=repo_root,
+                snapshot_config=False, runner=b_runner,
+                resume=b_boot.resume_context,
+            )
+        except WorkflowError as exc:
+            b_dir = exc.run_dir
+        else:  # pragma: no cover - B must fail at the reviewer
+            raise AssertionError("B did not fail at review")
+        assert b_calls == ["reviewer", "worker", "reviewer"]
+
+        # Only B's disposable producing-review receipt (turn 1) is mutated; its
+        # owner history and selected worker remain unchanged.
+        review_path = b_dir / "turns" / "turn-001" / "result.json"
+        review = json.loads(review_path.read_text(encoding="utf-8"))
+        if mutation == "local_review_missing_rejection":
+            review.pop("review_rejection", None)
+        elif mutation == "local_review_foreign_repair":
+            review["review_rejection"]["repair_plan_path"] = "foreign-overlay.md"
+        elif mutation == "local_review_missing_post_snapshot":
+            review["snapshot_after"] = None
+        elif mutation == "local_review_missing_transition":
+            review["chosen_transition"] = None
+        else:  # pragma: no cover - parametrize covers every case
+            raise AssertionError(f"unhandled mutation {mutation!r}")
+        review_path.write_text(json.dumps(review), encoding="utf-8")
+
+        runs_root = repo_root / ".aflow" / "runs"
+        before_runs = sorted(path.name for path in runs_root.iterdir())
+        source_artifacts = {
+            path.relative_to(b_dir).as_posix(): path.read_bytes()
+            for path in sorted(b_dir.rglob("*"))
+            if path.is_file()
+        }
+        with pytest.raises(ValueError, match="pending-review evidence"):
+            self._bootstrap_for(repo_root, workflow_config, "review-b")
+        assert sorted(p.name for p in runs_root.iterdir()) == before_runs
+        self._assert_source_preserved(b_dir, source_artifacts)
+
+    @pytest.mark.parametrize(
+        "mutation",
+        [
+            "local_receipt_foreign_scope",
+            "local_receipt_foreign_source",
+            "local_receipt_wrong_predecessor",
+            "local_receipt_foreign_checkpoint",
+            "local_receipt_foreign_selector",
+            "local_receipt_foreign_original",
+            "local_receipt_missing_before",
+            "local_receipt_inconsistent_after",
+            "local_receipt_wrong_transition",
+            "local_receipt_false_new_plan",
+            "local_receipt_boolean_returncode",
+        ],
+    )
+    def test_bootstrap_failed_pending_review_v12_producing_receipt_refuses(
+        self, tmp_path: Path, mutation: str
+    ) -> None:
+        """Issue #79 v12: the producing receipt's recorded rejection and finalization are correlated.
+
+        B performs one real rejection and repair worker before the failing
+        review, so the selected local worker (turn 2, ordinal 2) is bound to
+        its producing rejection. Each mutation breaks one dimension of the
+        producing review receipt's actual relationship to the selected
+        owner-history rejection: the recorded rejection's scope, source run,
+        reviewed predecessor ordinal, or checkpoint is foreign; the receipt's
+        selector or original plan is foreign; its before-snapshot is removed;
+        its after-snapshot contradicts the before-snapshot; its produced
+        transition is not the selected repair worker's step; its
+        ``NEW_PLAN_EXISTS`` condition is false; or its return code is boolean
+        false instead of the producer-supported integer zero. The CLI
+        bootstrap must refuse cleanly before any successor is allocated, with
+        no new run and B source bytes preserved.
+        """
+        from tests.test_control_plane_resume import _bootstrap_cli, _progression_source
+
+        repo_root, plan_path, config_path, workflow_config, a_dir = _progression_source(
+            tmp_path / "repo"
+        )
+        b_boot = _bootstrap_cli(repo_root, config_path, workflow_config, a_dir.name)
+        assert b_boot.start_step == "review"
+        b_calls: list[str] = []
+
+        def b_runner(
+            argv: list[str], **kwargs: object
+        ) -> subprocess.CompletedProcess[str]:
+            prompt = str(kwargs["input"])
+            b_calls.append("worker" if "Implement " in prompt else "reviewer")
+            if len(b_calls) == 1:
+                overlay = Path(prompt.split("repair at ", 1)[1].split()[0].rstrip("."))
+                overlay.write_text("# Repair\n\n- [ ] fix\n", encoding="utf-8")
+                return subprocess.CompletedProcess(argv, 0, "repair needed", "")
+            if b_calls[-1] == "worker":
+                active = Path(prompt.split("Implement ", 1)[1].rstrip("."))
+                active.write_text(
+                    active.read_text(encoding="utf-8").replace("[ ]", "[x]"),
+                    encoding="utf-8",
+                )
+                return subprocess.CompletedProcess(argv, 0, "repair done", "")
+            return subprocess.CompletedProcess(
+                argv, 3, "", "expected reviewer failure\n"
+            )
+
+        try:
+            run_workflow(
+                ControllerConfig(
+                    repo_root=repo_root, plan_path=plan_path, max_turns=40,
+                    start_step=b_boot.start_step, reserved_run_id="review-b",
+                    keep_runs=20,
+                ),
+                workflow_config, "live", config_dir=repo_root,
+                snapshot_config=False, runner=b_runner,
+                resume=b_boot.resume_context,
+            )
+        except WorkflowError as exc:
+            b_dir = exc.run_dir
+        else:  # pragma: no cover - B must fail at the reviewer
+            raise AssertionError("B did not fail at review")
+        assert b_calls == ["reviewer", "worker", "reviewer"]
+
+        # Only B's disposable producing-review receipt (turn 1) is mutated; its
+        # owner history and selected worker remain unchanged.
+        review_path = b_dir / "turns" / "turn-001" / "result.json"
+        review = json.loads(review_path.read_text(encoding="utf-8"))
+        if mutation == "local_receipt_foreign_scope":
+            review["review_rejection"]["scope_id"] = "foreign-scope"
+        elif mutation == "local_receipt_foreign_source":
+            review["review_rejection"]["source_run_id"] = "foreign-source"
+        elif mutation == "local_receipt_wrong_predecessor":
+            review["review_rejection"]["reviewed_attempt_ordinal"] = 999
+        elif mutation == "local_receipt_foreign_checkpoint":
+            review["review_rejection"]["checkpoint_name"] = "Foreign checkpoint"
+        elif mutation == "local_receipt_foreign_selector":
+            review["selector"] = "foreign-reviewer"
+        elif mutation == "local_receipt_foreign_original":
+            review["original_plan_path"] = "foreign-original.md"
+        elif mutation == "local_receipt_missing_before":
+            review["snapshot_before"] = None
+        elif mutation == "local_receipt_inconsistent_after":
+            review["snapshot_after"]["total_checkpoint_count"] += 1
+        elif mutation == "local_receipt_wrong_transition":
+            review["chosen_transition"] = "review"
+        elif mutation == "local_receipt_false_new_plan":
+            review["conditions"]["NEW_PLAN_EXISTS"] = False
+        elif mutation == "local_receipt_boolean_returncode":
+            review["returncode"] = False
+        else:  # pragma: no cover - parametrize covers every case
+            raise AssertionError(f"unhandled mutation {mutation!r}")
+        review_path.write_text(json.dumps(review), encoding="utf-8")
+
+        runs_root = repo_root / ".aflow" / "runs"
+        before_runs = sorted(path.name for path in runs_root.iterdir())
+        source_artifacts = {
+            path.relative_to(b_dir).as_posix(): path.read_bytes()
+            for path in sorted(b_dir.rglob("*"))
+            if path.is_file()
+        }
+        with pytest.raises(ValueError, match="pending-review evidence"):
+            self._bootstrap_for(repo_root, workflow_config, "review-b")
+        assert sorted(p.name for p in runs_root.iterdir()) == before_runs
+        self._assert_source_preserved(b_dir, source_artifacts)
+
+    # Candidate-shape mutations (failed terminal source, configured reviewer
+    # current step, awaiting-review scope) must produce a clean public refusal
+    # before any successor is allocated; noncandidate mutations keep the
+    # established no-review-route fallback.
+    @staticmethod
+    def _candidate_refusal_mutations() -> set[str]:
+        return {
+            "missing_last_receipt",
+            "mismatched_receipt_turn",
+            "mismatched_receipt_step",
+            "unfinalized_receipt",
+            "unknown_receipt_status",
+            "worker_receipt_role",
+            "wrong_original_plan_path",
+            "foreign_original_plan_path",
+            "wrong_active_plan_path",
+            "foreign_active_plan_path",
+            "missing_original_plan_path",
+            "blank_original_plan_path",
+            "nonstring_original_plan_path",
+            "missing_active_plan_path",
+            "blank_active_plan_path",
+            "nonstring_active_plan_path",
+            "invalid_post_snapshot",
+            "inconsistent_post_snapshot",
+            "missing_last_snapshot",
+            "malformed_last_snapshot",
+            "foreign_last_snapshot_index",
+            "turn_dir_symlink",
+            "result_symlink",
+        }
+
+    @pytest.mark.parametrize(
+        "mutation",
+        [
+            "missing_last_receipt",
+            "mismatched_receipt_turn",
+            "mismatched_receipt_step",
+            "unfinalized_receipt",
+            "unknown_receipt_status",
+            "worker_receipt_role",
+            "worker_current_step",
+            "turn_count_mismatch",
+            "absent_awaiting_scope",
+            "active_source",
+            "wrong_original_plan_path",
+            "foreign_original_plan_path",
+            "wrong_active_plan_path",
+            "foreign_active_plan_path",
+            "missing_original_plan_path",
+            "blank_original_plan_path",
+            "nonstring_original_plan_path",
+            "missing_active_plan_path",
+            "blank_active_plan_path",
+            "nonstring_active_plan_path",
+            "invalid_post_snapshot",
+            "inconsistent_post_snapshot",
+            "missing_last_snapshot",
+            "malformed_last_snapshot",
+            "foreign_last_snapshot_index",
+            "turn_dir_symlink",
+            "result_symlink",
+        ],
+    )
+    def test_bootstrap_failed_pending_review_negatives(
+        self, tmp_path: Path, mutation: str
+    ) -> None:
+        repo_root, _plan_path, workflow_config = self._producer_source(tmp_path)
+        run_dir = repo_root / ".aflow" / "runs" / "failed-pending-review-source"
+        receipt_path = run_dir / "turns" / "turn-002" / "result.json"
+
+        def mutate_receipt() -> None:
+            receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+            if mutation == "mismatched_receipt_turn":
+                receipt["turn_number"] = 1
+            elif mutation == "mismatched_receipt_step":
+                receipt["step_name"] = "implement"
+            elif mutation == "unfinalized_receipt":
+                receipt["status"] = "starting"
+            elif mutation == "unknown_receipt_status":
+                receipt["status"] = "exploded"
+            elif mutation == "worker_receipt_role":
+                receipt["step_role"] = "worker"
+            elif mutation in {"wrong_original_plan_path", "foreign_original_plan_path"}:
+                receipt["original_plan_path"] = str(repo_root / "other-plan.md")
+            elif mutation in {"wrong_active_plan_path", "foreign_active_plan_path"}:
+                receipt["active_plan_path"] = str(repo_root / "other-plan.md")
+            elif mutation == "missing_original_plan_path":
+                receipt.pop("original_plan_path")
+            elif mutation == "blank_original_plan_path":
+                receipt["original_plan_path"] = ""
+            elif mutation == "nonstring_original_plan_path":
+                receipt["original_plan_path"] = {"invalid": True}
+            elif mutation == "missing_active_plan_path":
+                receipt.pop("active_plan_path")
+            elif mutation == "blank_active_plan_path":
+                receipt["active_plan_path"] = ""
+            elif mutation == "nonstring_active_plan_path":
+                receipt["active_plan_path"] = {"invalid": True}
+            elif mutation == "invalid_post_snapshot":
+                receipt["snapshot_after"] = {"bogus": True}
+            elif mutation == "inconsistent_post_snapshot":
+                # A valid snapshot shape but inconsistent with last_snapshot.
+                # Mark the plan as complete when it is not.
+                receipt["snapshot_after"] = {
+                    "current_checkpoint_name": "Checkpoint 2: Next",
+                    "current_checkpoint_index": 2,
+                    "unchecked_checkpoint_count": 0,
+                    "current_checkpoint_unchecked_step_count": 0,
+                    "is_complete": True,
+                    "total_checkpoint_count": 2,
+                }
+            receipt_path.write_text(json.dumps(receipt), encoding="utf-8")
+
+        def mutate_run() -> None:
+            if mutation == "active_source":
+                payload["status"] = "running"
+            elif mutation == "absent_awaiting_scope":
+                scope = dict(payload["active_implementation_scope"])
+                scope["awaiting_review"] = False
+                payload["active_implementation_scope"] = scope
+            elif mutation == "worker_current_step":
+                payload["current_step_name"] = "implement"
+            elif mutation == "turn_count_mismatch":
+                payload["active_turn"] = payload["turns_completed"]
+            elif mutation == "missing_last_snapshot":
+                payload.pop("last_snapshot")
+            elif mutation == "malformed_last_snapshot":
+                payload["last_snapshot"] = {"bogus": True}
+            elif mutation == "foreign_last_snapshot_index":
+                payload["last_snapshot"]["current_checkpoint_index"] = 0
+            else:
+                raise AssertionError(f"unhandled mutation {mutation}")
+            run_json_path = run_dir / "run.json"
+            run_json_path.write_text(
+                json.dumps(payload, sort_keys=True), encoding="utf-8"
+            )
+
+        if mutation == "missing_last_receipt":
+            receipt_path.unlink()
+        elif mutation == "turn_dir_symlink":
+            # Replace the turn directory with a symlink to outside the run.
+            turn_dir = receipt_path.parent
+            outside = tmp_path / "outside-turn"
+            outside.mkdir(exist_ok=True)
+            (outside / "result.json").write_text("{}", encoding="utf-8")
+            turn_dir.rename(turn_dir.with_name(turn_dir.name + ".bak"))
+            turn_dir.symlink_to(outside)
+        elif mutation == "result_symlink":
+            # Replace result.json with a symlink to outside the run.
+            outside_file = tmp_path / "outside-result.json"
+            outside_file.write_text(
+                json.dumps(json.loads(receipt_path.read_text(encoding="utf-8"))),
+                encoding="utf-8",
+            )
+            receipt_path.unlink()
+            receipt_path.symlink_to(outside_file)
+        elif mutation in {
+            "mismatched_receipt_turn",
+            "mismatched_receipt_step",
+            "unfinalized_receipt",
+            "unknown_receipt_status",
+            "worker_receipt_role",
+            "wrong_original_plan_path",
+            "foreign_original_plan_path",
+            "wrong_active_plan_path",
+            "foreign_active_plan_path",
+            "missing_original_plan_path",
+            "blank_original_plan_path",
+            "nonstring_original_plan_path",
+            "missing_active_plan_path",
+            "blank_active_plan_path",
+            "nonstring_active_plan_path",
+            "invalid_post_snapshot",
+            "inconsistent_post_snapshot",
+        }:
+            mutate_receipt()
+        else:
+            payload = json.loads(
+                (run_dir / "run.json").read_text(encoding="utf-8")
+            )
+            mutate_run()
+
+        runs_root = repo_root / ".aflow" / "runs"
+        before_runs = sorted(path.name for path in runs_root.iterdir())
+        source_artifacts = {
+            path.relative_to(run_dir).as_posix(): path.read_bytes()
+            for path in sorted(run_dir.rglob("*"))
+            if path.is_file()
+        }
+        if mutation in self._candidate_refusal_mutations():
+            # Candidate-shape evidence failures refuse cleanly before any
+            # successor is allocated or provider dispatched.
+            with pytest.raises(ValueError, match="pending-review evidence"):
+                self._bootstrap(repo_root, workflow_config)
+        else:
+            # Noncandidate shapes keep the established recovery paths, which
+            # for an awaiting scope is the scope-reconciliation refusal.
+            with pytest.raises(ValueError):
+                self._bootstrap(repo_root, workflow_config)
+        # No successor run directory was allocated in either case.
+        assert sorted(p.name for p in runs_root.iterdir()) == before_runs
+        # The refusal rewrites no source artifact (append-only audit grows).
+        self._assert_source_preserved(run_dir, source_artifacts)
+
+    @pytest.mark.parametrize(
+        "field", ["original_plan_path", "active_plan_path"]
+    )
+    @pytest.mark.parametrize(
+        "mutation", ["missing", "blank", "nonstring", "foreign"]
+    )
+    def test_bootstrap_failed_pending_review_unchecked_identity_refusals(
+        self, tmp_path: Path, field: str, mutation: str
+    ) -> None:
+        """Each receipt plan identity refuses independently while unchecked.
+
+        With the original checkpoint and its step still unchecked, a missing,
+        blank, non-string, or foreign receipt identity is a clean public
+        refusal: no review route, no successor run allocation, and the source
+        artifacts remain byte-identical.  There is no implementation fallback.
+        """
+        repo_root, _plan_path, workflow_config = self._producer_source(
+            tmp_path, complete_checkpoint=False
+        )
+        run_dir = repo_root / ".aflow" / "runs" / "failed-pending-review-source"
+        receipt_path = run_dir / "turns" / "turn-002" / "result.json"
+        receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+        if mutation == "missing":
+            receipt.pop(field)
+        elif mutation == "blank":
+            receipt[field] = ""
+        elif mutation == "nonstring":
+            receipt[field] = {"invalid": True}
+        else:
+            receipt[field] = str(repo_root / "other-plan.md")
+        receipt_path.write_text(json.dumps(receipt), encoding="utf-8")
+        metadata = json.loads((run_dir / "run.json").read_text(encoding="utf-8"))
+        assert metadata["last_snapshot"]["current_checkpoint_index"] == 1
+        assert metadata["last_snapshot"]["is_complete"] is False
+        source_artifacts = {
+            path.relative_to(run_dir).as_posix(): path.read_bytes()
+            for path in sorted(run_dir.rglob("*"))
+            if path.is_file()
+        }
+        runs_root = repo_root / ".aflow" / "runs"
+        before_runs = sorted(path.name for path in runs_root.iterdir())
+        with pytest.raises(ValueError, match="pending-review evidence"):
+            self._bootstrap(repo_root, workflow_config)
+        assert sorted(p.name for p in runs_root.iterdir()) == before_runs
+        self._assert_source_preserved(run_dir, source_artifacts)
+
+    def test_bootstrap_failed_pending_review_conflicting_checkpoint_name_refuses(
+        self, tmp_path: Path
+    ) -> None:
+        """A same-index snapshot renamed away from the immutable scope refuses.
+
+        Changing both the saved snapshot and the receipt post-snapshot
+        checkpoint name to a foreign name, while the immutable awaiting scope
+        retains the original name and the same index, is contradictory
+        evidence: a clean refusal, not a review admission.
+        """
+        repo_root, _plan_path, workflow_config = self._producer_source(
+            tmp_path, complete_checkpoint=False
+        )
+        run_dir = repo_root / ".aflow" / "runs" / "failed-pending-review-source"
+        run_json_path = run_dir / "run.json"
+        payload = json.loads(run_json_path.read_text(encoding="utf-8"))
+        assert payload["active_implementation_scope"]["checkpoint_name"] == (
+            "Checkpoint 1: First"
+        )
+        payload["last_snapshot"]["current_checkpoint_name"] = (
+            "Checkpoint 1: Foreign"
+        )
+        run_json_path.write_text(json.dumps(payload, sort_keys=True), encoding="utf-8")
+        receipt_path = run_dir / "turns" / "turn-002" / "result.json"
+        receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+        receipt["snapshot_after"]["current_checkpoint_name"] = (
+            "Checkpoint 1: Foreign"
+        )
+        receipt_path.write_text(json.dumps(receipt), encoding="utf-8")
+        source_artifacts = {
+            path.relative_to(run_dir).as_posix(): path.read_bytes()
+            for path in sorted(run_dir.rglob("*"))
+            if path.is_file()
+        }
+        runs_root = repo_root / ".aflow" / "runs"
+        before_runs = sorted(path.name for path in runs_root.iterdir())
+        with pytest.raises(ValueError, match="immutable checkpoint name"):
+            self._bootstrap(repo_root, workflow_config)
+        assert sorted(p.name for p in runs_root.iterdir()) == before_runs
+        self._assert_source_preserved(run_dir, source_artifacts)
+
+    def test_bootstrap_failed_pending_review_unresolved_hotplug_refuses(
+        self, tmp_path: Path
+    ) -> None:
+        repo_root, _plan_path, workflow_config = self._producer_source(tmp_path)
+        run_dir = repo_root / ".aflow" / "runs" / "failed-pending-review-source"
+
+        def apply(payload: dict[str, object]) -> None:
+            payload["current_hotplug_transaction"] = {"bogus": True}
+
+        self._mutate_run(run_dir, apply)
+        with pytest.raises(ValueError):
+            self._bootstrap(repo_root, workflow_config)
+
+    def test_bootstrap_failed_pending_review_valid_relocation(self, tmp_path: Path) -> None:
+        """A valid relocation maps historical receipt paths before identity comparison.
+
+        The failed-reviewer source recorded its plan under the historical
+        repo root.  After mapping the receipt identities through the
+        relocation they match the current authorized plan and the pending
+        review is recovered.  A current plan outside the mapped lineage is
+        refused, and without relocation the historical paths are foreign.
+        No live worktree or controller state is touched: the mapping is a
+        pure path transform on the owned read-only source.
+        """
+        from types import SimpleNamespace
+
+        import aflow.cli as cli_module
+        from aflow.resume_relocation import ResumeRelocation
+
+        # The historical run was recorded under a linked worktree of a
+        # separate primary checkout; relocation roots must be distinct and
+        # non-nested, mirroring the producer contract.
+        old_main = tmp_path / "old-main"
+        old_main.mkdir()
+        old_root = tmp_path / "old-worktree"
+        old_root.mkdir()
+        repo_root, _plan_path, _workflow_config = self._producer_source(old_root)
+        current_main = tmp_path / "current-main"
+        current_main.mkdir()
+        current_root = tmp_path / "current-worktree"
+        current_root.mkdir()
+        current_plan = current_root / "plan.md"
+        current_plan.write_text(
+            "# Plan\n\n### [x] Checkpoint 1: First\n- [x] step\n"
+            "### [ ] Checkpoint 2: Next\n- [ ] next step\n",
+            encoding="utf-8",
+        )
+        run_dir = repo_root / ".aflow" / "runs" / "failed-pending-review-source"
+        prev_run = json.loads((run_dir / "run.json").read_text(encoding="utf-8"))
+        workflow_steps = {
+            "implement": SimpleNamespace(role="worker"),
+            "review": SimpleNamespace(role="reviewer"),
+        }
+        relocation = ResumeRelocation(
+            "failed-pending-review-source",
+            old_main,
+            repo_root,
+            current_main,
+            current_root,
+        )
+        assert (
+            cli_module._failed_pending_review_step(
+                run_dir,
+                prev_run,
+                workflow_steps=workflow_steps,
+                relocation=relocation,
+                plan_path=current_plan,
+            )
+            == "review"
+        )
+        # Without relocation the historical receipt paths are foreign; the
+        # candidate is recognized and the refusal is clean, not a no-route
+        # fallback to implementation.
+        with pytest.raises(ValueError, match="pending-review evidence"):
+            cli_module._failed_pending_review_step(
+                run_dir,
+                prev_run,
+                workflow_steps=workflow_steps,
+                relocation=None,
+                plan_path=current_plan,
+            )
+        # A current authorized plan outside the mapped lineage is refused.
+        foreign = current_root / "other.md"
+        foreign.write_text("# Plan\n\n### [ ] Checkpoint 1\n- [ ] step\n", encoding="utf-8")
+        with pytest.raises(ValueError, match="pending-review evidence"):
+            cli_module._failed_pending_review_step(
+                run_dir,
+                prev_run,
+                workflow_steps=workflow_steps,
+                relocation=relocation,
+                plan_path=foreign,
+            )

@@ -156,6 +156,175 @@ boundary. For an actual run, inspect the saved run metadata, finalized worker
 receipt, scope envelope/evidence, manager boundary, unit start/exit receipts,
 and current Git identity read-only before requesting recovery.
 
+## Resuming a Failed Reviewer at the Pending Review (issue #79)
+
+A failed terminal run can carry a finalized unsuccessful reviewer receipt:
+the worker completed its checkpoint, the controller advanced to the
+configured reviewer, and the reviewer turn ended in a proven harness failure
+(the run is `failed` with no terminal `end_reason`, `active_turn` is exactly
+`turns_completed + 1`, and the final turn result is a `harness-failed`
+reviewer receipt with a nonzero return code and produced finalization
+evidence). The original implementation scope is still awaiting review, so
+the pending work is the review itself. Resume admission accepts exactly that
+proven shape: the saved `current_step_name` must be the configured reviewer
+step, the awaiting-review scope must reference the same original plan with a
+positive checkpoint index, and the receipt's turn, step, and role must all
+agree with the run metadata.
+
+Receipt binding enforces path ownership and identity: the `turns` directory
+and the selected turn directory must be owned directories (not symlink
+escapes), and `result.json` must be an owned regular file. The receipt's
+recorded `original_plan_path` and `active_plan_path` are both required
+evidence: each must be a nonempty string that, after relocation mapping,
+matches the current authorized plan. A missing, blank, non-string,
+unparseable, unmapped, or foreign identity is failed validation, never
+permission to skip the comparison. Once the candidate shape is recognized,
+every such evidence failure is a clean resume refusal before any successor
+is allocated, a unit is started, or a provider is dispatched; it is never
+an indistinguishable no-route value that falls through to implementation.
+The saved `last_snapshot` may describe the currently supported
+complete/next-checkpoint scope, or the same awaiting scope with the original
+checkpoint still unchecked; in the latter case the scope's checkpoint index
+is bound to that checkpoint, its checkpoint name must equal the scope's
+immutable checkpoint name, and the exact turn/count/step/role/status/
+return-code checks still apply, so approval is never inferred from
+checkpoint or step completion. The produced
+`snapshot_after` must decode to a valid plan snapshot and be consistent with
+the source's saved `last_snapshot`; an empty, invalid, or inconsistent
+finalization snapshot rejects the route. Sources outside the candidate shape (an active source, a non-reviewer
+current step, an absent awaiting scope, a missing scope index, or no single
+open finalized turn) keep the existing admission paths, which never dispatch
+a provider on the weaker route.
+
+The successor starts directly at that reviewer with the predecessor's
+full turn history and the retained scope; it never re-runs the completed
+implementation step first, and the predecessor run directory is never
+rewritten. Under `keep_runs=1`, the failed-review predecessor is added to
+the preserved resume run-ID set before `create_run_paths`, so its
+`run.json`, turn receipts, and scope evidence remain byte-identical and
+accessible at first review and after successor completion. The route yields
+to the existing repair, budget, owner-stopped, and cumulative-review routes
+and is used through CLI, daemon, REST, and MCP with the same idempotency
+boundary.
+
+Worker-owner binding: when the resumed reviewer's prompt needs the exact
+worker receipt, the controller resolves the latest awaiting-scope worker
+attempt source-first. It checks the source run before following the
+`resumed_from_run_id` chain, so a valid new local repair worker for that
+scope satisfies the requirement without any unrelated ancestor having to own
+the same local turn number; an inherited worker additionally requires every
+validated predecessor up to and including its owner. Each candidate receipt
+must be producer-supported, successful, and finalized worker evidence: an
+integer, non-boolean zero return code, decoded before/after snapshot
+evidence (an empty or malformed snapshot mapping is invalid), and a produced
+nonblank selected transition, with an exact matching
+turn/step/role and original-plan identity. The receipt's nonempty
+`active_plan_path` is bound to that identity: an original worker's active
+plan must be the original plan, and a repair worker's active plan must be
+the exact overlay produced by the unique rejection for which that worker is
+the repair — the scope's recorded rejection whose reviewed ordinal is
+exactly one less than the worker's ordinal and whose reviewed worker
+identity matches the predecessor turn. The selected repair must have its
+predecessor recorded in the scope's attempt sequence: a missing or
+ambiguous predecessor is a refusal, never a skip; a legacy rejection without
+an ordinal may use its reviewed turn number only when it uniquely
+identifies the predecessor. The producing rejection is bound to its actual
+owned producing review, not only to matching ordinal and path metadata: its
+`source_run_id` must be the worker's owner run or an owned
+`resumed_from_run_id` ancestor in the recorded lineage, and that run must
+hold a finalized completed reviewer receipt (owned `turns`/turn
+directories, an owned regular receipt) at the recorded
+`review_turn_number`/`review_step_name`; the rejection's checkpoint index
+and name must agree with the selected immutable awaiting scope when both
+sides carry them; and a local producing review must precede the selected
+worker in that run. A completed reviewer status at the named step/turn alone
+is not enough: that producing receipt must also carry the finalized rejection
+it actually produced, correlated field by field with the selected
+owner-history rejection (never raw object equality, so a genuinely
+ordinal-absent owner-history record stays admissible when the uniquely
+recorded predecessor and producing receipt establish the same relationship):
+the recorded `review_rejection`'s scope, rejection number, producing
+source/step/turn, checkpoint identity, reviewer selector, reviewed
+predecessor turn/selector/team, and historical repair overlay must agree with
+the selected relationship, and a present reviewed ordinal must agree with the
+selected predecessor. The receipt's actual `selector` must be the producing
+reviewer, and its `original_plan_path` the immutable scope original plan.
+The producer-supported finalization requires an integer non-boolean zero
+return code, valid decoded before/after snapshots that agree (the original
+snapshot does not change during a scoped rejection),
+`NEW_PLAN_EXISTS=true`, `MAX_TURNS_REACHED=false`, `DONE` equal to the
+original snapshot's completion, and the produced transition to the selected
+repair worker's actual step. The receipt rejection's repair path, the
+selected rejection's repair path, and the receipt's `new_plan_path` must all
+be the same historical overlay (relative identities resolved against the
+repository, so equivalent relative/absolute spellings agree; the consumed
+overlay need not still exist). A foreign source run, a non-reviewer review
+step, a review turn with no producing receipt, a contradictory checkpoint, a
+missing predecessor, a producing receipt with no `review_rejection`, a
+recorded rejection whose scope, source, predecessor ordinal, checkpoint,
+selector, or original plan is foreign, a removed or contradictory
+before/after snapshot, a produced transition that is not the repair worker's
+step, a false `NEW_PLAN_EXISTS` condition, a boolean return code, a
+producing rejection naming a foreign repair overlay, or a `new_plan_path`
+that is not the repair overlay refuses; a repair worker naming the original
+plan, a stale same-scope overlay from an earlier repair, or any unrelated,
+missing, or malformed active plan refuses. The owner's active scope must
+match the selected immutable awaiting scope's identity — scope id,
+checkpoint index, checkpoint name, original-plan path, and, when the scope
+carries one, its exact envelope reference; an attempts-map key alone does
+not prove matching scope ownership, and a contradictory checkpoint index,
+checkpoint name, original plan, or envelope refuses. When the scope carries
+an envelope reference, the owner's envelope artifact must also validate
+against the recorded bytes: the artifact hash, scope id, checkpoint index
+and name, plan digest, and canonical encoding are all checked, so the
+recorded hashes alone are not sufficient. The owner's recorded attempts
+under the same immutable scope must establish the selected step, worker
+role, local turn, and scope-local ordinal through a unique strong match:
+either exactly one recorded attempt with a well-formed ordinal equal to the
+selected ordinal and no other recorded ordinal, or, for a legacy owner,
+exactly one recorded attempt with no ordinal and no recorded ordinal
+anywhere. A present recorded ordinal must be a positive non-boolean integer
+(a malformed present value is not a legacy absence and refuses), a recorded
+ordinal higher than the selected ordinal is a contradiction and refuses, an
+ambiguous legacy duplicate (two ordinal-less recorded attempts) refuses, and
+an owner that records no worker attempt under the resumed scope (for
+example because its attempts were re-keyed to a foreign scope) refuses;
+none of these becomes a weaker legacy fallback. A JSON object or mere file existence proves nothing: a
+non-finalized status, a nonzero completed return code, a missing
+post-snapshot, a missing produced transition, a foreign `original_plan_path`,
+a mismatched turn number, a malformed or non-object receipt, a symlinked
+metadata file, or a symlinked run/`turns`/turn directory refuses the
+candidate. A symlinked `turns` parent escapes the owned run and refuses
+rather than following it. A run directory that exists only as a
+symlink — including an intermediate run in the chain — is refused before
+its existence is classified or its `run.json` is followed: a present link
+is not absence and never supplies owned lineage evidence. A malformed
+candidate worker is never silently replaced by an older worker. An intermediate review-only run
+that legitimately carries a reviewer receipt at the same local turn is walked
+through to its owned predecessor rather than treated as a worker or refusing
+a valid inherited worker. The same validated decision drives admission, the
+prompt's artifact reference/location, and the preserved predecessor set. The
+strict binding publishes the physical dependencies it actually validated —
+the worker owner, the producing rejection's source run when the selected
+worker is a repair, and the owned links connecting the resumed-from run to
+those owners from the existing chain walk — and only that set is added to the
+preserved resume run-ID set before `create_run_paths`, so the worker receipt
+and its lineage survive `keep_runs=1` pruning and, for a repair whose
+validated producing rejection is owned by an earlier run, that producer and
+every owned intermediate link are also preserved so the strict binding can
+re-validate the producing receipt on a subsequent retry. Because retention
+reuses the binding's validated relationship (not a separate ordinal-only
+scan), a genuinely ordinal-absent legacy producer is retained exactly like its
+ordinal-bearing counterpart, and a binding refusal publishes no dependency set
+at all. If the required owner cannot be uniquely and safely
+bound (missing, foreign, malformed, cyclic, or symlinked lineage), admission
+refuses cleanly before any successor, manifest, unit, or provider is
+allocated; it never falls back to the historical single-hop reviewer-file
+route, fabricates evidence, or replays implementation. This route performs
+no debug-file I/O: preview, bootstrap, and resume reconstruction never
+depend on the writability of any scratch file (for example `/tmp/dbg.txt`),
+so an unwritable debug path cannot block a valid resume.
+
 ## Resuming a Managed-Stop Killed Pending Checkpoint Repair (issue #55)
 
 A managed owner stop (`owner_stopped`) can kill the controller in the middle

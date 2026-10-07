@@ -126,6 +126,7 @@ _PENDING_REPARTITION_ARTIFACT_FIELDS = (
 )
 from .workflow import (
     WorkflowError,
+    _bind_worker_receipt,
     _latest_approved_checkpoint_index,
     _rebase_scope_envelope_evidence,
     _scope_envelope_reference,
@@ -1725,6 +1726,21 @@ def _bootstrap_resume_invocation(
         )
         is not None
     )
+    # Issue #79: a failed terminal source whose last turn is a proven
+    # finalized unsuccessful reviewer receipt with the original
+    # awaiting-review scope resumes at the pending review.  The complete
+    # snapshot of a single-checkpoint plan is expected for that shape, so the
+    # candidate check must not reject it as an already-complete run.
+    has_failed_pending_review = (
+        _failed_pending_review_step(
+            run_dir,
+            prev_run,
+            workflow_steps=workflow_spec.steps,
+            relocation=relocation,
+            plan_path=plan_path,
+        )
+        is not None
+    )
     mismatch_reason = _resume_candidate_mismatch_reason(
         prev_run,
         workflow_spec,
@@ -1746,6 +1762,7 @@ def _bootstrap_resume_invocation(
         allow_budget_continuation=budget_boundary is not None,
         allow_review_repair=review_repair_step is not None,
         allow_stopped_repair=has_stopped_pending_repair,
+        allow_failed_pending_review=has_failed_pending_review,
         team_explicit=saved_team_explicit,
         max_turns_explicit=saved_max_turns_explicit,
         run_dir=run_dir,
@@ -1804,7 +1821,11 @@ def _bootstrap_resume_invocation(
         start_step=(
             resume_context.pending_cumulative_review.reviewer_step_name
             if resume_context.pending_cumulative_review is not None
-            else effective_start_step
+            else (
+                resume_context.failed_pending_review_step
+                if resume_context.failed_pending_review_step is not None
+                else effective_start_step
+            )
         ),
         max_turns=effective_max_turns,
         extra_instructions=effective_extra,
@@ -1843,6 +1864,7 @@ def _resume_candidate_mismatch_reason(
     allow_budget_continuation: bool = False,
     allow_review_repair: bool = False,
     allow_stopped_repair: bool = False,
+    allow_failed_pending_review: bool = False,
     team_explicit: bool | None = None,
     max_turns_explicit: bool | None = None,
     run_dir: Path | None = None,
@@ -1910,6 +1932,7 @@ def _resume_candidate_mismatch_reason(
         and not allow_owner_stopped_pending_review
         and not allow_budget_continuation
         and not allow_stopped_repair
+        and not allow_failed_pending_review
     ):
         if run_dir is not None:
             try:
@@ -1938,6 +1961,7 @@ def _resume_candidate_mismatch_reason(
         and not _completed_manager_budget_boundary_pending(prev_run, current_repo_root)
         and not allow_review_repair
         and not allow_stopped_repair
+        and not allow_failed_pending_review
     ):
         return "its last saved plan snapshot was already complete"
 
@@ -2216,6 +2240,307 @@ def _owner_stopped_pending_review_step(
         run_dir, prev_run, workflow_steps=workflow_steps
     )
     return final_review.reviewer_step_name if final_review is not None else None
+
+
+def _failed_pending_review_step(
+    run_dir: Path,
+    prev_run: Mapping[str, object],
+    *,
+    workflow_steps: Mapping[str, object] | None = None,
+    relocation: ResumeRelocation | None = None,
+    plan_path: Path | None = None,
+) -> str | None:
+    """Recover the pending reviewer after a finalized unsuccessful reviewer turn.
+
+    Issue #79: a failed terminal source whose last turn is a proven finalized
+    unsuccessful reviewer receipt, with the original awaiting-review scope
+    still open, must resume at the pending review instead of falling back to
+    the workflow's first implementation step.  A status string or
+    ``current_step_name`` alone is never enough: the failed terminal status,
+    exact active turn ownership (``active_turn == turns_completed + 1``), the
+    finalized reviewer receipt (turn, step, role, produced finalization
+    evidence), the configured reviewer role, and the awaiting-review scope
+    with matching original plan must all agree.
+
+    The candidate shape is a failed terminal source (no terminal
+    ``end_reason``) whose one open turn (``active_turn == turns_completed +
+    1``) is the configured reviewer step and whose original scope is awaiting
+    review.  Sources outside that shape return ``None`` so the established
+    recovery paths remain authoritative.  Once the candidate shape is
+    recognized, every missing, malformed, unreadable, or contradictory
+    receipt/finalization/snapshot-identity item is a clean resume refusal
+    (``ValueError``), never an indistinguishable no-route value that would
+    fall through to implementation.  Checkboxes never grant or revoke
+    eligibility, and a validation failure never becomes permission to replay
+    a worker.
+    """
+    if prev_run.get("status") != "failed" or prev_run.get("end_reason") is not None:
+        return None
+    current_step_name = prev_run.get("current_step_name")
+    if not isinstance(current_step_name, str) or not current_step_name.strip():
+        return None
+    if workflow_steps is not None:
+        step = workflow_steps.get(current_step_name)
+        if step is None or getattr(step, "role", None) != "reviewer":
+            return None
+    scope = prev_run.get("active_implementation_scope")
+    if not isinstance(scope, Mapping) or scope.get("awaiting_review") is not True:
+        return None
+    index = scope.get("checkpoint_index")
+    if not isinstance(index, int) or isinstance(index, bool) or index < 1:
+        return None
+    original_plan = prev_run.get("original_plan_path")
+    scope_plan = scope.get("original_plan_path")
+    if (
+        isinstance(original_plan, str)
+        and original_plan.strip()
+        and scope_plan != original_plan
+    ):
+        return None
+    turns_completed = prev_run.get("turns_completed")
+    active_turn = prev_run.get("active_turn")
+    if (
+        not isinstance(turns_completed, int)
+        or isinstance(turns_completed, bool)
+        or turns_completed < 0
+        or not isinstance(active_turn, int)
+        or isinstance(active_turn, bool)
+        or active_turn != turns_completed + 1
+    ):
+        # The last turn is not one open finalized reviewer turn, so the
+        # source is outside the candidate shape and the established recovery
+        # paths (for example the pending cumulative review) remain
+        # authoritative.
+        return None
+    # The source matches the failed-reviewer/awaiting-scope candidate shape:
+    # a failed terminal source whose one open turn is the configured reviewer
+    # with the original scope awaiting review.  From here on, every missing,
+    # malformed, unreadable, or contradictory evidence item is a clean
+    # refusal, never a silent no-route fallback to implementation.
+    run_id = run_dir.name
+
+    def _refuse(reason: str) -> None:
+        raise ValueError(
+            f"error: run '{run_id}' has a failed reviewer turn with an "
+            "awaiting-review scope, but its pending-review evidence is "
+            f"invalid: {reason}; refusing to resume and starting no "
+            "successor."
+        )
+
+    snapshot = _resume_plan_snapshot(prev_run.get("last_snapshot"))
+    # A valid saved snapshot may describe the currently supported
+    # complete/next-checkpoint scope, or the same awaiting scope the receipt
+    # is reviewing (the original checkpoint may remain unchecked).  In the
+    # same-scope case the scope's index is already bound to that checkpoint
+    # above and its immutable checkpoint name must agree too; the exact
+    # turn/count/step/role/status/return-code checks and the decoded receipt
+    # post-snapshot equality below still apply, so approval is never inferred
+    # from step completion alone.
+    if snapshot is None:
+        _refuse(
+            "the saved last snapshot is missing, malformed, or not decodable "
+            "plan-snapshot evidence"
+        )
+    if not (
+        snapshot.is_complete is True
+        or snapshot.current_checkpoint_index in {index, index + 1}
+    ):
+        _refuse(
+            f"the saved snapshot's current checkpoint index "
+            f"{snapshot.current_checkpoint_index!r} is neither complete nor "
+            f"the awaiting scope's same ({index}) or next ({index + 1}) "
+            "checkpoint"
+        )
+    if snapshot.current_checkpoint_index == index:
+        scope_checkpoint_name = scope.get("checkpoint_name")
+        if (
+            not isinstance(scope_checkpoint_name, str)
+            or not scope_checkpoint_name.strip()
+            or snapshot.current_checkpoint_name != scope_checkpoint_name
+        ):
+            _refuse(
+                "the same-checkpoint snapshot does not carry the awaiting "
+                "scope's immutable checkpoint name"
+            )
+    # Validate receipt path ownership: turns and the selected turn must be
+    # owned directories (not symlink escapes), and result.json must be an
+    # owned regular file.
+    turns_dir = run_dir / "turns"
+    if turns_dir.is_symlink() or not turns_dir.is_dir():
+        _refuse("the turns directory is not an owned directory")
+    turn_dir = turns_dir / f"turn-{active_turn:03d}"
+    if turn_dir.is_symlink() or not turn_dir.is_dir():
+        _refuse("the selected turn directory is not an owned directory")
+    result_path = turn_dir / "result.json"
+    if result_path.is_symlink() or not result_path.is_file():
+        _refuse("the turn result is not an owned regular file")
+    try:
+        result = json.loads(result_path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        _refuse(f"the finalized reviewer receipt is missing or unreadable: {exc}")
+    if not isinstance(result, Mapping):
+        _refuse("the finalized reviewer receipt is not a JSON object")
+    if (
+        result.get("turn_number") != active_turn
+        or result.get("step_name") != current_step_name
+        or result.get("step_role") != "reviewer"
+        or result.get("chosen_transition") is not None
+    ):
+        _refuse(
+            "the finalized reviewer receipt does not prove this exact turn, "
+            "step, and role"
+        )
+    # Validate plan identity: the receipt's recorded plan paths must match
+    # the source's recorded plan (after relocation mapping).  Both identities
+    # are required evidence; a missing, blank, non-string, unmapped, or
+    # foreign value is a clean refusal, never permission to skip the
+    # comparison.
+    expected_plan = _resume_result_path(str(plan_path), relocation=relocation)
+    if expected_plan is None:
+        _refuse("the expected plan path is not usable")
+    receipt_original = _resume_result_path(
+        result.get("original_plan_path"), relocation=relocation
+    )
+    receipt_active = _resume_result_path(
+        result.get("active_plan_path"), relocation=relocation
+    )
+    if receipt_original is None or not _resume_path_matches(
+        receipt_original, expected_plan
+    ):
+        _refuse(
+            "the receipt's original plan identity is missing, unmapped, or "
+            "foreign"
+        )
+    if receipt_active is None or not _resume_path_matches(
+        receipt_active, expected_plan
+    ):
+        _refuse(
+            "the receipt's active plan identity is missing, unmapped, or "
+            "foreign"
+        )
+    status = result.get("status")
+    if status == "harness-failed":
+        if (
+            not isinstance(result.get("returncode"), int)
+            or isinstance(result.get("returncode"), bool)
+            or result.get("returncode") == 0
+            or not isinstance(result.get("snapshot_after"), Mapping)
+        ):
+            _refuse(
+                "the finalized reviewer receipt lacks a nonzero failure with "
+                "a produced snapshot"
+            )
+    elif status == "owner-stopped":
+        # Producer-supported owner stop of the reviewer turn; the managed
+        # owner-stopped source keeps its existing separate route.
+        if not (
+            isinstance(result.get("snapshot_before"), Mapping)
+            and isinstance(result.get("snapshot_after"), Mapping)
+        ):
+            _refuse(
+                "the owner-stopped reviewer receipt lacks strict before/after "
+                "snapshots"
+            )
+    else:
+        _refuse(
+            f"the finalized reviewer receipt has unsupported status {status!r}"
+        )
+    # Decode and bind the produced finalization snapshot: it must be valid
+    # and consistent with the source's saved last snapshot.
+    result_snapshot_after = _resume_plan_snapshot(result.get("snapshot_after"))
+    if result_snapshot_after is None:
+        _refuse("the receipt's post-snapshot is not valid plan evidence")
+    if result_snapshot_after != snapshot:
+        _refuse(
+            "the receipt's post-snapshot does not equal the saved snapshot"
+        )
+    # Verify the worker receipt can be bound (source-first) before admitting
+    # the successor. This applies to every proven failed-review source,
+    # including an initial source without a predecessor: the source run is
+    # checked first, then its owned resumed_from_run_id chain for an inherited
+    # worker. A pruned, broken, foreign, cyclic, symlink-escaping, or
+    # unbindable lineage refuses cleanly with no allocation.
+    attempts_map = prev_run.get("implementation_attempts")
+    scope_data = prev_run.get("active_implementation_scope")
+    scope_id = (
+        scope_data.get("scope_id")
+        if isinstance(scope_data, Mapping)
+        else None
+    )
+    scope_checkpoint_name: str | None = None
+    scope_original_plan: str | None = None
+    scope_envelope: tuple[str, str, str] | None = None
+    if isinstance(scope_data, Mapping):
+        cname = scope_data.get("checkpoint_name")
+        if isinstance(cname, str):
+            scope_checkpoint_name = cname
+        oplan = scope_data.get("original_plan_path")
+        if isinstance(oplan, str):
+            scope_original_plan = oplan
+        envelope_values = (
+            scope_data.get("envelope_artifact_path"),
+            scope_data.get("envelope_artifact_sha256"),
+            scope_data.get("envelope_canonical_sha256"),
+        )
+        if all(isinstance(v, str) and v for v in envelope_values):
+            scope_envelope = tuple(envelope_values)  # type: ignore[arg-type]
+    attempts = (
+        attempts_map.get(scope_id, [])
+        if isinstance(attempts_map, Mapping) and isinstance(scope_id, str)
+        else []
+    )
+    worker_attempts = [
+        a for a in attempts
+        if isinstance(a, Mapping) and a.get("role") == "worker"
+    ]
+    if not worker_attempts:
+        # A proven failed-review source must have its scope's worker recorded
+        # by the owner. No recorded worker attempt under the resumed scope
+        # means the owner's metadata does not establish this scope's ownership
+        # (for example the attempts were re-keyed to a foreign scope), so the
+        # lineage refuses rather than being admitted with no worker binding.
+        _refuse(
+            "the owner does not record a worker attempt under the resumed "
+            "scope; the scope ownership is not established"
+        )
+    last_worker = worker_attempts[-1]
+    worker_turn = last_worker.get("turn_number")
+    if not (isinstance(worker_turn, int) and not isinstance(worker_turn, bool)):
+        _refuse("the owner's recorded worker attempt has no usable local turn")
+    worker_step = last_worker.get("step_name")
+    worker_ordinal = last_worker.get("attempt_ordinal")
+    repo_root = run_dir.parent.parent.parent
+    bound = _bind_worker_receipt(
+        repo_root,
+        run_id,
+        worker_turn,
+        scope_id=scope_id,
+        step_name=(
+            worker_step
+            if isinstance(worker_step, str) and worker_step.strip()
+            else None
+        ),
+        attempt_ordinal=(
+            worker_ordinal
+            if (
+                isinstance(worker_ordinal, int)
+                and not isinstance(worker_ordinal, bool)
+            )
+            else None
+        ),
+        scope_checkpoint_index=index,
+        scope_checkpoint_name=scope_checkpoint_name,
+        scope_original_plan=scope_original_plan,
+        scope_envelope=scope_envelope,
+        strict=True,
+    )
+    if bound is None:
+        _refuse(
+            "the worker receipt cannot be bound through the "
+            "resumed_from_run_id chain; the lineage is "
+            "missing, foreign, malformed, or cyclic"
+        )
+    return current_step_name
 
 
 def _managed_owner_stop_evidence(
@@ -4657,6 +4982,24 @@ def _reconstruct_resume_context(
             run_dir, prev_run, workflow_steps=workflow_steps
         ) is not None
     )
+    # Issue #79: one proven pending-review route.  The failed terminal source
+    # carries a finalized unsuccessful reviewer receipt and the original
+    # awaiting-review scope; the successor starts at that reviewer.  Existing
+    # specialized routes (repair, budget, owner-stopped) keep precedence, and
+    # the scope-reconciliation / cumulative-review paths must not close the
+    # retained scope while the review is pending.
+    failed_pending_review_step = (
+        _failed_pending_review_step(
+            run_dir, prev_run, workflow_steps=workflow_steps,
+            relocation=relocation, plan_path=plan_path,
+        )
+        if (
+            not reset_scope
+            and not terminal_completion_only
+            and not terminal_integration_only
+        )
+        else None
+    )
     pending_cumulative_review: PendingCumulativeReview | None = None
     if (
         not reset_scope
@@ -4676,6 +5019,7 @@ def _reconstruct_resume_context(
         and not terminal_completion_only
         and not terminal_integration_only
         and not has_owner_stopped_pending_review
+        and failed_pending_review_step is None
         and budget_boundary is None
     ):
         repo_root_value = prev_run.get("repo_root")
@@ -4698,6 +5042,7 @@ def _reconstruct_resume_context(
         and pending_cumulative_review is None
         and review_repair_step is None
         and not has_owner_stopped_pending_review
+        and failed_pending_review_step is None
         and budget_boundary is None
     ):
         reconciled_scope = _reconcile_verified_resume_scope(
@@ -4829,6 +5174,8 @@ def _reconstruct_resume_context(
             if budget_boundary is not None
             else pending_cumulative_review.reviewer_step_name
             if pending_cumulative_review is not None
+            else failed_pending_review_step
+            if failed_pending_review_step is not None
             else effective_start_step
             if start_step_override
             else (
@@ -4905,6 +5252,7 @@ def _reconstruct_resume_context(
         resume_team_override=resume_team_override,
         budget_continuation=budget_boundary,
         review_repair_step=review_repair_step,
+        failed_pending_review_step=failed_pending_review_step,
         **hotplug_fields,
         **manager_fields,
     ))

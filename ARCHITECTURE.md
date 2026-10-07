@@ -1150,7 +1150,107 @@ classifier while retaining its backup-plan and active-plan allowances.
    owner-directed replacement and preserves lifecycle identity and manager
    history while omitting the saved active overlay and clearing the live
    scope/attempt index; the linked source run retains the immutable attempt
-   audit.
+   audit. A failed terminal source whose last turn is a proven finalized
+   unsuccessful reviewer receipt while the original scope is still awaiting
+   review resumes at that pending reviewer
+   (`ResumeContext.failed_pending_review_step`), never re-running the completed
+   implementation step first; the route yields to the repair, budget,
+   owner-stopped, and cumulative-review routes. Once the candidate shape is
+   recognized, missing, malformed, unreadable, or contradictory evidence is
+   a clean resume refusal before any successor is allocated; sources outside
+   the candidate shape keep the existing admission paths. The worker-owner
+   binding resolves the latest awaiting-scope worker attempt source-first: it
+   checks the source run before following the `resumed_from_run_id` chain, so
+   a valid new local repair worker wins without an unrelated ancestor having
+   to own the same local turn, and the chain is walked only for an inherited
+   worker (with every necessary predecessor validated up to its owner). Each
+   candidate must be producer-supported, successful, finalized worker evidence
+   — an integer, non-boolean zero return code, decoded before/after snapshot
+   evidence (an empty or malformed snapshot mapping is invalid), and a
+   produced nonblank selected transition — with exact turn/step/role and
+   original-plan identity, and the receipt's nonempty `active_plan_path` is
+   bound to that identity (an original worker names the original plan; a
+   repair worker names the exact overlay produced by the unique rejection
+   for which that worker is the repair — the rejection whose reviewed
+   ordinal is exactly one less than the worker's ordinal and whose reviewed
+   worker identity matches the predecessor turn, with the predecessor
+   recorded in the scope's attempt sequence (a missing or ambiguous
+   predecessor refuses; a legacy ordinal-absent rejection may use its
+   reviewed turn number only when it uniquely identifies the predecessor). The
+   producing rejection is bound to its actual owned producing review: its
+   `source_run_id` must be the worker's owner run or an owned
+   `resumed_from_run_id` ancestor in the recorded lineage holding a
+   finalized completed reviewer receipt at the recorded
+   `review_turn_number`/`review_step_name`, its checkpoint identity must
+   agree with the selected immutable awaiting scope, and a local producing
+   review must precede the selected worker in that run; a foreign source,
+   non-reviewer step, absent producing receipt, contradictory checkpoint, or
+   missing predecessor refuses. A completed reviewer status alone is not
+   enough: that producing receipt must also carry the finalized rejection it
+   actually produced, correlated field by field with the selected
+   owner-history rejection (never raw object equality, so a genuinely
+   ordinal-absent owner-history record stays admissible): the recorded
+   `review_rejection`'s scope, rejection number, producing source/step/turn,
+   checkpoint identity, reviewer selector, reviewed predecessor
+   turn/selector/team, and historical repair overlay must agree, a present
+   reviewed ordinal must agree with the selected predecessor, the receipt's
+   actual selector must be the producing reviewer, and its original plan the
+   immutable scope original plan. The finalization must be
+   producer-supported: an integer non-boolean zero return code, decoded
+   before/after snapshots that agree, `NEW_PLAN_EXISTS=true`,
+   `MAX_TURNS_REACHED=false`, `DONE` equal to the original snapshot's
+   completion, and the produced transition to the selected repair worker's
+   actual step. The receipt rejection's repair path, the selected rejection's
+   repair path, and the `new_plan_path` must all be the same historical
+   overlay (relative identities resolved against the repository, so
+   equivalent relative/absolute spellings agree; a producing receipt with no
+   `review_rejection`, a foreign recorded rejection identity, a removed or
+   contradictory snapshot, a non-repair transition, a false `NEW_PLAN_EXISTS`,
+   a boolean return code, a foreign recorded repair overlay, or a
+   `new_plan_path` that is not the overlay refuses). The original plan, a stale same-scope
+   overlay from an earlier repair, or any unrelated, missing, or malformed
+   active plan refuses). The owner's active scope must match the
+   selected immutable awaiting scope's identity — scope id, checkpoint
+   index, checkpoint name, original-plan path, and, when present, the exact
+   envelope reference (a contradictory checkpoint index, name, original
+   plan, or envelope refuses), and the owner's envelope artifact bytes must
+   validate against the recorded hash, scope, checkpoint, plan digest, and
+   canonical encoding. The owner's recorded attempts under the same
+   immutable scope must establish the selected step/role/turn/ordinal
+   through a unique strong match: exactly one well-formed ordinal equal to
+   the selected ordinal with no other recorded ordinal, or, for a legacy
+   owner, exactly one ordinal-less attempt with no recorded ordinal
+   anywhere; a malformed present ordinal, a recorded ordinal higher than the
+   selected one, an ambiguous legacy duplicate, or a missing owner attempt
+   under the resumed scope (for example a foreign re-keyed scope) is a
+   refusal, not a weaker legacy fallback. A JSON object or file existence
+   alone proves nothing, and a malformed candidate is refused rather than
+   replaced by an older worker. The same validated decision drives admission,
+   the prompt's artifact reference, and the preserved predecessor set: the
+   strict binding publishes the physical dependencies it actually validated
+   (the worker owner, the producing rejection's source run for a repair, and
+   the owned links connecting the resumed-from run to those owners), and only
+   that set is preserved before `create_run_paths`, so the worker receipt and
+   its lineage survive `keep_runs=1` pruning; when the selected worker is a
+   repair whose validated producing rejection is owned by an earlier run, that
+   producer and every owned intermediate link are also preserved so the strict
+   binding can re-validate on a subsequent retry. Retention reuses the
+   binding's validated relationship rather than a separate ordinal-only scan,
+   so a genuinely ordinal-absent legacy producer is retained exactly like its
+   ordinal-bearing counterpart, and a binding refusal publishes no dependency
+   set. A missing,
+   foreign, malformed, cyclic, or symlinked lineage — a non-finalized status,
+   a nonzero completed return code, a missing post-snapshot, a missing produced
+   transition, a foreign plan, a mismatched turn, a symlinked metadata file, or
+   a symlinked run/`turns`/turn directory (a symlinked `turns` parent escapes
+   the owned run; a run directory that exists only as a symlink, including an
+   intermediate chain run, is refused before its `run.json` is followed — a
+   present link is not absence and never supplies owned lineage evidence) —
+   refuses cleanly at admission before any successor, unit,
+   or provider is allocated, and never falls back to the historical single-hop
+   reviewer-file route. The route performs no debug-file I/O: resume
+   preview, bootstrap, and reconstruction never depend on the writability of
+   any scratch file (for example `/tmp/dbg.txt`).
 
    An explicit `--resume RUN_ID --resume-rehome-worktree PATH` is the only
    relocation path. It verifies the current primary main branch, recorded
