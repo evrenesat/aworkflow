@@ -1,5 +1,25 @@
 # DEVLOG
 
+## 2026-10-07 — AFLOW-MAINT-20261006-01 CP2: required dashboard web lint CI step
+
+- The Dashboard CI job now runs `npm run lint` (existing web baseline,
+  `eslint src --ext ts,tsx`) immediately after `npm ci` and before the web
+  test and build steps, so every pull request exercises the same web lint
+  baseline before build. No other CI gate changed: the existing OS/Python
+  matrix, root test, ruff hygiene, browser (Chromium/WebKit) and packaging
+  jobs are all preserved as-is.
+- README "Local development" now documents the web baseline commands: the
+  required `npm --prefix apps/aflow_app/web run lint` CI step plus the
+  unchanged `npm test -- --run` and `npm run build` commands. It also records
+  that tests moved by later maintainability plans keep explicit imports and
+  focused fixtures, with no project-wide Git or path overrides to make tests
+  pass.
+- Verification: `npm --prefix apps/aflow_app/web run lint` exits 0 (same 11
+  pre-existing warnings, no errors); `git diff --check` exits 0; the workflow
+  YAML parses and the lint step is non-optional in the dashboard job. The
+  required lint step running on an exact commit is confirmed by the delivery
+  CI run after publication.
+
 ## 2026-10-07 — issue #76 release repair CP2: atomic same-plan startup-record publish
 
 - CI 37611601058 also failed

@@ -105,6 +105,10 @@ jobs:
         working-directory: apps/aflow_app/web
         run: npm ci
 
+      - name: Lint web app
+        working-directory: apps/aflow_app/web
+        run: npm run lint
+
       - name: Run web tests
         working-directory: apps/aflow_app/web
         run: npm test -- --run

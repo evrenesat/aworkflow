@@ -680,6 +680,15 @@ root production code, root tests, and the remote app server source and tests
 under the unchanged selected rules (unused imports, redefinitions, unresolved
 names, unused locals). CI checks only production Python.
 
+The web app has its own lint baseline, which is now a required CI step:
+`npm --prefix apps/aflow_app/web run lint` runs in the Dashboard job
+immediately after `npm ci` and before the web test and build steps, so every
+pull request exercises the same web lint baseline. The existing web test and
+build commands are unchanged: `npm --prefix apps/aflow_app/web test -- --run`
+and `npm --prefix apps/aflow_app/web run build`. Tests moved by later
+maintainability plans keep explicit imports and focused fixtures; they are not
+made to pass with project-wide Git or path overrides.
+
 `uv run pytest -q` is the supported root test command on Linux and macOS. Linux
 runs the systemd deployment tests; macOS skips that Linux-only module and runs
 all core tests. Pull requests and pushes to `main` run Python 3.11 on Ubuntu
