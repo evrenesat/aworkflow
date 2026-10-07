@@ -23,6 +23,11 @@ from .config import (
     _config_path,
     load_workflow_config,
 )
+from .config_pair import (
+    ConfigPairError,
+    TRANSACTION_RECORD_NAME,
+    recover_pending_transaction,
+)
 from .run_config_snapshot import (
     RunConfigSnapshot,
     SnapshotError,
@@ -132,6 +137,52 @@ def _path_value(
     return path.resolve()
 
 
+def _pending_pair_directory(path: Path) -> Path | None:
+    """Return ``path``'s directory when it holds a pending transaction record.
+
+    Presence is detected with ``lstat`` so a dangling or unsafe record is not
+    treated as absent.  Inspection failures become the live reader's bounded
+    :class:`ConfigError` contract and preserve the record as evidence.
+    """
+    record = path.parent / TRANSACTION_RECORD_NAME
+    try:
+        record.lstat()
+    except FileNotFoundError:
+        return None
+    except OSError as exc:
+        raise LiveConfigError(
+            f"live configuration transaction record is unavailable: {record}: {exc}"
+        ) from exc
+    return path.parent
+
+
+def _select_live_path(
+    value: str | Path,
+    *,
+    relative_to: Path | None = None,
+) -> Path:
+    """Normalize the configured pair path and guard a pending journal.
+
+    The path is expanded and the relative base is applied, then the parent
+    directory is normalized while the final ``aflow.toml`` leaf is retained
+    for inspection.  A pending transaction record in that directory plus a
+    leaf symlink is a fail-closed bounded :class:`LiveConfigError` before the
+    link is dereferenced, so a pending recovery can never be redirected to an
+    unrelated pair in another directory.  With no pending record the existing
+    resolution and symlink-to-valid-source behavior is retained.
+    """
+    path = Path(value).expanduser()
+    if not path.is_absolute() and relative_to is not None:
+        path = relative_to / path
+    candidate = path.parent.resolve() / path.name
+    if _pending_pair_directory(candidate) is not None and candidate.is_symlink():
+        raise LiveConfigError(
+            "live configuration leaf is a symlink while a configuration "
+            f"transaction record is pending in its directory: {candidate}"
+        )
+    return candidate.resolve()
+
+
 def _provided(value: object) -> bool:
     return value is not None and not (isinstance(value, str) and not value.strip())
 
@@ -193,6 +244,12 @@ def resolve_live_config_source(
     explicit or saved path is an error.  A missing legacy origin is ignored as
     historical metadata and falls through to ``default_config_path`` (or the
     normal user default).
+
+    Every selected ``aflow.toml`` path is checked for a pending transaction
+    record before its leaf symlink is dereferenced.  A pending record plus a
+    leaf symlink fails closed with :class:`LiveConfigError` for every source
+    kind (a pending unsafe legacy source never falls through to a default);
+    with no pending record, valid symlink sources resolve as before.
     """
     if config_path is not None and explicit_config_path is not None:
         raise TypeError("pass only one of config_path and explicit_config_path")
@@ -201,12 +258,12 @@ def resolve_live_config_source(
     )
 
     if selected_explicit is not None:
-        selected = _path_value(selected_explicit)
+        selected = _select_live_path(selected_explicit)
         _require_live_file(selected, source_kind="explicit")
         return LiveConfigSource(selected, selected.with_name("workflows.toml"), "explicit")
 
     if _provided(saved_live_config_path):
-        selected = _path_value(saved_live_config_path)  # type: ignore[arg-type]
+        selected = _select_live_path(saved_live_config_path)  # type: ignore[arg-type]
         _require_live_file(selected, source_kind="saved")
         return LiveConfigSource(selected, selected.with_name("workflows.toml"), "saved")
 
@@ -217,7 +274,7 @@ def resolve_live_config_source(
             if legacy_origin_base_dir is not None
             else None
         )
-        selected = _path_value(origin, relative_to=base_dir)
+        selected = _select_live_path(origin, relative_to=base_dir)
         if _is_regular_file(selected):
             return LiveConfigSource(
                 selected,
@@ -225,7 +282,7 @@ def resolve_live_config_source(
                 "legacy_snapshot_origin",
             )
 
-    selected = _path_value(
+    selected = _select_live_path(
         default_config_path if default_config_path is not None else _config_path()
     )
     _require_live_file(selected, source_kind="default")
@@ -281,14 +338,34 @@ def load_live_config(
                 raise LiveConfigPairLockBusy(
                     f"configuration pair lock is busy: {selected.config_path}"
                 )
+            _recover_live_pair(selected.config_path.parent)
             workflow_config = _parse_live_config_pair(parse, selected)
     else:
         with configuration_pair_lock(selected.config_path.parent):
+            _recover_live_pair(selected.config_path.parent)
             workflow_config = _parse_live_config_pair(parse, selected)
     return LoadedLiveConfig(
         workflow_config=_resolve_relative_settings(workflow_config, selected),
         source=selected,
     )
+
+
+def _recover_live_pair(pair_dir: Path) -> None:
+    """Run pending-transaction recovery under the live reader's pair lock.
+
+    Transaction parsing, conflict, and recovery failures become the live
+    reader's bounded :class:`ConfigError` contract so unchanged consumers
+    (daemon refresh, control validation) translate them normally.  The
+    original bounded reason is preserved and bytes and journal are left in
+    place for a later recoverable read.  Actual lock contention is reported
+    separately as :class:`LiveConfigPairLockBusy` by the callers.
+    """
+    try:
+        recover_pending_transaction(pair_dir)
+    except ConfigPairError as exc:
+        raise LiveConfigError(
+            f"live configuration pair recovery failed: {exc}"
+        ) from exc
 
 
 def _parse_live_config_pair(

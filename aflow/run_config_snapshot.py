@@ -1,33 +1,58 @@
-"""Compatibility snapshots and the lock for a configuration pair.
+"""Compatibility snapshots for a configuration pair.
 
 Snapshots are ordinary launch-time diagnostic copies.  They remain readable
 for legacy inspection and may preserve their historical origin metadata, but
 their copied TOML and old fingerprints never decide whether a current run may
 execute.  New current-source reads belong in :mod:`aflow.live_config`, which
-holds :func:`configuration_pair_lock` while parsing ``aflow.toml`` and its
-optional sibling ``workflows.toml``.
+holds the pair lock from :mod:`aflow.config_pair` while parsing
+``aflow.toml`` and its optional sibling ``workflows.toml``.
 
-Snapshot creation still uses exclusive atomic writes and resolves the
-schema-defined relative ``worktree_root`` against the selected source
-directory so old diagnostic copies retain their original meaning.
+The pair lock and crash-recovery transaction now live in
+:mod:`aflow.config_pair`; this module re-exports the lock names so existing
+imports keep working.  Snapshot creation still uses exclusive atomic writes
+and resolves the schema-defined relative ``worktree_root`` against the
+selected source directory so old diagnostic copies retain their original
+meaning.
 """
 
 from __future__ import annotations
 
-from contextlib import contextmanager
 from dataclasses import dataclass
-import errno
 import json
 import os
 from pathlib import Path
 import time
-from typing import Iterator
+
+from .config_pair import (
+    ConfigPairError,
+    DOCUMENT_NAMES,
+    PAIR_LOCK_NAME,
+    configuration_pair_lock,
+    configuration_pair_lock_nonblocking,
+    recover_pending_transaction,
+)
+
+# ``PAIR_LOCK_NAME`` and ``configuration_pair_lock_nonblocking`` are
+# compatibility re-exports from the core pair owner.
+__all__ = [
+    "DOCUMENT_NAMES",
+    "PAIR_LOCK_NAME",
+    "RunConfigSnapshot",
+    "SNAPSHOT_DIR_NAME",
+    "SNAPSHOT_MANIFEST_NAME",
+    "SNAPSHOT_SCHEMA_VERSION",
+    "SnapshotError",
+    "configuration_pair_lock",
+    "configuration_pair_lock_nonblocking",
+    "copy_run_config_snapshot",
+    "create_run_config_snapshot",
+    "load_run_config_snapshot",
+    "snapshot_directory",
+]
 
 SNAPSHOT_SCHEMA_VERSION = 1
 SNAPSHOT_DIR_NAME = "config"
 SNAPSHOT_MANIFEST_NAME = "snapshot.json"
-PAIR_LOCK_NAME = ".aflow-config-pair.lock"
-DOCUMENT_NAMES = ("aflow.toml", "workflows.toml")
 _RELATIVE_ROOT_LIMIT = 64 * 1024
 
 
@@ -68,85 +93,6 @@ class RunConfigSnapshot:
             return None
         value = origin.get("workflow_name")
         return value if isinstance(value, str) and value.strip() else None
-
-
-@contextmanager
-def configuration_pair_lock(pair_dir: Path) -> Iterator[Path]:
-    """Serialize snapshot reads and global saves for one configuration pair.
-
-    The lock file lives next to the pair it guards, so global UI saves and
-    run-reservation snapshots block each other but unrelated repositories or
-    legacy project-local pairs remain independent. On a read-only file system
-    (for example a hardened deployment whose unit cannot write the global
-    configuration directory) the lock degrades to best-effort: an existing
-    lock file is still honored, and with none available reads proceed
-    unlocked because writes are impossible there anyway.
-    """
-    pair_dir = Path(pair_dir)
-    try:
-        pair_dir.mkdir(parents=True, exist_ok=True)
-        lock_path = pair_dir / PAIR_LOCK_NAME
-        fd = os.open(lock_path, os.O_WRONLY | os.O_CREAT | os.O_NOFOLLOW, 0o600)
-    except OSError as exc:
-        if exc.errno not in (errno.EROFS, errno.EPERM, errno.EACCES):
-            raise
-        existing = pair_dir / PAIR_LOCK_NAME
-        if existing.is_file() and not existing.is_symlink():
-            fd = os.open(existing, os.O_WRONLY | os.O_NOFOLLOW)
-            lock_path = existing
-        else:
-            yield None
-            return
-    import fcntl
-
-    try:
-        fcntl.flock(fd, fcntl.LOCK_EX)
-        try:
-            yield lock_path
-        finally:
-            fcntl.flock(fd, fcntl.LOCK_UN)
-    finally:
-        os.close(fd)
-
-
-@contextmanager
-def configuration_pair_lock_nonblocking(pair_dir: Path) -> Iterator[Path | None]:
-    """Acquire the configuration pair lock without blocking.
-
-    Yields ``None`` when the lock is already held (or unavailable on a
-    read-only file system).  Callers inside a control-servicing wait loop
-    must treat a ``None`` yield as "yield to the loop" and keep polling; they
-    must never fall back to an unlocked read.
-    """
-    pair_dir = Path(pair_dir)
-    try:
-        pair_dir.mkdir(parents=True, exist_ok=True)
-        lock_path = pair_dir / PAIR_LOCK_NAME
-        fd = os.open(lock_path, os.O_WRONLY | os.O_CREAT | os.O_NOFOLLOW, 0o600)
-    except OSError as exc:
-        if exc.errno not in (errno.EROFS, errno.EPERM, errno.EACCES):
-            raise
-        existing = pair_dir / PAIR_LOCK_NAME
-        if existing.is_file() and not existing.is_symlink():
-            fd = os.open(existing, os.O_WRONLY | os.O_NOFOLLOW)
-            lock_path = existing
-        else:
-            yield None
-            return
-    import fcntl
-
-    try:
-        try:
-            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except BlockingIOError:
-            yield None
-            return
-        try:
-            yield lock_path
-        finally:
-            fcntl.flock(fd, fcntl.LOCK_UN)
-    finally:
-        os.close(fd)
 
 
 def snapshot_directory(repo_root: Path, run_id: str) -> Path:
@@ -257,6 +203,15 @@ def create_run_config_snapshot(
         existing = load_run_config_snapshot(repo_root, run_id)
         if existing is not None:
             return existing
+        try:
+            recover_pending_transaction(origin_dir)
+        except ConfigPairError as exc:
+            # Launch callers handle this optional diagnostic operation through
+            # SnapshotError only; a failed recovery must never publish a
+            # snapshot, consume the journal, or surface a raw core error.
+            raise SnapshotError(
+                f"configuration pair recovery failed before snapshot capture: {exc}"
+            ) from exc
 
         aflow_bytes = _read_stable(origin_config)
         workflows_path = origin_config.with_name("workflows.toml")

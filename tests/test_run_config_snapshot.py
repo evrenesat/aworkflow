@@ -4,12 +4,19 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+from unittest.mock import patch
 
 import pytest
 
 from aflow.config import ConfigError, load_workflow_config
+from aflow.config_pair import (
+    TRANSACTION_RECORD_NAME,
+    ConfigPairError,
+    _record_bytes,
+)
 from aflow.live_config import LiveConfigError, load_live_config, load_live_config_for_run
 from aflow.run_config_snapshot import (
+    SnapshotError,
     configuration_pair_lock,
     copy_run_config_snapshot,
     create_run_config_snapshot,
@@ -160,6 +167,104 @@ def test_snapshot_manifest_without_old_fingerprint_remains_readable(tmp_path: Pa
     assert loaded is not None
     assert loaded.fingerprint is None
     assert loaded.origin_config_path == "/legacy/aflow.toml"
+
+
+def _pending_journal(config_path: Path) -> tuple[Path, bytes]:
+    """Add a valid prepared record for a newer generation to an existing pair."""
+    record = _record_bytes(
+        "prepared",
+        {"aflow.toml": VALID_AFLOW.encode(), "workflows.toml": VALID_WORKFLOWS.encode()},
+        {
+            "aflow.toml": VALID_AFLOW.replace("test-model", "pending-model").encode(),
+            "workflows.toml": VALID_WORKFLOWS.encode(),
+        },
+    )
+    journal = config_path.parent / TRANSACTION_RECORD_NAME
+    journal.write_bytes(record)
+    return journal, record
+
+
+def test_failed_pending_recovery_is_snapshot_error_with_preserved_evidence(
+    tmp_path: Path, global_pair: tuple[Path, Path]
+) -> None:
+    _, config_path = global_pair
+    repo = _repo(tmp_path)
+    journal, record_bytes = _pending_journal(config_path)
+
+    with patch(
+        "aflow.run_config_snapshot.recover_pending_transaction",
+        side_effect=ConfigPairError(
+            "configuration transaction recovery failed (injected EROFS)"
+        ),
+    ):
+        with pytest.raises(SnapshotError) as excinfo:
+            _snapshot(repo, config_path, "run-recovery-fail")
+
+    # Bounded reason with exception chaining to the core pair error.
+    assert "recovery failed" in str(excinfo.value)
+    assert "injected EROFS" in str(excinfo.value)
+    assert isinstance(excinfo.value.__cause__, ConfigPairError)
+    # No diagnostic snapshot was published; documents and journal preserved.
+    assert not snapshot_directory(repo, "run-recovery-fail").exists()
+    assert journal.read_bytes() == record_bytes
+    assert config_path.read_bytes() == VALID_AFLOW.encode()
+    assert (
+        config_path.with_name("workflows.toml").read_bytes()
+        == VALID_WORKFLOWS.encode()
+    )
+
+
+def test_malformed_pending_record_is_snapshot_error(tmp_path: Path, global_pair) -> None:
+    _, config_path = global_pair
+    repo = _repo(tmp_path)
+    journal = config_path.parent / TRANSACTION_RECORD_NAME
+    journal.write_bytes(b"{not a record")
+
+    with pytest.raises(SnapshotError, match="malformed") as excinfo:
+        _snapshot(repo, config_path, "run-malformed")
+
+    assert isinstance(excinfo.value.__cause__, ConfigPairError)
+    assert not snapshot_directory(repo, "run-malformed").exists()
+    assert journal.read_bytes() == b"{not a record"
+
+
+def test_unknown_edit_during_pending_recovery_is_snapshot_error(
+    tmp_path: Path, global_pair: tuple[Path, Path]
+) -> None:
+    _, config_path = global_pair
+    repo = _repo(tmp_path)
+    journal, record_bytes = _pending_journal(config_path)
+    config_path.write_bytes(b"operator edit matching no generation")
+
+    with pytest.raises(
+        SnapshotError, match="changed while a configuration transaction was pending"
+    ) as excinfo:
+        _snapshot(repo, config_path, "run-unknown-edit")
+
+    assert isinstance(excinfo.value.__cause__, ConfigPairError)
+    assert not snapshot_directory(repo, "run-unknown-edit").exists()
+    assert journal.read_bytes() == record_bytes
+    assert config_path.read_bytes() == b"operator edit matching no generation"
+
+
+def test_snapshot_recovers_pending_journal_to_exact_old_generation(
+    tmp_path: Path, global_pair: tuple[Path, Path]
+) -> None:
+    _, config_path = global_pair
+    repo = _repo(tmp_path)
+    journal, _ = _pending_journal(config_path)
+
+    snapshot = _snapshot(repo, config_path, "run-recovered")
+
+    # The pending prepared journal rolled the pair back to the old generation
+    # and that exact generation, with relative paths resolved, was captured.
+    assert not journal.exists()
+    assert config_path.read_bytes() == VALID_AFLOW.encode()
+    copied = snapshot.config_path.read_text(encoding="utf-8")
+    assert "test-model" in copied
+    assert "pending-model" not in copied
+    assert str((config_path.parent / "trees").resolve()) in copied
+    assert 'worktree_root = "trees"' not in copied
 
 
 def test_current_source_uses_legacy_origin_not_snapshot_files(
