@@ -446,7 +446,12 @@ provider cessation: a dead controller whose bound child is alive, whose child
 PID was reused, whose process group is alive or unobservable, or which never
 bound a child keeps the resource occupied. Only positive cessation of the
 controller, child, and group (or the confirmed host-reboot proof) frees it.
-A corrupted journal fails closed for that resource instead of being reset.
+The same positive-cessation rule applies at teardown: the harness child leads
+its own process group inside the controller's owned session, and its lease
+releases only when the child and the whole owned group are confirmed gone, so
+a wrapper exit cannot free the resource while a provider descendant is still
+alive. A corrupted journal fails closed for that resource instead of being
+reset.
 Deleting broker journal files or restarting a controller is
 not safe release evidence and must not be used to clear an unconfirmed claim.
 
@@ -715,9 +720,91 @@ become observable ownership errors instead of duplicate launches or unrelated
 signals. A returning UI reconciles the exact receipts: it can display,
 monitor, and explicitly stop a pre-existing worker, and a workflow that
 finished while the UI was absent reports its real terminal result.
-`shutdown` in this adapter is a documented no-op — UI shutdown never signals
-workflow groups. The systemd unit manager remains the production-deployment
-adapter and the local-daemon subprocess adapter is unchanged.
+An explicit stop is session-scoped. The controller leads its own session and
+the harness child leads its own process group inside it, so an immediate stop
+verifies the unit nonce, the live controller birth and the session-leader
+contract, then takes one bounded snapshot of session members (bounded member
+count and byte total; truncation, permission failure, malformed identity or
+an exceeded bound all count as unknown, never as an empty session). It ends
+every verified group with one TERM per group — a group is escalated to KILL
+only after its own TERM grace elapses inside the outer deadline and a live
+proven member of that group is revalidated immediately before the KILL — and
+same-session descendant rescans anchored on a live birth-matching captured
+member so ordinary reparenting cannot erase ownership. A numeric-SID inventory
+is authorized only while a proven member is live, and every ownership proof,
+group proof, anchor selection, and cessation decision shares one operation
+deadline of at most two seconds (or the remaining outer deadline), never a
+fresh per-member window.
+Every captured member must be positively absent before the `stopped.json`
+receipt is written; survivors keep a typed failure and the resource stays
+occupied.
+
+The contract decision separates three topologies. A session-leader
+controller with a complete observation uses the session path. A genuine
+legacy controller-group receipt (non-leader session) retains the
+controller-only fallback: it signals the controller's own verified group
+only and never claims additional cleanup. An uncertain modern stop —
+identity loss during contract validation, a failed or incomplete
+observation, or an unreadable birth — is `unknown`, fails typed with no
+signal, and never falls through to the legacy fallback. The local
+subprocess adapter applies the same rule to its directly owned Popen: only
+a leader that has positively exited (its own `poll()` result) may use the
+owned controller-group drain; a live controller whose topology is unknown
+fails typed before any TERM/KILL, retains the unit, and never infers
+ownership from a reusable numeric PID. In the legacy
+fallback, every signal (TERM and the KILL escalation) is preceded by a fresh
+bounded ownership proof of the exact recorded PID, process birth, and group
+identity; a changed or unproven identity is never escalated.
+
+All stop-path revalidation shares the stop deadline: liveness, birth, and
+group checks use native bounded probes (a single Linux procfs read, or a
+Darwin `ps` probe capped at the remaining budget, at most two seconds),
+never the generic five-second fallback, and no signal is issued after the
+deadline expires. A persistent stop creates its outer deadline before any
+identity observation, so the entry observation and identity recheck stay
+inside even a one-second stop window; an unconfirmed entry identity fails
+typed with no signal and no successful `stopped.json` receipt. Until a
+trusted child receipt exists, the stop entry's startup observation
+distinguishes a positively observed live wrapper (which keeps the active
+`start-post` answer), a positively absent wrapper (the genuine
+`startup_lost` answer), and a timed-out, unavailable, missing, or reused
+wrapper identity (a typed unconfirmed failure that may still finish startup
+and is never reported as inactive). The contract
+birth probe is bounded by the two-second observation window, never the
+entire outer stop deadline. Both unit adapters create one absolute initial
+operation deadline (at most two seconds) before the first snapshot and use
+that same value for the initial inventory, the original-controller
+revalidation, and the initial anchor/group signal proof; the outer deadline
+is reserved for later rescans and escalation and is never renewed after the
+inventory. Each rescan
+creates one operation deadline before its inventory and reuses that same
+absolute deadline for the post-inventory anchor, group proof, and cessation
+decision; the window is never renewed after a snapshot. A native read that
+finishes at/after the shared deadline (Linux procfs birth, liveness, or
+group scan; Darwin `ps` probes) is expired evidence: it authorizes no birth
+identity, no presence/absence answer, and no signal. A provider that
+deliberately escaped to another session remains an explicit
+unsupported/uncertain case. Unrelated sessions are never discovered or
+signalled.
+
+`shutdown` in the persistent adapter is a documented no-op — UI shutdown never
+signals workflow groups. The systemd unit manager remains the
+production-deployment adapter. The local-daemon subprocess adapter
+(`SubprocessUnitManager`) shares this same proven-session stop algorithm:
+it proves the controller's exact birth and session-leader topology, ends the
+controller group and any separate-group provider in the session (TERM, then
+bounded KILL escalation), and requires positive cessation of every owned
+member before reporting success; when the controller leader has already
+exited it drains its owned group with the same positive-absence requirement
+(every group observation is one bounded operation that never passes the
+outer stop deadline, and each is rechecked immediately before TERM, KILL,
+and a successful absence result), and its `shutdown` applies the same
+session stop to every managed unit. The owned-group teardown preserves the
+full configured TERM grace from the first TERM with independent
+direct-child reaping; at grace expiry one kill-phase deadline owns the
+rest of the teardown (ownership proof, group KILL, direct-child KILL/wait,
+and final group cessation) without another renewed kill allowance, and an
+expired absence scan is never positive cessation.
 
 ## UI-server MCP and direct CLI
 

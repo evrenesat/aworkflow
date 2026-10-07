@@ -37,11 +37,23 @@ import signal
 import subprocess
 import time
 import uuid
-from typing import Mapping
+from typing import Callable, Mapping
 
-from aflow.process_identity import process_birth_identity
+from aflow.process_identity import (
+    SESSION_OBSERVATION_SECONDS,
+    SessionMember,
+    controller_group_owned,
+    process_birth_bounded,
+    process_birth_identity,
+    process_birth_proof,
+    process_group_state,
+    process_liveness,
+    session_member_live,
+    session_members,
+)
 
 from .units import UnitState, _ENVIRONMENT_NAME_RE, _environment_file_entries
+
 
 _UNIT_NAME_RE = re.compile(
     r"^aflow-run-(?P<run_id>[a-z0-9](?:[a-z0-9-]{0,62}[a-z0-9])?)\.service$"
@@ -53,6 +65,14 @@ _RECEIPT_SCHEMA = 1
 
 class PersistentUnitError(RuntimeError):
     """A persistent unit launch, observation, or stop failed safely."""
+
+
+@dataclass(frozen=True)
+class _SessionContract:
+    """Verified controller topology: session, legacy, or unknown."""
+
+    topology: str
+    session_id: int | None = None
 
 
 @dataclass(frozen=True)
@@ -125,6 +145,393 @@ def _birth_identity(pid: int) -> str | None:
 
 def _process_alive(pid: int, birth: str) -> bool:
     return _birth_identity(pid) == birth
+
+
+def _bounded_process_alive(pid: int, birth: str, deadline: float) -> bool:
+    """Bounded birth-verified liveness for deadline-bound stop paths.
+
+    Delegates to the shared bounded birth probe (native procfs on Linux,
+    a single bounded ``ps`` probe on Darwin): the exact recorded birth is
+    required, and an expired deadline, a vanished, zombie, unobservable, or
+    expired-read identity is never alive.  The generic five-second probe is
+    never used here.
+    """
+    if time.monotonic() >= deadline:
+        return False
+    observed = process_birth_bounded(pid, deadline)
+    return observed is not None and observed == birth
+
+
+#: Bounded KILL-escalation window at the end of a stop deadline.
+_KILL_ESCALATION_SECONDS = 2.0
+
+#: Bounded TERM grace phase of a legacy controller-group stop.
+_TERM_GRACE_SECONDS = 2.0
+
+
+def _pid_present(pid: int) -> bool:
+    """Cheap null-signal presence check used to gate birth revalidation."""
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except (OSError, ValueError):
+        return True
+    return True
+
+
+def session_contract(
+    pid: int, birth: str, deadline: float
+) -> _SessionContract:
+    """Classify the controller's positively observed topology.
+
+    ``session``: the controller is the live, birth-verified leader of its
+    own session (modern wrapper).  ``legacy``: a positively observed genuine
+    legacy controller-group topology - live exact birth, actual PGID equal to
+    the recorded controller group, and a positively observed non-leader SID.
+    Everything else (a disappearing controller, birth mismatch or missing
+    birth, failed syscall, inaccessible identity, an expired stop deadline, or
+    a non-self group) is ``unknown`` and is never collapsed into legacy.
+
+    The liveness proof is bounded by the shared stop ``deadline`` (native
+    procfs on Linux, a single bounded ``ps`` birth probe on Darwin); the
+    generic five-second probe never consumes stop budget.
+    """
+    try:
+        sid = os.getsid(pid)
+        pgid = os.getpgid(pid)
+    except (OSError, ValueError, AttributeError):
+        return _SessionContract("unknown")
+    # The contract birth probe shares the stop's bounded observation window,
+    # never the entire outer stop deadline.
+    if not _bounded_process_alive(
+        pid, birth, min(deadline, time.monotonic() + SESSION_OBSERVATION_SECONDS)
+    ):
+        return _SessionContract("unknown")
+    if sid == pid and pgid == pid:
+        return _SessionContract("session", session_id=pid)
+    if pgid == pid and sid != pid:
+        return _SessionContract("legacy", session_id=sid)
+    return _SessionContract("unknown")
+
+
+def session_snapshot(
+    session_id: int, deadline: float
+) -> list[SessionMember] | None:
+    """One bounded initial/rescan inventory under the shared stop deadline.
+
+    The observation window is the raw remaining stop budget (capped at the
+    two-second observation bound) with no minimum floor; an expired deadline
+    yields ``None`` (unknown) without any further work.
+    """
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        return None
+    return session_members(
+        session_id,
+        deadline_seconds=min(SESSION_OBSERVATION_SECONDS, remaining),
+    )
+
+
+def session_anchor(
+    session_id: int,
+    members: list[SessionMember],
+    deadline: float,
+) -> SessionMember | None:
+    """Revalidate one proven captured member as the live anchor.
+
+    Only a member of the proven set - the initial capture plus members
+    observed under an earlier live anchor - whose exact birth, PGID, and SID
+    all still match authorizes a further numeric-SID inventory.  Missing
+    birth (zombie), reused PIDs, and unproven identities are never anchors:
+    a fresh inventory can never prove its own ancestry.  Revalidation is
+    bounded by the shared outer deadline and uses the native per-member
+    checks, never an unbounded per-member fallback.
+    """
+    for member in members:
+        if time.monotonic() >= deadline:
+            return None
+        if member.birth is not None and session_member_live(member, session_id, deadline):
+            return member
+    return None
+
+
+def session_ceased(
+    members: list[SessionMember],
+    deadline: float,
+    unproven_pids: frozenset[int] = frozenset(),
+) -> bool:
+    """Positive cessation of every captured identity and group.
+
+    A positively dead member counts as ceased, including an unreaped zombie
+    whose birth is unobservable (liveness reports absent).  A live or unknown
+    identity, or a present or unknown group, retains failure; a missing birth
+    is never equated with death on its own.
+
+    Additionally, every unproven live identity from the last complete
+    observation must be positively absent: a replacement session that reused
+    the numeric SID is not part of the owned session and can never count as
+    ceased on the owned members' behalf.
+    """
+    for pid in sorted(unproven_pids):
+        if time.monotonic() >= deadline:
+            return False
+        if process_liveness(pid, deadline) != "absent":
+            return False
+    for member in members:
+        if time.monotonic() >= deadline:
+            return False
+        if process_liveness(member.pid, deadline) != "absent":
+            return False
+    for pgid in sorted({member.pgid for member in members}):
+        if time.monotonic() >= deadline:
+            return False
+        if process_group_state(pgid, deadline) != "absent":
+            return False
+    return True
+
+
+def stop_controller_group(
+    pid: int,
+    birth: str,
+    deadline: float,
+    session_id: int | None,
+    signal_group: Callable[[int, signal.Signals], None],
+) -> bool:
+    """Legacy stop: signal only the controller's own process group.
+
+    Fresh bounded birth and group proof (plus the positively observed SID
+    when one was verified) is required immediately before each TERM and KILL;
+    a reused, moved, missing, or inaccessible identity receives no signal and
+    the stop is unconfirmed.  Cessation is positive: an unknown liveness is
+    never treated as absence.
+
+    TERM is sent first and the controller is observed through a bounded TERM
+    grace phase inside the outer deadline.  A genuine TERM survivor is
+    escalated to KILL only after the same original birth/group/session is
+    re-proved immediately before the KILL with a fresh operation bounded by
+    the still-live outer deadline: an expired TERM-phase deadline is never
+    passed as the KILL budget and the outer bound is never extended to issue a
+    late signal.  Prompt success is retained when TERM suffices; changed,
+    missing, or unknown ownership before the KILL receives no KILL.
+    """
+    if not controller_group_owned(pid, birth, session_id, deadline):
+        return process_liveness(pid, deadline) == "absent"
+    if time.monotonic() >= deadline:
+        return process_liveness(pid, deadline) == "absent"
+    signal_group(pid, signal.SIGTERM)
+    # Bounded TERM phase: observe until positive cessation or the shorter of
+    # the TERM grace and the remaining outer deadline.
+    term_deadline = min(deadline, time.monotonic() + _TERM_GRACE_SECONDS)
+    while (
+        process_liveness(pid, deadline) == "present"
+        and time.monotonic() < term_deadline
+    ):
+        time.sleep(0.05)
+    if process_liveness(pid, deadline) != "present":
+        # Positively ceased (or unknown) during the TERM phase.
+        return process_liveness(pid, deadline) == "absent"
+    # A genuine TERM survivor: prove the same original birth/group/session
+    # immediately before the KILL with a fresh budget bounded by the
+    # still-live outer deadline.
+    if not controller_group_owned(pid, birth, session_id, deadline):
+        return False
+    if time.monotonic() >= deadline:
+        # No time remains inside the outer bound: never issue a late KILL.
+        return False
+    signal_group(pid, signal.SIGKILL)
+    while (
+        process_liveness(pid, deadline) == "present"
+        and time.monotonic() < deadline
+    ):
+        time.sleep(0.05)
+    return process_liveness(pid, deadline) == "absent"
+
+
+def stop_session_groups(
+    session_id: int,
+    captured: list[SessionMember],
+    deadline: float,
+    *,
+    signal_group: Callable[[int, signal.Signals], None],
+    snapshot: Callable[[int, float], list[SessionMember] | None],
+    anchor: Callable[
+        [int, list[SessionMember], float], SessionMember | None
+    ],
+    ceased: Callable[[list[SessionMember], float, frozenset[int]], bool],
+    kill_escalation_seconds: float = _KILL_ESCALATION_SECONDS,
+    poll_interval: float = 0.05,
+    initial_operation: float | None = None,
+) -> bool:
+    """Terminate every verified group inside the owned session.
+
+    The initial capture is anchored by the verified session-leader contract
+    and forms the proven set.  A numeric-SID inventory is only authorized
+    while a proven member is live, and each inventory is trusted only after a
+    live member of the proven set is revalidated against its exact birth,
+    PGID, and SID AFTER the inventory completes; only same-session
+    descendants observed under that post-inventory live anchor join the proven
+    set and are signalled.  The fresh inventory can never prove its own
+    ancestry: with no post-inventory live anchor no newly observed member is
+    adopted, signalled, or used to clear prior uncertainty.  Before each
+    actual signal a live proven member of the target group is revalidated;
+    groups whose members are all positively dead (for example unreaped
+    zombies) are never signalled.  TERM is sent once per verified group; a
+    group is escalated to KILL only after its own TERM grace elapses inside
+    the outer deadline and a live proven member is revalidated immediately
+    before the KILL.  Every ownership proof, group proof, anchor selection,
+    and cessation decision shares one operation deadline of at most two
+    seconds (or the remaining outer deadline), never a fresh per-member
+    window.  Incomplete observations stay pending uncertainty until a
+    subsequent complete anchored observation clears them; an unanchored
+    inventory can never clear them.  Returns True only on positive cessation
+    of every captured identity and group and of every unproven live identity
+    from the last complete observation, with no pending uncertainty.
+
+    The ``signal_group``, ``snapshot``, ``anchor``, and ``ceased`` callbacks
+    let each unit adapter reuse this single proven-session algorithm with its
+    own signal function while the ownership/liveness decisions stay in this
+    module's namespace.
+
+    ``initial_operation`` (private to the unit adapters) shares the caller's
+    pre-inventory operation deadline with the initial anchor/group signal
+    proof so the initial snapshot and its associated proofs never receive
+    renewed time; existing direct helper callers keep the current behavior
+    of creating a fresh per-operation window.
+    """
+    members = list(captured)
+    proven: set[int] = {member.pid for member in members}
+    term_signalled: dict[int, float] = {}
+    kill_signalled: set[int] = set()
+    pending_uncertainty = False
+    last_complete: list[SessionMember] = []
+
+    def _operation_deadline() -> float:
+        # One shared observation/proof budget per operation: at most the
+        # two-second observation window, and never past the outer stop
+        # deadline.
+        return min(deadline, time.monotonic() + SESSION_OBSERVATION_SECONDS)
+
+    def _unproven_live_pids() -> frozenset[int]:
+        return frozenset(
+            member.pid for member in last_complete if member.pid not in proven
+        )
+
+    def _proven_members() -> list[SessionMember]:
+        return [member for member in members if member.pid in proven]
+
+    def _signal_group_if_owned(
+        pgid: int, inventory: list[SessionMember], operation: float
+    ) -> None:
+        # Revalidate a live proven member of the target group immediately
+        # before each actual signal; positively dead members (zombies) and
+        # unproven identities are never signalled, and no signal is issued
+        # after the shared outer deadline has expired.
+        if time.monotonic() >= operation or time.monotonic() >= deadline:
+            return
+        if not any(
+            session_member_live(member, session_id, operation)
+            for member in inventory
+            if member.pgid == pgid and member.pid in proven
+        ):
+            return
+        # The ownership proof may have completed at/after the shared deadline:
+        # expired evidence authorizes no signal, TERM or KILL.
+        if time.monotonic() >= operation or time.monotonic() >= deadline:
+            return
+        if pgid not in term_signalled:
+            signal_group(pgid, signal.SIGTERM)
+            term_signalled[pgid] = time.monotonic()
+            return
+        # TERM-first escalation: a group already TERMed is KILLed only after
+        # its own TERM grace elapses, with fresh revalidation and while time
+        # remains inside the outer deadline.
+        if (
+            pgid not in kill_signalled
+            and time.monotonic() - term_signalled[pgid]
+            >= kill_escalation_seconds
+            and time.monotonic() < deadline
+        ):
+            signal_group(pgid, signal.SIGKILL)
+            kill_signalled.add(pgid)
+
+    # Signal the initial captured groups immediately so the controller chain
+    # begins exiting before the first rescan; the whole initial proof shares
+    # one operation deadline and each target group is revalidated against the
+    # anchored initial capture first.
+    if time.monotonic() >= deadline:
+        return False
+    # The initial anchor/group proof shares the caller's pre-inventory
+    # operation deadline when provided (the initial snapshot's budget), so
+    # the inventory and its proofs are never given renewed time; direct
+    # helper callers keep the current per-operation behavior.
+    if initial_operation is not None:
+        operation = min(initial_operation, deadline)
+    else:
+        operation = _operation_deadline()
+    if anchor(session_id, _proven_members(), operation) is not None:
+        for pgid in sorted({member.pgid for member in members}):
+            _signal_group_if_owned(pgid, members, operation)
+    # Observe while something proven is still live or a signal was already
+    # issued: with nothing live and nothing signalled there is no anchored
+    # observation to authorize and the final cessation decision below decides
+    # the outcome.
+    while time.monotonic() < deadline and (
+        term_signalled
+        or anchor(session_id, _proven_members(), _operation_deadline())
+        is not None
+    ):
+        # One shared operation deadline for the rescan inventory and all of
+        # its post-inventory proof: the window is created before the snapshot
+        # and never renewed after it.
+        operation = _operation_deadline()
+        session = snapshot(session_id, operation)
+        if session is None:
+            # Incomplete: the uncertainty stays pending until a subsequent
+            # complete anchored observation clears it.  No inventory exists,
+            # so no adoption or signal is authorized.
+            pending_uncertainty = True
+            time.sleep(poll_interval)
+            continue
+        last_complete = list(session)
+        # The fresh inventory is trusted only after a proven member is
+        # revalidated live against it; the anchor must survive the
+        # observation, not merely precede it.
+        anchor_member = anchor(session_id, _proven_members(), operation)
+        if anchor_member is None:
+            # No live proven anchor after the inventory: no adoption, signal,
+            # or uncertainty clearing is authorized.  Success still requires
+            # positive cessation of every captured identity and group and of
+            # every unproven live identity from this complete observation.
+            if not pending_uncertainty and ceased(
+                members, operation, _unproven_live_pids()
+            ):
+                return True
+            time.sleep(poll_interval)
+            continue
+        pending_uncertainty = False
+        # Retain newly observed same-session descendants captured under the
+        # live anchor; they join the proven set.
+        known = {member.pid for member in members}
+        new_members = [member for member in session if member.pid not in known]
+        members.extend(new_members)
+        proven.update(member.pid for member in new_members)
+        for pgid in sorted({member.pgid for member in session}):
+            _signal_group_if_owned(pgid, session, operation)
+        if ceased(members, operation, _unproven_live_pids()):
+            return True
+        time.sleep(poll_interval)
+    # Final bounded decision: with no pending uncertainty, positive cessation
+    # of every captured identity and group and of every unproven live identity
+    # from the last complete observation is success; anything else fails
+    # typed rather than infer success.
+    if not pending_uncertainty and ceased(
+        members,
+        min(deadline, initial_operation) if initial_operation is not None else deadline,
+        _unproven_live_pids(),
+    ):
+        return True
+    return False
 
 
 def _receipts_for(name: str, cwd: Path) -> _UnitReceipts | None:
@@ -420,11 +827,22 @@ class PersistentUnitManager:
             if isinstance(unit, str) and _UNIT_NAME_RE.fullmatch(unit):
                 self._receipt_roots[unit] = root
 
-    def _observe(self, receipts: _UnitReceipts) -> UnitState:
+    def _observe(
+        self, receipts: _UnitReceipts, deadline: float | None = None
+    ) -> UnitState:
+        # The generic observation contract is unchanged for ordinary `get`
+        # (deadline is None).  Stop passes its entry operation deadline so
+        # stop-specific birth checks use the bounded native probe and never
+        # spend the generic five-second probe against a shorter stop budget.
+        def _alive(pid: int, birth: str) -> bool:
+            if deadline is None:
+                return _process_alive(pid, birth)
+            return _bounded_process_alive(pid, birth, deadline)
+
         child = _read_json(receipts.child)
         if _nonce_matches(child, receipts.nonce):
             pid, birth = child.get("pid"), child.get("process_birth")
-            if type(pid) is int and pid > 0 and child.get("pgid") == pid and isinstance(birth, str) and _process_alive(pid, birth):
+            if type(pid) is int and pid > 0 and child.get("pgid") == pid and isinstance(birth, str) and _alive(pid, birth):
                 return UnitState(name=receipts.name, active_state="active", sub_state="running", main_pid=pid)
         stopped = _terminal_receipt(receipts, receipts.stopped)
         if _nonce_matches(stopped, receipts.nonce):
@@ -450,19 +868,51 @@ class PersistentUnitManager:
             # starting or it died before recording the workflow process.
             wrapper_pid = receipts.start.get("wrapper_pid")
             wrapper_birth = receipts.start.get("wrapper_birth")
-            if (
-                isinstance(wrapper_pid, int)
-                and isinstance(wrapper_birth, str)
-                and _process_alive(wrapper_pid, wrapper_birth)
-            ):
+            if deadline is None:
+                # Ordinary `get` keeps the generic observation contract.
+                if (
+                    isinstance(wrapper_pid, int)
+                    and isinstance(wrapper_birth, str)
+                    and _alive(wrapper_pid, wrapper_birth)
+                ):
+                    return UnitState(
+                        name=receipts.name, active_state="active", sub_state="start-post"
+                    )
                 return UnitState(
-                    name=receipts.name, active_state="active", sub_state="start-post"
+                    name=receipts.name,
+                    active_state="inactive",
+                    sub_state="dead",
+                    result="startup_lost",
+                )
+            # Stop-specific bounded startup observation: a timeout, missing
+            # or malformed wrapper identity, or a reused still-present PID is
+            # unconfirmed, never inactive; only a positively observed live
+            # wrapper stays active and only positive wrapper absence is a
+            # genuine startup loss.
+            if not (isinstance(wrapper_pid, int) and isinstance(wrapper_birth, str)):
+                return UnitState(
+                    name=receipts.name,
+                    active_state="inactive",
+                    sub_state="dead",
+                    result="startup_unconfirmed",
+                )
+            proof = process_birth_proof(wrapper_pid, deadline)
+            if proof.status == "observed":
+                if proof.birth == wrapper_birth:
+                    return UnitState(
+                        name=receipts.name, active_state="active", sub_state="start-post"
+                    )
+                return UnitState(
+                    name=receipts.name,
+                    active_state="inactive",
+                    sub_state="dead",
+                    result="startup_unconfirmed",
                 )
             return UnitState(
                 name=receipts.name,
                 active_state="inactive",
                 sub_state="dead",
-                result="startup_lost",
+                result="startup_lost" if proof.status == "absent" else "startup_unconfirmed",
             )
         try:
             pid = int(child["pid"])
@@ -474,7 +924,7 @@ class PersistentUnitManager:
                 result="startup_lost",
             )
         birth = child.get("process_birth")
-        if type(child.get("pid")) is not int or pid < 1 or child.get("pgid") != pid or not isinstance(birth, str) or not _process_alive(pid, birth):
+        if type(child.get("pid")) is not int or pid < 1 or child.get("pgid") != pid or not isinstance(birth, str) or not _alive(pid, birth):
             # The wrapper writes exit.json after the child exits; reaching
             # here means the wrapper died without recording a terminal result.
             return UnitState(
@@ -496,8 +946,28 @@ class PersistentUnitManager:
         receipts = _receipts_for(name, self._cwd_for(name))
         if receipts is None:
             return None
-        current = self._observe(receipts)
+        # The outer stop deadline is created before any stop-specific native
+        # identity observation: the entry observation and identity checks
+        # share one <=2s operation budget and never spend the generic
+        # five-second probe against a shorter stop deadline.
+        deadline = time.monotonic() + self._stop_timeout_seconds
+        entry_operation = min(deadline, time.monotonic() + SESSION_OBSERVATION_SECONDS)
+        current = self._observe(receipts, entry_operation)
         if not current.is_active:
+            # A trusted terminal receipt (stopped/exit) is authoritative.
+            # An ownership_lost answer only means the recorded child was not
+            # positively observed alive inside the entry budget (vanished,
+            # zombie, or unobservable): fail typed rather than fabricating an
+            # inactive stop answer.  A startup_unconfirmed answer means the
+            # recorded wrapper's birth proof timed out, was unavailable, or
+            # its identity is missing/reused: the wrapper may still finish
+            # startup, so stop fails typed with no signal and no
+            # stopped.json.  Only positive wrapper absence (startup_lost) is
+            # a genuine inactive stop answer.
+            if current.result in ("ownership_lost", "startup_unconfirmed"):
+                raise PersistentUnitError(
+                    f"workflow unit {name} controller identity is unconfirmed"
+                )
             return current
         child = _read_json(receipts.child)
         if not _nonce_matches(child, receipts.nonce):
@@ -507,24 +977,76 @@ class PersistentUnitManager:
         except (KeyError, TypeError, ValueError):
             return current
         birth = child.get("process_birth")
-        if not isinstance(birth, str) or not _process_alive(pid, birth):
-            return self._observe(receipts)
+        if not isinstance(birth, str) or not _bounded_process_alive(
+            pid, birth, entry_operation
+        ):
+            # A live/unknown identity or a timed-out entry read inside the
+            # bounded stop entry is unconfirmed: typed failure, no signal,
+            # and no successful stopped receipt.
+            raise PersistentUnitError(
+                f"workflow unit {name} controller identity is unconfirmed"
+            )
         if pid != int(child.get("pgid", pid)):
             raise PersistentUnitError(
                 f"workflow unit {name} recorded mismatched process group identity"
             )
-        self._signal_group(pid, signal.SIGTERM)
-        deadline = time.monotonic() + self._stop_timeout_seconds
-        while _process_alive(pid, birth) and time.monotonic() < deadline:
-            time.sleep(0.05)
-        if _process_alive(pid, birth):
-            self._signal_group(pid, signal.SIGKILL)
-            kill_deadline = time.monotonic() + 2.0
-            while _process_alive(pid, birth) and time.monotonic() < kill_deadline:
-                time.sleep(0.05)
-        if _process_alive(pid, birth):
+        contract = self._session_contract(pid, birth, deadline)
+        if contract.topology == "session":
+            # The initial inventory and all associated proofs (original
+            # controller revalidation, initial anchor/group signal proof)
+            # share one <=2s operation deadline created before the first
+            # snapshot; the outer deadline stays separate for later
+            # rescans/escalation and is never renewed after the inventory.
+            initial_operation = min(
+                deadline, time.monotonic() + SESSION_OBSERVATION_SECONDS
+            )
+            captured = self._session_snapshot(pid, initial_operation)
+            if captured is None:
+                # The session-leader contract is verified but the initial
+                # observation was incomplete, so no session proof exists.
+                # The verified controller group may still be stopped within
+                # its bounds (fresh ownership proof required before each
+                # signal), but session cessation cannot be proven: fail
+                # typed and never write a successful stopped receipt.
+                self._stop_controller_group(pid, birth, deadline, contract.session_id)
+                raise PersistentUnitError(
+                    f"workflow unit {name} session observation was incomplete"
+                )
+            if not self._controller_group_still_owned(
+                pid, birth, contract.session_id, initial_operation
+            ):  # shares the pre-inventory operation budget
+                # The receipt-bound controller was verified only before the
+                # initial observation.  If it ceased (or its identity was
+                # reused) during that observation, the inventory's own birth
+                # identities cannot replace the recorded authority: fail
+                # typed without any inventory-derived signal and without a
+                # successful stopped receipt.
+                raise PersistentUnitError(
+                    f"workflow unit {name} session leader identity was lost during observation"
+                )
+            if not self._stop_session_groups(
+                pid, captured, deadline, initial_operation=initial_operation
+            ):
+                # Session proof existed and live owned members survived the
+                # bounded deadline (or an anchored rescan went incomplete):
+                # fail typed.  Never fall back to the weaker controller-only
+                # check after a full observation.
+                raise PersistentUnitError(
+                    f"workflow unit {name} owned session did not terminate"
+                )
+        elif contract.topology == "legacy":
+            # A positively observed genuine legacy controller-group
+            # topology: stop only the controller's own group, as before.
+            if not self._stop_controller_group(pid, birth, deadline, contract.session_id):
+                raise PersistentUnitError(
+                    f"workflow unit {name} process group did not terminate"
+                )
+        else:
+            # Unknown topology: a disappearing controller, birth mismatch or
+            # missing birth, failed syscall, or inaccessible identity.  No
+            # signal is issued and no successful stopped receipt is written.
             raise PersistentUnitError(
-                f"workflow unit {name} process group did not terminate"
+                f"workflow unit {name} controller identity is unconfirmed"
             )
         _write_receipt(
             receipts.stopped,
@@ -548,6 +1070,99 @@ class PersistentUnitManager:
             os.killpg(pgid, sig)
         except (ProcessLookupError, PermissionError):
             return
+
+    def _session_contract(
+        self, pid: int, birth: str, deadline: float
+    ) -> _SessionContract:
+        """Classify the controller's positively observed topology.
+
+        Delegates to the shared :func:`session_contract` so both unit
+        adapters classify the same topology under the same bounded contract.
+        """
+        return session_contract(pid, birth, deadline)
+
+    def _session_snapshot(
+        self, session_id: int, deadline: float
+    ) -> list[SessionMember] | None:
+        """Bounded initial/rescan inventory under the shared stop deadline."""
+        return session_snapshot(session_id, deadline)
+
+    def _controller_group_still_owned(
+        self,
+        pid: int,
+        birth: str,
+        session_id: int | None,
+        deadline: float,
+    ) -> bool:
+        """Fresh bounded proof that the recorded controller still owns its group.
+
+        The proof is bounded to the caller's operation deadline (the shared
+        pre-inventory budget on the initial proof, never a renewed window).
+        """
+        return controller_group_owned(pid, birth, session_id, deadline)
+
+    def _stop_controller_group(
+        self,
+        pid: int,
+        birth: str,
+        deadline: float,
+        session_id: int | None = None,
+    ) -> bool:
+        """Legacy stop: signal only the controller's own process group.
+
+        Delegates to the shared :func:`stop_controller_group` with this
+        manager's signal function so both adapters stop a legacy controller
+        group under the same bounded deadline.
+        """
+        return stop_controller_group(
+            pid, birth, deadline, session_id, self._signal_group
+        )
+
+    def _session_anchor(
+        self,
+        session_id: int,
+        members: list[SessionMember],
+        deadline: float,
+    ) -> SessionMember | None:
+        """Revalidate one proven captured member as the live anchor."""
+        return session_anchor(session_id, members, deadline)
+
+    def _session_ceased(
+        self,
+        members: list[SessionMember],
+        deadline: float,
+        unproven_pids: frozenset[int] = frozenset(),
+    ) -> bool:
+        """Positive cessation of every captured identity and group."""
+        return session_ceased(members, deadline, unproven_pids)
+
+    def _stop_session_groups(
+        self,
+        session_id: int,
+        captured: list[SessionMember],
+        deadline: float,
+        *,
+        initial_operation: float | None = None,
+    ) -> bool:
+        """Terminate every verified group inside the owned session.
+
+        Delegates to the shared :func:`stop_session_groups` with this
+        manager's signal/snapshot/anchor/ceased callbacks so both adapters
+        run the same proven-session algorithm.  ``initial_operation`` shares
+        the caller's pre-inventory budget with the initial anchor/group proof
+        so the inventory and its proofs are never given renewed time.
+        """
+        return stop_session_groups(
+            session_id,
+            captured,
+            deadline,
+            signal_group=self._signal_group,
+            snapshot=self._session_snapshot,
+            anchor=self._session_anchor,
+            ceased=self._session_ceased,
+            kill_escalation_seconds=_KILL_ESCALATION_SECONDS,
+            initial_operation=initial_operation,
+        )
 
     # --------------------------------------------------------------- shutdown
 

@@ -301,7 +301,31 @@ cessation evidence, and uncertain observations remain `unconfirmed`. A
 corrupted journal fails closed for that resource instead of being reset.
 Leases bind to controller process lifetime (PID/process-start/host-boot
 identity), and dead-owner reclamation requires positive evidence, never file
-deletion or controller restart.
+deletion or controller restart. The harness child leads its own process group
+(`process_group=0`) inside the controller's owned session, so a wrapper
+cannot change the recorded group identity after launch. Owned teardown
+signals that verified group (TERM, then bounded KILL escalation), and every
+teardown signal is preceded by a fresh bounded ownership proof of the exact
+recorded identity; all stop-path revalidation shares the stop deadline
+through native bounded probes (Linux procfs, bounded Darwin `ps`), never
+serial generic probes, and no signal is issued after the deadline. A
+persistent stop creates its outer deadline before any identity observation,
+so the entry observation and identity recheck stay inside even a one-second
+stop window, and an unconfirmed entry identity fails typed without a
+successful stopped receipt. The contract birth probe is bounded by the
+two-second observation window, the initial inventory and its associated
+proofs (original-controller revalidation and initial anchor/group signal
+proof) share one absolute operation deadline created before the first
+snapshot in both unit adapters (the outer deadline is reserved for later
+rescans and escalation and is never renewed after the inventory), each
+rescan's inventory and its post-inventory proof share one operation
+deadline that is never renewed after the snapshot, and a native read
+finishing at/after the deadline is expired evidence that authorizes no
+identity, cessation, or signal. A live local controller whose topology is
+unknown fails typed and retains its unit; only a positively exited directly
+owned leader may drain its owned group. A lease completes only when the
+child and the owned group are both positively gone; a wrapper exit with
+surviving descendants in the group leaves the claim `unconfirmed`.
 
 `workflow.py` gates each model-bearing invocation (workflow turns and
 auxiliary model calls; probe-free paths such as git-only fast-forward merges
@@ -1618,7 +1642,21 @@ launcher: it resolves the global configuration through
 UI process lifecycle (foreground/daemon/status/stop) with a per-user record
 under `~/.config/aflow/ui/`, and wires the portable persistent unit adapter
 (`aflow/control_plane/persistent_units.py`) into the server's control plane so
-workflow units survive UI restarts on Linux and macOS. The FastAPI server and
+workflow units survive UI restarts on Linux and macOS. An explicit unit stop
+verifies the nonce, the live controller birth and the session-leader contract,
+then ends every birth-verified process group inside the owned session
+(bounded snapshot, one TERM per verified group, bounded KILL escalation,
+anchored same-session descendant rescans) and requires positive cessation of
+every captured member before the stopped receipt; without session proof it
+falls back to the verified controller group only and never claims extra
+cleanup. The local `SubprocessUnitManager` adapter (used by local
+control-plane callers without systemd) shares this proven-session stop
+algorithm: it proves the controller's exact birth and session-leader topology,
+ends the controller group and any separate-group provider in the session
+(TERM, then bounded KILL escalation), and requires positive cessation of every
+owned member before reporting success; when the controller leader has already
+exited it drains its owned group with the same positive-absence requirement.
+The FastAPI server and
 React client expose four product areas: registered projects, the shared
 global workflow configuration pair plus server settings, filesystem plans,
 and durable workflow runs.

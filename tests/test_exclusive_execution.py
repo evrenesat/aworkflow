@@ -73,7 +73,11 @@ from aflow.hotplug import (
     HotplugTransactionV1,
     hotplug_transaction_id,
 )
-from aflow.process_identity import process_birth_identity, process_liveness
+from aflow.process_identity import (
+    process_birth_identity,
+    process_group_state,
+    process_liveness,
+)
 from aflow.run_state import (
     ControllerConfig,
     ImplementationAttempt,
@@ -2985,11 +2989,47 @@ print('synthetic local result')
 '''
 
 
-def _ipc_controller(root, config_path, store_root, label, gates, trace, rounds, fail_first):
-    """Real controller and real harness children; only the model is local."""
+def _ipc_controller(
+    root, config_path, store_root, label, gates, trace, rounds, fail_first,
+    predecessor=None,
+):
+    """Real controller and real harness children; only the model is local.
+
+    ``predecessor`` is an optional test-only ``(pid, birth, group)`` identity
+    of an earlier owned provider.  When set, the isolated store's real
+    ``try_acquire`` is wrapped so that a returned acquisition is only handed
+    to admission/provider launch after the captured predecessor PID and group
+    have positively ceased, with a timestamped trace at that boundary.  The
+    default (absent) keeps the existing paired-controller callers unchanged.
+    """
     import aflow.workflow as workflow_module
 
     store = ExecutionResourceStore(root=Path(store_root))
+    if predecessor is not None:
+        pred_pid, pred_birth, pred_group = predecessor
+        original_acquire = store.try_acquire
+
+        def try_acquire(resource, invocation_id, controller):
+            outcome = original_acquire(resource, invocation_id, controller)
+            if outcome.state == "acquired":
+                # Test-only boundary: the real successful acquisition must
+                # never precede positive cessation of the captured
+                # predecessor provider; no journal mutation, no reconcile,
+                # no manufactured liveness.
+                assert process_liveness(pred_pid) == "absent", (
+                    "predecessor provider pid is not positively absent"
+                )
+                assert process_birth_identity(pred_pid) is None, (
+                    "predecessor provider identity is not gone"
+                )
+                assert process_group_state(pred_group) == "absent", (
+                    "predecessor provider group is not positively absent"
+                )
+                trace.put(("predecessor_ceased", label, 0, pred_pid, pred_birth,
+                           {"phase_at": time.monotonic_ns()}))
+            return outcome
+
+        store.try_acquire = try_acquire
     workflow_module._default_execution_resource_store = lambda: store
     workflow_module._execution_resource_admission_options = lambda: {"poll_interval": 0.02, "control_interval": 0.05}
     # Spawn does not inherit pytest's ordinary synthetic-publication fixture.
@@ -6351,3 +6391,559 @@ go = [{ to = "END", when = "DONE" }, { to = "implement" }]
             resource_store, _HANDOVER_SOURCE_RESOURCE,
             peer_identity, peer_invocation, required=False,
         )
+
+
+# ---------------------------------------------------------------------------
+# End-to-end managed stop + automatic FIFO reconciliation (checkpoint 2)
+# ---------------------------------------------------------------------------
+# A managed exclusive owner (started through the daemon/PersistentUnitManager
+# owned-stop seam) is stopped while two FIFO waiters are queued.  The managed
+# stop must end the owned timeout-shaped group and the FIFO head must acquire
+# automatically, with no direct reconcile call in the test.  A second case
+# proves a controller crash with a live child keeps the resource occupied until
+# the child actually ceases.
+
+
+_E2E_FAKE_AFLOW = '''\
+#!/usr/bin/env python3
+import argparse, json, os, subprocess, sys, time
+from pathlib import Path
+
+def _birth(pid):
+    from aflow.process_identity import process_birth_identity
+    return process_birth_identity(pid)
+
+def _ui_worker(argv):
+    if "--" in argv:
+        split = argv.index("--")
+        flags, worker_argv = argv[:split], argv[split + 1:]
+    else:
+        flags, worker_argv = argv, []
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--receipt-dir", type=Path, required=True)
+    parser.add_argument("--nonce", required=True)
+    args = parser.parse_args(flags)
+    receipt_dir = args.receipt_dir
+    inner = [a for a in worker_argv if a != "--"]
+    start = json.loads((receipt_dir / "start.json").read_text())
+    if start.get("nonce") != args.nonce:
+        sys.exit(3)
+    def write(name, payload):
+        temp = receipt_dir / f".{name}.tmp"
+        temp.write_text(json.dumps(payload, indent=2))
+        os.replace(temp, receipt_dir / name)
+    child = subprocess.Popen(
+        inner, stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        start_new_session=True,
+    )
+    write("child.json", {
+        "schema": 1, "nonce": args.nonce, "pid": child.pid,
+        "pgid": child.pid, "process_birth": _birth(child.pid),
+    })
+    code = child.wait()
+    write("exit.json", {
+        "schema": 1, "nonce": args.nonce, "returncode": code,
+        "at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+    })
+    sys.exit(code if code >= 0 else 128 - code)
+
+def _log(activity, label, phase, message):
+    entry = {"label": label, "phase": phase, "at": time.monotonic_ns(),
+             "pid": message.get("pid"), "birth": message.get("birth")}
+    with open(activity, "a") as handle:
+        handle.write(json.dumps(entry) + "\\n")
+
+def _daemon_worker(argv):
+    import socketserver, threading
+    from dataclasses import replace
+    import aflow.workflow as workflow_module
+    from aflow.config import load_workflow_config
+    from aflow.run_state import ControllerConfig
+    from aflow.workflow import run_workflow
+    from aflow.harnesses.codex import CodexAdapter
+    from aflow.harnesses.preflight import NoOpHarnessPreflightProbe
+    from aflow.execution_resources import ExecutionResourceStore
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--repo-root", type=Path, required=True)
+    parser.add_argument("--config", type=Path, required=True)
+    parser.add_argument("--run-id", required=True)
+    args = parser.parse_args(argv)
+    root = args.repo_root
+    config = args.config
+    store_root = Path(os.environ["AFLOW_TEST_E2E_STORE"])
+    _host, _, _port = os.environ["AFLOW_TEST_E2E_GATE"].rpartition(":")
+    gate = (_host, int(_port))
+    activity = Path(os.environ["AFLOW_TEST_E2E_ACTIVITY"])
+    store = ExecutionResourceStore(root=store_root)
+    workflow_module._default_execution_resource_store = lambda: store
+    workflow_module._execution_resource_admission_options = lambda: {
+        "poll_interval": 0.02, "control_interval": 0.05}
+    workflow_module.publish_completed_run = lambda *a, **k: None
+    plan = root / "plan.md"
+    from aflow.control_plane.repository import RunRepository
+    launch_manifest = RunRepository(root).get_launch_manifest(args.run_id)
+    if launch_manifest is None:
+        sys.exit(3)
+    class GateHandler(socketserver.StreamRequestHandler):
+        def handle(self):
+            self.request.settimeout(120)
+            message = json.loads(self.rfile.readline())
+            _log(activity, "owner", "enter", message)
+            while True:
+                time.sleep(1)
+    server = socketserver.ThreadingTCPServer(gate, GateHandler)
+    server.daemon_threads = True
+    bridge = threading.Thread(target=server.serve_forever, daemon=True)
+    bridge.start()
+    class LocalAdapter(CodexAdapter):
+        name = "e2e-owner"
+        def build_invocation(self, **kwargs):
+            invocation = super().build_invocation(**kwargs)
+            return replace(invocation,
+                argv=(sys.executable, str(root / "fake-harness.py"),
+                      kwargs["model"]),
+                env={"PYTHONPATH": str(Path(workflow_module.__file__)
+                                       .resolve().parent.parent),
+                     "AFLOW_TEST_IPC": json.dumps({"address": list(gate),
+                                                  "rounds": 1, "fail_first": False,
+                                                  "plan_name": plan.name,
+                                                  "effort": kwargs.get("effort")})})
+    try:
+        run_workflow(
+            ControllerConfig(repo_root=root, plan_path=plan, max_turns=8,
+                            reserved_run_id=args.run_id,
+                            team=launch_manifest.team,
+                            idempotency_key=launch_manifest.idempotency_key,
+                            caller_scope=launch_manifest.caller_scope),
+            load_workflow_config(config), "live", config_dir=config,
+            snapshot_config=False, adapter=LocalAdapter(),
+            preflight_probe=NoOpHarnessPreflightProbe(),
+            allow_existing_launch_manifest=True,
+            admission_reservation_nonce=os.environ.get(
+                "AFLOW_ADMISSION_RESERVATION_NONCE"),
+        )
+    except BaseException:
+        import traceback
+        with open(activity, "a") as handle:
+            handle.write("DAEMON_WORKER_TRACEBACK\\n" + traceback.format_exc() + "\\n")
+        raise
+    finally:
+        server.shutdown(); server.server_close()
+
+def main():
+    argv = sys.argv[1:]
+    if not argv:
+        sys.exit(2)
+    if argv[0] == "ui-worker":
+        _ui_worker(argv[1:])
+    elif argv[0] == "daemon-worker":
+        _daemon_worker(argv[1:])
+    else:
+        sys.exit(2)
+
+main()
+'''
+
+
+def _e2e_free_port() -> int:
+    import socket
+
+    with socket.socket() as sock:
+        sock.bind(("127.0.0.1", 0))
+        return sock.getsockname()[1]
+
+
+def _e2e_store_owner(store_root: Path, resource: str) -> dict | None:
+    path = store_root / f"{resource}.json"
+    if not path.exists():
+        return None
+    return json.loads(path.read_text(encoding="utf-8"))["owner"]
+
+
+def _e2e_drain_trace(trace: object, events: list[object]) -> None:
+    while True:
+        try:
+            events.append(trace.get(timeout=0.1))  # type: ignore[union-attr]
+        except queue.Empty:
+            break
+
+
+def _e2e_start_owner(tmp_path, monkeypatch, *, store_root, activity):
+    """Start a managed exclusive owner through the daemon owned-stop seam."""
+    import aflow as _aflow_pkg
+    from aflow.api.models import PreparedRun, StartupRequest
+    from aflow.config import load_workflow_config
+    from aflow.control_plane.persistent_units import PersistentUnitManager
+    from aflow.daemon import AflowDaemon, DaemonConfig
+
+    repo_root = tmp_path / "owner-repo"
+    repo_root.mkdir()
+    (repo_root / "README.md").write_text("managed owner fixture\n", encoding="utf-8")
+    (repo_root / "plan.md").write_text(_VALID_PLAN, encoding="utf-8")
+    (repo_root / "fake-harness.py").write_text(_IPC_HARNESS, encoding="utf-8")
+    executable = tmp_path / "e2e-aflow" / "aflow"
+    executable.parent.mkdir()
+    executable.write_text(_E2E_FAKE_AFLOW, encoding="utf-8")
+    executable.chmod(0o755)
+    config_path, _ = _write_split_config(
+        home_dir=repo_root,
+        aflow_text=_aflow_toml(worker_model="shared-model"),
+        workflows_text=_workflows_toml(steps="work_only"),
+    )
+    environment_file = repo_root / "aflowd.env"
+    environment_file.write_text("AFLOWD_MODE=test\n", encoding="utf-8")
+    gate = _e2e_free_port()
+    units = PersistentUnitManager(executable=executable, stop_timeout_seconds=20)
+    daemon = AflowDaemon(
+        DaemonConfig(
+            repo_root=repo_root,
+            config_path=config_path,
+            aflow_executable=executable,
+            environment_file=environment_file,
+            release_identity="release-e2e",
+            environment={
+                "AFLOW_TEST_E2E_STORE": str(store_root),
+                "AFLOW_TEST_E2E_GATE": f"127.0.0.1:{gate}",
+                "AFLOW_TEST_E2E_ACTIVITY": str(activity),
+                # The fake aflow executable is a plain script, so the
+                # daemon-worker subprocess must be told where the test
+                # process' aflow package lives.
+                "PYTHONPATH": str(Path(_aflow_pkg.__file__).resolve().parent.parent),
+            },
+            stop_timeout_seconds=20,
+            poll_interval_seconds=0.05,
+        ),
+        units=units,
+    )
+    daemon.start()
+
+    def _prepared(request):
+        workflow = request.workflow_config.workflows[request.workflow_name]
+        return PreparedRun(
+            workflow_name="live",
+            repo_root=request.repo_root,
+            plan_path=request.plan_path,
+            config_path=request.config_path,
+            max_turns=request.max_turns or 8,
+            team=request.team if request.team is not None else workflow.team,
+            extra_instructions=(),
+            start_step="work",
+        )
+
+    monkeypatch.setattr("aflow.daemon.prepare_startup", _prepared)
+    request = StartupRequest(
+        repo_root=repo_root,
+        plan_path=repo_root / "plan.md",
+        config_path=config_path,
+        workflow_config=load_workflow_config(config_path),
+        workflow_name="live",
+        start_step=None,
+        max_turns=8,
+        team=None,
+    )
+    started = daemon.service.start(request)
+    resource = _resource_for(config_path, "codex.base")
+    assert resource is not None
+
+    def _owner_bound() -> bool:
+        owner = _e2e_store_owner(store_root, resource)
+        return bool(
+            owner
+            and owner["child_pid"] is not None
+            and owner["status"] == "running"
+        )
+
+    assert _wait_until(_owner_bound), "managed owner must bind and hold the resource"
+    return daemon, units, repo_root, config_path, started.run_id, resource
+
+
+def _e2e_launch_waiter(
+    context, trace, tree: Path, config_path: Path, store_root: Path, label: str,
+    gates, predecessor=None,
+):
+    tree.mkdir(parents=True, exist_ok=True)
+    (tree / f"plan-{label}.md").write_text(_VALID_PLAN, encoding="utf-8")
+    (tree / "fake-harness.py").write_text(_IPC_HARNESS, encoding="utf-8")
+    proc = context.Process(
+        target=_ipc_controller,
+        args=(str(tree), str(config_path), str(store_root), label,
+              gates, trace, 1, False, predecessor),
+    )
+    proc.start()
+    return proc
+
+
+class TestManagedStopReconcileE2E:
+    def test_automatic_reconcile_managed_stop_grants_fifo_head(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        store_root = tmp_path / "shared-ipc-store"
+        activity = tmp_path / "e2e-activity.log"
+        daemon, units, repo_root, config_path, run_id, resource = _e2e_start_owner(
+            tmp_path, monkeypatch, store_root=store_root, activity=activity
+        )
+        # Capture the original owner's identity from its bound record before
+        # any stop or waiter launch; the stopped provider is never derived
+        # from the mutable post-stop owner slot (the FIFO head may already
+        # own it when owner_stop returns).
+        owner_record = _e2e_store_owner(store_root, resource)
+        assert (
+            owner_record
+            and owner_record["run_id"] == run_id
+            and owner_record["child_pid"] is not None
+            and owner_record["child_birth"] is not None
+            and owner_record["process_group"] is not None
+        ), "the bound record must belong to the managed owner before stop"
+        predecessor = (
+            owner_record["child_pid"],
+            owner_record["child_birth"],
+            owner_record["process_group"],
+        )
+        context = multiprocessing.get_context("spawn")
+        trace = context.Queue()
+        events: list[object] = []
+        processes: dict[str, object] = {}
+        gates: dict[str, list] = {}
+        try:
+            for label in ("W1", "W2"):
+                gates[label] = [context.Event() for _ in range(1)]
+                processes[label] = _e2e_launch_waiter(
+                    context, trace, tmp_path / f"waiter-{label}",
+                    config_path, store_root, label, gates[label],
+                    predecessor=predecessor,
+                )
+            # Both waiters must be queued behind the managed owner.
+            for label in ("W1", "W2"):
+                def _waiting(lbl=label) -> bool:
+                    _e2e_drain_trace(trace, events)
+                    assert not any(e[0] == "error" for e in events), events
+                    dirs = _run_dirs(tmp_path / f"waiter-{lbl}")
+                    return bool(dirs) and _run_json(dirs[0]).get(
+                        "execution_resource_wait") is not None
+
+                assert _wait_until(_waiting), events
+            # Identify the FIFO head/tail from the journal; the two spawned
+            # waiters race to enqueue, so ticket order (not launch order) is
+            # the contract under test.
+            journal = json.loads((store_root / f"{resource}.json").read_text())
+            queued = [str(claim.get("project_root")) for claim in journal["queue"]]
+            assert len(queued) == 2, queued
+            head_label = next(
+                label for label in ("W1", "W2") if f"waiter-{label}" in queued[0]
+            )
+            tail_label = "W2" if head_label == "W1" else "W1"
+            # The managed stop ends the owned group and the FIFO head acquires
+            # automatically, with no direct reconcile call in this test.
+            stopped = daemon.service.owner_stop(run_id, expected_revision=0)
+            assert stopped.status == "owner_stopped"
+            # The head waiter's real acquisition boundary positively observed
+            # the captured predecessor's cessation before its provider
+            # launched; this child-recorded timestamp (not a later
+            # parent-poll timestamp) is the exit evidence the head must not
+            # precede, and it stays valid even when the post-stop owner slot
+            # already belongs to the head.
+            def _predecessor_ceased() -> bool:
+                _e2e_drain_trace(trace, events)
+                return any(
+                    e[0] == "predecessor_ceased" and e[1] == head_label
+                    for e in events
+                )
+
+            assert _wait_until(
+                _predecessor_ceased, timeout=30
+            ), "the head must positively observe the original owner's cessation " \
+               "before its provider launches"
+            owner_exit = next(
+                e for e in events
+                if e[0] == "predecessor_ceased" and e[1] == head_label
+            )[5]["phase_at"]
+
+            def _head_acquired() -> bool:
+                owner = _e2e_store_owner(store_root, resource)
+                # The real run_workflow claim carries its own invocation/run
+                # identity; the FIFO head is identified by its project tree.
+                return bool(
+                    owner
+                    and owner.get("status") == "running"
+                    and f"waiter-{head_label}" in str(owner.get("project_root"))
+                )
+
+            assert _wait_until(_head_acquired), (
+                "the FIFO head must acquire after the managed stop"
+            )
+            # The tail is still queued, not acquired.
+            journal = json.loads((store_root / f"{resource}.json").read_text())
+            queued = [str(claim.get("project_root")) for claim in journal["queue"]]
+            assert len(queued) == 1 and f"waiter-{tail_label}" in queued[0], (
+                "the second waiter must be retained"
+            )
+            # Release the head: it completes and the tail acquires.
+            gates[head_label][0].set()
+
+            def _head_done() -> bool:
+                _e2e_drain_trace(trace, events)
+                return any(
+                    e[0] == "end" and e[1] == head_label for e in events
+                )
+
+            assert _wait_until(_head_done, timeout=30), events
+
+            def _tail_acquired() -> bool:
+                _e2e_drain_trace(trace, events)
+                return any(
+                    e[0] == "start" and e[1] == tail_label for e in events
+                )
+
+            assert _wait_until(_tail_acquired, timeout=30), events
+            gates[tail_label][0].set()
+
+            def _tail_done() -> bool:
+                _e2e_drain_trace(trace, events)
+                return any(
+                    e[0] == "end" and e[1] == tail_label for e in events
+                )
+
+            assert _wait_until(_tail_done, timeout=30), events
+            for proc in processes.values():
+                proc.join(15)
+            _e2e_drain_trace(trace, events)
+            # Zero overlap from the fake provider enter/exit records.  The
+            # activity log may also carry non-JSON diagnostic lines (for
+            # example a stopped owner's traceback marker), so skip them.
+            owner_enter = min(
+                int(entry["at"])
+                for line in activity.read_text().splitlines()
+                if line
+                for entry in [json.loads(line) if line.startswith("{") else {}]
+                if entry.get("phase") == "enter"
+            )
+            head_start = next(
+                e for e in events if e[0] == "start" and e[1] == head_label
+            )
+            head_end = next(
+                e for e in events if e[0] == "end" and e[1] == head_label
+            )
+            tail_start = next(
+                e for e in events if e[0] == "start" and e[1] == tail_label
+            )
+            # The shared completion wrapper recorded the head's actual child
+            # reaping (it verifies the child was wait()ed); that inspectable
+            # timestamp - not only the earlier protocol `end` timestamp -
+            # bounds when the tail provider may enter.
+            head_reaped = next(
+                e for e in events if e[0] == "reaped" and e[1] == head_label
+            )
+            assert owner_enter < owner_exit
+            assert owner_exit <= head_start[5]["phase_at"], (
+                "the head must not enter before the managed owner has ceased"
+            )
+            assert head_start[5]["phase_at"] < head_end[5]["phase_at"]
+            assert head_end[5]["phase_at"] <= head_reaped[5]["phase_at"], (
+                "the head's child must be reaped by its completion wrapper"
+            )
+            assert head_reaped[5]["phase_at"] <= tail_start[5]["phase_at"], (
+                "the tail must not enter before the head's child is reaped"
+            )
+        finally:
+            for gate in gates.values():
+                for event in gate:
+                    event.set()
+            for proc in processes.values():
+                proc.join(10)
+                if proc.is_alive():
+                    proc.terminate()
+                    proc.join(5)
+            _e2e_drain_trace(trace, events)
+            trace.close()
+            daemon.shutdown()
+
+
+def _e2e_reap_pid(pid: int, birth: str | None = None) -> None:
+    """Terminate a PID and wait for confirmed absence (test cleanup only).
+
+    When ``birth`` is given, the exact fixture-owned identity is revalidated
+    immediately before every signal (TERM and a later KILL); a reused or
+    unknown PID is never touched.
+    """
+    for sig in (signal.SIGTERM, signal.SIGKILL):
+        if birth is not None:
+            assert process_liveness(pid) == "present" and process_birth_identity(pid) == birth, (
+                f"pid {pid} no longer carries the fixture-owned birth {birth!r}"
+            )
+        try:
+            os.kill(pid, sig)
+        except ProcessLookupError:
+            return
+        if _wait_until(lambda: process_liveness(pid) == "absent", timeout=5):
+            return
+    raise AssertionError(f"pid {pid} did not cease")
+
+
+class TestManagedStopReconcileCrash:
+    def test_automatic_reconcile_controller_crash_live_child_waits(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        store_root = tmp_path / "shared-ipc-store"
+        activity = tmp_path / "e2e-activity.log"
+        daemon, units, repo_root, config_path, run_id, resource = _e2e_start_owner(
+            tmp_path, monkeypatch, store_root=store_root, activity=activity
+        )
+        try:
+            receipts = repo_root / ".aflow" / "runs" / run_id / "units"
+            child = json.loads((receipts / "child.json").read_text(encoding="utf-8"))
+            controller_pid = child["pid"]
+            # Revalidate the exact fixture-owned identity immediately before
+            # the crash signal; a reused PID is never touched.
+            assert process_liveness(controller_pid) == "present" and (
+                process_birth_identity(controller_pid) == child["process_birth"]
+            ), "the controller no longer carries its receipt birth"
+            owner = _e2e_store_owner(store_root, resource)
+            harness_pid = owner["child_pid"]
+            harness_birth = owner["child_birth"]
+            assert process_liveness(harness_pid) == "present"
+            # Crash the controller only; the live harness child keeps the
+            # resource occupied, so a peer must not acquire.
+            os.kill(controller_pid, signal.SIGKILL)
+            assert _wait_until(lambda: process_liveness(controller_pid) == "absent")
+            store = ExecutionResourceStore(root=store_root)
+            peer = store.current_controller_identity()
+            assert peer is not None
+            spec = ClaimSpec(
+                "/peer", "peer-run", "peer", "turn", "worker", "codex.base"
+            )
+            assert store.enqueue(resource, spec, peer).state == "queued"
+            assert store.try_acquire(resource, "peer", peer).state != "acquired"
+            # Terminate the live child: the resource is now free and the peer
+            # acquires on the next automatic reconciliation.
+            _e2e_reap_pid(harness_pid, harness_birth)
+            assert _wait_until(lambda: process_liveness(harness_pid) == "absent")
+            # The peer acquires through the normal control-aware admission
+            # loop (which performs bounded automatic reconciliation), not a
+            # direct reconcile call.
+            admission = ExecutionResourceAdmission(
+                store, poll_interval=0.02, control_interval=0.05
+            )
+            acquired: list[ExecutionLease | None] = []
+
+            def _admit_peer() -> None:
+                acquired.append(
+                    admission.admit(
+                        resource=resource,
+                        spec=spec,
+                        controller=peer,
+                        stop_check=lambda: None,
+                        revalidate=lambda **_kwargs: UNCHANGED,
+                    )
+                )
+
+            peer_thread = threading.Thread(target=_admit_peer, daemon=True)
+            peer_thread.start()
+            assert _wait_until(
+                lambda: acquired and acquired[0] is not None,
+                timeout=30,
+            ), "peer must acquire after the dead owner is reclaimed"
+            peer_thread.join(10)
+            _release(store, resource, peer, "peer", required=False)
+        finally:
+            daemon.shutdown()

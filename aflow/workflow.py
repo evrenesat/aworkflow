@@ -89,6 +89,7 @@ from .execution_resources import (
     UNCHANGED,
     owned_child_binding,
 )
+from .process_identity import process_group_state, terminate_owned_group
 from .harnesses import get_adapter
 from .harnesses.preflight import (
     HarnessEnvironmentBlocker,
@@ -6064,30 +6065,43 @@ def _normalize_process_launch_error(
     )
 
 
-def _reap_owned_process(proc: subprocess.Popen, grace_seconds: float = 5.0) -> None:
-    """Best-effort reap of a child we own; never raises into the caller."""
-    try:
-        proc.wait(timeout=grace_seconds)
-        return
-    except subprocess.TimeoutExpired:
-        pass
-    try:
-        proc.terminate()
-    except OSError:
-        pass
-    try:
-        proc.wait(timeout=grace_seconds)
-        return
-    except subprocess.TimeoutExpired:
-        pass
-    try:
-        proc.kill()
-    except OSError:
-        pass
-    try:
-        proc.wait(timeout=grace_seconds)
-    except subprocess.TimeoutExpired:
-        pass
+def _reap_owned_process(
+    proc: subprocess.Popen[str],
+    process_group: int | None,
+    *,
+    grace_seconds: float = 5.0,
+) -> bool:
+    """Tear down the verified owned process group we spawned.
+
+    Sends TERM once to the group (only while our child still leads it),
+    escalates to KILL for survivors, and waits.  Returns ``True`` only on
+    positive group absence, which is the evidence a lease release requires.
+    Never raises into the caller.
+    """
+    return terminate_owned_group(proc, process_group, grace_seconds=grace_seconds)
+
+
+def _owned_group_absent(
+    process_group: int | None, grace_seconds: float = 5.0
+) -> bool:
+    """Positive group-absence evidence for a successful lease release.
+
+    The child itself was already reaped; this only verifies that no owned
+    group descendant (for example a provider spawned by a wrapper) remains.
+    """
+    if process_group is None or process_group < 1:
+        return False
+    deadline = time.monotonic() + grace_seconds
+    while (
+        time.monotonic() < deadline
+        and process_group_state(process_group, deadline) == "present"
+    ):
+        time.sleep(0.05)
+    # A scan finishing at/after the window is expired evidence, never
+    # positive absence: ownership stays unconfirmed.
+    if time.monotonic() >= deadline:
+        return False
+    return process_group_state(process_group, deadline) == "absent"
 
 
 def _mark_auxiliary_launch_intent(
@@ -6120,6 +6134,13 @@ def _run_process(
         # Durable launch intent is persisted before the spawn attempt.
         _mark_auxiliary_launch_intent(lease, None)
     try:
+        popen_kwargs: dict[str, object] = {}
+        if sys.platform in ("linux", "darwin"):
+            # The child leads its own process group inside the controller's
+            # owned session, so its real group identity is stable before
+            # exec: a wrapper such as ``timeout`` cannot move the group
+            # later, and the group stays addressable for owned teardown.
+            popen_kwargs["process_group"] = 0
         proc = subprocess.Popen(
             list(invocation.argv),
             cwd=str(repo_root),
@@ -6134,6 +6155,7 @@ def _run_process(
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
+            **popen_kwargs,
         )
     except OSError as exc:
         if lease is not None:
@@ -6141,75 +6163,90 @@ def _run_process(
             lease.complete()
         return _normalize_process_launch_error(invocation, exc)
 
-    if lease is not None:
-        try:
-            child_pid, child_birth, process_group = owned_child_binding(proc)
-            lease.bind_child(child_pid, child_birth, process_group)
-        except BaseException as exc:
-            _reap_owned_process(proc)
-            try:
-                lease.mark_unconfirmed()
-            except ResourceLeaseError as retain_error:
-                raise retain_error from exc
-            raise ResourceLeaseError("register_child", str(exc), context=exc) from exc
-
-    banner.update(state)
-
-    stdout_chunks: list[str] = []
-    stderr_chunks: list[str] = []
-
-    def _drain(stream, chunks: list[str]) -> None:
-        while True:
-            chunk = stream.read(4096)
-            if not chunk:
-                break
-            chunks.append(chunk)
-
-    assert proc.stdout is not None
-    assert proc.stderr is not None
-    t_out = threading.Thread(
-        target=_drain,
-        args=(proc.stdout, stdout_chunks),
-        daemon=True,
+    # The teardown group target is established before the potentially
+    # interruptible birth observation: on Linux/macOS ``process_group=0``
+    # already makes the child lead its own group, so ``proc.pid`` is the
+    # intended group target; the teardown freshly revalidates the directly
+    # owned child/group before signalling it.  Unsupported platforms keep
+    # ``None`` so no parent group is ever signalled, and the observed real
+    # group identity below replaces the target once verified.
+    process_group: int | None = (
+        proc.pid if sys.platform in ("linux", "darwin") else None
     )
-    t_err = threading.Thread(
-        target=_drain,
-        args=(proc.stderr, stderr_chunks),
-        daemon=True,
-    )
-    t_out.start()
-    t_err.start()
-
-    stdin_errors: list[BrokenPipeError] = []
-    t_in: threading.Thread | None = None
-    stdin_text = invocation.stdin_text
-    if stdin_text is not None:
-        assert proc.stdin is not None
-
-        def _record_broken_pipe(exc: BrokenPipeError) -> None:
-            try:
-                proc.wait(timeout=PROCESS_POLL_INTERVAL_SECONDS)
-            except subprocess.TimeoutExpired:
-                stdin_errors.append(exc)
-
-        def _write_stdin() -> None:
-            try:
-                proc.stdin.write(stdin_text)
-            except BrokenPipeError as exc:
-                # A child which exits while its input is being written has
-                # already closed the pipe.  If it is still alive, preserve the
-                # error rather than hiding an unexpected transport failure.
-                _record_broken_pipe(exc)
-            finally:
-                try:
-                    proc.stdin.close()
-                except BrokenPipeError as exc:
-                    _record_broken_pipe(exc)
-
-        t_in = threading.Thread(target=_write_stdin, daemon=True)
-        t_in.start()
-
+    child_bound = False
     try:
+        child_pid, child_birth, process_group = owned_child_binding(proc)
+        if lease is not None:
+            try:
+                lease.bind_child(child_pid, child_birth, process_group)
+            except BaseException as exc:
+                # The registration failure keeps its typed error and
+                # unconfirmed transition; the single outer teardown below
+                # cleans the owned child/group exactly once.
+                try:
+                    lease.mark_unconfirmed()
+                except ResourceLeaseError as retain_error:
+                    raise retain_error from exc
+                raise ResourceLeaseError("register_child", str(exc), context=exc) from exc
+            child_bound = True
+
+        banner.update(state)
+
+        stdout_chunks: list[str] = []
+        stderr_chunks: list[str] = []
+
+        def _drain(stream, chunks: list[str]) -> None:
+            while True:
+                chunk = stream.read(4096)
+                if not chunk:
+                    break
+                chunks.append(chunk)
+
+        assert proc.stdout is not None
+        assert proc.stderr is not None
+        t_out = threading.Thread(
+            target=_drain,
+            args=(proc.stdout, stdout_chunks),
+            daemon=True,
+        )
+        t_err = threading.Thread(
+            target=_drain,
+            args=(proc.stderr, stderr_chunks),
+            daemon=True,
+        )
+        t_out.start()
+        t_err.start()
+
+        stdin_errors: list[BrokenPipeError] = []
+        t_in: threading.Thread | None = None
+        stdin_text = invocation.stdin_text
+        if stdin_text is not None:
+            assert proc.stdin is not None
+
+            def _record_broken_pipe(exc: BrokenPipeError) -> None:
+                try:
+                    proc.wait(timeout=PROCESS_POLL_INTERVAL_SECONDS)
+                except subprocess.TimeoutExpired:
+                    stdin_errors.append(exc)
+
+            def _write_stdin() -> None:
+                try:
+                    proc.stdin.write(stdin_text)
+                except BrokenPipeError as exc:
+                    # A child which exits while its input is being written
+                    # has already closed the pipe.  If it is still alive,
+                    # preserve the error rather than hiding an unexpected
+                    # transport failure.
+                    _record_broken_pipe(exc)
+                finally:
+                    try:
+                        proc.stdin.close()
+                    except BrokenPipeError as exc:
+                        _record_broken_pipe(exc)
+
+            t_in = threading.Thread(target=_write_stdin, daemon=True)
+            t_in.start()
+
         while True:
             try:
                 proc.wait(timeout=PROCESS_POLL_INTERVAL_SECONDS)
@@ -6217,22 +6254,37 @@ def _run_process(
             except subprocess.TimeoutExpired:
                 if control_callback is not None:
                     control_callback()
-    except BaseException:
-        # A live child may still be running when the controller stops polling
-        # (for example an owner stop); ownership is retained, never released.
-        if lease is not None:
-            lease.mark_unconfirmed()
-        raise
 
-    if t_in is not None:
-        t_in.join()
-    t_out.join()
-    t_err.join()
+        if t_in is not None:
+            t_in.join()
+        t_out.join()
+        t_err.join()
+    except BaseException:
+        # A live child may still be running when identity observation, lease
+        # binding, startup banner output, stream setup, polling, or the
+        # synchronous stream join is interrupted (for example an owner stop,
+        # or a foreground interrupt of an unleased nonexclusive run): tear
+        # down the verified owned group exactly once in every case, then
+        # release the claim only on positive group absence, otherwise retain
+        # ownership as unconfirmed.  A failed child binding already marked
+        # the claim unconfirmed and must not be completed here.
+        group_cleared = _reap_owned_process(proc, process_group)
+        if lease is not None and child_bound:
+            if group_cleared:
+                lease.complete()
+            else:
+                lease.mark_unconfirmed()
+        raise
 
     if lease is not None:
         # The child was reaped by proc.wait() above (including the stdin-error
-        # path below), so the claim can be released.
-        lease.complete()
+        # path below); the claim is released only when the owned group is
+        # positively gone, so a wrapper exit cannot release the resource
+        # while a live provider descendant still runs.
+        if _owned_group_absent(process_group):
+            lease.complete()
+        else:
+            lease.mark_unconfirmed()
 
     if stdin_errors:
         raise stdin_errors[0]

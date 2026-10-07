@@ -23,7 +23,6 @@ import json
 import os
 import re
 import stat as stat_module
-import sys
 import tempfile
 import time
 from contextlib import contextmanager
@@ -34,6 +33,7 @@ from typing import Any, Callable, Iterator, Literal
 from aflow.process_identity import (
     host_boot_identity,
     process_birth_identity,
+    process_group_state,
     process_liveness,
 )
 
@@ -207,36 +207,10 @@ def _default_process_evidence(pid: int) -> ProcessEvidence:
 
 
 def _default_group_evidence(pgid: int | None) -> GroupState:
-    if pgid is None or pgid < 1:
-        return "unknown"
-    if sys.platform == "linux":
-        try:
-            names = sorted(entry.name for entry in Path("/proc").iterdir() if entry.name.isdigit())
-        except OSError:
-            return "unknown"
-        seen = False
-        for name in names:
-            try:
-                raw = Path(f"/proc/{name}/stat").read_text(encoding="utf-8")
-                suffix = raw[raw.rfind(")") + 2 :].split()
-                if int(suffix[2]) == pgid:
-                    seen = True
-            except (OSError, UnicodeError, IndexError, ValueError):
-                return "unknown"
-        return "present" if seen else "absent"
-    if sys.platform == "darwin":
-        # POSIX null-signal group probe: signal 0 checks existence without
-        # signaling anything.  ESRCH proves every member of the group is
-        # gone; success proves the group still exists.  Permission and other
-        # observation failures stay unknown rather than manufacture absence.
-        try:
-            os.kill(-pgid, 0)
-        except ProcessLookupError:
-            return "absent"
-        except OSError:
-            return "unknown"
-        return "present"
-    return "unknown"
+    # Shared with the owned-group teardown so lease termination evidence and
+    # stop signalling agree on what counts as a live group member (zombies
+    # are already dead and must not hold a claim open).
+    return process_group_state(pgid)
 
 
 def _valid_resource_id(resource: str) -> bool:

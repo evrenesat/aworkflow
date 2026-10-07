@@ -159,15 +159,25 @@ def test_subprocess_unit_drains_group_after_worker_leader_exits(tmp_path: Path) 
     finally:
         manager.shutdown()
     assert terminal is not None
+    # Assert positive cessation through the platform liveness contract:
+    # an unreaped Linux zombie is positively ceased, and kill(0) succeeds on
+    # a zombie, so an immediate ESRCH check would race asynchronous reaping
+    # (e.g. when this test process is a child subreaper).
+    from aflow.process_identity import process_liveness
+
     deadline = time.monotonic() + 2.0
     while time.monotonic() < deadline:
-        try:
-            os.kill(child_pid, 0)
-        except ProcessLookupError:
+        if process_liveness(child_pid, time.monotonic() + 5) == "absent":
             break
         time.sleep(0.01)
     else:
         pytest.fail("worker descendant survived process-group drain")
+    # Reap the adopted fixture child (this process may be a subreaper) using
+    # the owned identity; never a broad discovery.
+    try:
+        os.waitpid(child_pid, os.WNOHANG)
+    except ChildProcessError:
+        pass
 
 
 def test_subprocess_unit_rejects_invalid_identity_and_environment_file(tmp_path: Path) -> None:

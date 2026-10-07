@@ -12,6 +12,17 @@ import subprocess
 import time
 from typing import Callable, Mapping, Protocol
 
+from aflow.process_identity import (
+    SESSION_OBSERVATION_SECONDS,
+    controller_group_owned,
+    process_birth_bounded,
+    process_group_state,
+)
+
+#: Bounded KILL grace appended to the configured stop timeout so a verified
+#: TERM survivor can be escalated and observed inside the shared stop window.
+_STOP_KILL_GRACE_SECONDS = 2.0
+
 
 @dataclass(frozen=True)
 class UnitState:
@@ -225,21 +236,98 @@ class SubprocessUnitManager:
         process = self._units.get(name)
         if process is None:
             return None
-        self._signal_group(process, signal.SIGTERM)
-        deadline = time.monotonic() + self._stop_timeout_seconds
-        while self._group_is_alive(process):
-            process.poll()
-            if time.monotonic() >= deadline:
-                break
-            time.sleep(0.01)
-        if self._group_is_alive(process):
-            self._signal_group(process, signal.SIGKILL)
-            kill_deadline = time.monotonic() + 2.0
-            while self._group_is_alive(process) and time.monotonic() < kill_deadline:
-                process.poll()
-                time.sleep(0.01)
-        if self._group_is_alive(process):
-            raise RuntimeError(f"workflow unit {name} process group did not terminate")
+        # Imported lazily: persistent_units imports from this module, so a
+        # top-level import would be circular.  Both adapters share the same
+        # proven-session stop algorithm from that module.
+        from aflow.control_plane import persistent_units as pu
+
+        pid = process.pid
+        # The outer stop deadline spans the configured TERM grace plus a
+        # bounded KILL grace so a verified TERM survivor can be escalated and
+        # observed inside the shared window.
+        deadline = (
+            time.monotonic() + self._stop_timeout_seconds + _STOP_KILL_GRACE_SECONDS
+        )
+        # Prove the controller's exact birth and dedicated session/group
+        # topology before any signal: a live session leader uses the shared
+        # proven-session stop algorithm (which also ends a separate-group
+        # provider such as the local harness child), an exited leader drains
+        # its owned group.  The birth probe is bounded by the shared stop
+        # deadline: a timed-out or inaccessible read is unknown, never a
+        # generic five-second fallback that spends stop budget.
+        birth = process_birth_bounded(pid, deadline)
+        contract = pu.session_contract(pid, birth, deadline)
+        if contract.topology == "session":
+            # The initial inventory and all associated proofs (original
+            # controller revalidation, initial anchor/group signal proof)
+            # share one <=2s operation deadline created before the first
+            # snapshot; the outer deadline stays separate for later
+            # rescans/escalation and is never renewed after the inventory.
+            initial_operation = min(
+                deadline, time.monotonic() + SESSION_OBSERVATION_SECONDS
+            )
+            captured = pu.session_snapshot(pid, initial_operation)
+            if captured is None:
+                # The session-leader contract is verified but the initial
+                # observation was incomplete, so no session proof exists.  The
+                # verified controller group may still be stopped within its
+                # bounds (fresh ownership proof required before each signal),
+                # but session cessation cannot be proven: fail typed.
+                pu.stop_controller_group(
+                    pid, birth, deadline, contract.session_id, self._signal_pgid
+                )
+                raise RuntimeError(
+                    f"workflow unit {name} session observation was incomplete"
+                )
+            if not controller_group_owned(
+                pid, birth, contract.session_id, initial_operation
+            ):
+                # The controller was verified only before the initial
+                # observation; if it ceased (or its identity was reused)
+                # during that observation the inventory cannot replace the
+                # recorded authority: fail typed without any inventory-derived
+                # signal.
+                raise RuntimeError(
+                    f"workflow unit {name} controller identity was lost during observation"
+                )
+            if not pu.stop_session_groups(
+                pid,
+                captured,
+                deadline,
+                signal_group=self._signal_pgid,
+                snapshot=pu.session_snapshot,
+                anchor=pu.session_anchor,
+                ceased=pu.session_ceased,
+                kill_escalation_seconds=self._stop_timeout_seconds,
+                poll_interval=0.01,
+                initial_operation=initial_operation,
+            ):
+                # Session proof existed and a live owned member (the
+                # controller or a separate-group provider) survived the
+                # bounded deadline: fail typed.  Never report inactive while
+                # an owned group remains alive.
+                raise RuntimeError(
+                    f"workflow unit {name} owned session did not terminate"
+                )
+        else:
+            if process.poll() is None:
+                # The directly owned Popen is still live but its topology is
+                # unknown (a timed-out or inaccessible birth/SID/PGID
+                # observation): this is not an exited leader.  Never signal a
+                # group on a reusable numeric PID, never infer success, and
+                # never remove the unit: fail typed so the live controller
+                # stays visible to the manager.
+                raise RuntimeError(
+                    f"workflow unit {name} controller topology is unknown"
+                )
+            # The owned Popen has positively exited (a zombie whose birth is
+            # unobservable) before this stop.  Preserve the legacy
+            # controller-group drain: signal the owned group and require
+            # positive group absence before reporting success.
+            if not self._drain_controller_group(pid, deadline):
+                raise RuntimeError(
+                    f"workflow unit {name} process group did not terminate"
+                )
         process.wait()
         del self._units[name]
         return self._terminal_state(name, process)
@@ -274,6 +362,44 @@ class SubprocessUnitManager:
             os.killpg(process.pid, sig)
         except ProcessLookupError:
             return
+
+    def _signal_pgid(self, pgid: int, sig: signal.Signals) -> None:
+        """Signal a verified numeric process group (the shared contract)."""
+        try:
+            os.killpg(pgid, sig)
+        except ProcessLookupError:
+            return
+
+    def _drain_controller_group(self, pid: int, deadline: float) -> bool:
+        """Drain the owned group of an exited controller leader.
+
+        The controller is a directly-owned Popen that has already exited (a
+        zombie), so its birth is unobservable and no session proof exists.
+        Signal the owned group (TERM, then KILL after the configured grace)
+        and require positive group absence before reporting success; an
+        unknown group state is never treated as absence.  Every group
+        observation is bounded by one <=2s operation that never passes the
+        outer stop deadline and is rechecked immediately before TERM, KILL
+        and a successful absence result: expired evidence authorizes no
+        signal and no positive cessation.
+        """
+
+        def _group_state() -> str:
+            # One bounded operation per observation, never past the outer
+            # stop deadline; expired evidence reports unknown.
+            operation = min(deadline, time.monotonic() + SESSION_OBSERVATION_SECONDS)
+            return process_group_state(pid, operation)
+
+        if time.monotonic() < deadline:
+            self._signal_pgid(pid, signal.SIGTERM)
+        term_deadline = min(deadline, time.monotonic() + self._stop_timeout_seconds)
+        while time.monotonic() < term_deadline and _group_state() == "present":
+            time.sleep(0.01)
+        if time.monotonic() < deadline and _group_state() == "present":
+            self._signal_pgid(pid, signal.SIGKILL)
+            while time.monotonic() < deadline and _group_state() == "present":
+                time.sleep(0.01)
+        return time.monotonic() < deadline and _group_state() == "absent"
 
     def _group_is_alive(self, process: subprocess.Popen[str]) -> bool:
         try:

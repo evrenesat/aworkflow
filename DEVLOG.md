@@ -1,5 +1,439 @@
 # DEVLOG
 
+## 2026-10-07 — CP2 v10 repair: cover owned subprocess startup with exception teardown (issue #76)
+
+- Extended the v09 owned-group cleanup boundary in `_run_process` from the
+polling loop to the whole post-spawn lifetime: identity observation
+(`owned_child_binding`), lease child binding, startup `banner.update`,
+out/in stream setup, polling, and the synchronous stream joins now all run
+inside one `try` whose single `except BaseException` handler calls
+`_reap_owned_process` exactly once and rethrows the original exception with
+its identity and type. The teardown group target is established before the
+potentially interruptible birth observation: on Linux/macOS
+`process_group=0` already makes the child lead its own group, so
+`proc.pid` is the pre-observation target and `terminate_owned_group`
+freshly revalidates the directly owned child/group before signalling; the
+verified observed group replaces it afterwards, and unsupported platforms
+keep `None` so no parent group is signalled.
+- The bind-child failure keeps its established contract: the typed
+`ResourceLeaseError("register_child", ...)` and the unconfirmed transition
+are unchanged, and the outer handler now performs the single teardown for
+it instead of the branch's own call, so overlapping binding/outer
+exception paths clean exactly once and a failed binding is never completed
+as a success release (the handler releases only when a child was
+positively bound and the group is positively absent).
+- New real-process regressions in
+`tests/test_execution_resource_processes.py` (`owner_stop_unleased_startup`):
+(a) an isolated fixture controller in its own session runs the real
+unleased `_run_process` with the real `BannerRenderer` against a full
+native output pipe, so `banner.update` is verifiably blocked (Linux wchan
+guard; portable POSIX readiness barrier elsewhere) before the polling
+loop; a SIGINT to that exact foreground group must end the owned provider
+group with positive cessation and direct-child reaping before the 130
+exit while an unrelated decoy session survives; (b) a real spawn whose
+binding observation is interrupted by an injected `KeyboardInterrupt`
+must propagate that identical interrupt after exactly one delegated call
+to the real owned-group teardown, with the directly owned child
+positively gone. Existing polling-interrupt, callback-stop, leased
+bind-failure/success/unconfirmed, and FIFO tests are retained unchanged.
+- Verification: four `owner_stop_unleased_startup` regressions, the eight
+focused gates (including `TestManagedStopReconcileE2E` /
+`TestManagedStopReconcileCrash` and the retained
+`.issue76-proof/reviewer-fifo-race-v02.py`), the original checkpoint
+gates (focused suites, scoped Ruff, `git diff --check`), and the retained
+hotplug profile-drift test (the accepted-main versus retained
+`tests/test_hotplug.py` difference is exactly `_occupy_resource`'s owner
+identity: the retained live birth-matching identity is required because
+admission now reconciles proven-dead owners, so the dead `999999`
+identity from accepted main would be reclaimed and could not keep the
+resource busy; the retained version at HEAD preserves both intended
+behaviors) all pass, followed by one cumulative gate on the final source
+state. See `.issue76-proof/cp2-fix-v10-verification.log` for exact argv,
+cwd/HEAD, fingerprints, exit statuses, and elapsed times.
+
+## 2026-10-07 — CP2 v09 repair: tear down the owned group on unleased interruption (issue #76)
+
+- Repaired the v08-admitted unleased interruption regression without
+touching completed adapter, deadline, startup, portability, FIFO, or
+accepted-main work. `_run_process`'s exception path guarded
+`_reap_owned_process` with `lease is not None`, while the stable
+`process_group=0` spawn applies to every ordinary Linux/macOS subprocess:
+a foreground Ctrl-C of a nonexclusive controller (`run_workflow` passes
+`turn_lease=None`) reached the controller group, the newly separated
+provider never received the interrupt, and the controller exited leaving
+the provider orphaned. The exception path now calls
+`_reap_owned_process(proc, process_group)` exactly once outside the lease
+guard, uses its positive-absence result for the leased complete/unconfirmed
+decision only when a lease exists, and rethrows the original exception.
+`terminate_owned_group` has no broker/store involvement, so an unleased run
+creates no exclusive state and an unrelated session is untouched.
+- New regressions in `tests/test_execution_resource_processes.py` (real
+`_run_process` and real owned-group teardown, no mocks for the positive
+cases): an isolated fixture controller in its own session runs the real
+unleased `_run_process`; a SIGINT to that exact foreground group must end
+the provider group with positive cessation and reaping before the 130
+exit, while an unrelated decoy session survives; and an unleased
+`control_callback` stop must propagate the callback exception with
+preserved identity and type, cease the owned child, and create no broker
+journal. Linux-only subreaper reaping is guarded; native probes and
+bounded readiness/cessation deadlines are used throughout.
+- The hotplug profile-drift isolation from the previous cumulative run is
+confirmed by the retained `tests/test_hotplug.py` already present at HEAD
+(live birth-matching busy-owner identity); the accepted-main
+`pid=999999`/`foreign-birth` form would be reclaimed under CP1 and is not
+introduced here. Rerun evidence follows in the v09 verification log.
+
+## 2026-10-07 — CP2 v08 repair: keep a timed-out startup wrapper observation unconfirmed (issue #76)
+
+- Repaired the v07 bounded-entry startup classification defect without
+touching completed adapter, deadline, portability, FIFO, or accepted-main
+work. `PersistentUnitManager.stop` passed its entry operation deadline to
+`_observe`, but `_observe` mapped a timed-out wrapper birth observation to
+`inactive/startup_lost`, and stop returned that false inactive answer while
+the recorded wrapper was still live and could finish startup. The
+stop-specific startup observation now uses a new tri-state bounded birth
+proof (`process_identity.process_birth_proof`): a positively observed live
+wrapper keeps `active/start-post`, a positively absent wrapper keeps the
+genuine `inactive/startup_lost`, and an expired deadline, timed-out or
+inaccessible probe, missing/malformed wrapper identity, or a reused
+still-present PID yields `inactive/startup_unconfirmed`, which stop converts
+to a typed `PersistentUnitError` with no signal and no `stopped.json`
+inside the original entry operation (the probe never renews the budget or
+spends the generic five-second window). Ordinary `get` keeps the generic
+observation contract, and trusted nonce-bound stopped/exit receipts remain
+authoritative.
+- The accepted-main `tests/test_hotplug.py` `_occupy_resource` helper was
+integrated by keeping the CP1 retained form: the simulated busy owner uses
+the store's provably live, birth-matching controller identity, so the
+foreign claim keeps the resource busy under CP1's automatic dead-owner
+reconciliation (the accepted-main dead `pid=999999` fixture would be
+reclaimed and breaks
+`test_run_resume_recovered_session_resource_identity_survives_profile_drift`).
+Both intended behaviors are preserved by the retained helper; no other
+accepted-main test changes were needed.
+- New regressions in `tests/test_persistent_units.py` (fake clocks, native
+Darwin `ps` output/timeouts, recorded signals; the final `_observe`,
+`_bounded_process_alive`, and stop decision are not mocked): a timed-out
+live-wrapper birth probe fails typed inside a one-second stop entry while
+`get` stays `active/start-post`; missing and malformed wrapper identity fail
+typed without any probe; a reused wrapper PID fails typed; a positively
+absent wrapper returns `startup_lost`; a nonexpired live wrapper keeps
+`active/start-post`; and matching trusted stopped/exit receipts authorize
+their terminal answers without any wrapper probe. All eight focused gates,
+the five original checkpoint gates, and the cumulative gate were rerun at
+the final fingerprint.
+
+## 2026-10-07 — CP2 v07 repair: complete stop/teardown deadline propagation and portable fixtures (issue #76)
+
+- Repaired the two v06 root causes without changing completed adapter/
+  deadline behavior. (1) Deadline propagation now reaches every stop/
+  teardown decision: the persistent stop creates its outer deadline before
+  any identity observation (the entry observation and identity recheck stay
+  inside even a one-second stop window, and an unconfirmed entry identity
+  fails typed with no signal and no `stopped.json`); both unit adapters
+  create one absolute initial operation deadline (<=2s) before the first
+  snapshot and thread that same value to the initial inventory, the
+  original-controller revalidation, and the initial anchor/group signal
+  proof (the outer deadline is reserved for later rescans/escalation and is
+  never renewed after the inventory); the local exited-controller drain
+  bounds every group observation to one operation that never passes the
+  outer deadline and rechecks it before TERM, KILL, and a successful
+  absence result; the owned-group teardown uses ONE kill-phase deadline for
+  the ownership proof, group KILL, direct-child KILL/wait, and final group
+  cessation (no renewed `kill_seconds` allowance), and
+  `workflow._owned_group_absent` passes the existing deadline to the native
+  group probe and rechecks it before positive completion. (2) The five new
+  fixtures are host-portable: the three synthetic `test_linux_*deadline*`
+  cases pin `process_identity.sys.platform` to `linux` so their fake procfs
+  is exercised on every host, and the two real `subprocess_unit_stop_unknown`
+  tests inject the failure at the host's native birth observation (Linux
+  procfs suffix; on Darwin the controller's `ps -o lstart= -p PID` probe
+  times out while every other probe delegates to the real function).
+- New regressions (required behavior, fake clocks + recorded signals, no
+  mocked final ownership decisions): a bounded persistent stop entry whose
+  full-timeout native reads stay inside a one-second stop window (typed
+  `PersistentUnitError`, no signal, no `stopped.json`); initial-budget
+  threading in both adapters (inventory, controller revalidation, and
+  initial proof all receive the one shared <=2s value, never the larger
+  outer deadline); a positively exited local controller drain whose KILL
+  gate's fresh group read completes after the outer deadline (only the
+  in-budget initial TERM is issued, typed failure, no success); and an
+  owned teardown whose final Linux group-absence scan (40ms) outlives the
+  30ms kill-phase deadline (returns False, the claim stays unconfirmed, no
+  renewed time). All eight v06 focused gates and the five checkpoint
+  verification commands pass on the repaired tree.
+- Evidence: primary log
+  `.issue76-scratch/cp2-fix-v07-out/primary-v07.log` (cwd, exact argv, HEAD,
+  dirty fingerprints, elapsed times); focused suites `test_process_identity.py`
+  + `test_persistent_units.py` + `test_execution_resource_processes.py`
+  = 149 passed. Implementation left uncommitted for independent checkpoint
+  review; no plan state edited.
+
+## 2026-10-07 — CP2 v06 repair: unknown-topology local stop, shared observation deadline, zombie cessation assertions (issue #76)
+
+- `SubprocessUnitManager.stop` no longer treats every non-session contract
+  as an exited leader. Only a directly owned Popen with a positive `poll()`
+  result may use the owned controller-group drain; a live controller whose
+  topology is unknown (timed-out/inaccessible birth, SID, or PGID
+  observation) raises a typed `RuntimeError` before any TERM/KILL, retains
+  the unit, and issues no group signal on a reusable numeric PID.
+  `shutdown` shares the same failure behavior. The stop entry now uses the
+  bounded birth probe instead of the generic five-second one.
+- The shared stop deadline is now created once per operation before the
+  work it bounds: the contract birth probe is bounded by the two-second
+  observation window (never the entire outer deadline), and each rescan in
+  `stop_session_groups` creates its operation deadline before the inventory
+  and reuses that same absolute deadline for the post-inventory anchor,
+  group proof, and cessation decision (no renewed window after a snapshot).
+  `_bounded_process_alive` delegates to `process_birth_bounded` instead of
+  duplicating native birth logic.
+- Expired native evidence is rejected across the assigned stop paths:
+  Linux procfs birth, liveness, inventory, and group-scan reads that finish
+  at/after the shared deadline report no birth / `unknown` instead of
+  presence, absence, or identity; the pre-signal ownership revalidation
+  rechecks the operation and outer deadlines immediately before every
+  TERM/KILL. Positive nonexpired zombie cessation and fail-closed
+  inaccessible/malformed evidence are preserved.
+- New regressions: `subprocess_unit_stop_unknown` local cases (real
+  `_run_process` controller, separate-group provider, failed native birth
+  observation, typed stop/shutdown failure with unit retained and decoy
+  surviving, then successful ordinary stop once observation is restored);
+  an owned-subreaper case where a deliberately unreaped zombie provider is
+  positively ceased (`process_liveness == "absent"` while `kill(0)`
+  succeeds); and deadline cases covering a 10-second outer Darwin contract
+  probe (<=2s), a rescan inventory (0.8s) whose post-inventory proof is
+  constrained to the same original two-second deadline, an ownership proof
+  finishing at the deadline authorizing no signal, and Linux reads
+  finishing exactly at/after expiry (including 30ms remaining) yielding no
+  birth authority, no presence/absence, and no successful cessation.
+- The new adapter tests now assert immediate positive provider cessation
+  through `process_liveness(provider_pid) == "absent"` (an unreaped Linux
+  zombie is positively ceased) instead of an immediate ESRCH from
+  `kill(0)`, which raced asynchronous reaping; adopted fixture children are
+  reaped only in cleanup using owned identities.
+- Accepted-main integration (issue #78 lint baseline now resolved): the
+  reviewed lint repairs were integrated and the exact full Ruff command passes.
+  One cumulative-suite regression was isolated to
+  `tests/test_hotplug.py::_occupy_resource`. Accepted main 5d3a0be0 occupies a
+  foreign resource with a dead identity (`pid=999999, birth="foreign-birth"`),
+  which this worktree's CP1 dead-owner reclamation automatically reclaims, so
+  the resource is never held busy and
+  `test_run_resume_recovered_session_resource_identity_survives_profile_drift`
+  failed. The retained base fd488d62 helper uses a provably-live, birth-matching
+  controller identity, which reclamation leaves alone. The smallest proven
+  integration fix keeps the retained `test_hotplug.py` (git-clean vs base),
+  preserving both intended behaviors (resource stays occupied; busy owner is not
+  reclaimed). Cumulative validation on the reconciled tree (patch
+  `76091b5d...`): full suite 3543 passed / 244 subtests, MCP stop 6 passed,
+  broad Ruff, compileall and whitespace all exit 0 (see the primary log).
+
+## 2026-10-06 — CP2 v05 repair: local-adapter session stop and shared stop deadline (issue #76)
+
+- `SubprocessUnitManager` (the local control-plane adapter) now uses the same
+  proven-session stop algorithm as the persistent and workflow adapters instead
+  of signalling only the controller group. It proves the controller's exact
+  birth and session-leader topology, then ends the controller group and any
+  separate-group provider in the session (TERM, then bounded KILL escalation)
+  and requires positive cessation of every owned member before reporting
+  success. This closes the local-adapter gap where the separate harness group
+  (`process_group=0`) left a provider child alive after a managed local stop.
+  When the controller leader has already exited, the adapter drains its owned
+  group with the same positive-absence requirement, and `shutdown` applies the
+  same session stop to every managed unit.
+- The shared stop algorithm in `persistent_units.py` is now a module-level set
+  of functions (`session_contract`, `session_snapshot`, `session_anchor`,
+  `session_ceased`, `stop_controller_group`, `stop_session_groups`) that all
+  three adapters call with their own signal and deadline parameters; the
+  per-adapter instance methods delegate to it.
+- All stop-path revalidation shares one outer stop deadline. The local
+  adapter's deadline is the configured stop timeout plus a bounded KILL grace
+  so a verified TERM survivor is escalated and observed inside the window.
+- Added `subprocess_unit_stop` selections that exercise a real local controller
+  running `_run_process` with a separate-group provider: ordinary stop and
+  shutdown tear down both the controller and the provider, a TERM-ignoring
+  provider is escalated to KILL, and an unrelated decoy in another session
+  survives.
+
+## 2026-10-06 — CP2 v04 repair: pre-signal ownership proof, anchored post-inventory
+revalidation, TERM-first bounded escalation (issue #76)
+
+- Fixed the initial-snapshot replacement race in `stop()`: after the bounded
+  session snapshot, the controller group is re-proved (exact recorded
+  PID/birth, session ID, group identity) before any signal; a replaced or
+  missing controller leaves the initial capture untrusted, no group is
+  signalled, and the stop fails typed. The initial capture is now anchored by
+  the verified session-leader contract and only same-session descendants are
+  signalled from it.
+- `_stop_session_groups` now revalidates a live proven anchor AFTER each
+  inventory completes: a fresh inventory can never prove its own ancestry, so
+  with no post-inventory live anchor no newly observed member is adopted,
+  signalled, or used to clear prior uncertainty. A numeric-SID inventory is
+  authorized only while a proven member is live (no unanchored inventories),
+  and incomplete observations stay pending until a subsequent complete
+  anchored observation clears them. Every ownership proof, group proof,
+  anchor selection, and cessation decision shares one operation deadline of
+  at most two seconds (or the remaining outer deadline), never a fresh
+  per-member window; groups whose members are all positively dead (zombies)
+  are never signalled.
+- Escalation is now TERM-first and bounded per group: each verified group
+  receives one TERM, and is escalated to KILL only after its own TERM grace
+  elapses inside the outer deadline and a live proven member of that group is
+  revalidated immediately before the KILL. The legacy controller-group stop
+  observes the controller through a bounded TERM grace phase, then re-proves
+  ownership with a fresh budget bounded by the still-live outer deadline
+  before the KILL — an expired TERM-phase deadline is never passed as the KILL
+  budget and the outer bound is never extended for a late signal.
+- Fixed `_darwin_session_members` passing a relative remaining budget to
+  `_ps_lstart_batch`, which takes the absolute shared stop deadline (the birth
+  batch always failed closed on Darwin); added native Darwin `ps` output
+  contract tests (padded PIDs, no numeric `sid` keyword, separate groups,
+  vanished/inaccessible members, byte/member limits, expired evidence).
+- Added focused regressions for all three reported defects: the reused initial
+  target (no snapshot, no signal), the lost anchor (replacement inventory never
+  signalled), the shared group-proof budget (one two-second window for a
+  three-member group), and the legacy TERM-survivor KILL inside the outer
+  deadline, plus real-process escalations for a TERM-ignoring provider and a
+  surviving descendant after wrapper exit.
+
+## 2026-10-06 — CP2 v03 repair: contract separation, bounded stop-path revalidation (issue #76)
+
+- Separated the explicit-stop contract decision from the legacy fallback in
+  `persistent_units.py`: `_session_contract` now returns a typed topology
+  (`session`, `legacy`, or `unknown`) derived from the session-leader proof.
+  An uncertain modern stop — identity loss during validation, a failed
+  observation, or an unreadable birth — is `unknown` and fails typed with no
+  signal, while a genuine legacy controller-group receipt retains its
+  controller-only stop contract.
+- Made every controller-group fallback signal re-prove ownership: TERM and
+  the KILL escalation each require a fresh bounded `controller_group_owned`
+  proof (exact recorded PID/birth, matching session ID, and group identity),
+  so a changed identity after TERM is never escalated.
+- Added `process_birth_bounded` (native Linux procfs read; bounded Darwin `ps`
+  probe capped at the remaining stop budget, never the generic five-second
+  fallback) and `controller_group_owned` to `process_identity.py`, and wired an
+  optional shared `deadline` through `process_liveness`, `session_member_live`,
+  `process_group_state`, `_owned_group_anchor_live`, and the `terminate_owned_group`
+  escalation so stop-path revalidation cannot exceed the stop deadline.
+- Marked the unreaped-zombie ownership test Linux-only: its `ps -o lstart`
+  contract is a Linux observation, and Darwin reports unowned reaped zombies
+  as `Z<tab>` without the full field set.
+- Added recorded-signal regressions for loss during contract validation,
+  failed snapshot with a replaced controller, changed/unknown identity after
+  TERM, and valid legacy success (only the controller's own group signalled,
+  no additional provider claim); added fake-clock regressions proving bounded
+  Darwin revalidation and inaccessible Linux identity stay within the shared
+  stop budget with no serial five-second probes and no signal after the
+  deadline.
+- Completed the FIFO ordering acceptance in the managed-stop E2E test: the
+  shared completion wrapper's `reaped` trace timestamp (verified
+  `os.waitpid` of the provider child) must precede the tail provider entry,
+  and `_e2e_reap_pid` revalidates the fixture birth before every cleanup
+  signal, including a later KILL.
+
+## 2026-10-06 — CP2 repair: grace deadline, anchored session stop, FIFO test (issue #76)
+
+- `terminate_owned_group` now revalidates the captured group's ownership after
+  the snapshot and before the first TERM (a group that changed ownership in the
+  capture window is never signalled), and the grace deadline is monotonic from
+  the first TERM: the wrapper's own exit no longer ends the grace while a
+  verified descendant survives. At the deadline it revalidates the live
+  captured survivor immediately before the bounded KILL, and the final group
+  check uses the bounded kill budget.
+- `_stop_session_groups` now revalidates one live anchor from the captured
+  identities (exact birth, PGID and SID) before every same-session rescan and
+  before every signal: without a live anchor it inventories and signals
+  nothing; every signal target is revalidated live just before the signal;
+  zombie-only groups are never signalled (they cannot be observed); and an
+  incomplete observation leaves a pending uncertainty that a later complete
+  anchored observation must clear before a success receipt. Success still
+  requires positive cessation of every captured member.
+- The managed-stop FIFO test now hands the slot through a predecessor-verified
+  FIFO: each waiter starts only after the bound record's controller, child and
+  group are positively absent, the captured owner identity is read before the
+  stop, and cessation evidence is the child's recorded phase time (deterministic
+  across processes) instead of a wall-clock poll; the crash test revalidates
+  births before reaping or killing.
+- New regression tests: a delayed provider holds the grace until its positive
+  cessation and a TERM-ignoring provider is KILLed only after grace;
+  session-stop tests for a reused initial target (never signalled), a lost
+  anchor (replacement inventory never signalled), a failed rescan that keeps
+  pending uncertainty, an unknown-birth member (never signalled), a valid
+  anchored late descendant (signalled), an unknown identity (retains failure),
+  and an unreaped owned zombie (ceases with zero signals).
+- Verification (measured, final state): `tests/test_process_identity.py`
+  (42 passed, including the two new grace tests); the
+  owner-stop/terminate/bind/descendant subset (12 passed); the managed-stop
+  FIFO E2E and crash tests (2 passed, three consecutive runs plus the
+  reviewer's forced-interleaving repro where the handoff completes before the
+  caller reads the owner); full persistent-unit and resource-process suites
+  (69 passed, including the seven new session-stop tests); the selected
+  reconciliation/owner-stop subset (39 passed); control-plane stop tests (3
+  passed); scoped Ruff on the five production files (clean); broad Ruff
+  (139 baseline diagnostics, byte-identical identities to HEAD, zero
+  introduced — the gate remains an explicit failing blocker, issue #78);
+  cumulative full suite once: `uv run pytest -q` → 3425 passed, 244 subtests
+  passed in 386 s; server `tests/test_mcp.py` stop subset (6 passed);
+  `python -m compileall -q aflow` (clean); `git diff --check` (clean).
+
+## 2026-10-06 — Existing defect recorded: ruff gate fails on a clean tree
+
+- The broad ruff gate (`ruff check aflow tests apps/aflow_app/server/src
+  apps/aflow_app/server/tests`) fails on a clean tree with 139 pre-existing
+  findings (mostly unused imports/locals in `tests/_support.py`,
+  `tests/test_cli.py`, `test_process_identity.py`, and scattered F841s).
+  The exclusive-stop CP2 patch adds zero new findings; the scoped CP2 check
+  on the five production files passes. Recorded as issue #78.
+
+## 2026-10-06 — Exclusive stop and dead-owner reclamation (issue #76)
+
+- Waiting admission now runs the broker's bounded safe reconciliation for the
+  exact resource at most once per control interval (including the initial
+  wait), after stop/config controls and before acquisition. A proven-dead
+  owner (controller gone with the bound child and process group positively
+  absent, or the confirmed host-reboot proof) and dead queued predecessors are
+  reclaimed automatically, so the FIFO head advances without an operator;
+  controller loss alone, a surviving/reused/unobservable child, revision
+  changes, lock contention and corrupt journals all remain held or fail
+  closed.
+- Harness children now lead their own process group (`process_group=0`) inside
+  the controller's owned session, eliminating the race where a `timeout`
+  wrapper changes its group after the parent recorded it. Owned teardown
+  targets the verified group (TERM, then bounded KILL escalation), and a lease
+  completes only when the child and the owned group are both positively gone;
+  a wrapper exit with surviving descendants keeps the claim `unconfirmed`.
+- The managed unit stop is session-scoped: it verifies the nonce, the live
+  controller birth and the session-leader contract, snapshots session members
+  in one bounded pass (bounded members/bytes; ambiguity counts as unknown,
+  never empty), sends one TERM per verified group with bounded KILL
+  escalation, rescan-captures same-session descendants while a birth-matching
+  live member anchors the session, and requires positive cessation of every
+  captured member before the stopped receipt. Without session proof it falls
+  back to the legacy controller-group stop and never claims extra cleanup;
+  unrelated sessions and deliberately escaped providers remain untouched and
+  explicit.
+- Real-process acceptance covers a timeout-shaped wrapper group with a
+  long-lived provider (including TERM-ignoring escalation, a surviving
+  descendant after wrapper exit, PID reuse and observation failure), an
+  unrelated decoy session, and an end-to-end managed stop with two FIFO
+  waiters where the head acquires automatically with zero provider overlap;
+  a controller crash with a live child keeps the resource occupied until the
+  child verifiably ceases. Shutdown remains a no-op and cross-server-restart
+  stop tests are retained.
+- The README's existing stop statements (unit-level `owner_stop`, UI
+  shutdown no-op) remain accurate, so the README is unchanged.
+- Verification at that time: persistent-unit and
+  resource-process suites (61 passed); selected reconciliation/owner-stop
+  admission tests (39 passed); control-plane owner-stop/stop tests (3
+  passed); `tests/test_process_identity.py` (33 passed); server
+  `tests/test_mcp.py` (58 passed); scoped Ruff on the five production files
+  (clean; the broad gate fails with 139 baseline diagnostics, issue #78);
+  `git diff --check`; and the cumulative full suite once: `uv run pytest -q`
+  → 3408 passed, 244 subtests passed in 393 s. Primary log:
+  `.issue76-proof/cp2-verification.log` (fingerprinted with HEAD and patch
+  sha256). A later cumulative run exposed one intermittent failure in the
+  managed-stop FIFO test (owner teardown raced the waiter's acquisition),
+  which the CP2 repair entry above fixes.
+
 ## 2026-10-06 — Give the macOS Python 3.12 dashboard CI job a 35-minute budget (Refs evrenesat/aworkflow#78)
 
 - On exact SHA `2f15a235b624e7553a456c7bc4e71d02c87fac2e`, CI run
