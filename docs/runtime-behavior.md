@@ -760,7 +760,13 @@ All stop-path revalidation shares the stop deadline: liveness, birth, and
 group checks use native bounded probes (a single Linux procfs read, or a
 Darwin `ps` probe capped at the remaining budget, at most two seconds),
 never the generic five-second fallback, and no signal is issued after the
-deadline expires. A persistent stop creates its outer deadline before any
+deadline expires. On Darwin the group-state and liveness probes read the
+native per-process state field (`ps` `stat`): an unreaped zombie is
+positively ceased, not live work, so a zombie-only owned group counts as
+terminated while any live member keeps the group present; a malformed,
+incomplete, over-bounded, timed-out, or deadline-expired listing remains
+unknown. Session inventories carry the same state, so a zombie member is
+captured with no birth and can never anchor, revalidate, or be signalled. A persistent stop creates its outer deadline before any
 identity observation, so the entry observation and identity recheck stay
 inside even a one-second stop window; an unconfirmed entry identity fails
 typed with no signal and no successful `stopped.json` receipt. Until a

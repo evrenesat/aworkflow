@@ -1,5 +1,47 @@
 # DEVLOG
 
+## 2026-10-07 — issue #76 release repair CP1: truthful bounded macOS process cessation
+
+- CI 37611601058 failed nine stop/teardown tests on both native macOS
+  Python 3.11/3.12 jobs while Linux passed. Root cause: after KILL the
+  provider is often an unreaped zombie (its parent controller is itself an
+  unreaped zombie, so launchd never adopts it), and the Darwin
+  observations misreported it. `process_group_state` used `kill(-pgid, 0)`,
+  which stays alive while a zombie occupies the numeric group, so
+  `session_ceased`/`_group_absent` could never confirm cessation ("owned
+  session did not terminate"); `process_liveness` used `ps -o pid=`, which
+  reports a zombie as present; and `_darwin_session_members` never read the
+  per-process state, so zombies were captured with a usable birth and could
+  anchor and revalidate as live members.
+- Fix (Darwin only, Linux path untouched): `process_group_state` now runs
+  one bounded `ps -axo pid=,pgid=,stat=` scan — a live (non-zombie) member
+  makes the group present, a complete inventory with no members or only
+  zombies is positively absent, and any malformed, over-bounded, failed,
+  timed-out, or deadline-expired listing stays unknown. `process_liveness`
+  reads `ps -o pid=,stat=` and reports a zombie as absent (a row without its
+  state field is unknown, never present). Session inventories read the same
+  state field and capture zombie members with no birth, so they can never
+  anchor, revalidate, or be signalled. Ownership capture, TERM grace,
+  fresh pre-KILL revalidation, direct-child reaping, and the shared
+  kill-phase deadline (never renewed) are unchanged; no skips, xfails,
+  timeout increases, or unknown-as-absent conversions were introduced.
+- New deterministic native-Darwin-shaped regressions in
+  `tests/test_process_identity.py` reproduce the failing contract on any
+  host before the fix (zombie-only group kept "present"/unterminated) and
+  pin the corrected behavior: live/zombie/absent group states, malformed,
+  failed, over-bounded, timed-out, and budget-exhausted (expired) scans stay
+  unknown, zombie liveness is absent, zombie session members carry no birth,
+  `_group_absent` confirms a zombie-only group inside the shared kill
+  deadline while a live member polls to the deadline unconfirmed, and
+  `session_ceased` treats a zombie-only owned session as ceased. The
+  existing Darwin-shaped fixture tests were extended to the new native
+  `pid=,pgid=,stat=` listing contract. Native macOS CI remains the required
+  release gate for real-process validation.
+- Verification: focused suites (`test_process_identity.py`,
+  `test_execution_resource_processes.py`, `test_systemd_units.py`,
+  `test_persistent_units.py`, `test_exclusive_execution.py`) — 277 passed;
+  `ruff check` on the touched modules/tests; `git diff --check` clean.
+
 ## 2026-10-07 — CP2 v10 repair: cover owned subprocess startup with exception teardown (issue #76)
 
 - Extended the v09 owned-group cleanup boundary in `_run_process` from the

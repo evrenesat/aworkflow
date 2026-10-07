@@ -871,7 +871,7 @@ def test_session_members_ignores_unrelated_sessions() -> None:
 def _fake_ps(monkeypatch: pytest.MonkeyPatch, *, listing: str, births: str = "") -> None:
     def fake_run(argv, *args, **kwargs):
         argv = tuple(argv)
-        if "pid=,pgid=" in argv:
+        if "pid=,pgid=,stat=" in argv:
             return subprocess.CompletedProcess(list(argv), 0, listing, "")
         if "pid=,lstart=" in argv:
             return subprocess.CompletedProcess(list(argv), 0, births, "")
@@ -912,10 +912,10 @@ def test_darwin_session_members_avoids_sid_and_captures_separate_groups(
 
     def fake_run(argv, *args, **kwargs):
         argv = tuple(argv)
-        if "pid=,pgid=" in argv:
+        if "pid=,pgid=,stat=" in argv:
             seen["listing_argv"] = argv
             return subprocess.CompletedProcess(
-                list(argv), 0, "  100 100\n  200 200\n  300 300\n", ""
+                list(argv), 0, "  100 100 S\n  200 200 S\n  300 300 S\n", ""
             )
         if "pid=,lstart=" in argv:
             return subprocess.CompletedProcess(
@@ -939,7 +939,7 @@ def test_darwin_session_members_avoids_sid_and_captures_separate_groups(
         100, _darwin_deadline(), 4096, 1_048_576
     )
     # The native inventory must not request an unsupported numeric sid keyword.
-    assert seen["listing_argv"] == ("ps", "-axo", "pid=,pgid=")
+    assert seen["listing_argv"] == ("ps", "-axo", "pid=,pgid=,stat=")
     # 300 belongs to a different session and is excluded; 100/200 keep groups.
     by_pid = {m.pid: m for m in members}
     assert set(by_pid) == {100, 200}
@@ -955,9 +955,9 @@ def test_darwin_session_members_disappeared_omitted_inaccessible_unknown(
 
     def fake_run(argv, *args, **kwargs):
         argv = tuple(argv)
-        if "pid=,pgid=" in argv:
+        if "pid=,pgid=,stat=" in argv:
             return subprocess.CompletedProcess(
-                list(argv), 0, "  100 100\n  200 200\n  300 300\n", ""
+                list(argv), 0, "  100 100 S\n  200 200 S\n  300 300 S\n", ""
             )
         if "pid=,lstart=" in argv:
             return subprocess.CompletedProcess(
@@ -1012,22 +1012,22 @@ def test_darwin_session_members_respects_byte_and_member_limits(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Byte and member bounds fail the observation, never a partial list."""
-    big_listing = "\n".join(f"  {i} {i}" for i in range(1, 5000))
+    big_listing = "\n".join(f"  {i} {i} S" for i in range(1, 5000))
 
     def fake_run_big(argv, *args, **kwargs):
         argv = tuple(argv)
-        if "pid=,pgid=" in argv:
+        if "pid=,pgid=,stat=" in argv:
             return subprocess.CompletedProcess(list(argv), 0, big_listing, "")
         raise AssertionError(f"unexpected ps argv: {argv}")
 
     monkeypatch.setattr(process_identity.subprocess, "run", fake_run_big)
     assert process_identity._darwin_session_members(100, _darwin_deadline(), 4096, 50) is None
 
-    small_listing = "\n".join(f"  {i} {i}" for i in range(1, 6))
+    small_listing = "\n".join(f"  {i} {i} S" for i in range(1, 6))
 
     def fake_run_small(argv, *args, **kwargs):
         argv = tuple(argv)
-        if "pid=,pgid=" in argv:
+        if "pid=,pgid=,stat=" in argv:
             return subprocess.CompletedProcess(list(argv), 0, small_listing, "")
         raise AssertionError(f"unexpected ps argv: {argv}")
 
@@ -1044,13 +1044,229 @@ def test_darwin_session_members_exhausted_budget_returns_none(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """No remaining observation budget yields unknown, not an empty session."""
-    _fake_ps(monkeypatch, listing="  100 100\n", births="  100 Tue Oct  6 10:00:00 2026\n")
+    _fake_ps(monkeypatch, listing="  100 100 S\n", births="  100 Tue Oct  6 10:00:00 2026\n")
     monkeypatch.setattr(process_identity.os, "getsid", lambda pid: 100)
     monkeypatch.setattr(process_identity.os, "getpgid", lambda pid: pid)
     assert (
         process_identity._darwin_session_members(100, time.monotonic() - 1.0, 4096, 1_048_576)
         is None
     )
+
+
+def test_darwin_session_members_zombie_has_no_birth(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A zombie member is captured with no birth, never a live identity."""
+
+    def fake_run(argv, *args, **kwargs):
+        argv = tuple(argv)
+        if "pid=,pgid=,stat=" in argv:
+            return subprocess.CompletedProcess(
+                list(argv), 0, "  100 100 S\n  200 200 Z\n", ""
+            )
+        if "pid=,lstart=" in argv:
+            return subprocess.CompletedProcess(
+                list(argv),
+                0,
+                "  100 Tue Oct  6 10:00:00 2026\n  200 Tue Oct  6 10:00:01 2026\n",
+                "",
+            )
+        if argv == ("ps", "-o", "lstart=", "-p", "100"):
+            return subprocess.CompletedProcess(
+                list(argv), 0, "Tue Oct  6 10:00:00 2026\n", ""
+            )
+        raise AssertionError(f"unexpected ps argv: {argv}")
+
+    monkeypatch.setattr(process_identity.subprocess, "run", fake_run)
+    monkeypatch.setattr(process_identity.os, "getsid", lambda pid: 100)
+    monkeypatch.setattr(process_identity.os, "getpgid", lambda pid: pid)
+    members = process_identity._darwin_session_members(
+        100, _darwin_deadline(), 4096, 1_048_576
+    )
+    by_pid = {m.pid: m for m in members}
+    assert set(by_pid) == {100, 200}
+    assert by_pid[100].birth == "ps-lstart:Tue Oct  6 10:00:00 2026"
+    # A zombie is not live work and must never carry a usable birth identity.
+    assert by_pid[200].birth is None
+    assert process_identity.session_member_live(by_pid[200], 100) is False
+    # A real host PID must not leak into the birth revalidation: with no
+    # procfs the bounded ps probe is the only identity source.
+    def fake_read(path, *, encoding: str) -> str:
+        raise FileNotFoundError(path)
+
+    monkeypatch.setattr(process_identity.Path, "read_text", fake_read)
+    assert process_identity.session_member_live(by_pid[100], 100) is True
+
+
+def test_darwin_group_state_distinguishes_live_zombie_and_absent(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A live member keeps a group present; a zombie-only group is absent.
+
+    The kill(-pgid, 0) probe cannot make this distinction: an unreaped
+    zombie keeps the numeric group alive to it, so the native scan must use
+    the per-process state field.
+    """
+    monkeypatch.setattr(process_identity.sys, "platform", "darwin")
+
+    def with_listing(listing: str) -> None:
+        def fake_run(argv, *args, **kwargs):
+            argv = tuple(argv)
+            if "pid=,pgid=,stat=" in argv:
+                return subprocess.CompletedProcess(list(argv), 0, listing, "")
+            raise AssertionError(f"unexpected ps argv: {argv}")
+
+        monkeypatch.setattr(process_identity.subprocess, "run", fake_run)
+
+    # A live member of the target group: present.
+    with_listing("  500 500 S\n  600 500 S\n  700 700 R\n")
+    assert process_identity.process_group_state(500) == "present"
+    # A zombie-only target group: positively absent (zombies are not live work).
+    with_listing("  500 500 Z\n  600 500 Z\n  700 700 R\n")
+    assert process_identity.process_group_state(500) == "absent"
+    # No members at all: absent.
+    with_listing("  700 700 R\n")
+    assert process_identity.process_group_state(500) == "absent"
+
+
+def test_darwin_group_state_malformed_incomplete_expired_unknown(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Malformed rows, failed probes, over-bounded listings, and a scan that
+    finishes at/after the shared deadline all stay unknown, never absent."""
+    monkeypatch.setattr(process_identity.sys, "platform", "darwin")
+
+    def with_listing(listing: str) -> None:
+        def fake_run(argv, *args, **kwargs):
+            argv = tuple(argv)
+            if "pid=,pgid=,stat=" in argv:
+                return subprocess.CompletedProcess(list(argv), 0, listing, "")
+            raise AssertionError(f"unexpected ps argv: {argv}")
+
+        monkeypatch.setattr(process_identity.subprocess, "run", fake_run)
+
+    # A row missing its state field is ambiguous, not an empty group.
+    with_listing("  500 500\n")
+    assert process_identity.process_group_state(500) == "unknown"
+    # A nonzero native exit is an observation failure.
+    def failed_run(argv, *args, **kwargs):
+        return subprocess.CompletedProcess(list(argv), 1, "", "ps: error")
+
+    monkeypatch.setattr(process_identity.subprocess, "run", failed_run)
+    assert process_identity.process_group_state(500) == "unknown"
+    # A probe that times out is unknown.
+    def timed_out_run(argv, *args, **kwargs):
+        raise subprocess.TimeoutExpired(list(argv), float(kwargs["timeout"]))
+
+    monkeypatch.setattr(process_identity.subprocess, "run", timed_out_run)
+    assert process_identity.process_group_state(500) == "unknown"
+    # An over-bounded listing with no target member fails the whole
+    # observation (a live target member is positive presence, like Linux).
+    big_listing = "\n".join(f"  {i} 9999 S" for i in range(1, 4098))
+    with_listing(big_listing)
+    assert process_identity.process_group_state(500) == "unknown"
+    # A scan that consumes the entire remaining budget is expired evidence.
+    clock = {"now": 100.0}
+    monkeypatch.setattr(process_identity.time, "monotonic", lambda: clock["now"])
+
+    def consume_full_budget(argv, *args, **kwargs):
+        clock["now"] += float(kwargs["timeout"])
+        return subprocess.CompletedProcess(list(argv), 0, "", "")
+
+    monkeypatch.setattr(process_identity.subprocess, "run", consume_full_budget)
+    assert process_identity.process_group_state(500, 101.0) == "unknown"
+
+
+def test_darwin_group_absent_polls_zombie_only_within_deadline(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Positive cessation after KILL: a zombie-only group is absent inside the
+    shared kill deadline; a live member polls to the deadline and stays unconfirmed."""
+    monkeypatch.setattr(process_identity.sys, "platform", "darwin")
+
+    def with_listing(listing: str) -> None:
+        def fake_run(argv, *args, **kwargs):
+            argv = tuple(argv)
+            if "pid=,pgid=,stat=" in argv:
+                return subprocess.CompletedProcess(list(argv), 0, listing, "")
+            raise AssertionError(f"unexpected ps argv: {argv}")
+
+        monkeypatch.setattr(process_identity.subprocess, "run", fake_run)
+
+    with_listing("  500 500 Z\n")
+    assert process_identity._group_absent(500, time.monotonic() + 1.0) is True
+    with_listing("  500 500 S\n")
+    assert process_identity._group_absent(500, time.monotonic() + 0.2) is False
+
+
+def test_darwin_liveness_zombie_is_absent(monkeypatch: pytest.MonkeyPatch) -> None:
+    """An unreaped zombie is positively ceased on Darwin; live work is present.
+
+    A bare ``ps -o pid=`` probe reports a zombie as present, so the liveness
+    probe must read the native state field.
+    """
+    monkeypatch.setattr(process_identity.sys, "platform", "darwin")
+
+    def with_output(stdout: str, rc: int = 0, stderr: str = "") -> None:
+        def fake_run(argv, *args, **kwargs):
+            argv = tuple(argv)
+            if "pid=,stat=" in argv:
+                return subprocess.CompletedProcess(list(argv), rc, stdout, stderr)
+            raise AssertionError(f"unexpected ps argv: {argv}")
+
+        monkeypatch.setattr(process_identity.subprocess, "run", fake_run)
+
+    with_output("  100 Z\n")
+    assert process_identity.process_liveness(100) == "absent"
+    with_output("  100 S\n")
+    assert process_identity.process_liveness(100) == "present"
+    # A positively vanished PID: absent.
+    with_output("", rc=1)
+    assert process_identity.process_liveness(100) == "absent"
+    # A row without its state field is unknown, never present.
+    with_output("  100\n")
+    assert process_identity.process_liveness(100) == "unknown"
+
+
+def test_darwin_zombie_only_session_is_ceased(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Contract regression: captured members left as unreaped zombies in
+    zombie-only groups are positively ceased, the exact contract that
+    ``stop_session_groups`` requires to report a terminated owned session."""
+    from aflow.process_identity import SessionMember
+
+    monkeypatch.setattr(process_identity.sys, "platform", "darwin")
+
+    def fake_run(argv, *args, **kwargs):
+        argv = tuple(argv)
+        if "pid=,stat=" in argv:
+            pid = argv[-1]
+            return subprocess.CompletedProcess(list(argv), 0, f"  {pid} Z\n", "")
+        if "pid=,pgid=,stat=" in argv:
+            return subprocess.CompletedProcess(
+                list(argv), 0, "  100 100 Z\n  200 200 Z\n", ""
+            )
+        raise AssertionError(f"unexpected ps argv: {argv}")
+
+    monkeypatch.setattr(process_identity.subprocess, "run", fake_run)
+    members = [
+        SessionMember(pid=100, birth=None, pgid=100),
+        SessionMember(pid=200, birth=None, pgid=200),
+    ]
+    assert persistent_units.session_ceased(members, time.monotonic() + 2.0) is True
+    # A live member keeps the contract unconfirmed.
+    def live_run(argv, *args, **kwargs):
+        argv = tuple(argv)
+        if "pid=,stat=" in argv:
+            pid = argv[-1]
+            return subprocess.CompletedProcess(list(argv), 0, f"  {pid} S\n", "")
+        if "pid=,pgid=,stat=" in argv:
+            return subprocess.CompletedProcess(
+                list(argv), 0, "  100 100 S\n  200 200 Z\n", ""
+            )
+        raise AssertionError(f"unexpected ps argv: {argv}")
+
+    monkeypatch.setattr(process_identity.subprocess, "run", live_run)
+    assert persistent_units.session_ceased(members, time.monotonic() + 2.0) is False
 
 
 # -- bounded evidence expiry ----------------------------------------------------

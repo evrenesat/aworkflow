@@ -308,7 +308,11 @@ signals that verified group (TERM, then bounded KILL escalation), and every
 teardown signal is preceded by a fresh bounded ownership proof of the exact
 recorded identity; all stop-path revalidation shares the stop deadline
 through native bounded probes (Linux procfs, bounded Darwin `ps`), never
-serial generic probes, and no signal is issued after the deadline. A
+serial generic probes, and no signal is issued after the deadline. Darwin
+group-state and liveness probes read the native per-process state field, so
+an unreaped zombie is positively ceased (a zombie-only owned group is
+terminated) while any live member keeps the group present, and malformed,
+incomplete, or expired listings remain unknown. A
 persistent stop creates its outer deadline before any identity observation,
 so the entry observation and identity recheck stay inside even a one-second
 stop window, and an unconfirmed entry identity fails typed without a

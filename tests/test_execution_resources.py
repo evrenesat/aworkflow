@@ -798,9 +798,9 @@ def make_default_group_store(root: Path, *, liveness: dict[int, str]) -> Executi
     return ExecutionResourceStore(root, process_evidence=process_evidence, boot_provider=lambda: BOOT)
 
 
-# The null-signal group probe follows POSIX semantics on the Linux and macOS
-# kernels alike, so the darwin branch is exercised against real process groups
-# by faking only the platform label.
+# The Darwin group probe is a bounded native ``ps -axo pid=,pgid=,stat=``
+# scan, which works on the Linux test host as well, so the darwin branch is
+# exercised against real process groups by faking only the platform label.
 
 
 def test_darwin_default_observer_reports_live_then_reaped_group(
@@ -818,19 +818,23 @@ def test_darwin_default_observer_reports_live_then_reaped_group(
 
 
 @pytest.mark.parametrize(
-    "error",
-    [PermissionError(1, "Operation not permitted"), OSError(5, "Input/output error")],
-    ids=["permission-denied", "other-oserror"],
+    "mode",
+    ["failed-exit", "timeout"],
+    ids=["failed-exit", "timeout"],
 )
-def test_darwin_default_observer_inconclusive_kill_errors_are_unknown(
-    monkeypatch: pytest.MonkeyPatch, error: OSError
+def test_darwin_default_observer_inconclusive_ps_probes_are_unknown(
+    monkeypatch: pytest.MonkeyPatch, mode: str
 ) -> None:
+    from aflow import process_identity
+
     monkeypatch.setattr(sys, "platform", "darwin")
 
-    def failing_kill(pgid: int, sig: int) -> None:
-        raise error
+    def failing_ps(argv, *args, **kwargs):
+        if mode == "timeout":
+            raise subprocess.TimeoutExpired(list(argv), float(kwargs["timeout"]))
+        return subprocess.CompletedProcess(list(argv), 1, "", "ps: error")
 
-    monkeypatch.setattr(os, "kill", failing_kill)
+    monkeypatch.setattr(process_identity.subprocess, "run", failing_ps)
     assert er._default_group_evidence(4242) == "unknown"
 
 
@@ -902,12 +906,14 @@ def test_darwin_default_observer_retains_owner_with_live_group(
 def test_darwin_default_observer_retains_owner_with_unobservable_group(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    from aflow import process_identity
+
     monkeypatch.setattr(sys, "platform", "darwin")
 
-    def denied_kill(pgid: int, sig: int) -> None:
-        raise PermissionError(1, "Operation not permitted")
+    def denied_ps(argv, *args, **kwargs):
+        raise subprocess.TimeoutExpired(list(argv), float(kwargs["timeout"]))
 
-    monkeypatch.setattr(os, "kill", denied_kill)
+    monkeypatch.setattr(process_identity.subprocess, "run", denied_ps)
     _seed_owner(tmp_path, "running")
     store = make_default_group_store(tmp_path, liveness={1: "absent", 4242: "absent"})
     assert store.reconcile(RESOURCE_A).state == "unchanged"

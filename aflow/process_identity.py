@@ -352,9 +352,16 @@ def process_liveness(pid: int, deadline: float | None = None) -> ProcessLiveness
             return "unknown"
     else:
         timeout = 5
+    is_darwin = sys.platform == "darwin"
     try:
         completed = subprocess.run(
-            ("ps", "-o", "pid=", "-p", str(pid)),
+            (
+                "ps",
+                "-o",
+                "pid=,stat=" if is_darwin else "pid=",
+                "-p",
+                str(pid),
+            ),
             check=False,
             capture_output=True,
             text=True,
@@ -365,6 +372,23 @@ def process_liveness(pid: int, deadline: float | None = None) -> ProcessLiveness
     if deadline is not None and time.monotonic() >= deadline:
         # A successful native liveness result that finished at/after the
         # shared stop deadline is expired evidence, never absence proof.
+        return "unknown"
+    if is_darwin:
+        if completed.returncode == 0 and completed.stdout.strip():
+            fields = completed.stdout.strip().split()
+            # The row must name the exact probed PID and carry its native
+            # state field; a bare PID row is ambiguous, never present.
+            if (
+                len(fields) != 2
+                or not fields[0].isdigit()
+                or int(fields[0]) != pid
+                or not fields[1]
+            ):
+                return "unknown"
+            # A zombie is positively ceased, not live work.
+            return "absent" if fields[1].startswith("Z") else "present"
+        if completed.returncode != 0 and not completed.stdout.strip() and not completed.stderr.strip():
+            return "absent"
         return "unknown"
     if completed.returncode == 0 and completed.stdout.strip():
         return "present"
@@ -521,10 +545,10 @@ def _darwin_session_members(
     try:
         # Native Apple ps exposes no numeric session id (there is no ``sid``
         # keyword; the ``sess`` field is not a session-leader PID and is never
-        # used as one).  Inventory PIDs and groups only, then resolve each
-        # candidate's numeric session through os.getsid.
+        # used as one).  Inventory PIDs, groups, and per-process state, then
+        # resolve each candidate's numeric session through os.getsid.
         listing = subprocess.run(
-            ("ps", "-axo", "pid=,pgid="),
+            ("ps", "-axo", "pid=,pgid=,stat="),
             check=False,
             capture_output=True,
             text=True,
@@ -537,14 +561,24 @@ def _darwin_session_members(
     if len(listing.stdout.encode("utf-8", "replace")) > max_bytes:
         return None
     listed: list[tuple[int, int]] = []
+    zombie_pids: set[int] = set()
     for line in listing.stdout.splitlines():
+        if not line.strip():
+            continue
         parts = line.split()
-        if len(parts) != 2:
+        if len(parts) != 3:
             return None
         try:
-            pid, pgid = (int(part) for part in parts)
+            pid, pgid = int(parts[0]), int(parts[1])
         except ValueError:
             return None
+        state = parts[2]
+        if not state:
+            return None
+        # A zombie is inventory-visible but not live work: it is captured
+        # with no birth so it can never anchor, revalidate, or be signalled.
+        if state[0] == "Z":
+            zombie_pids.add(pid)
         listed.append((pid, pgid))
         if len(listed) > max_members:
             return None
@@ -585,9 +619,12 @@ def _darwin_session_members(
             continue
         except (OSError, ValueError):
             return None
-        birth = births.get(pid)
-        if birth is None:
-            return None
+        if pid in zombie_pids:
+            birth = None
+        else:
+            birth = births.get(pid)
+            if birth is None:
+                return None
         members.append(SessionMember(pid=pid, birth=birth, pgid=pgid))
     return members
 
@@ -651,15 +688,74 @@ def session_member_live(
     return process_birth_bounded(member.pid, deadline) == member.birth
 
 
+def _darwin_group_state(pgid: int, deadline: float) -> GroupState:
+    """Positive Darwin process-group state from a bounded native scan.
+
+    A single bounded ``ps -axo pid=,pgid=,stat=`` scan distinguishes live
+    work from zombies: the first live (non-zombie) member of the group makes
+    it ``present``; a complete inventory with no members, or only zombie
+    members, is positively ``absent`` (a zombie is not live work and an
+    unreaped zombie keeps the numeric group alive to ``kill(-pgid, 0)``).
+    Any malformed, over-bounded, failed, timed-out, or deadline-expired
+    observation is ``unknown``.
+    """
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        return "unknown"
+    try:
+        listing = subprocess.run(
+            ("ps", "-axo", "pid=,pgid=,stat="),
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=remaining,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return "unknown"
+    if listing.returncode != 0:
+        return "unknown"
+    if len(listing.stdout.encode("utf-8", "replace")) > SESSION_MAX_BYTES:
+        return "unknown"
+    seen = 0
+    for line in listing.stdout.splitlines():
+        if not line.strip():
+            continue
+        seen += 1
+        if seen > SESSION_MAX_MEMBERS:
+            return "unknown"
+        parts = line.split()
+        if len(parts) != 3:
+            return "unknown"
+        try:
+            member_pgid = int(parts[1])
+        except ValueError:
+            return "unknown"
+        state = parts[2]
+        if not state:
+            return "unknown"
+        if member_pgid == pgid and state[0] != "Z":
+            # A scan that finished at/after the shared deadline is expired
+            # evidence, never positive presence.
+            if time.monotonic() >= deadline:
+                return "unknown"
+            return "present"
+    if time.monotonic() >= deadline:
+        return "unknown"
+    return "absent"
+
+
 def process_group_state(pgid: int | None, deadline: float | None = None) -> GroupState:
     """Report a positive group state for termination evidence.
 
     Linux scans ``/proc`` once for a live (non-zombie) member of the group.
-    macOS uses ``kill(-pgid, 0)``.  Returns ``unknown`` on any ambiguity.
+    macOS scans the native ``ps`` inventory for the same distinction: a
+    zombie-only group is positively absent, a live member is present.
+    Returns ``unknown`` on any ambiguity.
 
     With a shared stop ``deadline``, the Linux scan checks the deadline
-    before and during the scan; an expired deadline reports ``unknown``
-    without further work.  The macOS syscall contract is unchanged.
+    before and during the scan and the Darwin scan is bounded to the
+    remaining window; an expired deadline reports ``unknown`` without
+    further work.
     """
     if pgid is None or pgid < 1:
         return "unknown"
@@ -696,13 +792,9 @@ def process_group_state(pgid: int | None, deadline: float | None = None) -> Grou
             return "unknown"
         return "absent"
     if sys.platform == "darwin":
-        try:
-            os.kill(-pgid, 0)
-        except ProcessLookupError:
-            return "absent"
-        except (OSError, ValueError):
-            return "unknown"
-        return "present"
+        if deadline is None:
+            deadline = time.monotonic() + SESSION_OBSERVATION_SECONDS
+        return _darwin_group_state(pgid, deadline)
     return "unknown"
 
 
