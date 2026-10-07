@@ -267,9 +267,10 @@ export function PlanPanel({ project, onDirtyChange, onOpenRunDashboard, onOpenRu
       if (!current()) return
       setError(err instanceof Error ? err.message : 'Failed to load plans')
     } finally {
-      if (!current()) return
-      if (initial) setPlansLoading(false)
-      else setPlansRefreshing(false)
+      if (current()) {
+        if (initial) setPlansLoading(false)
+        else setPlansRefreshing(false)
+      }
     }
   }
 

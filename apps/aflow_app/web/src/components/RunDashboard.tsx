@@ -1696,8 +1696,7 @@ export function RunDashboard({ visible = true, page, onNewRun, onCancelNewRun, o
     const epoch = refreshEpochRef.current
     const active = () => epoch === refreshEpochRef.current
     const startRefresh = (runInBackground: boolean): Promise<void> => {
-      let task: Promise<void>
-      task = (async () => {
+      const task = (async () => {
         if (!runInBackground) setRefreshing(true)
         if (handoffError) setRefreshNonce(nonce => nonce + 1)
         await loadDashboard(projectId, active, { background: runInBackground })
@@ -1730,8 +1729,7 @@ export function RunDashboard({ visible = true, page, onNewRun, onCancelNewRun, o
         return pageRefreshRef.current
       }
       const olderRefresh = pageRefreshRef.current
-      let queuedRefresh: Promise<void>
-      queuedRefresh = olderRefresh.catch(() => undefined).then(() => {
+      const queuedRefresh = olderRefresh.catch(() => undefined).then(() => {
         if (!active() || !visible || !projectId) return
         return startRefresh(false)
       }).finally(() => {
@@ -1743,8 +1741,7 @@ export function RunDashboard({ visible = true, page, onNewRun, onCancelNewRun, o
 
     const task = startRefresh(background)
     if (background) return task
-    let manualRefresh: Promise<void>
-    manualRefresh = task.finally(() => {
+    const manualRefresh = task.finally(() => {
       if (manualRefreshRef.current === manualRefresh) manualRefreshRef.current = null
     })
     manualRefreshRef.current = manualRefresh

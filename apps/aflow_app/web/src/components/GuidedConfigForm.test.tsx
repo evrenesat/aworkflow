@@ -11,11 +11,6 @@ vi.mock('../api', async () => {
   return { ...actual, postGlobalConfigForm: vi.fn() }
 })
 
-const project = {
-  id: 'beta', display_name: 'Beta Project', current_path: '/srv/code/beta',
-  is_git_root: true, registered_at: '2026-01-01T00:00:00Z', readiness: 'configuration_required' as const,
-}
-
 const suggestions = {
   label: 'suggestion',
   harnesses: [

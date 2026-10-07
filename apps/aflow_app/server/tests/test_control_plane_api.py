@@ -690,6 +690,45 @@ def _commit_fixture_repository(root: Path) -> None:
     )
 
 
+def test_fixture_commit_retains_plans_under_hostile_global_ignore(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The fixture helper must track plans even when operator Git ignores them.
+
+    Uses a task-owned global Git config plus excludes file containing
+    ``/plans/``; the operator's real Git configuration is never touched.
+    """
+    excludes = tmp_path / "git-excludes"
+    excludes.write_text("/plans/\n", encoding="utf-8")
+    git_config = tmp_path / "gitconfig"
+    git_config.write_text(f"[core]\n\texcludesFile = {excludes}\n", encoding="utf-8")
+    monkeypatch.setenv("GIT_CONFIG_GLOBAL", str(git_config))
+    monkeypatch.setenv("GIT_CONFIG_SYSTEM", str(git_config))
+    monkeypatch.setenv("GIT_CONFIG_NOSYSTEM", "1")
+
+    root = tmp_path / "fixture-repo"
+    root.mkdir()
+    subprocess.run(("git", "init", "-q"), cwd=root, check=True, capture_output=True)
+    plans = root / "plans"
+    plans.mkdir()
+    plan = plans / "test-plan.md"
+    plan.write_text("# fixture plan\n", encoding="utf-8")
+
+    # Prove the hostile ignore is in force while the file is untracked, so a
+    # tracked file after the commit is a regression proof.
+    assert subprocess.run(
+        ("git", "check-ignore", "-q", "plans/test-plan.md"), cwd=root, capture_output=True
+    ).returncode == 0
+
+    _commit_fixture_repository(root)
+
+    tracked = subprocess.run(
+        ("git", "ls-files"), cwd=root, check=True, capture_output=True, text=True
+    ).stdout.splitlines()
+    assert "plans/test-plan.md" in tracked
+    assert plan.read_text(encoding="utf-8") == "# fixture plan\n"
+
+
 def _lifecycle_record_bytes(root: Path) -> dict[str, bytes]:
     records: dict[str, bytes] = {}
     for directory_name in ("runs", "launches"):

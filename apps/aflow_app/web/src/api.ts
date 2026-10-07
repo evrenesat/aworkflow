@@ -434,7 +434,7 @@ export async function listControlPlanePlans(projectId: string): Promise<ControlP
   const seenCursors = new Set<string>()
   let cursor: string | undefined
 
-  while (true) {
+  for (;;) {
     const response = await fetchJson<{ plans: ControlPlanePlan[] }>(
       `${controlProjectPath(projectId)}/plans${buildQuery({
         limit: CONTROL_PLANE_PLAN_PAGE_SIZE,
@@ -458,7 +458,7 @@ export async function listControlPlanePlans(projectId: string): Promise<ControlP
       plans.push(plan)
     }
 
-    if (response.plans.length < CONTROL_PLANE_PLAN_PAGE_SIZE) return plans
+    if (response.plans.length < CONTROL_PLANE_PLAN_PAGE_SIZE) break
 
     // The full-page check above proves this is present; retain the explicit
     // guard so a future refactor cannot silently return a partial page.
@@ -468,6 +468,7 @@ export async function listControlPlanePlans(projectId: string): Promise<ControlP
     seenCursors.add(nextCursor)
     cursor = nextCursor
   }
+  return plans
 }
 
 export async function preflightControlPlaneRun(

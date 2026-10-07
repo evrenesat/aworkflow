@@ -1,4 +1,4 @@
-import { fireEvent, render, screen, waitFor, within } from '@testing-library/react'
+import { act, fireEvent, render, screen, waitFor, within } from '@testing-library/react'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 import { ApiError } from './api'
 import * as api from './api'
@@ -199,8 +199,9 @@ function mockMatchMedia(initialMatches: boolean) {
 
 function deferred<T>() {
   let resolve!: (value: T | PromiseLike<T>) => void
-  const promise = new Promise<T>((resolvePromise) => { resolve = resolvePromise })
-  return { promise, resolve }
+  let reject!: (reason: Error) => void
+  const promise = new Promise<T>((yes, no) => { resolve = yes; reject = no })
+  return { promise, resolve, reject }
 }
 
 /** Opens an added project from its compact row (the row itself is the open control). */
@@ -342,6 +343,58 @@ describe('App workspace shell', () => {
     fireEvent.click(screen.getByRole('button', { name: 'Retry logout' }))
     await waitFor(() => expect(api.logoutSession).toHaveBeenCalledTimes(2))
     await screen.findByPlaceholderText('Auth token')
+  })
+
+  it('keeps a newer project request loading after a stale success from a previous session', async () => {
+    const stale = deferred<Array<typeof readyProject>>()
+    const current = deferred<Array<typeof readyProject>>()
+    vi.mocked(api.listProjects)
+      .mockImplementationOnce(() => stale.promise)
+      .mockImplementationOnce(() => current.promise)
+    render(<App />)
+    await waitFor(() => expect(api.listProjects).toHaveBeenCalledTimes(1))
+    // Sign out while the first request is still pending, then sign back in.
+    fireEvent.click(screen.getByRole('button', { name: 'Logout' }))
+    await waitFor(() => expect(api.logoutSession).toHaveBeenCalledTimes(1))
+    fireEvent.change(await screen.findByPlaceholderText('Auth token'), { target: { value: 'token' } })
+    fireEvent.click(screen.getByRole('button', { name: 'Login' }))
+    await waitFor(() => expect(api.listProjects).toHaveBeenCalledTimes(2))
+    expect(screen.getByText('Loading registered projects…')).toBeDefined()
+    // The stale success belongs to the signed-out session; it must not publish.
+    await act(async () => { stale.resolve([readyProject]) })
+    expect(screen.getByText('Loading registered projects…')).toBeDefined()
+    expect(screen.queryByRole('button', { name: /Alpha Project/ })).toBeNull()
+    expect(screen.queryByRole('alert')).toBeNull()
+    // The authenticated shell remains usable while the current request loads.
+    expect(screen.getByRole('button', { name: 'Settings' })).toBeDefined()
+    await act(async () => { current.resolve([configProject]) })
+    expect(screen.queryByText('Loading registered projects…')).toBeNull()
+    expect(await screen.findByRole('button', { name: /^Beta Project/ })).toBeDefined()
+  })
+
+  it('keeps a newer project request loading after a stale rejection from a previous session', async () => {
+    const stale = deferred<Array<typeof readyProject>>()
+    const current = deferred<Array<typeof readyProject>>()
+    vi.mocked(api.listProjects)
+      .mockImplementationOnce(() => stale.promise)
+      .mockImplementationOnce(() => current.promise)
+    render(<App />)
+    await waitFor(() => expect(api.listProjects).toHaveBeenCalledTimes(1))
+    fireEvent.click(screen.getByRole('button', { name: 'Logout' }))
+    await waitFor(() => expect(api.logoutSession).toHaveBeenCalledTimes(1))
+    fireEvent.change(await screen.findByPlaceholderText('Auth token'), { target: { value: 'token' } })
+    fireEvent.click(screen.getByRole('button', { name: 'Login' }))
+    await waitFor(() => expect(api.listProjects).toHaveBeenCalledTimes(2))
+    expect(screen.getByText('Loading registered projects…')).toBeDefined()
+    // The stale rejection belongs to the signed-out session; it must not publish an error.
+    await act(async () => { stale.reject(new ApiError(503, 'control plane unavailable')) })
+    expect(screen.getByText('Loading registered projects…')).toBeDefined()
+    expect(screen.queryByText(/control plane unavailable/)).toBeNull()
+    expect(screen.queryByRole('button', { name: /Alpha Project/ })).toBeNull()
+    expect(screen.getByRole('button', { name: 'Settings' })).toBeDefined()
+    await act(async () => { current.resolve([configProject]) })
+    expect(screen.queryByText('Loading registered projects…')).toBeNull()
+    expect(await screen.findByRole('button', { name: /^Beta Project/ })).toBeDefined()
   })
 
   it('treats a 401 during ordinary use as session expiry and preserves the workspace for re-login', async () => {

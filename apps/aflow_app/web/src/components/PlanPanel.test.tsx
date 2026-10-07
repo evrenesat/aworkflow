@@ -146,6 +146,67 @@ describe('PlanPanel', () => {
     expect(screen.getByText(/Implementation slots: 2 of 2/)).toBeDefined()
   })
 
+  const betaProject: ProjectInfo = { ...project, id: 'beta', display_name: 'Beta Project', current_path: '/srv/code/beta' }
+  const betaPlan: PlanDocument = {
+    project_id: 'beta', name: 'plan-beta.md', path: 'plans/in-progress/plan-beta.md',
+    status: 'in_progress', revision: 'c'.repeat(64), size_bytes: 14,
+  }
+
+  it('keeps the newer project list loading after a stale success from the previous project', async () => {
+    const oldList = deferred<PlanDocument[]>()
+    const oldQueue = deferred<ProjectQueue>()
+    const newList = deferred<PlanDocument[]>()
+    const newQueue = deferred<ProjectQueue>()
+    vi.mocked(api.listProjectPlans)
+      .mockReturnValueOnce(oldList.promise)
+      .mockReturnValueOnce(newList.promise)
+    vi.mocked(api.getProjectQueue)
+      .mockReturnValueOnce(oldQueue.promise)
+      .mockReturnValueOnce(newQueue.promise)
+    const view = render(<PlanPanel project={project} onDirtyChange={vi.fn()} onOpenRunDashboard={vi.fn()} />)
+    view.rerender(<PlanPanel project={betaProject} onDirtyChange={vi.fn()} onOpenRunDashboard={vi.fn()} />)
+    expect(screen.getByText('Loading plans…')).toBeDefined()
+    // Alpha's stale success must not publish rows, an error, or clear beta's loading.
+    await act(async () => { oldList.resolve([todoPlan]) })
+    expect(screen.getByText('Loading plans…')).toBeDefined()
+    expect(screen.queryByRole('button', { name: /plan-a.md/ })).toBeNull()
+    expect(screen.queryByRole('alert')).toBeNull()
+    expect(screen.queryByText('No plans yet. Create a draft to begin.')).toBeNull()
+    await act(async () => { newList.resolve([betaPlan]) })
+    expect(screen.queryByText('Loading plans…')).toBeNull()
+    expect(await screen.findByRole('button', { name: /plan-beta.md/ })).toBeDefined()
+    // Queue completion stays independent of the list assertions.
+    await act(async () => { oldQueue.resolve(queueEvidence); newQueue.resolve({ ...queueEvidence, project_id: 'beta' }) })
+    expect(screen.getByText(/Implementation slots: 2 of 2/)).toBeDefined()
+  })
+
+  it('keeps the newer project list loading after a stale rejection from the previous project', async () => {
+    const oldList = deferred<PlanDocument[]>()
+    const oldQueue = deferred<ProjectQueue>()
+    const newList = deferred<PlanDocument[]>()
+    const newQueue = deferred<ProjectQueue>()
+    vi.mocked(api.listProjectPlans)
+      .mockReturnValueOnce(oldList.promise)
+      .mockReturnValueOnce(newList.promise)
+    vi.mocked(api.getProjectQueue)
+      .mockReturnValueOnce(oldQueue.promise)
+      .mockReturnValueOnce(newQueue.promise)
+    const view = render(<PlanPanel project={project} onDirtyChange={vi.fn()} onOpenRunDashboard={vi.fn()} />)
+    view.rerender(<PlanPanel project={betaProject} onDirtyChange={vi.fn()} onOpenRunDashboard={vi.fn()} />)
+    expect(screen.getByText('Loading plans…')).toBeDefined()
+    // Alpha's stale rejection must not publish an error or clear beta's loading.
+    await act(async () => { oldList.reject(new Error('alpha list offline')) })
+    expect(screen.getByText('Loading plans…')).toBeDefined()
+    expect(screen.queryByRole('button', { name: /plan-a.md/ })).toBeNull()
+    expect(screen.queryByRole('alert')).toBeNull()
+    expect(screen.queryByText('No plans yet. Create a draft to begin.')).toBeNull()
+    await act(async () => { newList.resolve([betaPlan]) })
+    expect(screen.queryByText('Loading plans…')).toBeNull()
+    expect(await screen.findByRole('button', { name: /plan-beta.md/ })).toBeDefined()
+    await act(async () => { oldQueue.resolve(queueEvidence); newQueue.resolve({ ...queueEvidence, project_id: 'beta' }) })
+    expect(screen.getByText(/Implementation slots: 2 of 2/)).toBeDefined()
+  })
+
   it('retains equal plan rows and capacity while a repeat queue request is pending', async () => {
     render(hosted(project))
     const row = await screen.findByRole('button', { name: /plan-a.md/ })

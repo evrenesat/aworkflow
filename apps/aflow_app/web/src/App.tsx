@@ -327,9 +327,10 @@ export function App() {
       if (authEpoch.current !== epoch || projectsRequestRef.current !== request) return
       setProjectsError(err instanceof Error ? err.message : 'Failed to load registered projects')
     } finally {
-      if (authEpoch.current !== epoch || projectsRequestRef.current !== request) return
-      if (initial) setProjectsLoading(false)
-      else setProjectsRefreshing(false)
+      if (authEpoch.current === epoch && projectsRequestRef.current === request) {
+        if (initial) setProjectsLoading(false)
+        else setProjectsRefreshing(false)
+      }
     }
   }, [])
 

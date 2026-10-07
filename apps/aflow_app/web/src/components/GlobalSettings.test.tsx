@@ -2450,7 +2450,7 @@ describe('GlobalSettings', () => {
     const stale = deferred<ReturnType<typeof skillDetail>>()
     const current = deferred<ReturnType<typeof skillDetail>>()
     let refreshCalls = 0
-    vi.mocked(api.readSkill).mockImplementation((name: string) => {
+    vi.mocked(api.readSkill).mockImplementation((_name: string) => {
       refreshCalls += 1
       return refreshCalls === 1 ? stale.promise : current.promise
     })
