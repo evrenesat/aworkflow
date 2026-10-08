@@ -2,21 +2,32 @@
 
 The global service owns the one shared workflow pair in the global AFlow
 configuration directory (``~/.config/aflow/aflow.toml`` plus its sibling
-``workflows.toml``).  It reuses the project service's validation, revision,
-and rollback-safe commit machinery, serializes pair writes through the shared
-configuration lock, and never blocks a save because some project has a running
-or resumable run. Existing runs reload the committed source at their next
-boundary; only an invalid candidate or stale revision rejects the save.
+``workflows.toml``).  It reuses the project service's validation and revision
+machinery and delegates every durable pair write to the core transaction
+owner in :mod:`aflow.config_pair`, which records a bounded write-ahead
+journal, replaces both documents, and recovers an interrupted generation
+under the shared configuration lock.  Reads and saves run pending-transaction
+recovery first, so the service never observes a mixed pair.  A save never
+blocks because some project has a running or resumable run; existing runs
+reload the committed source at their next boundary, and only an invalid
+candidate or stale revision rejects the save.
+
+A third-party edit that conflicts with a pending recovery rejects the read
+or save with a bounded :class:`ProjectConfigError` and preserves both the
+edited bytes and the transaction record.
 """
 
 from __future__ import annotations
 
 from pathlib import Path
-import os
-import tempfile
 import threading
 
-from aflow.run_config_snapshot import configuration_pair_lock
+from aflow.config_pair import (
+    ConfigPairError,
+    commit_configuration_pair,
+    configuration_pair_lock,
+    recover_pending_transaction,
+)
 
 from .project_config_service import (
     CONFIG_DOCUMENT_NAMES,
@@ -25,9 +36,7 @@ from .project_config_service import (
     ProjectConfigSnapshot,
     _DOCUMENT_HEX_RE,
     _append_audit_line,
-    _fsync_directory,
     _read_protected_document,
-    _restore_document,
     combined_revision,
     validate_candidate_pair,
 )
@@ -52,6 +61,7 @@ class GlobalConfigService:
     def read(self) -> ProjectConfigSnapshot:
         """Return the exact committed texts, revision, and validation report."""
         with self._lock, configuration_pair_lock(self._config_dir):
+            self._recover()
             return self._snapshot()
 
     def validate_candidate(
@@ -112,6 +122,7 @@ class GlobalConfigService:
         from .guided_config import apply_action_batch
 
         with self._lock, configuration_pair_lock(self._config_dir):
+            self._recover()
             current = self._snapshot()
             if payload.expected_revision != current.revision:
                 raise ProjectConfigRevisionConflict(current.revision)
@@ -140,8 +151,7 @@ class GlobalConfigService:
         expected_revision: str,
         revisions: dict[str, str | None],
     ) -> ProjectConfigSnapshot:
-        from .project_config_service import _read_protected_document
-
+        self._recover()
         aflow_doc = _read_protected_document(self._config_dir, "aflow.toml")
         workflows_doc = _read_protected_document(self._config_dir, "workflows.toml")
         current_revision = combined_revision(
@@ -170,10 +180,6 @@ class GlobalConfigService:
         new_revision = combined_revision(aflow_bytes, workflows_bytes)
         _commit_pair_locked(
             self._config_dir,
-            previous=(
-                aflow_doc[0] if aflow_doc else None,
-                workflows_doc[0] if workflows_doc else None,
-            ),
             payloads=(aflow_bytes, workflows_bytes),
         )
         committed_aflow = _read_protected_document(self._config_dir, "aflow.toml")
@@ -217,52 +223,41 @@ class GlobalConfigService:
             validation=report,
         )
 
+    def _recover(self) -> None:
+        """Complete a pending pair transaction; the caller holds the pair lock.
+
+        Recovery failures reject the read or save with the service's bounded
+        :class:`ProjectConfigError` contract while preserving the edited
+        bytes and the transaction record for a later recoverable read.
+        """
+        try:
+            recover_pending_transaction(self._config_dir)
+        except ConfigPairError as exc:
+            raise ProjectConfigError(
+                f"configuration pair recovery failed: {exc}"
+            ) from exc
+
 
 def _commit_pair_locked(
     config_dir: Path,
     *,
-    previous: tuple[bytes | None, bytes | None],
     payloads: tuple[bytes, bytes],
 ) -> None:
-    """Replace the pair on disk; the caller holds the shared pair lock."""
-    from .project_config_service import (
-        document_path,
-    )
+    """Commit the pair through the transaction owner; the caller holds the lock.
 
-    config_dir.mkdir(parents=True, exist_ok=True)
-    staged: list[Path] = []
+    The core owner re-enters the shared pair lock (one effective flock per
+    process), records the old and new generations, replaces both documents,
+    and restores the old generation on any pre-commit failure.  Core
+    failures surface as the service's bounded :class:`ProjectConfigError`
+    contract so REST/MCP keep their public errors and audit outcomes.
+    """
     try:
-        for name, payload in zip(CONFIG_DOCUMENT_NAMES, payloads):
-            descriptor, temp_name = tempfile.mkstemp(
-                prefix=f".{name}.", suffix=".tmp", dir=config_dir
-            )
-            temp = Path(temp_name)
-            staged.append(temp)
-            with os.fdopen(descriptor, "wb") as handle:
-                handle.write(payload)
-                handle.flush()
-                os.fsync(handle.fileno())
-        first_temp, second_temp = staged
-        first_target = document_path(config_dir, CONFIG_DOCUMENT_NAMES[0])
-        second_target = document_path(config_dir, CONFIG_DOCUMENT_NAMES[1])
-        if previous[0] != payloads[0]:
-            os.replace(first_temp, first_target)
-        try:
-            if previous[1] != payloads[1]:
-                os.replace(second_temp, second_target)
-        except OSError as exc:
-            _restore_document(first_target, previous[0])
-            _fsync_directory(config_dir)
-            raise ProjectConfigError(
-                "workflows.toml replacement failed; the previous aflow.toml was restored"
-            ) from exc
-        _fsync_directory(config_dir)
-    finally:
-        for temp in staged:
-            try:
-                temp.unlink(missing_ok=True)
-            except OSError:
-                pass
+        commit_configuration_pair(
+            config_dir,
+            payloads=dict(zip(CONFIG_DOCUMENT_NAMES, payloads)),
+        )
+    except ConfigPairError as exc:
+        raise ProjectConfigError(str(exc)) from exc
 
 
 def _failure_outcome(exc: Exception) -> str:

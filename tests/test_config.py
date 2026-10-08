@@ -1,4 +1,8 @@
 from dataclasses import asdict
+from hashlib import sha256
+import errno
+import json
+import pytest
 import tomllib
 
 from tests._support import *  # noqa: F401,F403
@@ -7,9 +11,311 @@ from aflow.run_state import load_override_request
 from aflow.config import (
     bootstrap_project_config,
     find_placeholders,
+    load_config,
     project_configuration_state,
     render_starter_documents,
 )
+from aflow.config_pair import (
+    TRANSACTION_RECORD_NAME,
+    pair_revision,
+)
+from tests.test_config_pair import NEW_AFLOW, NEW_WORKFLOWS, OLD_AFLOW, OLD_WORKFLOWS
+
+
+def test_public_loader_recovers_prepared_pair_in_fresh_process(tmp_path: Path) -> None:
+    """A killed save is recovered by a fresh general load before parsing."""
+    pair_dir = _crash_pair_commit(tmp_path, "after_replacement:aflow.toml")
+    # The crash left the pair mixed on disk: new aflow, old workflows.
+    assert (pair_dir / "aflow.toml").read_bytes() == NEW_AFLOW.encode("utf-8")
+    assert (pair_dir / TRANSACTION_RECORD_NAME).is_file()
+
+    result = _run_general_reader(pair_dir)
+    assert result.returncode == 0, result.stderr
+    data = json.loads(result.stdout)
+    assert data["digests"] == {
+        "aflow.toml": sha256(OLD_AFLOW.encode("utf-8")).hexdigest(),
+        "workflows.toml": sha256(OLD_WORKFLOWS.encode("utf-8")).hexdigest(),
+    }
+    assert data["model"] == "model-a"
+    assert data["record"] is False
+
+
+def test_public_loader_recovers_committed_pair_in_fresh_process(tmp_path: Path) -> None:
+    pair_dir = _crash_pair_commit(tmp_path, "after_committed_marker")
+    assert (pair_dir / TRANSACTION_RECORD_NAME).is_file()
+
+    result = _run_general_reader(pair_dir)
+    assert result.returncode == 0, result.stderr
+    data = json.loads(result.stdout)
+    assert data["digests"] == {
+        "aflow.toml": sha256(NEW_AFLOW.encode("utf-8")).hexdigest(),
+        "workflows.toml": sha256(NEW_WORKFLOWS.encode("utf-8")).hexdigest(),
+    }
+    assert data["model"] == "model-b"
+    assert data["record"] is False
+
+
+def test_public_loader_fails_closed_on_unknown_edit_during_pending(
+    tmp_path: Path,
+) -> None:
+    pair_dir = _crash_pair_commit(tmp_path, "after_replacement:aflow.toml")
+    aflow_path = pair_dir / "aflow.toml"
+    aflow_path.write_text(
+        OLD_AFLOW.replace("model-a", "operator-model"), encoding="utf-8"
+    )
+    edited = aflow_path.read_bytes()
+    record = pair_dir / TRANSACTION_RECORD_NAME
+    record_bytes = record.read_bytes()
+
+    result = _run_general_reader(pair_dir)
+    assert result.returncode == 2
+    data = json.loads(result.stdout)
+    assert data["type"] == "ConfigError"
+    assert "recovery failed" in data["error"]
+    # The operator edit and the transaction evidence are both preserved.
+    assert aflow_path.read_bytes() == edited
+    assert record.read_bytes() == record_bytes
+
+
+def test_public_loader_fails_closed_on_malformed_record(tmp_path: Path) -> None:
+    pair_dir = tmp_path / "pair"
+    pair_dir.mkdir()
+    (pair_dir / "aflow.toml").write_text(OLD_AFLOW, encoding="utf-8")
+    (pair_dir / "workflows.toml").write_text(OLD_WORKFLOWS, encoding="utf-8")
+    record = pair_dir / TRANSACTION_RECORD_NAME
+    record.write_text("not a transaction record", encoding="utf-8")
+
+    result = _run_general_reader(pair_dir)
+    assert result.returncode == 2
+    data = json.loads(result.stdout)
+    assert data["type"] == "ConfigError"
+    assert "recovery failed" in data["error"]
+    assert record.read_text(encoding="utf-8") == "not a transaction record"
+
+
+def test_public_loader_fails_closed_on_record_inspection_io_error(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """An I/O error inspecting the record is neither absence nor a parse."""
+    import aflow.config_pair as config_pair_module
+
+    pair_dir = tmp_path / "pair"
+    pair_dir.mkdir()
+    (pair_dir / "aflow.toml").write_text(OLD_AFLOW, encoding="utf-8")
+    (pair_dir / "workflows.toml").write_text(OLD_WORKFLOWS, encoding="utf-8")
+    record = pair_dir / TRANSACTION_RECORD_NAME
+    record.write_text("pending record", encoding="utf-8")
+
+    class _EioRecordPath(Path):
+        def lstat(self, *args, **kwargs):
+            raise OSError(errno.EIO, "Input/output error")
+
+    monkeypatch.setattr(
+        config_pair_module,
+        "transaction_record_path",
+        lambda directory: _EioRecordPath(directory, TRANSACTION_RECORD_NAME),
+    )
+
+    with pytest.raises(ConfigError, match="transaction record is unavailable") as excinfo:
+        load_workflow_config(pair_dir / "aflow.toml")
+    assert isinstance(excinfo.value.__cause__, OSError)
+    # No defaults fallback and no parsing: both documents and the record
+    # are preserved exactly.
+    assert (pair_dir / "aflow.toml").read_bytes() == OLD_AFLOW.encode("utf-8")
+    assert (pair_dir / "workflows.toml").read_bytes() == OLD_WORKFLOWS.encode("utf-8")
+    assert record.read_text(encoding="utf-8") == "pending record"
+
+
+def test_public_loader_fails_closed_on_dangling_record_link(
+    tmp_path: Path,
+) -> None:
+    """A dangling record link is not an absent journal."""
+    pair_dir = tmp_path / "pair"
+    pair_dir.mkdir()
+    (pair_dir / "aflow.toml").write_text(OLD_AFLOW, encoding="utf-8")
+    (pair_dir / "workflows.toml").write_text(OLD_WORKFLOWS, encoding="utf-8")
+    record = pair_dir / TRANSACTION_RECORD_NAME
+    record.symlink_to(record.with_name("no-such-record"))
+
+    result = _run_general_reader(pair_dir)
+    assert result.returncode == 2, result.stderr
+    data = json.loads(result.stdout)
+    assert data["type"] == "ConfigError"
+    assert "regular file" in data["error"]
+    # The dangling record link and both documents are preserved.
+    assert record.is_symlink()
+    assert not record.exists()
+    assert (pair_dir / "aflow.toml").read_bytes() == OLD_AFLOW.encode("utf-8")
+    assert (pair_dir / "workflows.toml").read_bytes() == OLD_WORKFLOWS.encode("utf-8")
+
+
+def test_public_loader_fails_closed_on_pending_unsafe_document_link(
+    tmp_path: Path,
+) -> None:
+    """A document replaced by an unsafe link under a pending record fails closed."""
+    pair_dir = _crash_pair_commit(tmp_path, "after_record")
+    record = pair_dir / TRANSACTION_RECORD_NAME
+    record_bytes = record.read_bytes()
+    aflow_path = pair_dir / "aflow.toml"
+    aflow_path.unlink()
+    aflow_path.symlink_to(aflow_path.with_name("no-such-target"))
+
+    result = _run_general_reader(pair_dir)
+    assert result.returncode == 2, result.stderr
+    data = json.loads(result.stdout)
+    assert data["type"] == "ConfigError"
+    assert "regular file" in data["error"]
+    # The unsafe link and the pending record evidence are preserved.
+    assert aflow_path.is_symlink()
+    assert not aflow_path.exists()
+    assert record.read_bytes() == record_bytes
+    assert (pair_dir / "workflows.toml").read_bytes() == OLD_WORKFLOWS.encode("utf-8")
+
+
+def test_public_loader_missing_input_keeps_defaults_without_creating_parent(
+    tmp_path: Path,
+) -> None:
+    missing = tmp_path / "absent" / "nested" / "aflow.toml"
+    assert load_workflow_config(missing) == WorkflowUserConfig()
+    assert not (tmp_path / "absent").exists()
+
+    # An existing pair directory without a journal and without the input
+    # still yields the historical empty defaults.
+    empty_dir = tmp_path / "empty"
+    empty_dir.mkdir()
+    assert load_workflow_config(empty_dir / "aflow.toml") == WorkflowUserConfig()
+    assert list(empty_dir.iterdir()) == []
+
+
+def test_public_loader_follows_supported_symlink_without_journal(
+    tmp_path: Path,
+) -> None:
+    real = tmp_path / "real"
+    real.mkdir()
+    (real / "aflow.toml").write_text(OLD_AFLOW, encoding="utf-8")
+    (real / "workflows.toml").write_text(OLD_WORKFLOWS, encoding="utf-8")
+    link_dir = tmp_path / "link"
+    link_dir.mkdir()
+    (link_dir / "aflow.toml").symlink_to(real / "aflow.toml")
+    (link_dir / "workflows.toml").symlink_to(real / "workflows.toml")
+
+    loaded = load_workflow_config(link_dir / "aflow.toml")
+    assert loaded.harnesses["codex"].profiles["default"].model == "model-a"
+    assert list(loaded.workflows) == ["simple"]
+
+
+def test_load_config_alias_delegates_to_the_public_loader(tmp_path: Path) -> None:
+    pair_dir = tmp_path / "pair"
+    pair_dir.mkdir()
+    (pair_dir / "aflow.toml").write_text(OLD_AFLOW, encoding="utf-8")
+    (pair_dir / "workflows.toml").write_text(OLD_WORKFLOWS, encoding="utf-8")
+
+    alias = load_config(str(pair_dir / "aflow.toml"))
+    assert alias == load_workflow_config(pair_dir / "aflow.toml")
+
+    # The alias routes a pending transaction through the same boundary.
+    pending = _crash_pair_commit(tmp_path / "pending", "after_replacement:aflow.toml")
+    reloaded = load_config(str(pending / "aflow.toml"))
+    assert reloaded.harnesses["codex"].profiles["default"].model == "model-a"
+    assert not (pending / TRANSACTION_RECORD_NAME).exists()
+
+
+def test_public_loader_uses_default_source(tmp_path: Path, monkeypatch) -> None:
+    import aflow.config as config_module
+
+    pair_dir = tmp_path / "pair"
+    pair_dir.mkdir()
+    (pair_dir / "aflow.toml").write_text(OLD_AFLOW, encoding="utf-8")
+    (pair_dir / "workflows.toml").write_text(OLD_WORKFLOWS, encoding="utf-8")
+    monkeypatch.setattr(
+        config_module, "_config_path", lambda: pair_dir / "aflow.toml"
+    )
+    loaded = load_workflow_config()
+    assert loaded.harnesses["codex"].profiles["default"].model == "model-a"
+    assert list(loaded.workflows) == ["simple"]
+
+
+_GENERAL_READER_SCRIPT = """\
+import hashlib, json, sys
+from pathlib import Path
+from aflow.config import ConfigError, load_workflow_config
+
+pair_dir = Path(sys.argv[1])
+try:
+    loaded = load_workflow_config(pair_dir / "aflow.toml")
+except ConfigError as exc:
+    print(json.dumps({"error": str(exc), "type": type(exc).__name__}))
+    sys.exit(2)
+digests = {}
+for name in ("aflow.toml", "workflows.toml"):
+    path = pair_dir / name
+    digests[name] = hashlib.sha256(path.read_bytes()).hexdigest() if path.is_file() else None
+print(json.dumps({
+    "digests": digests,
+    "model": loaded.harnesses["codex"].profiles["default"].model,
+    "record": (pair_dir / ".aflow-config-pair.transaction.json").is_file(),
+}))
+"""
+
+_GENERAL_COMMIT_SCRIPT = """\
+import os, sys
+from pathlib import Path
+from aflow.config_pair import commit_configuration_pair
+
+pair_dir = Path(sys.argv[1])
+new_dir = Path(sys.argv[2])
+payloads = {name: (new_dir / name).read_bytes() for name in ("aflow.toml", "workflows.toml")}
+
+def barrier(point):
+    if point == sys.argv[4]:
+        os._exit(37)
+
+commit_configuration_pair(
+    pair_dir, payloads=payloads, expected_revision=sys.argv[3], barrier=barrier
+)
+"""
+
+
+def _run_general_reader(pair_dir: Path) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        [sys.executable, "-c", _GENERAL_READER_SCRIPT, str(pair_dir)],
+        capture_output=True,
+        text=True,
+        timeout=120,
+    )
+
+
+def _crash_pair_commit(base_dir: Path, crash_point: str) -> Path:
+    """Kill a real core commit at one durable boundary; return the pair dir."""
+    pair_dir = base_dir / "pair"
+    new_dir = base_dir / "new"
+    pair_dir.mkdir(parents=True)
+    new_dir.mkdir(parents=True)
+    (pair_dir / "aflow.toml").write_text(OLD_AFLOW, encoding="utf-8")
+    (pair_dir / "workflows.toml").write_text(OLD_WORKFLOWS, encoding="utf-8")
+    (new_dir / "aflow.toml").write_text(NEW_AFLOW, encoding="utf-8")
+    (new_dir / "workflows.toml").write_text(NEW_WORKFLOWS, encoding="utf-8")
+    expected = pair_revision(
+        (pair_dir / "aflow.toml").read_bytes(),
+        (pair_dir / "workflows.toml").read_bytes(),
+    )
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            _GENERAL_COMMIT_SCRIPT,
+            str(pair_dir),
+            str(new_dir),
+            expected,
+            crash_point,
+        ],
+        capture_output=True,
+        text=True,
+        timeout=120,
+    )
+    assert result.returncode == 37, result.stderr
+    assert (pair_dir / TRANSACTION_RECORD_NAME).is_file()
+    return pair_dir
 
 
 def test_normal_config_loading_preserves_defaults_and_split_workflows(tmp_path: Path) -> None:

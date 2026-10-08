@@ -1048,6 +1048,9 @@ When a workflow's effective `teardown` includes `merge`, validation also checks 
 
 Cross-validates that harness profiles, roles, teams, prompts, aliases, and transition targets all reference things that exist.
 
+### `config_pair.py`
+Owns crash-safe writes of the global `aflow.toml` + `workflows.toml` pair. A commit writes a write-ahead record, replaces the two files atomically, fsyncs a committed marker, then removes the record; the pair lock serializes commits and recoveries. `recover_pending_transaction` completes an interrupted commit idempotently from the record — restoring the old pair or installing the new one — and fails closed when a document changed outside the transaction. `load_workflow_config` in `config.py` acquires the pair lock before inspecting the recovery record and holds it through recovery and parsing, so every reader (general filesystem loads, remote REST reads, the live configuration watcher, and run snapshots) sees one complete generation even when a save starts after the reader observed no journal; a pending transaction with an unknown edit, and any failed record inspection, fail closed with a bounded error instead of authorizing an unlocked parse. The remote configuration service and its MCP authoring tools commit through this owner instead of staging files directly.
+
 ### `plan.py`
 Parses a Markdown plan file into structured checkpoint data. Expects `### [x] Checkpoint ...` headings (h3 with checkbox) and `- [ ] step` items underneath. Produces a `PlanSnapshot` with:
 - `current_checkpoint_name`, `current_checkpoint_index`

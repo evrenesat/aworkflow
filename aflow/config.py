@@ -10,6 +10,7 @@ from collections.abc import Mapping
 import tomllib
 from typing import Literal
 
+from . import config_pair
 from .harnesses import ADAPTERS
 
 VALID_CONDITION_SYMBOLS = frozenset({"DONE", "NEW_PLAN_EXISTS", "MAX_TURNS_REACHED"})
@@ -1316,12 +1317,12 @@ def resolve_team_config(
     )
 
 
-def load_workflow_config(
-    config_path: Path | None = None,
-) -> WorkflowUserConfig:
-    path = config_path or _config_path()
-    if not path.exists():
-        return WorkflowUserConfig()
+def _parse_config_pair(path: Path) -> WorkflowUserConfig:
+    """Parse and validate the pair at ``path``.
+
+    The caller has selected ``path`` and holds the pair lock for the whole
+    read, having completed recovery for any pending transaction.
+    """
     try:
         with path.open("rb") as handle:
             raw = tomllib.load(handle)
@@ -1368,6 +1369,49 @@ def load_workflow_config(
     if errors:
         raise ConfigError("; ".join(errors))
     return merged
+
+
+def load_workflow_config(
+    config_path: Path | None = None,
+) -> WorkflowUserConfig:
+    """Load the workflow pair after recovering any pending pair transaction.
+
+    The selected supplied (or default) path is never resolved away from its
+    journal: the pair directory is its parent.  Any read of an existing file
+    acquires the pair lock before the recovery state is inspected and holds
+    it through recovery, both document reads, parsing and validation, so an
+    initially absent journal never authorizes an unlocked parse.  A truly
+    missing input with a confirmed absent record keeps the historical
+    empty-default behavior without creating its parent directory.  Record
+    inspection and recovery failures become a bounded :class:`ConfigError`
+    with the original reason chained, preserving the record and document
+    bytes.  Supported symlinks, split-file parsing, and validation are
+    unchanged.
+    """
+    path = config_path or _config_path()
+    pair_dir = path.parent
+    try:
+        config_pair.transaction_record_path(pair_dir).lstat()
+        record_visible = True
+    except FileNotFoundError:
+        record_visible = False
+    except OSError as exc:
+        raise ConfigError(
+            f"configuration recovery failed for {pair_dir}: "
+            f"transaction record is unavailable: {exc}"
+        ) from exc
+    if not record_visible and not path.exists():
+        return WorkflowUserConfig()
+    with config_pair.configuration_pair_lock(pair_dir) as _lock:
+        try:
+            config_pair.recover_pending_transaction(pair_dir)
+        except config_pair.ConfigPairError as exc:
+            raise ConfigError(
+                f"configuration recovery failed for {pair_dir}: {exc}"
+            ) from exc
+        if not path.exists():
+            return WorkflowUserConfig()
+        return _parse_config_pair(path)
 
 
 def load_config(config_path: Path | str | None = None) -> WorkflowUserConfig:

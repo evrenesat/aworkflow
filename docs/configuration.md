@@ -549,10 +549,32 @@ The remote app edits the shared workflow pair as one revisioned pair:
   calls finish with their starting settings and the next turn or resume reads
   the saved pair. A run may retain a launch-time snapshot for diagnostics, but
   it is not an execution or admission gate.
-- A successful write stages and fsyncs both documents atomically with
-  rollback handling and appends redacted revision metadata to the audit log.
-  The save and run-reservation snapshots share one configuration lock, so a
-  launch observes either the old pair or the new pair, never half of each.
+- A successful write commits both documents through the shared configuration
+  pair transaction owner (`aflow/config_pair.py`): a write-ahead record,
+  atomic file replacements, a durable committed marker, then record cleanup.
+  The record is the recovery evidence, so a killed save cannot leave a
+  half-updated pair: the first reader (general filesystem load, remote REST
+  read, live configuration watcher, or run snapshot) completes the
+  interrupted transaction idempotently before parsing, restoring either the
+  complete old pair or the complete new pair. Renamed prompts and their workflow references commit and recover as
+  one unit, never half-renamed.
+- Every supported read (general filesystem load, remote REST read, live
+  configuration watcher, run snapshot) holds the pair lock from before the
+  journal inspection through recovery and parsing. An initially absent
+  journal therefore never authorizes an unlocked parse: a save that begins
+  after a read saw no journal, or between its two document reads, cannot
+  return a mixed generation. Only a truly missing input with a confirmed
+  absent record keeps the historical empty defaults, and a failed journal
+  inspection fails with a bounded error instead of falling back to defaults
+  or an unlocked parse.
+- If a manual edit changed a document while a transaction was pending,
+  recovery preserves the edited bytes and the record and the read fails
+  with a bounded explicit error instead of guessing which generation was
+  intended.
+- Every save appends redacted revision metadata to the audit log, recording
+  the REST or MCP transport that performed it. The save, recovery, and
+  run-reservation snapshots share one configuration lock, so a launch
+  observes either the old pair or the new pair, never half of each.
 
 ## Server settings API
 

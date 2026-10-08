@@ -77,6 +77,97 @@
   passes; `uv run ruff check aflow/cli.py tests/test_run_state.py
   tests/test_control_plane_resume.py` passes.
 
+## 2026-10-07 — AFLOW-MAINT-20261006-02 CP2 repair (v01): general reads hold the pair lock before journal inspection
+
+- `load_workflow_config` no longer skips the pair lock when an unlocked
+  record inspection reports no journal: every existing-file read now acquires
+  the pair lock before inspecting recovery state and holds it through
+  recovery, both document reads, parsing and validation. A save that starts
+  after a reader observed no journal, or between its two document parses,
+  therefore cannot return a mixed generation. The unlocked
+  `_has_pending_config_pair_record` bypass was removed; a truly missing input
+  with a confirmed absent record still returns the historical empty defaults
+  without creating its parent directory, and any other journal inspection
+  failure fails closed through the bounded `ConfigError` contract with the
+  original reason chained.
+- `tests/test_config.py` adds fail-closed core regressions for a record
+  inspection I/O error, a dangling record link, and a pending unsafe document
+  link, all preserving exact document and record bytes.
+- `apps/aflow_app/server/tests/test_config_pair_parity.py` adds coordinated
+  subprocess regressions over disposable directories: a no-journal general
+  reader overlapping a real `GlobalConfigService.save` killed after the first
+  replacement (the reader waits on the pair lock, recovers the complete old
+  pair, and cleans the record; real child exit 37), and a reader paused after
+  its first document parse while a full save requests the lock (the saver
+  cannot replace either document until the reader finishes the complete old
+  pair, then commits the complete new pair; real child exit 0). Both use
+  explicit pipe/file barriers and assert the interpreted model/workflow
+  combination plus exact on-disk bytes.
+
+## 2026-10-07 — AFLOW-MAINT-20261006-02 CP2 repair: general filesystem reads recover before parsing
+
+- The public `load_workflow_config` filesystem reader now runs the pair
+  transaction boundary before parsing: it selects the same supplied or
+  default path, inspects the canonical record without following any
+  document leaf, and when a transaction is pending it locks the pair
+  directory, completes recovery, and only then reads and parses the pair
+  through the private already-locked parsing helper. Recovery failures
+  become a bounded `ConfigError` with the original reason chained, preserving
+  the record and document bytes; a pending transaction with an unknown edit,
+  unsafe link, or malformed record therefore fails closed instead of being
+  parsed through.
+- With no pending transaction the historical behavior is unchanged: missing
+  inputs keep the empty defaults without creating the parent directory,
+  supported symlinks, split-file parsing, validation, and the `load_config`
+  alias delegation are intact. Readers that already hold the pair lock
+  (live configuration, run snapshots) re-enter the re-entrant lock, keeping
+  one effective flock and one loader invocation.
+- `tests/test_config.py` gains fresh-process core-reader regressions:
+  prepared/committed recovery with exact pair digests, fail-closed unknown
+  edits and malformed records, no-journal missing/default/symlink behavior,
+  and alias/default-source delegation. `apps/aflow_app/server/tests/
+  test_config_pair_parity.py` exercises a real `GlobalConfigService.save`
+  killed after the first replacement observed first by a fresh
+  `load_workflow_config` reader (old complete generation plus record
+  cleanup), committed recovery (new generation), and a pending valid manual
+  edit rejected without changing either document or the record.
+
+## 2026-10-07 — AFLOW-MAINT-20261006-02 CP2: remote configuration pair parity on the transaction owner
+
+- The global configuration service no longer stages and renames files
+  itself: `save`, `patch`, and `read` now run recovery and commit the pair
+  through the core transaction owner (`aflow/config_pair.py`, CP1). REST
+  saves, MCP authoring-tool saves, and normal launches therefore share one
+  crash-safe commit and one recovery path. The service keeps its public
+  contracts: `GlobalConfigSnapshot` fields, `ProjectConfigError` / `ProjectConfigRevisionConflict`,
+  audit line schema, and redaction are unchanged.
+- Recovery is now reachable from every supported read path: the REST read,
+  the live configuration watcher, and the run snapshot all parse only
+  after `load_workflow_config` completes any pending transaction.
+  `apps/aflow_app/server/tests/test_config_pair_parity.py` proves the new
+  parity with a real prompt rename: a killed save at each durable boundary
+  is observed by fresh REST and live reader processes and always yields the
+  complete old or new pair (the rename and its workflow references move
+  together). A manual edit during a pending recovery preserves the edited
+  bytes and the record and fails closed on both boundaries; stale revisions
+  and invalid candidates preserve exact bytes with the same public errors
+  and audit outcomes over REST and MCP.
+  A killed save is also observed through the real HTTP `GET /api/config`
+  boundary (disposable server/config directory) plus a fresh-process live
+  read on the same directory.
+- Docs: `docs/configuration.md` (Remote configuration editing) describes the
+  write-ahead transaction, read-path recovery, and the manual-edit
+  conflict; `ARCHITECTURE.md` gains the `config_pair.py` section.
+- Final verification (cumulative gate): `uv run ruff check aflow
+  apps/aflow_app/server/src` clean; `uv run pytest -q tests/test_config_pair.py
+  tests/test_config.py tests/test_live_config.py tests/test_live_config_runtime.py
+  tests/test_run_config_snapshot.py tests/test_runtime.py` (588 passed);
+  `uv run --project apps/aflow_app/server pytest -q apps/aflow_app/server/tests/test_project_config_service.py
+  apps/aflow_app/server/tests/test_global_config_patch.py apps/aflow_app/server/tests/test_guided_config.py
+  apps/aflow_app/server/tests/test_mcp.py apps/aflow_app/server/tests/test_config_pair_parity.py`
+  (194 passed); `git diff --check` clean; `uv build --wheel` plus
+  `scripts/smoke_ui.py` on the built wheel: SMOKE PASSED.
+
 ## 2026-10-07 — AFLOW-MAINT-20261006-01 CP2: required dashboard web lint CI step
 
 - The Dashboard CI job now runs `npm run lint` (existing web baseline,
