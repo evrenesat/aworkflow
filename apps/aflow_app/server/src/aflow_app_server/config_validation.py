@@ -1,7 +1,7 @@
 """Shared in-memory validation for submitted configuration pair text.
 
-This module owns the server's configuration exception types, report
-shapes, revision, and bounds helpers.  Candidate text is validated through
+This module owns the server's configuration exception types, report and
+snapshot shapes, revision, and bounds helpers.  Candidate text is validated through
 the core pure parser :func:`aflow.config.parse_workflow_pair` — one parse,
 one sibling merge, one semantic validation pass, and no candidate files —
 so submitted text and filesystem inputs produce equivalent reports.
@@ -25,6 +25,7 @@ CONFIG_DOCUMENT_NAMES = ("aflow.toml", "workflows.toml")
 MAX_CONFIG_DOCUMENT_BYTES = 256 * 1024
 MAX_VALIDATION_ISSUES = 20
 MAX_ISSUE_MESSAGE_CHARS = 300
+DOCUMENT_HEX_RE = re.compile(r"^[0-9a-f]{64}$")
 _TOML_LINE_RE = re.compile(r"line (\d+)")
 
 
@@ -59,6 +60,18 @@ class ConfigValidationReport:
     workflows: tuple[str, ...]
     teams: tuple[str, ...]
     roles: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class ProjectConfigSnapshot:
+    """The exact committed text pair plus its combined revision and report."""
+
+    project_id: str
+    revision: str
+    documents: tuple[str, ...]
+    aflow_toml: str
+    workflows_toml: str
+    validation: ConfigValidationReport
 
 
 def combined_revision(aflow_bytes: bytes, workflows_bytes: bytes) -> str:

@@ -406,3 +406,52 @@ def test_team_upgrade_cycle_is_rejected_without_writes(service):
             dict(type='set_team_upgrade', team='b', upgrade_to='a'),
         ])
     assert service.read() == before
+
+
+def _imported_modules(module: object) -> set[str]:
+    """Return the dotted names of every module the given module imports."""
+    import ast
+
+    source = Path(module.__file__).read_text(encoding="utf-8")
+    names: set[str] = set()
+    package_parts = (module.__package__ or "").split(".")
+    for node in ast.walk(ast.parse(source, filename=module.__file__)):
+        if isinstance(node, ast.Import):
+            names.update(alias.name for alias in node.names)
+        elif isinstance(node, ast.ImportFrom) and node.module:
+            if node.level == 0:
+                names.add(node.module)
+            else:
+                base = package_parts[: len(package_parts) - (node.level - 1)]
+                names.add(".".join(base + [node.module]))
+    return names
+
+
+def test_active_global_config_code_does_not_import_legacy_project_editing():
+    import aflow_app_server.config_response as config_response
+    import aflow_app_server.global_config_service as global_config_service
+    import aflow_app_server.guided_config as guided_config
+    import aflow_app_server.mcp_adapter as mcp_adapter
+    import aflow_app_server.mcp_config_authoring as mcp_config_authoring
+
+    legacy = "aflow_app_server.project_config_service"
+    for module in (
+        global_config_service,
+        config_response,
+        guided_config,
+        mcp_adapter,
+        mcp_config_authoring,
+    ):
+        assert legacy not in _imported_modules(module), (
+            f"{module.__name__} must not depend on the legacy project "
+            f"configuration import path"
+        )
+
+
+def test_global_config_service_delegates_to_current_config_owners():
+    import aflow_app_server.global_config_service as global_config_service
+
+    imported = _imported_modules(global_config_service)
+    assert "aflow.config_pair" in imported
+    assert "aflow_app_server.config_validation" in imported
+    assert "aflow_app_server.config_documents" in imported

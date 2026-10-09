@@ -7,7 +7,7 @@ from .models import (
     ConfigValidationModel,
     ProjectConfigResponse,
 )
-from .project_config_service import ConfigValidationReport, ProjectConfigSnapshot
+from .config_validation import ConfigValidationReport, ProjectConfigSnapshot
 
 
 def config_validation_response(report: ConfigValidationReport) -> ConfigValidationModel:

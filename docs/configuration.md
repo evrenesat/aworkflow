@@ -538,7 +538,17 @@ an existing `config.toml` are preserved on writes.
 
 ## Remote configuration editing
 
-The remote app edits the shared workflow pair as one revisioned pair:
+The remote app edits the shared workflow pair as one revisioned pair. Server
+side, `aflow_app_server/config_validation.py` owns the shared in-memory
+candidate validator (one call into the core pure `aflow.config
+.parse_workflow_pair`, so submitted text and filesystem inputs produce
+equivalent reports), the configuration exception types, report and snapshot
+shapes, and the revision/bounds helpers; `aflow_app_server/config_documents.py`
+owns protected document reads and audit records. The legacy
+`project_config_service.py` module remains only as a compatibility facade:
+it re-exports those names and keeps the project-scoped editing service,
+while the active global configuration code imports the current owners
+directly.
 
 - GET /api/config returns the exact UTF-8 text of aflow.toml and
   workflows.toml plus their combined SHA-256 revision.

@@ -15,7 +15,7 @@ from aflow.control_plane import StartRunResult
 from aflow.control_plane.units import InMemoryUnitManager
 from aflow.daemon import AflowDaemon
 
-from aflow_app_server import project_config_service
+from aflow_app_server import config_documents, config_validation
 from aflow_app_server.control_plane_service import ControlPlaneService
 from aflow_app_server.project_config_service import (
     ProjectConfigError,
@@ -139,6 +139,18 @@ def _audit_records(tmp_path: Path) -> list[dict[str, object]]:
     ]
 
 
+def test_legacy_config_helper_aliases_keep_current_owner_identity() -> None:
+    from aflow_app_server.project_config_service import (
+        _DOCUMENT_HEX_RE,
+        _append_audit_line,
+        _read_protected_document,
+    )
+
+    assert _read_protected_document is config_documents.read_protected_document
+    assert _append_audit_line is config_documents.append_audit_line
+    assert _DOCUMENT_HEX_RE is config_validation.DOCUMENT_HEX_RE
+
+
 class TestRead:
     def test_read_returns_exact_texts_revision_and_ready_state(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
@@ -230,7 +242,7 @@ class TestRead:
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         service, _, _, root, _ = _env(tmp_path, monkeypatch, initial="valid")
-        monkeypatch.setattr(project_config_service, "MAX_CONFIG_DOCUMENT_BYTES", 16)
+        monkeypatch.setattr(config_documents, "MAX_CONFIG_DOCUMENT_BYTES", 16)
         (root / ".aflow" / "config" / "aflow.toml").write_text(
             "x" * 64, encoding="utf-8"
         )
@@ -533,7 +545,11 @@ class TestSave:
     ) -> None:
         service, _, _, root, _ = _env(tmp_path, monkeypatch, initial="valid")
         before = service.read(PROJECT_ID)
-        aflow_text, workflows_text = _valid_pair(model="rolled-back-model")
+        # Change both documents so the transaction owner replaces both files;
+        # the injected second-file failure must then roll the first back.
+        aflow_text, workflows_text = _valid_pair(
+            model="rolled-back-model", workflow="deliver-2"
+        )
         real_replace = os.replace
 
         def failing_replace(src: object, dst: object, *args: object) -> None:
@@ -541,7 +557,7 @@ class TestSave:
                 raise OSError("simulated second-file replacement failure")
             real_replace(src, dst)  # type: ignore[arg-type]
 
-        monkeypatch.setattr(project_config_service.os, "replace", failing_replace)
+        monkeypatch.setattr(os, "replace", failing_replace)
 
         with pytest.raises(ProjectConfigError, match="restored"):
             service.save(PROJECT_ID, aflow_text, workflows_text, before.revision)
@@ -575,7 +591,7 @@ class TestSave:
                 raise OSError("simulated second-file replacement failure")
             real_replace(src, dst)  # type: ignore[arg-type]
 
-        monkeypatch.setattr(project_config_service.os, "replace", failing_replace)
+        monkeypatch.setattr(os, "replace", failing_replace)
 
         with pytest.raises(ProjectConfigError, match="restored"):
             service.save(PROJECT_ID, aflow_text, workflows_text, before.revision)
@@ -651,7 +667,7 @@ class TestSave:
                 first_replaced.set()
                 assert release_save.wait(timeout=30)
 
-        monkeypatch.setattr(project_config_service.os, "replace", pausing_replace)
+        monkeypatch.setattr(os, "replace", pausing_replace)
         saver = Thread(
             target=lambda: outcomes.setdefault(
                 "save",

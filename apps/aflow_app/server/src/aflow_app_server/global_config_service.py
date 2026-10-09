@@ -2,8 +2,10 @@
 
 The global service owns the one shared workflow pair in the global AFlow
 configuration directory (``~/.config/aflow/aflow.toml`` plus its sibling
-``workflows.toml``).  It reuses the project service's validation and revision
-machinery and delegates every durable pair write to the core transaction
+``workflows.toml``).  It validates through the shared owner in
+:mod:`aflow_app_server.config_validation`, reads protected documents and
+audit records through :mod:`aflow_app_server.config_documents`, and
+delegates every durable pair write to the core transaction
 owner in :mod:`aflow.config_pair`, which records a bounded write-ahead
 journal, replaces both documents, and recovers an interrupted generation
 under the shared configuration lock.  Reads and saves run pending-transaction
@@ -29,14 +31,15 @@ from aflow.config_pair import (
     recover_pending_transaction,
 )
 
-from .project_config_service import (
+from .config_documents import append_audit_line, read_protected_document
+from .config_validation import (
     CONFIG_DOCUMENT_NAMES,
+    DOCUMENT_HEX_RE,
+    ConfigValidationReport,
+    MAX_VALIDATION_ISSUES,
     ProjectConfigError,
     ProjectConfigRevisionConflict,
     ProjectConfigSnapshot,
-    _DOCUMENT_HEX_RE,
-    _append_audit_line,
-    _read_protected_document,
     combined_revision,
     validate_candidate_pair,
 )
@@ -85,7 +88,7 @@ class GlobalConfigService:
             raise ValueError("unsupported configuration transport scope")
         if (
             not isinstance(expected_revision, str)
-            or _DOCUMENT_HEX_RE.fullmatch(expected_revision) is None
+            or DOCUMENT_HEX_RE.fullmatch(expected_revision) is None
         ):
             raise ProjectConfigError(
                 "expected_revision must be a SHA-256 hex digest"
@@ -97,7 +100,7 @@ class GlobalConfigService:
                     aflow_text, workflows_text, expected_revision, revisions
                 )
             except Exception as exc:
-                _append_audit_line(
+                append_audit_line(
                     self._audit_path,
                     project_id="global",
                     outcome=_failure_outcome(exc),
@@ -106,7 +109,7 @@ class GlobalConfigService:
                     caller_scope=caller_scope,
                 )
                 raise
-            _append_audit_line(
+            append_audit_line(
                 self._audit_path,
                 project_id="global",
                 outcome="saved",
@@ -137,11 +140,11 @@ class GlobalConfigService:
             try:
                 saved = self._save_locked(*texts, current.revision, revisions)
             except Exception as exc:
-                _append_audit_line(self._audit_path, project_id="global", outcome=_failure_outcome(exc),
-                                   old_revision=revisions["old"], new_revision=revisions["new"], caller_scope=caller_scope)
+                append_audit_line(self._audit_path, project_id="global", outcome=_failure_outcome(exc),
+                                  old_revision=revisions["old"], new_revision=revisions["new"], caller_scope=caller_scope)
                 raise
-            _append_audit_line(self._audit_path, project_id="global", outcome="saved",
-                               old_revision=revisions["old"], new_revision=revisions["new"], caller_scope=caller_scope)
+            append_audit_line(self._audit_path, project_id="global", outcome="saved",
+                              old_revision=revisions["old"], new_revision=revisions["new"], caller_scope=caller_scope)
             return saved
 
     def _save_locked(
@@ -152,8 +155,8 @@ class GlobalConfigService:
         revisions: dict[str, str | None],
     ) -> ProjectConfigSnapshot:
         self._recover()
-        aflow_doc = _read_protected_document(self._config_dir, "aflow.toml")
-        workflows_doc = _read_protected_document(self._config_dir, "workflows.toml")
+        aflow_doc = read_protected_document(self._config_dir, "aflow.toml")
+        workflows_doc = read_protected_document(self._config_dir, "workflows.toml")
         current_revision = combined_revision(
             aflow_doc[0] if aflow_doc else b"",
             workflows_doc[0] if workflows_doc else b"",
@@ -169,8 +172,6 @@ class GlobalConfigService:
                 f"candidate configuration is invalid: {location}: {first.message}"
             )
         if report.placeholders:
-            from .project_config_service import MAX_VALIDATION_ISSUES
-
             raise ProjectConfigError(
                 "candidate configuration still contains placeholder selectors: "
                 + ", ".join(report.placeholders[:MAX_VALIDATION_ISSUES])
@@ -182,8 +183,8 @@ class GlobalConfigService:
             self._config_dir,
             payloads=(aflow_bytes, workflows_bytes),
         )
-        committed_aflow = _read_protected_document(self._config_dir, "aflow.toml")
-        committed_workflows = _read_protected_document(
+        committed_aflow = read_protected_document(self._config_dir, "aflow.toml")
+        committed_workflows = read_protected_document(
             self._config_dir, "workflows.toml"
         )
         committed_revision = combined_revision(
@@ -196,16 +197,14 @@ class GlobalConfigService:
         return self._snapshot()
 
     def _snapshot(self) -> ProjectConfigSnapshot:
-        aflow_doc = _read_protected_document(self._config_dir, "aflow.toml")
-        workflows_doc = _read_protected_document(self._config_dir, "workflows.toml")
+        aflow_doc = read_protected_document(self._config_dir, "aflow.toml")
+        workflows_doc = read_protected_document(self._config_dir, "workflows.toml")
         aflow_bytes = aflow_doc[0] if aflow_doc else b""
         workflows_bytes = workflows_doc[0] if workflows_doc else b""
         aflow_text = aflow_doc[1] if aflow_doc else ""
         workflows_text = workflows_doc[1] if workflows_doc else ""
         report = validate_candidate_pair(aflow_text, workflows_text)
         if (aflow_doc is None or workflows_doc is None) and report.state == "ready":
-            from .project_config_service import ConfigValidationReport
-
             report = ConfigValidationReport(
                 state="configuration_required",
                 issues=report.issues,

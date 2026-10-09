@@ -1965,10 +1965,22 @@ run-artifact watches wake
 the relevant project scanner between bounded periodic passes. Server shutdown releases scanner ownership
 without stopping already launched workflow units.
 
-`project_config_service.py` owns exactly `.aflow/config/aflow.toml` and
-`.aflow/config/workflows.toml` as one validated revisioned pair. Configuration
-reads, commits, capability loads, and launch reservation share one per-project
-lock so a launch cannot freeze a torn or superseded pair.
+Server configuration ownership is split by concern: `config_validation.py`
+owns the configuration exception types, report and snapshot shapes, revision
+and bounds helpers, and the in-memory candidate validator (one call into the
+core pure `aflow.config.parse_workflow_pair`); `config_documents.py` owns
+protected document reads and bounded audit records; `aflow.config_pair`
+owns the durable pair lock, write-ahead transaction, and recovery. The
+global editor (`global_config_service.py`) and the project-scoped
+`ProjectConfigService` both validate through `config_validation.py` and
+delegate every durable pair write to the `aflow.config_pair` transaction
+owner. `project_config_service.py` is a compatibility facade for the legacy
+import path: it keeps the project-scoped read/save behavior (exactly
+`.aflow/config/aflow.toml` and `.aflow/config/workflows.toml` as one
+validated revisioned pair) and re-exports the legacy module-level names, but
+active server code imports the current owners directly. Configuration reads,
+commits, capability loads, and launch reservation share one per-project lock
+so a launch cannot freeze a torn or superseded pair.
 
 The pure guided_config.py form endpoint projects or transforms the supplied
 configuration pair without saving it. GlobalSettings owns one draft across

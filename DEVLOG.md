@@ -1,5 +1,66 @@
 # DEVLOG
 
+## 2026-10-09 — configuration validation ownership: global editor and legacy facade delegate to current owners (AFLOW-MAINT-20261006 · 03)
+
+- Checkpoint 2 of the configuration validation ownership plan. The active
+  global configuration code no longer imports the legacy
+  `project_config_service` module: `global_config_service.py`,
+  `config_response.py`, `guided_config.py`, `mcp_adapter.py`, and `main.py`
+  now import the exception types, report/snapshot shapes, revision/bounds
+  helpers, and the in-memory candidate validator from
+  `aflow_app_server/config_validation.py`, and protected document reads plus
+  audit records from the new thin `aflow_app_server/config_documents.py`
+  adapter. `config_validation.py` additionally owns the
+  `ProjectConfigSnapshot` shape and the `DOCUMENT_HEX_RE` expected-revision
+  bound that previously lived in the legacy module.
+- `project_config_service.py` is now an explicit compatibility facade: it
+  re-exports the legacy module-level names and keeps the project-scoped
+  `ProjectConfigService` read/save behavior, but its duplicated private
+  commit machinery (mkstemp staging, manual restore, fsync helpers) is
+  removed. Project saves and reads now run under the shared
+  `aflow.config_pair` pair lock, complete pending-transaction recovery
+  first, and commit through
+  `aflow.config_pair.commit_configuration_pair` — the same transaction
+  owner the global editor uses. No new routes were registered and the
+  public save/validate contracts are unchanged.
+- New import-boundary tests in
+  `apps/aflow_app/server/tests/test_global_config_patch.py` prove the active
+  global configuration modules do not import the legacy project editing
+  path and that `GlobalConfigService` visibly delegates to
+  `aflow.config_pair`, `config_validation`, and `config_documents`.
+- Test injection points moved with the implementation: the project-service
+  rollback/torn-read/size-bounds tests now patch the current owners (global
+  `os.replace`, `config_documents.MAX_CONFIG_DOCUMENT_BYTES`) instead of
+  attributes of the removed private code, and the second-file-failure test
+  changes both documents (the transaction owner only replaces changed
+  documents, so a workflows-only-identical candidate never reached the
+  injected failure). All behavioral assertions are unchanged.
+- Review repair (cp01-v01): the legacy helper spellings
+  `_read_protected_document`, `_append_audit_line`, and `_DOCUMENT_HEX_RE`
+  were missing from the facade; they are restored as explicit aliases of the
+  exact current-owner objects (`config_documents.read_protected_document`,
+  `config_documents.append_audit_line`,
+  `config_validation.DOCUMENT_HEX_RE`), so old
+  `from aflow_app_server.project_config_service import ...` imports resolve
+  again without copied implementations. A focused identity regression test
+  (`test_legacy_config_helper_aliases_keep_current_owner_identity`) fails
+  without the aliases and passes with them.
+- Documentation: `ARCHITECTURE.md` and `docs/configuration.md` describe the
+  current parse/transaction/editing owners and label
+  `project_config_service.py` as a compatibility-only facade; the server
+  `AGENTS.md` records the import boundary.
+- Checks (Linux, worktree at 3d0aec9a plus this checkpoint's uncommitted
+  changes): `uv run --project apps/aflow_app/server pytest -q
+  apps/aflow_app/server/tests/test_project_config_service.py
+  apps/aflow_app/server/tests/test_global_config_patch.py
+  apps/aflow_app/server/tests/test_guided_config.py
+  apps/aflow_app/server/tests/test_mcp.py -k 'config'` (134 passed, 55
+  deselected) and `uv run pytest -q tests/test_config_pair.py
+  tests/test_config.py` (225 passed, 7 subtests). Primary log:
+  `tmp/aflow-maintainability-20261006/03/checkpoint-2-verify.log`.
+  Cumulative final-verification gates (lint, full regression, wheel, UI
+  smoke, publication) remain with the final checkpoint.
+
 ## 2026-10-09 — multiprocess fixture respects transient journal lock contention (test-only)
 
 - CI 37880564817 at 05ca3c6e failed macOS

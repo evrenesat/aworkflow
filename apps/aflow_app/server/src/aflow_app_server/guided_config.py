@@ -56,7 +56,7 @@ from .models import (
     SetWorkflowUpgradeAfterRepairsAction,
     UpsertProfileAction,
 )
-from .project_config_service import (
+from .config_validation import (
     ConfigValidationIssue,
     check_document_text,
     validate_candidate_pair,

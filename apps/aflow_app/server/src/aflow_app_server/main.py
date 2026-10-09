@@ -115,7 +115,7 @@ from .plan_service import (
     PlanServiceError,
 )
 import aflow_app_server.plan_routes as plan_routes_module
-from .project_config_service import (
+from .config_validation import (
     ProjectConfigError,
     ProjectConfigRevisionConflict,
 )

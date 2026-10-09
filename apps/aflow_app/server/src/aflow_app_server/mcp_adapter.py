@@ -42,7 +42,7 @@ from .plan_service import (
     PlanRequeueResumeConflict,
     PlanServiceError,
 )
-from .project_config_service import ProjectConfigError, ProjectConfigRevisionConflict
+from .config_validation import ProjectConfigError, ProjectConfigRevisionConflict
 from .scheduling_service import SchedulingService
 from .mcp_scheduling import register_scheduling_tools
 from aflow.project_admission import ProjectAdmissionError

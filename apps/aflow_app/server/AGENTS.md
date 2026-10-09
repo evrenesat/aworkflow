@@ -1,5 +1,14 @@
 # Remote App Server Notes
 
+- Configuration ownership: `config_validation.py` owns the shared in-memory
+  candidate validator, exception types, report/snapshot shapes, and
+  revision/bounds helpers; `config_documents.py` owns protected document
+  reads and audit records; `aflow.config_pair` owns the durable pair
+  transaction and recovery. Active global configuration code
+  (`global_config_service.py`, `config_response.py`, `guided_config.py`, the
+  MCP config transports) imports those owners directly.
+  `project_config_service.py` is a compatibility facade for legacy imports and
+  project-scoped editing; do not add new imports of it from active code.
 - Global configuration PATCH accepts ordered typed actions or edited documents,
   never both. Transform under the shared pair lock and validate the final pair;
   preserve PUT/MCP compatibility. Prompt text belongs only to the existing schema.

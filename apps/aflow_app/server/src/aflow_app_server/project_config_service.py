@@ -1,37 +1,49 @@
-"""Atomic, revision-checked project configuration text service.
+"""Compatibility facade for the legacy project configuration import path.
 
-The service owns exactly two documents per registered project,
-``.aflow/config/aflow.toml`` and ``.aflow/config/workflows.toml``.  It never
-reads or writes another project file, never starts or stops workflow units,
-and does not gate a valid save on the state or historical configuration of a
-workflow run.
+The current owners are:
 
-The configuration exception types, report shapes, revision and bounds
-helpers, and the in-memory candidate validator live in
-:mod:`aflow_app_server.config_validation`; this module re-exports them so
-the compatibility import path keeps working.
+- :mod:`aflow.config_pair` — the durable pair lock, write-ahead
+  transaction, and crash recovery;
+- :mod:`aflow_app_server.config_validation` — the configuration exception
+  types, report and snapshot shapes, revision and bounds helpers, and the
+  in-memory candidate validator;
+- :mod:`aflow_app_server.config_documents` — protected document reads and
+  bounded audit records.
+
+:class:`ProjectConfigService` keeps the project-scoped read/save facade
+under its existing tests and visibly delegates parsing, validation, and
+every durable pair write to those owners.  The legacy module-level names
+remain available here only as forwarding aliases for compatibility
+callers; active server code imports the current owners directly.
 """
 
 from __future__ import annotations
 
-from dataclasses import dataclass
-from datetime import datetime, timezone
-import json
-import os
 from pathlib import Path
-import re
-import stat as stat_module
-import tempfile
 
+from aflow.config_pair import (
+    ConfigPairError,
+    commit_configuration_pair,
+    configuration_pair_lock,
+    recover_pending_transaction,
+)
+
+from .config_documents import (
+    append_audit_line,
+    document_path,  # noqa: F401  compatibility re-export
+    read_protected_document,
+)
 from .config_validation import (
     CONFIG_DOCUMENT_NAMES,
-    MAX_CONFIG_DOCUMENT_BYTES,
+    MAX_CONFIG_DOCUMENT_BYTES,  # noqa: F401  compatibility re-export
     MAX_ISSUE_MESSAGE_CHARS,  # noqa: F401  compatibility re-export
     MAX_VALIDATION_ISSUES,
+    DOCUMENT_HEX_RE,
     ConfigValidationIssue,  # noqa: F401  compatibility re-export
     ConfigValidationReport,
     ProjectConfigError,
     ProjectConfigRevisionConflict,
+    ProjectConfigSnapshot,
     check_document_text,  # noqa: F401  compatibility re-export
     combined_revision,
     validate_candidate_pair,
@@ -43,129 +55,23 @@ from .control_plane_service import (
 )
 from .project_registry import ProjectRegistry, ProjectRegistryError
 
-
-_AUDIT_SCHEMA_VERSION = 1
-_DOCUMENT_HEX_RE = re.compile(r"^[0-9a-f]{64}$")
-
-
-@dataclass(frozen=True)
-class ProjectConfigSnapshot:
-    """The exact committed text pair plus its combined revision and report."""
-
-    project_id: str
-    revision: str
-    documents: tuple[str, ...]
-    aflow_toml: str
-    workflows_toml: str
-    validation: ConfigValidationReport
-
-
-def document_path(config_dir: Path, name: str) -> Path:
-    """Map the only supported document names to their exact contained paths."""
-    if name not in CONFIG_DOCUMENT_NAMES:
-        raise ProjectConfigError("unsupported configuration document name")
-    return config_dir / name
-
-
-def _fsync_directory(path: Path) -> None:
-    descriptor = os.open(path, os.O_RDONLY)
-    try:
-        os.fsync(descriptor)
-    finally:
-        os.close(descriptor)
-
-
-def _read_protected_document(
-    config_dir: Path, name: str
-) -> tuple[bytes, str] | None:
-    """Read one protected document; ``None`` when it does not exist yet."""
-    path = document_path(config_dir, name)
-    if path.is_symlink():
-        raise ProjectConfigError(f"{name} must not be a symlink")
-    try:
-        info = path.lstat()
-    except FileNotFoundError:
-        return None
-    except OSError as exc:
-        raise ProjectConfigError(f"{name} is unavailable") from exc
-    if not stat_module.S_ISREG(info.st_mode):
-        raise ProjectConfigError(f"{name} must be a regular file")
-    if info.st_nlink != 1:
-        raise ProjectConfigError(f"{name} must not be a hard-linked file")
-    if info.st_size > MAX_CONFIG_DOCUMENT_BYTES:
-        raise ProjectConfigError(f"{name} exceeds the maximum supported size")
-    try:
-        payload = path.read_bytes()
-    except OSError as exc:
-        raise ProjectConfigError(f"{name} is unreadable") from exc
-    if len(payload) > MAX_CONFIG_DOCUMENT_BYTES:
-        raise ProjectConfigError(f"{name} exceeds the maximum supported size")
-    try:
-        return payload, payload.decode("utf-8")
-    except UnicodeDecodeError as exc:
-        raise ProjectConfigError(f"{name} is not valid UTF-8 text") from exc
-
-
-def _restore_document(target: Path, previous_bytes: bytes | None) -> None:
-    try:
-        if previous_bytes is None:
-            # The document did not exist before the failed transaction.
-            target.unlink(missing_ok=True)
-            return
-        descriptor, temp_name = tempfile.mkstemp(
-            prefix=f".{target.name}.", suffix=".restore-tmp", dir=target.parent
-        )
-        temp = Path(temp_name)
-        try:
-            with os.fdopen(descriptor, "wb") as handle:
-                handle.write(previous_bytes)
-                handle.flush()
-                os.fsync(handle.fileno())
-            os.replace(temp, target)
-        finally:
-            temp.unlink(missing_ok=True)
-    except OSError as exc:
-        raise ProjectConfigError(
-            "the previous configuration could not be restored"
-        ) from exc
-
-
-def _append_audit_line(
-    audit_path: Path,
-    *,
-    project_id: str,
-    outcome: str,
-    old_revision: str | None,
-    new_revision: str | None,
-    caller_scope: str,
-) -> None:
-    """Append one bounded, redacted audit record to server state."""
-    record = {
-        "schema_version": _AUDIT_SCHEMA_VERSION,
-        "timestamp": datetime.now(timezone.utc).isoformat(),
-        "project_id": project_id,
-        "outcome": outcome,
-        "old_revision": old_revision,
-        "new_revision": new_revision,
-        "caller_scope": caller_scope,
-    }
-    line = (json.dumps(record, sort_keys=True) + "\n").encode("utf-8")
-    try:
-        audit_path.parent.mkdir(parents=True, exist_ok=True)
-        flags = os.O_WRONLY | os.O_CREAT | os.O_APPEND | getattr(os, "O_NOFOLLOW", 0)
-        descriptor = os.open(audit_path, flags, 0o600)
-        try:
-            os.write(descriptor, line)
-            os.fsync(descriptor)
-        finally:
-            os.close(descriptor)
-    except OSError:
-        # Audit metadata is advisory; a save must never fail because of it.
-        pass
+# Compatibility aliases for the legacy module-level helper spellings.  Each
+# name is the exact current-owner object, not a copy or wrapper; active
+# server code imports the current owners directly.
+_DOCUMENT_HEX_RE = DOCUMENT_HEX_RE
+_append_audit_line = append_audit_line
+_read_protected_document = read_protected_document
 
 
 class ProjectConfigService:
-    """Read, validate, and atomically save the two project config documents."""
+    """Read, validate, and atomically save the two project config documents.
+
+    The service owns exactly two documents per registered project,
+    ``.aflow/config/aflow.toml`` and ``.aflow/config/workflows.toml``.  It
+    never reads or writes another project file, never starts or stops
+    workflow units, and does not gate a valid save on the state or
+    historical configuration of a workflow run.
+    """
 
     def __init__(
         self,
@@ -182,7 +88,10 @@ class ProjectConfigService:
         """Return the exact committed texts, revision, and validation report."""
         with self._control_plane.project_lock(project_id):
             root = self._project_root(project_id)
-            return self._snapshot(project_id, root)
+            config_dir = self._validated_config_dir(root)
+            with configuration_pair_lock(config_dir):
+                self._recover(config_dir)
+                return self._snapshot(project_id, config_dir)
 
     def validate_candidate(
         self,
@@ -208,7 +117,7 @@ class ProjectConfigService:
             raise ValueError("unsupported configuration transport scope")
         if (
             not isinstance(expected_revision, str)
-            or _DOCUMENT_HEX_RE.fullmatch(expected_revision) is None
+            or DOCUMENT_HEX_RE.fullmatch(expected_revision) is None
         ):
             raise ProjectConfigError("expected_revision must be a SHA-256 hex digest")
         with self._control_plane.project_lock(project_id):
@@ -256,46 +165,41 @@ class ProjectConfigService:
     ) -> ProjectConfigSnapshot:
         root = self._project_root(project_id)
         config_dir = self._validated_config_dir(root)
-        aflow_doc, workflows_doc = self._current_documents(config_dir)
-        current_revision = combined_revision(
-            aflow_doc[0] if aflow_doc else b"",
-            workflows_doc[0] if workflows_doc else b"",
-        )
-        revisions["old"] = current_revision
-        if expected_revision != current_revision:
-            raise ProjectConfigRevisionConflict(current_revision)
-        report = validate_candidate_pair(aflow_text, workflows_text)
-        if report.state == "invalid":
-            first = report.issues[0]
-            location = first.document or "configuration"
-            raise ProjectConfigError(
-                f"candidate configuration is invalid: {location}: {first.message}"
+        with configuration_pair_lock(config_dir):
+            self._recover(config_dir)
+            aflow_doc, workflows_doc = self._current_documents(config_dir)
+            current_revision = combined_revision(
+                aflow_doc[0] if aflow_doc else b"",
+                workflows_doc[0] if workflows_doc else b"",
             )
-        if report.placeholders:
-            raise ProjectConfigError(
-                "candidate configuration still contains placeholder selectors: "
-                + ", ".join(report.placeholders[:MAX_VALIDATION_ISSUES])
+            revisions["old"] = current_revision
+            if expected_revision != current_revision:
+                raise ProjectConfigRevisionConflict(current_revision)
+            report = validate_candidate_pair(aflow_text, workflows_text)
+            if report.state == "invalid":
+                first = report.issues[0]
+                location = first.document or "configuration"
+                raise ProjectConfigError(
+                    f"candidate configuration is invalid: {location}: {first.message}"
+                )
+            if report.placeholders:
+                raise ProjectConfigError(
+                    "candidate configuration still contains placeholder selectors: "
+                    + ", ".join(report.placeholders[:MAX_VALIDATION_ISSUES])
+                )
+            aflow_bytes = aflow_text.encode("utf-8")
+            workflows_bytes = workflows_text.encode("utf-8")
+            new_revision = combined_revision(aflow_bytes, workflows_bytes)
+            self._commit_pair(config_dir, payloads=(aflow_bytes, workflows_bytes))
+            committed_aflow, committed_workflows = self._current_documents(config_dir)
+            committed_revision = combined_revision(
+                committed_aflow[0] if committed_aflow else b"",
+                committed_workflows[0] if committed_workflows else b"",
             )
-        aflow_bytes = aflow_text.encode("utf-8")
-        workflows_bytes = workflows_text.encode("utf-8")
-        new_revision = combined_revision(aflow_bytes, workflows_bytes)
-        self._commit_pair(
-            config_dir,
-            previous=(
-                aflow_doc[0] if aflow_doc else None,
-                workflows_doc[0] if workflows_doc else None,
-            ),
-            payloads=(aflow_bytes, workflows_bytes),
-        )
-        committed_aflow, committed_workflows = self._current_documents(config_dir)
-        committed_revision = combined_revision(
-            committed_aflow[0] if committed_aflow else b"",
-            committed_workflows[0] if committed_workflows else b"",
-        )
-        if committed_revision != new_revision:
-            raise ProjectConfigError("committed configuration could not be verified")
-        revisions["new"] = committed_revision
-        return self._snapshot(project_id, root)
+            if committed_revision != new_revision:
+                raise ProjectConfigError("committed configuration could not be verified")
+            revisions["new"] = committed_revision
+            return self._snapshot(project_id, config_dir)
 
     def _project_root(self, project_id: str) -> Path:
         if self._registry.get(project_id) is None:
@@ -323,22 +227,18 @@ class ProjectConfigService:
             raise ProjectConfigError("configuration path must be a directory")
         return current
 
-    @staticmethod
-    def _read_document(config_dir: Path, name: str) -> tuple[bytes, str] | None:
-        """Read one protected document; ``None`` when it does not exist yet."""
-        return _read_protected_document(config_dir, name)
-
     def _current_documents(
         self, config_dir: Path
     ) -> tuple[tuple[bytes, str] | None, tuple[bytes, str] | None]:
         """Return both documents, or ``None`` for a document that is absent."""
         return (
-            self._read_document(config_dir, "aflow.toml"),
-            self._read_document(config_dir, "workflows.toml"),
+            read_protected_document(config_dir, "aflow.toml"),
+            read_protected_document(config_dir, "workflows.toml"),
         )
 
-    def _snapshot(self, project_id: str, root: Path) -> ProjectConfigSnapshot:
-        config_dir = self._validated_config_dir(root)
+    def _snapshot(
+        self, project_id: str, config_dir: Path
+    ) -> ProjectConfigSnapshot:
         aflow_doc, workflows_doc = self._current_documents(config_dir)
         aflow_bytes = aflow_doc[0] if aflow_doc else b""
         workflows_bytes = workflows_doc[0] if workflows_doc else b""
@@ -366,54 +266,38 @@ class ProjectConfigService:
             validation=report,
         )
 
-    def _commit_pair(
-        self,
-        config_dir: Path,
-        *,
-        previous: tuple[bytes | None, bytes | None],
-        payloads: tuple[bytes, bytes],
-    ) -> None:
-        created_dir = not config_dir.exists()
-        if created_dir:
-            config_dir.mkdir(parents=True)
-        staged: list[Path] = []
-        try:
-            for name, payload in zip(CONFIG_DOCUMENT_NAMES, payloads):
-                descriptor, temp_name = tempfile.mkstemp(
-                    prefix=f".{name}.", suffix=".tmp", dir=config_dir
-                )
-                temp = Path(temp_name)
-                staged.append(temp)
-                with os.fdopen(descriptor, "wb") as handle:
-                    handle.write(payload)
-                    handle.flush()
-                    os.fsync(handle.fileno())
-            first_temp, second_temp = staged
-            first_target = document_path(config_dir, CONFIG_DOCUMENT_NAMES[0])
-            second_target = document_path(config_dir, CONFIG_DOCUMENT_NAMES[1])
-            os.replace(first_temp, first_target)
-            try:
-                os.replace(second_temp, second_target)
-            except OSError as exc:
-                _restore_document(first_target, previous[0])
-                _fsync_directory(config_dir)
-                raise ProjectConfigError(
-                    "workflows.toml replacement failed; the previous aflow.toml was restored"
-                ) from exc
-            _fsync_directory(config_dir)
-            if created_dir:
-                _fsync_directory(config_dir.parent)
-        finally:
-            for temp in staged:
-                try:
-                    temp.unlink(missing_ok=True)
-                except OSError:
-                    pass
+    @staticmethod
+    def _commit_pair(config_dir: Path, *, payloads: tuple[bytes, bytes]) -> None:
+        """Commit the pair through the core transaction owner; the pair lock is held.
 
-    def _restore_document_for_target(
-        self, target: Path, previous_bytes: bytes | None
-    ) -> None:
-        _restore_document(target, previous_bytes)
+        The core owner re-enters the shared pair lock (one effective flock per
+        process), records the old and new generations, replaces both
+        documents, and restores the old generation on any pre-commit
+        failure.  Core failures surface as the service's bounded
+        :class:`ProjectConfigError` contract so REST/MCP keep their public
+        errors and audit outcomes.
+        """
+        try:
+            commit_configuration_pair(
+                config_dir,
+                payloads=dict(zip(CONFIG_DOCUMENT_NAMES, payloads)),
+            )
+        except ConfigPairError as exc:
+            raise ProjectConfigError(str(exc)) from exc
+
+    def _recover(self, config_dir: Path) -> None:
+        """Complete a pending pair transaction; the caller holds the pair lock.
+
+        Recovery failures reject the read or save with the service's bounded
+        :class:`ProjectConfigError` contract while preserving the edited
+        bytes and the transaction record for a later recoverable read.
+        """
+        try:
+            recover_pending_transaction(config_dir)
+        except ConfigPairError as exc:
+            raise ProjectConfigError(
+                f"configuration pair recovery failed: {exc}"
+            ) from exc
 
     @staticmethod
     def _failure_outcome(exc: Exception) -> str:
@@ -435,7 +319,7 @@ class ProjectConfigService:
         caller_scope: str,
     ) -> None:
         """Append one bounded, redacted audit record to server state."""
-        _append_audit_line(
+        append_audit_line(
             self._audit_path,
             project_id=project_id,
             outcome=outcome,
