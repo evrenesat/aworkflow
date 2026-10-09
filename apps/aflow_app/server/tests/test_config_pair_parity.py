@@ -22,7 +22,6 @@ from hashlib import sha256
 from pathlib import Path
 import subprocess
 import sys
-import time
 
 import pytest
 from fastapi.testclient import TestClient
@@ -840,8 +839,6 @@ def test_stale_config_revision_is_a_public_conflict_on_both_transports(
 
 def test_invalid_config_candidate_preserves_exact_bytes(service: GlobalConfigService) -> None:
     before = service.read()
-    aflow_path = service.config_dir / "aflow.toml"
-    workflows_path = service.config_dir / "workflows.toml"
     with pytest.raises(ProjectConfigError, match="invalid"):
         service.save(
             "not toml at all",
