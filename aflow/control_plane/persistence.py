@@ -11,11 +11,11 @@ import json
 import os
 from pathlib import Path
 import re
-import tempfile
 import tomllib
 from typing import Any, Iterator, Literal, Mapping
 from uuid import uuid4
 
+from ..file_io import atomic_replace_file, create_exclusive_file
 from .models import (
     CONTROL_PLANE_SCHEMA_VERSION,
     MAX_SERIALIZED_ITEMS,
@@ -218,52 +218,22 @@ def _fsync_directory(path: Path) -> None:
 def _write_exclusive_json(path: Path, payload: Mapping[str, Any]) -> None:
     """Durably publish JSON without exposing a partial final-path artifact.
 
-    ``os.link`` creates the final name only when it does not already exist.
-    Publishing a fully fsynced same-directory temporary file through that
-    operation preserves the immutable/exclusive contract without a window in
-    which a crash can leave a partial final manifest behind.
+    The audited exclusive primitive publishes a fully fsynced same-directory
+    temporary through a hard link at mode ``0o600``. A hard link creates the
+    final name only when it does not already exist, raising ``FileExistsError``
+    for a completed/corrupt competing final manifest, which the caller
+    classifies without any overwrite.
     """
     encoded = (json.dumps(payload, sort_keys=True, separators=(",", ":")) + "\n").encode("utf-8")
     path.parent.mkdir(parents=True, exist_ok=True)
-    fd, temporary_name = tempfile.mkstemp(
-        prefix=f".{path.name}.",
-        suffix=".tmp",
-        dir=path.parent,
-    )
-    temporary = Path(temporary_name)
-    try:
-        with os.fdopen(fd, "wb") as handle:
-            handle.write(encoded)
-            handle.flush()
-            os.fsync(handle.fileno())
-        # A hard link is an atomic no-replace publish on the same filesystem.
-        # It raises FileExistsError for a completed/corrupt competing final
-        # manifest, which the caller classifies without any overwrite.
-        os.link(temporary, path)
-        _fsync_directory(path.parent)
-    finally:
-        try:
-            temporary.unlink()
-        except FileNotFoundError:
-            pass
+    create_exclusive_file(path, encoded, mode=0o600)
+    _fsync_directory(path.parent)
 
 
 def _write_atomic_bytes(path: Path, payload: bytes) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    fd, temporary_name = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
-    temporary = Path(temporary_name)
-    try:
-        with os.fdopen(fd, "wb") as handle:
-            handle.write(payload)
-            handle.flush()
-            os.fsync(handle.fileno())
-        os.replace(temporary, path)
-        _fsync_directory(path.parent)
-    finally:
-        try:
-            temporary.unlink()
-        except FileNotFoundError:
-            pass
+    atomic_replace_file(path, payload, mode=0o600)
+    _fsync_directory(path.parent)
 
 
 def _manifest_step_names(value: object) -> tuple[str, ...]:

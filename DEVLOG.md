@@ -36,6 +36,29 @@
   gate for the new revision remains an outstanding coordinator delivery
   gate and is not claimed from the local Linux run.
 
+## 2026-10-09 — AFLOW-MAINT-20261006-14 CP3: migrate backups, control-plane writes, and resource journals to the shared file primitives
+
+- Migrated the remaining selected persistence callers to the audited
+  `aflow/file_io.py` primitives, one caller at a time, while each domain keeps
+  its own validation, locks, schema checks, and transaction ordering:
+  - `plan_backups._write_atomic_json` now uses `atomic_replace_file` at mode
+    `0o600` and keeps its tolerant `_fsync_directory` domain adapter (open and
+    fsync failures tolerated).
+  - `control_plane.persistence._write_exclusive_json` now uses
+    `create_exclusive_file` at mode `0o600` (hard-link exclusive publish, no
+    overwrite); `_write_atomic_bytes` now uses `atomic_replace_file` at mode
+    `0o600`. Both keep the open-only-tolerant `_fsync_directory` adapter and
+    the parent `mkdir`.
+  - `execution_resources._write_journal` now uses `atomic_replace_file` at
+    mode `0o600` (no directory sync, as before) and keeps its journal size
+    cap, revision/claim ordering, and lock ownership.
+- Removed the now-unused per-caller `tempfile.mkstemp` temporary writers; the
+  control-plane event journal's append-only path stays with its journal owner
+  for the later plan 13 handoff and is not folded into the atomic replacement
+  primitives.
+- Updated `docs/persistence-primitives.md` caller contract table and migration
+  status for the migrated callers.
+
 ## 2026-10-09 — owner-stopped checkpoint-review-to-final-review resume admission
 
 - A graceful owner stop that lands on the checkpoint-review-to-final-review

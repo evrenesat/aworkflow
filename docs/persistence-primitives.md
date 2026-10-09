@@ -28,10 +28,10 @@ keeps its domain adapter:
 | `runlog.store_evidence_artifact` → `atomic_replace_file` | `os.replace` | yes (digest-addressed idempotent) | umask default | none | Digest/byte-size verification, containment and symlink fail-closed checks |
 | `publication._write_atomic_receipt` → `atomic_replace_file` | `os.replace` | yes | `0o600` | best effort (open failure tolerated via `_sync_receipt_directory`; fsync/close failures propagate) | Receipt JSON shape; publication receipt authority |
 | `project_admission._save_locked` → domain-owned temporary writer + `fsync_directory` | `os.replace` | yes (under lock) | exact `0o600` via `os.fchmod` on the owned temporary descriptor before file fsync | strict (failures map to `ProjectAdmissionSafetyError`) | Admission lock ownership; symlink rejection; state payload cap; exact private mode under any umask |
-| `plan_backups._write_atomic_json` | `os.replace` from `O_EXCL\|O_NOFOLLOW` temp | yes | `0o600` explicit | best effort (open and fsync tolerated) | Backup provenance; `pid` in temp name |
-| `control_plane.persistence._write_exclusive_json` | `os.link` | never (`FileExistsError`) | `0o600` (mkstemp) | best effort | Immutable launch manifest; request-digest idempotency |
-| `control_plane.persistence._write_atomic_bytes` | `os.replace` | yes | `0o600` (mkstemp) | best effort | Control-plane revision handling |
-| `execution_resources._write_journal` | `os.replace` | yes (under lock) | `0o600` (mkstemp) | none | Journal size cap, revision/claim ordering, lock ownership |
+| `plan_backups._write_atomic_json` → `atomic_replace_file` | `os.replace` | yes | `0o600` explicit | best effort (open and fsync tolerated via the `_fsync_directory` domain adapter) | Backup provenance; tolerant directory-sync adapter |
+| `control_plane.persistence._write_exclusive_json` → `create_exclusive_file` | `os.link` | never (`FileExistsError`) | `0o600` | best effort (open failure tolerated via `_fsync_directory`; fsync/close failures propagate) | Immutable launch manifest; request-digest idempotency |
+| `control_plane.persistence._write_atomic_bytes` → `atomic_replace_file` | `os.replace` | yes | `0o600` | best effort (same `_fsync_directory` adapter) | Control-plane revision handling |
+| `execution_resources._write_journal` → `atomic_replace_file` | `os.replace` | yes (under lock) | `0o600` | none | Journal size cap, revision/claim ordering, lock ownership |
 
 Read-side notes: `project_admission` opens plan files with `O_NOFOLLOW`
 bounded reads; `plan_backups` and `execution_resources` stream files in
@@ -52,7 +52,16 @@ primitive for these bounded regular-file reads when callers migrate.
   `tempfile.mkstemp` + `os.fchmod` and reuses only the strict
   `fsync_directory` primitive for the post-publication directory sync. Receipt
   and claim ownership stay with their domains.
-- Checkpoint 3 migrates the remaining callers one at a time, preserving the
-  contracts in the table above.
+- Checkpoint 3 migrates the remaining selected callers to the shared
+  primitives, one at a time, preserving the contracts in the table above:
+  `plan_backups._write_atomic_json` uses `atomic_replace_file` and keeps its
+  tolerant `_fsync_directory` domain adapter; `control_plane.persistence`
+  uses `create_exclusive_file` / `atomic_replace_file` and keeps its
+  open-only-tolerant `_fsync_directory` adapter; `execution_resources
+  ._write_journal` uses `atomic_replace_file` (no directory sync, as before).
+  The control-plane event journal's append-only path stays with its journal
+  owner for the later plan 13 handoff and is not folded into the atomic
+  replacement primitives. Each domain keeps its locks, schema validation,
+  and revision/claim ordering.
 
 Effort: `AFLOW-MAINT-20261006` (member 14).

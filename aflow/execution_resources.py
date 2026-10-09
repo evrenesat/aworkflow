@@ -23,13 +23,13 @@ import json
 import os
 import re
 import stat as stat_module
-import tempfile
 import time
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Iterator, Literal
 
+from aflow.file_io import atomic_replace_file
 from aflow.process_identity import (
     host_boot_identity,
     process_birth_identity,
@@ -471,22 +471,10 @@ class ExecutionResourceStore:
         payload = json.dumps(journal, sort_keys=True, separators=(",", ":")).encode("utf-8")
         if len(payload) > MAX_JOURNAL_BYTES:
             raise _StoreError("journal_size_exceeded")
-        path = self._journal_path(resource)
-        descriptor, temporary = tempfile.mkstemp(
-            dir=self._root, prefix=f".{resource}.", suffix=".tmp"
-        )
-        try:
-            with os.fdopen(descriptor, "wb") as handle:
-                handle.write(payload)
-                handle.flush()
-                os.fsync(handle.fileno())
-            os.replace(temporary, path)
-        except BaseException:
-            try:
-                os.unlink(temporary)
-            except OSError:
-                pass
-            raise
+        # The audited primitive publishes the fully fsynced same-directory
+        # temporary atomically at mode 0o600, preserving the journal's
+        # crash-boundary contract without a partial final write.
+        atomic_replace_file(self._journal_path(resource), payload, mode=0o600)
 
     # -- operations ---------------------------------------------------------
 

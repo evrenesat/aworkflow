@@ -15,6 +15,8 @@ from pathlib import Path
 from typing import Mapping
 from uuid import uuid4
 
+from .file_io import atomic_replace_file
+
 
 PROVENANCE_SCHEMA_VERSION = 1
 PROVENANCE_DIRECTORY_NAME = ".provenance"
@@ -565,36 +567,17 @@ def _fsync_directory(path: Path) -> None:
 
 
 def _write_atomic_json(path: Path, payload: Mapping[str, object]) -> None:
+    """Durably replace one provenance JSON record without a partial write.
+
+    The audited primitive publishes the fully fsynced same-directory temporary
+    atomically at mode ``0o600``; the domain adapter then applies plan backups'
+    established directory-sync tolerance at the call site.
+    """
     data = (
         json.dumps(payload, indent=2, sort_keys=True, ensure_ascii=False) + "\n"
     ).encode("utf-8")
-    temporary = path.with_name(f".{path.name}.{os.getpid()}.{uuid4().hex}.tmp")
-    descriptor: int | None = None
-    try:
-        descriptor = os.open(
-            temporary,
-            os.O_WRONLY
-            | os.O_CREAT
-            | os.O_EXCL
-            | getattr(os, "O_NOFOLLOW", 0),
-            0o600,
-        )
-        with os.fdopen(descriptor, "wb") as handle:
-            descriptor = None
-            handle.write(data)
-            handle.flush()
-            os.fsync(handle.fileno())
-        os.replace(temporary, path)
-        _fsync_directory(path.parent)
-    except OSError:
-        raise
-    finally:
-        if descriptor is not None:
-            os.close(descriptor)
-        try:
-            temporary.unlink()
-        except FileNotFoundError:
-            pass
+    atomic_replace_file(path, data, mode=0o600)
+    _fsync_directory(path.parent)
 
 
 def _valid_plan_identity_id(value: object) -> bool:
