@@ -1,5 +1,37 @@
 # DEVLOG
 
+## 2026-10-09 — configuration fixture repair: portable EIO path and clean zcode fixture repo
+
+- CI 37875182064 (4d88e447) and 37875345919 (3bfd998c) failed the reviewed
+  configuration-pair change's fixtures. `tests/test_config.py::
+  test_public_loader_fails_closed_on_record_inspection_io_error` subclassed
+  abstract `pathlib.Path`; on Python 3.11 constructing that subclass raises
+  `AttributeError` before the injected `lstat` EIO is ever reached, so the
+  intended fail-closed `ConfigError` was never exercised. The fixture now
+  subclasses the concrete platform path type (`type(tmp_path)`) and keeps the
+  `lstat` EIO injection and every original production-loader assertion
+  (exception cause, exact-byte preservation of both documents and the record).
+  No production code changed.
+- `tests/test_zcode.py::test_zcode_completes_through_public_runner` failed on
+  all four core jobs because `load_workflow_config` creates the runtime pair
+  lock (`.aflow-config-pair.lock`, `aflow.config_pair.PAIR_LOCK_NAME`) in the
+  fixture git repository, making startup see a dirty tree and ask for dirty
+  confirmation. The fixture `.gitignore` now lists the exact lock name
+  (imported from the authoritative constant, alongside `.aflow/`) before the
+  initial commit, and the test asserts `git status --porcelain` is empty after
+  `load_workflow_config` and before the real `prepare_startup`. The
+  fake-provider integration assertions (PreparedRun, transition_end, actual
+  fake zcode invocation, plan completion, result label) are unchanged. No
+  blanket ignore and no dirty-confirmation bypass.
+- Verification: `uv run --python 3.11 --isolated --with pytest --with
+  pytest-subtests --with rich --with tomlkit pytest -q
+  tests/test_config.py::test_public_loader_fails_closed_on_record_inspection_io_error
+  tests/test_zcode.py::test_zcode_completes_through_public_runner` (2 passed)
+  and the equivalent `--python 3.12` command (2 passed), with isolated
+  basetemp under `/tmp/aflow-config-fixture-ci-20261009-cp1/`. The exact-SHA
+  CI matrix for the new revision remains an outstanding coordinator delivery
+  gate.
+
 ## 2026-10-09 — fixture child reap: confirmed absence is completed cleanup
 
 - `_e2e_reap_pid` in `tests/test_exclusive_execution.py` now observes

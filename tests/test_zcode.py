@@ -10,6 +10,7 @@ import pytest
 from aflow.api import RunnerConfig, StartupRequest, WorkflowRunner, prepare_startup
 from aflow.api.models import PreparedRun
 from aflow.config import ConfigError, load_workflow_config, validate_workflow_config
+from aflow.config_pair import PAIR_LOCK_NAME
 from aflow.harnesses import get_adapter
 from aflow.harnesses.zcode import ZcodeAdapter
 
@@ -77,7 +78,7 @@ def test_zcode_completes_through_public_runner(
     config_path = configuration(root)
     plan = root / "plan.md"
     plan.write_text("# Fixture\n\n### [ ] Checkpoint 1: Finish\n- [ ] finish task\n")
-    (root / ".gitignore").write_text(".aflow/\n")
+    (root / ".gitignore").write_text(f".aflow/\n{PAIR_LOCK_NAME}\n")
     subprocess.run(["git", "-C", str(root), "add", "."], check=True)
     subprocess.run([
         "git", "-C", str(root), "-c", "user.name=Fixture",
@@ -105,6 +106,13 @@ def test_zcode_completes_through_public_runner(
     monkeypatch.setenv("PATH", str(binary_dir) + os.pathsep + os.environ["PATH"])
     config = load_workflow_config(config_path)
     assert validate_workflow_config(config) == []
+    # The loader's runtime pair lock is the only fixture artifact and is
+    # covered by the exact .gitignore entry, so startup sees a clean tree.
+    status = subprocess.run(
+        ["git", "-C", str(root), "status", "--porcelain"],
+        check=True, capture_output=True, text=True,
+    )
+    assert status.stdout == ""
     prepared = prepare_startup(StartupRequest(
         repo_root=root, plan_path=plan, config_path=config_path,
         workflow_config=config, workflow_name="simple", start_step="implement",

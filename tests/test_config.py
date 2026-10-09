@@ -106,7 +106,9 @@ def test_public_loader_fails_closed_on_record_inspection_io_error(
     record = pair_dir / TRANSACTION_RECORD_NAME
     record.write_text("pending record", encoding="utf-8")
 
-    class _EioRecordPath(Path):
+    # Base on the concrete platform path type: subclassing abstract Path
+    # fails before lstat on Python 3.11 and changes pathlib behavior on 3.12.
+    class _EioRecordPath(type(tmp_path)):
         def lstat(self, *args, **kwargs):
             raise OSError(errno.EIO, "Input/output error")
 
