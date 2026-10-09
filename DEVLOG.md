@@ -1,5 +1,46 @@
 # DEVLOG
 
+## 2026-10-09 — owner-stopped checkpoint-review-to-final-review resume admission
+
+- A graceful owner stop that lands on the checkpoint-review-to-final-review
+  edge can now be resumed to run the configured first cumulative review, even
+  with a complete original plan and no active implementation scope. A new
+  narrow classifier (`_owner_stopped_pending_final_review_evidence` in
+  `aflow/cli.py`) verifies owner_stopped status/end reason, no unresolved
+  boundary decision and no active scope, an exact finalized checkpoint-reviewer
+  turn with a completed zero-exit receipt and complete `snapshot_after`, and a
+  declared transition to the configured cumulative review role (architect, or
+  senior_architect where configured) in the current workflow metadata.
+- The verified boundary is carried as the pending cumulative-review
+  continuation (`ResumeContext.pending_cumulative_review`), so the managed
+  `can_resume` preview and the successor bootstrap agree and both start exactly
+  that cumulative review with no checkpoint implementation or review replayed.
+  The existing finalized-worker checkpoint-review branch is preserved unchanged,
+  and ordinary complete plans and already-delivered plans are not newly
+  rerouted to review.
+- This boundary requires the current owner-stop intent to be cleared before
+  admission: the classifier reads the source's current `overrides.toml`
+  directly through `load_override_request` (no consumed-digest shortcut) and
+  rejects a missing, unreadable, or invalid current request, or one that still
+  carries `owner_stop = true`, even when the original stop digest was already
+  accepted and consumed. With the stop uncleared, the managed preview reports
+  `can_resume=false` and the shared bootstrap refuses before any successor is
+  reserved; a supported revision-checked clear restores admission.
+- Tests: positive first-final-review admission (architect and senior_architect)
+  and focused negative cases, including uncleared/absent/invalid current stop
+  requests, in `tests/test_run_state.py`; a real-controller fixture in
+  `tests/test_control_plane_resume.py` runs implementation and checkpoint
+  review, requests a graceful stop, asserts the preview and managed resume
+  refuse with no successor artifacts before the supported clear, then clears
+  it, resumes, and asserts the first successor invocation is the cumulative
+  review with idempotent replay and retained lineage. No real harness
+  requests.
+- Verification: `uv run pytest -q tests/test_run_state.py
+  tests/test_control_plane_resume.py tests/test_resume_pending_review.py
+  tests/test_resume_checkpoint_repair.py tests/test_resume_review_repair.py`
+  passes; `uv run ruff check aflow/cli.py tests/test_run_state.py
+  tests/test_control_plane_resume.py` passes.
+
 ## 2026-10-07 — AFLOW-MAINT-20261006-01 CP2: required dashboard web lint CI step
 
 - The Dashboard CI job now runs `npm run lint` (existing web baseline,

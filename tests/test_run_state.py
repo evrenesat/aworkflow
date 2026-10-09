@@ -470,6 +470,326 @@ def _run_graceful_stop_resume(
     assert source_turn["step_name"] == "implement"
 
 
+def _final_review_workflow_steps() -> dict[str, WorkflowStepConfig]:
+    return {
+        "implement": WorkflowStepConfig(
+            role="worker",
+            go=(GoTransition(to="review"),),
+        ),
+        "review": WorkflowStepConfig(
+            role="reviewer",
+            go=(GoTransition(to="final_review"),),
+        ),
+        "final_review": WorkflowStepConfig(
+            role="architect",
+            go=(GoTransition(to="END"),),
+        ),
+    }
+
+
+_CLEARED_OWNER_STOP_OVERRIDE = "revision = 1\nowner_stop = false\n"
+
+
+def _final_review_case(
+    tmp_path: Path,
+    *,
+    prev_overrides: dict[str, object] | None = None,
+    result_overrides: dict[str, object] | None = None,
+    steps: dict[str, WorkflowStepConfig] | None = None,
+    missing_result: bool = False,
+    current_override: str | None = _CLEARED_OWNER_STOP_OVERRIDE,
+) -> tuple[Path, dict[str, object], dict[str, WorkflowStepConfig]]:
+    run_dir = _run_dir(tmp_path, "first-final-review")
+    if current_override is not None:
+        run_dir.joinpath("overrides.toml").write_text(
+            current_override, encoding="utf-8"
+        )
+    base_result: dict[str, object] = {
+        "turn_number": 2,
+        "status": "completed",
+        "step_role": "reviewer",
+        "step_name": "review",
+        "chosen_transition": "final_review",
+        "returncode": 0,
+        "snapshot_after": {
+            "current_checkpoint_name": "Checkpoint 1: First",
+            "current_checkpoint_index": 1,
+            "unchecked_checkpoint_count": 0,
+            "current_checkpoint_unchecked_step_count": 0,
+            "total_checkpoint_count": 1,
+            "is_complete": True,
+        },
+    }
+    if result_overrides is not None:
+        base_result.update(result_overrides)
+    if not missing_result:
+        turn_dir = run_dir / "turns" / "turn-002"
+        turn_dir.mkdir(parents=True)
+        turn_dir.joinpath("result.json").write_text(
+            json.dumps(base_result), encoding="utf-8"
+        )
+    base_prev: dict[str, object] = {
+        "status": "owner_stopped",
+        "end_reason": "owner_stopped",
+        "pending_boundary_decision": None,
+        "active_implementation_scope": None,
+        "current_step_name": "final_review",
+        "turns_completed": 2,
+        "active_turn": 2,
+    }
+    if prev_overrides is not None:
+        base_prev.update(prev_overrides)
+    return run_dir, base_prev, (steps or _final_review_workflow_steps())
+
+
+def test_owner_stopped_finalized_checkpoint_reviewer_admits_first_cumulative_review(
+    tmp_path: Path,
+) -> None:
+    from aflow.cli import (
+        _owner_stopped_pending_final_review_evidence,
+        _owner_stopped_pending_review_step,
+    )
+
+    run_dir, prev_run, steps = _final_review_case(tmp_path)
+    evidence = _owner_stopped_pending_final_review_evidence(
+        run_dir, prev_run, workflow_steps=steps
+    )
+    assert evidence is not None
+    assert evidence.reviewer_step_name == "final_review"
+    assert (
+        _owner_stopped_pending_review_step(run_dir, prev_run, workflow_steps=steps)
+        == "final_review"
+    )
+
+
+def test_owner_stopped_finalized_checkpoint_reviewer_accepts_senior_architect(
+    tmp_path: Path,
+) -> None:
+    from aflow.cli import _owner_stopped_pending_final_review_evidence
+
+    steps = _final_review_workflow_steps()
+    steps["final_review"] = WorkflowStepConfig(
+        role="senior_architect", go=(GoTransition(to="END"),)
+    )
+    run_dir, prev_run, _ = _final_review_case(tmp_path, steps=steps)
+    evidence = _owner_stopped_pending_final_review_evidence(
+        run_dir, prev_run, workflow_steps=steps
+    )
+    assert evidence is not None
+    assert evidence.reviewer_step_name == "final_review"
+
+
+@pytest.mark.parametrize(
+    "name,prev_overrides,result_overrides,steps,missing_result,current_override",
+    [
+        (
+            "stale active turn",
+            {"active_turn": 3},
+            None,
+            None,
+            False,
+            _CLEARED_OWNER_STOP_OVERRIDE,
+        ),
+        (
+            "mismatched turn number",
+            None,
+            {"turn_number": 3},
+            None,
+            False,
+            _CLEARED_OWNER_STOP_OVERRIDE,
+        ),
+        (
+            "nonzero result",
+            None,
+            {"returncode": 1},
+            None,
+            False,
+            _CLEARED_OWNER_STOP_OVERRIDE,
+        ),
+        (
+            "failed result",
+            None,
+            {"status": "failed"},
+            None,
+            False,
+            _CLEARED_OWNER_STOP_OVERRIDE,
+        ),
+        (
+            "missing result",
+            None,
+            None,
+            None,
+            True,
+            _CLEARED_OWNER_STOP_OVERRIDE,
+        ),
+        (
+            "incomplete snapshot",
+            None,
+            {
+                "snapshot_after": {
+                    "current_checkpoint_name": "Checkpoint 1: First",
+                    "current_checkpoint_index": 1,
+                    "unchecked_checkpoint_count": 1,
+                    "current_checkpoint_unchecked_step_count": 1,
+                    "total_checkpoint_count": 2,
+                    "is_complete": False,
+                }
+            },
+            None,
+            False,
+            _CLEARED_OWNER_STOP_OVERRIDE,
+        ),
+        (
+            "unresolved boundary decision",
+            {
+                "pending_boundary_decision": {
+                    "finalized_turn_number": 2,
+                    "decision_number": 2,
+                    "action": "continue",
+                    "proposed_action": "transition",
+                    "proposed_transition": "final_review",
+                    "resolved_next_step": "final_review",
+                    "target_role": "architect",
+                    "target_team": None,
+                    "target_selector": "codex.high",
+                    "checkpoint_identity": "plan::checkpoint-1",
+                    "post_transition_active_plan_path": "plan",
+                    "post_transition_checkpoint_identity": "plan::checkpoint-1",
+                    "notes_reference": None,
+                    "applied": False,
+                    "consumed": False,
+                    "scope_id": None,
+                    "target_plan_identity": "plan::checkpoint-1",
+                    "repartition_generation_id": None,
+                    "repartition_candidate_sha256": None,
+                    "repartition_partition_id": None,
+                }
+            },
+            None,
+            None,
+            False,
+            _CLEARED_OWNER_STOP_OVERRIDE,
+        ),
+        (
+            "active implementation scope",
+            {"active_implementation_scope": {"awaiting_review": True}},
+            None,
+            None,
+            False,
+            _CLEARED_OWNER_STOP_OVERRIDE,
+        ),
+        (
+            "worker-target result",
+            {"current_step_name": "review"},
+            {"step_role": "worker", "step_name": "implement", "chosen_transition": "review"},
+            None,
+            False,
+            _CLEARED_OWNER_STOP_OVERRIDE,
+        ),
+        (
+            "wrong target role",
+            None,
+            None,
+            {
+                "implement": WorkflowStepConfig(
+                    role="worker", go=(GoTransition(to="review"),)
+                ),
+                "review": WorkflowStepConfig(
+                    role="reviewer", go=(GoTransition(to="final_review"),)
+                ),
+                "final_review": WorkflowStepConfig(
+                    role="worker", go=(GoTransition(to="END"),)
+                ),
+            },
+            False,
+            _CLEARED_OWNER_STOP_OVERRIDE,
+        ),
+        (
+            "changed workflow transition",
+            None,
+            {"chosen_transition": "END"},
+            None,
+            False,
+            _CLEARED_OWNER_STOP_OVERRIDE,
+        ),
+        (
+            "active source",
+            {"status": "running"},
+            None,
+            None,
+            False,
+            _CLEARED_OWNER_STOP_OVERRIDE,
+        ),
+        (
+            "ordinary complete plan without boundary",
+            {"current_step_name": "END"},
+            {"step_role": "worker", "step_name": "implement", "chosen_transition": "END"},
+            None,
+            False,
+            _CLEARED_OWNER_STOP_OVERRIDE,
+        ),
+        (
+            "uncleared current owner stop",
+            None,
+            None,
+            None,
+            False,
+            "revision = 1\nowner_stop = true\n",
+        ),
+        (
+            "absent current override request",
+            None,
+            None,
+            None,
+            False,
+            None,
+        ),
+        (
+            "invalid current override request",
+            None,
+            None,
+            None,
+            False,
+            "revision = [[not toml\n",
+        ),
+    ],
+)
+def test_owner_stopped_finalized_checkpoint_reviewer_rejects_invalid_evidence(
+    tmp_path: Path,
+    name: str,
+    prev_overrides: dict[str, object] | None,
+    result_overrides: dict[str, object] | None,
+    steps: dict[str, WorkflowStepConfig] | None,
+    missing_result: bool,
+    current_override: str | None,
+) -> None:
+    from aflow.cli import (
+        _owner_stopped_pending_final_review_evidence,
+        _owner_stopped_pending_review_step,
+    )
+
+    run_dir, prev_run, resolved_steps = _final_review_case(
+        tmp_path,
+        prev_overrides=prev_overrides,
+        result_overrides=result_overrides,
+        steps=steps,
+        missing_result=missing_result,
+        current_override=current_override,
+    )
+    assert (
+        _owner_stopped_pending_final_review_evidence(
+            run_dir, prev_run, workflow_steps=resolved_steps
+        )
+        is None
+    )
+    assert (
+        _owner_stopped_pending_review_step(
+            run_dir, prev_run, workflow_steps=resolved_steps
+        )
+        is None
+    )
+
+
 def test_reserved_run_id_collision_fails_before_launch_artifacts(tmp_path: Path) -> None:
     plan = tmp_path / "plan.md"
     plan.write_text("# Plan\n\n### [ ] Checkpoint 1: First\n- [ ] step\n")

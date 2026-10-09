@@ -58,6 +58,7 @@ from .run_state import (
     _mark_validated_resume_context,
     describe_end_reason,
     hotplug_resume_fields,
+    load_override_request,
     manager_resume_fields,
     manager_resume_fields_strict,
     resolve_resume_override,
@@ -1703,7 +1704,7 @@ def _bootstrap_resume_invocation(
         reset_scope=reset_scope,
     )
     has_owner_stopped_pending_review = (
-        _owner_stopped_review_step(
+        _owner_stopped_pending_review_step(
             run_dir,
             prev_run,
             workflow_steps=workflow_spec.steps,
@@ -2088,6 +2089,135 @@ def _owner_stopped_review_step(
     return current_step_name
 
 
+def _owner_stopped_pending_final_review_evidence(
+    run_dir: Path,
+    prev_run: Mapping[str, object],
+    *,
+    workflow_steps: Mapping[str, object] | None = None,
+) -> PendingCumulativeReview | None:
+    """Classify the first cumulative review after a finalized checkpoint reviewer.
+
+    Returns the pending cumulative-review continuation evidence when durable
+    evidence shows an owner-stopped run whose last finalized turn is a
+    checkpoint reviewer that selected the configured first cumulative review
+    (architect, or senior_architect where configured), with a complete snapshot
+    and no active implementation scope. Worker-target, failed, stale,
+    incomplete, mismatched, or scope/boundary-pending evidence returns
+    ``None``. The current owner stop intent must also be cleared: the
+    current ``overrides.toml`` must be a valid request with
+    ``owner_stop`` false. A missing, unreadable, or invalid current
+    request, or one that still carries ``owner_stop = true``, is rejected
+    even when the original stop digest was already accepted and consumed.
+    The existing finalized-worker checkpoint-review branch is left
+    untouched.
+    """
+    if (
+        prev_run.get("status") != "owner_stopped"
+        or prev_run.get("end_reason") != "owner_stopped"
+        or prev_run.get("pending_boundary_decision") is not None
+    ):
+        return None
+    # The accepted original stop digest alone does not establish that the
+    # owner's stop intent is cleared. Read the current override directly
+    # without a consumed-digest shortcut: a supported clear writes a valid
+    # false request and restores admission.
+    current_override = load_override_request(run_dir / "overrides.toml")
+    if (
+        current_override.status != "valid"
+        or current_override.request is None
+        or current_override.request.owner_stop is not False
+    ):
+        return None
+    # A complete plan with no implementation awaiting review: this boundary
+    # must never carry an active implementation scope.
+    if prev_run.get("active_implementation_scope") is not None:
+        return None
+    current_step_name = prev_run.get("current_step_name")
+    if not isinstance(current_step_name, str) or not current_step_name.strip():
+        return None
+    if workflow_steps is None:
+        return None
+    cumulative_step = workflow_steps.get(current_step_name)
+    if (
+        cumulative_step is None
+        or getattr(cumulative_step, "role", None) not in {"architect", "senior_architect"}
+    ):
+        return None
+
+    turns_completed = prev_run.get("turns_completed")
+    active_turn = prev_run.get("active_turn")
+    if (
+        not isinstance(turns_completed, int)
+        or isinstance(turns_completed, bool)
+        or turns_completed < 1
+        or active_turn != turns_completed
+    ):
+        return None
+    result_path = run_dir / "turns" / f"turn-{turns_completed:03d}" / "result.json"
+    try:
+        result = json.loads(result_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    if (
+        not isinstance(result, Mapping)
+        or result.get("status") != "completed"
+        or result.get("turn_number") != turns_completed
+        or result.get("step_role") != "reviewer"
+        or result.get("returncode") != 0
+    ):
+        return None
+    snapshot_after = _resume_plan_snapshot(result.get("snapshot_after"))
+    if snapshot_after is None or snapshot_after.is_complete is not True:
+        return None
+    finalized_step_name = result.get("step_name")
+    if not isinstance(finalized_step_name, str) or not finalized_step_name.strip():
+        return None
+    # The finalized turn must be a checkpoint reviewer whose declared
+    # transition points at the pending cumulative review step.
+    finalized_step = workflow_steps.get(finalized_step_name)
+    if finalized_step is None or getattr(finalized_step, "role", None) != "reviewer":
+        return None
+    if result.get("chosen_transition") != current_step_name:
+        return None
+    if not any(
+        getattr(transition, "to", None) == current_step_name
+        for transition in getattr(finalized_step, "go", ())
+    ):
+        return None
+    return PendingCumulativeReview(
+        source_run_dir=run_dir,
+        worker_turn_number=turns_completed,
+        worker_step_name=finalized_step_name,
+        reviewer_step_name=current_step_name,
+        snapshot_before=snapshot_after,
+        worker_artifact_path=(
+            f"resumed-from/{run_dir.name}/turns/turn-{turns_completed:03d}/result.json"
+        ),
+    )
+
+
+def _owner_stopped_pending_review_step(
+    run_dir: Path,
+    prev_run: Mapping[str, object],
+    *,
+    workflow_steps: Mapping[str, object] | None = None,
+) -> str | None:
+    """Admit an owner-stopped run at a verified pending review boundary.
+
+    Returns the pending review step when either the finalized-worker
+    checkpoint-review branch or the finalized-checkpoint-reviewer
+    first-cumulative-review branch is durably verified. Each branch remains
+    independently fail-closed; the first verified boundary wins.
+    """
+    worker = _owner_stopped_review_step(run_dir, prev_run, workflow_steps=workflow_steps)
+    if worker is not None:
+        return worker
+    final_review = _owner_stopped_pending_final_review_evidence(
+        run_dir, prev_run, workflow_steps=workflow_steps
+    )
+    return final_review.reviewer_step_name if final_review is not None else None
+
+
 def _managed_owner_stop_evidence(
     run_dir: Path,
     prev_run: Mapping[str, object],
@@ -2223,7 +2353,7 @@ def _interrupted_resume_step(
     status = prev_run.get("status")
     current_step_name = prev_run.get("current_step_name")
     if status == "owner_stopped":
-        return _owner_stopped_review_step(
+        return _owner_stopped_pending_review_step(
             run_dir,
             prev_run,
             workflow_steps=workflow_steps,
@@ -4523,12 +4653,25 @@ def _reconstruct_resume_context(
 
     has_owner_stopped_pending_review = (
         not reset_scope
-        and _owner_stopped_review_step(
+        and _owner_stopped_pending_review_step(
             run_dir, prev_run, workflow_steps=workflow_steps
         ) is not None
     )
     pending_cumulative_review: PendingCumulativeReview | None = None
     if (
+        not reset_scope
+        and not terminal_completion_only
+        and not terminal_integration_only
+        and has_owner_stopped_pending_review
+    ):
+        # A finalized checkpoint reviewer may already have selected the first
+        # cumulative review; carry that verified boundary through the existing
+        # pending cumulative-review continuation. The finalized-worker
+        # checkpoint-review boundary returns None here and is unaffected.
+        pending_cumulative_review = _owner_stopped_pending_final_review_evidence(
+            run_dir, prev_run, workflow_steps=workflow_steps
+        )
+    elif (
         not reset_scope
         and not terminal_completion_only
         and not terminal_integration_only
@@ -4837,7 +4980,7 @@ def _detect_resume_candidate(
         )
     )
     has_owner_stopped_pending_review = (
-        _owner_stopped_review_step(
+        _owner_stopped_pending_review_step(
             run_dir,
             prev_run,
             workflow_steps=getattr(workflow_config, "steps", None),

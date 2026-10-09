@@ -467,6 +467,274 @@ def test_daemon_resume_preview_and_start_reviews_complete_owner_stopped_source(
     ).read_bytes() == source_turn_result
 
 
+def test_daemon_resume_starts_first_cumulative_review_after_owner_stopped_checkpoint_reviewer(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A finalized checkpoint reviewer awaiting its first cumulative review resumes that review only."""
+    repo_root = tmp_path / "repo"
+    repo_root.mkdir()
+    plan_path = repo_root / "plan.md"
+    plan_path.write_text(
+        "# Plan\n\n### [ ] Checkpoint 1: First\n- [ ] step\n",
+        encoding="utf-8",
+    )
+    config_path = repo_root / "aflow.toml"
+    config_path.write_text(
+        "# focused daemon first-final-review fixture\n", encoding="utf-8"
+    )
+    environment_file = repo_root / "aflowd.env"
+    environment_file.write_text("AFLOWD_MODE=test\n", encoding="utf-8")
+    executable = repo_root / "release" / "bin" / "aflow"
+    executable.parent.mkdir(parents=True)
+    executable.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    executable.chmod(0o755)
+    workflow_config = WorkflowUserConfig(
+        roles={
+            "worker": "codex.high",
+            "reviewer": "codex.high",
+            "architect": "codex.high",
+        },
+        harnesses={
+            "codex": WorkflowHarnessConfig(
+                profiles={"high": HarnessProfileConfig(model="high-model")}
+            )
+        },
+        workflows={
+            "live": WorkflowConfig(
+                steps={
+                    "implement": WorkflowStepConfig(
+                        role="worker",
+                        prompts=("implement",),
+                        go=(GoTransition(to="review"),),
+                    ),
+                    "review": WorkflowStepConfig(
+                        role="reviewer",
+                        prompts=("review",),
+                        go=(GoTransition(to="final_review"),),
+                    ),
+                    "final_review": WorkflowStepConfig(
+                        role="architect",
+                        prompts=("final_review",),
+                        go=(GoTransition(to="END"),),
+                    ),
+                },
+                first_step="implement",
+            )
+        },
+        prompts={
+            "implement": "Implement the checkpoint.",
+            "review": "Review the completed worker turn.",
+            "final_review": "Run the cumulative final review.",
+        },
+    )
+    monkeypatch.setattr(
+        "aflow.daemon.load_workflow_config",
+        lambda _path: workflow_config,
+    )
+
+    source_id = "first-final-review-source"
+    entered_review = Event()
+    release_review = Event()
+    invocations: list[str] = []
+
+    def source_runner(
+        argv: list[str], **kwargs: object
+    ) -> subprocess.CompletedProcess[str]:
+        if not invocations:
+            invocations.append("implement")
+            plan_path.write_text(
+                "# Plan\n\n"
+                "### [x] Checkpoint 1: First\n"
+                "- [x] step\n",
+                encoding="utf-8",
+            )
+            return subprocess.CompletedProcess(argv, 0, "worker output\n", "")
+        invocations.append("review")
+        entered_review.set()
+        assert release_review.wait(timeout=5), "fake reviewer did not receive its release"
+        return subprocess.CompletedProcess(argv, 0, "review output\n", "")
+
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        future = pool.submit(
+            run_workflow,
+            ControllerConfig(
+                repo_root=repo_root,
+                plan_path=plan_path,
+                max_turns=4,
+                reserved_run_id=source_id,
+                idempotency_key="source-key",
+                caller_scope="project:one",
+            ),
+            workflow_config,
+            "live",
+            config_dir=repo_root,
+            snapshot_config=False,
+            runner=source_runner,
+        )
+        assert entered_review.wait(timeout=5), "fake reviewer did not start"
+        requested = compare_and_swap_overrides(
+            repo_root,
+            source_id,
+            RunControlRequest(expected_revision=0, owner_stop=True),
+        )
+        assert requested.owner_stop is True
+        assert not future.done()
+        release_review.set()
+        source = future.result(timeout=5)
+
+    assert source.status == "owner_stopped"
+    source_run_json = (source.run_dir / "run.json").read_bytes()
+    review_turn_result = (
+        source.run_dir / "turns" / "turn-002" / "result.json"
+    ).read_bytes()
+    source_metadata = json.loads(source_run_json)
+    assert source_metadata["last_snapshot"]["is_complete"] is True
+    assert source_metadata["active_implementation_scope"] is None
+    assert source_metadata["current_step_name"] == "final_review"
+    review_turn = json.loads(review_turn_result)
+    assert review_turn["step_name"] == "review"
+    assert review_turn["step_role"] == "reviewer"
+    assert review_turn["chosen_transition"] == "final_review"
+    assert review_turn["returncode"] == 0
+    assert review_turn["snapshot_after"]["is_complete"] is True
+
+    units = InMemoryUnitManager()
+    daemon = AflowDaemon(
+        DaemonConfig(
+            repo_root=repo_root,
+            config_path=config_path,
+            aflow_executable=executable,
+            environment_file=environment_file,
+            release_identity="release-test",
+            stop_timeout_seconds=0,
+        ),
+        units=units,
+    )
+    daemon.start()
+
+    # The current stop intent is still set: the preview and the shared
+    # bootstrap admission must both refuse before any successor is reserved.
+    source_overrides_bytes = (source.run_dir / "overrides.toml").read_bytes()
+    blocked_preview = daemon.service.run_status(source_id)
+    assert blocked_preview.status == "owner_stopped"
+    assert blocked_preview.evidence["can_resume"] is False
+    with pytest.raises(ValueError, match=r"is not resumable"):
+        daemon.service.resume(
+            source_id,
+            caller_scope="project:one",
+            idempotency_key="resume-key",
+        )
+    assert units.start_calls == []
+    assert units.stop_calls == []
+    assert list(source.run_dir.parent.iterdir()) == [source.run_dir]
+    launches_root = repo_root / ".aflow" / "launches"
+    assert sorted(p.name for p in launches_root.iterdir()) == [
+        f"{source_id}.json",
+        f"{source_id}.state.json",
+    ]
+    assert (source.run_dir / "run.json").read_bytes() == source_run_json
+    assert (
+        source.run_dir / "turns" / "turn-002" / "result.json"
+    ).read_bytes() == review_turn_result
+    assert (
+        source.run_dir / "overrides.toml"
+    ).read_bytes() == source_overrides_bytes
+
+    cleared = compare_and_swap_overrides(
+        repo_root,
+        source_id,
+        RunControlRequest(expected_revision=1, owner_stop=False),
+    )
+    assert cleared.owner_stop is False
+
+    preview = daemon.service.run_status(source_id)
+    assert preview.status == "owner_stopped"
+    assert preview.evidence["can_resume"] is True
+
+    continuation = daemon.service.resume(
+        source_id,
+        caller_scope="project:one",
+        idempotency_key="resume-key",
+    )
+    assert continuation.created is True
+    assert continuation.run_id != source_id
+    assert len(units.start_calls) == 1
+    assert units.stop_calls == []
+    record = daemon.service._read_record(continuation.run_id)
+    manifest = daemon.application.repository.get_launch_manifest(continuation.run_id)
+    assert manifest is not None
+    prepared, resume_context = _worker_prepared(
+        record,
+        manifest,
+        repo_root,
+        config_path,
+        workflow_config,
+        managed_inactivity_check=lambda _run_id: True,
+    )
+    assert prepared.start_step == "final_review"
+    assert resume_context is not None
+    assert resume_context.interrupted_step_name == "final_review"
+    assert resume_context.active_implementation_scope is None
+    assert resume_context.pending_cumulative_review is not None
+    assert (
+        resume_context.pending_cumulative_review.reviewer_step_name == "final_review"
+    )
+
+    replay = daemon.service.resume(
+        source_id,
+        caller_scope="project:one",
+        idempotency_key="resume-key",
+    )
+    assert replay.created is False
+    assert replay.run_id == continuation.run_id
+    assert len(units.start_calls) == 1
+
+    final_review_invocations: list[str] = []
+
+    def final_reviewer(
+        argv: list[str], **kwargs: object
+    ) -> subprocess.CompletedProcess[str]:
+        final_review_invocations.append(str(kwargs.get("input", "")))
+        return subprocess.CompletedProcess(argv, 0, "final review output\n", "")
+
+    continuation_result = run_workflow(
+        ControllerConfig(
+            repo_root=repo_root,
+            plan_path=prepared.plan_path,
+            max_turns=prepared.max_turns,
+            team=prepared.team,
+            extra_instructions=prepared.extra_instructions,
+            start_step=prepared.start_step,
+            reserved_run_id=prepared.reserved_run_id,
+            idempotency_key=prepared.idempotency_key,
+            caller_scope=prepared.caller_scope,
+            team_explicit=prepared.team_explicit,
+            max_turns_explicit=prepared.max_turns_explicit,
+            start_step_explicit=prepared.start_step_explicit,
+        ),
+        workflow_config,
+        "live",
+        config_dir=repo_root,
+        snapshot_config=False,
+        runner=final_reviewer,
+        resume=resume_context,
+        allow_existing_launch_manifest=True,
+    )
+    assert continuation_result.status == "completed"
+    assert len(final_review_invocations) == 1
+    continuation_turn = json.loads(
+        (
+            continuation_result.run_dir / "turns" / "turn-001" / "result.json"
+        ).read_text(encoding="utf-8")
+    )
+    assert continuation_turn["step_name"] == "final_review"
+    assert continuation_turn["step_role"] == "architect"
+    assert (source.run_dir / "run.json").read_bytes() == source_run_json
+    assert (
+        source.run_dir / "turns" / "turn-002" / "result.json"
+    ).read_bytes() == review_turn_result
+
+
 @pytest.mark.parametrize("source_phase", ("unit_started", "launch_started"))
 @pytest.mark.parametrize("source_status,reconcile", (("running", True), ("failed", True), ("interrupted", True), ("running", False)))
 def test_resume_creates_one_new_continuation_and_audits_the_source(tmp_path: Path, monkeypatch, source_phase: str, source_status: str, reconcile: bool) -> None:

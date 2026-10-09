@@ -117,6 +117,24 @@ portable receipts exist; a failed source under the issue #74 contract also
 stays admissible); stopped ancestors that fail the rule are rejected
 without being converted into failed evidence. Absence of trusted receipts
 is never converted into confirmed inactivity.
+A graceful owner stop that lands on the checkpoint-review-to-final-review
+edge is admitted by the same shared classifier: the run is `owner_stopped`
+with no unresolved boundary decision and no active implementation scope, its
+last finalized turn is a checkpoint reviewer with a completed zero-exit
+receipt and a complete `snapshot_after`, and that reviewer's declared
+transition selects the configured first cumulative review (architect, or
+senior_architect where configured) in the current workflow metadata. The
+verified boundary is carried as the pending cumulative-review continuation,
+so the managed `can_resume` preview and the successor bootstrap both start
+exactly that cumulative review with no checkpoint implementation or review
+replayed. This branch also requires the current owner-stop intent to be
+cleared: the source's current `overrides.toml` must be a valid request with
+`owner_stop` false, read directly through the shared override loader without
+a consumed-digest shortcut; an accepted original stop digest alone never
+re-establishes clearing, and a missing, unreadable, or invalid current
+request is rejected. Failed, stale, unfinished, worker-target, mismatched,
+incomplete, or scope/boundary-pending evidence is rejected, and ordinary
+complete plans and already-delivered plans are not newly rerouted to review.
 The receipt owner stays in run history even under a small keep_runs setting.
 The same lock also admits only one unresolved run claim for a validated plan
 path across daemon and direct controllers, including linked worktrees. A
