@@ -1387,21 +1387,36 @@ def load_workflow_config(
     with the original reason chained, preserving the record and document
     bytes.  Supported symlinks, split-file parsing, and validation are
     unchanged.
+
+    A supported whole-pair alias — both the selected ``aflow.toml`` leaf and
+    its sibling resolving to the canonical pair in one other directory — is
+    locked, recovered, and parsed through that target directory's existing
+    transaction owner, so a pending target journal is honored while the
+    effective lock is held and no mixed generation is ever parsed.  A pending
+    record in the supplied directory is always inspected before any leaf is
+    dereferenced and still fails closed; ordinary regular-file paths, a
+    separately selected sibling, and missing inputs are unchanged.
     """
     path = config_path or _config_path()
-    pair_dir = path.parent
+    supplied_dir = path.parent
     try:
-        config_pair.transaction_record_path(pair_dir).lstat()
+        config_pair.transaction_record_path(supplied_dir).lstat()
         record_visible = True
     except FileNotFoundError:
         record_visible = False
     except OSError as exc:
         raise ConfigError(
-            f"configuration recovery failed for {pair_dir}: "
+            f"configuration recovery failed for {supplied_dir}: "
             f"transaction record is unavailable: {exc}"
         ) from exc
     if not record_visible and not path.exists():
         return WorkflowUserConfig()
+    # Only a confirmed absent supplied-directory journal may redirect the
+    # transaction owner to the canonical target behind a supported alias;
+    # a pending local record always keeps the supplied directory's
+    # fail-closed behavior instead of being bypassed through the link.
+    target_dir = None if record_visible else config_pair.canonical_pair_directory(path)
+    pair_dir = target_dir if target_dir is not None else supplied_dir
     with config_pair.configuration_pair_lock(pair_dir) as _lock:
         try:
             config_pair.recover_pending_transaction(pair_dir)
@@ -1409,9 +1424,14 @@ def load_workflow_config(
             raise ConfigError(
                 f"configuration recovery failed for {pair_dir}: {exc}"
             ) from exc
-        if not path.exists():
+        # The helper proved the selected leaf resolves to the target
+        # directory's canonical aflow.toml; the supplied basename must not
+        # be reconstructed there, where an unrelated same-name file (or its
+        # absence) would silently change the selection.
+        selected = target_dir / "aflow.toml" if target_dir is not None else path
+        if not selected.exists():
             return WorkflowUserConfig()
-        return _parse_config_pair(path)
+        return _parse_config_pair(selected)
 
 
 def load_config(config_path: Path | str | None = None) -> WorkflowUserConfig:

@@ -567,6 +567,16 @@ The remote app edits the shared workflow pair as one revisioned pair:
   absent record keeps the historical empty defaults, and a failed journal
   inspection fails with a bounded error instead of falling back to defaults
   or an unlocked parse.
+- A supported pair of leaf symlinks (both `aflow.toml` and `workflows.toml`
+  pointing at the canonical pair in one other directory) is read through
+  that target directory's transaction owner: the supplied directory's
+  pending-journal safety check runs first, then the target lock is acquired
+  and the complete selected pair is recovered and parsed while it is held.
+  A pending record in the supplied (alias) directory still fails closed
+  instead of being bypassed through the links, and a separately selected
+  sibling keeps its own identity. The target's canonical `aflow.toml` is
+  selected regardless of the supplied leaf's name, so a noncanonical
+  supplied basename never selects an unrelated target-side same-name file.
 - If a manual edit changed a document while a transaction was pending,
   recovery preserves the edited bytes and the record and the read fails
   with a bounded explicit error instead of guessing which generation was

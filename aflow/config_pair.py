@@ -227,6 +227,39 @@ def transaction_record_path(pair_dir: Path) -> Path:
     return Path(pair_dir) / TRANSACTION_RECORD_NAME
 
 
+def canonical_pair_directory(config_path: Path) -> Path | None:
+    """Return the canonical directory behind a supported whole-pair alias.
+
+    A supported alias directory holds ``aflow.toml`` and ``workflows.toml``
+    as leaf symlinks that both resolve to the canonical documents in one
+    other directory.  That directory is the pair's transaction owner.  Any
+    other selection — regular files, a missing sibling, a separately
+    selected sibling, targets in different directories, non-canonical target
+    names, a target in the supplied directory itself, or an inspection I/O
+    failure — returns ``None`` so the supplied directory remains the
+    transaction owner and the existing selection semantics are unchanged.
+    """
+    aflow = Path(config_path)
+    sibling = aflow.with_name("workflows.toml")
+    try:
+        aflow_info = aflow.lstat()
+        sibling_info = sibling.lstat()
+    except (FileNotFoundError, OSError):
+        return None
+    if not stat.S_ISLNK(aflow_info.st_mode) or not stat.S_ISLNK(sibling_info.st_mode):
+        return None
+    aflow_target = aflow.resolve()
+    sibling_target = sibling.resolve()
+    if aflow_target.name != "aflow.toml" or sibling_target.name != "workflows.toml":
+        return None
+    target_dir = sibling_target.parent
+    if aflow_target.parent != target_dir:
+        return None
+    if target_dir == aflow.parent.resolve():
+        return None
+    return target_dir
+
+
 def _encode_payload(payload: bytes | None) -> dict | None:
     if payload is None:
         return None

@@ -301,6 +301,256 @@ print(json.dumps({
 """
 
 
+# A fresh general public reader over a supported canonical-pair alias: it
+# reads through the alias leaf symlinks and reports the interpreted
+# generation plus the exact target bytes and journal state.
+ALIAS_READER_SCRIPT = """\
+import hashlib, json, sys
+from pathlib import Path
+from aflow.config import ConfigError, load_workflow_config
+
+alias_dir, target_dir = map(Path, sys.argv[1:3])
+leaf_name = sys.argv[3] if len(sys.argv) > 3 else "aflow.toml"
+try:
+    loaded = load_workflow_config(alias_dir / leaf_name)
+except ConfigError as exc:
+    print(json.dumps({"error": str(exc), "type": type(exc).__name__}))
+    sys.exit(2)
+digests = {}
+for name in ("aflow.toml", "workflows.toml"):
+    path = target_dir / name
+    digests[name] = hashlib.sha256(path.read_bytes()).hexdigest() if path.is_file() else None
+print(json.dumps({
+    "digests": digests,
+    "model": loaded.harnesses["codex"].profiles["worker"].model,
+    "steps": list(loaded.workflows["demo"].steps),
+    "record": (target_dir / ".aflow-config-pair.transaction.json").is_file(),
+}))
+"""
+
+# The same alias reader gated just before the product's pair-lock
+# acquisition, so a parent can prove the saver owns the target lock
+# mid-commit before the alias read may acquire it.
+ALIAS_OVERLAP_READER_SCRIPT = """\
+import hashlib, json, sys, time
+from pathlib import Path
+import aflow.config_pair as config_pair
+from aflow.config import ConfigError, load_workflow_config
+
+alias_dir, target_dir, gate = map(Path, sys.argv[1:4])
+leaf_name = sys.argv[4] if len(sys.argv) > 4 else "aflow.toml"
+real_lock = config_pair.configuration_pair_lock
+def gated(directory):
+    print("pre-lock", flush=True)
+    deadline = time.monotonic() + 60
+    while not gate.exists():
+        if time.monotonic() > deadline:
+            raise TimeoutError("pre-lock gate timed out")
+        time.sleep(0.02)
+    return real_lock(directory)
+config_pair.configuration_pair_lock = gated
+print("ready", flush=True)
+try:
+    loaded = load_workflow_config(alias_dir / leaf_name)
+except ConfigError as exc:
+    print(json.dumps({"error": str(exc), "type": type(exc).__name__}))
+    sys.exit(2)
+digests = {}
+for name in ("aflow.toml", "workflows.toml"):
+    path = target_dir / name
+    digests[name] = hashlib.sha256(path.read_bytes()).hexdigest()
+print(json.dumps({
+    "digests": digests,
+    "model": loaded.harnesses["codex"].profiles["worker"].model,
+    "steps": list(loaded.workflows["demo"].steps),
+    "record": (target_dir / ".aflow-config-pair.transaction.json").is_file(),
+}))
+"""
+
+
+def _alias_case(
+    tmp_path: Path, crash_point: str, leaf_name: str = "aflow.toml"
+) -> tuple[Path, Path, Path]:
+    """Kill a real service save on the target; return target, alias, new.
+
+    The target holds the old generation, the candidate the new one, and the
+    alias directory holds the supported whole-pair leaf symlinks over the
+    target, with the selected aflow leaf under ``leaf_name`` (a non-canonical
+    supplied basename is supported).  The saver is the real
+    ``GlobalConfigService.save`` run in a child process.
+    """
+    target = tmp_path / "real"
+    alias = tmp_path / "alias"
+    new_dir = tmp_path / "candidate"
+    for directory in (target, alias, new_dir):
+        directory.mkdir(parents=True)
+    _write_pair(target, AFLOW, WORKFLOWS)
+    _write_pair(new_dir, OVERLAP_NEW_AFLOW, OVERLAP_NEW_WORKFLOWS)
+    (alias / leaf_name).symlink_to(target / "aflow.toml")
+    (alias / "workflows.toml").symlink_to(target / "workflows.toml")
+    saver = _run(SERVICE_SAVER_SCRIPT, target, new_dir, crash_point)
+    assert saver.returncode == _CRASH_EXIT, saver.stderr
+    assert (target / TRANSACTION_RECORD_NAME).is_file()
+    return target, alias, new_dir
+
+
+@pytest.mark.parametrize("leaf_name", ["aflow.toml", "custom.toml"])
+def test_killed_service_save_alias_reader_recovers_old_generation(
+    tmp_path: Path, leaf_name: str,
+) -> None:
+    """A prepared interruption is recovered to exact old bytes via the alias."""
+    target, alias, new_dir = _alias_case(
+        tmp_path, "after_replacement:aflow.toml", leaf_name
+    )
+    # The crash left the target mixed on disk: new aflow, old workflows.
+    assert _digest(target / "aflow.toml") == sha256(
+        new_dir.joinpath("aflow.toml").read_bytes()
+    ).hexdigest()
+
+    general = _run(ALIAS_READER_SCRIPT, alias, target, leaf_name)
+    assert general.returncode == 0, general.stderr
+    data = json.loads(general.stdout)
+    assert data["digests"] == {
+        "aflow.toml": sha256(AFLOW.encode("utf-8")).hexdigest(),
+        "workflows.toml": sha256(WORKFLOWS.encode("utf-8")).hexdigest(),
+    }
+    assert data["model"] == "test"
+    assert data["steps"] == ["implement"]
+    assert data["record"] is False
+
+
+@pytest.mark.parametrize("leaf_name", ["aflow.toml", "custom.toml"])
+def test_committed_service_save_alias_reader_recovers_new_generation(
+    tmp_path: Path, leaf_name: str,
+) -> None:
+    """A committed interruption installs exact new bytes visible via alias."""
+    target, alias, new_dir = _alias_case(tmp_path, "after_committed_marker", leaf_name)
+
+    general = _run(ALIAS_READER_SCRIPT, alias, target, leaf_name)
+    assert general.returncode == 0, general.stderr
+    data = json.loads(general.stdout)
+    assert data["digests"] == {
+        "aflow.toml": sha256(
+            new_dir.joinpath("aflow.toml").read_bytes()
+        ).hexdigest(),
+        "workflows.toml": sha256(
+            new_dir.joinpath("workflows.toml").read_bytes()
+        ).hexdigest(),
+    }
+    assert data["model"] == "parity-b"
+    assert data["steps"] == ["implement", "review"]
+    assert data["record"] is False
+
+
+@pytest.mark.parametrize("leaf_name", ["aflow.toml", "custom.toml"])
+def test_killed_service_save_pending_manual_edit_alias_reader_fails_closed(
+    tmp_path: Path, leaf_name: str,
+) -> None:
+    """An unknown edit under a pending target journal fails closed via alias."""
+    target, alias, _ = _alias_case(
+        tmp_path, "after_replacement:aflow.toml", leaf_name
+    )
+    aflow_path = target / "aflow.toml"
+    aflow_path.write_text(
+        AFLOW.replace('model = "test"', 'model = "manual-edit"'),
+        encoding="utf-8",
+    )
+    edited = aflow_path.read_bytes()
+    record = target / TRANSACTION_RECORD_NAME
+    record_bytes = record.read_bytes()
+
+    general = _run(ALIAS_READER_SCRIPT, alias, target, leaf_name)
+    assert general.returncode == 2
+    data = json.loads(general.stdout)
+    assert data["type"] == "ConfigError"
+    assert "recovery failed" in data["error"]
+    # Neither the operator edit nor the pending journal was changed.
+    assert aflow_path.read_bytes() == edited
+    assert record.read_bytes() == record_bytes
+
+
+@pytest.mark.parametrize("leaf_name", ["aflow.toml", "custom.toml"])
+def test_no_journal_alias_read_overlapping_killed_service_save(
+    tmp_path: Path, leaf_name: str,
+) -> None:
+    """A no-journal alias read overlapping a save cannot mix generations.
+
+    The general reader announces it is about to read (no journal is present)
+    through the alias, then blocks on the target pair lock while a real
+    service save publishes the record and replaces the first document before
+    dying.  The reader must wait on the target lock, recover the complete old
+    pair after release, and clean the record — the target lock covers
+    recovery and both parses.
+    """
+    target = tmp_path / "real"
+    alias = tmp_path / "alias"
+    new_dir = tmp_path / "candidate"
+    for directory in (target, alias, new_dir):
+        directory.mkdir(parents=True)
+    _write_pair(target, AFLOW, WORKFLOWS)
+    _write_pair(new_dir, OVERLAP_NEW_AFLOW, OVERLAP_NEW_WORKFLOWS)
+    (alias / leaf_name).symlink_to(target / "aflow.toml")
+    (alias / "workflows.toml").symlink_to(target / "workflows.toml")
+
+    gate = tmp_path / "reader-lock"
+    reader = subprocess.Popen(
+        [
+            sys.executable,
+            "-c",
+            ALIAS_OVERLAP_READER_SCRIPT,
+            str(alias),
+            str(target),
+            str(gate),
+            leaf_name,
+        ],
+        stdout=subprocess.PIPE,
+        text=True,
+    )
+    saver: subprocess.Popen[str] | None = None
+    try:
+        assert reader.stdout is not None
+        assert reader.stdout.readline().strip() == "ready"
+        # The reader has confirmed the absent journal and is now gated just
+        # before its own pair-lock acquisition.
+        assert reader.stdout.readline().strip() == "pre-lock"
+        saver = subprocess.Popen(
+            [
+                sys.executable,
+                "-c",
+                OVERLAP_SAVER_SCRIPT,
+                str(target),
+                str(new_dir),
+                "",
+                "after_replacement:aflow.toml",
+            ],
+            stdout=subprocess.PIPE,
+            text=True,
+        )
+        assert saver.stdout is not None
+        assert saver.stdout.readline().strip() == "starting"
+        assert saver.stdout.readline().strip() == "held"
+        # The saver owns the target lock mid-commit while the alias reader
+        # is gated, so no document can be read before recovery.
+        assert reader.poll() is None
+        gate.touch()
+        saver.wait(timeout=60)
+        assert saver.returncode == _CRASH_EXIT
+        out, _ = reader.communicate(timeout=60)
+    finally:
+        gate.unlink(missing_ok=True)
+        _terminate(reader)
+        _terminate(saver)
+    assert reader.returncode == 0, out
+    data = json.loads(out)
+    assert data["digests"] == {
+        "aflow.toml": sha256(AFLOW.encode("utf-8")).hexdigest(),
+        "workflows.toml": sha256(WORKFLOWS.encode("utf-8")).hexdigest(),
+    }
+    assert data["model"] == "test"
+    assert data["steps"] == ["implement"]
+    assert data["record"] is False
+
+
 def _overlap_pair(tmp_path: Path) -> tuple[Path, Path]:
     pair_dir = tmp_path / "pair"
     new_dir = tmp_path / "new"

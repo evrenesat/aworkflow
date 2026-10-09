@@ -204,6 +204,155 @@ def test_public_loader_follows_supported_symlink_without_journal(
     assert list(loaded.workflows) == ["simple"]
 
 
+def test_public_loader_alias_recovers_prepared_pair_in_fresh_process(
+    tmp_path: Path,
+) -> None:
+    """A killed target save is recovered through a canonical-pair alias."""
+    pair_dir = _crash_pair_commit(tmp_path, "after_replacement:aflow.toml")
+    alias_dir = _alias_over(pair_dir, tmp_path / "alias")
+
+    result = _run_alias_reader(alias_dir, pair_dir)
+    assert result.returncode == 0, result.stderr
+    data = json.loads(result.stdout)
+    assert data["digests"] == {
+        "aflow.toml": sha256(OLD_AFLOW.encode("utf-8")).hexdigest(),
+        "workflows.toml": sha256(OLD_WORKFLOWS.encode("utf-8")).hexdigest(),
+    }
+    assert data["model"] == "model-a"
+    assert data["record"] is False
+
+
+def test_public_loader_alias_recovers_committed_pair_in_fresh_process(
+    tmp_path: Path,
+) -> None:
+    pair_dir = _crash_pair_commit(tmp_path, "after_committed_marker")
+    alias_dir = _alias_over(pair_dir, tmp_path / "alias")
+
+    result = _run_alias_reader(alias_dir, pair_dir)
+    assert result.returncode == 0, result.stderr
+    data = json.loads(result.stdout)
+    assert data["digests"] == {
+        "aflow.toml": sha256(NEW_AFLOW.encode("utf-8")).hexdigest(),
+        "workflows.toml": sha256(NEW_WORKFLOWS.encode("utf-8")).hexdigest(),
+    }
+    assert data["model"] == "model-b"
+    assert data["record"] is False
+
+
+def test_public_loader_alias_fails_closed_on_unknown_edit_during_pending(
+    tmp_path: Path,
+) -> None:
+    pair_dir = _crash_pair_commit(tmp_path, "after_replacement:aflow.toml")
+    alias_dir = _alias_over(pair_dir, tmp_path / "alias")
+    aflow_path = pair_dir / "aflow.toml"
+    aflow_path.write_text(
+        OLD_AFLOW.replace("model-a", "operator-model"), encoding="utf-8"
+    )
+    edited = aflow_path.read_bytes()
+    record = pair_dir / TRANSACTION_RECORD_NAME
+    record_bytes = record.read_bytes()
+
+    result = _run_alias_reader(alias_dir, pair_dir)
+    assert result.returncode == 2
+    data = json.loads(result.stdout)
+    assert data["type"] == "ConfigError"
+    assert "recovery failed" in data["error"]
+    # The operator edit and the pending target journal are both preserved.
+    assert aflow_path.read_bytes() == edited
+    assert record.read_bytes() == record_bytes
+
+
+def test_public_loader_fails_closed_on_alias_directory_journal(
+    tmp_path: Path,
+) -> None:
+    """A pending journal in the selected alias directory is not bypassed."""
+    pair_dir = _crash_pair_commit(tmp_path, "after_record")
+    alias_dir = _alias_over(pair_dir, tmp_path / "alias")
+    local_record = alias_dir / TRANSACTION_RECORD_NAME
+    local_record.write_text("pending record", encoding="utf-8")
+    target_record = pair_dir / TRANSACTION_RECORD_NAME
+    target_record_bytes = target_record.read_bytes()
+
+    result = _run_alias_reader(alias_dir, pair_dir)
+    assert result.returncode == 2, result.stderr
+    data = json.loads(result.stdout)
+    assert data["type"] == "ConfigError"
+    assert "recovery failed" in data["error"]
+    # The local record and the untouched target pair/journal are preserved.
+    assert local_record.read_text(encoding="utf-8") == "pending record"
+    assert target_record.read_bytes() == target_record_bytes
+    assert (pair_dir / "aflow.toml").read_bytes() == OLD_AFLOW.encode("utf-8")
+    assert (
+        pair_dir / "workflows.toml"
+    ).read_bytes() == OLD_WORKFLOWS.encode("utf-8")
+
+
+def test_public_loader_alias_keeps_separately_selected_sibling(
+    tmp_path: Path,
+) -> None:
+    """A symlinked aflow leaf does not pull in the target's sibling."""
+    real = tmp_path / "real"
+    real.mkdir()
+    (real / "aflow.toml").write_text(OLD_AFLOW, encoding="utf-8")
+    (real / "workflows.toml").write_text(NEW_WORKFLOWS, encoding="utf-8")
+    alias = tmp_path / "alias"
+    alias.mkdir()
+    (alias / "aflow.toml").symlink_to(real / "aflow.toml")
+    (alias / "workflows.toml").write_text(OLD_WORKFLOWS, encoding="utf-8")
+
+    loaded = load_workflow_config(alias / "aflow.toml")
+    assert loaded.harnesses["codex"].profiles["default"].model == "model-a"
+    # The locally selected sibling (workflow "simple") wins over the target's
+    # sibling (workflow "other"): no whole-pair alias was applied.
+    assert list(loaded.workflows) == ["simple"]
+
+
+@pytest.mark.parametrize("loader", [load_workflow_config, load_config])
+@pytest.mark.parametrize(
+    "case",
+    ["canonical", "missing_same_name", "unrelated_same_name"],
+)
+def test_public_loaders_select_target_pair_for_noncanonical_basename(
+    tmp_path: Path, loader, case: str
+) -> None:
+    """A supplied noncanonical basename must not be reconstructed in the target.
+
+    The selected alias leaf resolves to the target's canonical aflow.toml, so
+    the exact target pair must load whether the target-side same-name file is
+    absent or is a valid unrelated document with a distinct model.
+    """
+    real = tmp_path / "real"
+    real.mkdir()
+    (real / "aflow.toml").write_text(OLD_AFLOW, encoding="utf-8")
+    (real / "workflows.toml").write_text(OLD_WORKFLOWS, encoding="utf-8")
+    if case == "unrelated_same_name":
+        (real / "custom.toml").write_text(
+            OLD_AFLOW.replace("model-a", "unselected-model"),
+            encoding="utf-8",
+        )
+    alias = tmp_path / "alias"
+    alias.mkdir()
+    leaf_name = "aflow.toml" if case == "canonical" else "custom.toml"
+    (alias / leaf_name).symlink_to(real / "aflow.toml")
+    (alias / "workflows.toml").symlink_to(real / "workflows.toml")
+
+    loaded = loader(alias / leaf_name)
+    assert loaded.harnesses["codex"].profiles["default"].model == "model-a"
+    assert list(loaded.workflows) == ["simple"]
+
+
+def test_load_config_alias_recovers_through_canonical_pair_alias(
+    tmp_path: Path,
+) -> None:
+    pair_dir = _crash_pair_commit(tmp_path, "after_replacement:aflow.toml")
+    alias_dir = _alias_over(pair_dir, tmp_path / "alias")
+
+    loaded = load_config(str(alias_dir / "aflow.toml"))
+    assert loaded.harnesses["codex"].profiles["default"].model == "model-a"
+    assert list(loaded.workflows) == ["simple"]
+    assert not (pair_dir / TRANSACTION_RECORD_NAME).exists()
+
+
 def test_load_config_alias_delegates_to_the_public_loader(tmp_path: Path) -> None:
     pair_dir = tmp_path / "pair"
     pair_dir.mkdir()
@@ -276,6 +425,29 @@ commit_configuration_pair(
 """
 
 
+_ALIAS_READER_SCRIPT = """\
+import hashlib, json, sys
+from pathlib import Path
+from aflow.config import ConfigError, load_workflow_config
+
+alias_dir, target_dir = map(Path, sys.argv[1:3])
+try:
+    loaded = load_workflow_config(alias_dir / "aflow.toml")
+except ConfigError as exc:
+    print(json.dumps({"error": str(exc), "type": type(exc).__name__}))
+    sys.exit(2)
+digests = {}
+for name in ("aflow.toml", "workflows.toml"):
+    path = target_dir / name
+    digests[name] = hashlib.sha256(path.read_bytes()).hexdigest() if path.is_file() else None
+print(json.dumps({
+    "digests": digests,
+    "model": loaded.harnesses["codex"].profiles["default"].model,
+    "record": (target_dir / ".aflow-config-pair.transaction.json").is_file(),
+}))
+"""
+
+
 def _run_general_reader(pair_dir: Path) -> subprocess.CompletedProcess[str]:
     return subprocess.run(
         [sys.executable, "-c", _GENERAL_READER_SCRIPT, str(pair_dir)],
@@ -283,6 +455,31 @@ def _run_general_reader(pair_dir: Path) -> subprocess.CompletedProcess[str]:
         text=True,
         timeout=120,
     )
+
+
+def _run_alias_reader(
+    alias_dir: Path, target_dir: Path
+) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            _ALIAS_READER_SCRIPT,
+            str(alias_dir),
+            str(target_dir),
+        ],
+        capture_output=True,
+        text=True,
+        timeout=120,
+    )
+
+
+def _alias_over(target_dir: Path, alias_dir: Path) -> Path:
+    """Create the supported whole-pair alias over ``target_dir``."""
+    alias_dir.mkdir(parents=True, exist_ok=True)
+    for name in ("aflow.toml", "workflows.toml"):
+        (alias_dir / name).symlink_to(target_dir / name)
+    return alias_dir
 
 
 def _crash_pair_commit(base_dir: Path, crash_point: str) -> Path:

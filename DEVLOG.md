@@ -77,6 +77,61 @@
   passes; `uv run ruff check aflow/cli.py tests/test_run_state.py
   tests/test_control_plane_resume.py` passes.
 
+## 2026-10-07 — AFLOW-MAINT-20261006-02 final-review repair (cp01 v02): selected aliases read the target's canonical pair
+
+- `load_workflow_config` no longer reconstructs the supplied leaf's basename
+  inside the canonical target directory: when
+  `config_pair.canonical_pair_directory` proves the selected leaf resolves to
+  the target's canonical `aflow.toml`, that canonical file is selected under
+  the same target pair lock. A noncanonical supplied basename (for example
+  `alias/custom.toml` -> `real/aflow.toml`) therefore loads the exact target
+  pair whether `real/custom.toml` is absent or is a valid unrelated document
+  with a distinct model, instead of silently returning empty defaults or the
+  unrelated file's configuration.
+- `tests/test_config.py` adds a parameterized regression over both public
+  loaders (`load_workflow_config`, `load_config`) for canonical, missing
+  target-side same-name, and unrelated target-side same-name selections;
+  ordinary regular files, separate siblings, and missing inputs are
+  unchanged.
+- `apps/aflow_app/server/tests/test_config_pair_parity.py` extends the
+  existing fresh-process alias recovery coverage with the noncanonical
+  supplied basename: prepared interruption returns the exact old pair,
+  committed interruption returns the exact new pair, an unknown edit fails
+  closed with a chained `ConfigError` preserving edit/journal bytes, and the
+  no-journal overlapping save remains excluded by the target lock (asserted
+  child exits 37/0/2, interpreted models/steps, and exact bytes).
+- `docs/configuration.md` and `ARCHITECTURE.md` note that the target's
+  canonical `aflow.toml` is selected regardless of the supplied leaf's name.
+
+## 2026-10-07 — AFLOW-MAINT-20261006-02 final-review repair (cp01 v01): general reads honor the canonical pair behind supported aliases
+
+- `load_workflow_config` now recognizes the supported whole-pair alias —
+  both the selected `aflow.toml` leaf and its sibling resolving to the
+  canonical pair in one other directory — through the new
+  `config_pair.canonical_pair_directory` helper, and locks, recovers, and
+  parses through that target directory's existing transaction owner. A
+  prepared interruption on the target therefore restores the exact old pair
+  before an alias read interprets it, a committed interruption installs the
+  exact new pair, and an unknown edit under a pending target journal fails
+  closed with a bounded chained `ConfigError` while preserving edit and
+  journal bytes. One effective lock acquisition per canonical read is kept;
+  live/snapshot reentry is unchanged.
+- The supplied directory's pending-journal safety check runs before any leaf
+  is dereferenced: a pending local record with symlink leaves still fails
+  closed, a confirmed absent record is the only case that may redirect the
+  transaction owner, and an initially absent target journal never bypasses
+  the target lock. Regular files, relative paths, missing inputs, missing
+  siblings, and a separately selected sibling keep their existing behavior.
+- `tests/test_config.py` adds fresh-process alias regressions (prepared and
+  committed recovery, unknown edit, alias-directory journal guard, separate
+  sibling selection) plus the `load_config` alias over a canonical pair.
+- `apps/aflow_app/server/tests/test_config_pair_parity.py` adds real
+  `GlobalConfigService.save` child-process alias regressions: prepared and
+  committed interruptions read through the aliases, a pending manual edit
+  fails closed with preserved bytes, and a no-journal alias read overlapping
+  a killed save proves the target lock covers recovery and both parses
+  (asserted child exits 37/0/2).
+
 ## 2026-10-07 — AFLOW-MAINT-20261006-02 CP2 repair (v01): general reads hold the pair lock before journal inspection
 
 - `load_workflow_config` no longer skips the pair lock when an unlocked
