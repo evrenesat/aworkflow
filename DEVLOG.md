@@ -1,5 +1,29 @@
 # DEVLOG
 
+## 2026-10-09 — Rebound paused-reader fixture to the extracted pure parser (maintenance03 pair-lock CI repair)
+
+- Checkpoint 1 of the pair-lock fixture CI-repair plan. Maintenance03 moved
+  TOML parsing into `aflow.config.parse_workflow_pair`, where both documents
+  parse through `tomllib.loads`; the `PAUSED_READER_SCRIPT` subprocess in
+  `apps/aflow_app/server/tests/test_config_pair_parity.py` still patched
+  `tomllib.load`, which the parsing path no longer calls. The reader was
+  therefore never paused, `test_reader_holds_lock_between_document_parses`
+  saw the reader's final JSON instead of `parsed-first`, and three dashboard
+  CI jobs failed against reviewed main `b1ca851b`.
+- The fixture now wraps `tomllib.loads`, delegates to the saved function, and
+  pauses once after the first successful parse in the dedicated reader
+  process — identified by a local call counter, because the pure parser
+  boundary no longer sees file handles — using the existing `parsed-first`
+  signal and bounded flag-file gate, then lets later parses proceed. Cleanup
+  and subprocess failure visibility are unchanged.
+- No production change: `aflow/config.py` keeps pure parsing, and
+  `load_workflow_config` still holds the configuration pair lock through
+  recovery, both document reads, and both parses. All concurrency assertions
+  are preserved: the concurrent saver cannot replace either document while
+  the reader is paused, the reader observes the complete old generation, and
+  the saver commits the complete new generation only after the reader
+  finishes.
+
 ## 2026-10-09 — configuration validation ownership: global editor and legacy facade delegate to current owners (AFLOW-MAINT-20261006 · 03)
 
 - Checkpoint 2 of the configuration validation ownership plan. The active

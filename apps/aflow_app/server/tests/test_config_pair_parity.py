@@ -271,10 +271,12 @@ from pathlib import Path
 from aflow.config import ConfigError, load_workflow_config
 
 pair, flag = map(Path, sys.argv[1:3])
-real_load = tomllib.load
-def gap(handle):
-    result = real_load(handle)
-    if Path(getattr(handle, "name", "")).name == "aflow.toml":
+real_loads = tomllib.loads
+state = {"count": 0}
+def gap(text):
+    result = real_loads(text)
+    state["count"] += 1
+    if state["count"] == 1:
         print("parsed-first", flush=True)
         deadline = time.monotonic() + 60
         while not flag.exists():
@@ -282,7 +284,7 @@ def gap(handle):
                 raise TimeoutError("reader pause timed out")
             time.sleep(0.02)
     return result
-tomllib.load = gap
+tomllib.loads = gap
 try:
     loaded = load_workflow_config(pair / "aflow.toml")
 except ConfigError as exc:
