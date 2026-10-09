@@ -16,6 +16,7 @@ import subprocess
 import tempfile
 from typing import Iterator
 
+from aflow.file_io import atomic_replace_file
 from aflow.project_settings import ProjectSettingsError, resolve_project_identity
 
 
@@ -69,33 +70,29 @@ def _load_receipt(path: Path) -> dict[str, object]:
     return value
 
 
+def _sync_receipt_directory(path: Path) -> None:
+    """Synchronize a published receipt directory with open-only tolerance.
+
+    Historical publication contract: a failure to open the directory
+    read-only (some platforms) does not fail an already-published receipt,
+    but a directory that opened successfully must sync and close; fsync and
+    close failures propagate to the caller.
+    """
+    try:
+        descriptor = os.open(path, os.O_RDONLY)
+    except OSError:
+        return
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
 def _write_atomic_receipt(path: Path, receipt: dict[str, object]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    descriptor, temporary_name = tempfile.mkstemp(
-        prefix=f".{path.name}.", suffix=".tmp", dir=path.parent
-    )
-    temporary = Path(temporary_name)
-    try:
-        with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
-            json.dump(receipt, stream, indent=2, sort_keys=True)
-            stream.write("\n")
-            stream.flush()
-            os.fsync(stream.fileno())
-        os.replace(temporary, path)
-        try:
-            directory_fd = os.open(path.parent, os.O_RDONLY)
-        except OSError:
-            pass
-        else:
-            try:
-                os.fsync(directory_fd)
-            finally:
-                os.close(directory_fd)
-    finally:
-        try:
-            temporary.unlink()
-        except FileNotFoundError:
-            pass
+    payload = (json.dumps(receipt, indent=2, sort_keys=True) + "\n").encode("utf-8")
+    atomic_replace_file(path, payload, mode=0o600)
+    _sync_receipt_directory(path.parent)
 
 
 _RUN_ID_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]{0,63}")

@@ -32,6 +32,7 @@ from typing import Any, Literal
 from uuid import uuid4
 
 from aflow.control_plane.persistence import RunIdentityError, validate_run_id
+from aflow.file_io import fsync_directory
 from aflow.control_plane.repository import (
     MAX_READ_ARTIFACT_BYTES,
     RepositoryError,
@@ -1387,6 +1388,11 @@ class ProjectAdmission:
         if path.is_symlink():
             raise ProjectAdmissionSafetyError("project admission state must not be a symlink")
         payload = _state_payload(self._root, reservations)
+        # The shared atomic primitive applies its mode at temporary creation,
+        # so it is subject to the process umask and cannot guarantee the
+        # exact 0o600 descriptor this journal requires before file fsync and
+        # rename.  Keep the domain-owned temporary writer; only the strict
+        # directory sync below is shared.
         descriptor, temporary_name = tempfile.mkstemp(
             prefix=f".{path.name}.", suffix=".tmp", dir=path.parent
         )
@@ -1398,11 +1404,7 @@ class ProjectAdmission:
                 handle.flush()
                 os.fsync(handle.fileno())
             os.replace(temporary, path)
-            directory_descriptor = os.open(path.parent, os.O_RDONLY)
-            try:
-                os.fsync(directory_descriptor)
-            finally:
-                os.close(directory_descriptor)
+            fsync_directory(path.parent)
         except OSError as exc:
             raise ProjectAdmissionSafetyError("project admission state write failed") from exc
         finally:

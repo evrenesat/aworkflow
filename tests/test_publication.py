@@ -1,5 +1,7 @@
 import json
 from pathlib import Path
+import os
+import stat
 import subprocess
 from concurrent.futures import ThreadPoolExecutor
 from threading import Event, Lock
@@ -736,3 +738,77 @@ def test_workflow_publishes_before_done_and_keeps_failures_in_progress(tmp_path,
         assert not plan.exists()
         assert (tmp_path / 'plans/done/test.md').exists()
     assert len(observed) == 1
+
+
+def _leftover_receipt_temporaries(target: Path) -> list:
+    prefix = f".{target.name}."
+    if not target.parent.exists():
+        return []
+    return [entry for entry in target.parent.iterdir() if entry.name.startswith(prefix)]
+
+
+def test_receipt_write_publishes_exact_bytes_with_private_mode(tmp_path: Path) -> None:
+    target = tmp_path / "publication.json"
+    publication_module._write_atomic_receipt(target, {"status": "published", "remote": "origin"})
+    expected = (json.dumps({"status": "published", "remote": "origin"}, indent=2, sort_keys=True) + "\n").encode("utf-8")
+    assert target.read_bytes() == expected
+    assert stat.S_IMODE(os.stat(target).st_mode) == 0o600
+    assert not _leftover_receipt_temporaries(target)
+
+
+def test_receipt_write_fsync_failure_preserves_previous_bytes_and_cleans_temporary(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    target = tmp_path / "publication.json"
+    publication_module._write_atomic_receipt(target, {"status": "pending"})
+    before = target.read_bytes()
+
+    def failing_fsync(descriptor: int) -> None:
+        raise OSError("injected fsync failure")
+
+    monkeypatch.setattr(publication_module.os, "fsync", failing_fsync)
+    with pytest.raises(OSError, match="injected fsync failure"):
+        publication_module._write_atomic_receipt(target, {"status": "published"})
+    assert target.read_bytes() == before
+    assert not _leftover_receipt_temporaries(target)
+
+
+def test_receipt_directory_open_failure_is_tolerated(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    target = tmp_path / "publication.json"
+    publication_module._write_atomic_receipt(target, {"status": "pending"})
+    real_open = publication_module.os.open
+
+    def failing_directory_open(path, flags, *args):
+        if Path(path).is_dir() and not (flags & publication_module.os.O_WRONLY):
+            raise OSError("injected directory open failure")
+        return real_open(path, flags, *args)
+
+    monkeypatch.setattr(publication_module.os, "open", failing_directory_open)
+    # Historical receipt contract: a directory that cannot be opened
+    # read-only does not fail the already-published receipt.
+    publication_module._write_atomic_receipt(target, {"status": "published"})
+    assert json.loads(target.read_text(encoding="utf-8")) == {"status": "published"}
+    assert not _leftover_receipt_temporaries(target)
+
+
+def test_receipt_directory_fsync_failure_propagates_with_receipt_published(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    target = tmp_path / "publication.json"
+    publication_module._write_atomic_receipt(target, {"status": "pending"})
+    real_fsync = publication_module.os.fsync
+
+    def failing_directory_fsync(descriptor: int) -> None:
+        if stat.S_ISDIR(publication_module.os.fstat(descriptor).st_mode):
+            raise OSError("injected directory fsync failure")
+        real_fsync(descriptor)
+
+    monkeypatch.setattr(publication_module.os, "fsync", failing_directory_fsync)
+    # A directory that opened must sync; its failure reaches the caller
+    # with the new receipt still published.
+    with pytest.raises(OSError, match="injected directory fsync failure"):
+        publication_module._write_atomic_receipt(target, {"status": "published"})
+    assert json.loads(target.read_text(encoding="utf-8")) == {"status": "published"}
+    assert not _leftover_receipt_temporaries(target)

@@ -1,9 +1,12 @@
 from __future__ import annotations
 
 from multiprocessing.context import BaseContext
+import errno
 import json
 from pathlib import Path
 import multiprocessing
+import os
+import stat
 import subprocess
 from types import SimpleNamespace
 
@@ -1407,3 +1410,142 @@ def test_released_history_compacts_before_capacity_state_limit(
     assert snapshot.claim_retained_run_ids == ("claim-run",)
     state = json.loads(admission.state_path.read_text(encoding="utf-8"))
     assert len(state["reservations"]) <= 4
+
+
+def _leftover_state_temporaries(state_path: Path) -> list:
+    prefix = f".{state_path.name}."
+    if not state_path.parent.exists():
+        return []
+    return [entry for entry in state_path.parent.iterdir() if entry.name.startswith(prefix)]
+
+
+def test_admission_state_write_enforces_private_mode(tmp_path: Path) -> None:
+    admission = ProjectAdmission(tmp_path)
+    admission.acquire("admission-mode-run", idempotency_key="admission-mode-key")
+    assert stat.S_IMODE(admission.state_path.stat().st_mode) == 0o600
+    assert not _leftover_state_temporaries(admission.state_path)
+
+
+def test_admission_state_write_failure_is_bounded_and_keeps_previous_state(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    admission = ProjectAdmission(tmp_path)
+    admission.acquire("admission-fault-first", idempotency_key="admission-fault-key-1")
+    before = admission.state_path.read_bytes()
+
+    def failing_fsync(descriptor: int) -> None:
+        raise OSError("injected fsync failure")
+
+    monkeypatch.setattr(admission_module.os, "fsync", failing_fsync)
+    # The historical contract maps every state write I/O failure to one
+    # bounded safety error without leaking the low-level message.
+    with pytest.raises(ProjectAdmissionSafetyError, match="state write failed"):
+        admission.acquire("admission-fault-second", idempotency_key="admission-fault-key-2")
+    assert admission.state_path.read_bytes() == before
+    assert not _leftover_state_temporaries(admission.state_path)
+
+
+def test_admission_state_directory_fsync_failure_fails_closed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    admission = ProjectAdmission(tmp_path)
+    real_fsync = admission_module.os.fsync
+
+    def failing_directory_fsync(descriptor: int) -> None:
+        if stat.S_ISDIR(admission_module.os.fstat(descriptor).st_mode):
+            raise OSError("injected directory fsync failure")
+        real_fsync(descriptor)
+
+    monkeypatch.setattr(admission_module.os, "fsync", failing_directory_fsync)
+    # Unlike the publication receipt's best-effort directory sync, the
+    # admission journal requires a durable rename: the failure reaches the
+    # caller as one bounded safety error.
+    with pytest.raises(ProjectAdmissionSafetyError, match="state write failed"):
+        admission.acquire("admission-dir-fsync-run", idempotency_key="admission-dir-fsync-key")
+    state = json.loads(admission.state_path.read_text(encoding="utf-8"))
+    assert "reservations" in state
+    assert not _leftover_state_temporaries(admission.state_path)
+
+
+def test_admission_state_permission_failure_keeps_previous_state(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    admission = ProjectAdmission(tmp_path)
+    admission.acquire("perm-fault-first", idempotency_key="perm-fault-key-1")
+    before = admission.state_path.read_bytes()
+
+    def failing_fchmod(descriptor: int, mode: int) -> None:
+        raise OSError(errno.EIO, "injected permission failure")
+
+    monkeypatch.setattr(admission_module.os, "fchmod", failing_fchmod)
+    # The permission correction happens on the owned temporary descriptor
+    # before publication, so the failed acquisition must not publish its
+    # reservation, retain the previous journal bytes, or consume its slot.
+    with pytest.raises(ProjectAdmissionSafetyError, match="state write failed"):
+        admission.acquire("perm-fault-second", idempotency_key="perm-fault-key-2")
+    assert admission.state_path.read_bytes() == before
+    assert not _leftover_state_temporaries(admission.state_path)
+    # Under the default two-slot limit the failed acquisition left its slot
+    # free: one live reservation plus this one is still admissible.
+    monkeypatch.undo()
+    admission.acquire("perm-fault-third", idempotency_key="perm-fault-key-3")
+    assert not _leftover_state_temporaries(admission.state_path)
+
+
+def test_admission_state_permission_failure_on_first_save_leaves_no_state(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    admission = ProjectAdmission(tmp_path)
+
+    def failing_fchmod(descriptor: int, mode: int) -> None:
+        raise OSError(errno.EIO, "injected permission failure")
+
+    monkeypatch.setattr(admission_module.os, "fchmod", failing_fchmod)
+    with pytest.raises(ProjectAdmissionSafetyError, match="state write failed"):
+        admission.acquire("perm-fault-initial", idempotency_key="perm-fault-key-initial")
+    assert not admission.state_path.exists()
+    assert not _leftover_state_temporaries(admission.state_path)
+
+
+def test_admission_state_exact_mode_at_fsync_and_rename(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Precreate the project state directory and lock under the normal mask;
+    # the observed save below must still publish exact 0o600 under a
+    # restrictive umask because the mode is set on the owned temporary
+    # descriptor before file fsync and rename.
+    admission = ProjectAdmission(tmp_path)
+    admission.acquire("umask-order-first", idempotency_key="umask-order-key-1")
+
+    real_fsync = admission_module.os.fsync
+    real_replace = admission_module.os.replace
+    file_modes_at_fsync: list[int] = []
+    source_modes_at_rename: list[int] = []
+
+    def observing_fsync(descriptor: int) -> None:
+        try:
+            info = admission_module.os.fstat(descriptor)
+            if not stat.S_ISDIR(info.st_mode):
+                file_modes_at_fsync.append(stat.S_IMODE(info.st_mode))
+        finally:
+            real_fsync(descriptor)
+
+    def observing_replace(source: Path, target: Path):
+        source_modes_at_rename.append(
+            stat.S_IMODE(admission_module.os.lstat(source).st_mode)
+        )
+        return real_replace(source, target)
+
+    monkeypatch.setattr(admission_module.os, "fsync", observing_fsync)
+    monkeypatch.setattr(admission_module.os, "replace", observing_replace)
+    old_umask = os.umask(0o777)
+    try:
+        admission.acquire("umask-order-second", idempotency_key="umask-order-key-2")
+    finally:
+        os.umask(old_umask)
+
+    assert file_modes_at_fsync
+    assert file_modes_at_fsync == [0o600] * len(file_modes_at_fsync)
+    assert source_modes_at_rename == [0o600] * len(source_modes_at_rename)
+    assert stat.S_IMODE(admission.state_path.stat().st_mode) == 0o600
+    assert not _leftover_state_temporaries(admission.state_path)
