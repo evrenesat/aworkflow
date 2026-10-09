@@ -1,5 +1,41 @@
 # DEVLOG
 
+## 2026-10-09 — fixture child reap: confirmed absence is completed cleanup
+
+- `_e2e_reap_pid` in `tests/test_exclusive_execution.py` now observes
+  liveness once before every signal attempt: a confirmed-absent child is
+  treated as completed cleanup and the helper returns without probing birth
+  or signalling. This fixes the cleanup-boundary race that failed
+  `TestManagedStopReconcileCrash::test_automatic_reconcile_controller_crash_live_child_waits`
+  on macOS/Python3.11 in CI run37867626559 (the cleanup assertion demanded a
+  present PID while liveness had already reported absent). The exact race
+  timing on macOS is not established and is not claimed here; Linux and
+  macOS 3.12 passed the same unchanged test.
+- Fail-closed behaviour is unchanged and is revalidated per signal stage:
+  for a present child with a captured birth, exact process-birth matching is
+  required before TERM and again before KILL; unknown liveness, missing
+  birth, and mismatched/reused identities raise without signalling,
+  `ProcessLookupError` remains a completed disappearance, and a stubborn
+  matching child still produces the bounded "did not cease" failure after
+  exactly one TERM and one KILL. No production code changed.
+- New `TestFixtureChildReap` focused tests use controlled liveness/birth/kill
+  observations and assert observable signals: zero signals (and no birth
+  lookup) on confirmed absence; TERM only, returning after confirmed exit;
+  no KILL when absence is observed at the escalation boundary; KILL with a
+  fresh birth check for a still-present matching child; no unsafe signal on
+  unknown/missing/mismatched identities in either signalling stage;
+  tolerated `ProcessLookupError`; and bounded failure for a stubborn child.
+  The real integration assertion (peer stays queued while the crashed
+  controller's live child owns the resource, automatic admission only after
+  confirmed cessation) is unchanged and runs on the local platform without
+  mocking the owner or broker away.
+- Verification: `uv run pytest -q tests/test_exclusive_execution.py -k
+  'FixtureChildReap or automatic_reconcile_controller_crash_live_child_waits'`
+  (12 passed) and `uv run ruff check tests/test_exclusive_execution.py`
+  both pass on the local Linux platform. The exact-SHA macOS Python3.11 CI
+  gate for the new revision remains an outstanding coordinator delivery
+  gate and is not claimed from the local Linux run.
+
 ## 2026-10-09 — owner-stopped checkpoint-review-to-final-review resume admission
 
 - A graceful owner stop that lands on the checkpoint-review-to-final-review

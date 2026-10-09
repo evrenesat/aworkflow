@@ -6862,14 +6862,20 @@ class TestManagedStopReconcileE2E:
 def _e2e_reap_pid(pid: int, birth: str | None = None) -> None:
     """Terminate a PID and wait for confirmed absence (test cleanup only).
 
-    When ``birth`` is given, the exact fixture-owned identity is revalidated
-    immediately before every signal (TERM and a later KILL); a reused or
-    unknown PID is never touched.
+    Liveness is observed once before every signal attempt: a confirmed
+    absent child is already cleaned up and the call returns without probing
+    birth or signalling.  When ``birth`` is given for a present child, the
+    exact fixture-owned identity is revalidated immediately before each
+    signal (TERM and a later KILL); an unknown liveness, missing birth, or
+    a mismatched/reused PID is never touched.
     """
     for sig in (signal.SIGTERM, signal.SIGKILL):
+        liveness = process_liveness(pid)
+        if liveness == "absent":
+            return
         if birth is not None:
-            assert process_liveness(pid) == "present" and process_birth_identity(pid) == birth, (
-                f"pid {pid} no longer carries the fixture-owned birth {birth!r}"
+            assert liveness == "present" and process_birth_identity(pid) == birth, (
+                f"pid {pid} does not carry the fixture-owned birth {birth!r}"
             )
         try:
             os.kill(pid, sig)
@@ -6878,6 +6884,184 @@ def _e2e_reap_pid(pid: int, birth: str | None = None) -> None:
         if _wait_until(lambda: process_liveness(pid) == "absent", timeout=5):
             return
     raise AssertionError(f"pid {pid} did not cease")
+
+
+class TestFixtureChildReap:
+    """Controlled-observation tests for the fixture cleanup boundary."""
+
+    def _patch(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        liveness: Callable[[int], str],
+        birth: Callable[[int], str | None],
+        kill,
+    ) -> tuple[list[tuple[int, int]], list[int]]:
+        signals: list[tuple[int, int]] = []
+        births: list[int] = []
+
+        def fake_liveness(pid, deadline=None):
+            return liveness(pid)
+
+        def fake_birth(pid):
+            births.append(pid)
+            return birth(pid)
+
+        def fake_kill(pid, sig):
+            signals.append((pid, sig))
+            kill(pid, sig)
+
+        module = sys.modules[__name__]
+        monkeypatch.setattr(module, "process_liveness", fake_liveness)
+        monkeypatch.setattr(module, "process_birth_identity", fake_birth)
+        monkeypatch.setattr(os, "kill", fake_kill)
+        # One bounded poll per wait; the fake liveness is deterministic.
+        monkeypatch.setattr(
+            module, "_wait_until", lambda predicate, timeout=20.0: predicate()
+        )
+        return signals, births
+
+    def test_confirmed_absent_before_cleanup_signals_nothing(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        signals, births = self._patch(
+            monkeypatch, lambda pid: "absent", lambda pid: "b1", lambda pid, sig: None
+        )
+        _e2e_reap_pid(4242, "b1")
+        assert signals == []
+        assert births == []
+
+    def test_matching_present_child_term_returns_after_confirmed_exit(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        state = {"live": True}
+        signals, births = self._patch(
+            monkeypatch,
+            lambda pid: "present" if state["live"] else "absent",
+            lambda pid: "b1",
+            lambda pid, sig: state.update(live=False),
+        )
+        _e2e_reap_pid(4242, "b1")
+        assert signals == [(4242, signal.SIGTERM)]
+        assert births == [4242]
+
+    def test_absence_at_escalation_boundary_avoids_kill(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # present at the TERM check, present on the post-TERM poll, then
+        # gone before the KILL-stage observation.
+        observations = iter(["present", "present", "absent"])
+        signals, _ = self._patch(
+            monkeypatch,
+            lambda pid: next(observations),
+            lambda pid: "b1",
+            lambda pid, sig: None,
+        )
+        _e2e_reap_pid(4242, "b1")
+        assert signals == [(4242, signal.SIGTERM)]
+
+    def test_still_present_matching_child_escalates_to_kill_with_fresh_birth(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        state = {"live": True}
+
+        def kill(pid, sig):
+            if sig == signal.SIGKILL:
+                state["live"] = False
+
+        signals, births = self._patch(
+            monkeypatch,
+            lambda pid: "present" if state["live"] else "absent",
+            lambda pid: "b1",
+            kill,
+        )
+        _e2e_reap_pid(4242, "b1")
+        assert signals == [(4242, signal.SIGTERM), (4242, signal.SIGKILL)]
+        # The KILL stage revalidates the fixture-owned birth before signalling.
+        assert births == [4242, 4242]
+
+    def test_unknown_liveness_does_not_signal(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        signals, _ = self._patch(
+            monkeypatch, lambda pid: "unknown", lambda pid: "b1", lambda pid, sig: None
+        )
+        with pytest.raises(AssertionError):
+            _e2e_reap_pid(4242, "b1")
+        assert signals == []
+
+    def test_missing_birth_does_not_signal(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        signals, _ = self._patch(
+            monkeypatch, lambda pid: "present", lambda pid: None, lambda pid, sig: None
+        )
+        with pytest.raises(AssertionError):
+            _e2e_reap_pid(4242, "b1")
+        assert signals == []
+
+    def test_reused_identity_does_not_signal(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        signals, _ = self._patch(
+            monkeypatch, lambda pid: "present", lambda pid: "other", lambda pid, sig: None
+        )
+        with pytest.raises(AssertionError):
+            _e2e_reap_pid(4242, "b1")
+        assert signals == []
+
+    def test_mismatched_identity_at_escalation_stage_does_not_kill(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # The identity matches for TERM, then no longer carries the fixture
+        # birth when the KILL stage revalidates it.
+        observations = iter(["present", "present", "present"])
+        births_seen = iter(["b1", "other"])
+        signals, _ = self._patch(
+            monkeypatch,
+            lambda pid: next(observations),
+            lambda pid: next(births_seen),
+            lambda pid, sig: None,
+        )
+        with pytest.raises(AssertionError):
+            _e2e_reap_pid(4242, "b1")
+        assert signals == [(4242, signal.SIGTERM)]
+
+    def test_unknown_liveness_at_escalation_stage_does_not_kill(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        observations = iter(["present", "present", "unknown"])
+        signals, _ = self._patch(
+            monkeypatch,
+            lambda pid: next(observations),
+            lambda pid: "b1",
+            lambda pid, sig: None,
+        )
+        with pytest.raises(AssertionError):
+            _e2e_reap_pid(4242, "b1")
+        assert signals == [(4242, signal.SIGTERM)]
+
+    def test_process_lookup_error_is_completed_disappearance(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        def kill(pid, sig):
+            raise ProcessLookupError
+
+        signals, _ = self._patch(
+            monkeypatch, lambda pid: "present", lambda pid: "b1", kill
+        )
+        _e2e_reap_pid(4242, "b1")
+        assert signals == [(4242, signal.SIGTERM)]
+
+    def test_stubborn_matching_child_fails_bounded(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        signals, _ = self._patch(
+            monkeypatch, lambda pid: "present", lambda pid: "b1", lambda pid, sig: None
+        )
+        with pytest.raises(AssertionError, match="did not cease"):
+            _e2e_reap_pid(4242, "b1")
+        # Bounded escalation: exactly one TERM and one KILL, never more.
+        assert signals == [(4242, signal.SIGTERM), (4242, signal.SIGKILL)]
 
 
 class TestManagedStopReconcileCrash:
