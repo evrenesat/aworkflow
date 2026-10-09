@@ -9,6 +9,7 @@ import os
 import subprocess
 import sys
 import time
+from collections.abc import Callable
 from queue import Empty
 from dataclasses import dataclass
 from pathlib import Path
@@ -20,6 +21,7 @@ from aflow.execution_resources import (
     ClaimSpec,
     ControllerIdentity,
     ExecutionResourceStore,
+    Outcome,
     ProcessEvidence,
 )
 
@@ -953,6 +955,38 @@ def _mp_spec(invocation: str) -> ClaimSpec:
     )
 
 
+def _mp_settle(
+    operation: Callable[[], Outcome],
+    *,
+    label: str,
+    deadline_seconds: float = 60.0,
+    poll_seconds: float = 0.025,
+    clock: Callable[[], float] = time.monotonic,
+    sleep: Callable[[float], None] = time.sleep,
+) -> Outcome:
+    """Repeat one fixture lifecycle operation while the journal lock is contended.
+
+    ``contended`` is a supported nonterminal store result: the same operation
+    (same owner, invocation and arguments) is retried within the fixture's
+    60-second budget and the first non-contended outcome is returned. An
+    unexpected outcome or a raised exception reaches the caller immediately,
+    so a contended journal can never crash a child as failure or masquerade
+    as a successful release.
+    """
+    deadline = clock() + deadline_seconds
+    last = operation()
+    while last.state == "contended":
+        remaining = deadline - clock()
+        if remaining <= 0:
+            raise AssertionError(
+                f"{label}: journal lock remained contended after {deadline_seconds:.1f}s "
+                f"(state={last.state}, reason={last.reason})"
+            )
+        sleep(min(poll_seconds, remaining))
+        last = operation()
+    return last
+
+
 def _mp_first_holder(args: MpArgs) -> None:
     root, resource, invocation, queue, (holding, release, released) = (
         args.root,
@@ -965,19 +999,37 @@ def _mp_first_holder(args: MpArgs) -> None:
     identity = store.current_controller_identity()
     queue.put(("A-identity", identity is not None))
     assert identity is not None
-    result = store.enqueue(resource, _mp_spec(invocation), identity)
+    result = _mp_settle(
+        lambda: store.enqueue(resource, _mp_spec(invocation), identity),
+        label="A-enqueue",
+    )
+    assert result.state == "queued"
     queue.put(("A-enqueue", result.state, result.ticket))
-    acquired = store.try_acquire(resource, invocation, identity)
+    acquired = _mp_settle(
+        lambda: store.try_acquire(resource, invocation, identity),
+        label="A-acquire",
+    )
     queue.put(("A-acquire", acquired.state))
     assert acquired.state == "acquired"
-    assert store.mark_launching(resource, invocation, identity).state == "launching"
-    assert (
-        store.register_child(resource, invocation, identity, os.getpid(), "self", os.getpid()).state
-        == "running"
+    launching = _mp_settle(
+        lambda: store.mark_launching(resource, invocation, identity),
+        label="A-launching",
     )
+    assert launching.state == "launching"
+    running = _mp_settle(
+        lambda: store.register_child(
+            resource, invocation, identity, os.getpid(), "self", os.getpid()
+        ),
+        label="A-register",
+    )
+    assert running.state == "running"
     holding.set()
     assert release.wait(timeout=60)
-    assert store.record_completion(resource, invocation, identity).state == "released"
+    release_outcome = _mp_settle(
+        lambda: store.record_completion(resource, invocation, identity),
+        label="A-release",
+    )
+    assert release_outcome.state == "released"
     released.set()
     queue.put(("A-release", "released"))
 
@@ -996,7 +1048,11 @@ def _mp_second_waiter(args: MpArgs) -> None:
     store = ExecutionResourceStore(root)
     identity = store.current_controller_identity()
     assert identity is not None
-    result = store.enqueue(resource, _mp_spec(invocation), identity)
+    result = _mp_settle(
+        lambda: store.enqueue(resource, _mp_spec(invocation), identity),
+        label="B-enqueue",
+    )
+    assert result.state == "queued"
     queue.put(("B-enqueue", result.state, result.ticket))
     started.set()
     deadline = time.monotonic() + 60
@@ -1007,11 +1063,33 @@ def _mp_second_waiter(args: MpArgs) -> None:
             acquired = outcome
             break
         time.sleep(0.025)
+    owner = None
+    if acquired is not None:
+        # Ownership evidence at acquisition: the durable journal must show B
+        # as owner, which is only possible after A's durable release cleared
+        # the owner slot. This causal assertion does not rely on A's
+        # post-release Event, so A being briefly preempted between its
+        # durable release and Event.set cannot make it flaky.
+        try:
+            journal = json.loads((Path(root) / f"{resource}.json").read_text(encoding="utf-8"))
+            owner = journal["owner"]["invocation_id"] if journal["owner"] is not None else None
+        except (OSError, ValueError, KeyError, TypeError):
+            owner = None
     queue.put(
-        ("B-acquire", acquired.state if acquired else "timeout", released.is_set() if acquired else None)
+        (
+            "B-acquire",
+            acquired.state if acquired else "timeout",
+            released.is_set() if acquired else None,
+            owner,
+        )
     )
     if acquired is not None:
-        queue.put(("B-release", store.record_completion(resource, invocation, identity).state))
+        release_outcome = _mp_settle(
+            lambda: store.record_completion(resource, invocation, identity),
+            label="B-release",
+        )
+        assert release_outcome.state == "released"
+        queue.put(("B-release", "released"))
 
 
 def _mp_independent_holder(args: MpArgs) -> None:
@@ -1025,12 +1103,23 @@ def _mp_independent_holder(args: MpArgs) -> None:
     store = ExecutionResourceStore(root)
     identity = store.current_controller_identity()
     assert identity is not None
-    result = store.enqueue(resource, _mp_spec(invocation), identity)
-    acquired = store.try_acquire(resource, invocation, identity)
+    result = _mp_settle(
+        lambda: store.enqueue(resource, _mp_spec(invocation), identity),
+        label="C-enqueue",
+    )
+    assert result.state == "queued"
+    acquired = _mp_settle(
+        lambda: store.try_acquire(resource, invocation, identity),
+        label="C-acquire",
+    )
     queue.put(("C-acquire", result.ticket, acquired.state))
     assert acquired.state == "acquired"
     holding.set()
-    assert store.record_completion(resource, invocation, identity).state == "released"
+    release_outcome = _mp_settle(
+        lambda: store.record_completion(resource, invocation, identity),
+        label="C-release",
+    )
+    assert release_outcome.state == "released"
     queue.put(("C-release", "released"))
 
 
@@ -1098,15 +1187,195 @@ def test_real_multiprocess_fifo_exclusion_and_independence(tmp_path: Path) -> No
     assert ("A-enqueue", "queued", 1) in records
     assert ("A-acquire", "acquired") in records
     assert ("B-enqueue", "queued", 2) in records
+    # A's release receipt is emitted only after a confirmed durable release.
     assert ("A-release", "released") in records
-    # B acquired only after A's confirmed release, with its own ticket.
-    assert b_acquire[1] == "acquired" and b_acquire[2] is True
+    # B acquired only after A's confirmed release, with its own ticket, and
+    # the durable journal shows B as owner at acquisition (A's release was
+    # the only thing that could have cleared the owner slot before it).
+    # The causal assertion no longer depends on A's post-release Event,
+    # which A sets only after the durable release and could be preempted
+    # before B's acquisition observes it.
+    assert b_acquire[1] == "acquired"
+    assert b_acquire[3] == "B"
     assert ("B-release", "released") in records
     assert ("C-release", "released") in records
     # The independent resource was acquired before the first holder released.
     a_release_index = records.index(("A-release", "released"))
     c_acquire_index = next(i for i, record in enumerate(records) if record[0] == "C-acquire")
     assert c_acquire_index < a_release_index
+
+
+class TestMultiprocessContentionRetry:
+    """Deterministic coverage for the fixture's contended-retry helper."""
+
+    def test_contended_then_success_repeats_identical_operation(self) -> None:
+        outcomes = [
+            Outcome("contended", reason="lock_contended"),
+            Outcome("released"),
+        ]
+        calls: list[int] = []
+
+        def op() -> Outcome:
+            calls.append(len(calls))
+            return outcomes[len(calls) - 1]
+
+        now = [0.0]
+        sleeps: list[float] = []
+
+        def sleep(seconds: float) -> None:
+            now[0] += seconds
+            sleeps.append(seconds)
+
+        result = _mp_settle(
+            op, label="A-release", clock=lambda: now[0], sleep=sleep
+        )
+        assert result.state == "released"
+        assert calls == [0, 1]
+        # One bounded poll inside the 60s budget, then the same operation
+        # returned the first non-contended outcome.
+        assert sleeps == [0.025]
+
+    def test_unexpected_outcome_is_not_retried(self) -> None:
+        calls: list[int] = []
+
+        def op() -> Outcome:
+            calls.append(len(calls))
+            return Outcome("rejected", reason="identity_conflict")
+
+        result = _mp_settle(
+            op, label="A-release", clock=lambda: 0.0, sleep=lambda _seconds: None
+        )
+        assert result.state == "rejected"
+        assert calls == [0]
+        # The caller's own terminal-state assertion fails, not a retry loop.
+        with pytest.raises(AssertionError):
+            assert result.state == "released"
+
+    def test_sustained_contention_fails_at_deadline_with_context(self) -> None:
+        calls: list[int] = []
+
+        def op() -> Outcome:
+            calls.append(len(calls))
+            return Outcome("contended", reason="lock_contended")
+
+        now = [0.0]
+
+        def sleep(seconds: float) -> None:
+            now[0] += 61.0  # jump the fake clock past the 60s deadline
+
+        with pytest.raises(AssertionError, match="A-release.*state=contended.*reason=lock_contended"):
+            _mp_settle(
+                op,
+                label="A-release",
+                deadline_seconds=60.0,
+                clock=lambda: now[0],
+                sleep=sleep,
+            )
+        assert calls == [0, 1]
+
+    def test_release_then_acquire_leaves_second_invocation_as_durable_owner(
+        self, tmp_path: Path
+    ) -> None:
+        # Documents the multiprocess parent's causal assertion: after A's
+        # durable release, B's acquisition leaves B as the durable journal
+        # owner. This store-ownership evidence (plus A's durable release
+        # receipt) proves release-before-acquisition without depending on
+        # A's post-release Event, which A sets only after the durable write.
+        store = make_store(tmp_path)
+        a = make_controller()
+        b = make_controller(2000)
+        assert store.enqueue(RESOURCE_A, make_spec("A"), a).state == "queued"
+        assert store.try_acquire(RESOURCE_A, "A", a).state == "acquired"
+        assert store.record_completion(RESOURCE_A, "A", a).state == "released"
+        assert store.enqueue(RESOURCE_A, make_spec("B"), b).state == "queued"
+        assert store.try_acquire(RESOURCE_A, "B", b).state == "acquired"
+        journal = read_journal(tmp_path, RESOURCE_A)
+        assert journal["owner"]["invocation_id"] == "B"
+
+    def test_raised_exception_propagates(self) -> None:
+        def op() -> Outcome:
+            raise RuntimeError("boom")
+
+        with pytest.raises(RuntimeError, match="boom"):
+            _mp_settle(
+                op, label="A-release", clock=lambda: 0.0, sleep=lambda _seconds: None
+            )
+
+    @pytest.mark.parametrize(
+        "waiting_outcome",
+        [
+            Outcome("contended", reason="lock_contended"),
+            Outcome("queued", ticket=2, reason="busy"),
+        ],
+        ids=["contended", "queued"],
+    )
+    def test_second_waiter_timeout_emits_receipt_without_owner(
+        self, monkeypatch: pytest.MonkeyPatch, waiting_outcome: Outcome
+    ) -> None:
+        # B's bounded acquisition loop can expire while every supported
+        # waiting outcome keeps the resource unavailable. The timeout path
+        # must emit its ordinary four-field receipt without touching the
+        # acquisition-only owner evidence or attempting completion.
+        class FakeEvent:
+            def __init__(self) -> None:
+                self._value = False
+
+            def wait(self, timeout: float | None = None) -> bool:
+                return self._value
+
+            def set(self) -> None:
+                self._value = True
+
+            def is_set(self) -> bool:
+                return self._value
+
+        class FakeQueue:
+            def __init__(self) -> None:
+                self.records: list[tuple] = []
+
+            def put(self, record: tuple) -> None:
+                self.records.append(record)
+
+        class FakeStore:
+            def __init__(self, root: str) -> None:
+                self.root = root
+
+            def current_controller_identity(self) -> object:
+                return make_controller(1001)
+
+            def enqueue(self, resource: str, spec: ClaimSpec, identity: object) -> Outcome:
+                return Outcome("queued", ticket=2)
+
+            def try_acquire(self, resource: str, invocation: str, identity: object) -> Outcome:
+                return waiting_outcome
+
+            def record_completion(self, *args: object, **kwargs: object) -> Outcome:
+                raise AssertionError("B must not attempt completion after a timeout")
+
+        holding = FakeEvent()
+        holding.set()
+        started = FakeEvent()
+        queue = FakeQueue()
+        now = [0.0]
+
+        with monkeypatch.context() as patch:
+            patch.setattr(
+                "tests.test_execution_resources.ExecutionResourceStore", FakeStore
+            )
+            patch.setattr(time, "monotonic", lambda: now[0])
+            # One acquisition attempt, then the next poll jump runs the fake
+            # clock past the existing 60-second deadline; no real waiting.
+            patch.setattr(time, "sleep", lambda seconds: now.__setitem__(0, now[0] + 61.0))
+            _mp_second_waiter(
+                MpArgs("/tmp/mp-timeout", RESOURCE_A, "B", queue, (holding, started, FakeEvent(), FakeEvent()))
+            )
+
+        assert started.is_set()
+        assert queue.records == [
+            ("B-enqueue", "queued", 2),
+            ("B-acquire", "timeout", None, None),
+        ]
+        assert not any(record[0] == "B-release" for record in queue.records)
 
 
 def test_real_default_store_root_is_under_config_home(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:

@@ -1,5 +1,62 @@
 # DEVLOG
 
+## 2026-10-09 — multiprocess fixture respects transient journal lock contention (test-only)
+
+- CI 37880564817 at 05ca3c6e failed macOS
+  `tests/test_execution_resources.py::
+  test_real_multiprocess_fifo_exclusion_and_independence` because
+  `_mp_first_holder` asserted `record_completion(...).state == "released"`
+  directly. The store contract treats `contended` (journal lock briefly held
+  by a sibling process) as a supported nonterminal result, so the assertion
+  crashed the A child and `a_released` timed out after 60s. No production
+  change: this is a fixture misuse of a documented result.
+- Added `_mp_settle` in `tests/test_execution_resources.py`: repeats the same
+  operation (same owner/invocation/arguments) while the outcome is
+  `contended`, within the existing 60-second fixture budget with 25 ms bounded
+  polling on `time.monotonic`. It returns the first non-contended outcome
+  unchanged; unexpected terminal outcomes and raised exceptions reach the
+  caller immediately, and a deadline failure names the operation and last
+  outcome/reason. The clock and sleep are injectable, so the new
+  `TestMultiprocessContentionRetry` class proves retry, no-retry-on-unexpected,
+  deadline diagnostics, and exception propagation with a fake clock (no real
+  60-second waits).
+- All fixture lifecycle mutations that assumed immediate success
+  (`_mp_first_holder`, `_mp_second_waiter`, `_mp_independent_holder`:
+  enqueue/try_acquire/mark_launching/register_child/record_completion) now go
+  through `_mp_settle` and explicitly assert their expected terminal states,
+  so A/B/C release receipts and B enrollment readiness are published only
+  after confirmed durable outcomes. B's existing bounded waiting-acquisition
+  loop (which already tolerates `contended` and `queued` waiting states) is
+  unchanged.
+- The parent's release-before-acquisition assertion no longer depends on A's
+  post-release Event, which A sets only after the durable release and could
+  theoretically be preempted before B's acquisition observes it. B now records
+  durable journal ownership evidence at acquisition; the parent asserts the
+  confirmed `("A-release", "released")` receipt plus B being the durable
+  owner, with B's ticket (2) still ordered after A's (1). Mutual exclusion is
+  unchanged (B can only acquire while no owner exists); documented by the
+  deterministic `test_release_then_acquire_leaves_second_invocation_as_durable_owner`.
+- Checks (Linux, worktree at 39c9dfc5): `uv run pytest
+  tests/test_execution_resources.py -q -k 'MultiprocessContentionRetry or
+  real_multiprocess_fifo_exclusion_and_independence'`, `uv run ruff check
+  tests/test_execution_resources.py`, `git diff --check`. Proof kept under
+  `/tmp/mp-release-contention-fixture-ci-20261009-proof`. Cross-platform CI
+  (macOS) remains a separate delivery gate.
+- Review repair (same plan, repair overlay cp01-v01): `_mp_second_waiter` initialized `owner` only inside the
+  successful-acquisition branch, but the acquisition receipt always read it.
+  When the bounded waiting loop expired (supported `contended`/`queued`
+  outcomes until the 60-second deadline), the child raised
+  `UnboundLocalError` and lost its `("B-acquire", "timeout", None, None)`
+  receipt. `owner = None` now precedes the branch; journal reads stay
+  acquisition-only, and the timeout path still emits no B-release and no
+  completion call. Added the deterministic
+  `TestMultiprocessContentionRetry::
+  test_second_waiter_timeout_emits_receipt_without_owner` (fake store/queue/
+  events, fake monotonic clock, parameterized over both waiting outcomes) so
+  the timeout receipt is proven without any real 60-second wait. Re-ran the
+  focused pytest filter, Ruff, and `git diff --check` against the repaired
+  state; evidence appended to the same proof log.
+
 ## 2026-10-09 — configuration fixture repair: portable EIO path and clean zcode fixture repo
 
 - CI 37875182064 (4d88e447) and 37875345919 (3bfd998c) failed the reviewed
