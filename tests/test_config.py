@@ -2,6 +2,7 @@ from dataclasses import asdict
 from hashlib import sha256
 import errno
 import json
+import os
 import pytest
 import tomllib
 
@@ -2399,3 +2400,257 @@ class TestRenderStarterDocuments:
             render_starter_documents(initial_workflow="../escape")
         with pytest.raises(ConfigError, match="workflow-safe name"):
             render_starter_documents(initial_team="bad name")
+
+
+# ---------------------------------------------------------------------------
+# AFLOW-MAINT-20261006-03 checkpoint 1: parse_workflow_pair pure shared path
+# ---------------------------------------------------------------------------
+
+
+def test_parse_workflow_pair_matches_filesystem_loader_for_valid_pair(
+    tmp_path: Path,
+) -> None:
+    from aflow.config import ConfigError, load_workflow_config, parse_workflow_pair
+
+    pair_dir = tmp_path / "pair"
+    pair_dir.mkdir()
+    (pair_dir / "aflow.toml").write_text(OLD_AFLOW, encoding="utf-8")
+    (pair_dir / "workflows.toml").write_text(OLD_WORKFLOWS, encoding="utf-8")
+    loaded = load_workflow_config(pair_dir / "aflow.toml")
+    parsed = parse_workflow_pair(
+        OLD_AFLOW, OLD_WORKFLOWS, source_dir=pair_dir
+    )
+    assert parsed == loaded
+    assert parsed.aflow.default_workflow == "simple"
+    assert "simple" in parsed.workflows
+
+
+def test_parse_workflow_pair_missing_sibling_stays_distinguishable_from_empty(
+    tmp_path: Path,
+) -> None:
+    from aflow.config import load_workflow_config, parse_workflow_pair
+
+    # A self-valid aflow document (no workflow reference) so the pair is
+    # semantic-valid without its sibling.
+    lone_aflow = OLD_AFLOW.replace('default_workflow = "simple"\n', "")
+
+    # Absent sibling: the filesystem loader over a lone aflow.toml.
+    lone_dir = tmp_path / "lone"
+    lone_dir.mkdir()
+    (lone_dir / "aflow.toml").write_text(lone_aflow, encoding="utf-8")
+    assert parse_workflow_pair(lone_aflow, None, source_dir=lone_dir) == (
+        load_workflow_config(lone_dir / "aflow.toml")
+    )
+
+    # Present empty sibling: the filesystem loader over an empty file.
+    empty_dir = tmp_path / "empty"
+    empty_dir.mkdir()
+    (empty_dir / "aflow.toml").write_text(lone_aflow, encoding="utf-8")
+    (empty_dir / "workflows.toml").write_text("", encoding="utf-8")
+    assert parse_workflow_pair(lone_aflow, "", source_dir=empty_dir) == (
+        load_workflow_config(empty_dir / "aflow.toml")
+    )
+
+    # Both supported sibling states agree for an equivalent pair.
+    assert parse_workflow_pair(
+        lone_aflow, None, source_dir=lone_dir
+    ) == parse_workflow_pair(lone_aflow, "", source_dir=empty_dir)
+
+
+def test_parse_workflow_pair_reports_syntax_line_errors_per_document(
+    tmp_path: Path,
+) -> None:
+    from aflow.config import ConfigError, load_workflow_config, parse_workflow_pair
+
+    bad_aflow = "a = 1\nb = \n"
+    with pytest.raises(ConfigError) as text_exc:
+        parse_workflow_pair(bad_aflow, OLD_WORKFLOWS, source_dir=tmp_path)
+    assert "invalid TOML in aflow.toml" in str(text_exc.value)
+    assert "line 2" in str(text_exc.value)
+
+    with pytest.raises(ConfigError):
+        parse_workflow_pair(OLD_AFLOW, "a = 1\nb = \n", source_dir=tmp_path)
+    with pytest.raises(ConfigError) as sibling_exc:
+        parse_workflow_pair(OLD_AFLOW, "a = 1\nb = \n", source_dir=tmp_path)
+    assert "invalid TOML in workflows.toml" in str(sibling_exc.value)
+
+    # The filesystem loader reports the identical bounded diagnostics.
+    pair_dir = tmp_path / "pair"
+    pair_dir.mkdir()
+    (pair_dir / "aflow.toml").write_text(bad_aflow, encoding="utf-8")
+    with pytest.raises(ConfigError) as file_exc:
+        load_workflow_config(pair_dir / "aflow.toml")
+    assert str(text_exc.value) == str(file_exc.value)
+
+
+def test_parse_workflow_pair_cross_document_missing_prompt_matches_loader(
+    tmp_path: Path,
+) -> None:
+    from aflow.config import ConfigError, load_workflow_config, parse_workflow_pair
+
+    bad_workflows = OLD_WORKFLOWS.replace('prompts = ["p"]', 'prompts = ["missing"]')
+    with pytest.raises(ConfigError) as text_exc:
+        parse_workflow_pair(OLD_AFLOW, bad_workflows, source_dir=tmp_path)
+    assert "references unknown prompt 'missing'" in str(text_exc.value)
+
+    pair_dir = tmp_path / "pair"
+    pair_dir.mkdir()
+    (pair_dir / "aflow.toml").write_text(OLD_AFLOW, encoding="utf-8")
+    (pair_dir / "workflows.toml").write_text(bad_workflows, encoding="utf-8")
+    with pytest.raises(ConfigError) as file_exc:
+        load_workflow_config(pair_dir / "aflow.toml")
+    assert str(text_exc.value) == str(file_exc.value)
+
+
+def test_parse_workflow_pair_relative_root_uses_source_dir(tmp_path: Path) -> None:
+    from aflow.config import load_workflow_config, parse_workflow_pair
+
+    relative_aflow = OLD_AFLOW.replace(
+        'default_workflow = "simple"',
+        'default_workflow = "simple"\nworktree_root = "trees"',
+    )
+    parsed = parse_workflow_pair(
+        relative_aflow, OLD_WORKFLOWS, source_dir=tmp_path
+    )
+    # The relative root anchors lexically against the source directory; the
+    # expected value is the lexical absolute path, not a resolved symlink.
+    assert parsed.aflow.worktree_root == os.path.abspath(str(tmp_path / "trees"))
+
+    # The filesystem loader anchors the same relative root against the
+    # selected source directory.
+    pair_dir = tmp_path / "pair"
+    pair_dir.mkdir()
+    (pair_dir / "aflow.toml").write_text(relative_aflow, encoding="utf-8")
+    (pair_dir / "workflows.toml").write_text(OLD_WORKFLOWS, encoding="utf-8")
+    loaded = load_workflow_config(pair_dir / "aflow.toml")
+    assert loaded.aflow.worktree_root == os.path.abspath(str(pair_dir / "trees"))
+
+    # Absolute and ~ roots stay unchanged.
+    for root in ("/abs/root", "~/roots"):
+        absolute_aflow = OLD_AFLOW.replace(
+            'default_workflow = "simple"',
+            f'default_workflow = "simple"\nworktree_root = "{root}"',
+        )
+        assert (
+            parse_workflow_pair(
+                absolute_aflow, OLD_WORKFLOWS, source_dir=tmp_path
+            ).aflow.worktree_root
+            == root
+        )
+
+
+def _relative_root_aflow() -> str:
+    return OLD_AFLOW.replace(
+        'default_workflow = "simple"',
+        'default_workflow = "simple"\nworktree_root = "trees"',
+    )
+
+
+def test_parse_workflow_pair_relative_root_anchors_without_filesystem(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A relative root anchors lexically: no destination filesystem access."""
+    import tempfile
+
+    from aflow.config import parse_workflow_pair
+
+    # tmp_path is a real, absolute directory. Spying on destination reads
+    # (lstat/stat/readlink) and on the creation primitives used by earlier
+    # candidate validation proves the pure parser touches no filesystem.
+    destination_reads: list[str] = []
+
+    def _spy(name: str, func):
+        def _wrapper(*args: object, **kwargs: object) -> object:
+            destination_reads.append(name)
+            return func(*args, **kwargs)
+
+        return _wrapper
+
+    monkeypatch.setattr(os, "lstat", _spy("os.lstat", os.lstat), raising=True)
+    monkeypatch.setattr(os, "stat", _spy("os.stat", os.stat), raising=True)
+    monkeypatch.setattr(os, "readlink", _spy("os.readlink", os.readlink), raising=True)
+    created: list[str] = []
+
+    def deny_create(*args: object, **kwargs: object) -> object:
+        created.append("create")
+        raise AssertionError("parse_workflow_pair touched the filesystem")
+
+    monkeypatch.setattr(Path, "write_text", deny_create, raising=True)
+    monkeypatch.setattr(tempfile, "TemporaryDirectory", deny_create, raising=True)
+
+    parsed = parse_workflow_pair(
+        _relative_root_aflow(), OLD_WORKFLOWS, source_dir=tmp_path
+    )
+    assert parsed.aflow.worktree_root == os.path.abspath(str(tmp_path / "trees"))
+    assert created == []
+    # The source directory is never stat'ed, lstat'ed, or readlink'ed, and
+    # neither is the anchored root (which does not exist on disk).
+    assert destination_reads == []
+
+
+def test_parse_workflow_pair_relative_root_ignores_symlink_target(
+    tmp_path: Path,
+) -> None:
+    """The anchored root does not depend on a destination symlink target."""
+    from aflow.config import parse_workflow_pair
+
+    trees = tmp_path / "trees"
+    target_a = tmp_path / "target-a"
+    target_b = tmp_path / "target-b"
+    target_a.mkdir()
+    target_b.mkdir()
+
+    trees.symlink_to(target_a)
+    first = parse_workflow_pair(
+        _relative_root_aflow(), OLD_WORKFLOWS, source_dir=tmp_path
+    ).aflow.worktree_root
+
+    trees.unlink()
+    trees.symlink_to(target_b)
+    second = parse_workflow_pair(
+        _relative_root_aflow(), OLD_WORKFLOWS, source_dir=tmp_path
+    ).aflow.worktree_root
+
+    # Identical text and source_dir give the same lexical root regardless of
+    # where the destination symlink points; the target is never followed.
+    assert first == second
+    assert first == os.path.abspath(str(tmp_path / "trees"))
+
+
+def test_parse_workflow_pair_escaped_nul_root_anchors_without_os_call(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A TOML-escaped NUL in the root value does not reach an OS call."""
+    from aflow.config import parse_workflow_pair
+
+    # The TOML source contains the escape sequence \\u0000 (six characters),
+    # which decodes to an embedded NUL in the parsed value. The raw document
+    # has no literal NUL byte, so the bounds check passes and the parser must
+    # anchor lexically without dereferencing the NUL-laden path.
+    escaped_nul_aflow = OLD_AFLOW.replace(
+        'default_workflow = "simple"',
+        'default_workflow = "simple"\nworktree_root = "trees\\u0000tail"',
+    )
+    assert "\\u0000" in escaped_nul_aflow
+    assert "\x00" not in escaped_nul_aflow
+
+    os_calls: list[str] = []
+
+    def _spy(name: str, func):
+        def _wrapper(*args: object, **kwargs: object) -> object:
+            os_calls.append(name)
+            return func(*args, **kwargs)
+
+        return _wrapper
+
+    monkeypatch.setattr(os, "lstat", _spy("os.lstat", os.lstat), raising=True)
+    monkeypatch.setattr(os, "stat", _spy("os.stat", os.stat), raising=True)
+    monkeypatch.setattr(os, "readlink", _spy("os.readlink", os.readlink), raising=True)
+
+    parsed = parse_workflow_pair(
+        escaped_nul_aflow, OLD_WORKFLOWS, source_dir=tmp_path
+    )
+    # The anchored root carries the decoded NUL verbatim; no OS call is made.
+    assert "\x00" in parsed.aflow.worktree_root
+    assert parsed.aflow.worktree_root.startswith(os.path.abspath(str(tmp_path)))
+    assert os_calls == []

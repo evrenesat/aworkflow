@@ -2,8 +2,9 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import re
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from importlib import resources
 from pathlib import Path
 from collections.abc import Mapping
@@ -1317,38 +1318,78 @@ def resolve_team_config(
     )
 
 
-def _parse_config_pair(path: Path) -> WorkflowUserConfig:
-    """Parse and validate the pair at ``path``.
+AFLOW_TOP_LEVEL_KEYS = frozenset(
+    {"aflow", "harness", "roles", "teams", "prompts", "error_handling", "manager"}
+)
+WORKFLOWS_TOP_LEVEL_KEYS = frozenset({"workflow"})
 
-    The caller has selected ``path`` and holds the pair lock for the whole
-    read, having completed recovery for any pending transaction.
+
+def _resolve_relative_worktree_root(
+    config: WorkflowUserConfig, source_dir: Path
+) -> WorkflowUserConfig:
+    """Anchor a relative ``[aflow].worktree_root`` against ``source_dir``.
+
+    Absolute and ``~`` roots are unchanged; the schema-defined relative root
+    anchors lexically against the selected source directory, never a
+    temporary one.  This is pure path string normalization: it keeps the
+    ``.``/``..`` lexical normalization and the selected directory as the base
+    without resolving symlink targets or inspecting the root or its
+    ancestors.  A relative ``source_dir`` is made absolute against the
+    current working directory.  Actual lifecycle path resolution (including
+    symlink resolution) happens separately in :mod:`aflow.workflow`.
+    """
+    worktree_root = config.aflow.worktree_root
+    if (
+        worktree_root is None
+        or worktree_root.startswith("~")
+        or Path(worktree_root).is_absolute()
+    ):
+        return config
+    return replace(
+        config,
+        aflow=replace(
+            config.aflow,
+            worktree_root=os.path.abspath(str(source_dir / worktree_root)),
+        ),
+    )
+
+
+def parse_workflow_pair(
+    aflow_text: str,
+    workflows_text: str | None,
+    *,
+    source_dir: str | Path,
+) -> WorkflowUserConfig:
+    """Purely parse and semantically validate one configuration pair.
+
+    ``workflows_text`` is ``None`` when the sibling document is absent; a
+    present sibling (even an empty one) is parsed and merged.  Relative
+    ``[aflow].worktree_root`` values resolve against ``source_dir``, never a
+    temporary directory.  This performs no filesystem access: the filesystem
+    loader reads the documents and delegates here, and submitted-text
+    validation calls this directly, so both inputs share one parse and one
+    semantic validation pass.
     """
     try:
-        with path.open("rb") as handle:
-            raw = tomllib.load(handle)
+        raw = tomllib.loads(aflow_text)
     except tomllib.TOMLDecodeError as exc:
-        raise ConfigError(f"invalid TOML in {path}: {exc}") from exc
-    except OSError as exc:
-        raise ConfigError(f"unable to read config file {path}: {exc}") from exc
-    sibling_path = path.with_name("workflows.toml")
-    aflow_allowed_top_level_keys = {"aflow", "harness", "roles", "teams", "prompts", "error_handling", "manager"}
-    if sibling_path.exists():
-        config = _parse_workflow_user_config(
-            raw, path=path, allowed_top_level_keys=aflow_allowed_top_level_keys
-        )
+        raise ConfigError(f"invalid TOML in aflow.toml: {exc}") from exc
+    config = _parse_workflow_user_config(
+        raw,
+        path=Path("aflow.toml"),
+        allowed_top_level_keys=AFLOW_TOP_LEVEL_KEYS,
+    )
+    if workflows_text is None:
+        merged = config
+    else:
         try:
-            with sibling_path.open("rb") as handle:
-                sibling_raw = tomllib.load(handle)
+            sibling_raw = tomllib.loads(workflows_text)
         except tomllib.TOMLDecodeError as exc:
-            raise ConfigError(
-                f"invalid TOML in {sibling_path}: {exc}"
-            ) from exc
-        except OSError as exc:
-            raise ConfigError(
-                f"unable to read config file {sibling_path}: {exc}"
-            ) from exc
+            raise ConfigError(f"invalid TOML in workflows.toml: {exc}") from exc
         sibling_config = _parse_workflow_user_config(
-            sibling_raw, path=sibling_path, allowed_top_level_keys={"workflow"}
+            sibling_raw,
+            path=Path("workflows.toml"),
+            allowed_top_level_keys=WORKFLOWS_TOP_LEVEL_KEYS,
         )
         merged = WorkflowUserConfig(
             aflow=config.aflow,
@@ -1361,14 +1402,43 @@ def _parse_config_pair(path: Path) -> WorkflowUserConfig:
             workflows={**config.workflows, **sibling_config.workflows},
             prompts={**config.prompts, **sibling_config.prompts},
         )
-    else:
-        merged = _parse_workflow_user_config(
-            raw, path=path, allowed_top_level_keys=aflow_allowed_top_level_keys
-        )
     errors = validate_workflow_config(merged)
     if errors:
         raise ConfigError("; ".join(errors))
-    return merged
+    return _resolve_relative_worktree_root(merged, Path(source_dir))
+
+
+def _parse_config_pair(path: Path) -> WorkflowUserConfig:
+    """Parse and validate the pair at ``path``.
+
+    The caller has selected ``path`` and holds the pair lock for the whole
+    read, having completed recovery for any pending transaction.  Both
+    document reads stay in this filesystem wrapper; TOML parsing, the
+    sibling merge, and the single semantic validation pass delegate to
+    :func:`parse_workflow_pair` with the selected directory as the
+    relative-root source.
+    """
+    try:
+        with path.open("rb") as handle:
+            aflow_bytes = handle.read()
+    except OSError as exc:
+        raise ConfigError(f"unable to read config file {path}: {exc}") from exc
+    sibling_path = path.with_name("workflows.toml")
+    workflows_text: str | None = None
+    if sibling_path.exists():
+        try:
+            with sibling_path.open("rb") as handle:
+                workflows_bytes = handle.read()
+        except OSError as exc:
+            raise ConfigError(
+                f"unable to read config file {sibling_path}: {exc}"
+            ) from exc
+        workflows_text = workflows_bytes.decode("utf-8")
+    return parse_workflow_pair(
+        aflow_bytes.decode("utf-8"),
+        workflows_text,
+        source_dir=path.parent,
+    )
 
 
 def load_workflow_config(

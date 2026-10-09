@@ -5,28 +5,37 @@ The service owns exactly two documents per registered project,
 reads or writes another project file, never starts or stops workflow units,
 and does not gate a valid save on the state or historical configuration of a
 workflow run.
+
+The configuration exception types, report shapes, revision and bounds
+helpers, and the in-memory candidate validator live in
+:mod:`aflow_app_server.config_validation`; this module re-exports them so
+the compatibility import path keeps working.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime, timezone
-import hashlib
 import json
 import os
 from pathlib import Path
 import re
 import stat as stat_module
 import tempfile
-import tomllib
 
-from aflow.config import (
-    ConfigError,
-    find_placeholders,
-    load_workflow_config,
-    validate_workflow_config,
+from .config_validation import (
+    CONFIG_DOCUMENT_NAMES,
+    MAX_CONFIG_DOCUMENT_BYTES,
+    MAX_ISSUE_MESSAGE_CHARS,  # noqa: F401  compatibility re-export
+    MAX_VALIDATION_ISSUES,
+    ConfigValidationIssue,  # noqa: F401  compatibility re-export
+    ConfigValidationReport,
+    ProjectConfigError,
+    ProjectConfigRevisionConflict,
+    check_document_text,  # noqa: F401  compatibility re-export
+    combined_revision,
+    validate_candidate_pair,
 )
-
 from .control_plane_service import (
     ControlPlaneService,
     ControlPlaneUnavailableError,
@@ -35,47 +44,8 @@ from .control_plane_service import (
 from .project_registry import ProjectRegistry, ProjectRegistryError
 
 
-CONFIG_DOCUMENT_NAMES = ("aflow.toml", "workflows.toml")
-MAX_CONFIG_DOCUMENT_BYTES = 256 * 1024
-MAX_VALIDATION_ISSUES = 20
-MAX_ISSUE_MESSAGE_CHARS = 300
 _AUDIT_SCHEMA_VERSION = 1
-_TOML_LINE_RE = re.compile(r"line (\d+)")
-
 _DOCUMENT_HEX_RE = re.compile(r"^[0-9a-f]{64}$")
-
-
-class ProjectConfigError(RuntimeError):
-    """A bounded, actionable project configuration failure."""
-
-
-class ProjectConfigRevisionConflict(ProjectConfigError):
-    """The submitted expected revision no longer matches the committed pair."""
-
-    def __init__(self, current_revision: str) -> None:
-        super().__init__("configuration revision does not match the committed revision")
-        self.current_revision = current_revision
-
-
-@dataclass(frozen=True)
-class ConfigValidationIssue:
-    """One bounded diagnostic; messages never contain filesystem paths."""
-
-    document: str | None
-    line: int | None
-    message: str
-
-
-@dataclass(frozen=True)
-class ConfigValidationReport:
-    """Combined-pair validation summary with parsed, bounded names only."""
-
-    state: str  # "ready" | "configuration_required" | "invalid"
-    issues: tuple[ConfigValidationIssue, ...]
-    placeholders: tuple[str, ...]
-    workflows: tuple[str, ...]
-    teams: tuple[str, ...]
-    roles: tuple[str, ...]
 
 
 @dataclass(frozen=True)
@@ -95,130 +65,6 @@ def document_path(config_dir: Path, name: str) -> Path:
     if name not in CONFIG_DOCUMENT_NAMES:
         raise ProjectConfigError("unsupported configuration document name")
     return config_dir / name
-
-
-def combined_revision(aflow_bytes: bytes, workflows_bytes: bytes) -> str:
-    """Compute the compare-and-swap revision over the exact pair bytes."""
-    digest = hashlib.sha256()
-    digest.update(b"aflow.toml\x00")
-    digest.update(aflow_bytes)
-    digest.update(b"\x00workflows.toml\x00")
-    digest.update(workflows_bytes)
-    return digest.hexdigest()
-
-
-def _bounded_message(message: str) -> str:
-    collapsed = " ".join(message.split())
-    if len(collapsed) > MAX_ISSUE_MESSAGE_CHARS:
-        return collapsed[:MAX_ISSUE_MESSAGE_CHARS] + "[truncated]"
-    return collapsed
-
-
-def _line_number(message: str) -> int | None:
-    match = _TOML_LINE_RE.search(message)
-    return int(match.group(1)) if match else None
-
-
-def _syntax_issue(name: str, text: str) -> ConfigValidationIssue | None:
-    try:
-        tomllib.loads(text)
-    except tomllib.TOMLDecodeError as exc:
-        message = str(exc)
-        return ConfigValidationIssue(
-            document=name,
-            line=_line_number(message),
-            message=_bounded_message(message),
-        )
-    return None
-
-
-def _candidate_load_issue(temporary: Path, exc: ConfigError) -> ConfigValidationIssue:
-    """Sanitize one production loader failure into a bounded diagnostic."""
-    raw = str(exc)
-    document: str | None = None
-    for name in CONFIG_DOCUMENT_NAMES:
-        if str(temporary / name) in raw:
-            document = name
-            break
-    message = raw
-    for name in CONFIG_DOCUMENT_NAMES:
-        message = message.replace(str(temporary / name), name)
-    message = message.replace(str(temporary), "<candidate>")
-    return ConfigValidationIssue(
-        document=document,
-        line=_line_number(message),
-        message=_bounded_message(message),
-    )
-
-
-def check_document_text(name: str, text: str) -> bytes:
-    """Apply candidate size and content bounds before any parse or write."""
-    if not isinstance(text, str):
-        raise ProjectConfigError(f"{name} must be UTF-8 text")
-    try:
-        payload = text.encode("utf-8")
-    except UnicodeEncodeError as exc:  # pragma: no cover - str is always encodable
-        raise ProjectConfigError(f"{name} is not valid UTF-8 text") from exc
-    if len(payload) > MAX_CONFIG_DOCUMENT_BYTES:
-        raise ProjectConfigError(f"{name} exceeds the maximum supported size")
-    if "\x00" in text:
-        raise ProjectConfigError(f"{name} must not contain NUL characters")
-    return payload
-
-
-def validate_candidate_pair(
-    aflow_text: str, workflows_text: str
-) -> ConfigValidationReport:
-    """Validate both candidate documents together through the production loader."""
-    check_document_text("aflow.toml", aflow_text)
-    check_document_text("workflows.toml", workflows_text)
-    issues: list[ConfigValidationIssue] = []
-    for name, text in (("aflow.toml", aflow_text), ("workflows.toml", workflows_text)):
-        issue = _syntax_issue(name, text)
-        if issue is not None:
-            issues.append(issue)
-    config = None
-    if not issues:
-        with tempfile.TemporaryDirectory(prefix="aflow-project-config-") as temporary:
-            temp_dir = Path(temporary)
-            (temp_dir / "aflow.toml").write_text(aflow_text, encoding="utf-8")
-            (temp_dir / "workflows.toml").write_text(workflows_text, encoding="utf-8")
-            try:
-                config = load_workflow_config(temp_dir / "aflow.toml")
-            except ConfigError as exc:
-                issues.append(_candidate_load_issue(temp_dir, exc))
-            if config is not None:
-                # The production loader already enforces semantic validation;
-                # the explicit pass keeps diagnostics structured if that
-                # enforcement ever moves behind a flag.
-                for message in validate_workflow_config(config):
-                    issues.append(
-                        ConfigValidationIssue(
-                            document=None,
-                            line=None,
-                            message=_bounded_message(message),
-                        )
-                    )
-    issues = issues[:MAX_VALIDATION_ISSUES]
-    if issues:
-        return ConfigValidationReport(
-            state="invalid",
-            issues=tuple(issues),
-            placeholders=(),
-            workflows=(),
-            teams=(),
-            roles=(),
-        )
-    assert config is not None
-    placeholders = tuple(find_placeholders(config))
-    return ConfigValidationReport(
-        state="configuration_required" if placeholders else "ready",
-        issues=(),
-        placeholders=placeholders,
-        workflows=tuple(sorted(config.workflows)),
-        teams=tuple(sorted(config.teams)),
-        roles=tuple(sorted(config.roles)),
-    )
 
 
 def _fsync_directory(path: Path) -> None:
