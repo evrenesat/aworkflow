@@ -1200,3 +1200,252 @@ def test_run_metadata_drops_malformed_historical_confirmation(
     payload = json.loads(paths.run_json.read_text(encoding="utf-8"))
     assert payload["status"] == "running"
     assert "defect_confirmation" not in payload
+
+
+# -- checkpoint 1: runlog paths on the shared file primitives ---------------
+
+import errno
+import stat
+
+import aflow.runlog as runlog_module
+from aflow.runlog import (
+    _write_atomic_bytes,
+    _write_atomic_json,
+    write_repartition_artifact,
+)
+
+
+def _leftover_temporaries(path: Path) -> list[Path]:
+    prefix = f".{path.name}."
+    if not path.parent.exists():
+        return []
+    return [entry for entry in path.parent.iterdir() if entry.name.startswith(prefix)]
+
+
+def test_repartition_artifact_creates_new_file_durally(tmp_path: Path) -> None:
+    target = tmp_path / "proposal.json"
+    write_repartition_artifact(target, {"decision": 1})
+    assert json.loads(target.read_text(encoding="utf-8")) == {"decision": 1}
+    assert not _leftover_temporaries(target)
+
+
+def test_repartition_artifact_rejects_existing_without_change(tmp_path: Path) -> None:
+    target = tmp_path / "proposal.json"
+    target.write_text('{"decision": 1}\n', encoding="utf-8")
+    original = target.read_bytes()
+    with pytest.raises(FileExistsError, match="already exists"):
+        write_repartition_artifact(target, {"decision": 2})
+    assert target.read_bytes() == original
+    assert not _leftover_temporaries(target)
+
+
+def test_repartition_artifact_fsync_failure_leaves_no_artifact(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    target = tmp_path / "proposal.json"
+
+    def failing_fsync(descriptor: int) -> None:
+        raise OSError("injected fsync failure")
+
+    monkeypatch.setattr(runlog_module.os, "fsync", failing_fsync)
+    with pytest.raises(OSError, match="injected fsync failure"):
+        write_repartition_artifact(target, {"decision": 1})
+    assert not target.exists()
+    assert not _leftover_temporaries(target)
+
+
+def test_repartition_artifact_publish_failure_leaves_no_artifact(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    target = tmp_path / "proposal.json"
+
+    def failing_link(source: Path, destination: Path) -> None:
+        raise OSError("injected publish failure")
+
+    monkeypatch.setattr(runlog_module.os, "link", failing_link)
+    with pytest.raises(OSError, match="injected publish failure"):
+        write_repartition_artifact(target, {"decision": 1})
+    assert not target.exists()
+    assert not _leftover_temporaries(target)
+
+
+def test_repartition_artifact_directory_fsync_failure_propagates(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    target = tmp_path / "proposal.json"
+    monkeypatch.setattr(
+        runlog_module,
+        "fsync_directory",
+        lambda path: (_ for _ in ()).throw(OSError("injected directory fsync failure")),
+    )
+    with pytest.raises(OSError, match="injected directory fsync failure"):
+        write_repartition_artifact(target, {"decision": 1})
+    # The publish already happened; the artifact stays.
+    assert target.read_text(encoding="utf-8") == '{\n  "decision": 1\n}\n'
+
+
+def test_run_metadata_publish_failure_preserves_previous_bytes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    writer, paths, plan_path = _writer(tmp_path)
+    writer.write(status="running", original_plan_path=plan_path)
+    before = paths.run_json.read_bytes()
+
+    def failing_replace(source: Path, destination: Path) -> None:
+        raise OSError("injected publish failure")
+
+    monkeypatch.setattr(runlog_module.os, "replace", failing_replace)
+    with pytest.raises(OSError, match="injected publish failure"):
+        writer.write(status="completed", original_plan_path=plan_path)
+    assert paths.run_json.read_bytes() == before
+    assert not _leftover_temporaries(paths.run_json)
+
+
+@pytest.mark.parametrize(
+    ("write", "first", "second"),
+    [
+        (
+            lambda path, payload: _write_atomic_json(path, payload),
+            {"state": 1},
+            {"state": 2},
+        ),
+        (
+            lambda path, payload: _write_atomic_bytes(path, payload),
+            b"old",
+            b"new",
+        ),
+    ],
+    ids=["json", "bytes"],
+)
+def test_runlog_directory_open_failure_is_tolerated(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, write, first, second
+) -> None:
+    target = tmp_path / "state"
+    write(target, first)
+    real_open = runlog_module.os.open
+
+    def failing_directory_open(path, flags, *args):
+        if Path(path).is_dir() and not (flags & runlog_module.os.O_WRONLY):
+            raise OSError(errno.EACCES, "injected directory open failure")
+        return real_open(path, flags, *args)
+
+    monkeypatch.setattr(runlog_module.os, "open", failing_directory_open)
+    # Historical contract: a directory that cannot be opened read-only
+    # does not fail the already-published runlog write.
+    write(target, second)
+    expected = (
+        runlog_module._json_dump(second).encode("utf-8")
+        if isinstance(second, dict)
+        else second
+    )
+    assert target.read_bytes() == expected
+    assert not _leftover_temporaries(target)
+
+
+@pytest.mark.parametrize(
+    ("write", "first", "second"),
+    [
+        (
+            lambda path, payload: _write_atomic_json(path, payload),
+            {"state": 1},
+            {"state": 2},
+        ),
+        (
+            lambda path, payload: _write_atomic_bytes(path, payload),
+            b"old",
+            b"new",
+        ),
+    ],
+    ids=["json", "bytes"],
+)
+def test_runlog_directory_fsync_failure_propagates(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, write, first, second
+) -> None:
+    target = tmp_path / "state"
+    write(target, first)
+    real_fsync = runlog_module.os.fsync
+    real_close = runlog_module.os.close
+    raised_fds: list[int] = []
+    closed_fds: list[int] = []
+
+    def failing_directory_fsync(descriptor: int) -> None:
+        if stat.S_ISDIR(runlog_module.os.fstat(descriptor).st_mode):
+            raised_fds.append(descriptor)
+            raise OSError(errno.EIO, "injected directory fsync failure")
+        real_fsync(descriptor)
+
+    def tracking_close(descriptor: int) -> None:
+        closed_fds.append(descriptor)
+        real_close(descriptor)
+
+    monkeypatch.setattr(runlog_module.os, "fsync", failing_directory_fsync)
+    monkeypatch.setattr(runlog_module.os, "close", tracking_close)
+    # A directory that opened must sync; its failure reaches the caller
+    # with the new file still published and the descriptor closed.
+    with pytest.raises(OSError, match="injected directory fsync failure"):
+        write(target, second)
+    expected = (
+        runlog_module._json_dump(second).encode("utf-8")
+        if isinstance(second, dict)
+        else second
+    )
+    assert raised_fds
+    assert all(fd in closed_fds for fd in raised_fds)
+    assert target.read_bytes() == expected
+    assert not _leftover_temporaries(target)
+
+
+def test_run_metadata_directory_fsync_failure_propagates(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    writer, paths, plan_path = _writer(tmp_path)
+    real_fsync = runlog_module.os.fsync
+
+    def failing_directory_fsync(descriptor: int) -> None:
+        if stat.S_ISDIR(runlog_module.os.fstat(descriptor).st_mode):
+            raise OSError(errno.EIO, "injected directory fsync failure")
+        real_fsync(descriptor)
+
+    monkeypatch.setattr(runlog_module.os, "fsync", failing_directory_fsync)
+    with pytest.raises(OSError, match="injected directory fsync failure"):
+        writer.write(status="running", original_plan_path=plan_path)
+    payload = json.loads(paths.run_json.read_text(encoding="utf-8"))
+    assert payload["status"] == "running"
+    assert not _leftover_temporaries(paths.run_json)
+
+
+def test_atomic_runlog_write_fsync_failure_preserves_previous_bytes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    target = tmp_path / "artifact.bin"
+    _write_atomic_bytes(target, b"old")
+    _write_atomic_json(target, {"state": 1})
+
+    def failing_fsync(descriptor: int) -> None:
+        raise OSError("injected fsync failure")
+
+    monkeypatch.setattr(runlog_module.os, "fsync", failing_fsync)
+    with pytest.raises(OSError, match="injected fsync failure"):
+        _write_atomic_bytes(target, b"new")
+    with pytest.raises(OSError, match="injected fsync failure"):
+        _write_atomic_json(target, {"state": 2})
+    assert json.loads(target.read_text(encoding="utf-8")) == {"state": 1}
+    assert not _leftover_temporaries(target)
+
+
+def test_evidence_store_publish_failure_leaves_no_destination(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    paths = _evidence_paths(tmp_path)
+    destination = runlog_module.evidence_artifact_path(
+        paths, "plan", hashlib.sha256(b"body").hexdigest()
+    )
+
+    def failing_replace(source: Path, destination_path: Path) -> None:
+        raise OSError("injected publish failure")
+
+    monkeypatch.setattr(runlog_module.os, "replace", failing_replace)
+    with pytest.raises(OSError, match="injected publish failure"):
+        store_evidence_artifact(paths, kind="plan", data=b"body")
+    assert not destination.exists()
+    assert not _leftover_temporaries(destination)

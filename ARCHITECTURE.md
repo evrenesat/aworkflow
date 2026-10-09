@@ -1307,7 +1307,10 @@ Persists run data under `.aflow/runs/<timestamp>-<uuid>/`:
 - `create_run_paths()` also writes `.aflow/last_run_id` immediately after the run directory is created, and writes `.aflow/last_run_ids/<shell-id>` when a stable shell/session id is available, so later `aflow analyze` invocations can prefer shell-local state without losing the repo-wide fallback if the workflow fails mid-run.
 
 `run.json` is written through a sibling temporary file, flushed and fsynced,
-then replaced in the same directory. It records the current configuration
+then replaced in the same directory. The audited byte operations behind this
+and the other persistence callers live in `aflow/file_io.py`; the
+[persistence primitives note](docs/persistence-primitives.md) records each
+caller's publish, mode, and directory-fsync contract. It records the current configuration
 source used at each boundary and may retain a launch-time fingerprint for
 diagnostics; runtime reloads the current pair rather than treating that copy as
 authority. Accepted override digests are durable before routing changes, rejected digests produce

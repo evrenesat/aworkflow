@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import Any, Literal, Mapping
 from uuid import uuid4
 
+from .file_io import atomic_replace_file, create_exclusive_file, fsync_directory
 from .plan import PlanSnapshot
 from .recovery import build_recovery_payload
 from .run_state import (
@@ -134,54 +135,36 @@ def _write_json(path: Path, payload: dict[str, object]) -> None:
     path.write_text(_json_dump(payload), encoding="utf-8")
 
 
+def _sync_runlog_directory(path: Path) -> None:
+    """Synchronize a published runlog directory with open-only tolerance.
+
+    Historical runlog contract: a failure to open the directory read-only
+    (some platforms) does not fail an already-published write, but a
+    directory that opened successfully must sync and close; fsync and
+    close failures propagate to the caller.
+    """
+    try:
+        descriptor = os.open(path, os.O_RDONLY)
+    except OSError:
+        return
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
 def _write_atomic_json(path: Path, payload: dict[str, object]) -> None:
     """Durably replace one JSON file without exposing a partial write."""
     path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = path.with_name(f".{path.name}.{uuid4().hex}.tmp")
-    try:
-        with temporary.open("w", encoding="utf-8") as handle:
-            handle.write(_json_dump(payload))
-            handle.flush()
-            os.fsync(handle.fileno())
-        os.replace(temporary, path)
-        try:
-            directory_fd = os.open(path.parent, os.O_RDONLY)
-        except OSError:
-            return
-        try:
-            os.fsync(directory_fd)
-        finally:
-            os.close(directory_fd)
-    finally:
-        try:
-            temporary.unlink()
-        except FileNotFoundError:
-            pass
+    atomic_replace_file(path, _json_dump(payload).encode("utf-8"))
+    _sync_runlog_directory(path.parent)
 
 
 def _write_atomic_bytes(path: Path, payload: bytes) -> None:
     """Durably replace one byte artifact without exposing a partial write."""
     path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = path.with_name(f".{path.name}.{uuid4().hex}.tmp")
-    try:
-        with temporary.open("wb") as handle:
-            handle.write(payload)
-            handle.flush()
-            os.fsync(handle.fileno())
-        os.replace(temporary, path)
-        try:
-            directory_fd = os.open(path.parent, os.O_RDONLY)
-        except OSError:
-            return
-        try:
-            os.fsync(directory_fd)
-        finally:
-            os.close(directory_fd)
-    finally:
-        try:
-            temporary.unlink()
-        except FileNotFoundError:
-            pass
+    atomic_replace_file(path, payload)
+    _sync_runlog_directory(path.parent)
 
 
 def manager_decision_paths(paths: RunPaths, decision_number: int) -> ManagerDecisionPaths:
@@ -475,23 +458,8 @@ def write_repartition_artifact(
         payload = content.encode("utf-8")
     else:
         payload = content
-    temporary = path.with_name(f".{path.name}.{uuid4().hex}.tmp")
-    try:
-        with temporary.open("xb") as handle:
-            handle.write(payload)
-            handle.flush()
-            os.fsync(handle.fileno())
-        os.replace(temporary, path)
-        directory_fd = os.open(path.parent, os.O_RDONLY)
-        try:
-            os.fsync(directory_fd)
-        finally:
-            os.close(directory_fd)
-    finally:
-        try:
-            temporary.unlink()
-        except FileNotFoundError:
-            pass
+    create_exclusive_file(path, payload)
+    fsync_directory(path.parent)
 
 
 def _aflow_dir(repo_root: Path) -> Path:
@@ -931,7 +899,7 @@ def store_evidence_artifact(
     are verified and reused; mismatched bytes are never overwritten.
     """
     digest = hashlib.sha256(data).hexdigest()
-    kind_dir = _ensure_evidence_kind_dir(paths, kind)
+    _ensure_evidence_kind_dir(paths, kind)
     destination = evidence_artifact_path(paths, kind, digest)
     if destination.exists():
         _validate_evidence_destination(paths, kind, destination)
@@ -941,18 +909,7 @@ def store_evidence_artifact(
                 "existing evidence artifact bytes do not match their filename digest"
             )
         return evidence_reference(paths, kind, digest, len(existing))
-    temporary = kind_dir / f".{digest}.{uuid4().hex}.tmp"
-    try:
-        with temporary.open("wb") as handle:
-            handle.write(data)
-            handle.flush()
-            os.fsync(handle.fileno())
-        os.replace(temporary, destination)
-    finally:
-        try:
-            temporary.unlink()
-        except FileNotFoundError:
-            pass
+    atomic_replace_file(destination, data)
     _validate_evidence_destination(paths, kind, destination)
     return evidence_reference(paths, kind, digest, len(data))
 
