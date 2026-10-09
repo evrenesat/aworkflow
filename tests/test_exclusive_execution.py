@@ -6674,6 +6674,365 @@ def _e2e_launch_waiter(
     return proc
 
 
+def _e2e_waiter_enrollment(
+    store_root: Path,
+    resource: str,
+    owner_run_id: str,
+    trees: dict[str, Path],
+) -> dict[str, int] | None:
+    """Durable-enrollment barrier for the pre-stop FIFO boundary.
+
+    Returns ``{label: ticket}`` only when every intended waiter's run
+    record carries a valid positive ticket with the matching resource and
+    invocation identity AND the resource journal's owner is still the
+    captured original owner with exactly one well-formed queue claim per
+    waiter whose ticket and invocation identity match the waiter's own
+    durable wait record.  Incomplete enrollment (absent wait, ticketless
+    lock-contended wait, missing claim) returns ``None``; a malformed or
+    foreign claim, an identity mismatch, a duplicate claim, or a replaced
+    owner raises ``AssertionError`` instead of silently waiting.
+    """
+    waits: dict[str, dict] = {}
+    for label, tree in trees.items():
+        dirs = _run_dirs(tree)
+        wait = _run_json(dirs[0]).get("execution_resource_wait") if dirs else None
+        if not isinstance(wait, dict):
+            return None
+        ticket = wait.get("ticket")
+        invocation = wait.get("invocation_id")
+        if (
+            wait.get("resource") != resource
+            or not isinstance(invocation, str)
+            or not invocation
+            or not isinstance(ticket, int)
+            or isinstance(ticket, bool)
+            or ticket < 1
+        ):
+            return None
+        waits[label] = wait
+
+    path = store_root / f"{resource}.json"
+    if not path.is_file():
+        return None
+    journal = json.loads(path.read_text(encoding="utf-8"))
+    owner = journal.get("owner")
+    assert isinstance(owner, dict) and owner.get("run_id") == owner_run_id, (
+        "the journal owner is not the captured original owner"
+    )
+    assert owner.get("status") == "running" and owner.get("child_pid") is not None, (
+        "the original owner must still be bound before the stop barrier"
+    )
+    queue = journal.get("queue")
+    assert isinstance(queue, list), "the resource journal carries no queue"
+    claims: dict[str, dict] = {}
+    for claim in queue:
+        assert isinstance(claim, dict), "malformed journal claim"
+        ticket = claim.get("ticket")
+        fields = (claim.get(key) for key in ("project_root", "run_id", "invocation_id"))
+        assert all(isinstance(value, str) for value in fields), (
+            "malformed journal claim identity"
+        )
+        assert (
+            isinstance(ticket, int)
+            and not isinstance(ticket, bool)
+            and ticket >= 1
+        ), f"malformed journal claim ticket: {claim!r}"
+        label = next(
+            (
+                known
+                for known in trees
+                if f"waiter-{known}" in claim["project_root"]
+            ),
+            None,
+        )
+        assert label is not None, (
+            f"foreign journal claim outside the intended waiters: {claim!r}"
+        )
+        assert label not in claims, f"duplicate journal claim for {label}"
+        assert claim["invocation_id"] == waits[label]["invocation_id"], (
+            f"journal claim invocation does not match {label}'s wait record"
+        )
+        assert ticket == waits[label]["ticket"], (
+            f"journal claim ticket does not match {label}'s wait record"
+        )
+        claims[label] = claim
+    if len(claims) != len(trees):
+        return None
+    return {label: claim["ticket"] for label, claim in claims.items()}
+
+
+def _e2e_wait_for_waiter_enrollment(
+    store_root: Path,
+    resource: str,
+    owner_run_id: str,
+    trees: dict[str, Path],
+    trace: object,
+    events: list[object],
+) -> dict[str, int]:
+    """Bounded enrollment wait that retains the accepted snapshot.
+
+    Polls :func:`_e2e_waiter_enrollment` inside the bounded wait and
+    stores the first complete ``{label: ticket}`` dictionary; that
+    accepted snapshot is returned as observed.  An already-enrolled
+    waiter can legitimately publish a ticketless wait record when its
+    next admission pass hits journal-lock contention, so a later
+    ticketless run record must not invalidate the snapshot and no
+    unguarded reread follows the successful observation.
+    """
+    enrollment: dict[str, int] | None = None
+
+    def _enrolled() -> bool:
+        nonlocal enrollment
+        _e2e_drain_trace(trace, events)
+        assert not any(e[0] == "error" for e in events), events
+        observed = _e2e_waiter_enrollment(
+            store_root, resource, owner_run_id, trees
+        )
+        if observed is not None:
+            enrollment = observed
+        return enrollment is not None
+
+    assert _wait_until(_enrolled), events
+    assert enrollment is not None and len(enrollment) == 2, enrollment
+    return enrollment
+
+
+class TestFifoTicketBarrier:
+    """The pre-stop barrier requires durable tickets, not mere waiting."""
+
+    RESOURCE = "test.fifo-barrier"
+    OWNER_RUN = "owner-run-1"
+
+    def _claim(self, label: str, ticket: int, invocation: str | None = None, **overrides) -> dict:
+        claim = {
+            "status": "queued",
+            "project_root": f"/tree/waiter-{label}",
+            "run_id": f"run-{label}",
+            "invocation_id": invocation if invocation is not None else f"inv-{label}",
+            "kind": "turn",
+            "role": "main",
+            "selector": "codex.base",
+            "ticket": ticket,
+            "controller": {"pid": 1, "birth": "b", "boot": "boot"},
+            "child_pid": None,
+            "child_birth": None,
+            "process_group": None,
+        }
+        claim.update(overrides)
+        return claim
+
+    def _fixture(
+        self,
+        tmp_path: Path,
+        *,
+        waits: dict[str, dict | None],
+        queue: list[object],
+    ) -> tuple[Path, dict[str, Path]]:
+        store_root = tmp_path / "store"
+        store_root.mkdir()
+        (store_root / f"{self.RESOURCE}.json").write_text(
+            json.dumps({
+                "version": 1,
+                "resource": self.RESOURCE,
+                "revision": 1,
+                "next_ticket": 3,
+                "owner": {
+                    "status": "running",
+                    "project_root": "/tree/owner",
+                    "run_id": self.OWNER_RUN,
+                    "invocation_id": "inv-owner",
+                    "kind": "turn",
+                    "role": "main",
+                    "selector": "codex.base",
+                    "ticket": 1,
+                    "controller": {"pid": 2, "birth": "b", "boot": "boot"},
+                    "child_pid": 42,
+                    "child_birth": "b42",
+                    "process_group": 42,
+                },
+                "queue": queue,
+            }),
+            encoding="utf-8",
+        )
+        trees: dict[str, Path] = {}
+        for label in ("W1", "W2"):
+            tree = tmp_path / f"waiter-{label}"
+            run_dir = tree / ".aflow" / "runs" / f"run-{label}"
+            run_dir.mkdir(parents=True)
+            record: dict = {"run_id": f"run-{label}"}
+            record["execution_resource_wait"] = waits[label]
+            (run_dir / "run.json").write_text(
+                json.dumps(record), encoding="utf-8"
+            )
+            trees[label] = tree
+        return store_root, trees
+
+    def _enrollment(self, store_root: Path, trees: dict[str, Path]):
+        return _e2e_waiter_enrollment(
+            store_root, self.RESOURCE, self.OWNER_RUN, trees
+        )
+
+    @staticmethod
+    def _wait(label: str, ticket: int | None, invocation: str | None = None) -> dict:
+        return {
+            "version": 1,
+            "resource": TestFifoTicketBarrier.RESOURCE,
+            "label": label,
+            "invocation_id": invocation if invocation is not None else f"inv-{label}",
+            "kind": "turn",
+            "role": "main",
+            "selector": "codex.base",
+            "step": "work",
+            "ticket": ticket,
+            "wait_started_at": "t0",
+        }
+
+    def test_absent_wait_is_not_ready(self, tmp_path: Path) -> None:
+        store_root, trees = self._fixture(
+            tmp_path, waits={"W1": None, "W2": None}, queue=[]
+        )
+        assert self._enrollment(store_root, trees) is None
+
+    def test_ticketless_lock_contended_wait_is_not_ready(self, tmp_path: Path) -> None:
+        store_root, trees = self._fixture(
+            tmp_path,
+            waits={"W1": self._wait("W1", None), "W2": self._wait("W2", 2)},
+            queue=[self._claim("W2", 2)],
+        )
+        assert self._enrollment(store_root, trees) is None
+
+    def test_single_enrolled_claim_is_not_ready(self, tmp_path: Path) -> None:
+        store_root, trees = self._fixture(
+            tmp_path,
+            waits={"W1": self._wait("W1", 2), "W2": self._wait("W2", 3)},
+            queue=[self._claim("W1", 2)],
+        )
+        assert self._enrollment(store_root, trees) is None
+
+    def test_matching_durable_claims_are_ready_in_ticket_order(self, tmp_path: Path) -> None:
+        # W2 holds the smaller ticket: launch order must not decide the head.
+        store_root, trees = self._fixture(
+            tmp_path,
+            waits={"W1": self._wait("W1", 3), "W2": self._wait("W2", 2)},
+            queue=[
+                self._claim("W1", 3),
+                self._claim("W2", 2),
+            ],
+        )
+        enrollment = self._enrollment(store_root, trees)
+        assert enrollment == {"W1": 3, "W2": 2}
+        head, tail = sorted(enrollment, key=enrollment.__getitem__)
+        assert (head, tail) == ("W2", "W1")
+
+    def test_retained_snapshot_survives_later_ticketless_record(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # The polling helper must retain the accepted enrollment snapshot
+        # even when the enrollment observer's next observation regresses a
+        # wait record to ticketless (the supported lock-contended
+        # transition), instead of discarding it and rereading unguarded.
+        # W2 holds the smaller ticket: the snapshot must still decide the
+        # head in ticket order.
+        store_root, trees = self._fixture(
+            tmp_path,
+            waits={"W1": self._wait("W1", 3), "W2": self._wait("W2", 2)},
+            queue=[
+                self._claim("W1", 3),
+                self._claim("W2", 2),
+            ],
+        )
+        real = _e2e_waiter_enrollment
+        observed: list[object] = []
+
+        def _observer(*args: object) -> dict[str, int] | None:
+            result = real(*args)
+            if result is not None:
+                wait_path = (
+                    trees["W2"] / ".aflow" / "runs" / "run-W2" / "run.json"
+                )
+                record = json.loads(wait_path.read_text(encoding="utf-8"))
+                record["execution_resource_wait"]["ticket"] = None
+                wait_path.write_text(json.dumps(record), encoding="utf-8")
+            observed.append(result)
+            return result
+
+        monkeypatch.setattr(
+            sys.modules[__name__], "_e2e_waiter_enrollment", _observer
+        )
+        trace = queue.Queue()
+        events: list[object] = []
+        enrollment = _e2e_wait_for_waiter_enrollment(
+            store_root, self.RESOURCE, self.OWNER_RUN, trees, trace, events
+        )
+        assert enrollment == {"W1": 3, "W2": 2}
+        head, tail = sorted(enrollment, key=enrollment.__getitem__)
+        assert (head, tail) == ("W2", "W1")
+        # The accepted snapshot is retained: a subsequent direct
+        # observation now sees the ticketless record and returns None,
+        # and the successful polling observation was not repeated after
+        # success.
+        assert real(store_root, self.RESOURCE, self.OWNER_RUN, trees) is None
+        assert observed == [{"W1": 3, "W2": 2}]
+
+    def test_wrong_resource_wait_is_not_ready(self, tmp_path: Path) -> None:
+        store_root, trees = self._fixture(
+            tmp_path,
+            waits={
+                "W1": {**self._wait("W1", 2), "resource": "other.resource"},
+                "W2": self._wait("W2", 3),
+            },
+            queue=[self._claim("W1", 2), self._claim("W2", 3)],
+        )
+        assert self._enrollment(store_root, trees) is None
+
+    def test_malformed_claim_ticket_fails_closed(self, tmp_path: Path) -> None:
+        store_root, trees = self._fixture(
+            tmp_path,
+            waits={"W1": self._wait("W1", 2), "W2": self._wait("W2", 3)},
+            queue=[self._claim("W1", 0), self._claim("W2", 3)],
+        )
+        with pytest.raises(AssertionError, match="malformed"):
+            self._enrollment(store_root, trees)
+
+    def test_foreign_claim_fails_closed(self, tmp_path: Path) -> None:
+        store_root, trees = self._fixture(
+            tmp_path,
+            waits={"W1": self._wait("W1", 2), "W2": self._wait("W2", 3)},
+            queue=[
+                self._claim("W1", 2),
+                self._claim("W2", 3),
+                self._claim("W3", 4),
+            ],
+        )
+        with pytest.raises(AssertionError, match="foreign"):
+            self._enrollment(store_root, trees)
+
+    def test_identity_mismatch_fails_closed(self, tmp_path: Path) -> None:
+        store_root, trees = self._fixture(
+            tmp_path,
+            waits={"W1": self._wait("W1", 2), "W2": self._wait("W2", 3)},
+            queue=[
+                self._claim("W1", 2, invocation="inv-other"),
+                self._claim("W2", 3),
+            ],
+        )
+        with pytest.raises(AssertionError, match="invocation"):
+            self._enrollment(store_root, trees)
+
+    def test_replaced_owner_fails_closed(self, tmp_path: Path) -> None:
+        store_root, trees = self._fixture(
+            tmp_path,
+            waits={"W1": self._wait("W1", 2), "W2": self._wait("W2", 3)},
+            queue=[self._claim("W1", 2), self._claim("W2", 3)],
+        )
+        journal_path = store_root / f"{self.RESOURCE}.json"
+        journal = json.loads(journal_path.read_text(encoding="utf-8"))
+        journal["owner"]["run_id"] = "somebody-else"
+        journal_path.write_text(json.dumps(journal), encoding="utf-8")
+        with pytest.raises(AssertionError, match="original owner"):
+            self._enrollment(store_root, trees)
+
+
 class TestManagedStopReconcileE2E:
     def test_automatic_reconcile_managed_stop_grants_fifo_head(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
@@ -6713,26 +7072,47 @@ class TestManagedStopReconcileE2E:
                     config_path, store_root, label, gates[label],
                     predecessor=predecessor,
                 )
-            # Both waiters must be queued behind the managed owner.
+            # Both waiters must be durably queued behind the managed owner:
+            # a ticketless lock-contended wait is a valid intermediate
+            # state, not enrollment, so the barrier requires each waiter's
+            # own positive ticket with the matching resource and invocation
+            # identity before the stop may proceed.
+            trees = {label: tmp_path / f"waiter-{label}" for label in ("W1", "W2")}
             for label in ("W1", "W2"):
                 def _waiting(lbl=label) -> bool:
                     _e2e_drain_trace(trace, events)
                     assert not any(e[0] == "error" for e in events), events
-                    dirs = _run_dirs(tmp_path / f"waiter-{lbl}")
-                    return bool(dirs) and _run_json(dirs[0]).get(
-                        "execution_resource_wait") is not None
+                    dirs = _run_dirs(trees[lbl])
+                    wait = (
+                        _run_json(dirs[0]).get("execution_resource_wait")
+                        if dirs else None
+                    )
+                    if not isinstance(wait, dict):
+                        return False
+                    ticket = wait.get("ticket")
+                    return (
+                        wait.get("resource") == resource
+                        and isinstance(wait.get("invocation_id"), str)
+                        and bool(wait["invocation_id"])
+                        and isinstance(ticket, int)
+                        and not isinstance(ticket, bool)
+                        and ticket >= 1
+                    )
 
                 assert _wait_until(_waiting), events
-            # Identify the FIFO head/tail from the journal; the two spawned
-            # waiters race to enqueue, so ticket order (not launch order) is
-            # the contract under test.
-            journal = json.loads((store_root / f"{resource}.json").read_text())
-            queued = [str(claim.get("project_root")) for claim in journal["queue"]]
-            assert len(queued) == 2, queued
-            head_label = next(
-                label for label in ("W1", "W2") if f"waiter-{label}" in queued[0]
+            # Identify the FIFO head/tail from the accepted durable
+            # enrollment snapshot; the two spawned waiters race to
+            # enqueue, so ticket order (not launch order) is the contract
+            # under test.  The snapshot is retained from inside the bounded
+            # wait, so a later ticketless run record cannot invalidate it;
+            # a malformed or foreign claim fails immediately instead of
+            # silently waiting.
+            enrollment = _e2e_wait_for_waiter_enrollment(
+                store_root, resource, run_id, trees, trace, events
             )
-            tail_label = "W2" if head_label == "W1" else "W1"
+            head_label, tail_label = sorted(
+                enrollment, key=enrollment.__getitem__
+            )
             # The managed stop ends the owned group and the FIFO head acquires
             # automatically, with no direct reconcile call in this test.
             stopped = daemon.service.owner_stop(run_id, expected_revision=0)

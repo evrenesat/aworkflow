@@ -32,6 +32,65 @@
   CI matrix for the new revision remains an outstanding coordinator delivery
   gate.
 
+## 2026-10-09 — managed-stop FIFO fixture: barrier now requires durable tickets
+
+- CI37875345919 at3bfd998c (macOS Python3.11) failed
+  `TestManagedStopReconcileE2E::test_automatic_reconcile_managed_stop_grants_fifo_head`
+  with only waiter W1 visible in the journal after both run records exposed
+  `execution_resource_wait`. Root cause: the pre-stop barrier keyed only on
+  the wait record's presence. Production
+  `ExecutionResourceAdmission.admit` intentionally publishes
+  `on_waiting(reason, ticket=None)` when the journal lock is contended and
+  only enqueues (and publishes the ticket) on the retry, so a ticketless
+  wait record does not prove durable enqueue. No production defect is
+  claimed; the exact scheduler timing on macOS was not captured and is not
+  asserted here.
+- `tests/test_exclusive_execution.py` now requires the state the case
+  asserts. The per-waiter predicate demands a positive integer ticket with
+  the matching resource and a non-empty invocation identity from each
+  waiter's actual run record (trace draining and immediate child-error
+  failure unchanged; the bounded `_wait_until` budgets are unchanged). The
+  pre-stop journal boundary uses the new `_e2e_waiter_enrollment` barrier,
+  which rereads the resource journal and returns the `{label: ticket}` map
+  only when the owner is still the captured original owner and the queue
+  holds exactly one well-formed claim per intended waiter whose ticket and
+  invocation identity match the waiter's own durable wait record. Incomplete
+  enrollment (absent wait, ticketless lock-contended wait, missing claim)
+  returns `None`; a malformed or foreign claim, an identity mismatch, a
+  duplicate claim, or a replaced owner raises immediately. The integration
+  now drives this barrier through the narrow
+  `_e2e_wait_for_waiter_enrollment` polling helper, which retains the
+  first successful `{label: ticket}` snapshot from inside the bounded
+  wait, validates its exact two-entry length, and returns it without an
+  unguarded reread: an already-enrolled waiter can legitimately publish
+  `ticket=None` when its next admission pass hits journal-lock
+  contention, and that later ticketless run record must not invalidate
+  the accepted snapshot. Head/tail are derived from ticket order
+  (smallest ticket is head) on the retained snapshot. All subsequent real
+  owner-stop, predecessor-cessation, head/tail and non-overlap checks are
+  unchanged, and no manual reconcile call was introduced.
+- New `TestFifoTicketBarrier` regression exercises the barrier behaviorally
+  against durable run/journal state (no broker or controller mocking):
+  absent wait, ticketless lock-contended wait, wrong-resource wait, and a
+  single enrolled claim are all unready; two matching durable claims are
+  ready with ticket-order head/tail selection; malformed tickets, foreign
+  claims, invocation mismatches, and a replaced owner fail closed. A new
+  deterministic regression wraps the enrollment observer so that its next
+  observation regresses one wait record to ticketless immediately after
+  the first successful snapshot: the polling helper must return the
+  accepted two-ticket snapshot with ticket-order head/tail even though a
+  subsequent direct observation now returns `None`, and the successful
+  observation must not be repeated after success.
+- Verification: `uv run pytest -q tests/test_exclusive_execution.py -k
+  'ManagedStopReconcileE2E or ManagedStopReconcileCrash or FifoTicketBarrier'`
+  (12 passed, including the new snapshot-retention regression) and
+  `uv run ruff check tests/test_exclusive_execution.py` both pass on the
+  local Linux platform; compact proof in
+  /tmp/aflow-fifo-ticket-ci-20261009-cp1/. No production code changed.
+  The exact-SHA macOS Python3.11 CI gate for the new combined revision
+  remains an outstanding coordinator delivery gate and is not claimed from
+  the local Linux run.
+
 ## 2026-10-09 — fixture child reap: confirmed absence is completed cleanup
 
 - `_e2e_reap_pid` in `tests/test_exclusive_execution.py` now observes
