@@ -776,6 +776,25 @@ class PendingCumulativeReview:
 
 
 @dataclass(frozen=True)
+class FailedWorkerCheckpointReview:
+    """Verified failed worker evidence whose checklist advance requires checkpoint review.
+
+    The source worker turn exited unsuccessfully after proving its checkpoint
+    checklist advance.  The original scope stays open (awaiting review) with
+    its immutable envelope; the successor's first provider invocation must be
+    the bound checkpoint reviewer.  Checkboxes are implementation evidence,
+    never review approval, and the truthful worker returncode is carried for
+    the reviewer prompt.
+    """
+
+    source_run_dir: Path
+    worker_turn_number: int
+    worker_step_name: str
+    reviewer_step_name: str
+    worker_returncode: int
+
+
+@dataclass(frozen=True)
 class ResumeContext:
     resumed_from_run_id: str
     feature_branch: str | None
@@ -802,6 +821,11 @@ class ResumeContext:
     last_manager_report_path: str | None = None
     pending_finalized_turn: PendingFinalizedTurn | None = None
     pending_cumulative_review: PendingCumulativeReview | None = None
+    # A validated failed worker whose proven checklist advance requires the
+    # configured checkpoint review before any later worker or delivery.  The
+    # original scope is retained awaiting review with its envelope; this field
+    # binds the immutable failed worker receipt for the resumed reviewer.
+    failed_worker_review: FailedWorkerCheckpointReview | None = None
     review_repair_step: str | None = None
     # A failed terminal source whose last turn is a proven finalized
     # unsuccessful reviewer receipt with the original awaiting-review scope

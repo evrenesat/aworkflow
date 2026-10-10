@@ -142,6 +142,7 @@ from .recovery import (
 )
 from .run_state import ActiveImplementationScope, CheckpointRepartitionRecord, ControllerConfig, ControllerRunResult, ControllerState, ExecutionContext, FinalizedTurnBoundary, FrozenRunIdentity, HarnessRecoveryAction, HarnessRecoveryContext, ImplementationAttempt, IssueRecord, ManagerDecisionSummary, OverrideResult, PendingBoundaryDecision, PendingFinalizedTurn, PendingManagerNotes, PendingRepartitionV1, PendingTeamOverride, RecoverySessionContext, RetryContext, ResumeContext, ReviewRejectionRecord, TurnRecord, WorkflowEndReason, _resume_context_validation_marker, format_harness_model_display, load_override_request, merge_accepted_override_choices
 from .control_plane.validation import ControlValidationError, validate_override_targets
+from .resume_relocation import ResumeRelocation, prepare_resume_relocation
 from .hotplug import (
     HarnessSessionRefV1, HotplugTransactionV1, bounded_hotplug_history,
     build_handover_context_v1, render_controller_handover,
@@ -4622,6 +4623,235 @@ def _worker_receipt_is_finalized_worker(
     return True
 
 
+def _worker_receipt_is_failed_worker(
+    result: Mapping[str, object],
+    *,
+    turn_number: int,
+    step_name: str | None,
+    expected_plan: str | None,
+    owner_meta: Mapping[str, object] | None = None,
+    scope_checkpoint_index: int | None = None,
+    selector: str | None = None,
+    scope_snapshot: PlanSnapshot | None = None,
+    relocation: ResumeRelocation | None = None,
+) -> bool:
+    """Validate the original strict failed-worker proof retained through lineage.
+
+    A descendant reviewer retry may rebind only the exact strictly validated
+    failed-worker ancestor.  The receipt must reproduce the proof the initial
+    admission required, using the ancestor's saved evidence (never a
+    descendant's current plan state): the exact selected turn and worker step,
+    a worker role, a transport failure (``harness-failed`` with a nonzero
+    integer return code and no chosen transition/transition condition),
+    terminal conditions (``NEW_PLAN_EXISTS`` and ``MAX_TURNS_REACHED`` false
+    and ``DONE`` matching the proven after-snapshot), a decodable
+    before-snapshot that equals the ancestor's captured scope snapshot in full
+    (name, counts, completeness, and index) when that immutable evidence is
+    provided, an after-snapshot that agrees with the ancestor's immutable last
+    snapshot and proves exactly the old checkpoint's advance (or its final
+    completion), the original plan identity (no overlay), and the bound
+    selector.  The ancestor's terminal metadata must bind this exact worker
+    turn: terminal ``failed`` status with no terminal end reason, the selected
+    active worker turn with ``turns_completed = active_turn - 1``, the worker
+    step, and the original plan identity.  Recorded plan identities are
+    compared in one validated identity space: when a verified relocation is
+    provided, the ancestor's raw recorded paths are mapped through it before
+    comparison, and the allowed logical-primary versus owned-execution
+    counterpart (derived from the owner's recorded roots) remains accepted. It
+    never grants approval and is not a successful worker.
+    """
+    def _mapped(value: object) -> Path | None:
+        """Map one recorded plan identity into the validated identity space."""
+        if not isinstance(value, str) or not value.strip():
+            return None
+        try:
+            path = Path(value).expanduser()
+            if relocation is not None:
+                path = relocation.map_path(path, required=False)
+            return path.resolve()
+        except (OSError, RuntimeError, ValueError):
+            return None
+
+    def _identity_set() -> set[Path] | None:
+        """Return the validated identity space for the expected plan.
+
+        The recorded identity must equal the expected plan or its counterpart
+        execution identity (owned worktree copy versus logical primary) derived
+        from the owner's mapped recorded roots.  A worktree lifecycle with
+        unresolvable roots is contradictory metadata, not an absent
+        counterpart, and refuses.
+        """
+        expected = _mapped(expected_plan)
+        if expected is None:
+            return None
+        identities = {expected}
+        lifecycle_setup = (
+            owner_meta.get("lifecycle_setup") if owner_meta is not None else None
+        )
+        if not isinstance(lifecycle_setup, (list, tuple)) or "worktree" not in lifecycle_setup:
+            return identities
+        repo_root = _mapped(owner_meta.get("repo_root"))
+        worktree_root = _mapped(owner_meta.get("worktree_path"))
+        if repo_root is None or worktree_root is None:
+            return None
+        try:
+            counterpart = worktree_root / expected.relative_to(repo_root)
+        except ValueError:
+            try:
+                counterpart = repo_root / expected.relative_to(worktree_root)
+            except ValueError:
+                return None
+        return identities | {counterpart}
+
+    identities: set[Path] | None = None
+    if isinstance(expected_plan, str) and expected_plan.strip():
+        identities = _identity_set()
+        if identities is None:
+            return False
+    if result.get("turn_number") != turn_number:
+        return False
+    if step_name is not None and result.get("step_name") != step_name:
+        return False
+    if result.get("step_role") != "worker":
+        return False
+    if result.get("status") != "harness-failed":
+        return False
+    returncode = result.get("returncode")
+    if (
+        not isinstance(returncode, int)
+        or isinstance(returncode, bool)
+        or returncode == 0
+    ):
+        return False
+    if result.get("chosen_transition") is not None:
+        return False
+    if result.get("chosen_transition_condition") is not None:
+        return False
+    conditions = result.get("conditions")
+    if not isinstance(conditions, Mapping) or any(
+        not isinstance(conditions.get(name), bool)
+        for name in ("DONE", "NEW_PLAN_EXISTS", "MAX_TURNS_REACHED")
+    ):
+        return False
+    if conditions.get("NEW_PLAN_EXISTS") or conditions.get("MAX_TURNS_REACHED"):
+        return False
+    snapshot_before = _snapshot_from_review_result(result.get("snapshot_before"))
+    if snapshot_before is None:
+        return False
+    snapshot_after = _snapshot_from_review_result(result.get("snapshot_after"))
+    if snapshot_after is None:
+        return False
+    if conditions.get("DONE") is not snapshot_after.is_complete:
+        return False
+    # The original plan identity: the ancestor's receipt must have been
+    # working on exactly the original plan (no repair overlay) when it
+    # produced the failed proof.  Both the active and original recorded
+    # identities are compared in the validated identity space; a missing
+    # identity is not evidence of the original plan, so it refuses rather than
+    # being treated as absent proof of an overlay.
+    if identities is not None:
+        if _mapped(result.get("active_plan_path")) not in identities:
+            return False
+        if _mapped(result.get("original_plan_path")) not in identities:
+            return False
+    if owner_meta is not None:
+        owner_snapshot = _snapshot_from_review_result(owner_meta.get("last_snapshot"))
+        if owner_snapshot is None or snapshot_after != owner_snapshot:
+            return False
+        # The ancestor's terminal metadata must bind this exact worker turn:
+        # a terminal transport failure with no terminal end reason, the
+        # selected active worker turn with its predecessor turns completed,
+        # the worker step, and the original plan identity in the same
+        # validated space.  Equal checkpoint indices or envelope references
+        # alone do not establish the original terminal worker.
+        if owner_meta.get("status") != "failed":
+            return False
+        if owner_meta.get("end_reason") is not None:
+            return False
+        owner_active_turn = owner_meta.get("active_turn")
+        if (
+            not isinstance(owner_active_turn, int)
+            or isinstance(owner_active_turn, bool)
+            or owner_active_turn != turn_number
+        ):
+            return False
+        owner_turns_completed = owner_meta.get("turns_completed")
+        if (
+            not isinstance(owner_turns_completed, int)
+            or isinstance(owner_turns_completed, bool)
+            or owner_turns_completed != turn_number - 1
+        ):
+            return False
+        if step_name is not None and owner_meta.get("current_step_name") != step_name:
+            return False
+        if identities is not None and (
+            _mapped(owner_meta.get("active_plan_path")) not in identities
+            or _mapped(owner_meta.get("original_plan_path")) not in identities
+        ):
+            return False
+    if scope_snapshot is not None and snapshot_before != scope_snapshot:
+        return False
+    if scope_checkpoint_index is not None:
+        # The before-snapshot agrees with the captured scope checkpoint, and
+        # the after-snapshot proves exactly that checkpoint's advance (or its
+        # final completion).
+        if snapshot_before.current_checkpoint_index != scope_checkpoint_index:
+            return False
+        if snapshot_after.is_complete:
+            if snapshot_after.total_checkpoint_count != scope_checkpoint_index:
+                return False
+        elif snapshot_after.current_checkpoint_index != scope_checkpoint_index + 1:
+            return False
+    if selector is not None and result.get("selector") != selector:
+        return False
+    return True
+
+
+def _bound_attempt_selector(
+    metadata: Mapping[str, object] | None,
+    *,
+    scope_id: str | None,
+    turn_number: int,
+    step_name: str | None,
+    attempt_ordinal: int | None,
+) -> str | None:
+    """Return the owner's recorded selector for the selected worker attempt.
+
+    The recovered failed-worker attempt is recorded by the resumed run (the
+    source of the lineage walk).  Its selector is the bound identity the
+    ancestor's receipt must match; a missing/foreign scope returns ``None`` so
+    the selector check is skipped only when no ownership is asserted.
+    """
+    if metadata is None or scope_id is None:
+        return None
+    attempts_map = metadata.get("implementation_attempts")
+    if not isinstance(attempts_map, Mapping):
+        return None
+    attempts = attempts_map.get(scope_id, [])
+    if not isinstance(attempts, (list, tuple)):
+        return None
+    fallback: str | None = None
+    for attempt in attempts:
+        if not isinstance(attempt, Mapping):
+            continue
+        if (
+            attempt.get("role") != "worker"
+            or attempt.get("turn_number") != turn_number
+            or (step_name is not None and attempt.get("step_name") != step_name)
+        ):
+            continue
+        selector = attempt.get("selector")
+        candidate = selector if isinstance(selector, str) else None
+        if (
+            attempt_ordinal is not None
+            and attempt.get("attempt_ordinal") == attempt_ordinal
+        ):
+            return candidate
+        if fallback is None:
+            fallback = candidate
+    return fallback
+
+
 def _owned_worker_attempt_recorded(
     metadata: Mapping[str, object] | None,
     *,
@@ -4696,6 +4926,129 @@ def _owned_worker_attempt_recorded(
     if attempt_ordinal is None:
         return absent == 1 and strong == 0
     return (strong == 1 and absent == 0) or (strong == 0 and absent == 1)
+
+
+def _resume_relocation_from_provenance(
+    value: Mapping[str, object] | None,
+) -> ResumeRelocation | None:
+    """Rebuild the validated relocation from its durable provenance fields.
+
+    The resume context carries the relocation's provenance mapping (never the
+    object); the retained-worker binding compares the ancestor's raw recorded
+    identities in the same validated identity space, so the exact source and
+    current roots must be reconstructed.  Malformed provenance returns
+    ``None`` and the binding keeps its unmapped comparison.
+    """
+    if not isinstance(value, Mapping):
+        return None
+    fields = (
+        "source_run_id",
+        "source_repo_root",
+        "source_worktree_root",
+        "current_repo_root",
+        "current_worktree_root",
+    )
+    if not all(
+        isinstance(value.get(field), str) and value.get(field) for field in fields
+    ):
+        return None
+    return ResumeRelocation(
+        source_run_id=value["source_run_id"],  # type: ignore[index]
+        source_repo_root=Path(value["source_repo_root"]),  # type: ignore[index]
+        source_worktree_root=Path(value["source_worktree_root"]),  # type: ignore[index]
+        current_repo_root=Path(value["current_repo_root"]),  # type: ignore[index]
+        current_worktree_root=Path(value["current_worktree_root"]),  # type: ignore[index]
+    )
+
+
+def _restored_ancestor_relocation(
+    source_meta: Mapping[str, object] | None,
+    *,
+    run_id: str,
+    ancestor_meta: Mapping[str, object] | None,
+    repo_root: Path,
+    current_worktree_root: Path | None,
+) -> ResumeRelocation | None:
+    """Revalidate the source's recorded relocation for a selected ancestor.
+
+    The provenance must name this exact selected ancestor and agree with the
+    source's registered layout.  Provenance alone is not new authority, so
+    the mapping is revalidated through the existing relocation checks
+    against the current registered roots and branches.  Absent,
+    contradictory, or unverifiable evidence returns ``None`` and the caller
+    refuses the binding.
+    """
+    if source_meta is None or ancestor_meta is None:
+        return None
+    provenance = _resume_relocation_from_provenance(
+        source_meta.get("resume_relocation")
+    )
+    if provenance is None or provenance.source_run_id != run_id:
+        return None
+    source_repo = source_meta.get("repo_root")
+    source_worktree = source_meta.get("worktree_path")
+    if (
+        not isinstance(source_repo, str)
+        or not source_repo.strip()
+        or not isinstance(source_worktree, str)
+        or not source_worktree.strip()
+        or current_worktree_root is None
+    ):
+        return None
+    try:
+        if provenance.current_repo_root != Path(source_repo).resolve():
+            return None
+        if provenance.current_worktree_root != Path(source_worktree).resolve():
+            return None
+    except (OSError, ValueError):
+        return None
+    try:
+        return prepare_resume_relocation(
+            ancestor_meta,
+            source_run_id=run_id,
+            current_repo_root=repo_root,
+            replacement_worktree=current_worktree_root,
+        )
+    except ValueError:
+        return None
+
+
+def _ancestor_relocation_owner_meta(
+    repo_root: Path,
+    chain: list[tuple[str, bool]],
+    worker_run_id: str,
+) -> Mapping[str, object] | None:
+    """Find the chain run whose recorded provenance verified this ancestor.
+
+    The selected worker's historical identities are mapped by the relocation
+    that was verified for this exact ancestor: the immediate source's recorded
+    provenance when it is the direct owner, or an intermediate descendant's
+    recorded provenance when that source was itself explicitly rehomed again
+    (its own provenance then names the intermediate, not the worker).  The
+    closest owning record before the worker wins; an unreadable owned record
+    or no owning provenance is a refusal, never a fallback to the current
+    descendant's identity map.
+    """
+    chain_ids = [rid for rid, _ in chain]
+    if worker_run_id not in chain_ids:
+        return None
+    worker_index = chain_ids.index(worker_run_id)
+    for owner_id, dir_exists in reversed(chain[:worker_index]):
+        if not dir_exists:
+            continue
+        owner_run_dir = repo_root / ".aflow" / "runs" / owner_id
+        metadata_path = owner_run_dir / "run.json"
+        if metadata_path.is_symlink() or not metadata_path.is_file():
+            return None
+        meta = load_run_json(owner_run_dir)
+        if meta is None:
+            return None
+        provenance = _resume_relocation_from_provenance(
+            meta.get("resume_relocation")
+        )
+        if provenance is not None and provenance.source_run_id == worker_run_id:
+            return meta
+    return None
 
 
 def _chain_predecessor_kind(run_dir: Path) -> tuple[str, str | None]:
@@ -5269,6 +5622,7 @@ def _owner_scope_identity_matches(
     checkpoint_name: str | None,
     original_plan: str | None,
     envelope: tuple[str, str, str] | None,
+    relocation: ResumeRelocation | None = None,
 ) -> bool:
     """Bind the owner's active scope to the selected immutable awaiting scope.
 
@@ -5277,6 +5631,11 @@ def _owner_scope_identity_matches(
     and (when the selected scope carries one) the exact scope envelope
     reference. An attempts map key alone does not prove matching scope
     ownership; a contradictory owner scope identity is a refusal.
+
+    When a validated relocation is provided, the owner's recorded
+    original-plan identity is mapped into the same validated identity space
+    before the equality comparison; a missing, unmappable, or foreign
+    recorded identity is a refusal.
     """
     if scope_id is None:
         return True
@@ -5297,11 +5656,19 @@ def _owner_scope_identity_matches(
         and data.get("checkpoint_name") != checkpoint_name
     ):
         return False
-    if (
-        original_plan is not None
-        and data.get("original_plan_path") != original_plan
-    ):
-        return False
+    if original_plan is not None:
+        recorded = data.get("original_plan_path")
+        if relocation is not None:
+            if not isinstance(recorded, str) or not recorded.strip():
+                return False
+            try:
+                mapped = relocation.map_path(recorded, required=False)
+            except (OSError, ValueError):
+                return False
+            if mapped != Path(original_plan).resolve():
+                return False
+        elif recorded != original_plan:
+            return False
     if envelope is not None:
         artifact_path, artifact_sha, canonical_sha = envelope
         if (
@@ -5362,6 +5729,58 @@ def _owner_scope_envelope_validates(
     return True
 
 
+def _owner_scope_captured_plan_snapshot(
+    run_dir: Path,
+    owner_meta: Mapping[str, object],
+) -> PlanSnapshot | None:
+    """Resolve the ancestor's captured plan snapshot through its envelope.
+
+    The captured scope evidence is the ancestor's immutable envelope artifact:
+    its exact bytes must decode and hash through the shared envelope reader,
+    and its plan text must parse to a decodable plan snapshot.  Missing,
+    escaping, malformed, or unparseable evidence returns ``None`` so the
+    failed-worker binding refuses fail-closed rather than revalidating the
+    before-snapshot against a weaker index-only proof.
+    """
+    if owner_meta is None:
+        return None
+    data = owner_meta.get("active_implementation_scope")
+    if not isinstance(data, Mapping):
+        return None
+    try:
+        scope = ActiveImplementationScope(
+            scope_id=data.get("scope_id"),
+            original_plan_path=data.get("original_plan_path"),
+            checkpoint_index=data.get("checkpoint_index"),
+            checkpoint_name=data.get("checkpoint_name"),
+            opened_turn_number=data.get("opened_turn_number"),
+            envelope_artifact_path=data.get("envelope_artifact_path"),
+            envelope_artifact_sha256=data.get("envelope_artifact_sha256"),
+            envelope_canonical_sha256=data.get("envelope_canonical_sha256"),
+        )
+        envelope_bytes = load_scope_envelope_for_resume(run_dir, scope)
+        from .repartition import parse_envelope_bytes
+
+        envelope = parse_envelope_bytes(envelope_bytes)
+        source_root = run_dir.resolve(strict=True)
+        paths = RunPaths(
+            repo_root=source_root.parent.parent.parent,
+            runs_root=source_root.parent,
+            run_dir=source_root,
+            turns_dir=source_root / "turns",
+            manager_dir=source_root / "manager",
+            run_json=source_root / "run.json",
+        )
+        plan_text = _resolved_envelope_plan_text(paths, envelope)
+        original_plan = scope.original_plan_path
+        if not isinstance(original_plan, str) or not original_plan.strip():
+            original_plan = "plan.md"
+        parsed = parse_plan_text(plan_text, source_path=Path(original_plan))
+        return parsed.snapshot
+    except (WorkflowError, OSError, UnicodeDecodeError, PlanParseError, ValueError, TypeError):
+        return None
+
+
 def _bind_worker_receipt(
     repo_root: Path,
     start_run_id: str,
@@ -5377,6 +5796,8 @@ def _bind_worker_receipt(
     scope_envelope: tuple[str, str, str] | None = None,
     strict: bool = False,
     required_run_ids: set[str] | None = None,
+    relocation: ResumeRelocation | None = None,
+    current_worktree_root: Path | None = None,
 ) -> tuple[str, Path] | None:
     """Source-first binding of the worker receipt owner for one local turn.
 
@@ -5479,6 +5900,52 @@ def _bind_worker_receipt(
                     and not metadata_path.is_symlink()
                     else None
                 )
+                if run_id == start_run_id:
+                    ancestor_relocation = relocation
+                else:
+                    # The worker predates the resumed source, so its recorded
+                    # identities are historical.  They need the verified
+                    # relocation only when they are not already in the
+                    # current identity space.  The mapping is the recorded
+                    # provenance of the chain run that verified the
+                    # relocation for this exact selected ancestor (the
+                    # immediate source, or an intermediate descendant when
+                    # that source was itself explicitly rehomed again),
+                    # bound to this exact ancestor and revalidated against
+                    # the current registered roots and branches; the current
+                    # descendant's identity map must not replace it.  Absent
+                    # or unverifiable evidence is a refusal.
+                    ancestor_relocation = None
+                    scope_data = (
+                        owner_meta.get("active_implementation_scope")
+                        if owner_meta is not None
+                        else None
+                    )
+                    recorded_scope_plan = (
+                        scope_data.get("original_plan_path")
+                        if isinstance(scope_data, Mapping)
+                        else None
+                    )
+                    if (
+                        scope_original_plan is not None
+                        and isinstance(recorded_scope_plan, str)
+                        and recorded_scope_plan.strip()
+                        and recorded_scope_plan != scope_original_plan
+                    ):
+                        provenance_owner_meta = _ancestor_relocation_owner_meta(
+                            repo_root, chain, run_id
+                        )
+                        if provenance_owner_meta is None:
+                            return None
+                        ancestor_relocation = _restored_ancestor_relocation(
+                            provenance_owner_meta,
+                            run_id=run_id,
+                            ancestor_meta=owner_meta,
+                            repo_root=repo_root,
+                            current_worktree_root=current_worktree_root,
+                        )
+                        if ancestor_relocation is None:
+                            return None
                 if not _owner_scope_identity_matches(
                     owner_meta,
                     scope_id=scope_id,
@@ -5486,6 +5953,7 @@ def _bind_worker_receipt(
                     checkpoint_name=scope_checkpoint_name,
                     original_plan=scope_original_plan,
                     envelope=scope_envelope,
+                    relocation=ancestor_relocation,
                 ):
                     return None
                 if scope_envelope is not None and not _owner_scope_envelope_validates(
@@ -5495,6 +5963,58 @@ def _bind_worker_receipt(
                     # owner's envelope artifact; the exact bytes must decode
                     # and hash through the shared envelope reader.
                     return None
+                if result.get("status") == "harness-failed":
+                    # A descendant reviewer retry of a proven failed worker:
+                    # the bound worker is a transport-failed receipt, not a
+                    # successfully finalized one.  Reuse the failed-worker
+                    # validation (exact turn/step/role, nonzero failure, no
+                    # chosen transition, full before-snapshot equality to the
+                    # ancestor's captured scope snapshot, terminal owner
+                    # binding, plan identity) together with the owner
+                    # scope/envelope checks above.  Every other route keeps
+                    # the finalization requirement below; this is not blanket
+                    # acceptance of an unsuccessful worker and never grants
+                    # approval.
+                    captured_snapshot = _owner_scope_captured_plan_snapshot(
+                        run_dir, owner_meta
+                    )
+                    if captured_snapshot is None:
+                        # The captured scope evidence cannot be resolved
+                        # through the validated envelope; refuse fail-closed
+                        # rather than revalidating against a weaker proof.
+                        return None
+                    if not _worker_receipt_is_failed_worker(
+                        result,
+                        turn_number=turn_number,
+                        step_name=step_name,
+                        expected_plan=binding_plan,
+                        owner_meta=owner_meta,
+                        scope_checkpoint_index=scope_checkpoint_index,
+                        selector=_bound_attempt_selector(
+                            source_meta,
+                            scope_id=scope_id,
+                            turn_number=turn_number,
+                            step_name=step_name,
+                            attempt_ordinal=attempt_ordinal,
+                        ),
+                        scope_snapshot=captured_snapshot,
+                        relocation=ancestor_relocation,
+                    ):
+                        return None
+                    # The recovered failed-worker attempt is recorded by the
+                    # resumed run (the source of this walk), not by the
+                    # transport-failed ancestor, which finalized no attempt of
+                    # its own.  Bind it through the source's recorded attempts.
+                    if not _owned_worker_attempt_recorded(
+                        source_meta,
+                        scope_id=scope_id,
+                        turn_number=turn_number,
+                        step_name=step_name,
+                        attempt_ordinal=attempt_ordinal,
+                    ):
+                        return None
+                    publish_dependencies(run_id)
+                    return run_id, result_path
                 allowed_active_plans = _selected_worker_allowed_plans(
                     owner_meta,
                     repo_root,
@@ -5571,6 +6091,7 @@ def _review_worker_artifact_reference(
     scope_original_plan: str | None = None,
     scope_envelope: tuple[str, str, str] | None = None,
     strict: bool = False,
+    current_worktree_root: Path | None = None,
 ) -> tuple[str, Path | None]:
     """Return the selected worker result's reference and its concrete location.
 
@@ -5618,6 +6139,7 @@ def _review_worker_artifact_reference(
         scope_original_plan=scope_original_plan,
         scope_envelope=scope_envelope,
         strict=strict,
+        current_worktree_root=current_worktree_root,
     )
     if bound is not None:
         owner, location = bound
@@ -5852,6 +6374,32 @@ def _render_checkpoint_review_context(
                 / f"turn-{pending.worker_turn_number:03d}" / "result.json"
             ),
         )
+    elif (
+        resume is not None
+        and resume.failed_worker_review is not None
+        and state.turns_completed == 0
+    ):
+        pending = resume.failed_worker_review
+        target = _CheckpointReviewPromptTarget(
+            checkpoint_index=(
+                scope.checkpoint_index if scope is not None else None
+            ),
+            checkpoint_name=(
+                scope.checkpoint_name if scope is not None else None
+            ),
+            worker_artifact_path=(
+                f"resumed-from/{pending.source_run_dir.name}/"
+                f"turns/turn-{pending.worker_turn_number:03d}/result.json"
+            ),
+            source=(
+                "verified failed worker result "
+                "(checkpoint review required before progression)"
+            ),
+            worker_artifact_location=(
+                pending.source_run_dir / "turns"
+                / f"turn-{pending.worker_turn_number:03d}" / "result.json"
+            ),
+        )
     elif scope is not None and scope.awaiting_review:
         attempts = state.implementation_attempts.get(scope.scope_id, [])
         worker_attempts = [item for item in attempts if item.role == "worker"]
@@ -5876,6 +6424,9 @@ def _render_checkpoint_review_context(
                 strict=(
                     resume is not None
                     and resume.failed_pending_review_step is not None
+                ),
+                current_worktree_root=(
+                    resume.worktree_path if resume is not None else None
                 ),
             )
             target = _CheckpointReviewPromptTarget(
@@ -5965,6 +6516,19 @@ def _render_checkpoint_review_context(
         lines.append(
             "- Review coverage: complete original plan and all accumulated "
             "implementation commits; checked boxes are not approval."
+        )
+    if (
+        resume is not None
+        and resume.failed_worker_review is not None
+        and state.turns_completed == 0
+    ):
+        pending = resume.failed_worker_review
+        lines.append(
+            "- Worker evidence: the original worker turn "
+            f"(role: worker, turn {pending.worker_turn_number}) failed with "
+            f"returncode {pending.worker_returncode}; checked boxes are "
+            "implementation evidence, not approval. Inspect the "
+            "implementation, tests, and checkpoint scope before approving."
         )
     if active_plan_path != original_plan_path:
         lines.append(f"- Active plan/overlay: {active_plan_path}")
@@ -10183,6 +10747,10 @@ def _run_workflow_unchecked(
     if resume is not None and resume.pending_cumulative_review is not None:
         # The cumulative worker result is the reviewer's immutable evidence.
         preserved_resume_run_ids.add(resume.resumed_from_run_id)
+    if resume is not None and resume.failed_worker_review is not None:
+        # The failed worker receipt is the resumed reviewer's immutable
+        # evidence; keep the source run available through keep_runs pruning.
+        preserved_resume_run_ids.add(resume.resumed_from_run_id)
     if resume is not None and resume.budget_continuation is not None:
         # The validated budget boundary binds the successor to the source
         # run's immutable receipts; keep that lineage available.
@@ -10217,6 +10785,10 @@ def _run_workflow_unchecked(
                     scope_envelope=_scope_envelope_tuple(scope),
                     strict=True,
                     required_run_ids=bound_dependencies,
+                    relocation=_resume_relocation_from_provenance(
+                        resume.resume_relocation
+                    ),
+                    current_worktree_root=resume.worktree_path,
                 )
                 if bound is not None:
                     # The validated dependency set already includes every owned

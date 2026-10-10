@@ -47,7 +47,9 @@ from .skill_installer import InstallerError, install_skills
 from .skill_installer import DEFAULT_BUNDLED_SKILL_NAMES
 from .run_state import (
     ActiveImplementationScope,
+    FailedWorkerCheckpointReview,
     FrozenRunIdentity,
+    ImplementationAttempt,
     PendingFinalizedTurn,
     PendingCumulativeReview,
     PendingRepartitionV1,
@@ -131,8 +133,11 @@ from .workflow import (
     _rebase_scope_envelope_evidence,
     _scope_envelope_reference,
     _validate_scope_envelope_bytes,
+    _next_implementation_attempt_ordinal,
+    _worker_receipt_is_failed_worker,
     evaluate_condition,
     load_scope_envelope_for_resume,
+    pick_transition,
     load_scope_evidence_for_resume,
     move_completed_plan_to_done,
 )
@@ -1741,6 +1746,22 @@ def _bootstrap_resume_invocation(
         )
         is not None
     )
+    # A failed worker that proved a one-checkpoint advance (or a completed
+    # final checkpoint) under a workflow that requires checkpoint review must
+    # resume at the bound reviewer, never at a later worker or delivery.  The
+    # lightweight pre-classifier only opens the complete-snapshot refusal
+    # below; the full classifier in _reconstruct_resume_context remains
+    # authoritative and the bootstrap fails closed if the two disagree.
+    has_failed_worker_review = (
+        _failed_worker_advanced_checklist_reviewer_step(
+            run_dir,
+            prev_run,
+            workflow_steps=workflow_spec.steps,
+            relocation=relocation,
+            plan_path=plan_path,
+        )
+        is not None
+    )
     mismatch_reason = _resume_candidate_mismatch_reason(
         prev_run,
         workflow_spec,
@@ -1763,6 +1784,7 @@ def _bootstrap_resume_invocation(
         allow_review_repair=review_repair_step is not None,
         allow_stopped_repair=has_stopped_pending_repair,
         allow_failed_pending_review=has_failed_pending_review,
+        allow_failed_worker_review=has_failed_worker_review,
         team_explicit=saved_team_explicit,
         max_turns_explicit=saved_max_turns_explicit,
         run_dir=run_dir,
@@ -1806,6 +1828,18 @@ def _bootstrap_resume_invocation(
             "repair evidence that no longer validates; the source run was not "
             "modified and no successor was started."
         )
+    if has_failed_worker_review and resume_context.failed_worker_review is None:
+        # The pre-classifier recognized a failed-worker checklist advance
+        # requiring checkpoint review, but the authoritative classifier did
+        # not validate it (missing reviewer routing, tampered evidence, or a
+        # changed workflow).  Fail closed before any provider launch: no
+        # later worker, final review, or delivery may start first.
+        raise ValueError(
+            f"error: run '{resolved_run_id.name}' has a proven failed-worker "
+            "checklist advance requiring checkpoint review that no longer "
+            "validates; the source run was not modified and no successor was "
+            "started."
+        )
     if successor_max_turns is not None:
         resume_context = replace(
             resume_context, successor_max_turns=successor_max_turns
@@ -1822,9 +1856,13 @@ def _bootstrap_resume_invocation(
             resume_context.pending_cumulative_review.reviewer_step_name
             if resume_context.pending_cumulative_review is not None
             else (
-                resume_context.failed_pending_review_step
-                if resume_context.failed_pending_review_step is not None
-                else effective_start_step
+                resume_context.failed_worker_review.reviewer_step_name
+                if resume_context.failed_worker_review is not None
+                else (
+                    resume_context.failed_pending_review_step
+                    if resume_context.failed_pending_review_step is not None
+                    else effective_start_step
+                )
             )
         ),
         max_turns=effective_max_turns,
@@ -1838,6 +1876,7 @@ def _bootstrap_resume_invocation(
         start_step_override=(
             start_step_override
             or resume_context.pending_cumulative_review is not None
+            or resume_context.failed_worker_review is not None
         ),
         parsed_plan=parsed_plan_for_startup,
         relocation=relocation,
@@ -1865,6 +1904,7 @@ def _resume_candidate_mismatch_reason(
     allow_review_repair: bool = False,
     allow_stopped_repair: bool = False,
     allow_failed_pending_review: bool = False,
+    allow_failed_worker_review: bool = False,
     team_explicit: bool | None = None,
     max_turns_explicit: bool | None = None,
     run_dir: Path | None = None,
@@ -1933,6 +1973,7 @@ def _resume_candidate_mismatch_reason(
         and not allow_budget_continuation
         and not allow_stopped_repair
         and not allow_failed_pending_review
+        and not allow_failed_worker_review
     ):
         if run_dir is not None:
             try:
@@ -1962,6 +2003,7 @@ def _resume_candidate_mismatch_reason(
         and not allow_review_repair
         and not allow_stopped_repair
         and not allow_failed_pending_review
+        and not allow_failed_worker_review
     ):
         return "its last saved plan snapshot was already complete"
 
@@ -2242,6 +2284,53 @@ def _owner_stopped_pending_review_step(
     return final_review.reviewer_step_name if final_review is not None else None
 
 
+def _reviewer_receipt_active_plan_identities(
+    prev_run: Mapping[str, object],
+    expected_plan: Path,
+) -> set[Path] | None:
+    """The validated active-plan identities for a failed reviewer's receipt.
+
+    The expected plan (logical primary) plus, for a recorded linked-worktree
+    layout, the owned execution counterpart derived from the source's
+    recorded roots in the same validated identity space.  A worktree
+    lifecycle with unresolvable roots is contradictory metadata, not an
+    absent counterpart, and refuses.
+    """
+    try:
+        expected = expected_plan.resolve()
+    except (OSError, RuntimeError, ValueError):
+        return None
+    identities = {expected}
+    lifecycle_setup = prev_run.get("lifecycle_setup")
+    if (
+        not isinstance(lifecycle_setup, (list, tuple))
+        or "worktree" not in lifecycle_setup
+    ):
+        return identities
+    repo_value = prev_run.get("repo_root")
+    worktree_value = prev_run.get("worktree_path")
+    if (
+        not isinstance(repo_value, str)
+        or not repo_value.strip()
+        or not isinstance(worktree_value, str)
+        or not worktree_value.strip()
+    ):
+        return None
+    try:
+        repo_root = Path(repo_value).resolve()
+        worktree_root = Path(worktree_value).resolve()
+    except (OSError, RuntimeError, ValueError):
+        return None
+    try:
+        counterpart = worktree_root / expected.relative_to(repo_root)
+    except ValueError:
+        try:
+            counterpart = repo_root / expected.relative_to(worktree_root)
+        except ValueError:
+            return None
+    return identities | {counterpart}
+
+
 def _failed_pending_review_step(
     run_dir: Path,
     prev_run: Mapping[str, object],
@@ -2411,8 +2500,21 @@ def _failed_pending_review_step(
             "the receipt's original plan identity is missing, unmapped, or "
             "foreign"
         )
-    if receipt_active is None or not _resume_path_matches(
-        receipt_active, expected_plan
+    if receipt_active is None:
+        _refuse(
+            "the receipt's active plan identity is missing, unmapped, or "
+            "foreign"
+        )
+    # The active plan identity is the execution copy, not the logical
+    # primary: for a linked-worktree source it is the owned counterpart
+    # derived from the source's recorded roots, and the receipt must match
+    # the expected plan only in the non-worktree layout.
+    active_identities = _reviewer_receipt_active_plan_identities(
+        prev_run, expected_plan
+    )
+    if (
+        active_identities is None
+        or receipt_active.resolve() not in active_identities
     ):
         _refuse(
             "the receipt's active plan identity is missing, unmapped, or "
@@ -2533,6 +2635,15 @@ def _failed_pending_review_step(
         scope_original_plan=scope_original_plan,
         scope_envelope=scope_envelope,
         strict=True,
+        relocation=relocation,
+        current_worktree_root=(
+            Path(recorded_worktree)
+            if (
+                isinstance(recorded_worktree := prev_run.get("worktree_path"), str)
+                and recorded_worktree.strip()
+            )
+            else None
+        ),
     )
     if bound is None:
         _refuse(
@@ -2541,6 +2652,179 @@ def _failed_pending_review_step(
             "missing, foreign, malformed, or cyclic"
         )
     return current_step_name
+
+
+def _active_plan_is_repair_overlay(
+    prev_run: Mapping[str, object],
+) -> bool:
+    """Whether the recorded active plan is a foreign (repair) overlay.
+
+    A linked-worktree run records the logical primary in ``plan_path`` and
+    the owned worktree copy in ``active_plan_path``; that pairing is the
+    execution layout, not a repair overlay.  Only an active identity that is
+    neither the recorded plan nor the owned execution counterpart derived
+    from the owner's recorded roots is an overlay.  A worktree lifecycle
+    with unresolvable roots is contradictory metadata and refuses as an
+    overlay.
+    """
+    recorded_plan = prev_run.get("plan_path")
+    active_plan = prev_run.get("active_plan_path")
+    if not isinstance(active_plan, str) or not active_plan.strip():
+        return False
+    if not isinstance(recorded_plan, str) or not recorded_plan.strip():
+        return True
+    try:
+        active = Path(active_plan).resolve()
+        recorded = Path(recorded_plan).resolve()
+    except OSError:
+        return True
+    if active == recorded:
+        return False
+    lifecycle_setup = prev_run.get("lifecycle_setup")
+    if not isinstance(lifecycle_setup, (list, tuple)) or "worktree" not in lifecycle_setup:
+        return True
+    repo_root = prev_run.get("repo_root")
+    worktree_root = prev_run.get("worktree_path")
+    if (
+        not isinstance(repo_root, str)
+        or not repo_root.strip()
+        or not isinstance(worktree_root, str)
+        or not worktree_root.strip()
+    ):
+        return True
+    try:
+        repo = Path(repo_root).resolve()
+        worktree = Path(worktree_root).resolve()
+    except OSError:
+        return True
+    try:
+        counterpart = worktree / active.relative_to(repo)
+    except ValueError:
+        try:
+            counterpart = repo / active.relative_to(worktree)
+        except ValueError:
+            return True
+    return counterpart != recorded
+
+
+def _failed_worker_advanced_checklist_reviewer_step(
+    run_dir: Path,
+    prev_run: Mapping[str, object],
+    *,
+    workflow_steps: Mapping[str, object] | None = None,
+    relocation: ResumeRelocation | None = None,
+    plan_path: Path | None = None,
+) -> str | None:
+    """Lightweight pre-classifier for a failed worker that advanced its checklist.
+
+    A failed terminal source whose single open turn is a configured worker
+    step, whose terminal receipt proves a transport failure after a proven
+    one-checkpoint advance (or a completed final checkpoint), and whose
+    workflow requires the bound checkpoint reviewer for that worker's success
+    transition.  Sources outside that shape return ``None`` so the established
+    cumulative, budget, repair, and failed-reviewer routes remain
+    authoritative.  Once the shape is recognized, a missing, malformed, or
+    contradictory terminal receipt is a clean resume refusal, never a silent
+    fallback that would let a later worker or delivery start first.  The full
+    classifier in ``_reconstruct_resume_context`` remains authoritative.
+    """
+    if prev_run.get("status") != "failed" or prev_run.get("end_reason") is not None:
+        return None
+    current_step_name = prev_run.get("current_step_name")
+    if not isinstance(current_step_name, str) or not current_step_name.strip():
+        return None
+    run_id = run_dir.name
+
+    def _refuse(reason: str) -> None:
+        raise ValueError(
+            f"error: run '{run_id}' has a failed worker turn that advanced a "
+            "required checkpoint review, but its evidence is invalid: "
+            f"{reason}; refusing to resume and starting no successor."
+        )
+
+    snapshot = _resume_plan_snapshot(prev_run.get("last_snapshot"))
+    if snapshot is None:
+        _refuse("the saved last snapshot is missing, malformed, or not decodable")
+    # The validated worker condition: a mid-plan transport advance reports
+    # DONE=False, a completed final checkpoint reports DONE=True.  The worker
+    # success transition is evaluated with this proven state, never forced.
+    reviewer_step_name = _failed_worker_review_transition(
+        workflow_steps,
+        current_step_name,
+        done=snapshot.is_complete is True,
+    )
+    if reviewer_step_name is _UNRESOLVED_WORKER_TRANSITION:
+        _refuse(
+            "the worker success transition cannot be resolved, so the retained "
+            "checkpoint scope cannot be safely closed"
+        )
+    if reviewer_step_name is None:
+        return None
+    scope = prev_run.get("active_implementation_scope")
+    if not isinstance(scope, Mapping) or scope.get("awaiting_review") is True:
+        return None
+    index = scope.get("checkpoint_index")
+    if not isinstance(index, int) or isinstance(index, bool) or index < 1:
+        return None
+    # A repair overlay is active: the scoped repair route owns this source,
+    # not the failed-worker review route.  The owned worktree counterpart of
+    # the logical primary is the execution layout, not an overlay.
+    if _active_plan_is_repair_overlay(prev_run):
+        return None
+    turns_completed = prev_run.get("turns_completed")
+    active_turn = prev_run.get("active_turn")
+    if (
+        not isinstance(turns_completed, int)
+        or isinstance(turns_completed, bool)
+        or turns_completed < 0
+        or not isinstance(active_turn, int)
+        or isinstance(active_turn, bool)
+        or active_turn != turns_completed + 1
+    ):
+        return None
+    if snapshot.is_complete is True:
+        if (
+            snapshot.total_checkpoint_count is None
+            or index != snapshot.total_checkpoint_count
+        ):
+            return None
+    elif snapshot.current_checkpoint_index != index + 1:
+        # Not the proven one-checkpoint advance: the established cumulative
+        # route (same-scope retry, one-hop closure) remains authoritative.
+        return None
+
+    turns_dir = run_dir / "turns"
+    if turns_dir.is_symlink() or not turns_dir.is_dir():
+        _refuse("the turns directory is not an owned directory")
+    turn_dir = turns_dir / f"turn-{active_turn:03d}"
+    if turn_dir.is_symlink() or not turn_dir.is_dir():
+        _refuse("the selected turn directory is not an owned directory")
+    result_path = turn_dir / "result.json"
+    if result_path.is_symlink() or not result_path.is_file():
+        _refuse("the turn result is not an owned regular file")
+    try:
+        result = json.loads(result_path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        _refuse(f"the terminal worker receipt is missing or unreadable: {exc}")
+    if not isinstance(result, Mapping):
+        _refuse("the terminal worker receipt is not a JSON object")
+    receipt_snapshot_after = _resume_plan_snapshot(result.get("snapshot_after"))
+    if (
+        result.get("turn_number") != active_turn
+        or result.get("step_name") != current_step_name
+        or result.get("step_role") != "worker"
+        or result.get("status") != "harness-failed"
+        or not isinstance(result.get("returncode"), int)
+        or isinstance(result.get("returncode"), bool)
+        or result.get("returncode") == 0
+        or result.get("chosen_transition") is not None
+        or receipt_snapshot_after != snapshot
+    ):
+        _refuse(
+            "the terminal worker receipt does not prove a transport failure "
+            "after the proven checklist advance"
+        )
+    return reviewer_step_name
 
 
 def _managed_owner_stop_evidence(
@@ -4105,6 +4389,78 @@ def _resume_pending_cumulative_review_resume(
     )
 
 
+@dataclass(frozen=True)
+class VerifiedResumeScopeResolution:
+    """Shared classification result for a validated failed-worker progression.
+
+    ``kind`` is ``"close"`` for a validated workflow without checkpoint review
+    (the successor opens the next scope normally) or ``"checkpoint_review"``
+    when the configured worker transition requires the bound checkpoint
+    reviewer before any later worker.  The failed worker turn identity and
+    truthful returncode are carried for the pending-review handoff.
+    """
+
+    kind: str
+    reviewer_step_name: str | None = None
+    worker_turn_number: int | None = None
+    worker_returncode: int | None = None
+
+
+# Sentinel distinguishing a worker success transition that cannot be resolved
+# from a resolved non-reviewer target.  A caller that has already recognized the
+# failed-worker shape must refuse on the unresolvable sentinel before closing
+# the retained scope; a resolved non-reviewer target keeps the cumulative
+# one-hop behavior (represented by ``None``).
+_UNRESOLVED_WORKER_TRANSITION = object()
+
+
+def _failed_worker_review_transition(
+    workflow_steps: Mapping[str, object] | None,
+    current_step_name: object,
+    *,
+    done: bool,
+) -> object:
+    """Bind the checkpoint reviewer selected by the worker's success transition.
+
+    The normal successful-worker transition is evaluated with the *validated*
+    worker condition carried by the proven terminal receipt: ``done`` reflects
+    the proven checkpoint state (a mid-plan transport advance reports
+    DONE=False, a completed final checkpoint reports DONE=True), with no
+    overlay and not at the limit.  Only a transition target configured with the
+    reviewer role is a required checkpoint review and is returned by name.  END,
+    worker, and final-review targets keep the cumulative one-hop behavior and
+    return ``None``.  A transition that cannot be resolved for a worker step
+    returns the unresolvable sentinel: a caller that has already recognized the
+    failed-worker shape must refuse before closing scope, never treat it as
+    cumulative.  Evidence tampering is caught separately: the bootstrap
+    pre-classifier and this classifier must agree, and disagreement fails closed
+    before any provider launch.
+    """
+    if workflow_steps is None or not isinstance(current_step_name, str):
+        return None
+    step = workflow_steps.get(current_step_name)
+    if step is None or getattr(step, "role", None) != "worker":
+        return None
+    try:
+        target = pick_transition(
+            tuple(getattr(step, "go", ())),
+            step_path=f"workflow.{current_step_name}",
+            done=done,
+            new_plan_exists=False,
+            max_turns_reached=False,
+        )
+    except WorkflowError:
+        return _UNRESOLVED_WORKER_TRANSITION
+    if not isinstance(target, str) or target == "END":
+        return None
+    target_step = workflow_steps.get(target)
+    if target_step is None:
+        return None
+    if getattr(target_step, "role", None) != "reviewer":
+        return None
+    return target
+
+
 def _resume_scope_routing_blocker(
     manager_fields: dict[str, object],
     *,
@@ -4473,30 +4829,66 @@ def _reconcile_verified_resume_scope(
     manager_fields: Mapping[str, object],
     scope_envelope_bytes: bytes | None,
     pending_finalized_turn: PendingFinalizedTurn | None,
-) -> bool:
-    """Recognize only a strict transport-failure checkpoint progression.
+    workflow_steps: Mapping[str, object] | None = None,
+) -> VerifiedResumeScopeResolution | None:
+    """Classify a strict transport-failure checkpoint progression.
 
-    The function is deliberately read-only.  A true result means the caller
-    may construct a successor with the old scope closed; the normal workflow
+    The function is read-only except for the one-hop manager state it is
+    authorized to clear.  A ``"close"`` resolution means the caller may
+    construct a successor with the old scope closed; the normal workflow
     then opens the next scope and captures its envelope through its canonical
-    helpers.
+    helpers.  A ``"checkpoint_review"`` resolution means the configured
+    worker transition requires the bound checkpoint reviewer: the original
+    scope is retained awaiting review with its immutable envelope, and the
+    failed worker receipt stays the reviewer's evidence.  Checkboxes are
+    implementation evidence, never review approval.
     """
     if scope is None or scope_envelope_bytes is None:
-        return False
+        return None
     source_snapshot = _resume_plan_snapshot(prev_run.get("last_snapshot"))
-    if source_snapshot is None or source_snapshot.is_complete:
-        return False
-    if (
-        scope.checkpoint_index is None
-        or source_snapshot.current_checkpoint_index is None
-        or source_snapshot.current_checkpoint_index <= scope.checkpoint_index
-    ):
-        return False
-    if source_snapshot.current_checkpoint_index != scope.checkpoint_index + 1:
+    if source_snapshot is None or scope.checkpoint_index is None:
+        return None
+    # A repair overlay is active: the scoped repair route owns this source,
+    # not the failed-worker review route.  The owned worktree counterpart of
+    # the logical primary is the execution layout, not an overlay.
+    overlay_active = _active_plan_is_repair_overlay(prev_run)
+    final_checkpoint = source_snapshot.is_complete is True
+    # The worker success transition is evaluated with the validated worker
+    # condition: DONE mirrors the proven checkpoint state, never forced True.
+    reviewer_step_name = _failed_worker_review_transition(
+        workflow_steps,
+        prev_run.get("current_step_name"),
+        done=final_checkpoint,
+    )
+    if reviewer_step_name is _UNRESOLVED_WORKER_TRANSITION:
         raise ResumeScopeReconciliationError(
             run_id,
-            "source snapshot skips more than one checkpoint after the active scope",
+            "the worker success transition cannot be resolved, so the retained "
+            "checkpoint scope cannot be safely closed and no successor started",
         )
+    if final_checkpoint:
+        # The last-checkpoint variant is owned by this route only when a
+        # required checkpoint review is configured on the original plan; a
+        # source without that transition (or under a repair overlay) retains
+        # its prior cumulative behavior.
+        if (
+            reviewer_step_name is None
+            or overlay_active
+            or source_snapshot.total_checkpoint_count is None
+            or scope.checkpoint_index != source_snapshot.total_checkpoint_count
+        ):
+            return None
+    else:
+        if (
+            source_snapshot.current_checkpoint_index is None
+            or source_snapshot.current_checkpoint_index <= scope.checkpoint_index
+        ):
+            return None
+        if source_snapshot.current_checkpoint_index != scope.checkpoint_index + 1:
+            raise ResumeScopeReconciliationError(
+                run_id,
+                "source snapshot skips more than one checkpoint after the active scope",
+            )
 
     _resume_scope_routing_blocker(
         manager_fields,
@@ -4569,12 +4961,25 @@ def _reconcile_verified_resume_scope(
     conditions = result.get("conditions")
     if not isinstance(conditions, Mapping) or any(
         not isinstance(conditions.get(name), bool)
-        or conditions.get(name)
         for name in ("DONE", "NEW_PLAN_EXISTS", "MAX_TURNS_REACHED")
     ):
         raise ResumeScopeReconciliationError(
             run_id,
-            "terminal worker receipt has missing or non-terminal conditions",
+            "terminal worker receipt has missing conditions",
+        )
+    if conditions.get("NEW_PLAN_EXISTS") or conditions.get("MAX_TURNS_REACHED"):
+        raise ResumeScopeReconciliationError(
+            run_id,
+            "terminal worker receipt has a non-terminal condition",
+        )
+    # A transport-only failure leaves DONE unset for a mid-plan advance, but a
+    # worker that finished the final checkpoint reports DONE=True.  Bind DONE
+    # to the proven checkpoint state so both variants are accepted and a
+    # contradictory receipt still fails closed.
+    if conditions.get("DONE") is not final_checkpoint:
+        raise ResumeScopeReconciliationError(
+            run_id,
+            "terminal worker receipt conditions do not match the proven checkpoint state",
         )
 
     snapshot_before = _resume_plan_snapshot(result.get("snapshot_before"))
@@ -4647,6 +5052,35 @@ def _reconcile_verified_resume_scope(
         raise ResumeScopeReconciliationError(
             run_id,
             "captured scope has no concrete checkpoint index",
+        )
+    # The narrow shared failed-worker proof: the same receipt-level
+    # validation the descendant reviewer retry reuses (exact turn/step/role,
+    # nonzero transport failure, no chosen transition, decoded before/after
+    # snapshots bound to the scope and the source's immutable last snapshot,
+    # terminal owner binding, original plan identity, transport conditions).
+    # The recorded identities are compared in the same validated identity
+    # space as ``result_active_path``: a verified relocation maps the raw
+    # source paths, and the allowed logical-primary versus owned-execution
+    # counterpart is accepted.  The broader plan-byte and envelope checks
+    # below remain in force.
+    if not _worker_receipt_is_failed_worker(
+        result,
+        turn_number=active_turn,
+        step_name=(
+            prev_run.get("current_step_name")
+            if isinstance(prev_run.get("current_step_name"), str)
+            else None
+        ),
+        expected_plan=str(result_active_path),
+        owner_meta=prev_run,
+        scope_checkpoint_index=expected_index,
+        scope_snapshot=captured_plan.snapshot,
+        relocation=relocation,
+    ):
+        raise ResumeScopeReconciliationError(
+            run_id,
+            "terminal worker receipt does not reproduce the original strict "
+            "failed-worker proof",
         )
     try:
         captured_normalized = _resume_normalized_plan_bytes(
@@ -4734,27 +5168,102 @@ def _reconcile_verified_resume_scope(
                 run_id,
                 "current owned plan changed checkpoint structure",
             )
-    if not (
-        1 <= expected_index < len(current_plan.sections)
-    ):
-        raise ResumeScopeReconciliationError(
-            run_id,
-            "the next checkpoint is not present in the current owned plan",
+    if final_checkpoint:
+        if scope.checkpoint_index != len(current_plan.sections):
+            raise ResumeScopeReconciliationError(
+                run_id,
+                "the active scope is not the final checkpoint of the current owned plan",
+            )
+        old_section = current_plan.sections[expected_index - 1]
+        if not old_section.heading_checked or old_section.unchecked_step_count != 0:
+            raise ResumeScopeReconciliationError(
+                run_id,
+                "current owned plan does not show the final scope as completed",
+            )
+    else:
+        if not (
+            1 <= expected_index < len(current_plan.sections)
+        ):
+            raise ResumeScopeReconciliationError(
+                run_id,
+                "the next checkpoint is not present in the current owned plan",
+            )
+        old_section = current_plan.sections[expected_index - 1]
+        next_section = current_plan.sections[expected_index]
+        if (
+            not old_section.heading_checked
+            or old_section.unchecked_step_count != 0
+            or next_section.heading_checked
+            or next_section.name != source_snapshot.current_checkpoint_name
+            or next_section.unchecked_step_count
+            != source_snapshot.current_checkpoint_unchecked_step_count
+            or source_snapshot.current_checkpoint_index != expected_index + 1
+        ):
+            raise ResumeScopeReconciliationError(
+                run_id,
+                "current owned plan does not show exactly the next unchecked checkpoint",
+            )
+
+    if reviewer_step_name is not None and overlay_active:
+        # A repair overlay is active: the scoped repair route owns this
+        # source and keeps its established one-hop behavior.
+        reviewer_step_name = None
+    if reviewer_step_name is not None:
+        # Required checkpoint review: retain the original scope awaiting
+        # review with its immutable envelope.  The successor starts at the
+        # bound reviewer; approval follows existing progression and rejection
+        # follows existing scoped repair.  The source stays failed and
+        # immutable.
+        manager_fields["active_implementation_scope"] = replace(
+            scope, awaiting_review=True
         )
-    old_section = current_plan.sections[expected_index - 1]
-    next_section = current_plan.sections[expected_index]
-    if (
-        not old_section.heading_checked
-        or old_section.unchecked_step_count != 0
-        or next_section.heading_checked
-        or next_section.name != source_snapshot.current_checkpoint_name
-        or next_section.unchecked_step_count
-        != source_snapshot.current_checkpoint_unchecked_step_count
-        or source_snapshot.current_checkpoint_index != expected_index + 1
-    ):
-        raise ResumeScopeReconciliationError(
-            run_id,
-            "current owned plan does not show exactly the next unchecked checkpoint",
+        # A transport-failed worker turn records no durable implementation
+        # attempt of its own, yet the reviewer must be able to reject the
+        # retained scope through the existing scoped repair.  Carry a truthful
+        # non-accepted attempt for the failed worker so that repair has a
+        # lineage to reference; this never synthesizes an approval.  The team
+        # is the source run's historical executed team (not the current
+        # reviewer team or a live default) so the normal scoped-repair policy
+        # applies its configured team routing and any configured upgrade.
+        recovered_team = prev_run.get("team")
+        if not isinstance(recovered_team, str) or not recovered_team.strip():
+            recovered_team = None
+        attempts_map = manager_fields.get("implementation_attempts")
+        if not isinstance(attempts_map, dict):
+            attempts_map = {}
+            manager_fields["implementation_attempts"] = attempts_map
+        # ``manager_resume_fields`` restores durable histories as immutable
+        # tuples; extend that decoded history into a fresh list so every prior
+        # retained attempt is preserved (never lost) and the recovered attempt
+        # appends safely.  The ordinal is allocated after every retained
+        # scope-local attempt rather than restarted at 1.
+        retained = attempts_map.get(scope.scope_id)
+        retained_list = (
+            list(retained) if isinstance(retained, (list, tuple)) else []
+        )
+        attempts_map[scope.scope_id] = retained_list
+        retained_list.append(
+            ImplementationAttempt(
+                turn_number=active_turn,
+                step_name=str(prev_run.get("current_step_name")),
+                role="worker",
+                team=recovered_team,
+                selector=(
+                    result.get("selector")
+                    if isinstance(result.get("selector"), str)
+                    else None
+                ),
+                outcome="progress",
+                attempt_ordinal=_next_implementation_attempt_ordinal(
+                    retained_list
+                ),
+            )
+        )
+        return VerifiedResumeScopeResolution(
+            kind="checkpoint_review",
+            reviewer_step_name=reviewer_step_name,
+            worker_turn_number=active_turn,
+            worker_returncode=result.get("returncode"),
         )
 
     # This mirrors the canonical workflow scope close: only one-hop scope and
@@ -4765,7 +5274,7 @@ def _reconcile_verified_resume_scope(
     manager_fields["pending_step_team_override"] = None
     manager_fields["pending_boundary_decision"] = None
     manager_fields["reviewer_rejection_count"] = 0
-    return True
+    return VerifiedResumeScopeResolution(kind="close")
 
 
 def _reconstruct_resume_context(
@@ -5035,6 +5544,7 @@ def _reconstruct_resume_context(
             )
 
     reconciled_scope = False
+    failed_worker_review: FailedWorkerCheckpointReview | None = None
     if (
         not reset_scope
         and not terminal_completion_only
@@ -5045,7 +5555,7 @@ def _reconstruct_resume_context(
         and failed_pending_review_step is None
         and budget_boundary is None
     ):
-        reconciled_scope = _reconcile_verified_resume_scope(
+        scope_resolution = _reconcile_verified_resume_scope(
             run_id=run_id,
             run_dir=run_dir,
             prev_run=prev_run,
@@ -5059,13 +5569,30 @@ def _reconstruct_resume_context(
             manager_fields=manager_fields,
             scope_envelope_bytes=scope_envelope_bytes,
             pending_finalized_turn=pending_finalized_turn,
+            workflow_steps=workflow_steps,
         )
-        if reconciled_scope:
-            # The predecessor remains authoritative and immutable.  The
-            # successor will open and capture the exact next scope normally.
-            scope_envelope_source_path = None
-            scope_envelope_bytes = None
-            scope_evidence_artifact_bytes = {}
+        if scope_resolution is not None:
+            if scope_resolution.kind == "close":
+                reconciled_scope = True
+                # The predecessor remains authoritative and immutable.  The
+                # successor will open and capture the exact next scope
+                # normally.
+                scope_envelope_source_path = None
+                scope_envelope_bytes = None
+                scope_evidence_artifact_bytes = {}
+            else:
+                # Required checkpoint review: retain the original scope
+                # (now awaiting review) and its immutable envelope, and bind
+                # the failed worker receipt for the resumed reviewer.  The
+                # predecessor remains authoritative and immutable; the
+                # successor's first provider invocation is the bound reviewer.
+                failed_worker_review = FailedWorkerCheckpointReview(
+                    source_run_dir=run_dir,
+                    worker_turn_number=scope_resolution.worker_turn_number,
+                    worker_step_name=str(prev_run.get("current_step_name")),
+                    reviewer_step_name=scope_resolution.reviewer_step_name,
+                    worker_returncode=scope_resolution.worker_returncode,
+                )
 
     recovered_active_plan = (
         str(plan_path)
@@ -5174,6 +5701,8 @@ def _reconstruct_resume_context(
             if budget_boundary is not None
             else pending_cumulative_review.reviewer_step_name
             if pending_cumulative_review is not None
+            else failed_worker_review.reviewer_step_name
+            if failed_worker_review is not None
             else failed_pending_review_step
             if failed_pending_review_step is not None
             else effective_start_step
@@ -5193,6 +5722,7 @@ def _reconstruct_resume_context(
         ),
         pending_finalized_turn=pending_finalized_turn,
         pending_cumulative_review=pending_cumulative_review,
+        failed_worker_review=failed_worker_review,
         frozen_run_identity=frozen_run_identity,
         live_config_path=(
             frozen_run_identity.live_config_path
@@ -5247,7 +5777,16 @@ def _reconstruct_resume_context(
         scope_evidence_artifact_bytes=scope_evidence_artifact_bytes,
         resume_scope_reconciled=reconciled_scope,
         repartition_artifact_bytes=repartition_artifact_bytes,
-        resume_relocation=relocation.provenance() if relocation is not None else None,
+        resume_relocation=(
+            relocation.provenance()
+            if relocation is not None
+            else (
+                prev_run.get("resume_relocation")
+                if failed_pending_review_step is not None
+                and isinstance(prev_run.get("resume_relocation"), Mapping)
+                else None
+            )
+        ),
         resumed_from_team=resumed_from_team,
         resume_team_override=resume_team_override,
         budget_continuation=budget_boundary,
@@ -5359,6 +5898,23 @@ def _detect_resume_candidate(
         allow_budget_continuation=(
             resume_bootstrap is not None
             and resume_bootstrap.resume_context.budget_continuation is not None
+        ),
+        # The validated bootstrap already admitted a failed-worker checkpoint
+        # review (including the final-checkpoint source).  Carry that exact
+        # validated flag into this second admission so the two CLI stages
+        # agree; callers without a validated bootstrap keep the strict check.
+        allow_failed_worker_review=(
+            resume_bootstrap is not None
+            and resume_bootstrap.resume_context.failed_worker_review is not None
+        ),
+        # The validated bootstrap already admitted a failed-reviewer
+        # pending-review route (including the final-checkpoint complete
+        # snapshot).  Carry that exact validated flag into this second
+        # admission so the two CLI stages agree.
+        allow_failed_pending_review=(
+            resume_bootstrap is not None
+            and resume_bootstrap.resume_context.failed_pending_review_step
+            is not None
         ),
         team_explicit=team_explicit,
         max_turns_explicit=max_turns_explicit,

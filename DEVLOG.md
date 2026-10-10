@@ -1,5 +1,182 @@
 # DEVLOG
 
+## 2026-10-10 — Failed-worker advanced-checklist retry continuation identity (repair overlay cp01-v04)
+
+- Repair of the P2 identity defect of checkpoint 1 in
+  `plans/in-progress/failed-worker-advanced-checkbox-review-order-20261010.md`
+  reported by the v03 review: a supported retry of a failed reviewer
+  continuation was refused because the strict worker binder compared the
+  selected worker ancestor's raw recorded plan identity against the current
+  plan without the relocation mapping (and, in a further explicit rehome,
+  consulted the wrong chain run's provenance, whose source no longer named
+  the worker).
+- **Continuation identity rule.** `_bind_worker_receipt` now maps the worker
+  ancestor's recorded identities through the recorded provenance of the chain
+  run that verified the relocation for this exact ancestor. The new
+  `_ancestor_relocation_owner_meta` walks the immutable
+  `resumed_from_run_id` chain backwards from the worker and selects the
+  closest owning record whose provenance `source_run_id` names the worker
+  (the immediate source, or an intermediate descendant after a further
+  explicit rehome); the mapping is revalidated by the existing
+  `prepare_resume_relocation` checks against the current registered roots and
+  branches, so provenance alone is never new authority and the current
+  descendant's identity map never replaces the originally verified mapping.
+  Absent, contradictory, stale-root, or unverifiable evidence is a clean
+  refusal before successor allocation or provider launch. The retained
+  pending-review path applies the same shared proof.
+- Tests: `tests/test_resume_scope_reconciliation.py` gains the Git-Tracked
+  rehome producer and
+  `test_failed_worker_advanced_checklist_rehome_reviewer_retry_ordinary` /
+  `_explicit_rehome` (middle and final: a failed reviewer continuation retries
+  with the exact historical worker artifact in the reviewer prompt, the
+  original scope retained, the source and intermediate lineage byte-for-byte
+  unchanged, and the normal approval routing to the next worker or END),
+  `test_failed_worker_advanced_checklist_rehome_reviewer_retry_after_second_failure`
+  (a second failed-worker source retries after the first continuation was
+  consumed), and
+  `test_failed_worker_advanced_checklist_rehome_reviewer_retry_refusals`
+  (missing/foreign/overlay active-plan identities, a contradictory ancestor
+  scope original plan, and stale source roots each refuse with the lineage
+  exactly as mutated and no successor allocation).
+
+## 2026-10-10 — Failed-worker advanced-checklist historical proof and relocated plan identity (repair overlay cp01-v03)
+
+
+- Repair of the two remaining P2 validation defects of checkpoint 1 in
+  `plans/in-progress/failed-worker-advanced-checkbox-review-order-20261010.md`.
+- **Complete historical failed-worker proof.** `_worker_receipt_is_failed_worker`
+  now binds the entire decoded `snapshot_before` to the ancestor's captured
+  scope snapshot in full (name, counts, completeness, and index), matching the
+  initial admission's existing rule, and binds the ancestor's terminal
+  metadata to the exact terminal worker: `status=failed` with no terminal end
+  reason, the selected active worker turn with
+  `turns_completed = active_turn - 1`, the worker step, and the original plan
+  identity. Equal checkpoint indices and envelope references alone no longer
+  admit a mutated ancestor; the after-snapshot equality, exact
+  one-checkpoint/final progression, selector, transport conditions, and path
+  checks are unchanged. The proof is reused for first admission and retry, and
+  uses only immutable historical evidence, so an intervening reviewer or later
+  plan state cannot invalidate an otherwise valid ancestor.
+- **Relocated plan identity at the shared validator.**
+  `_reconcile_verified_resume_scope` now passes the relocation-mapped
+  `result_active_path` and the verified relocation into
+  `_worker_receipt_is_failed_worker`; recorded plan identities are compared in
+  one validated identity space (raw source paths mapped through the existing
+  verified relocation, with the allowed logical-primary versus owned-execution
+  counterpart derived from the owner's recorded roots). A valid
+  `rehome_worktree` bootstrap of a Git-verified failed-worker source passes
+  both CLI admission stages and starts the checkpoint reviewer with the
+  historical receipt and source artifacts byte-for-byte unchanged, while
+  missing, foreign, unmapped, or overlay identities still refuse before
+  successor allocation.
+- Tests: `tests/test_resume_scope_reconciliation.py` gains
+  `test_failed_worker_advanced_checklist_reviewer_retry_lineage_refusals`
+  (before-snapshot foreign name / step-count with retained index, and ancestor
+  `status`/`active_turn`/`current_step_name`/`end_reason` mutations, at both
+  middle and final checkpoints, refusing the pending preview, the full
+  reconstruction, and the strict binder with no published dependency) and the
+  Git-Tracked rehome producer with
+  `test_failed_worker_advanced_checklist_rehome_bootstrap_maps_receipt_identities_and_reviews_first`
+  (middle and final: `rehome_worktree` bootstrap, second CLI detection,
+  reviewer-first with the exact historical worker artifact, unchanged source
+  hashes, retained scope) and
+  `test_failed_worker_advanced_checklist_rehome_refuses_unmapped_or_foreign_identities`
+  (missing/foreign/unmapped/overlay refusals with the source unchanged and no
+  allocation).
+
+## 2026-10-10 — Failed-worker advanced-checklist retained-history ordinal and strict retry proof (repair overlay cp01-v02)
+
+- Repair of the two P2 findings from the cp01-v01 attempt of
+  `plans/in-progress/failed-worker-advanced-checkbox-review-order-20261010.md`.
+- **Retained-history ordinal.** `_reconcile_verified_resume_scope` no longer
+  restarts the recovered failed worker at ordinal 1. It safely extends the
+  decoded immutable attempt history (preserving the map and every prior row) and
+  allocates the recovered attempt with `_next_implementation_attempt_ordinal`,
+  so a retained-history source keeps its predecessor attempts and the recovered
+  failed worker appends after them (ordinal 2 after one predecessor, 3 after
+  two). No durable tuple decoding is made mutable elsewhere.
+- **Strict failed-ancestor proof.** `_worker_receipt_is_failed_worker` is
+  strengthened to bind the selected ancestor's terminal failed owner, active
+  turn/step and original plan to the recovered attempt and selected scope: the
+  before-snapshot must decode and agree with the captured scope, the
+  after-snapshot must agree with the ancestor's immutable last snapshot and
+  prove the exact checkpoint advance (or its final completion), the original
+  active-plan identity must hold (no overlay, and a missing identity refuses),
+  and the transport conditions (no chosen transition, `NEW_PLAN_EXISTS`/
+  `MAX_TURNS_REACHED` false, `DONE` matching) plus the bound selector must
+  match. The initial CLI admission (`_reconcile_verified_resume_scope`) now
+  applies the same shared receipt-level proof in addition to its broader
+  plan-byte and envelope checks, so admission and retry share one narrow
+  failed-worker proof. A missing, null, foreign, contradictory, or
+  envelope-mismatched ancestor is a clean refusal before any successor
+  allocation or provider launch; a valid unchanged ancestor still reaches the
+  original reviewer.
+- Tests: `tests/test_resume_scope_reconciliation.py` gains a retained-history
+  producer (prepare worker returns 0 without completing the checkpoint, the next
+  worker checks only that checkpoint and returns 124) proving the recovered
+  ordinal, multiple-retained-ordinal allocation, and a rejection/repair/retry
+  path where admission binds the new successful local repair over the old failed
+  ancestor; the reviewer-retry lineage refusals now cover a null/mismatched
+  before-snapshot, missing/foreign active plan, contradictory conditions/
+  selector, and a decodable after-snapshot contradicting ancestor metadata,
+  across both middle and last checkpoints, plus a positive final-checkpoint
+  retry where the unchanged final-completion ancestor still reaches the
+  original reviewer. `tests/test_control_plane_resume.py` gains a managed
+  rejection acceptance (same scope, repair worker, unchanged source receipts)
+  and a managed final-checkpoint acceptance with a distinct final-review step
+  before END, alongside full provider-order and execution-identity assertions.
+
+## 2026-10-10 — Failed-worker advanced-checklist review routing and retained evidence (repair overlay cp01-v01)
+
+- Repair of the rejected first attempt of checkpoint 1 in
+  `plans/in-progress/failed-worker-advanced-checkbox-review-order-20261010.md`.
+  A transport-failed worker that advanced its checklist must enter the same
+  required checkpoint review a successful worker would, and the routing must be
+  decided by one shared transition evaluation. Four reproduced defects were
+  fixed.
+- **P1 — transition selection.** `_failed_worker_review_transition` no longer
+  forces `DONE=True`; the lightweight pre-classifier and the authoritative
+  reconstruction both pass the source's validated `DONE` condition into the
+  worker step's configured success transitions. A middle-checkpoint
+  `DONE=False` source follows the graph's normal target; a final-checkpoint
+  `DONE=True` source follows its final target. A resolved non-reviewer target
+  (worker/END/final-review architect) preserves its cumulative one-hop route,
+  and an unresolvable transition is an explicit refusal before successor
+  allocation (a module-level sentinel distinguishes "unresolved" from
+  "resolved non-reviewer").
+- **P2 — second CLI admission.** `_detect_resume_candidate` carries the
+  validated `resume_bootstrap.resume_context.failed_worker_review` flag into its
+  mismatch check, so a final-checkpoint source passes both CLI stages (bootstrap
+  pre-classifier and candidate detector) instead of raising "already complete"
+  at the second stage.
+- **P3 — retained failed-worker binding.** The strict worker binder dispatches a
+  `harness-failed` worker receipt to a new `_worker_receipt_is_failed_worker`
+  validator (exact turn/step/role, nonzero returncode, no chosen transition,
+  decoded after-snapshot, scope identity/envelope) so a failed reviewer
+  successor can rebind the exact failed-worker ancestor through the immutable
+  `resumed_from_run_id` lineage. The retained ancestor survives pruning; a
+  missing, foreign, tampered, or envelope-mismatched ancestor is a clean
+  refusal. The completed-worker strict path is unchanged, and a genuinely new
+  successful local repair worker still wins source-first.
+- **P4 — team preservation.** The recovered worker attempt now carries the
+  source run's historical executed team (not `None`), so with
+  `upgrade_after_repairs=0` and `base.upgrade_to=strong` a post-recovery
+  rejection repairs on `codex.worker-strong` instead of falling back to the
+  base/default worker.
+- Tests: `tests/test_resume_scope_reconciliation.py` gains producer-backed
+  regressions covering all three workflow shapes (unconditional review,
+  `DONE -> architect final_review` with fallback reviewer, cumulative
+  `DONE -> reviewer` with fallback worker) comparing normal and resume
+  selection, an unresolvable-transition refusal, the final-checkpoint two-stage
+  bootstrap, the reviewer-retry lineage (worker124 -> reviewer124 -> resume ->
+  reviewer of the original checkpoint and exact worker receipt -> approval ->
+  next worker, with retained ancestor byte-for-byte), the absent/foreign/tampered
+  ancestor and envelope refusals, and the team-based upgrade after recovery.
+  `tests/test_control_plane_resume.py` gains a managed-resume acceptance for a
+  generated failed-worker source (preview/admission agreement, same-key single
+  successor, exact predecessor identity, explicit budget, checkpoint reviewer
+  first, approval then next worker, unchanged source records).
+
 ## 2026-10-10 — Isolated fixture signal interception from subprocess timeout cleanup (issue100 macOS release repair)
 
 - Priority failed-release repair of reviewed main `730b63da` (issue100).

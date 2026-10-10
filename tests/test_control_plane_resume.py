@@ -842,6 +842,547 @@ def _failed_pending_review_source(
     return repo_root, plan_path, config_path, workflow_config, source
 
 
+def _failed_worker_review_source(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    final_checkpoint: bool,
+    final_review_stage: bool = False,
+) -> tuple[Path, Path, Path, WorkflowUserConfig, SimpleNamespace]:
+    """Produce one genuine failed-worker source through the real controller.
+
+    The worker advances checkpoint 1 and then the harness transport fails
+    (returncode 124) before any transition is chosen; the source stays failed
+    with the checkpoint scope still open (``awaiting_review`` not set).  With
+    ``final_checkpoint`` the plan has only checkpoint 1 so the source reports
+    ``DONE=True``.  With ``final_review_stage`` the checkpoint review routes
+    to a distinct final-review step before END, so the managed acceptance can
+    assert the final checkpoint reviewer -> final review -> END order.
+    """
+    repo_root = tmp_path / "repo"
+    repo_root.mkdir()
+    plan_path = repo_root / "plan.md"
+    remaining = (
+        "\n### [ ] Checkpoint 2: Next\n- [ ] next step\n"
+        if not final_checkpoint
+        else ""
+    )
+    plan_path.write_text(
+        "# Plan\n\n### [ ] Checkpoint 1: First\n- [ ] step\n" + remaining,
+        encoding="utf-8",
+    )
+    config_path = repo_root / "aflow.toml"
+    config_path.write_text("# failed worker review fixture\n", encoding="utf-8")
+    if final_review_stage:
+        review_go = (GoTransition(to="final_review"),)
+        final_review_step = WorkflowStepConfig(
+            role="reviewer",
+            prompts=("final_review",),
+            go=(
+                GoTransition(to="END", when="DONE && !NEW_PLAN_EXISTS"),
+                GoTransition(to="implement"),
+            ),
+        )
+        final_review_prompt = "Final review of the completed plan."
+    else:
+        review_go = (
+            GoTransition(to="END", when="DONE && !NEW_PLAN_EXISTS"),
+            GoTransition(to="implement", when="NEW_PLAN_EXISTS"),
+            GoTransition(to="implement"),
+        )
+        final_review_step = None
+        final_review_prompt = "Final review of the completed plan."
+    steps: dict[str, WorkflowStepConfig] = {
+        "implement": WorkflowStepConfig(
+            role="worker",
+            prompts=("implement",),
+            go=(GoTransition(to="review"),),
+        ),
+        "review": WorkflowStepConfig(
+            role="reviewer",
+            prompts=("review",),
+            go=review_go,
+        ),
+    }
+    if final_review_step is not None:
+        steps["final_review"] = final_review_step
+    workflow_config = WorkflowUserConfig(
+        roles={"worker": "codex.high", "reviewer": "codex.high"},
+        harnesses={
+            "codex": WorkflowHarnessConfig(
+                profiles={"high": HarnessProfileConfig(model="high-model")}
+            )
+        },
+        workflows={
+            "live": WorkflowConfig(
+                steps=steps,
+                first_step="implement",
+            )
+        },
+        prompts={
+            "implement": "Implement the checkpoint.",
+            "review": "Review the completed worker turn.",
+            "final_review": final_review_prompt,
+        },
+    )
+    monkeypatch.setattr(
+        "aflow.daemon.load_workflow_config",
+        lambda _path: workflow_config,
+    )
+
+    def source_runner(
+        argv: list[str], **kwargs: object
+    ) -> subprocess.CompletedProcess[str]:
+        if "Implement" in str(kwargs.get("input", "")):
+            plan_path.write_text(
+                "# Plan\n\n### [x] Checkpoint 1: First\n- [x] step\n" + remaining,
+                encoding="utf-8",
+            )
+            return subprocess.CompletedProcess(
+                argv, 124, "", "harness transport failure\n"
+            )
+        return subprocess.CompletedProcess(argv, 0, "", "")
+
+    try:
+        run_workflow(
+            ControllerConfig(
+                repo_root=repo_root,
+                plan_path=plan_path,
+                max_turns=40,
+                reserved_run_id="failed-worker-review-source",
+                idempotency_key="source-key",
+                caller_scope="project:one",
+            ),
+            workflow_config,
+            "live",
+            config_dir=repo_root,
+            snapshot_config=False,
+            runner=source_runner,
+        )
+    except WorkflowError as exc:
+        source = SimpleNamespace(status="failed", run_dir=exc.run_dir)
+    else:  # pragma: no cover - the producer must fail at the worker
+        raise AssertionError("producer source did not fail at the worker")
+    return repo_root, plan_path, config_path, workflow_config, source
+
+
+@pytest.mark.parametrize("final_checkpoint", [False, True])
+def test_daemon_resume_failed_worker_advanced_checklist_review(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, final_checkpoint: bool
+) -> None:
+    """Managed resume of a failed-worker source admits and starts the reviewer.
+
+    The read-only preview and admission agree, the same-key resume creates one
+    successor with the exact predecessor identity and an explicit budget, the
+    checkpoint reviewer runs before any worker, and approval advances to the
+    next worker (or the final review for a final checkpoint) while the source
+    records stay unchanged.
+    """
+    repo_root, plan_path, config_path, workflow_config, source = (
+        _failed_worker_review_source(
+            tmp_path, monkeypatch, final_checkpoint=final_checkpoint
+        )
+    )
+    source_dir = source.run_dir
+    source_run_json = source_dir.joinpath("run.json").read_bytes()
+    source_turn_results = {
+        path.relative_to(source_dir).as_posix(): path.read_bytes()
+        for path in sorted(source_dir.glob("turns/*/result.json"))
+    }
+    metadata = json.loads(source_run_json)
+    assert metadata["status"] == "failed"
+    assert metadata["current_step_name"] == "implement"
+    failed_receipt = json.loads(
+        (source_dir / "turns" / f"turn-{metadata['active_turn']:03d}" / "result.json").read_text()
+    )
+    assert failed_receipt["status"] == "harness-failed"
+    assert failed_receipt["step_role"] == "worker"
+    assert failed_receipt["step_name"] == "implement"
+
+    environment_file = repo_root / "aflowd.env"
+    environment_file.write_text("AFLOWD_MODE=test\n", encoding="utf-8")
+    executable = repo_root / "release" / "bin" / "aflow"
+    executable.parent.mkdir(parents=True)
+    executable.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    executable.chmod(0o755)
+    units = InMemoryUnitManager()
+    daemon = AflowDaemon(
+        DaemonConfig(
+            repo_root=repo_root,
+            config_path=config_path,
+            aflow_executable=executable,
+            environment_file=environment_file,
+            release_identity="release-test",
+            stop_timeout_seconds=0,
+        ),
+        units=units,
+    )
+    daemon.start()
+
+    # Read-only preview and admission agree.
+    preview = daemon.service.run_status("failed-worker-review-source")
+    assert preview.evidence["can_resume"] is True
+
+    # Same-key single successor with the exact predecessor identity.
+    continuation = daemon.service.resume(
+        "failed-worker-review-source",
+        caller_scope="project:one",
+        idempotency_key="resume-failed-worker-review",
+    )
+    replay = daemon.service.resume(
+        "failed-worker-review-source",
+        caller_scope="project:one",
+        idempotency_key="resume-failed-worker-review",
+    )
+    assert continuation.created is True
+    assert replay.created is False
+    assert replay.run_id == continuation.run_id
+    assert len(units.start_calls) == 1
+    record = daemon.service._read_record(continuation.run_id)
+    assert record.get("resumed_from_run_id") == source_dir.name
+    assert record["prepared"]["start_step"] == "review"
+    assert record["prepared"]["max_turns"] == 40
+    manifest = daemon.application.repository.get_launch_manifest(continuation.run_id)
+    assert manifest is not None
+    assert manifest.start_step == "review"
+    prepared, resume_context = _worker_prepared(
+        record, manifest, repo_root, config_path, workflow_config
+    )
+    assert prepared.start_step == "review"
+    assert prepared.max_turns == 40
+    assert prepared.reserved_run_id == continuation.run_id
+    assert prepared.idempotency_key == "resume-failed-worker-review"
+    assert prepared.caller_scope == "project:one"
+    assert resume_context is not None
+    assert resume_context.failed_worker_review is not None
+    assert resume_context.failed_worker_review.reviewer_step_name == "review"
+    assert resume_context.active_implementation_scope is not None
+    assert resume_context.active_implementation_scope.awaiting_review is True
+
+    # Checkpoint reviewer first; approval then next worker (or final review).
+    provider_calls: list[str] = []
+
+    def successor_runner(
+        argv: list[str], **kwargs: object
+    ) -> subprocess.CompletedProcess[str]:
+        prompt = str(kwargs.get("input", ""))
+        if "Implement" in prompt:
+            provider_calls.append("worker")
+            if not final_checkpoint:
+                plan_path.write_text(
+                    "# Plan\n\n### [x] Checkpoint 1: First\n- [x] step\n"
+                    "### [x] Checkpoint 2: Next\n- [x] next step\n",
+                    encoding="utf-8",
+                )
+            return subprocess.CompletedProcess(
+                argv, 1, "", "worker stopped for fixture\n"
+            )
+        provider_calls.append("reviewer")
+        return subprocess.CompletedProcess(argv, 0, "review approved\n", "")
+
+    try:
+        continuation_result = run_workflow(
+            ControllerConfig(
+                repo_root=repo_root,
+                plan_path=prepared.plan_path,
+                max_turns=prepared.max_turns,
+                team=prepared.team,
+                extra_instructions=prepared.extra_instructions,
+                start_step=prepared.start_step,
+                reserved_run_id=prepared.reserved_run_id,
+                idempotency_key=prepared.idempotency_key,
+                caller_scope=prepared.caller_scope,
+                team_explicit=prepared.team_explicit,
+                max_turns_explicit=prepared.max_turns_explicit,
+                start_step_explicit=prepared.start_step_explicit,
+            ),
+            workflow_config,
+            "live",
+            config_dir=repo_root,
+            snapshot_config=False,
+            runner=successor_runner,
+            resume=resume_context,
+            allow_existing_launch_manifest=True,
+        )
+    except WorkflowError as exc:
+        continuation_run_dir = exc.run_dir
+    else:
+        continuation_run_dir = continuation_result.run_dir
+
+    # The full provider order: the checkpoint reviewer first, and only after
+    # approval the next worker (none for a final checkpoint that ends there).
+    assert provider_calls == (
+        ["reviewer"] if final_checkpoint else ["reviewer", "worker"]
+    )
+    continuation_turn = json.loads(
+        (continuation_run_dir / "turns" / "turn-001" / "result.json").read_text(encoding="utf-8")
+    )
+    assert continuation_turn["step_name"] == "review"
+    assert continuation_turn["step_role"] == "reviewer"
+    # The source records are unchanged.
+    assert (source_dir / "run.json").read_bytes() == source_run_json
+    for relative_path, artifact_bytes in source_turn_results.items():
+        assert (source_dir / relative_path).read_bytes() == artifact_bytes
+
+
+def test_daemon_resume_failed_worker_advanced_checklist_final_review_stage(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A final-checkpoint managed resume runs final review before END.
+
+    The checkpoint review routes to a distinct final-review step: the managed
+    resume admits the same single successor, the checkpoint reviewer runs
+    first, the distinct final-review step runs second, and only then does the
+    workflow reach END/delivery with the source records unchanged.
+    """
+    repo_root, plan_path, config_path, workflow_config, source = (
+        _failed_worker_review_source(
+            tmp_path,
+            monkeypatch,
+            final_checkpoint=True,
+            final_review_stage=True,
+        )
+    )
+    source_dir = source.run_dir
+    source_run_json = source_dir.joinpath("run.json").read_bytes()
+    source_turn_results = {
+        path.relative_to(source_dir).as_posix(): path.read_bytes()
+        for path in sorted(source_dir.glob("turns/*/result.json"))
+    }
+
+    environment_file = repo_root / "aflowd.env"
+    environment_file.write_text("AFLOWD_MODE=test\n", encoding="utf-8")
+    executable = repo_root / "release" / "bin" / "aflow"
+    executable.parent.mkdir(parents=True)
+    executable.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    executable.chmod(0o755)
+    units = InMemoryUnitManager()
+    daemon = AflowDaemon(
+        DaemonConfig(
+            repo_root=repo_root,
+            config_path=config_path,
+            aflow_executable=executable,
+            environment_file=environment_file,
+            release_identity="release-test",
+            stop_timeout_seconds=0,
+        ),
+        units=units,
+    )
+    daemon.start()
+
+    preview = daemon.service.run_status("failed-worker-review-source")
+    assert preview.evidence["can_resume"] is True
+    continuation = daemon.service.resume(
+        "failed-worker-review-source",
+        caller_scope="project:one",
+        idempotency_key="resume-failed-worker-final-review",
+    )
+    replay = daemon.service.resume(
+        "failed-worker-review-source",
+        caller_scope="project:one",
+        idempotency_key="resume-failed-worker-final-review",
+    )
+    assert continuation.created is True
+    assert replay.created is False
+    assert replay.run_id == continuation.run_id
+    assert len(units.start_calls) == 1
+    record = daemon.service._read_record(continuation.run_id)
+    assert record.get("resumed_from_run_id") == source_dir.name
+    assert record["prepared"]["start_step"] == "review"
+    assert record["prepared"]["max_turns"] == 40
+    manifest = daemon.application.repository.get_launch_manifest(continuation.run_id)
+    assert manifest is not None
+    assert manifest.start_step == "review"
+    prepared, resume_context = _worker_prepared(
+        record, manifest, repo_root, config_path, workflow_config
+    )
+    assert prepared.start_step == "review"
+    assert prepared.reserved_run_id == continuation.run_id
+    assert prepared.idempotency_key == "resume-failed-worker-final-review"
+    assert prepared.caller_scope == "project:one"
+    assert resume_context is not None
+    assert resume_context.failed_worker_review is not None
+    assert resume_context.failed_worker_review.reviewer_step_name == "review"
+    assert resume_context.active_implementation_scope is not None
+    assert resume_context.active_implementation_scope.awaiting_review is True
+
+    provider_calls: list[str] = []
+
+    def successor_runner(
+        argv: list[str], **kwargs: object
+    ) -> subprocess.CompletedProcess[str]:
+        prompt = str(kwargs.get("input", ""))
+        if "Implement" in prompt:
+            provider_calls.append("worker")
+            return subprocess.CompletedProcess(
+                argv, 1, "", "worker stopped for fixture\n"
+            )
+        if "Final review" in prompt:
+            provider_calls.append("final_reviewer")
+        else:
+            provider_calls.append("reviewer")
+        return subprocess.CompletedProcess(argv, 0, "review approved\n", "")
+
+    continuation_result = run_workflow(
+        ControllerConfig(
+            repo_root=repo_root,
+            plan_path=prepared.plan_path,
+            max_turns=prepared.max_turns,
+            team=prepared.team,
+            extra_instructions=prepared.extra_instructions,
+            start_step=prepared.start_step,
+            reserved_run_id=prepared.reserved_run_id,
+            idempotency_key=prepared.idempotency_key,
+            caller_scope=prepared.caller_scope,
+            team_explicit=prepared.team_explicit,
+            max_turns_explicit=prepared.max_turns_explicit,
+            start_step_explicit=prepared.start_step_explicit,
+        ),
+        workflow_config,
+        "live",
+        config_dir=repo_root,
+        snapshot_config=False,
+        runner=successor_runner,
+        resume=resume_context,
+        allow_existing_launch_manifest=True,
+    )
+    # Checkpoint reviewer first, then the distinct final-review step, and only
+    # then END/delivery; no worker runs in between.
+    assert provider_calls == ["reviewer", "final_reviewer"]
+    continuation_run_dir = continuation_result.run_dir
+    t1 = json.loads(
+        (continuation_run_dir / "turns" / "turn-001" / "result.json").read_text(encoding="utf-8")
+    )
+    assert t1["step_name"] == "review"
+    assert t1["step_role"] == "reviewer"
+    t2 = json.loads(
+        (continuation_run_dir / "turns" / "turn-002" / "result.json").read_text(encoding="utf-8")
+    )
+    assert t2["step_name"] == "final_review"
+    assert t2["step_role"] == "reviewer"
+    # The source records are unchanged.
+    assert (source_dir / "run.json").read_bytes() == source_run_json
+    for relative_path, artifact_bytes in source_turn_results.items():
+        assert (source_dir / relative_path).read_bytes() == artifact_bytes
+
+
+def test_daemon_resume_failed_worker_advanced_checklist_rejection_repairs(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A managed rejection selects the same scope and starts a repair worker.
+
+    The checkpoint reviewer rejects the retained scope (recording a rejection
+    that references the recovered attempt), the repair worker starts on the
+    same scope, and the source receipts stay byte-for-byte unchanged.
+    """
+    repo_root, plan_path, config_path, workflow_config, source = (
+        _failed_worker_review_source(tmp_path, monkeypatch, final_checkpoint=False)
+    )
+    source_dir = source.run_dir
+    source_run_json = source_dir.joinpath("run.json").read_bytes()
+
+    environment_file = repo_root / "aflowd.env"
+    environment_file.write_text("AFLOWD_MODE=test\n", encoding="utf-8")
+    executable = repo_root / "release" / "bin" / "aflow"
+    executable.parent.mkdir(parents=True)
+    executable.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    executable.chmod(0o755)
+    units = InMemoryUnitManager()
+    daemon = AflowDaemon(
+        DaemonConfig(
+            repo_root=repo_root,
+            config_path=config_path,
+            aflow_executable=executable,
+            environment_file=environment_file,
+            release_identity="release-test",
+            stop_timeout_seconds=0,
+        ),
+        units=units,
+    )
+    daemon.start()
+
+    preview = daemon.service.run_status("failed-worker-review-source")
+    assert preview.evidence["can_resume"] is True
+    continuation = daemon.service.resume(
+        "failed-worker-review-source",
+        caller_scope="project:one",
+        idempotency_key="resume-failed-worker-review-reject",
+    )
+    assert continuation.created is True
+    record = daemon.service._read_record(continuation.run_id)
+    assert record["prepared"]["start_step"] == "review"
+    manifest = daemon.application.repository.get_launch_manifest(continuation.run_id)
+    assert manifest is not None
+    prepared, resume_context = _worker_prepared(
+        record, manifest, repo_root, config_path, workflow_config
+    )
+    assert prepared.start_step == "review"
+    assert resume_context.active_implementation_scope is not None
+    assert resume_context.active_implementation_scope.awaiting_review is True
+    scope_id = resume_context.active_implementation_scope.scope_id
+
+    provider_calls: list[str] = []
+
+    def reject_runner(
+        argv: list[str], **kwargs: object
+    ) -> subprocess.CompletedProcess[str]:
+        prompt = str(kwargs.get("input", ""))
+        if "Implement" in prompt:
+            provider_calls.append("worker")
+            return subprocess.CompletedProcess(argv, 1, "", "worker stopped for fixture\n")
+        provider_calls.append("reviewer")
+        overlay = plan_path.with_name("plan-cp01-v01.md")
+        overlay.write_text(
+            "# Follow-up\n\n### [ ] Checkpoint 1: Repair\n- [ ] repair\n",
+            encoding="utf-8",
+        )
+        return subprocess.CompletedProcess(argv, 0, "review rejected\n", "")
+
+    try:
+        run_workflow(
+            ControllerConfig(
+                repo_root=repo_root,
+                plan_path=prepared.plan_path,
+                max_turns=prepared.max_turns,
+                team=prepared.team,
+                extra_instructions=prepared.extra_instructions,
+                start_step=prepared.start_step,
+                reserved_run_id=prepared.reserved_run_id,
+                idempotency_key=prepared.idempotency_key,
+                caller_scope=prepared.caller_scope,
+                team_explicit=prepared.team_explicit,
+                max_turns_explicit=prepared.max_turns_explicit,
+                start_step_explicit=prepared.start_step_explicit,
+            ),
+            workflow_config,
+            "live",
+            config_dir=repo_root,
+            snapshot_config=False,
+            runner=reject_runner,
+            resume=resume_context,
+            allow_existing_launch_manifest=True,
+        )
+    except WorkflowError as exc:
+        continuation_run_dir = exc.run_dir
+    else:  # pragma: no cover - the repair worker stops for the fixture
+        raise AssertionError("repair worker did not stop")
+
+    # Reviewer first, then the repair worker on the same scope.
+    assert provider_calls[0] == "reviewer"
+    assert provider_calls[1] == "worker"
+    review_turn = json.loads(
+        (continuation_run_dir / "turns" / "turn-001" / "result.json").read_text(encoding="utf-8")
+    )
+    assert review_turn["step_name"] == "review"
+    assert review_turn["step_role"] == "reviewer"
+    rejection = review_turn.get("review_rejection")
+    assert rejection is not None
+    assert rejection.get("scope_id") == scope_id
+    assert rejection.get("reviewed_attempt_ordinal") is not None
+    # The source receipts remain byte-for-byte unchanged.
+    assert (source_dir / "run.json").read_bytes() == source_run_json
+
+
 @pytest.mark.parametrize("remaining_checkpoint", [False, True])
 def test_daemon_resume_failed_pending_review_resumes_reviewer(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, remaining_checkpoint: bool

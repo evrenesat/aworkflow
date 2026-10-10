@@ -147,6 +147,73 @@ only after admission confirms its current ownership is inactive under that
 lock. Saved running metadata alone does not prove the prior controller stopped;
 terminal direct-controller records or identity-bound worker receipts do.
 
+A transport-failed worker that advanced its checklist is admitted to the same
+required checkpoint review that a successful worker would enter, and the
+routing is decided by one shared transition evaluation. The lightweight
+pre-classifier and the authoritative reconstruction both call the worker
+step's configured success transitions with the source's validated `DONE`
+condition (never a forced true), so a middle-checkpoint `DONE=False` source
+follows the graph's normal target and a final-checkpoint `DONE=True` source
+follows its final target. A resolved reviewer target retains the original
+scope (now awaiting review) and its immutable envelope and starts the
+checkpoint reviewer; a resolved non-reviewer target (worker, END, or a
+final-review architect) preserves its existing cumulative one-hop route and is
+not converted into a checkpoint review. A missing or unresolvable transition
+is an explicit refusal before any successor allocation or provider launch; it
+never closes the scope or falls back to cumulative behavior. The
+final-checkpoint source passes both CLI admission stages: the bootstrap
+pre-classifier admits it and the resume-candidate detector carries that exact
+validated flag into its second mismatch check, so the two stages agree.
+
+A failed reviewer successor can retry without losing its original failed-worker
+evidence. The recovered worker attempt is a truthful non-accepted record whose
+team is the source run's historical executed team (not `None`, the current
+reviewer team, or a live default) and whose selector comes from the bound
+receipt, so normal scoped repair applies the configured team routing and any
+configured upgrade. It is allocated the next scope-local ordinal after every
+retained same-scope attempt (never restarted at 1), so a retained-history
+source keeps its predecessor attempts and the recovered failed worker appends
+after them. When a descendant reviewer fails, the next supported resume
+rebinds the exact failed-worker ancestor through the immutable
+`resumed_from_run_id` lineage: the strict worker binder dispatches the
+`harness-failed` receipt to a failed-worker validator that checks the exact
+turn/step/role, the nonzero returncode, the absence of a chosen transition, the
+decoded before-snapshot bound in full (name, counts, completeness, and index)
+to the ancestor's captured scope snapshot, the after-snapshot agreeing with
+the ancestor's immutable last snapshot and proving the exact checkpoint advance
+(or its final completion), the original active-plan identity (no overlay),
+the ancestor's terminal owner metadata bound to this exact worker turn
+(terminal `failed` status with no terminal end reason, the selected active
+worker turn with `turns_completed = active_turn - 1`, the worker step, and the
+original plan identity), the transport conditions (`NEW_PLAN_EXISTS`/
+`MAX_TURNS_REACHED` false, `DONE` matching the historical after-snapshot), the
+bound selector, and the scope envelope, and it never accepts an unsuccessful
+worker receipt as a success or substitutes an older unrelated worker. Recorded
+plan identities are compared in one validated identity space: a verified
+relocation maps the raw source paths before comparison, and the allowed
+logical-primary versus owned-execution counterpart derived from the owner's
+recorded roots remains accepted, so a valid explicitly rehomed source passes
+both CLI admission stages while missing, foreign, unmapped, or overlay
+identities refuse. The initial CLI admission applies the same shared
+receipt-level proof (in addition to its broader plan-byte and envelope
+checks), so admission and retry never diverge in what the failed-worker
+receipt must prove. The retained ancestor survives pruning so
+the descendant reviewer can read the original worker receipt, and a missing,
+foreign, tampered, contradictory, or envelope-mismatched ancestor is a clean
+refusal. A genuinely new successful local repair worker still wins source-first
+over any ancestor. A supported retry of a failed reviewer continuation keeps
+that same identity space: the strict binder maps the selected worker
+ancestor's recorded identities through the recorded provenance of the chain
+run that verified the relocation for this exact ancestor (the immediate
+source, or an intermediate descendant when that source was itself explicitly
+rehomed again), revalidated through the existing relocation checks against
+the current registered roots and branches; provenance alone is never new
+authority, the originally verified mapping is preserved across descendant
+retries, and the current descendant's identity map never replaces it, so an
+ordinary retry and a further explicit rehome both rebind the same worker
+ancestor while absent, contradictory, stale-root, or unverifiable evidence
+refuses before successor allocation or provider launch.
+
 ## Optional issue-intake boundary
 
 `aflow/issue_intake.py` is a short-lived host command. It loads one strict
