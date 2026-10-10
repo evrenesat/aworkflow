@@ -1,5 +1,67 @@
 # DEVLOG
 
+## 2026-10-10 — Isolated fixture signal interception from subprocess timeout cleanup (issue100 macOS release repair)
+
+- Priority failed-release repair of reviewed main `730b63da` (issue100).
+  CI38046609968 macOS Python3.12 job114197305984 and Python3.11
+  job114197306008 each failed 2 tests (3841 passed). The shared-module mock
+  collision: `test_owned_fixture_cleanup_rejects_unproven_provider` patched the
+  process-global `os.kill`, so Python's own `subprocess` timeout cleanup of a
+  live `ps`/child probe called the interceptor and raised the test's
+  unauthorized-signal `AssertionError` instead of the ordinary
+  `TimeoutExpired`; the absent case also reported provider cessation unknown
+  when its live probe expired.
+- Fix is test-only (`tests/test_process_identity.py`): the fixture's signal
+  interceptor is isolated at the test module's own `os` reference via
+  `_IsolatedOs`, a proxy that delegates every ordinary attribute to the real
+  `os` module and replaces only `kill`. Monkeypatching the module binding (not
+  the process-global module object) leaves production process probes
+  (`process_liveness`, `process_group_state`) and independently owned
+  `subprocess` cleanup on the real `os.kill`; a rejected nonzero fixture signal
+  stays fatal. The two other reachable shared-module `os.kill` spies
+  (`_run_wrong_group_rejection`,
+  `test_owned_fixture_cleanup_unknown_wrapper_birth_never_claims_ceased`) were
+  rebound to the same isolation, retaining their exact assertions. In those
+  live fixture tests the created wrapper instance's own `kill` method is
+  additionally routed through the interceptor/policy (instance attribute only,
+  restored by the existing `monkeypatch.undo()` before real teardown), so the
+  fixture's direct wrapper signal keeps the old recorded/suppressed behavior
+  and the fixture group stays present until teardown; the Popen class and
+  process-global `os.kill` are never patched, and unrelated `Popen` instances
+  and native probes keep real cleanup. The `process_identity.os` `kill` spies
+  in the birth-identity tests are left untouched: they mock `subprocess.run`
+  too, so no real timeout cleanup can collide.
+- A new portable regression
+  `test_fixture_signal_interceptor_leaves_subprocess_probe_timeout_cleanup_alone`
+  installs the isolated interceptor, then drives an independently owned Python
+  child through `subprocess.run` with a deliberately expiring bounded timeout,
+  asserting the ordinary `TimeoutExpired`, a bounded reap, and that no fixture
+  signal is recorded. Under the old global patch this fails (the collision is
+  reproduced by the timeout cleanup calling `os.kill`); under the isolated
+  proxy it passes.
+- `test_owned_fixture_cleanup_rejects_unproven_provider` is now a
+  deterministic decision test at the process observation boundaries: positive
+  cessation requires both a positively absent group AND a positively absent
+  provider, and any present/unknown/expired observation of either is unconfirmed
+  cleanup (diagnostic preserved), never success. Rejected provider evidence
+  authorizes no signal. `test_owned_fixture_cleanup_rejects_unproven_provider_evidence`
+  restores the distinct rejected-proof cases through real `_cleanup_owned_fixture`
+  and `process_identity.session_member_live` validation: unknown captured
+  birth, reused birth, expired bounded birth, wrong recorded group, and wrong
+  session. Each case supplies deterministic native observation boundaries
+  (provider liveness, getsid/getpgid, bounded birth), uses present
+  group/provider observations so no absence shortcut replaces ownership
+  rejection, and uses the already-reaped synthetic wrapper plus the
+  established virtual-clock pattern so no live probe or real time is spent;
+  per-case boundary-call checks prove each case reaches its intended
+  ownership gate (the matrix cannot collapse to a getsid lookup failure).
+  These are deterministic synthetic decision checks that supplement, not
+  replace, the real process/group integration tests (readiness, escalation,
+  survivor cleanup) which still run live subprocesses.
+- Native macOS behavior remains unverified on Linux; green macOS 3.11/3.12,
+  all exact-SHA CI jobs, and matching deployed SHA/health/readiness are separate
+  delivery gates before issue100 closure.
+
 ## 2026-10-09 — Synchronized process-stop fixtures to provider readiness (issue100 process-stop fixture CI repair)
 
 - Checkpoint 1 repair of the process-stop fixture CI-repair plan. The two real

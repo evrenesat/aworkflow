@@ -5,6 +5,7 @@ from __future__ import annotations
 import os
 from dataclasses import dataclass
 from pathlib import Path
+import signal
 import subprocess
 import sys
 import time
@@ -14,6 +15,44 @@ import pytest
 from aflow import process_identity
 from aflow import ui_cli
 from aflow.control_plane import persistent_units, run_activity
+
+
+class _IsolatedOs:
+    """A module-local stand-in for the ``os`` module used only by this test
+    module's own fixture code.
+
+    Every ordinary attribute delegates to the real ``os`` module, so
+    production process probes (which import ``os`` themselves) and
+    independently owned subprocess timeout cleanup (which uses the real
+    ``os.kill``) are never intercepted.  Only this module's ``kill`` reference
+    is replaced, so the fixture's attempted signals are recorded and the
+    supplied policy decides their outcome (a rejected nonzero signal stays
+    fatal).  This isolates the fixture's signal interception from the
+    process-global ``os`` module object.
+    """
+
+    def __init__(self, real_os: object, policy) -> None:
+        object.__setattr__(self, "_real", real_os)
+        object.__setattr__(self, "_policy", policy)
+
+    def __getattr__(self, name: str) -> object:
+        return getattr(object.__getattribute__(self, "_real"), name)
+
+    def kill(self, pid: int, signum: int) -> None:
+        object.__getattribute__(self, "_policy")(pid, signum)
+
+
+def _install_fixture_signal_interceptor(
+    monkeypatch: pytest.MonkeyPatch, policy
+) -> None:
+    """Patch this module's own ``os`` binding to ``_IsolatedOs``.
+
+    The real ``os`` module is captured before the binding is replaced, so the
+    proxy delegates every ordinary attribute (``getpgid``, ``getsid``, ...) to
+    the genuine module while only ``kill`` is intercepted.  Production
+    process probes and ``subprocess`` retain the real ``os.kill``.
+    """
+    monkeypatch.setattr(sys.modules[__name__], "os", _IsolatedOs(real_os=os, policy=policy))
 
 
 def _proc_stat(*, state: str = "S", start_ticks: str = "4242") -> str:
@@ -1020,114 +1059,257 @@ def _wait_for_survivor_group_present(
     )
 
 
+@pytest.mark.skipif(sys.platform not in ("linux", "darwin"), reason="POSIX subprocess cleanup")
+def test_fixture_signal_interceptor_leaves_subprocess_probe_timeout_cleanup_alone(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """While the fixture signal interceptor is installed at this module's own
+    ``os`` reference, an independently owned child that exceeds a bounded
+    ``subprocess.run`` timeout is cleaned up by Python through the *real*
+    ``os.kill``.  The interceptor must not observe that cleanup: the ordinary
+    ``TimeoutExpired`` outcome is preserved, the owned child is reaped by
+    ``subprocess.run``, and no fixture signal is recorded.
+
+    A process-global ``os.kill`` patch (the old approach) would intercept the
+    timeout cleanup and raise the fixture's unauthorized-signal assertion
+    instead of the ordinary ``TimeoutExpired``; this regression fails under
+    that coupling and passes only while the interceptor is isolated.
+    """
+    signals: list[tuple[int, int]] = []
+
+    def intercept(pid: int, signum: int) -> None:
+        signals.append((pid, signum))
+        if signum == 0:
+            raise ProcessLookupError("no such process")
+        raise AssertionError(f"unauthorized signal {signum} to pid {pid}")
+
+    _install_fixture_signal_interceptor(monkeypatch, intercept)
+    started = time.monotonic()
+    with pytest.raises(subprocess.TimeoutExpired):
+        # A temporary short-lived Python child that deliberately outlives the
+        # bounded timeout; ``subprocess.run`` kills and reaps it on expiry.
+        subprocess.run(
+            [sys.executable, "-c", "import time; time.sleep(30)"],
+            start_new_session=True,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=0.3,
+        )
+    elapsed = time.monotonic() - started
+    # The ordinary bounded timeout outcome, not the fixture's fatal assertion.
+    assert elapsed < _CLEANUP_BUDGET_SECONDS
+    # The interceptor is isolated: Python's own timeout cleanup used the real
+    # ``os.kill``, so no fixture signal (null probe or otherwise) was recorded.
+    assert signals == []
+
+
 @pytest.mark.parametrize(
-    "reject_case",
-    ["reused", "unknown", "expired", "wrong-group", "wrong-session", "absent"],
+    ("group_obs", "provider_obs", "expected"),
+    [
+        ("absent", "absent", True),
+        ("present", "present", False),
+        ("present", "absent", False),
+        ("absent", "present", False),
+        ("unknown", "absent", False),
+        ("absent", "unknown", False),
+        ("unknown", "unknown", False),
+    ],
+    ids=[
+        "positive-absence",
+        "live-group-and-provider",
+        "live-group",
+        "live-provider",
+        "unknown-group",
+        "unknown-provider",
+        "unknown-both",
+    ],
 )
 def test_owned_fixture_cleanup_rejects_unproven_provider(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, reject_case: str
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    group_obs: str,
+    provider_obs: str,
+    expected: bool,
 ) -> None:
-    """Live, reused, unknown, expired, or wrong-group/session evidence
-    authorizes no group/provider signal and no confirmed cessation of the
-    surviving fixture group; an already-absent member still confirms through
-    positive absence only."""
-    sid = 123
-    member_pid = 2_000_000_000  # above any realistic pids_max: positively absent
-    survivor: subprocess.Popen[bytes] | None = None
-    try:
-        if reject_case != "absent":
-            # A live task-owned member of its own group: the recorded evidence
-            # is rejected, but the real process stays present, so no cessation
-            # can be claimed.  Its independently captured identity is used
-            # only for this test's own teardown.
-            survivor_script = tmp_path / "survivor.py"
-            survivor_script.write_text(
-                "import time\ntime.sleep(30)\n", encoding="utf-8"
-            )
-            survivor = subprocess.Popen(
-                [sys.executable, str(survivor_script)],
-                start_new_session=True,
-                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-            )
-            _wait_for_survivor_group_present(survivor)
-            member_pid = survivor.pid
-            # A new session: the survivor leads its own session and group.
-            sid = survivor.pid
+    """Deterministic cleanup-decision checks at the process observation
+    boundaries.
 
-        if reject_case == "unknown":
-            # An unproven (never-observed) birth is never live evidence.
-            member = process_identity.SessionMember(
-                pid=member_pid, birth=None, pgid=member_pid
-            )
-        elif reject_case == "reused":
-            # A live PID whose real birth differs from the captured one is
-            # reused.
-            member = process_identity.SessionMember(
-                pid=member_pid, birth="linux-start-ticks:1", pgid=member_pid
-            )
-        elif reject_case == "wrong-group":
-            # The recorded group differs from the live member's actual group.
-            member = process_identity.SessionMember(
-                pid=member_pid, birth="linux-start-ticks:1", pgid=member_pid + 1
-            )
-        else:
-            member = process_identity.SessionMember(
-                pid=member_pid, birth="linux-start-ticks:1", pgid=member_pid
-            )
+    Positive cessation requires *both* the fixture group and the retained
+    provider to be positively absent; a present, unknown, or expired
+    observation of either is unconfirmed cleanup, never success.  Rejected
+    (live, reused, unknown, expired, or wrong-group/session) provider evidence
+    authorizes no group/provider signal, and a rejected nonzero fixture signal
+    remains an assertion failure.  The interceptor is isolated at this module's
+    own ``os`` reference, and the observation boundaries are supplied
+    deterministically so a synthetic assertion test never spends the cleanup
+    budget on a live ``ps`` loop.  Real process/group integration (readiness,
+    escalation, survivor cleanup) is proven by the separate live-survivor
+    tests, which this decision test supplements rather than replaces; mocked
+    absence here does not assert native process behavior.
+    """
+    member_pid = 2_000_000_000  # above any realistic pids_max: never a live target
+    member = process_identity.SessionMember(
+        pid=member_pid, birth="linux-start-ticks:1", pgid=member_pid
+    )
+    signals: list[tuple[int, int]] = []
 
-        if reject_case == "expired":
-            # A bounded birth probe with no result is expired/unknown evidence.
-            monkeypatch.setattr(
-                process_identity,
-                "process_birth_bounded",
-                lambda pid, deadline: None,
-            )
-        elif reject_case == "wrong-session":
-            # The live member is not in the recorded session.
-            monkeypatch.setattr(process_identity.os, "getsid", lambda pid: 999)
+    def intercept(pid: int, signum: int) -> None:
+        signals.append((pid, signum))
+        if signum == 0:
+            # A null probe is not a signal.
+            raise ProcessLookupError("no such process")
+        # A rejected fixture signal remains an assertion failure.
+        raise AssertionError(f"unauthorized signal {signum} to pid {pid}")
 
-        signals: list[tuple[int, int]] = []
+    # Isolate the interceptor at this module's own ``os`` reference: production
+    # process probes and independently owned subprocess cleanup keep the real
+    # ``os.kill``.
+    _install_fixture_signal_interceptor(monkeypatch, intercept)
+    # Deterministic observation boundaries: no live ``ps`` loop in a synthetic
+    # assertion test.
+    monkeypatch.setattr(
+        process_identity, "process_group_state", lambda pgid, deadline=None: group_obs
+    )
+    monkeypatch.setattr(
+        process_identity, "process_liveness", lambda pid, deadline=None: provider_obs
+    )
 
-        def intercept(pid: int, signum: int) -> None:
-            signals.append((pid, signum))
-            if signum == 0:
-                # A null probe is not a signal.
-                raise ProcessLookupError("no such process")
-            raise AssertionError(f"unauthorized signal {signum} to pid {pid}")
+    wrapper = _ExitedWrapper(member_pid)
+    proof = _FixtureProof(
+        wrapper_birth="linux-start-ticks:1",
+        wrapper_pgid=member_pid,
+        session_id=member_pid,
+        provider=member,
+    )
+    confirmed = _cleanup_owned_fixture(wrapper, proof)
 
-        monkeypatch.setattr(os, "kill", intercept)
-
-        wrapper = _ExitedWrapper(member_pid)
-        proof = _FixtureProof(
-            wrapper_birth="linux-start-ticks:1",
-            wrapper_pgid=member_pid,
-            session_id=sid,
-            provider=member,
-        )
-        confirmed = _cleanup_owned_fixture(wrapper, proof)
-    finally:
-        # Undo the interception before the real task-owned teardown so the
-        # test's own cleanup is not recorded as a fixture signal; an early
-        # startup assertion or probe failure reaches the same direct-child
-        # cleanup, reaped within the existing cleanup allowance.
-        monkeypatch.undo()
-        if survivor is not None:
-            survivor.kill()
-            try:
-                survivor.wait(timeout=_CLEANUP_BUDGET_SECONDS)
-            except subprocess.TimeoutExpired:
-                pass
-
+    # No authorized fixture signal: rejected evidence is never signalled, and
+    # the reaped wrapper authorizes no group signal.
     assert [call for call in signals if call[1] != 0] == []
     assert wrapper.kill_calls == 0
-    if reject_case == "absent":
-        # The ordinary already-absent member confirms through positive
-        # absence of the group and the member.
-        assert confirmed is True
+    assert confirmed is expected
+    err = capsys.readouterr().err
+    if expected:
+        # Positive absence of both group and provider: no unconfirmed report.
+        assert "fixture cleanup unconfirmed" not in err
     else:
-        # A live/unknown survivor keeps the group present: no signal, no
-        # confirmed cessation.
-        assert confirmed is False
+        # Unconfirmed cleanup preserves its diagnostic rather than masking it.
+        assert "fixture cleanup unconfirmed" in err
+
+
+@pytest.mark.parametrize(
+    "reject_case",
+    [
+        "unknown-birth",
+        "reused-birth",
+        "expired-birth",
+        "wrong-group",
+        "wrong-session",
+    ],
+)
+def test_owned_fixture_cleanup_rejects_unproven_provider_evidence(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    reject_case: str,
+) -> None:
+    """Deterministic rejected-proof decisions through real validation.
+
+    An unknown captured provider birth, a reused PID birth, an expired
+    bounded birth, a mismatched recorded group, or a mismatched session is
+    never live provider proof: the real ``_cleanup_owned_fixture`` and
+    ``process_identity.session_member_live`` reject each case at its
+    intended ownership gate, authorize no fixture signal and no wrapper
+    kill, and return unconfirmed cleanup with its diagnostic.  Present
+    group/provider observations keep any absence shortcut from replacing
+    ownership rejection, and the deterministic native boundaries (provider
+    liveness, getsid/getpgid, bounded birth) plus the already-reaped
+    synthetic wrapper and virtual clock spend no real time and no live
+    probe in this decision test.  Real process/group integration remains
+    proven by the live-survivor tests, which this test supplements.
+    """
+    member_pid = 2_000_000_000  # above any realistic pids_max: never a live target
+    session_id = 4242
+    if reject_case == "unknown-birth":
+        # An unproven (never-observed) birth is never live evidence.
+        member = process_identity.SessionMember(
+            pid=member_pid, birth=None, pgid=member_pid
+        )
+    else:
+        member = process_identity.SessionMember(
+            pid=member_pid, birth="linux-start-ticks:1", pgid=member_pid
+        )
+
+    signals: list[tuple[int, int]] = []
+    boundary_calls: list[str] = []
+
+    def intercept(pid: int, signum: int) -> None:
+        signals.append((pid, signum))
+        # A rejected nonzero fixture signal remains an assertion failure.
+        raise AssertionError(f"unauthorized signal {signum} to pid {pid}")
+
+    _install_fixture_signal_interceptor(monkeypatch, intercept)
+    # Deterministic observation boundaries: present group and provider
+    # observations keep the cessation loop from taking an absence shortcut
+    # in place of ownership rejection.
+    monkeypatch.setattr(
+        process_identity, "process_group_state", lambda pgid, deadline=None: "present"
+    )
+    monkeypatch.setattr(
+        process_identity, "process_liveness", lambda pid, deadline=None: "present"
+    )
+    # Deterministic native identity boundaries for the synthetic target.
+    def fake_getsid(pid: int) -> int:
+        boundary_calls.append("getsid")
+        return session_id + 1 if reject_case == "wrong-session" else session_id
+
+    def fake_getpgid(pid: int) -> int:
+        boundary_calls.append("getpgid")
+        return member_pid + 7 if reject_case == "wrong-group" else member_pid
+
+    def fake_birth_bounded(pid: int, deadline: float) -> str | None:
+        boundary_calls.append("birth")
+        if reject_case == "reused-birth":
+            return "linux-start-ticks:999"
+        if reject_case == "expired-birth":
+            return None
+        return "linux-start-ticks:1"
+
+    monkeypatch.setattr(process_identity.os, "getsid", fake_getsid)
+    monkeypatch.setattr(process_identity.os, "getpgid", fake_getpgid)
+    monkeypatch.setattr(process_identity, "process_birth_bounded", fake_birth_bounded)
+    # A deterministic accelerated clock bounds the synthetic cessation loop
+    # on virtual time without changing the helper's two-second allowance.
+    clock = [0.0]
+    monkeypatch.setattr(time, "monotonic", lambda: clock[0])
+    monkeypatch.setattr(
+        time, "sleep", lambda seconds: clock.__setitem__(0, clock[0] + seconds)
+    )
+
+    wrapper = _ExitedWrapper(member_pid)
+    proof = _FixtureProof(
+        wrapper_birth="linux-start-ticks:1",
+        wrapper_pgid=member_pid,
+        session_id=session_id,
+        provider=member,
+    )
+    confirmed = _cleanup_owned_fixture(wrapper, proof)
+
+    # Rejected proof authorizes no fixture signal and no wrapper kill.
+    assert signals == []
+    assert wrapper.kill_calls == 0
+    assert confirmed is False
+    # Unconfirmed cleanup preserves its diagnostic rather than masking it.
+    assert "fixture cleanup unconfirmed" in capsys.readouterr().err
+    # Each case reached its intended ownership gate, so the matrix cannot
+    # collapse to a single getsid lookup failure for the synthetic target.
+    if reject_case == "unknown-birth":
+        assert boundary_calls == []
+    elif reject_case == "wrong-session":
+        assert boundary_calls == ["getsid"]
+    elif reject_case == "wrong-group":
+        assert boundary_calls == ["getsid", "getpgid"]
+    else:  # reused-birth and expired-birth
+        assert boundary_calls == ["getsid", "getpgid", "birth"]
 
 
 @dataclass
@@ -1201,7 +1383,21 @@ def _run_wrong_group_rejection(
         # Swallowed: the fixture group stays live so the decoy's survival
         # is observable and no real signal can reach any process.
 
-    monkeypatch.setattr(os, "kill", intercept)
+    # Isolate the interceptor at this module's own ``os`` reference so the
+    # real wrapper/decoy subprocesses' own timeout cleanup keeps the real
+    # ``os.kill`` while only the fixture's attempted signals are recorded.
+    _install_fixture_signal_interceptor(monkeypatch, intercept)
+    # The fixture's direct wrapper kill keeps the old recorded/suppressed
+    # behavior: route only this created wrapper instance's ``kill`` method
+    # through the interceptor, so the wrapper's exact PID and SIGKILL are
+    # observed and suppressed while the fixture group stays present until
+    # teardown.  The Popen class and process-global ``os.kill`` are not
+    # patched; the instance method is restored by the existing
+    # ``monkeypatch.undo()`` before the real teardown.
+    def _intercepted_wrapper_kill() -> None:
+        intercept(wrapper.pid, signal.SIGKILL)
+
+    monkeypatch.setattr(wrapper, "kill", _intercepted_wrapper_kill)
     decoy_pid: int | None = None
     decoy_member: process_identity.SessionMember | None = None
     body_failure: AssertionError | None = None
@@ -1569,7 +1765,18 @@ def test_owned_fixture_cleanup_unknown_wrapper_birth_never_claims_ceased(
             return
         raise AssertionError(f"unauthorized signal {signum} to pid {pid}")
 
-    monkeypatch.setattr(os, "kill", intercept)
+    # Isolate the interceptor at this module's own ``os`` reference so the
+    # real wrapper/provider subprocesses' own timeout cleanup keeps the real
+    # ``os.kill`` while only the fixture's attempted signals are recorded.
+    _install_fixture_signal_interceptor(monkeypatch, intercept)
+    # Route only this wrapper instance's ``kill`` through the policy so the
+    # allowed direct-wrapper reap stays recorded: the policy observes the
+    # wrapper's exact PID and delivers the real kill, while unrelated
+    # ``Popen`` instances keep the real ``os.kill``.
+    def _intercepted_wrapper_kill() -> None:
+        intercept(wrapper.pid, signal.SIGKILL)
+
+    monkeypatch.setattr(wrapper, "kill", _intercepted_wrapper_kill)
     provider_pid: int | None = None
     provider_member: process_identity.SessionMember | None = None
     provider_sid: int | None = None
