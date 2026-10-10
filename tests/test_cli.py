@@ -6,7 +6,12 @@ import re
 from typing import Mapping
 from unittest.mock import Mock
 from aflow.api.models import PreparedRun
-from aflow.config import ErrorHandlingConfig, ManagerConfig
+from aflow.config import (
+    ErrorHandlingConfig,
+    HarnessErrorRecoveryConfig,
+    HarnessErrorRecoveryRuleConfig,
+    ManagerConfig,
+)
 from aflow.repartition import create_envelope, derive_generation_id, write_envelope_atomic
 from aflow.status import BannerRenderer as RealBannerRenderer
 from aflow.workflow import _freeze_run_identity
@@ -7896,3 +7901,363 @@ class TestFailedPendingReviewResumeRouting:
                 relocation=relocation,
                 plan_path=foreign,
             )
+
+    @staticmethod
+    def _recovery_failed_source(
+        tmp_path: Path,
+        *,
+        complete_checkpoint: bool = True,
+        failing_role: str = "reviewer",
+    ) -> tuple[Path, Path, WorkflowUserConfig]:
+        """Produce a genuine recovery-failed terminal source through the real controller.
+
+        The worker completes checkpoint 1 (with a checkpoint remaining) and
+        the configured step exits nonzero; the deterministic recovery rule
+        fails the run immediately, so the real producer finalizes the turn
+        with status ``recovery-failed`` and strict before/after snapshots.
+        The original-plan-complete shape is not producer-supported: when the
+        post-snapshot is already complete the producer treats the failure as
+        recovery progress and finalizes it as harness-failed instead, which
+        the existing failed-pending-review cases cover.  No harness-failed
+        result is relabeled to manufacture this shape.
+        """
+        repo_root = tmp_path / "repo"
+        repo_root.mkdir()
+        plan_path = repo_root / "plan.md"
+        remaining = "\n### [ ] Checkpoint 2: Next\n- [ ] next step\n"
+        plan_path.write_text(
+            "# Plan\n\n"
+            "### [ ] Checkpoint 1: First\n- [ ] step\n"
+            + remaining,
+            encoding="utf-8",
+        )
+        config_path = repo_root / "aflow.toml"
+        config_path.write_text("# recovery-failed pending review fixture\n", encoding="utf-8")
+        workflow_config = WorkflowUserConfig(
+            roles={"worker": "codex.high", "reviewer": "codex.high"},
+            harnesses={
+                "codex": WorkflowHarnessConfig(
+                    profiles={"high": HarnessProfileConfig(model="high-model")}
+                )
+            },
+            workflows={
+                "live": WorkflowConfig(
+                    steps={
+                        "implement": WorkflowStepConfig(
+                            role="worker",
+                            prompts=("implement",),
+                            go=(GoTransition(to="review"),),
+                        ),
+                        "review": WorkflowStepConfig(
+                            role="reviewer",
+                            prompts=("review",),
+                            go=(GoTransition(to="END"),),
+                        ),
+                    },
+                    first_step="implement",
+                )
+            },
+            prompts={
+                "implement": "Implement the checkpoint.",
+                "review": "Review the completed worker turn.",
+            },
+            error_handling=ErrorHandlingConfig(
+                harness_error_recovery=HarnessErrorRecoveryConfig(
+                    rules=(
+                        HarnessErrorRecoveryRuleConfig(
+                            action="fail_immediately",
+                            match=(f"{failing_role} provider failed",),
+                        ),
+                    ),
+                )
+            ),
+        )
+
+        def source_runner(
+            argv: list[str], **kwargs: object
+        ) -> subprocess.CompletedProcess[str]:
+            if "Implement" in str(kwargs.get("input", "")):
+                if failing_role == "worker":
+                    return subprocess.CompletedProcess(
+                        argv, 1, "", "worker provider failed\n"
+                    )
+                if complete_checkpoint:
+                    checkpoint_one = "### [x] Checkpoint 1: First"
+                else:
+                    checkpoint_one = "### [ ] Checkpoint 1: First"
+                plan_path.write_text(
+                    "# Plan\n"
+                    f"{checkpoint_one}\n"
+                    "- [x] step\n"
+                    + remaining,
+                    encoding="utf-8",
+                )
+                return subprocess.CompletedProcess(argv, 0, "worker output\n", "")
+            return subprocess.CompletedProcess(
+                argv, 3, "", "reviewer provider failed\n"
+            )
+
+        run_dir = None
+        try:
+            run_workflow(
+                ControllerConfig(
+                    repo_root=repo_root,
+                    plan_path=plan_path,
+                    max_turns=40,
+                    reserved_run_id="recovery-failed-pending-review-source",
+                    idempotency_key="source-key",
+                    caller_scope="project:one",
+                ),
+                workflow_config,
+                "live",
+                config_dir=repo_root,
+                snapshot_config=False,
+                runner=source_runner,
+            )
+        except WorkflowError as exc:
+            run_dir = exc.run_dir
+        if run_dir is None:
+            raise AssertionError("producer source did not fail")
+        metadata = json.loads((run_dir / "run.json").read_text(encoding="utf-8"))
+        assert metadata["status"] == "failed"
+        assert metadata.get("end_reason") is None
+        active_turn = metadata["active_turn"]
+        assert active_turn == metadata["turns_completed"] + 1
+        receipt = json.loads(
+            (run_dir / "turns" / f"turn-{active_turn:03d}" / "result.json").read_text(encoding="utf-8")
+        )
+        assert receipt["status"] == "recovery-failed"
+        assert receipt["step_role"] == failing_role
+        assert receipt["returncode"] in {1, 3}
+        assert receipt["snapshot_before"]
+        assert receipt["snapshot_after"]
+        if failing_role == "reviewer":
+            assert metadata["current_step_name"] == "review"
+            assert metadata["active_implementation_scope"]["awaiting_review"] is True
+        return repo_root, plan_path, workflow_config
+
+    def test_bootstrap_recovery_failed_review_selects_reviewer(
+        self, tmp_path: Path
+    ) -> None:
+        """A producer-finalized recovery-failed reviewer resumes at the pending review.
+
+        The real producer finalizes the reviewer turn as recovery-failed when
+        a checkpoint remains (the original-plan-complete shape is not
+        producer-supported and stays harness-failed, covered by the existing
+        failed-pending-review cases).  The failed recovery helper does not
+        invalidate the bound failed reviewer, and the bootstrap selects
+        review with the preserved budget40.
+        """
+        repo_root, _plan_path, workflow_config = self._recovery_failed_source(tmp_path)
+        bootstrap = self._bootstrap_for(
+            repo_root, workflow_config, "recovery-failed-pending-review-source"
+        )
+        assert bootstrap.start_step == "review"
+        assert bootstrap.resume_context.failed_pending_review_step == "review"
+        assert bootstrap.resume_context.interrupted_step_name == "review"
+        assert bootstrap.max_turns == 40
+
+    def test_bootstrap_recovery_failed_review_incomplete_original_selects_reviewer(
+        self, tmp_path: Path
+    ) -> None:
+        """A valid still-unchecked original survives the no-progress rule.
+
+        The producer leaves the original checkpoint unchecked when the
+        failed reviewer turn made no plan progress; the decoded before and
+        after snapshots are equal and incomplete, so the pending review
+        resumes at review with the preserved budget.
+        """
+        repo_root, _plan_path, workflow_config = self._recovery_failed_source(
+            tmp_path, complete_checkpoint=False
+        )
+        bootstrap = self._bootstrap_for(
+            repo_root, workflow_config, "recovery-failed-pending-review-source"
+        )
+        assert bootstrap.start_step == "review"
+        assert bootstrap.resume_context.failed_pending_review_step == "review"
+        assert bootstrap.resume_context.interrupted_step_name == "review"
+        assert bootstrap.max_turns == 40
+
+    @pytest.mark.parametrize(
+        "mutation",
+        [
+            "zero_returncode",
+            "missing_returncode",
+            "bool_returncode",
+            "missing_snapshot_before",
+            "empty_snapshot_before",
+            "malformed_snapshot_before",
+            "unequal_snapshot_before",
+            "missing_snapshot_after",
+            "mismatched_receipt_turn",
+            "mismatched_receipt_step",
+            "worker_receipt_role",
+            "invalid_post_snapshot",
+            "inconsistent_post_snapshot",
+            "absent_awaiting_scope",
+            "active_source",
+            "turn_dir_symlink",
+            "result_symlink",
+        ],
+    )
+    def test_bootstrap_recovery_failed_review_negatives(
+        self, tmp_path: Path, mutation: str
+    ) -> None:
+        """Contradictory or incomplete recovery-failed evidence refuses cleanly.
+
+        Zero/missing/bool returncode, incomplete finalization, an empty,
+        malformed, or contradictory pre-snapshot, wrong source/turn/step,
+        mutated post-snapshots, an absent awaiting scope, and active or
+        foreign ownership are all clean refusals before any successor is
+        allocated or provider dispatched.
+        """
+        repo_root, _plan_path, workflow_config = self._recovery_failed_source(tmp_path)
+        run_dir = repo_root / ".aflow" / "runs" / "recovery-failed-pending-review-source"
+        receipt_path = run_dir / "turns" / "turn-002" / "result.json"
+
+        def mutate_receipt() -> None:
+            receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+            if mutation == "zero_returncode":
+                receipt["returncode"] = 0
+            elif mutation == "missing_returncode":
+                receipt.pop("returncode")
+            elif mutation == "bool_returncode":
+                receipt["returncode"] = True
+            elif mutation == "missing_snapshot_before":
+                receipt.pop("snapshot_before")
+            elif mutation == "empty_snapshot_before":
+                receipt["snapshot_before"] = {}
+            elif mutation == "malformed_snapshot_before":
+                receipt["snapshot_before"] = {"bogus": True}
+            elif mutation == "unequal_snapshot_before":
+                # A valid decoded snapshot with a changed unchecked-step
+                # count: it contradicts the producer's no-progress rule.
+                before = dict(receipt["snapshot_before"])
+                before["current_checkpoint_unchecked_step_count"] += 1
+                receipt["snapshot_before"] = before
+            elif mutation == "missing_snapshot_after":
+                receipt.pop("snapshot_after")
+            elif mutation == "mismatched_receipt_turn":
+                receipt["turn_number"] = 1
+            elif mutation == "mismatched_receipt_step":
+                receipt["step_name"] = "implement"
+            elif mutation == "worker_receipt_role":
+                receipt["step_role"] = "worker"
+            elif mutation == "invalid_post_snapshot":
+                receipt["snapshot_after"] = {"bogus": True}
+            elif mutation == "inconsistent_post_snapshot":
+                receipt["snapshot_after"] = {
+                    "current_checkpoint_name": "Checkpoint 2: Next",
+                    "current_checkpoint_index": 2,
+                    "unchecked_checkpoint_count": 0,
+                    "current_checkpoint_unchecked_step_count": 0,
+                    "is_complete": True,
+                    "total_checkpoint_count": 2,
+                }
+            else:
+                raise AssertionError(f"unhandled mutation {mutation}")
+            receipt_path.write_text(json.dumps(receipt), encoding="utf-8")
+
+        if mutation in {
+            "zero_returncode",
+            "missing_returncode",
+            "bool_returncode",
+            "missing_snapshot_before",
+            "empty_snapshot_before",
+            "malformed_snapshot_before",
+            "unequal_snapshot_before",
+            "missing_snapshot_after",
+            "mismatched_receipt_turn",
+            "mismatched_receipt_step",
+            "worker_receipt_role",
+            "invalid_post_snapshot",
+            "inconsistent_post_snapshot",
+        }:
+            mutate_receipt()
+        elif mutation in {"absent_awaiting_scope", "active_source"}:
+            run_json_path = run_dir / "run.json"
+            payload = json.loads(run_json_path.read_text(encoding="utf-8"))
+            if mutation == "absent_awaiting_scope":
+                scope = dict(payload["active_implementation_scope"])
+                scope["awaiting_review"] = False
+                payload["active_implementation_scope"] = scope
+            else:
+                payload["status"] = "running"
+            run_json_path.write_text(
+                json.dumps(payload, sort_keys=True), encoding="utf-8"
+            )
+        elif mutation == "turn_dir_symlink":
+            turn_dir = receipt_path.parent
+            outside = tmp_path / "outside-turn"
+            outside.mkdir(exist_ok=True)
+            (outside / "result.json").write_text("{}", encoding="utf-8")
+            turn_dir.rename(turn_dir.with_name(turn_dir.name + ".bak"))
+            turn_dir.symlink_to(outside)
+        elif mutation == "result_symlink":
+            outside_file = tmp_path / "outside-result.json"
+            outside_file.write_text(
+                json.dumps(json.loads(receipt_path.read_text(encoding="utf-8"))),
+                encoding="utf-8",
+            )
+            receipt_path.unlink()
+            receipt_path.symlink_to(outside_file)
+
+        runs_root = repo_root / ".aflow" / "runs"
+        before_runs = sorted(path.name for path in runs_root.iterdir())
+        source_artifacts = {
+            path.relative_to(run_dir).as_posix(): path.read_bytes()
+            for path in sorted(run_dir.rglob("*"))
+            if path.is_file()
+        }
+        if mutation in {"absent_awaiting_scope", "active_source"}:
+            # The mutated source is outside the candidate shape, so the
+            # established recovery paths refuse instead of the review route.
+            with pytest.raises(ValueError):
+                self._bootstrap_for(
+                    repo_root, workflow_config, "recovery-failed-pending-review-source"
+                )
+        else:
+            # Candidate-shape evidence failures refuse cleanly before any
+            # successor is allocated or provider dispatched.
+            with pytest.raises(ValueError, match="pending-review evidence"):
+                self._bootstrap_for(
+                    repo_root, workflow_config, "recovery-failed-pending-review-source"
+                )
+        # No successor run directory was allocated.
+        assert sorted(p.name for p in runs_root.iterdir()) == before_runs
+        # The refusal rewrites no source artifact (append-only audit grows).
+        self._assert_source_preserved(run_dir, source_artifacts)
+
+    def test_bootstrap_recovery_failed_review_worker_role_refuses(self, tmp_path: Path) -> None:
+        """A worker-role recovery-failed turn never acquires the review route.
+
+        The real producer fails the worker turn and its recovery assistance;
+        the failed-reviewer candidate shape requires the configured reviewer
+        step, so the shared determination returns no review route and the
+        established recovery paths remain authoritative.
+        """
+        repo_root, _plan_path, workflow_config = self._recovery_failed_source(
+            tmp_path, failing_role="worker"
+        )
+        run_dir = repo_root / ".aflow" / "runs" / "recovery-failed-pending-review-source"
+        metadata = json.loads((run_dir / "run.json").read_text(encoding="utf-8"))
+        assert metadata["current_step_name"] == "implement"
+        receipt = json.loads(
+            (run_dir / "turns" / "turn-001" / "result.json").read_text(encoding="utf-8")
+        )
+        assert receipt["status"] == "recovery-failed"
+        assert receipt["step_role"] == "worker"
+        runs_root = repo_root / ".aflow" / "runs"
+        before_runs = sorted(path.name for path in runs_root.iterdir())
+        source_artifacts = {
+            path.relative_to(run_dir).as_posix(): path.read_bytes()
+            for path in sorted(run_dir.rglob("*"))
+            if path.is_file()
+        }
+        bootstrap = self._bootstrap_for(
+            repo_root, workflow_config, "recovery-failed-pending-review-source"
+        )
+        # The issue-79 route must not be acquired for a worker-role failure.
+        assert bootstrap.resume_context.failed_pending_review_step is None
+        assert sorted(p.name for p in runs_root.iterdir()) == before_runs
+        self._assert_source_preserved(run_dir, source_artifacts)

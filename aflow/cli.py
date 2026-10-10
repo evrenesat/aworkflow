@@ -43,6 +43,7 @@ from .manager_context import scoped_reviewer_rejection_count
 from .live_config import load_live_config, load_live_config_for_run
 from .resume_relocation import ResumeRelocation, prepare_resume_relocation
 from .plan import PlanParseError, PlanSnapshot, load_plan, parse_plan_text, plan_step_checklist_is_complete
+from .recovery import recovery_made_progress
 from .skill_installer import InstallerError, install_skills
 from .skill_installer import DEFAULT_BUNDLED_SKILL_NAMES
 from .run_state import (
@@ -2441,6 +2442,24 @@ def _failed_pending_review_step(
                 "the owner-stopped reviewer receipt lacks strict before/after "
                 "snapshots"
             )
+    elif status == "recovery-failed":
+        # Producer-finalized recovery assistance failure: the reviewer
+        # invocation itself was genuinely unsuccessful (nonzero returncode)
+        # and the turn was finalized with strict before/after snapshots.
+        # The failed recovery helper neither invalidates an otherwise bound
+        # failed reviewer nor proves review approval.
+        if not (
+            isinstance(result.get("returncode"), int)
+            and not isinstance(result.get("returncode"), bool)
+            and result.get("returncode") != 0
+            and isinstance(result.get("snapshot_before"), Mapping)
+            and isinstance(result.get("snapshot_after"), Mapping)
+        ):
+            _refuse(
+                "the recovery-failed reviewer receipt lacks a nonzero "
+                "unsuccessful invocation with strict before/after finalization "
+                "snapshots"
+            )
     else:
         _refuse(
             f"the finalized reviewer receipt has unsupported status {status!r}"
@@ -2454,6 +2473,28 @@ def _failed_pending_review_step(
         _refuse(
             "the receipt's post-snapshot does not equal the saved snapshot"
         )
+    if status == "recovery-failed":
+        # The producer only finalizes a recovery-failed turn when the
+        # failed recovery made no plan progress: a complete post-snapshot
+        # or an unequal before/after pair skips recovery and takes the
+        # harness-failed route.  The pre-snapshot must therefore decode to
+        # valid plan evidence and satisfy that same no-progress rule; an
+        # empty, malformed, or contradictory pair proves no finalization.
+        result_snapshot_before = _resume_plan_snapshot(
+            result.get("snapshot_before")
+        )
+        if result_snapshot_before is None:
+            _refuse(
+                "the receipt's pre-snapshot is missing, malformed, or not "
+                "decodable plan-snapshot evidence"
+            )
+        if recovery_made_progress(
+            result_snapshot_before, result_snapshot_after
+        ):
+            _refuse(
+                "the receipt's before/after snapshots contradict the "
+                "producer's no-progress recovery rule"
+            )
     # Verify the worker receipt can be bound (source-first) before admitting
     # the successor. This applies to every proven failed-review source,
     # including an initial source without a predecessor: the source run is
