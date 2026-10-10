@@ -1,5 +1,72 @@
 # DEVLOG
 
+## 2026-10-09 — Synchronized process-stop fixtures to provider readiness (issue100 process-stop fixture CI repair)
+
+- Checkpoint 1 repair of the process-stop fixture CI-repair plan. The two real
+  subprocess cases in
+  `tests/test_process_identity.py::test_terminate_owned_group_escalates_proven_term_survivor`
+  now synchronize on provider readiness before invoking the unchanged
+  `terminate_owned_group` teardown.
+- Each provider publishes its own PID atomically: the complete PID is written
+  to a task-owned sibling temporary file and `os.replace`d onto the readiness
+  path, so the marker can never be observed half-written. The case-2 provider
+  installs its TERM-observation handler before publishing, and the
+  child-owned TERM-observation marker proves the handler ran before the proven
+  survivor's KILL cessation. The parent polls the marker on the existing
+  ten-second monotonic deadline and treats an absent, empty, or non-numeric
+  marker as not ready until that deadline, failing with a clear readiness
+  assertion that includes the observed marker content and wrapper status;
+  marker existence alone never authorizes teardown. A complete marker PID is
+  readiness only when it leads the fixture's recorded group and revalidates
+  its observed birth, SID, and PGID against the recorded session: a live
+  same-session process in another group, an unobserved birth, or a failed
+  revalidation is rejected with a clear assertion and no provider proof is
+  retained.
+- Fixture cleanup is ownership-scoped and independent of the readiness
+  assertions: the live direct wrapper's birth, fixture PGID, and SID are
+  captured while it is alive, and a positively validated provider
+  `SessionMember` plus the expected SID are retained as soon as a complete,
+  expected-group marker PID is read. Cleanup re-proves group ownership with
+  `controller_group_owned` immediately before KILLing the exact fixture group
+  (covering a missing readiness PID), signals a retained provider only after
+  `session_member_live` revalidates its captured birth/PGID/SID, reaps the
+  direct wrapper with a bounded `wait` that spends only the remaining shared
+  cleanup budget (a slow identity probe never renews the allowance), and
+  confirms success only
+  on positive cessation of the recorded fixture group and any retained
+  provider, observed with `process_group_state` and `process_liveness` inside
+  the same two-second cleanup budget. When readiness retained no PID the
+  group's positive absence is observed, never assumed; a present, unknown, or
+  expired cessation observation returns False and reports unconfirmed
+  cleanup. An absent, stale, expired, reused, or unknown identity authorizes
+  no group/provider signal; on unconfirmed cleanup the original failure is
+  retained and the evidence is reported.
+- Added local helper-contract regressions:
+  `test_provider_readiness_waits_for_complete_pid_marker` (an incomplete
+  marker causes a bounded readiness failure, never an immediate parse error),
+  `test_owned_fixture_cleanup_after_readiness_failure` (a readiness failure
+  after the real provider starts leaves both owned processes ceased and the
+  wrapper reaped; the provider's side-channel PID is atomically published
+  with the same sibling-temp/`os.replace` helper and the bounded startup
+  reader accepts only complete valid content, tolerating an incomplete
+  open-before-write publication until the deadline),
+  `test_owned_fixture_cleanup_rejects_unproven_provider` (live reused, unknown
+  birth, expired, wrong-group, and wrong-session evidence authorizes no
+  signal and no confirmed cessation of the surviving group, while the
+  ordinary already-absent member still confirms through positive absence),
+  `test_provider_readiness_rejects_live_wrong_group_pid` (a complete
+  readiness PID of a live same-session process in another group is rejected,
+  never retained or signalled), and
+  `test_owned_fixture_cleanup_unknown_wrapper_birth_never_claims_ceased`
+  (with missing readiness and an unknown wrapper birth, direct wrapper reaping
+  cannot claim a surviving provider ceased).
+  The two real TERM/KILL integration cases and their 5.0/1.0 and 1.0/1.0
+  teardown budgets are preserved.
+- No production change: `aflow/process_identity.py` and the
+  `terminate_owned_group` TERM-grace / bounded-KILL / ownership-evidence
+  semantics are untouched. The native macOS CI failure remains a hypothesis
+  only; causality is unproven until native macOS CI succeeds.
+
 ## 2026-10-09 — Rebound paused-reader fixture to the extracted pure parser (maintenance03 pair-lock CI repair)
 
 - Checkpoint 1 of the pair-lock fixture CI-repair plan. Maintenance03 moved

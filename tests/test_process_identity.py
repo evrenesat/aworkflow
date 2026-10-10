@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+from dataclasses import dataclass
 from pathlib import Path
 import subprocess
 import sys
@@ -572,20 +573,257 @@ def test_process_group_state_reports_present_absent_unknown() -> None:
     assert process_identity.process_group_state(leader.pid) == "absent"
 
 
+def _publish_marker_atomic(script_lines: list[str], ready: Path, tmp: Path) -> None:
+    """Append the provider's atomic readiness publication lines.
+
+    The complete PID is written to a task-owned sibling temporary file and
+    then ``os.replace``d onto the readiness path, so the marker can never be
+    observed half-written: existence implies complete content.
+    """
+    script_lines.append("import os, time\n")
+    script_lines.append("from pathlib import Path\n")
+    script_lines.append(f"Path({str(tmp)!r}).write_text(str(os.getpid()))\n")
+    script_lines.append(f"os.replace({str(tmp)!r}, {str(ready)!r})\n")
+
+
+@dataclass
+class _FixtureProof:
+    """Ownership proof captured inside the protected fixture lifetime."""
+
+    wrapper_birth: str | None
+    wrapper_pgid: int
+    session_id: int | None
+    provider: process_identity.SessionMember | None = None
+
+
+def _capture_wrapper_proof(wrapper: subprocess.Popen[bytes]) -> _FixtureProof:
+    """Record the live direct wrapper's birth, fixture PGID, and SID."""
+    try:
+        session_id = os.getsid(wrapper.pid)
+    except (OSError, ValueError):
+        session_id = None
+    return _FixtureProof(
+        wrapper_birth=process_identity.process_birth_identity(wrapper.pid),
+        wrapper_pgid=wrapper.pid,
+        session_id=session_id,
+    )
+
+
+def _wait_for_provider_ready(
+    ready: Path,
+    wrapper: subprocess.Popen[bytes],
+    proof: _FixtureProof,
+    *,
+    deadline_seconds: float = 10.0,
+) -> int:
+    """Bounded wait for a provider-owned, atomically published readiness PID.
+
+    The marker is published by the provider itself only after its own
+    initialization (sibling temp write + atomic ``os.replace``), so a
+    wrapper-created PID can never race handler installation and the marker
+    can never be observed half-written.  An absent, empty, or non-numeric
+    marker is treated as not ready until the monotonic deadline; marker
+    existence alone never authorizes teardown.  A complete PID is readiness
+    only when it leads the fixture's recorded group and revalidates its
+    observed birth, SID, and PGID against the recorded session; a live
+    same-session process in another group, an unobserved birth, or a failed
+    revalidation is rejected before any member is retained, so a marker PID
+    alone is never identity proof.  Retained proof precedes the remaining
+    readiness assertions, so cleanup ownership is independent of them.
+    """
+    deadline = time.monotonic() + deadline_seconds
+    content = ""
+    provider_pid: int | None = None
+    while time.monotonic() < deadline:
+        try:
+            content = ready.read_text()
+        except OSError:
+            content = ""
+        else:
+            try:
+                provider_pid = int(content)
+            except ValueError:
+                provider_pid = None
+            if provider_pid is not None and provider_pid >= 1:
+                break
+        time.sleep(0.02)
+    if provider_pid is None:
+        assert False, (
+            "provider readiness marker missing or incomplete "
+            f"(observed content: {content!r}; "
+            f"wrapper status: {wrapper.poll()})"
+        )
+    # Retain positively validated provider proof before any assertion that
+    # could reject wrapper/provider readiness; an unproven member is not
+    # retained, so a marker PID alone is never identity proof.  The marker
+    # PID must lead the fixture's recorded group: a live same-session
+    # process in another group is not the provider, and an unobserved birth
+    # or a failed SID/birth/PGID revalidation against the recorded session
+    # is never readiness.
+    provider_pgid: int | None = None
+    try:
+        provider_pgid = os.getpgid(provider_pid)
+    except (OSError, ValueError):
+        provider_pgid = None
+    provider_birth: str | None = None
+    if provider_pgid is not None and provider_pgid == proof.wrapper_pgid:
+        provider_birth = process_identity.process_birth_identity(provider_pid)
+    member: process_identity.SessionMember | None = None
+    if (
+        provider_pgid is not None
+        and provider_pgid == proof.wrapper_pgid
+        and provider_birth is not None
+        and proof.session_id is not None
+    ):
+        candidate = process_identity.SessionMember(
+            pid=provider_pid, birth=provider_birth, pgid=provider_pgid
+        )
+        if process_identity.session_member_live(candidate, proof.session_id):
+            member = candidate
+    proof.provider = member
+    assert member is not None, (
+        "provider readiness PID "
+        f"{provider_pid} is not a live member of the recorded fixture group "
+        f"(observed pgid: {provider_pgid}, "
+        f"expected: {proof.wrapper_pgid}, "
+        f"observed birth: {provider_birth!r}, "
+        f"session: {proof.session_id})"
+    )
+    assert wrapper.poll() is None, "wrapper exited before provider readiness"
+    assert (
+        process_identity.process_liveness(provider_pid) == "present"
+    ), "provider was not live at readiness"
+    return provider_pid
+
+
+_CLEANUP_BUDGET_SECONDS = 2.0
+
+
+def _cleanup_owned_fixture(
+    wrapper: subprocess.Popen[bytes] | "_ExitedWrapper",
+    proof: _FixtureProof | None,
+) -> bool:
+    """Bounded, ownership-scoped fixture cleanup.
+
+    While the live direct wrapper still owns its recorded group, a fresh
+    bounded ``controller_group_owned`` proof (captured wrapper birth/PGID/SID)
+    immediately before the signal authorizes KILL of the exact fixture group,
+    which also ceases a provider whose readiness PID was never published.  A
+    retained provider is signalled only when ``session_member_live``
+    revalidates its captured birth/PGID/SID immediately before that signal;
+    an absent, stale, expired, reused, or unknown proof authorizes no
+    group/provider signal.  The direct child is reaped with a bounded
+    ``wait(timeout=...)``; success additionally requires positive cessation
+    of the recorded fixture group and any retained provider, observed with
+    ``process_group_state`` and ``process_liveness`` inside the same
+    two-second budget.  When readiness retained no PID the group's positive
+    absence is observed, never assumed; a present, unknown, or expired
+    cessation observation returns False and reports unconfirmed cleanup.
+    On unconfirmed cleanup the evidence is reported and the caller retains
+    the original failure.
+    """
+    import signal as _signal
+
+    deadline = time.monotonic() + _CLEANUP_BUDGET_SECONDS
+    if proof is not None and wrapper.poll() is None and proof.wrapper_birth:
+        if process_identity.controller_group_owned(
+            wrapper.pid, proof.wrapper_birth, proof.session_id, deadline
+        ):
+            try:
+                os.kill(-wrapper.pid, _signal.SIGKILL)
+            except (ProcessLookupError, PermissionError, OSError):
+                pass
+    if proof is not None and proof.provider is not None:
+        member = proof.provider
+        if process_identity.process_liveness(member.pid, deadline) != "absent":
+            if process_identity.session_member_live(
+                member, proof.session_id, deadline
+            ):
+                try:
+                    os.kill(member.pid, _signal.SIGKILL)
+                except (ProcessLookupError, PermissionError):
+                    pass
+    if wrapper.poll() is None:
+        try:
+            wrapper.kill()
+        except (OSError, ValueError):
+            pass
+    try:
+        # The reap spends only the remaining shared cleanup budget: a slow
+        # identity probe above must never renew the allowance.
+        wrapper.wait(timeout=max(0.0, deadline - time.monotonic()))
+        reaped = wrapper.poll() is not None
+    except subprocess.TimeoutExpired:
+        reaped = False
+    # Positive cessation of the recorded fixture group and any retained
+    # provider is required before success can be claimed.  When readiness
+    # retained no PID the group's positive absence is observed inside the
+    # same deadline rather than assumed; a present, unknown, or expired
+    # observation is unconfirmed cleanup, never a default success.
+    group_confirmed = proof is None
+    provider_confirmed = True
+    if proof is not None:
+        retained = proof.provider
+        group_state = "present"
+        provider_state = "absent"
+        while time.monotonic() < deadline:
+            group_state = process_identity.process_group_state(
+                proof.wrapper_pgid, deadline
+            )
+            provider_state = (
+                process_identity.process_liveness(retained.pid, deadline)
+                if retained is not None
+                else "absent"
+            )
+            if group_state == "absent" and provider_state == "absent":
+                break
+            time.sleep(0.02)
+        group_confirmed = group_state == "absent"
+        provider_confirmed = provider_state == "absent"
+    confirmed = reaped and provider_confirmed and group_confirmed
+    if not confirmed:
+        # Report the evidence and let the caller retain the original failure
+        # rather than masking it or claiming no leak.
+        print(
+            "fixture cleanup unconfirmed: wrapper reaped="
+            f"{reaped}, fixture group positively absent={group_confirmed}, "
+            f"provider positively ceased={provider_confirmed}",
+            file=sys.stderr,
+        )
+    return confirmed
+
+
+class _ExitedWrapper:
+    """A duck-typed already-reaped wrapper for cleanup contract tests."""
+
+    def __init__(self, pid: int) -> None:
+        self.pid = pid
+        self.kill_calls = 0
+
+    def poll(self) -> int:
+        return 0
+
+    def kill(self) -> None:
+        self.kill_calls += 1
+
+    def wait(self, timeout: float | None = None) -> int:
+        return 0
+
+
 @pytest.mark.skipif(sys.platform not in ("linux", "darwin"), reason="POSIX group teardown")
 def test_terminate_owned_group_escalates_proven_term_survivor(tmp_path: Path) -> None:
     """A proven owned TERM survivor is escalated to KILL and the group ends."""
-    import time as _time
-
-    def _provider_sleep(body: str, path: Path) -> None:
-        path.write_text(body, encoding="utf-8")
-
-    # Case 1: a wrapper that waits for its provider; TERM ends the whole group.
+    # Case 1: an initialized TERM-responsive provider plus a waiting wrapper;
+    # TERM ceases the whole owned group.
     provider1 = tmp_path / "p1.py"
-    _provider_sleep("import time; time.sleep(30)", provider1)
+    ready1 = tmp_path / "p1.ready"
+    lines1: list[str] = []
+    _publish_marker_atomic(lines1, ready1, tmp_path / "p1.ready.tmp")
+    lines1.append("time.sleep(30)\n")
+    provider1.write_text("".join(lines1), encoding="utf-8")
     wrapper1 = tmp_path / "w1.py"
     wrapper1.write_text(
-        f"import subprocess, sys\n"
+        "import subprocess, sys\n"
         f"subprocess.Popen([sys.executable, {str(provider1)!r}]).wait()\n",
         encoding="utf-8",
     )
@@ -594,29 +832,42 @@ def test_terminate_owned_group_escalates_proven_term_survivor(tmp_path: Path) ->
         process_group=0,
         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
     )
-    assert process_identity.terminate_owned_group(
-        wrapper, wrapper.pid, grace_seconds=5.0, kill_seconds=1.0
-    ) is True
-    assert wrapper.poll() is not None
+    proof = _capture_wrapper_proof(wrapper)
+    provider1_pid: int | None = None
+    try:
+        provider1_pid = _wait_for_provider_ready(ready1, wrapper, proof)
+        assert process_identity.terminate_owned_group(
+            wrapper, wrapper.pid, grace_seconds=5.0, kill_seconds=1.0
+        ) is True
+        assert wrapper.poll() is not None
+        assert process_identity.process_liveness(provider1_pid) == "absent"
+    finally:
+        _cleanup_owned_fixture(wrapper, proof)
 
-    # Case 2: a wrapper that is alive initially and dies on TERM, leaving a
-    # TERM-ignoring provider in the same owned group.  The captured,
-    # birth/PGID/SID-validated survivor is escalated to KILL, the group ends,
-    # and teardown reports True (wrapper exit alone does not disable escalation).
+    # Case 2: an initialized TERM-ignoring provider survives the wrapper's
+    # TERM exit and is escalated to KILL through proven ownership.  The
+    # provider installs its TERM handler before writing its own readiness
+    # marker, and a child-owned TERM-observation marker proves the handler ran
+    # before the proven survivor's KILL cessation.
     provider2 = tmp_path / "p2.py"
-    _provider_sleep(
-        "import signal, time\n"
-        "signal.signal(signal.SIGTERM, signal.SIG_IGN)\n"
-        "time.sleep(30)\n",
-        provider2,
-    )
-    provider_pid_file = tmp_path / "provider.pid"
+    ready2 = tmp_path / "p2.ready"
+    seen2 = tmp_path / "p2.seen"
+    # The provider installs its TERM-observation handler before its atomic
+    # readiness publication.
+    lines2: list[str] = [
+        "import signal\n",
+        "def _term(s, f):\n",
+        f"    Path({str(seen2)!r}).touch()\n",
+        "    time.sleep(30)\n",
+        "signal.signal(signal.SIGTERM, _term)\n",
+    ]
+    _publish_marker_atomic(lines2, ready2, tmp_path / "p2.ready.tmp")
+    lines2.append("time.sleep(30)\n")
+    provider2.write_text("".join(lines2), encoding="utf-8")
     wrapper2_script = tmp_path / "w2.py"
     wrapper2_script.write_text(
-        f"import subprocess, sys\n"
-        f"p = subprocess.Popen([sys.executable, {str(provider2)!r}])\n"
-        f"open({str(provider_pid_file)!r}, 'w').write(str(p.pid))\n"
-        f"p.wait()\n",
+        "import subprocess, sys\n"
+        f"subprocess.Popen([sys.executable, {str(provider2)!r}]).wait()\n",
         encoding="utf-8",
     )
     wrapper2 = subprocess.Popen(
@@ -624,16 +875,883 @@ def test_terminate_owned_group_escalates_proven_term_survivor(tmp_path: Path) ->
         process_group=0,
         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
     )
-    deadline = _time.monotonic() + 10
-    while not provider_pid_file.exists() and _time.monotonic() < deadline:
-        _time.sleep(0.02)
-    provider_pid = int(provider_pid_file.read_text())
-    assert process_identity.terminate_owned_group(
-        wrapper2, wrapper2.pid, grace_seconds=1.0, kill_seconds=1.0
-    ) is True
-    assert wrapper2.poll() is not None
-    # The proven TERM-ignoring survivor was escalated to KILL and has ceased.
+    proof2 = _capture_wrapper_proof(wrapper2)
+    provider2_pid: int | None = None
+    try:
+        provider2_pid = _wait_for_provider_ready(ready2, wrapper2, proof2)
+        assert process_identity.terminate_owned_group(
+            wrapper2, wrapper2.pid, grace_seconds=1.0, kill_seconds=1.0
+        ) is True
+        assert wrapper2.poll() is not None
+        # The ignore handler observed TERM before the proven survivor ceased.
+        assert seen2.exists(), "TERM-observation marker missing"
+        assert process_identity.process_liveness(provider2_pid) == "absent"
+    finally:
+        _cleanup_owned_fixture(wrapper2, proof2)
+
+
+@pytest.mark.skipif(sys.platform not in ("linux", "darwin"), reason="POSIX group teardown")
+def test_provider_readiness_waits_for_complete_pid_marker(tmp_path: Path) -> None:
+    """An incomplete readiness marker causes a bounded readiness failure, never
+    an immediate parse error, and leaves no live owned process behind."""
+    ready = tmp_path / "p.ready"
+    provider = tmp_path / "p.py"
+    # The provider starts but never completes the publication; the ready path
+    # is pre-created empty to reproduce the write boundary the old helper
+    # parsed immediately after an exists() check.
+    provider.write_text("import time\ntime.sleep(30)\n", encoding="utf-8")
+    wrapper_script = tmp_path / "w.py"
+    wrapper_script.write_text(
+        "import subprocess, sys\n"
+        f"subprocess.Popen([sys.executable, {str(provider)!r}]).wait()\n",
+        encoding="utf-8",
+    )
+    wrapper = subprocess.Popen(
+        [sys.executable, str(wrapper_script)],
+        process_group=0,
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+    )
+    proof = _capture_wrapper_proof(wrapper)
+    ready.write_text("")
+    try:
+        start = time.monotonic()
+        with pytest.raises(AssertionError, match="readiness marker"):
+            _wait_for_provider_ready(ready, wrapper, proof, deadline_seconds=0.5)
+        elapsed = time.monotonic() - start
+        # The empty marker was polled until the deadline: a bounded readiness
+        # failure, not an immediate int() parse error.
+        assert elapsed >= 0.4
+        # An incomplete marker retains no provider identity proof.
+        assert proof.provider is None
+    finally:
+        confirmed = _cleanup_owned_fixture(wrapper, proof)
+    assert confirmed
+    assert wrapper.poll() is not None
+    assert process_identity.process_group_state(wrapper.pid) == "absent"
+
+
+@pytest.mark.skipif(sys.platform not in ("linux", "darwin"), reason="POSIX group teardown")
+def test_owned_fixture_cleanup_after_readiness_failure(tmp_path: Path) -> None:
+    """A readiness failure after a real provider starts leaves both owned
+    processes ceased and the wrapper reaped, without the provider's readiness
+    PID ever being published."""
+    import time as _time
+
+    provider_pid_file = tmp_path / "p.pid"
+    ready = tmp_path / "p.ready"
+    provider = tmp_path / "p.py"
+    # The provider atomically publishes its own PID on an independent
+    # side channel (sibling temp + os.replace); the final readiness marker
+    # is deliberately never written, so the helper receives no readiness or
+    # provider proof.
+    side_channel: list[str] = []
+    _publish_marker_atomic(side_channel, provider_pid_file, tmp_path / "p.pid.tmp")
+    side_channel.append("time.sleep(30)\n")
+    provider.write_text("".join(side_channel), encoding="utf-8")
+    wrapper_script = tmp_path / "w.py"
+    wrapper_script.write_text(
+        "import subprocess, sys\n"
+        f"subprocess.Popen([sys.executable, {str(provider)!r}]).wait()\n",
+        encoding="utf-8",
+    )
+    wrapper = subprocess.Popen(
+        [sys.executable, str(wrapper_script)],
+        process_group=0,
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+    )
+    proof = _capture_wrapper_proof(wrapper)
+    try:
+        # The real provider starts (its own side-channel PID file proves it),
+        # but the readiness marker is never published.  The bounded startup
+        # reader accepts only complete valid content and tolerates an
+        # incomplete (open-before-write) publication until the deadline:
+        # no immediate parse error.
+        deadline = _time.monotonic() + 10
+        provider_pid: int | None = None
+        while _time.monotonic() < deadline:
+            try:
+                content = provider_pid_file.read_text()
+            except OSError:
+                content = ""
+            else:
+                try:
+                    provider_pid = int(content)
+                except ValueError:
+                    provider_pid = None
+                if provider_pid is not None and provider_pid >= 1:
+                    break
+            _time.sleep(0.02)
+        assert provider_pid is not None, "provider never started"
+        assert process_identity.process_liveness(provider_pid) == "present"
+        with pytest.raises(AssertionError, match="readiness marker"):
+            _wait_for_provider_ready(ready, wrapper, proof, deadline_seconds=0.5)
+    finally:
+        confirmed = _cleanup_owned_fixture(wrapper, proof)
+    assert confirmed
+    assert wrapper.poll() is not None
     assert process_identity.process_liveness(provider_pid) == "absent"
+    assert process_identity.process_group_state(wrapper.pid) == "absent"
+
+
+@pytest.mark.skipif(sys.platform not in ("linux", "darwin"), reason="POSIX group teardown")
+def _wait_for_survivor_group_present(
+    survivor: subprocess.Popen[bytes],
+    deadline_seconds: float = 10.0,
+) -> None:
+    """Bounded positive observation that the task-owned survivor leads a
+    present group.
+
+    The existing ten-second deadline bounds the loop in addition to the
+    group-state condition: once it expires, ``process_group_state`` reports
+    ``unknown`` and the observation fails with a clear assertion instead of
+    spinning while the child remains live.  Present, absent, and unknown
+    observations keep their meanings throughout.
+    """
+    deadline = time.monotonic() + deadline_seconds
+    state = process_identity.process_group_state(survivor.pid, deadline)
+    while state != "present" and time.monotonic() < deadline:
+        if survivor.poll() is not None:
+            break
+        time.sleep(0.02)
+        state = process_identity.process_group_state(survivor.pid, deadline)
+    assert state == "present", (
+        "survivor group did not become present before the startup deadline "
+        f"(last state: {state}, survivor status: {survivor.poll()})"
+    )
+
+
+@pytest.mark.parametrize(
+    "reject_case",
+    ["reused", "unknown", "expired", "wrong-group", "wrong-session", "absent"],
+)
+def test_owned_fixture_cleanup_rejects_unproven_provider(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, reject_case: str
+) -> None:
+    """Live, reused, unknown, expired, or wrong-group/session evidence
+    authorizes no group/provider signal and no confirmed cessation of the
+    surviving fixture group; an already-absent member still confirms through
+    positive absence only."""
+    sid = 123
+    member_pid = 2_000_000_000  # above any realistic pids_max: positively absent
+    survivor: subprocess.Popen[bytes] | None = None
+    try:
+        if reject_case != "absent":
+            # A live task-owned member of its own group: the recorded evidence
+            # is rejected, but the real process stays present, so no cessation
+            # can be claimed.  Its independently captured identity is used
+            # only for this test's own teardown.
+            survivor_script = tmp_path / "survivor.py"
+            survivor_script.write_text(
+                "import time\ntime.sleep(30)\n", encoding="utf-8"
+            )
+            survivor = subprocess.Popen(
+                [sys.executable, str(survivor_script)],
+                start_new_session=True,
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            )
+            _wait_for_survivor_group_present(survivor)
+            member_pid = survivor.pid
+            # A new session: the survivor leads its own session and group.
+            sid = survivor.pid
+
+        if reject_case == "unknown":
+            # An unproven (never-observed) birth is never live evidence.
+            member = process_identity.SessionMember(
+                pid=member_pid, birth=None, pgid=member_pid
+            )
+        elif reject_case == "reused":
+            # A live PID whose real birth differs from the captured one is
+            # reused.
+            member = process_identity.SessionMember(
+                pid=member_pid, birth="linux-start-ticks:1", pgid=member_pid
+            )
+        elif reject_case == "wrong-group":
+            # The recorded group differs from the live member's actual group.
+            member = process_identity.SessionMember(
+                pid=member_pid, birth="linux-start-ticks:1", pgid=member_pid + 1
+            )
+        else:
+            member = process_identity.SessionMember(
+                pid=member_pid, birth="linux-start-ticks:1", pgid=member_pid
+            )
+
+        if reject_case == "expired":
+            # A bounded birth probe with no result is expired/unknown evidence.
+            monkeypatch.setattr(
+                process_identity,
+                "process_birth_bounded",
+                lambda pid, deadline: None,
+            )
+        elif reject_case == "wrong-session":
+            # The live member is not in the recorded session.
+            monkeypatch.setattr(process_identity.os, "getsid", lambda pid: 999)
+
+        signals: list[tuple[int, int]] = []
+
+        def intercept(pid: int, signum: int) -> None:
+            signals.append((pid, signum))
+            if signum == 0:
+                # A null probe is not a signal.
+                raise ProcessLookupError("no such process")
+            raise AssertionError(f"unauthorized signal {signum} to pid {pid}")
+
+        monkeypatch.setattr(os, "kill", intercept)
+
+        wrapper = _ExitedWrapper(member_pid)
+        proof = _FixtureProof(
+            wrapper_birth="linux-start-ticks:1",
+            wrapper_pgid=member_pid,
+            session_id=sid,
+            provider=member,
+        )
+        confirmed = _cleanup_owned_fixture(wrapper, proof)
+    finally:
+        # Undo the interception before the real task-owned teardown so the
+        # test's own cleanup is not recorded as a fixture signal; an early
+        # startup assertion or probe failure reaches the same direct-child
+        # cleanup, reaped within the existing cleanup allowance.
+        monkeypatch.undo()
+        if survivor is not None:
+            survivor.kill()
+            try:
+                survivor.wait(timeout=_CLEANUP_BUDGET_SECONDS)
+            except subprocess.TimeoutExpired:
+                pass
+
+    assert [call for call in signals if call[1] != 0] == []
+    assert wrapper.kill_calls == 0
+    if reject_case == "absent":
+        # The ordinary already-absent member confirms through positive
+        # absence of the group and the member.
+        assert confirmed is True
+    else:
+        # A live/unknown survivor keeps the group present: no signal, no
+        # confirmed cessation.
+        assert confirmed is False
+
+
+@dataclass
+class _WrongGroupOutcome:
+    """Observed outcome of one wrong-group readiness fixture run."""
+
+    wrapper: subprocess.Popen[bytes]
+    proof: _FixtureProof
+    decoy_pid: int | None
+    signals: list[tuple[int, int]]
+    cleanup_confirmed: bool
+    body_failure: AssertionError | None
+
+
+def _run_wrong_group_rejection(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    wrapper_birth_known: bool = True,
+    decoy_birth_known: bool = True,
+) -> _WrongGroupOutcome:
+    """Drive the actual wrong-group readiness fixture end to end.
+
+    A wrapper's child moves itself into a new group of the same session and
+    atomically publishes that (wrong-group) PID as the readiness marker.  The
+    readiness proof's provider stays unset on rejection and is never reused
+    for teardown; a separate teardown proof carries the independently
+    observed descendant evidence, so only a fresh positive
+    ``controller_group_owned`` authorizes the fixture-group signal and only a
+    fresh positive ``session_member_live`` authorizes the descendant signal.
+    ``wrapper_birth_known=False`` drops the captured wrapper birth so no
+    fixture-group signal may be authorized; ``decoy_birth_known=False`` makes
+    the decoy birth observation unknown, so the original setup assertion
+    stays the primary failure and unconfirmed cleanup is reported, never
+    asserted away.
+    """
+    ready = tmp_path / "p.ready"
+    decoy_script = tmp_path / "decoy.py"
+    decoy_lines: list[str] = ["import os\n", "os.setpgid(0, 0)\n"]
+    _publish_marker_atomic(decoy_lines, ready, tmp_path / "p.ready.tmp")
+    decoy_lines.append("time.sleep(30)\n")
+    decoy_script.write_text("".join(decoy_lines), encoding="utf-8")
+    wrapper_script = tmp_path / "w.py"
+    wrapper_script.write_text(
+        "import subprocess, sys\n"
+        f"subprocess.Popen([sys.executable, {str(decoy_script)!r}]).wait()\n",
+        encoding="utf-8",
+    )
+    wrapper = subprocess.Popen(
+        [sys.executable, str(wrapper_script)],
+        process_group=0,
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+    )
+    proof = _capture_wrapper_proof(wrapper)
+    if not wrapper_birth_known:
+        proof.wrapper_birth = None
+    decoy_pids: set[int] = set()
+    if not decoy_birth_known:
+        real_birth = process_identity.process_birth_identity
+
+        def fake_birth(pid: int) -> str | None:
+            return None if pid in decoy_pids else real_birth(pid)
+
+        monkeypatch.setattr(process_identity, "process_birth_identity", fake_birth)
+    signals: list[tuple[int, int]] = []
+
+    def intercept(pid: int, signum: int) -> None:
+        signals.append((pid, signum))
+        if signum == 0:
+            raise ProcessLookupError("no such process")
+        # Swallowed: the fixture group stays live so the decoy's survival
+        # is observable and no real signal can reach any process.
+
+    monkeypatch.setattr(os, "kill", intercept)
+    decoy_pid: int | None = None
+    decoy_member: process_identity.SessionMember | None = None
+    body_failure: AssertionError | None = None
+    cleanup_confirmed = False
+    try:
+        # Bounded startup read of the provider-owned atomic marker, using the
+        # same pattern readiness itself uses: the complete decoy PID must be
+        # retained before the expected-rejection assertion is entered.
+        deadline = time.monotonic() + 10
+        while time.monotonic() < deadline:
+            try:
+                content = ready.read_text()
+            except OSError:
+                content = ""
+            else:
+                try:
+                    decoy_pid = int(content)
+                except ValueError:
+                    decoy_pid = None
+                if decoy_pid is not None and decoy_pid >= 1:
+                    break
+            time.sleep(0.02)
+        assert decoy_pid is not None, "decoy readiness marker never published"
+        decoy_pids.add(decoy_pid)
+        # Independent positive task-owned decoy identity, revalidated before
+        # the expected-rejection assertion.  Its own PGID differs from the
+        # wrapper's fixture group but its SID is the recorded fixture
+        # session.  This teardown evidence must never set the readiness
+        # proof's provider, which stays unset on rejection.
+        decoy_pgid = os.getpgid(decoy_pid)
+        assert decoy_pgid != wrapper.pid, "decoy never left the fixture group"
+        assert os.getsid(decoy_pid) == proof.session_id, (
+            "decoy is not in the fixture session"
+        )
+        decoy_birth = process_identity.process_birth_identity(decoy_pid)
+        assert decoy_birth is not None, "decoy birth was not observed"
+        decoy_member = process_identity.SessionMember(
+            pid=decoy_pid, birth=decoy_birth, pgid=decoy_pgid
+        )
+        assert process_identity.session_member_live(decoy_member, proof.session_id)
+        with pytest.raises(AssertionError, match="not a live member"):
+            _wait_for_provider_ready(ready, wrapper, proof)
+        # The wrong-group PID was never retained as provider proof.
+        assert proof.provider is None
+        # The fixture group (live wrapper plus decoy) is present, so cleanup
+        # must stay unconfirmed while the intercepted group signal never
+        # landed.
+        assert _cleanup_owned_fixture(wrapper, proof) is False
+        # The decoy survived: it was never signalled as a provider.
+        assert process_identity.process_liveness(decoy_pid) == "present"
+    except AssertionError as exc:
+        # The original body failure remains the primary exception; the
+        # finalizer below must not replace it with a teardown assertion.
+        body_failure = exc
+    finally:
+        # Restore signal interception before the real task-owned teardown.
+        monkeypatch.undo()
+        # Task-owned teardown of the fixture this run created through the
+        # ownership-scoped helper.  The decoy leads its own group, so it is
+        # ceased only through its own revalidated identity, independently of
+        # the fixture group; a missing, unknown, or unrevalidated identity
+        # authorizes no signal, and the original failure is preserved.
+        teardown_proof = _FixtureProof(
+            wrapper_birth=proof.wrapper_birth,
+            wrapper_pgid=wrapper.pid,
+            session_id=proof.session_id,
+            provider=decoy_member,
+        )
+        cleanup_confirmed = _cleanup_owned_fixture(wrapper, teardown_proof)
+        if decoy_member is None and decoy_pid is not None:
+            # The marker PID is reporting evidence only, never signalling
+            # identity: absence must be positively established.
+            if process_identity.process_liveness(decoy_pid) != "absent":
+                cleanup_confirmed = False
+                print(
+                    "fixture cleanup unconfirmed: decoy marker PID "
+                    f"{decoy_pid} has no captured identity, so its "
+                    "absence cannot be positively established",
+                    file=sys.stderr,
+                )
+    return _WrongGroupOutcome(
+        wrapper=wrapper,
+        proof=proof,
+        decoy_pid=decoy_pid,
+        signals=signals,
+        cleanup_confirmed=cleanup_confirmed,
+        body_failure=body_failure,
+    )
+
+
+@pytest.mark.skipif(sys.platform not in ("linux", "darwin"), reason="POSIX group teardown")
+def test_provider_readiness_rejects_live_wrong_group_pid(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A complete readiness PID of a live same-session process in another
+    group is rejected: it is never retained as provider proof and never
+    signalled; cleanup stays unconfirmed while the fixture group is present.
+    The task-owned decoy's independent positive identity is captured and
+    revalidated before the expected-rejection assertion, so a readiness that
+    wrongly accepts it still leaves both processes ceased and reaped."""
+    outcome = _run_wrong_group_rejection(tmp_path, monkeypatch)
+    assert outcome.body_failure is None
+    # The wrong-group PID was never retained as provider proof.
+    assert outcome.proof.provider is None
+    # Both task-owned processes (fixture group plus decoy) are positively
+    # ceased and the direct child was reaped.
+    assert outcome.cleanup_confirmed is True
+    assert outcome.wrapper.poll() is not None
+    assert outcome.decoy_pid is not None
+    assert process_identity.process_liveness(outcome.decoy_pid) == "absent"
+    # Any attempted non-null signal went only to the proven-owned fixture
+    # group or the direct task-owned wrapper, never to the decoy or any
+    # other PID.
+    wrapper_pid = outcome.wrapper.pid
+    assert all(
+        pid in (wrapper_pid, -wrapper_pid)
+        for pid, signum in outcome.signals
+        if signum != 0
+    )
+    assert outcome.decoy_pid not in {pid for pid, _ in outcome.signals}
+
+
+@pytest.mark.skipif(sys.platform not in ("linux", "darwin"), reason="POSIX group teardown")
+def test_provider_readiness_rejects_live_wrong_group_pid_unknown_wrapper_birth(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """With an unknown captured wrapper birth the wrong-group rejection is
+    unchanged and no fixture-group signal is ever authorized: every group
+    signal is intercepted and none is attempted, and the decoy is ceased
+    only through its own revalidated identity."""
+    outcome = _run_wrong_group_rejection(
+        tmp_path, monkeypatch, wrapper_birth_known=False
+    )
+    assert outcome.body_failure is None
+    assert outcome.proof.provider is None
+    wrapper_pid = outcome.wrapper.pid
+    # The unknown wrapper birth authorizes no fixture-group signal.
+    assert all(pid != -wrapper_pid for pid, _ in outcome.signals)
+    # Only the direct task-owned wrapper was signalled, never the decoy.
+    assert all(pid == wrapper_pid for pid, signum in outcome.signals if signum != 0)
+    assert outcome.cleanup_confirmed is True
+    assert outcome.wrapper.poll() is not None
+    assert outcome.decoy_pid is not None
+    assert process_identity.process_liveness(outcome.decoy_pid) == "absent"
+    assert outcome.decoy_pid not in {pid for pid, _ in outcome.signals}
+
+
+@pytest.mark.skipif(sys.platform not in ("linux", "darwin"), reason="POSIX group teardown")
+def test_provider_readiness_rejects_live_wrong_group_pid_unknown_decoy_birth(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """With an unknown descendant birth, the original setup assertion stays
+    the primary failure: no descendant or group signal is attempted without
+    proof, unconfirmed cleanup is reported, and no teardown assertion
+    replaces the originating error.  The post-driver lifetime is protected
+    by a guard that revalidates the independently retained task-owned
+    decoy identity, so any post-driver assertion failure still ceases the
+    decoy and leaves the body assertion as the primary exception."""
+    outcome = _run_wrong_group_rejection(tmp_path, monkeypatch, decoy_birth_known=False)
+    # Independent positive task-owned decoy identity, retained after the
+    # driver's unknown-birth interception is undone and before any
+    # assertion that can fail.  Birth/PGID/SID are retained, never a raw
+    # PID, and the rejected readiness proof is never altered to authorize
+    # cleanup; a missing observation stays unproven.
+    decoy_pid = outcome.decoy_pid
+    decoy_member: process_identity.SessionMember | None = None
+    if decoy_pid is not None and outcome.proof.session_id is not None:
+        decoy_pgid = os.getpgid(decoy_pid)
+        decoy_birth = process_identity.process_birth_identity(decoy_pid)
+        if (
+            decoy_pgid == decoy_pid
+            and decoy_birth is not None
+            and os.getsid(decoy_pid) == outcome.proof.session_id
+        ):
+            candidate = process_identity.SessionMember(
+                pid=decoy_pid, birth=decoy_birth, pgid=decoy_pgid
+            )
+            if process_identity.session_member_live(
+                candidate, outcome.proof.session_id
+            ):
+                decoy_member = candidate
+    try:
+        # The original birth assertion is the primary failure, preserved
+        # verbatim.
+        assert outcome.body_failure is not None
+        assert "decoy birth was not observed" in str(outcome.body_failure)
+        # No signal was attempted at all while interception was active:
+        # without a captured birth the descendant is never signalled, and
+        # the body never reached an in-body cleanup call.
+        assert outcome.signals == []
+        # The proven fixture group signal ceased the wrapper, but the
+        # unproven decoy survived: unconfirmed cleanup is reported, not
+        # asserted away.
+        assert outcome.wrapper.poll() is not None
+        assert decoy_pid is not None
+        assert process_identity.process_liveness(decoy_pid) == "present"
+        assert outcome.cleanup_confirmed is False
+        assert "fixture cleanup unconfirmed" in capsys.readouterr().err
+    finally:
+        # The independent guard reuses the ownership-scoped cleanup
+        # helper: a fresh session_member_live immediately precedes any
+        # descendant signal, the reaped wrapper authorizes no group
+        # signal, and no guard assertion replaces the body exception.
+        if decoy_member is not None:
+            _cleanup_owned_fixture(
+                outcome.wrapper,
+                _FixtureProof(
+                    wrapper_birth=outcome.proof.wrapper_birth,
+                    wrapper_pgid=outcome.proof.wrapper_pgid,
+                    session_id=outcome.proof.session_id,
+                    provider=decoy_member,
+                ),
+            )
+        elif decoy_pid is not None:
+            # The marker PID is reporting evidence only, never signalling
+            # identity: absence must be positively established.
+            if process_identity.process_liveness(decoy_pid) != "absent":
+                print(
+                    "fixture cleanup unconfirmed: decoy marker PID "
+                    f"{decoy_pid} has no captured identity, so its "
+                    "absence cannot be positively established",
+                    file=sys.stderr,
+                )
+    # Success-only cessation assertions after the protected lifetime, so
+    # an assertion in the body remains the primary exception.
+    assert decoy_pid is not None
+    assert process_identity.process_liveness(decoy_pid) == "absent"
+
+
+@pytest.mark.skipif(sys.platform not in ("linux", "darwin"), reason="POSIX group teardown")
+def test_unknown_decoy_guard_protects_post_driver_assertion_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """The unknown-decoy test's guard ceases the task-owned decoy even when
+    a post-driver assertion receives the documented unknown-liveness
+    result: the original setup failure stays the primary failure, the
+    wrapper is reaped, and the decoy is positively absent.  The
+    regression independently retains the decoy's identity before the
+    observation is injected, and its own protecting guard revalidates and
+    cleans the task-owned process if the repair fails; it never signals an
+    unknown or reused identity."""
+    real_driver = _run_wrong_group_rejection
+    real_liveness = process_identity.process_liveness
+    state: dict[str, object] = {}
+
+    def observe_driver(*args: object, **kwargs: object) -> _WrongGroupOutcome:
+        outcome = real_driver(*args, **kwargs)
+        state["outcome"] = outcome
+        pid = outcome.decoy_pid
+        assert pid is not None
+        # The regression's own task-owned identity, retained and
+        # revalidated before the unknown observation is injected; it is
+        # guard evidence only, never readiness proof.
+        birth = process_identity.process_birth_identity(pid)
+        pgid = os.getpgid(pid)
+        sid = os.getsid(pid)
+        assert birth is not None
+        assert pgid == pid
+        assert sid == outcome.proof.session_id
+        member = process_identity.SessionMember(pid=pid, birth=birth, pgid=pgid)
+        assert process_identity.session_member_live(member, sid)
+        assert real_liveness(pid) == "present"
+        state["member"] = member
+        state["sid"] = sid
+
+        def one_unknown(target: int, deadline: float | None = None) -> str:
+            # The documented unknown-liveness result, injected exactly
+            # once at the test's first post-driver liveness assertion.
+            if target == pid and not state.get("injected"):
+                state["injected"] = True
+                return "unknown"
+            return real_liveness(target, deadline)
+
+        monkeypatch.setattr(process_identity, "process_liveness", one_unknown)
+        return outcome
+
+    monkeypatch.setattr(
+        sys.modules[__name__], "_run_wrong_group_rejection", observe_driver
+    )
+    try:
+        inner = pytest.MonkeyPatch()
+        try:
+            with pytest.raises(AssertionError) as excinfo:
+                test_provider_readiness_rejects_live_wrong_group_pid_unknown_decoy_birth(
+                    tmp_path, inner, capsys
+                )
+        finally:
+            inner.undo()
+        outcome = state["outcome"]
+        # The injected unknown observation deterministically failed the
+        # post-driver liveness assertion, and that assertion propagated as
+        # the primary exception: the guard ran in the protected lifetime
+        # without replacing it.
+        assert state.get("injected") is True
+        assert "unknown" in str(excinfo.value)
+        # The original setup failure is preserved verbatim.
+        assert outcome.body_failure is not None
+        assert "decoy birth was not observed" in str(outcome.body_failure)
+        # The guard cleaned up: the wrapper is reaped and the decoy is
+        # positively absent.
+        assert outcome.wrapper.poll() is not None
+        assert outcome.decoy_pid is not None
+        assert real_liveness(outcome.decoy_pid) == "absent"
+    finally:
+        # The regression's own protecting guard: if the repair failed the
+        # task-owned decoy is still live, so revalidate its captured
+        # identity and cease only that proven process.
+        member = state.get("member")
+        if member is not None:
+            sid = state["sid"]
+            deadline = time.monotonic() + _CLEANUP_BUDGET_SECONDS
+            if real_liveness(member.pid, deadline) != "absent":
+                assert process_identity.session_member_live(member, sid, deadline)
+                os.kill(member.pid, 9)
+            while (
+                real_liveness(member.pid, deadline) != "absent"
+                and time.monotonic() < deadline
+            ):
+                time.sleep(0.02)
+            assert real_liveness(member.pid) == "absent"
+
+
+@pytest.mark.skipif(sys.platform not in ("linux", "darwin"), reason="POSIX group teardown")
+def test_owned_fixture_cleanup_unknown_wrapper_birth_never_claims_ceased(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """With missing readiness and an unknown wrapper birth, direct wrapper
+    reaping cannot claim a surviving provider ceased: no group signal is
+    authorized and cleanup reports unconfirmed."""
+    import time as _time
+
+    provider_pid_file = tmp_path / "p.pid"
+    provider = tmp_path / "p.py"
+    side_channel: list[str] = []
+    _publish_marker_atomic(side_channel, provider_pid_file, tmp_path / "p.pid.tmp")
+    side_channel.append("time.sleep(30)\n")
+    provider.write_text("".join(side_channel), encoding="utf-8")
+    wrapper_script = tmp_path / "w.py"
+    wrapper_script.write_text(
+        "import subprocess, sys\n"
+        f"subprocess.Popen([sys.executable, {str(provider)!r}]).wait()\n",
+        encoding="utf-8",
+    )
+    wrapper = subprocess.Popen(
+        [sys.executable, str(wrapper_script)],
+        process_group=0,
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+    )
+    proof = _capture_wrapper_proof(wrapper)
+    # Unknown wrapper birth: the fresh group-ownership re-proof cannot
+    # succeed, so no group signal may be authorized.
+    proof.wrapper_birth = None
+    signals: list[tuple[int, int]] = []
+    real_kill = os.kill
+
+    def intercept(pid: int, signum: int) -> None:
+        signals.append((pid, signum))
+        if signum == 0:
+            raise ProcessLookupError("no such process")
+        if pid == wrapper.pid:
+            # Only the direct task-owned wrapper's bounded reap is allowed.
+            real_kill(wrapper.pid, signum)
+            return
+        raise AssertionError(f"unauthorized signal {signum} to pid {pid}")
+
+    monkeypatch.setattr(os, "kill", intercept)
+    provider_pid: int | None = None
+    provider_member: process_identity.SessionMember | None = None
+    provider_sid: int | None = None
+    try:
+        deadline = _time.monotonic() + 10
+        while _time.monotonic() < deadline:
+            try:
+                content = provider_pid_file.read_text()
+            except OSError:
+                content = ""
+            else:
+                try:
+                    provider_pid = int(content)
+                except ValueError:
+                    provider_pid = None
+                if provider_pid is not None and provider_pid >= 1:
+                    break
+            _time.sleep(0.02)
+        assert provider_pid is not None, "provider never started"
+        # Independent positive task-owned provider identity, revalidated
+        # against the fixture session before the cleanup assertion.  This
+        # teardown evidence must never become the readiness proof's
+        # provider.
+        provider_pgid = os.getpgid(provider_pid)
+        provider_sid = os.getsid(provider_pid)
+        provider_birth = process_identity.process_birth_identity(provider_pid)
+        assert provider_pgid == wrapper.pid, "provider is not in the fixture group"
+        assert provider_sid == proof.session_id, (
+            "provider is not in the fixture session"
+        )
+        assert provider_birth is not None, "provider birth was not observed"
+        provider_member = process_identity.SessionMember(
+            pid=provider_pid, birth=provider_birth, pgid=provider_pgid
+        )
+        assert process_identity.session_member_live(provider_member, provider_sid)
+        # The provider is a live member of the fixture group; readiness was
+        # never published, so cleanup retains no provider proof.
+        assert process_identity.process_liveness(provider_pid) == "present"
+        confirmed = _cleanup_owned_fixture(wrapper, proof)
+        # Reaping the direct wrapper alone never confirms cessation of the
+        # surviving provider and its group.
+        assert confirmed is False
+        assert wrapper.poll() is not None
+        assert process_identity.process_liveness(provider_pid) == "present"
+    finally:
+        monkeypatch.undo()
+        # Task-owned teardown through the ownership-scoped helper: the
+        # deliberately unknown wrapper birth authorizes no group signal, and
+        # the independently observed provider identity is the only descendant
+        # evidence.  A missing, unknown, or unrevalidated identity authorizes
+        # no signal; the original failure is preserved.
+        teardown_proof = _FixtureProof(
+            wrapper_birth=None,
+            wrapper_pgid=wrapper.pid,
+            session_id=proof.session_id,
+            provider=provider_member,
+        )
+        cleanup_confirmed = _cleanup_owned_fixture(wrapper, teardown_proof)
+        if provider_member is None and provider_pid is not None:
+            # The marker PID is reporting evidence only, never signalling
+            # identity: absence must be positively established.
+            if process_identity.process_liveness(provider_pid) != "absent":
+                cleanup_confirmed = False
+                print(
+                    "fixture cleanup unconfirmed: provider marker PID "
+                    f"{provider_pid} has no captured identity, so its "
+                    "absence cannot be positively established",
+                    file=sys.stderr,
+                )
+    # Reached only when the body succeeded: the task-owned fixture is
+    # positively ceased and the direct child was reaped.
+    assert cleanup_confirmed is True
+    # Only the direct task-owned wrapper was signalled (its bounded reap);
+    # the surviving provider was never signalled.
+    assert all(pid == wrapper.pid for pid, signum in signals if signum != 0)
+    assert provider_pid is not None
+    assert provider_pid not in {pid for pid, _ in signals}
+    # Bounded observation of the teardown cessation.
+    deadline = _time.monotonic() + 5
+    while (
+        process_identity.process_liveness(provider_pid) != "absent"
+        and _time.monotonic() < deadline
+    ):
+        _time.sleep(0.02)
+    assert process_identity.process_liveness(provider_pid) == "absent"
+
+
+def test_cleanup_owned_fixture_wait_uses_remaining_deadline(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A slow identity probe leaves only the remaining cleanup allowance for
+    the direct child's bounded reap; an already-expired budget passes a zero
+    allowance.  No renewed second budget is ever granted."""
+
+    class _PendingWrapper:
+        pid = 0
+
+        def __init__(self) -> None:
+            self.kill_calls = 0
+            self.wait_timeouts: list[float] = []
+
+        def poll(self) -> int | None:
+            return None
+
+        def kill(self) -> None:
+            self.kill_calls += 1
+
+        def wait(self, timeout: float | None = None) -> int:
+            self.wait_timeouts.append(timeout)
+            return 0
+
+    for probe_seconds in (1.6, 2.5):
+        # A deterministic accelerated clock: the fake probe spends virtual
+        # time, so no real long sleep is needed.
+        clock = [0.0]
+        monkeypatch.setattr(time, "monotonic", lambda: clock[0])
+        monkeypatch.setattr(
+            time, "sleep", lambda seconds: clock.__setitem__(0, clock[0] + seconds)
+        )
+        monkeypatch.setattr(
+            process_identity,
+            "controller_group_owned",
+            lambda pid, birth, session, probe_deadline: (
+                clock.__setitem__(0, clock[0] + probe_seconds),
+                False,
+            )[1],
+        )
+        wrapper = _PendingWrapper()
+        proof = _FixtureProof(
+            wrapper_birth="linux-start-ticks:1",
+            wrapper_pgid=0,
+            session_id=0,
+        )
+        _cleanup_owned_fixture(wrapper, proof)
+        assert wrapper.wait_timeouts == [
+            max(0.0, _CLEANUP_BUDGET_SECONDS - probe_seconds)
+        ]
+
+
+@pytest.mark.skipif(sys.platform not in ("linux", "darwin"), reason="POSIX group teardown")
+def test_owned_fixture_startup_unknown_observation_is_bounded_and_reaps(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A persistent unknown group observation fails at the bounded startup
+    deadline, the original assertion failure is preserved, and the
+    task-owned direct child is reaped."""
+    # A deterministic accelerated clock: a persistent unknown observation
+    # spins on virtual time only, never a real multi-second sleep.
+    clock = [0.0]
+    monkeypatch.setattr(time, "monotonic", lambda: clock[0])
+    monkeypatch.setattr(
+        time, "sleep", lambda seconds: clock.__setitem__(0, clock[0] + seconds)
+    )
+    monkeypatch.setattr(
+        process_identity,
+        "process_group_state",
+        lambda pgid, deadline=None: "unknown",
+    )
+    script = tmp_path / "survivor.py"
+    script.write_text("import time\ntime.sleep(30)\n", encoding="utf-8")
+    survivor = subprocess.Popen(
+        [sys.executable, str(script)],
+        start_new_session=True,
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+    )
+    try:
+        with pytest.raises(AssertionError, match="startup deadline"):
+            _wait_for_survivor_group_present(survivor)
+        # Bounded completion: the virtual clock stopped at the deadline.
+        assert clock[0] <= 10.0 + 0.02
+    finally:
+        # The same direct-child cleanup an early startup failure must reach:
+        # restore interception, then cease and reap the direct child within
+        # the existing cleanup allowance.
+        monkeypatch.undo()
+        survivor.kill()
+        try:
+            survivor.wait(timeout=_CLEANUP_BUDGET_SECONDS)
+        except subprocess.TimeoutExpired:
+            pass
+    assert survivor.poll() is not None
+    assert process_identity.process_liveness(survivor.pid) == "absent"
 
 
 @pytest.mark.skipif(sys.platform not in ("linux", "darwin"), reason="POSIX group teardown")
