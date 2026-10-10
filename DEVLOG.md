@@ -62,6 +62,44 @@
   all exact-SHA CI jobs, and matching deployed SHA/health/readiness are separate
   delivery gates before issue100 closure.
 
+## 2026-10-10 — Bound native retry predecessors to safe pending-review continuation
+
+- Producer: recovery-scheduled turns now carry `retry_next_turn` at all
+  native producer sites: `true` for same-team retry decisions (deterministic
+  `retry_same_team_after_delay` and team-lead same-team decisions), `false`
+  for team-switch decisions, and absent for failed recovery decisions.
+- Validator: `_derived_next_start_identity` in `budget_resume.py` admits a
+  retry-scheduled predecessor with `retry_next_turn=true` (explicit) or, for
+  the narrow historical shape, only when the flag is absent and the receipt
+  is context-bound: strict turn-number binding to the loaded predecessor
+  index, failed finalized invocation, executed same-team
+  `retry_same_team_after_delay` evidence, no selected transition or
+  condition, unchanged decodable snapshots bridging into the adjacent
+  successful turn's before snapshot, the same configured step/role/selector
+  as the adjacent turn, matching plan identities, and the required recovery
+  source and core evidence types validated in the receipt, saved summary
+  and last history entry before the receipt recovery fields are bound to
+  the owning run's last saved recovery-history entry and summary. A recovery-scheduled receipt naming a selected transition
+  rejects. An explicit flag (true, false, null, or any other value) is
+  never reinterpreted through the historical path.
+- Tests: three new cases in `test_budget_exit_recovery.py`
+  (`native_retry_same_team_budget_boundary`,
+  `native_retry_historical_compatibility`, `native_retry_negatives_reject`)
+  generate a genuine budget-driven END after a scheduled same-team retry via
+  the real worker/checkpoint-review workflow, then exercise the classifier,
+  daemon preview, bootstrap, and managed durable recovery. The positive and
+  historical cases boot one idempotent successor through the real
+  `worker_main` and observe the pending checkpoint reviewer (a distinct
+  configured role) invoked first with zero worker calls, the explicit budget
+  and execution workspace retained, and the source run dir
+  byte-identical. The negative case parameterizes ~30 contradictions
+  (turn/step, status, flags, snapshots, identities, transitions, run
+  recovery summary/history, worktree) that must reject before any
+  reservation, run, launch, unit start, or provider call. `test_runtime.py`
+  recovery tests pin the producer flag: true for same-team retries,
+  false for team-switch, absent for fail-immediately.
+- Source run records remain immutable; no backfill or file repair.
+
 ## 2026-10-09 — Synchronized process-stop fixtures to provider readiness (issue100 process-stop fixture CI repair)
 
 - Checkpoint 1 repair of the process-stop fixture CI-repair plan. The two real

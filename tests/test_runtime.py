@@ -6313,6 +6313,7 @@ class WorkflowArtifactTests(unittest.TestCase):
             assert turn1_result['recovery_action'] == 'retry_same_team_after_delay'
             assert turn1_result['recovery_source'] == 'deterministic'
             assert turn1_result['recovery_match_terms'] == ['throttled']
+            assert turn1_result['retry_next_turn'] is True
             turn2_result = json.loads((result.run_dir / 'turns' / 'turn-002' / 'result.json').read_text(encoding='utf-8'))
             assert turn2_result['status'] == 'completed'
 
@@ -6413,6 +6414,7 @@ class WorkflowArtifactTests(unittest.TestCase):
             turn_result = json.loads((ctx.value.run_dir / 'turns' / 'turn-001' / 'result.json').read_text(encoding='utf-8'))
             assert turn_result['status'] == 'recovery-failed'
             assert turn_result['recovery_action'] == 'fail_immediately'
+            assert 'retry_next_turn' not in turn_result
 
     def test_team_lead_recovery_executes_valid_json_decision_and_records_metadata(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -6504,6 +6506,7 @@ class WorkflowArtifactTests(unittest.TestCase):
             assert turn1_result['recovery_action'] == 'retry_same_team_after_delay'
             assert turn1_result['recovery_suggested_keywords'] == ['mystery failure', 'retry after failure']
             assert turn1_result['recovery_executed'] is True
+            assert turn1_result['retry_next_turn'] is True
             turn2_result = json.loads((result.run_dir / 'turns' / 'turn-002' / 'result.json').read_text(encoding='utf-8'))
             assert turn2_result['status'] == 'completed'
 
@@ -6852,6 +6855,7 @@ class WorkflowArtifactTests(unittest.TestCase):
             assert run_json['recovery_summary']['to_team'] == 'backup2'
             turn1_result = json.loads((result.run_dir / 'turns' / 'turn-001' / 'result.json').read_text(encoding='utf-8'))
             assert turn1_result['recovery_to_team'] == 'backup'
+            assert turn1_result['retry_next_turn'] is False
             turn2_result = json.loads((result.run_dir / 'turns' / 'turn-002' / 'result.json').read_text(encoding='utf-8'))
             assert turn2_result['recovery_to_team'] == 'backup2'
             turn3_result = json.loads((result.run_dir / 'turns' / 'turn-003' / 'result.json').read_text(encoding='utf-8'))

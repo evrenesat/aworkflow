@@ -2257,6 +2257,25 @@ stale-overlay substitution, and unrelated paths reject before any successor
 reservation or provider launch. A missing `review_rejection` credit is not
 an error and is never fabricated.
 
+A retry-scheduled predecessor (no selected transition) is admitted when the
+receipt carries `retry_next_turn=true` (the producer's explicit flag) or,
+for the narrow historical shape, when the flag is absent and the receipt is
+bound to its adjacent successful turn and the owning run's saved recovery
+evidence: `status=recovery-scheduled` with a failed finalized invocation,
+`recovery_executed=true`, `recovery_action=retry_same_team_after_delay`,
+same nonempty from/to team, valid positive consecutive count, nonnegative
+delay, no selected transition or condition, unchanged decodable before/after
+snapshots bridging into the adjacent turn's before snapshot, the same
+configured step/role/selector as the adjacent turn, matching plan
+identities, and the required recovery source and core evidence types
+(source, count, executed, delay) validated in the receipt, saved summary and
+last history entry before the receipt recovery fields are bound to the run's
+last saved recovery-history entry and summary. A recovery-scheduled receipt naming a
+selected transition is contradictory and rejects on every surface. An
+explicit `retry_next_turn` flag (true, false, null, or any other value) is
+never reinterpreted through the historical path. Source run records are
+immutable; no backfill or file repair is performed in production.
+
 The validated descriptor rides in `ResumeContext.budget_continuation`, distinct
 from the generic incomplete manager-boundary replay. The successor re-selects only the
 budget-sensitive saved edge with unchanged `DONE`/`NEW_PLAN_EXISTS` using its

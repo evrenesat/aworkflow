@@ -24,6 +24,7 @@ from aflow.runlog import load_run_json
 from aflow.workflow import (
     WorkflowError,
     _select_transition,
+    _snapshot_from_review_result,
     _terminal_resume_run_dir,
     evaluate_condition,
 )
@@ -315,12 +316,235 @@ def _workspace_identity(
     return (_text(run.get("worktree_path")), _text(run.get("feature_branch")))
 
 
+def _strict_nonzero_int(value: Any) -> bool:
+    return isinstance(value, int) and not isinstance(value, bool) and value != 0
+
+
+#: Producer fields the historical receipt must bind to the owning run's saved
+#: recovery summary and last recovery-history entry (receipt key, run key).
+_HISTORICAL_RECOVERY_FIELDS = (
+    ("recovery_source", "source"),
+    ("recovery_action", "action"),
+    ("recovery_reason", "reason"),
+    ("recovery_match_terms", "match_terms"),
+    ("recovery_matched_terms", "matched_terms"),
+    ("recovery_delay_seconds", "delay_seconds"),
+    ("recovery_from_team", "from_team"),
+    ("recovery_to_team", "to_team"),
+    ("recovery_consecutive_count", "consecutive_count"),
+    ("recovery_suggested_keywords", "suggested_keywords"),
+    ("recovery_suggested_action", "suggested_action"),
+    ("recovery_executed", "executed"),
+    ("recovery_rejection_reason", "rejection_reason"),
+)
+
+#: Supported producer recovery-source values for the historical evidence.
+_HISTORICAL_RECOVERY_SOURCES = ("deterministic", "team_lead")
+
+
+def _valid_historical_recovery_evidence(
+    evidence: Mapping[str, object],
+    *,
+    source_key: str,
+    count_key: str,
+    executed_key: str,
+    delay_key: str,
+) -> bool:
+    """Validate the required core recovery evidence in one evidence object.
+
+    The source must be a supported producer value, the consecutive count a
+    strict positive integer, the executed marker exactly True, and the delay
+    a nonnegative numeric nonboolean.  Missing or invalid values reject even
+    if they agree with the other evidence objects.
+    """
+    if evidence.get(source_key) not in _HISTORICAL_RECOVERY_SOURCES:
+        return False
+    if not _strict_positive_int(evidence.get(count_key)):
+        return False
+    if evidence.get(executed_key) is not True:
+        return False
+    delay = evidence.get(delay_key)
+    if not isinstance(delay, (int, float)) or isinstance(delay, bool) or delay < 0:
+        return False
+    return True
+
+
+def _is_historical_same_team_recovery(
+    predecessor: Mapping[str, object],
+    *,
+    run: Mapping[str, object],
+    predecessor_index: int,
+    adjacent_receipt: Mapping[str, object],
+    steps: Mapping[str, Any],
+    repo_root: Path,
+) -> bool:
+    """Recognize the narrow historical same-team recovery shape.
+
+    This predicate applies only when ``retry_next_turn`` is absent from the
+    receipt (not present as False, None, or any other value).  It validates
+    the producer's executed recovery evidence for a genuine completed
+    finalization of a scheduled same-team retry against the adjacent
+    successful turn and the owning run's saved recovery evidence:
+
+    * ``status`` is ``recovery-scheduled`` with a failed finalized
+      invocation (strict nonzero integer returncode)
+    * ``recovery_executed`` is True
+    * ``recovery_action`` is ``retry_same_team_after_delay``
+    * ``recovery_from_team`` and ``recovery_to_team`` are the same nonempty
+      string
+    * ``recovery_consecutive_count`` is a valid positive integer
+    * ``recovery_delay_seconds`` is a nonnegative number
+    * no chosen transition or transition condition, and no new overlay
+    * the receipt's turn number is a strict positive integer equal to the
+      loaded predecessor index and the adjacent receipt's is index+1
+    * unchanged decodable before/after snapshots, with the predecessor's
+      after equal to the adjacent turn's before snapshot (the adjacent turn
+      may complete the checkpoint and change its own after snapshot)
+    * the predecessor's step is a configured step with the configured role
+      and matches the adjacent turn's step/role/selector
+    * the predecessor's active/new plan identities equal the adjacent
+      turn's starting identities
+    * the receipt's recovery fields equal the owning run's last saved
+      recovery-history entry and saved recovery summary, with the required
+      source and core evidence types validated in the receipt, saved summary
+      and last history entry before equality can bind them
+
+    Any contradictory or missing field rejects.  An explicit
+    ``retry_next_turn`` flag (True, False, or any other value) is never
+    reinterpreted through this predicate.
+    """
+    # The flag must be absent, not merely false or null.
+    if "retry_next_turn" in predecessor:
+        return False
+    if predecessor.get("status") != "recovery-scheduled":
+        return False
+    # A failed finalized invocation, not a success replayed as a retry.
+    if not _strict_nonzero_int(predecessor.get("returncode")):
+        return False
+    # Bind both receipts to their exact loaded positions; equality alone is
+    # not turn evidence (boolean/float values compare equal to ints).
+    if not _strict_positive_int(predecessor.get("turn_number")):
+        return False
+    if predecessor.get("turn_number") != predecessor_index:
+        return False
+    if not _strict_positive_int(adjacent_receipt.get("turn_number")):
+        return False
+    if adjacent_receipt.get("turn_number") != predecessor_index + 1:
+        return False
+    if predecessor.get("recovery_executed") is not True:
+        return False
+    if predecessor.get("recovery_action") != "retry_same_team_after_delay":
+        return False
+    from_team = predecessor.get("recovery_from_team")
+    to_team = predecessor.get("recovery_to_team")
+    if not isinstance(from_team, str) or not from_team:
+        return False
+    if to_team != from_team:
+        return False
+    if not _strict_positive_int(predecessor.get("recovery_consecutive_count")):
+        return False
+    delay = predecessor.get("recovery_delay_seconds")
+    if not isinstance(delay, (int, float)) or isinstance(delay, bool) or delay < 0:
+        return False
+    # No selection and no overlay on the scheduled turn.
+    if predecessor.get("chosen_transition") is not None:
+        return False
+    if predecessor.get("chosen_transition_condition") is not None:
+        return False
+    predecessor_conditions = predecessor.get("conditions")
+    if (
+        not isinstance(predecessor_conditions, Mapping)
+        or predecessor_conditions.get("NEW_PLAN_EXISTS") is not False
+    ):
+        return False
+    # Unchanged decodable snapshots bridging into the adjacent turn.
+    predecessor_before = _snapshot_from_review_result(
+        predecessor.get("snapshot_before")
+    )
+    predecessor_after = _snapshot_from_review_result(predecessor.get("snapshot_after"))
+    adjacent_before = _snapshot_from_review_result(
+        adjacent_receipt.get("snapshot_before")
+    )
+    if (
+        predecessor_before is None
+        or predecessor_after is None
+        or adjacent_before is None
+        or predecessor_before != predecessor_after
+        or predecessor_after != adjacent_before
+    ):
+        return False
+    # The same configured step, with the configured role, as the adjacent
+    # successful turn: step/role/selector must all agree.
+    step_name = predecessor.get("step_name")
+    if not isinstance(step_name, str) or not step_name:
+        return False
+    step = steps.get(step_name)
+    if step is None:
+        return False
+    for field in ("step_name", "step_role", "selector"):
+        if predecessor.get(field) != adjacent_receipt.get(field):
+            return False
+    if predecessor.get("step_role") != getattr(step, "role", None):
+        return False
+    if not isinstance(predecessor.get("selector"), str) or not predecessor["selector"]:
+        return False
+    # Identical starting plan identities for both turns.
+    predecessor_identities = _receipt_plan_identities(predecessor, repo_root)
+    adjacent_identities = _receipt_plan_identities(adjacent_receipt, repo_root)
+    if (
+        predecessor_identities is None
+        or adjacent_identities is None
+        or predecessor_identities != adjacent_identities
+    ):
+        return False
+    # Bind the receipt's recovery evidence to the owning run's saved
+    # recovery summary and last recovery-history entry: compare the existing
+    # producer fields, never infer or synthesize absent history.  A positive
+    # count inconsistent with the saved history rejects.
+    history = run.get("recovery_history")
+    summary = run.get("recovery_summary")
+    if not isinstance(history, list) or not history:
+        return False
+    last_entry = history[-1]
+    if not isinstance(last_entry, Mapping) or not isinstance(summary, Mapping):
+        return False
+    # The required core recovery evidence must validate in the receipt, the
+    # saved summary and the last history entry before equality can bind it;
+    # agreement among missing or invalid values is not producer evidence.
+    if not _valid_historical_recovery_evidence(
+        predecessor,
+        source_key="recovery_source",
+        count_key="recovery_consecutive_count",
+        executed_key="recovery_executed",
+        delay_key="recovery_delay_seconds",
+    ):
+        return False
+    for evidence in (last_entry, summary):
+        if not _valid_historical_recovery_evidence(
+            evidence,
+            source_key="source",
+            count_key="consecutive_count",
+            executed_key="executed",
+            delay_key="delay_seconds",
+        ):
+            return False
+    for receipt_field, entry_field in _HISTORICAL_RECOVERY_FIELDS:
+        if predecessor.get(receipt_field) != last_entry.get(entry_field):
+            return False
+        if summary.get(entry_field) != last_entry.get(entry_field):
+            return False
+    return True
+
+
 def _derived_next_start_identity(
     predecessor: Mapping[str, object],
     *,
     steps: Mapping[str, Any],
     repo_root: Path,
     canonical_original_path: Path,
+    run: Mapping[str, object] | None = None,
+    predecessor_index: int | None = None,
+    adjacent_receipt: Mapping[str, object] | None = None,
 ) -> Path | None:
     """Derive the next turn's starting active identity from one receipt.
 
@@ -329,6 +553,10 @@ def _derived_next_start_identity(
     so the controller's post-transition selection is recomputable exactly
     against the canonical original.  Contradictory or missing predecessor
     evidence returns None instead of guessing a known path.
+
+    The narrow historical absent-flag compatibility requires the owning run
+    metadata, the loaded predecessor index, and the adjacent finalized
+    receipt; a caller without that adjacent evidence cannot use it.
     """
     pred_step_name = predecessor.get("step_name")
     pred_chosen = predecessor.get("chosen_transition")
@@ -344,9 +572,32 @@ def _derived_next_start_identity(
     if pred_chosen is None:
         # A retry-scheduled turn replayed with the same active plan and
         # never selected a transition.
-        if predecessor.get("retry_next_turn") is not True:
-            return None
-        return pred_active
+        if predecessor.get("retry_next_turn") is True:
+            return pred_active
+        # Narrow historical compatibility: an absent flag on a genuine
+        # completed finalization of a scheduled same-team retry, validated
+        # against the adjacent successful turn and the owning run's saved
+        # recovery evidence.  A caller without that context cannot use the
+        # absent-flag fallback.
+        if (
+            run is not None
+            and predecessor_index is not None
+            and adjacent_receipt is not None
+            and _is_historical_same_team_recovery(
+                predecessor,
+                run=run,
+                predecessor_index=predecessor_index,
+                adjacent_receipt=adjacent_receipt,
+                steps=steps,
+                repo_root=repo_root,
+            )
+        ):
+            return pred_active
+        return None
+    if pred_chosen is not None and predecessor.get("status") == "recovery-scheduled":
+        # A scheduled retry turn never records a selected transition; a
+        # recovery-scheduled receipt naming one contradicts the producer.
+        return None
     if not isinstance(pred_chosen, str) or pred_chosen == "END":
         # An END selection would have ended the run before the next turn.
         return None
@@ -840,6 +1091,9 @@ def classify_budget_boundary(
                 steps=steps,
                 repo_root=repo_root,
                 canonical_original_path=original_plan_path,
+                run=prev_run,
+                predecessor_index=turns_completed - 1,
+                adjacent_receipt=receipt,
             )
         )
         if expected_start is None or active_plan_path != expected_start:

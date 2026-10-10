@@ -3939,3 +3939,770 @@ def test_budget_only_retained_worker_control_reaches_managed_review(
         if failed_manifest is not None:
             assert failed_manifest.read_bytes() == failed_manifest_before
         assert _run_dir_bytes(source_dir) == source_before
+
+
+# ---------------------------------------------------------------------------
+# Native retry predecessor: same-team recovery → budget cap → pending review
+# ---------------------------------------------------------------------------
+
+# The worker's ordered routing puts the budget-only END edge first, so the
+# successful retry completing the checkpoint at the final allowed turn records
+# a real budget-driven END; with the budget restored the same routing selects
+# the pending checkpoint reviewer (a distinct configured role).
+_RECOVERY_WORKFLOWS = """\
+[workflow.live]
+team = "base"
+setup = ["worktree", "branch"]
+teardown = ["merge", "rm_worktree"]
+main_branch = "main"
+
+[workflow.live.steps.work]
+role = "worker"
+prompts = ["p"]
+go = [{ to = "END", when = "MAX_TURNS_REACHED" }, { to = "review" }, { to = "END", when = "DONE" }]
+
+[workflow.live.steps.review]
+role = "final_reviewer"
+prompts = ["p"]
+go = [{ to = "work", when = "!DONE" }, { to = "END", when = "DONE" }]
+"""
+
+_RECOVERY_CONFIG_EXTRA = """\
+[error_handling.harness_error_recovery]
+
+[[error_handling.harness_error_recovery.rules]]
+action = "retry_same_team_after_delay"
+match = ["throttled"]
+delay_seconds = 0
+"""
+
+
+def _make_recovery_source(root: Path) -> tuple:
+    """Run the real worker/checkpoint-review workflow to a budget-driven END.
+
+    Turn 1: work (worker, codex.base) fails with 'throttled' and the native
+    deterministic same-team recovery schedules the retry: recovery-scheduled,
+    retry_next_turn=True, failed returncode, unchanged snapshots, no selected
+    transition, and saved run recovery summary/history.
+    Turn 2: the work retry succeeds and completes the checkpoint at the final
+    allowed turn; the ordered MAX_TURNS_REACHED END edge (before DONE) records
+    a real budget-driven END.  Restoring the budget, the same routing selects
+    the pending checkpoint reviewer (final_reviewer, codex.reviewer).
+    """
+    repo_root, plan_path = _make_repo(root)
+    worktree_root = root / "worktrees"
+    worktree_root.mkdir()
+    config_dir = root / "config"
+    config_dir.mkdir(parents=True, exist_ok=True)
+    aflow_text = f'''\
+[aflow]
+default_workflow = "live"
+max_turns = 2
+worktree_root = "{worktree_root}"
+team_lead = "senior_architect"
+
+[harness.codex.profiles.base]
+model = "model-base"
+
+[harness.codex.profiles.other]
+model = "model-other"
+
+[harness.codex.profiles.reviewer]
+model = "model-reviewer"
+
+[roles]
+worker = "codex.base"
+final_reviewer = "codex.reviewer"
+senior_architect = "codex.base"
+
+[teams.base]
+worker = "codex.base"
+final_reviewer = "codex.reviewer"
+
+[prompts]
+p = "Work from {{ACTIVE_PLAN_PATH}}."
+'''
+    config_path = _write_split_config(config_dir, aflow_text, _RECOVERY_WORKFLOWS)[0]
+    # Append the deterministic recovery rules to the aflow.toml.
+    aflow_path = config_path.parent / "aflow.toml"
+    aflow_path.write_text(
+        aflow_path.read_text(encoding="utf-8") + _RECOVERY_CONFIG_EXTRA,
+        encoding="utf-8",
+    )
+
+    call_count = {"count": 0}
+
+    def recovery_runner(argv, **kwargs):
+        call_count["count"] += 1
+        if call_count["count"] == 1:
+            return subprocess.CompletedProcess(argv, 1, "", "throttled\n")
+        # The successful retry completes the checkpoint at the final turn.
+        _write_plan(_plan_path_in(Path(kwargs["cwd"])), _COMPLETE_PLAN)
+        return subprocess.CompletedProcess(argv, 0, "ok", "")
+
+    with _DeliverySpies() as spies:
+        result = _run_budget(
+            config_path,
+            repo_root,
+            plan_path,
+            recovery_runner,
+            max_turns=2,
+        )
+    spies.assert_no_delivery()
+    assert result.status == "completed"
+    assert result.end_reason == "max_turns_reached"
+    assert result.turns_completed == 2
+
+    # Turn 1: the genuine scheduled same-team retry, fully evidenced.
+    turn1_receipt = json.loads(
+        (result.run_dir / "turns" / "turn-001" / "result.json").read_text()
+    )
+    assert turn1_receipt["turn_number"] == 1
+    assert turn1_receipt["status"] == "recovery-scheduled"
+    assert turn1_receipt["returncode"] == 1
+    assert turn1_receipt["retry_next_turn"] is True
+    assert turn1_receipt["recovery_source"] == "deterministic"
+    assert turn1_receipt["recovery_action"] == "retry_same_team_after_delay"
+    assert turn1_receipt["recovery_executed"] is True
+    assert turn1_receipt["recovery_from_team"] == "base"
+    assert turn1_receipt["recovery_to_team"] == "base"
+    assert turn1_receipt["recovery_consecutive_count"] == 1
+    assert turn1_receipt["recovery_delay_seconds"] == 0
+    assert turn1_receipt.get("chosen_transition") is None
+    assert turn1_receipt.get("chosen_transition_condition") is None
+    assert turn1_receipt["conditions"]["NEW_PLAN_EXISTS"] is False
+    assert turn1_receipt["snapshot_before"] == turn1_receipt["snapshot_after"]
+    assert turn1_receipt["snapshot_before"]["is_complete"] is False
+    assert turn1_receipt["step_name"] == "work"
+    assert turn1_receipt["step_role"] == "worker"
+    assert turn1_receipt["selector"] == "codex.base"
+
+    # Turn 2: the successful retry records a real budget-driven END.
+    turn2_receipt = json.loads(
+        (result.run_dir / "turns" / "turn-002" / "result.json").read_text()
+    )
+    assert turn2_receipt["turn_number"] == 2
+    assert turn2_receipt["status"] == "completed"
+    assert turn2_receipt["returncode"] == 0
+    assert turn2_receipt["chosen_transition"] == "END"
+    assert turn2_receipt["chosen_transition_condition"] == "MAX_TURNS_REACHED"
+    assert turn2_receipt["snapshot_before"] == turn1_receipt["snapshot_after"]
+    assert turn2_receipt["snapshot_after"]["is_complete"] is True
+    assert turn2_receipt["step_name"] == "work"
+    assert turn2_receipt["step_role"] == "worker"
+    assert turn2_receipt["selector"] == "codex.base"
+
+    # The owning run's saved recovery evidence binds the receipt.
+    run_json = json.loads((result.run_dir / "run.json").read_text(encoding="utf-8"))
+    assert run_json["recovery_summary"]["action"] == "retry_same_team_after_delay"
+    assert run_json["recovery_summary"]["source"] == "deterministic"
+    assert run_json["recovery_summary"]["executed"] is True
+    assert run_json["recovery_history"][0]["consecutive_count"] == 1
+    assert run_json["recovery_history"][0]["executed"] is True
+
+    return repo_root, plan_path, config_path, result
+
+
+def _fake_stop_provider_bin(root: Path, provider_log: Path) -> Path:
+    """A fake ``codex`` provider that logs the call, then stops deliberately.
+
+    The checkpoint reviewer emits AFLOW_STOP after its call is logged so no
+    teardown, delivery, or further worker turn runs.
+    """
+    fake_bin = root / "fake-provider-bin"
+    fake_bin.mkdir()
+    (fake_bin / "codex").write_text(
+        "#!/usr/bin/env python3\n"
+        "import json, os, sys\n"
+        "args = sys.argv[1:]\n"
+        "if '--help' in args:\n"
+        "    print('--json resume [SESSION_ID] -m, --model MODEL'); sys.exit(0)\n"
+        "entry = {'argv': args, 'cwd': os.getcwd(), 'prompt': sys.stdin.read()}\n"
+        f"with open({str(provider_log)!r}, 'a') as f: f.write(json.dumps(entry) + '\\n')\n"
+        "text = 'AFLOW_STOP: pending checkpoint reviewer reached'\n"
+        "if '--output-last-message' in args:\n"
+        "    from pathlib import Path\n"
+        "    Path(args[args.index('--output-last-message') + 1]).write_text(text)\n"
+        "print(text)\n",
+        encoding="utf-8",
+    )
+    (fake_bin / "codex").chmod(0o755)
+    return fake_bin
+
+
+def _boot_successor_to_reviewer(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    root: Path,
+    repo_root: Path,
+    config_path: Path,
+    source_dir: Path,
+    wf_config,
+) -> tuple:
+    """Admit one managed successor and boot it to the pending reviewer.
+
+    Returns ``(daemon, continuation_run_id, source_before)`` with the source
+    hash evidence taken after the caller's owned fixture preparation.  The
+    real ``worker_main`` runs through the fixture daemon's admitted in-memory
+    unit manager; the fake checkpoint reviewer stops after its first call.
+    """
+    from aflow.daemon import worker_main
+
+    source_before = _run_dir_bytes(source_dir)
+    _attach_launch_evidence(repo_root, source_dir.name, "completed")
+    daemon = _make_daemon(tmp_path, monkeypatch, repo_root, config_path, wf_config)
+    _patch_inactive_worker_evidence(monkeypatch, daemon.application.repository)
+
+    # Daemon preview admits.
+    status = daemon.service.run_status(source_dir.name, include_resume_preview=True)
+    assert status.evidence.get("can_resume") is True
+
+    # Bootstrap starts at the pending checkpoint reviewer.
+    bootstrap = _real_bootstrap(repo_root, config_path, wf_config, source_dir.name)
+    assert bootstrap.start_step == "review"
+
+    # Managed durable recovery creates exactly one successor.
+    continuation = daemon.service.resume(
+        source_dir.name,
+        caller_scope="local",
+        idempotency_key="native-retry-recovery",
+    )
+    assert continuation.created is True
+    assert continuation.run_id != source_dir.name
+
+    # A repeated identical request creates no duplicate successor/launch.
+    continuation2 = daemon.service.resume(
+        source_dir.name,
+        caller_scope="local",
+        idempotency_key="native-retry-recovery",
+    )
+    assert continuation2.run_id == continuation.run_id
+    assert len(daemon.application.units.start_calls) == 1
+
+    provider_log = root / "provider-calls.jsonl"
+    fake_bin = _fake_stop_provider_bin(root, provider_log)
+    monkeypatch.setenv("PATH", str(fake_bin) + os.pathsep + os.environ.get("PATH", ""))
+    reservation = daemon.service._admission.reservation(continuation.run_id)
+    assert reservation is not None
+    monkeypatch.setenv("AFLOW_ADMISSION_RESERVATION_NONCE", reservation.nonce)
+    with _worker_boot_composition(daemon, repo_root=repo_root, config_path=config_path):
+        # 1 = the reviewer's deliberate AFLOW_STOP, not a failed boot.
+        assert (
+            worker_main(
+                repo_root=repo_root,
+                config_path=config_path,
+                run_id=continuation.run_id,
+            )
+            == 1
+        )
+
+    # The successor's first and only provider call is the pending checkpoint
+    # reviewer (a distinct configured role), never a worker replay.
+    calls = [
+        json.loads(line)
+        for line in provider_log.read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    assert len(calls) == 1
+    assert calls[0]["argv"][calls[0]["argv"].index("--model") + 1] == "model-reviewer"
+
+    successor_dir = repo_root / ".aflow" / "runs" / continuation.run_id
+    first_receipt = json.loads(
+        (successor_dir / "turns" / "turn-001" / "result.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert first_receipt["step_name"] == "review"
+    assert first_receipt["step_role"] == "final_reviewer"
+    assert first_receipt["selector"] == "codex.reviewer"
+
+    successor_state = json.loads(
+        (successor_dir / "run.json").read_text(encoding="utf-8")
+    )
+    source_state = json.loads((source_dir / "run.json").read_text(encoding="utf-8"))
+    # The explicit successor budget is retained in launch and run metadata.
+    launch_manifest = json.loads(
+        (repo_root / ".aflow" / "launches" / f"{continuation.run_id}.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert launch_manifest["max_turns"] == source_state["effective_max_turns"]
+    assert successor_state["effective_max_turns"] == source_state["effective_max_turns"]
+    # The successor continues the recorded execution workspace unchanged.
+    assert successor_state["worktree_path"] == source_state["worktree_path"]
+    assert successor_state["feature_branch"] == source_state["feature_branch"]
+    assert Path(calls[0]["cwd"]) == Path(source_state["worktree_path"])
+    # The deliberate reviewer stop ran no merge teardown or delivery.
+    assert "merge_status" not in successor_state
+    # Still one successor and one launch, source evidence byte-identical.
+    assert len(daemon.application.units.start_calls) == 1
+    assert _run_dir_bytes(source_dir) == source_before
+    return daemon, continuation.run_id, source_before
+
+
+def test_native_retry_same_team_budget_boundary(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Same-team native recovery then a budget-driven END reaches the reviewer.
+
+    The producer marks the recovery-scheduled turn with retry_next_turn=True.
+    The classifier, daemon preview, bootstrap, and managed durable recovery all
+    admit the successor, whose real worker boot invokes the pending checkpoint
+    reviewer first with zero worker calls.  Source artifacts and worktree stay
+    unchanged.
+    """
+    with tempfile.TemporaryDirectory() as tmpdir:
+        root = Path(tmpdir).resolve()
+        repo_root, plan_path, config_path, source = _make_recovery_source(root)
+        source_dir = source.run_dir
+        source_before = _run_dir_bytes(source_dir)
+        wf_config = load_workflow_config(config_path)
+
+        # The classifier admits the budget boundary.
+        boundary = _classify(source_dir, config_path, repo_root)
+        assert isinstance(boundary, BudgetBoundary)
+        assert boundary.next_step_name == "review"
+        assert boundary.source_step_name == "work"
+        assert boundary.source_step_role == "worker"
+        assert boundary.source_selector == "codex.base"
+
+        _boot_successor_to_reviewer(
+            tmp_path,
+            monkeypatch,
+            root,
+            repo_root,
+            config_path,
+            source_dir,
+            wf_config,
+        )
+        # Source unchanged through admission and the successor boot.
+        assert _run_dir_bytes(source_dir) == source_before
+
+
+def test_native_retry_historical_compatibility(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The same generated source with only the retry flag omitted also admits.
+
+    Removing only retry_next_turn from the genuinely generated receipt keeps
+    every other producer field intact.  The classifier, daemon preview,
+    bootstrap, and managed durable recovery agree on the identical
+    review-first continuation, with the explicit budget and one idempotent
+    successor.
+    """
+    with tempfile.TemporaryDirectory() as tmpdir:
+        root = Path(tmpdir).resolve()
+        repo_root, plan_path, config_path, source = _make_recovery_source(root)
+        source_dir = source.run_dir
+        wf_config = load_workflow_config(config_path)
+
+        # Remove only the retry_next_turn flag from the turn 1 receipt.
+        receipt_path = source_dir / "turns" / "turn-001" / "result.json"
+        receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+        original_receipt_bytes = receipt_path.read_bytes()
+        assert "retry_next_turn" in receipt
+        del receipt["retry_next_turn"]
+        receipt_path.write_text(json.dumps(receipt), encoding="utf-8")
+
+        try:
+            # Immutable-evidence hashes after this owned fixture preparation.
+            source_before = _run_dir_bytes(source_dir)
+
+            # The classifier still admits the boundary.
+            boundary = _classify(source_dir, config_path, repo_root)
+            assert isinstance(boundary, BudgetBoundary)
+            assert boundary.next_step_name == "review"
+            assert boundary.source_step_name == "work"
+
+            _boot_successor_to_reviewer(
+                tmp_path,
+                monkeypatch,
+                root,
+                repo_root,
+                config_path,
+                source_dir,
+                wf_config,
+            )
+            # Source run.json unchanged (only the receipt was mutated).
+            source_run = json.loads(
+                (source_dir / "run.json").read_text(encoding="utf-8")
+            )
+            assert source_run["turns_completed"] == 2
+            assert _run_dir_bytes(source_dir) == source_before
+        finally:
+            receipt_path.write_bytes(original_receipt_bytes)
+
+        # Restored: classifier still admits.
+        boundary = _classify(source_dir, config_path, repo_root)
+        assert isinstance(boundary, BudgetBoundary)
+
+
+def test_native_retry_negatives_reject(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Contradictory historical context rejects on every surface.
+
+    Each parameterized case introduces one contradiction into the genuinely
+    generated source (turn 1 receipt and/or the owning run.json).  Classifier,
+    daemon preview, bootstrap, and managed resume must all reject before any
+    reservation, run, launch, unit start, or provider call, with the source
+    hashes intact.
+    """
+    with tempfile.TemporaryDirectory() as tmpdir:
+        root = Path(tmpdir).resolve()
+        repo_root, plan_path, config_path, source = _make_recovery_source(root)
+        source_dir = source.run_dir
+        source_before = _run_dir_bytes(source_dir)
+        wf_config = load_workflow_config(config_path)
+        receipt_path = source_dir / "turns" / "turn-001" / "result.json"
+        run_path = source_dir / "run.json"
+        original_receipt_bytes = receipt_path.read_bytes()
+        original_run_bytes = run_path.read_bytes()
+        _attach_launch_evidence(repo_root, source_dir.name, "completed")
+        daemon = _make_daemon(tmp_path, monkeypatch, repo_root, config_path, wf_config)
+        _patch_inactive_worker_evidence(monkeypatch, daemon.application.repository)
+        runs_before = sorted(
+            p.name for p in (repo_root / ".aflow" / "runs").iterdir() if p.is_dir()
+        )
+        launches_before = sorted(
+            p.name
+            for p in (repo_root / ".aflow" / "launches").iterdir()
+            if p.name.endswith(".json") and not p.name.endswith(".state.json")
+        )
+
+        def reject_case(label: str, *, mutate_receipt=None, mutate_run=None) -> None:
+            receipt = json.loads(original_receipt_bytes.decode(encoding="utf-8"))
+            if mutate_receipt is not None:
+                mutate_receipt(receipt)
+            receipt_path.write_text(json.dumps(receipt), encoding="utf-8")
+            if mutate_run is not None:
+                run_json = json.loads(original_run_bytes.decode(encoding="utf-8"))
+                mutate_run(run_json)
+                run_path.write_text(json.dumps(run_json), encoding="utf-8")
+            try:
+                assert _classify(source_dir, config_path, repo_root) is None, label
+                tampered = daemon.service.run_status(
+                    source_dir.name, include_resume_preview=True
+                )
+                assert tampered.evidence.get("can_resume") is False, label
+                with pytest.raises(ValueError):
+                    _real_bootstrap(repo_root, config_path, wf_config, source_dir.name)
+                with pytest.raises(DurableRecoveryRejection):
+                    daemon.service.resume(
+                        source_dir.name,
+                        caller_scope="local",
+                        idempotency_key=f"reject-{label}",
+                        recovery={
+                            "mode": "durable_evidence",
+                            "worker_selector": "codex.base",
+                        },
+                    )
+                # No new reservation/run/launch/unit/provider activity.
+                assert (
+                    sorted(
+                        p.name
+                        for p in (repo_root / ".aflow" / "runs").iterdir()
+                        if p.is_dir()
+                    )
+                    == runs_before
+                ), label
+                assert (
+                    sorted(
+                        p.name
+                        for p in (repo_root / ".aflow" / "launches").iterdir()
+                        if p.name.endswith(".json")
+                        and not p.name.endswith(".state.json")
+                    )
+                    == launches_before
+                ), label
+                assert len(daemon.application.units.start_calls) == 0, label
+            finally:
+                receipt_path.write_bytes(original_receipt_bytes)
+                run_path.write_bytes(original_run_bytes)
+
+        def historical(mutate) -> object:
+            def apply(receipt: dict) -> None:
+                receipt.pop("retry_next_turn", None)
+                mutate(receipt)
+
+            return apply
+
+        # The review's original reproduction: contradictory predecessor
+        # turn/step and run recovery mismatch were admitted.
+        reject_case(
+            "contradictory-turn-step",
+            mutate_receipt=historical(
+                lambda r: (
+                    r.__setitem__("turn_number", 99),
+                    r.__setitem__("step_name", "nonexistent-step"),
+                )
+            ),
+        )
+        # Equality alone would admit boolean/float turn numbers; a strict
+        # positive integer bound to the loaded index is required.
+        reject_case(
+            "boolean-turn-number",
+            mutate_receipt=historical(
+                lambda r: r.__setitem__("turn_number", True)
+            ),
+        )
+        reject_case(
+            "float-turn-number",
+            mutate_receipt=historical(
+                lambda r: r.__setitem__("turn_number", 1.0)
+            ),
+        )
+        # Explicit flags are never reinterpreted through the history path.
+        reject_case(
+            "explicit-false-flag",
+            mutate_receipt=lambda r: r.__setitem__("retry_next_turn", False),
+        )
+        reject_case(
+            "explicit-null-flag",
+            mutate_receipt=lambda r: r.__setitem__("retry_next_turn", None),
+        )
+        reject_case(
+            "nonboolean-flag",
+            mutate_receipt=lambda r: r.__setitem__("retry_next_turn", "yes"),
+        )
+        # Arbitrary (non-recovery-scheduled) status rejects.
+        reject_case(
+            "wrong-status",
+            mutate_receipt=historical(lambda r: r.__setitem__("status", "completed")),
+        )
+        # Executed marker missing or false rejects.
+        reject_case(
+            "missing-executed",
+            mutate_receipt=historical(lambda r: r.pop("recovery_executed", None)),
+        )
+        reject_case(
+            "false-executed",
+            mutate_receipt=historical(
+                lambda r: r.__setitem__("recovery_executed", False)
+            ),
+        )
+        # Wrong recovery action rejects.
+        reject_case(
+            "wrong-action",
+            mutate_receipt=historical(
+                lambda r: r.__setitem__(
+                    "recovery_action", "switch_to_backup_team_and_retry"
+                )
+            ),
+        )
+        # Switched or empty teams reject.
+        reject_case(
+            "team-switch",
+            mutate_receipt=historical(
+                lambda r: r.__setitem__("recovery_to_team", "other")
+            ),
+        )
+        reject_case(
+            "empty-team",
+            mutate_receipt=historical(
+                lambda r: (
+                    r.__setitem__("recovery_from_team", ""),
+                    r.__setitem__("recovery_to_team", ""),
+                )
+            ),
+        )
+        # Bad count/delay reject; a positive count inconsistent with the
+        # saved run history rejects too.
+        reject_case(
+            "zero-count",
+            mutate_receipt=historical(
+                lambda r: r.__setitem__("recovery_consecutive_count", 0)
+            ),
+        )
+        reject_case(
+            "negative-delay",
+            mutate_receipt=historical(
+                lambda r: r.__setitem__("recovery_delay_seconds", -1)
+            ),
+        )
+        reject_case(
+            "count-inconsistent-with-history",
+            mutate_receipt=historical(
+                lambda r: r.__setitem__("recovery_consecutive_count", 2)
+            ),
+        )
+        # Required recovery source must be present and a supported producer
+        # value in the receipt, saved summary, and last history entry before
+        # equality can bind it; missing, null, or unsupported values that
+        # agree across all three objects reject.
+        reject_case(
+            "missing-source-all-objects",
+            mutate_receipt=historical(lambda r: r.pop("recovery_source", None)),
+            mutate_run=lambda r: (
+                r["recovery_summary"].pop("source", None),
+                r["recovery_history"][0].pop("source", None),
+            ),
+        )
+        reject_case(
+            "null-source-all-objects",
+            mutate_receipt=historical(
+                lambda r: r.__setitem__("recovery_source", None)
+            ),
+            mutate_run=lambda r: (
+                r["recovery_summary"].__setitem__("source", None),
+                r["recovery_history"][0].__setitem__("source", None),
+            ),
+        )
+        reject_case(
+            "unsupported-source-all-objects",
+            mutate_receipt=historical(
+                lambda r: r.__setitem__("recovery_source", "invented-source")
+            ),
+            mutate_run=lambda r: (
+                r["recovery_summary"].__setitem__("source", "invented-source"),
+                r["recovery_history"][0].__setitem__(
+                    "source", "invented-source"
+                ),
+            ),
+        )
+        # Saved core evidence must be independently valid before binding;
+        # boolean/float values that compare equal to the genuine receipt
+        # values reject.
+        reject_case(
+            "saved-boolean-count",
+            mutate_receipt=historical(lambda r: None),
+            mutate_run=lambda r: (
+                r["recovery_summary"].__setitem__("consecutive_count", True),
+                r["recovery_history"][0].__setitem__("consecutive_count", True),
+            ),
+        )
+        reject_case(
+            "saved-float-count",
+            mutate_receipt=historical(lambda r: None),
+            mutate_run=lambda r: (
+                r["recovery_summary"].__setitem__("consecutive_count", 1.0),
+                r["recovery_history"][0].__setitem__("consecutive_count", 1.0),
+            ),
+        )
+        # The saved executed marker must be exactly True; the int 1 compares
+        # equal under Python equality but is not the executed marker.
+        reject_case(
+            "saved-int-executed",
+            mutate_receipt=historical(lambda r: None),
+            mutate_run=lambda r: (
+                r["recovery_summary"].__setitem__("executed", 1),
+                r["recovery_history"][0].__setitem__("executed", 1),
+            ),
+        )
+        # The genuinely generated delay is 0; a saved boolean false compares
+        # equal under Python equality but is not numeric delay evidence.
+        reject_case(
+            "saved-boolean-delay",
+            mutate_receipt=historical(lambda r: None),
+            mutate_run=lambda r: (
+                r["recovery_summary"].__setitem__("delay_seconds", False),
+                r["recovery_history"][0].__setitem__("delay_seconds", False),
+            ),
+        )
+        # Missing, changed, malformed, or adjacent-mismatched snapshots.
+        reject_case(
+            "missing-snapshot-before",
+            mutate_receipt=historical(lambda r: r.pop("snapshot_before", None)),
+        )
+        reject_case(
+            "malformed-snapshot",
+            mutate_receipt=historical(
+                lambda r: r.__setitem__("snapshot_before", {"is_complete": "yes"})
+            ),
+        )
+        reject_case(
+            "changed-snapshot",
+            mutate_receipt=historical(
+                lambda r: r["snapshot_after"].__setitem__(
+                    "current_checkpoint_index", 99
+                )
+            ),
+        )
+        reject_case(
+            "snapshot-mismatch-adjacent-before",
+            mutate_receipt=historical(
+                lambda r: (
+                    r["snapshot_after"].__setitem__("is_complete", True),
+                    r["snapshot_after"].__setitem__("unchecked_checkpoint_count", 0),
+                )
+            ),
+        )
+        # A selected transition or condition contradicts the scheduled shape.
+        reject_case(
+            "non-null-transition",
+            mutate_receipt=historical(
+                lambda r: r.__setitem__("chosen_transition", "review")
+            ),
+        )
+        reject_case(
+            "non-null-condition",
+            mutate_receipt=historical(
+                lambda r: r.__setitem__("chosen_transition_condition", "DONE")
+            ),
+        )
+        # An overlay existence contradicts the unchanged-shape evidence.
+        reject_case(
+            "overlay-exists",
+            mutate_receipt=historical(
+                lambda r: r["conditions"].__setitem__("NEW_PLAN_EXISTS", True)
+            ),
+        )
+        # Mismatched plan identities, step, role, selector, or turn number.
+        reject_case(
+            "active-identity-mismatch",
+            mutate_receipt=historical(
+                lambda r: r.__setitem__(
+                    "active_plan_path", "plans/in-progress/plan-other.md"
+                )
+            ),
+        )
+        reject_case(
+            "new-identity-mismatch",
+            mutate_receipt=historical(
+                lambda r: r.__setitem__(
+                    "new_plan_path", "plans/in-progress/plan-other.md"
+                )
+            ),
+        )
+        reject_case(
+            "step-role-mismatch",
+            mutate_receipt=historical(
+                lambda r: r.__setitem__("step_role", "final_reviewer")
+            ),
+        )
+        reject_case(
+            "selector-mismatch",
+            mutate_receipt=historical(
+                lambda r: r.__setitem__("selector", "codex.reviewer")
+            ),
+        )
+        # Missing or mismatched run recovery summary/history rejects the
+        # historical path (flag omitted on the receipt).
+        reject_case(
+            "missing-run-recovery-summary",
+            mutate_receipt=historical(lambda r: None),
+            mutate_run=lambda r: r.pop("recovery_summary", None),
+        )
+        reject_case(
+            "missing-run-recovery-history",
+            mutate_receipt=historical(lambda r: None),
+            mutate_run=lambda r: r.pop("recovery_history", None),
+        )
+        reject_case(
+            "mismatched-run-recovery-history",
+            mutate_receipt=historical(lambda r: None),
+            mutate_run=lambda r: r["recovery_history"][0].__setitem__(
+                "action", "fail_immediately"
+            ),
+        )
+        # A nonexistent recorded execution worktree rejects.
+        reject_case(
+            "nonexistent-worktree",
+            mutate_run=lambda r: r.__setitem__(
+                "worktree_path", str(root / "no-such-worktree")
+            ),
+        )
+
+        # Restored: classifier admits again and the source is byte-identical.
+        assert isinstance(_classify(source_dir, config_path, repo_root), BudgetBoundary)
+        assert _run_dir_bytes(source_dir) == source_before

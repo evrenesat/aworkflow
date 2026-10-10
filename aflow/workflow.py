@@ -12208,6 +12208,7 @@ def _run_workflow_unchecked(
                     "MAX_TURNS_REACHED": turn_number >= config.max_turns,
                 },
                 recovery=recovery,
+                retry_next_turn=(to_team == active_team_name),
             )
             _supervise_scheduled_recovery()
             run_metadata.write(
@@ -12587,6 +12588,7 @@ def _run_workflow_unchecked(
                     "MAX_TURNS_REACHED": turn_number >= config.max_turns,
                 },
                 recovery=recovery,
+                retry_next_turn=True,
             )
             _supervise_scheduled_recovery()
             run_metadata.write(
@@ -12706,6 +12708,7 @@ def _run_workflow_unchecked(
                     "MAX_TURNS_REACHED": turn_number >= config.max_turns,
                 },
                 recovery=recovery,
+                retry_next_turn=False,
             )
             _supervise_scheduled_recovery()
             run_metadata.write(
