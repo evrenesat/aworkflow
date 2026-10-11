@@ -1,5 +1,37 @@
 # DEVLOG
 
+## 2026-10-11 — Stale enrichment route synchronization browser gate (checkpoint 1)
+
+- Repaired the release browser gate failing on `29773a5c` (CI
+  `38162867470`, attempts 1/2): `test_ui_followup_run_rows` asserted
+  `held_stale_routes` immediately after the stale DOM state appeared. The raw
+  list replacement marks the row `stale` before the enrichment pump admits the
+  exact detail GET, so the Python route callback had not necessarily run when
+  the collection was inspected; the callback is the true producer/consumer
+  boundary, and the DOM label is not an acknowledgement of it.
+- Test-synchronization only (no product change): the exact stale-detail branch
+  of `intercept_row_requests` now appends the held `Route` first, then publishes
+  a test-only `window.__aflow_test_stale_route_acknowledgement` value carrying
+  the scenario token, GET method, and exact pathname. The scenario resets the
+  value before arming, asserts no earlier stale hold remains, and after Refresh
+  uses `page.wait_for_function` (default timeout, no sleeps) on the exact
+  token/method/path before inspecting the held collection. The release sequence
+  now also parses each released detail body and asserts the running identity
+  plus the genuine older revision recorded by the child-list increment, so a
+  mismatching older response cannot be accepted as fresh progress. `finally`
+  disarms loading/stale interception before releasing any remaining held routes.
+  No assertions removed; all viewport/theme/loading/failure/preview/no-write
+  checks retained.
+- Verification (Linux, this worktree, source `29773a5c` + uncommitted patch,
+  primary log `tmp/ci-stale-enrichment-route-synchronization-20261011/verification.log`):
+  web tests 728 passed, then web build, then three consecutive
+  `test_ui_followup_run_rows` passes in each of Chromium and WebKit
+  (six `1 passed`), `git diff --check` clean. Capture inspection limitation:
+  this worker model cannot view images and no OCR is installed; stale-row and
+  mobile captures are evidenced by the in-test assertions preceding each
+  screenshot in both engines. Publication, exact-SHA CI, and live verification
+  remain coordinator-owned and are not claimed here.
+
 ## 2026-10-11 — Release CI recovery and refresh browser gates (checkpoint 2)
 
 - Repaired the two browser gates failing on release

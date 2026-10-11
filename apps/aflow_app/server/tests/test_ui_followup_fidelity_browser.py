@@ -723,6 +723,7 @@ def test_ui_followup_run_rows(
     stale_mode = {"enabled": False}
     held_stale_routes = []
     stale_revision_changes: list[tuple[str, str, int, int]] = []
+    stale_hold_token = "ci-stale-enrichment-route-synchronization"
 
     def intercept_row_requests(route) -> None:
         parsed = urlsplit(route.request.url)
@@ -755,7 +756,19 @@ def test_ui_followup_run_rows(
                 held_loading_routes.append(route)
                 return
             if run_id == running_id and stale_mode["enabled"]:
+                # Append first, then acknowledge: the test-only window value
+                # must only appear once this Python collection holds the Route.
                 held_stale_routes.append(route)
+                page.evaluate(
+                    """acknowledgement => {
+                      window.__aflow_test_stale_route_acknowledgement = acknowledgement
+                    }""",
+                    {
+                        "token": stale_hold_token,
+                        "method": route.request.method,
+                        "path": parsed.path,
+                    },
+                )
                 return
         route.continue_()
 
@@ -1003,12 +1016,29 @@ def test_ui_followup_run_rows(
                         expect(stale_progress).to_have_attribute("data-progress-state", "settled")
                         assert stale_progress.get_attribute("data-progress-availability") != "unavailable"
 
+                        # Raw coverage and the held detail callback are separate
+                        # boundaries: list replacement marks the row stale before
+                        # the enrichment pump admits this exact GET, so the test
+                        # inspects the held collection only after the route
+                        # callback acknowledges the actual hold.
+                        expected_detail_path = f"/api/control-plane/projects/{worktree_id}/runs/{running_id}"
+                        assert held_stale_routes == []
+                        page.evaluate("() => { window.__aflow_test_stale_route_acknowledgement = null }")
                         stale_mode["enabled"] = True
                         page.get_by_role("button", name="Refresh", exact=True).first.click()
                         expect(stale_row).to_have_attribute("data-enrichment-state", "stale")
                         expect(stale_row.locator(".compact-run-progress-row-notice.stale")).to_contain_text("Run changed; refresh")
+                        page.wait_for_function(
+                            """expected => {
+                              const acknowledgement = window.__aflow_test_stale_route_acknowledgement
+                              return acknowledgement
+                                && acknowledgement.token === expected.token
+                                && acknowledgement.method === 'GET'
+                                && acknowledgement.path === expected.path
+                            }""",
+                            arg={"token": stale_hold_token, "path": expected_detail_path},
+                        )
                         assert held_stale_routes
-                        expected_detail_path = f"/api/control-plane/projects/{worktree_id}/runs/{running_id}"
                         assert all(urlsplit(route.request.url).path == expected_detail_path for route in held_stale_routes)
                         assert any(
                             project_id == worktree_id
@@ -1022,10 +1052,22 @@ def test_ui_followup_run_rows(
                         for route in released_stale_routes:
                             route.continue_()
                         held_stale_routes.clear()
+                        released_revisions = []
                         for route in released_stale_routes:
                             response = route.request.response()
                             assert response is not None and response.ok, route.request.url
-                            response.body()
+                            released_detail = json.loads(response.body())
+                            assert released_detail.get("run_id") == running_id, released_detail.get("run_id")
+                            released_revisions.append(int(released_detail.get("revision", 0)))
+                        recorded_older_revisions = [
+                            previous_revision
+                            for project_id, run_id, previous_revision, changed_revision in stale_revision_changes
+                            if project_id == worktree_id and run_id == running_id
+                        ]
+                        assert recorded_older_revisions, stale_revision_changes
+                        assert all(
+                            revision in recorded_older_revisions for revision in released_revisions
+                        ), {"released": released_revisions, "recorded": stale_revision_changes}
                         _wait_for_render_settle(page)
                         expect(stale_row).to_have_attribute("data-enrichment-state", "stale")
                         expect(stale_row.locator(".compact-run-progress-row-notice.stale")).to_contain_text("Run changed; refresh")
@@ -1043,7 +1085,10 @@ def test_ui_followup_run_rows(
             ]
             assert writes == []
         finally:
+            # Disarm interception before releasing any held routes so cleanup
+            # cannot start new holds while the browser is torn down.
             loading_mode["enabled"] = False
+            stale_mode["enabled"] = False
             for route in held_loading_routes:
                 route.continue_()
             for route in held_stale_routes:
