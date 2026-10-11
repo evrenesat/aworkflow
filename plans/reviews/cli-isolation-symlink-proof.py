@@ -2,7 +2,6 @@
 import os
 from pathlib import Path
 import subprocess
-import sys
 import tempfile
 
 root = Path(__file__).resolve().parents[2]
