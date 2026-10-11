@@ -164,6 +164,15 @@ never closes the scope or falls back to cumulative behavior. The
 final-checkpoint source passes both CLI admission stages: the bootstrap
 pre-classifier admits it and the resume-candidate detector carries that exact
 validated flag into its second mismatch check, so the two stages agree.
+The pre-classifier establishes that transport-worker shape before it requires
+the last snapshot or resolves the review transition: a failed run alone is not
+a proven advance, so an `environment_preflight` block (which owns its own
+repartition-replay and explicit start-step-correction routes) and a non-worker
+step are classified as `None`, leaving their established recovery routes
+reachable, while a recognized worker-step non-preflight source with a missing,
+malformed, or contradictory snapshot still fails closed. The same helper is
+shared by daemon preview/admission and direct bootstrap, so the two never
+diverge in which sources enter this route.
 
 A failed reviewer successor can retry without losing its original failed-worker
 evidence. The recovered worker attempt is a truthful non-accepted record whose
@@ -190,7 +199,10 @@ original plan identity), the transport conditions (`NEW_PLAN_EXISTS`/
 bound selector, and the scope envelope, and it never accepts an unsuccessful
 worker receipt as a success or substitutes an older unrelated worker. Recorded
 plan identities are compared in one validated identity space: a verified
-relocation maps the raw source paths before comparison, and the allowed
+relocation maps both the owner's recorded original-plan and the selected
+scope's original-plan into that same space before the equality comparison
+(so a rehomed source's own historical worker scope is not spuriously rejected
+against a current-space identity), and the allowed
 logical-primary versus owned-execution counterpart derived from the owner's
 recorded roots remains accepted, so a valid explicitly rehomed source passes
 both CLI admission stages while missing, foreign, unmapped, or overlay

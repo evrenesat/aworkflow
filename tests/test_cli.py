@@ -7896,3 +7896,67 @@ class TestFailedPendingReviewResumeRouting:
                 relocation=relocation,
                 plan_path=foreign,
             )
+
+    def test_failed_worker_preclassifier_narrows_to_proven_worker_shape(
+        self, tmp_path: Path
+    ) -> None:
+        """The failed-worker pre-classifier engages only on the transport-worker shape.
+
+        A failed run alone is not a proven transport-worker advance: an
+        environment-preflight worker source owns its replay/correction route
+        and a non-worker (reviewer) step is never a failed-worker advance, so
+        both must return ``None`` (not refuse) and leave their established
+        routes authoritative.  A genuine worker-step non-preflight source is
+        recognized, so a malformed last snapshot still fails closed.
+        """
+        from types import SimpleNamespace
+
+        import aflow.cli as cli_module
+
+        run_dir = tmp_path / "run"
+        run_dir.mkdir()
+        plan = tmp_path / "plan.md"
+        plan.write_text("# Plan\n\n### [ ] Checkpoint 1\n- [ ] step\n", encoding="utf-8")
+        workflow_steps = {
+            "implement": SimpleNamespace(role="worker"),
+            "review": SimpleNamespace(role="reviewer"),
+        }
+        classify = cli_module._failed_worker_advanced_checklist_reviewer_step
+
+        # Environment-preflight worker source: not a transport-worker advance.
+        preflight_worker = {
+            "status": "failed",
+            "end_reason": None,
+            "failure_kind": "environment_preflight",
+            "current_step_name": "implement",
+            "last_snapshot": None,
+        }
+        assert (
+            classify(run_dir, preflight_worker, workflow_steps=workflow_steps, plan_path=plan)
+            is None
+        )
+
+        # Non-worker (reviewer) failed step: never a failed-worker advance.
+        reviewer_step = {
+            "status": "failed",
+            "end_reason": None,
+            "current_step_name": "review",
+            "last_snapshot": None,
+        }
+        assert (
+            classify(run_dir, reviewer_step, workflow_steps=workflow_steps, plan_path=plan)
+            is None
+        )
+
+        # Genuine worker-step non-preflight source: recognized, so a missing
+        # last snapshot is a clean refusal, never a silent no-route fallback.
+        genuine_worker = {
+            "status": "failed",
+            "end_reason": None,
+            "current_step_name": "implement",
+            "last_snapshot": None,
+        }
+        with pytest.raises(ValueError, match="advanced a required checkpoint review"):
+            classify(
+                run_dir, genuine_worker, workflow_steps=workflow_steps, plan_path=plan
+            )

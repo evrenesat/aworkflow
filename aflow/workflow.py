@@ -5662,10 +5662,20 @@ def _owner_scope_identity_matches(
             if not isinstance(recorded, str) or not recorded.strip():
                 return False
             try:
-                mapped = relocation.map_path(recorded, required=False)
+                # Map both sides into the same validated identity space before
+                # comparing.  The selected scope's recorded original-plan is
+                # the historical path (for example the source run's own worker
+                # scope), so comparing it against only the mapped owner record
+                # would spuriously reject an in-space identity.  Mapping both
+                # keeps the comparison space-consistent without remapping or
+                # relaxing the scope, ordinal, or lineage checks.
+                mapped_recorded = relocation.map_path(recorded, required=False)
+                mapped_original = relocation.map_path(
+                    original_plan, required=False
+                )
             except (OSError, ValueError):
                 return False
-            if mapped != Path(original_plan).resolve():
+            if mapped_recorded != mapped_original:
                 return False
         elif recorded != original_plan:
             return False

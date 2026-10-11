@@ -1,5 +1,40 @@
 # DEVLOG
 
+## 2026-10-11 — Release CI resume regressions: route precedence and relocated provenance (checkpoint 1)
+
+- Repair of the three resume regressions blocking release
+  `c5f275be72a82b6cd6251992564d9f86938bf4ce` in
+  `plans/in-progress/review-order-release-ci-repair-20261010.md`. The
+  lightweight failed-worker pre-classifier and the strict relocated owner
+  binding had each over-reached, refusing valid established recovery routes.
+- **Route precedence.** `_failed_worker_advanced_checklist_reviewer_step`
+  now narrows to its proven transport-worker shape *before* requiring the last
+  snapshot or resolving the review transition: an `environment_preflight`
+  block (which owns its repartition-replay and explicit start-step-correction
+  routes) and a non-worker (reviewer) step are classified as `None` so their
+  established routes stay reachable, while a recognized worker-step
+  non-preflight source with a missing/malformed/contradictory snapshot still
+  fails closed. The shared helper keeps daemon preview/admission and direct
+  bootstrap from diverging.
+- **Relocated provenance.** `_owner_scope_identity_matches` now maps both the
+  owner's recorded original-plan and the selected scope's original-plan into
+  the same validated identity space under a verified relocation before the
+  equality comparison. A valid explicitly rehomed source's own historical
+  worker scope therefore binds without a spurious historical/current
+  mismatch, while missing, foreign, unmapped, overlay, and no-relocation
+  identities still refuse with the source records byte-for-byte unchanged.
+- Tests: `tests/test_cli.py` gains
+  `test_failed_worker_preclassifier_narrows_to_proven_worker_shape` (a
+  preflight worker source and a reviewer step classify as `None`; a genuine
+  worker-step non-preflight source with a missing snapshot refuses), on top of
+  the now-passing valid preflight-replay, valid explicit-correction, and valid
+  relocated failed-review bootstrap cases. Verification: the checkpoint resume
+  suite (test_cli, test_resume_scope_reconciliation, test_resume_pending_review,
+  test_resume_relocation, test_control_plane_resume) reports 482 passed plus
+  141 subtests, with Ruff and `git diff --check` clean. This is local
+  validation only; publication, exact-SHA CI, and live activation are verified
+  separately by the coordinator.
+
 ## 2026-10-10 — Failed-worker advanced-checklist retry continuation identity (repair overlay cp01-v04)
 
 - Repair of the P2 identity defect of checkpoint 1 in

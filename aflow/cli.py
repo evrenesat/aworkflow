@@ -2733,6 +2733,22 @@ def _failed_worker_advanced_checklist_reviewer_step(
     current_step_name = prev_run.get("current_step_name")
     if not isinstance(current_step_name, str) or not current_step_name.strip():
         return None
+    # Establish the proven transport-worker shape before requiring the last
+    # snapshot or resolving the review transition.  A genuine failed-worker
+    # checklist advance is always a *worker* step that failed under transport,
+    # so a source outside that shape must remain ``None`` and its established
+    # recovery route stays authoritative: an environment-preflight block owns
+    # its own replay/correction route, and a non-worker step (for example a
+    # reviewer) is never a failed-worker advance.  A failed run alone does not
+    # prove this shape; once it is recognized, the evidence checks below still
+    # fail closed for any malformed receipt.
+    if prev_run.get("failure_kind") == "environment_preflight":
+        return None
+    step = (
+        workflow_steps.get(current_step_name) if workflow_steps is not None else None
+    )
+    if step is None or getattr(step, "role", None) != "worker":
+        return None
     run_id = run_dir.name
 
     def _refuse(reason: str) -> None:
