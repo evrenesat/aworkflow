@@ -2291,10 +2291,15 @@ def test_ui_demo_equal_refresh_retains_detail_and_changed_rows_update(
     _write_artifact_manifest(tmp_path / f"refresh-comparison-{theme}-{width}x{height}.json", captures)
 
 
-@pytest.mark.parametrize("variant", ("running", "paused"))
 @pytest.mark.parametrize(
-    ("width", "height", "theme"),
-    ((1280, 720, "light"), (390, 844, "dark")),
+    ("variant", "width", "height", "theme", "predecessor_overlap"),
+    (
+        ("running", 1280, 720, "light", False),
+        ("running", 390, 844, "dark", False),
+        ("paused", 1280, 720, "light", False),
+        ("paused", 390, 844, "dark", False),
+        ("paused", 1280, 720, "light", True),
+    ),
 )
 def test_ui_demo_selected_run_background_refresh_probe(
     control_client,  # noqa: F811
@@ -2304,6 +2309,7 @@ def test_ui_demo_selected_run_background_refresh_probe(
     width: int,
     height: int,
     theme: str,
+    predecessor_overlap: bool,
 ) -> None:
     """The real event refresh holds list, status, events and context in place."""
     _, root, units, _ = control_client
@@ -2319,6 +2325,7 @@ def test_ui_demo_selected_run_background_refresh_probe(
     selected_path = f"{base}/{selected['run_id']}"
     phase = {"value": "initial"}
     held: list[tuple[object, bytes, int, dict[str, str]]] = []
+    equal_list_captured = {"value": False}
     requested: list[str] = []
     reads = {base, selected_path, f"{selected_path}/events", f"{selected_path}/context"}
     lifecycle: dict[object, dict[str, object]] = {}
@@ -2390,8 +2397,20 @@ def test_ui_demo_selected_run_background_refresh_probe(
             return
         response = route.fetch()
         if phase["value"] == "equal":
-            lifecycle[request]["route_action"] = "held"
-            held.append((route, response.body(), response.status, response.headers))
+            if path == base:
+                equal_list_captured["value"] = True
+                lifecycle[request]["route_action"] = "held"
+                held.append((route, response.body(), response.status, response.headers))
+            else:
+                # Before the equal-phase list is captured, selected reads belong
+                # to a predecessor refresh; let them pass so it can complete and
+                # the queued replacement can start.
+                if equal_list_captured["value"]:
+                    lifecycle[request]["route_action"] = "held"
+                    held.append((route, response.body(), response.status, response.headers))
+                else:
+                    lifecycle[request]["route_action"] = "fulfilled"
+                    fulfill(route, status=response.status, headers=response.headers, body=response.body())
         elif phase["value"] == "changed" and path == f"{selected_path}/events":
             payload = json.loads(response.body())
             payload["events"].append({
@@ -2447,13 +2466,63 @@ def test_ui_demo_selected_run_background_refresh_probe(
             # A viewport screenshot does not resize a long page, which would
             # itself toggle the compact Back control during observation.
             page.screenshot(path=str(tmp_path / f"selected-{variant}-before-{theme}-{width}x{height}.png"))
+            barrier_held: list[tuple[object, bytes, int, dict[str, str]]] = []
+            if predecessor_overlap:
+                # Install a one-shot barrier that holds the predecessor's list
+                # so the predecessor refresh stays in progress when the tested
+                # event is dispatched, guaranteeing coalesced queuing.
+                def barrier_intercept(route) -> None:
+                    req = route.request
+                    p = urlsplit(req.url).path
+                    if req.method == "GET" and p == base and "order=recent" in req.url:
+                        resp = route.fetch()
+                        barrier_held.append((route, resp.body(), resp.status, resp.headers))
+                    else:
+                        route.continue_()
+
+                page.route("**/api/control-plane/projects/*/runs**", barrier_intercept)
+                page.evaluate("window.dispatchEvent(new Event('aflow-history-changed'))")
+                for _ in range(400):
+                    if barrier_held:
+                        break
+                    page.wait_for_timeout(25)
+                assert barrier_held, "predecessor list was not captured by the barrier"
             phase["value"] = "equal"
             page.evaluate("window.dispatchEvent(new Event('aflow-history-changed'))")
-            for _ in range(100):
+            if predecessor_overlap:
+                # Release the barrier: predecessor list completes, its selected
+                # reads start, then it finishes and the queued replacement begins.
+                route, body, status, headers = barrier_held.pop()
+                fulfill(route, status=status, headers=headers, body=body)
+                page.unroute("**/api/control-plane/projects/*/runs**", barrier_intercept)
+            # A coalesced replacement refresh can issue the selected
+            # status/events/context reads before the gating list read lands in
+            # ``held`` (out-of-order selected reads). Await the exact list
+            # route with bounded evidence rather than assuming the first held
+            # read is the list read; the list read is what gates the selected
+            # reads, so it must be present before they are released.
+            for _ in range(400):
                 if any(urlsplit(route.request.url).path == base for route, *_ in held):
                     break
                 page.wait_for_timeout(25)
-            assert held, "background run list read was not held"
+            assert any(
+                urlsplit(route.request.url).path == base for route, *_ in held
+            ), {
+                "held": [route.request.url for route, *_ in held],
+                "lifecycle": phase_records("equal"),
+            }
+            if predecessor_overlap:
+                # The predecessor selected reads must have completed (passed
+                # through the intercept) before the replacement list was held.
+                predecessor_selected = [
+                    entry for entry in phase_records("equal")
+                    if entry["path"] in {selected_path, f"{selected_path}/events", f"{selected_path}/context"}
+                    and entry["terminal"] == "requestfinished"
+                ]
+                assert len(predecessor_selected) == 3, {
+                    "predecessor_selected": predecessor_selected,
+                    "lifecycle": phase_records("equal"),
+                }
             held_snapshot = capture_refresh_probe(page)
             assert held_snapshot["roots"]["detail"]["sameNode"] is True
             assert held_snapshot["roots"]["disclosure"]["sameNode"] is True
@@ -2557,6 +2626,11 @@ def test_ui_demo_selected_run_background_refresh_probe(
             })
         finally:
             for route, body, status, headers in held:
+                try:
+                    fulfill(route, status=status, headers=headers, body=body)
+                except Exception:
+                    pass
+            for route, body, status, headers in barrier_held:
                 try:
                     fulfill(route, status=status, headers=headers, body=body)
                 except Exception:

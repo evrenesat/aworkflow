@@ -172,7 +172,15 @@ step are classified as `None`, leaving their established recovery routes
 reachable, while a recognized worker-step non-preflight source with a missing,
 malformed, or contradictory snapshot still fails closed. The same helper is
 shared by daemon preview/admission and direct bootstrap, so the two never
-diverge in which sources enter this route.
+diverge in which sources enter this route. Both the pre-classifier and the full
+`_reconcile_verified_resume_scope` classifier also establish the proven
+one-checkpoint advance (or a completed final checkpoint) from the snapshot and
+scope *before* resolving the review transition: a worker-step source whose
+snapshot is not a proven advance is not a transport-advance shape, so it is
+classified as `None` and stays on its established cumulative resume route
+(a plain failed run keeps `can_resume`), while a proven advance whose review
+transition is unresolvable, or whose terminal receipt is malformed,
+contradictory, or missing, still fails closed before any successor.
 
 A failed reviewer successor can retry without losing its original failed-worker
 evidence. The recovered worker attempt is a truthful non-accepted record whose

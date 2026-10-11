@@ -1,5 +1,47 @@
 # DEVLOG
 
+## 2026-10-11 — Release CI recovery and refresh browser gates (checkpoint 2)
+
+- Repaired the two browser gates failing on release
+  `c5f275be72a82b6cd6251992564d9f86938bf4ce` (CI job 114338297399):
+  `test_durable_recovery_ui_journey` and
+  `test_ui_demo_selected_run_background_refresh_probe[1280-720-light-paused]`.
+- **Recovery gate.** The durable-recovery source is a plain failed run, not a
+  proven failed-worker transport advance, yet the failed-worker pre-classifier
+  and the full `_reconcile_verified_resume_scope` classifier resolved the worker
+  success transition before validating the proven one-checkpoint advance. A
+  source whose snapshot is not a proven advance (`current_checkpoint_index ==
+  scope.checkpoint_index`, not `index + 1`) therefore hit the unresolvable-
+  transition refusal and suppressed `can_resume`, hiding the "Resume as new
+  run" action. Both classifiers now establish the proven advance (or completed
+  final checkpoint) *before* the transition refusal, so such a source returns
+  `None` and stays on its established cumulative resume route, while a proven
+  advance with an unresolvable transition or a malformed/contradictory/missing
+  terminal receipt still fails closed. No `can_resume` forcing and no product
+  UI change; pre/post-classifier agreement is preserved and Checkpoint 1's
+  genuine failed-worker refusal cases remain green (482 passed + 141 subtests).
+- **Refresh gate.** `test_ui_demo_selected_run_background_refresh_probe`
+  failed with `TypeError` when a coalesced predecessor refresh's held selected
+  reads (status/events/context) blocked its `Promise.all` completion, preventing
+  the queued replacement refresh from issuing its gating list request. The
+  `intercept` handler now lets selected reads pass through (fulfilling them
+  immediately) until the equal-phase list is captured in `held`, so a
+  predecessor refresh drains completely before the replacement's list is held.
+  A new controlled paused-desktop predecessor-overlap case uses a one-shot
+  `/ready` barrier to hold the predecessor's list, dispatches the tested event
+  while the predecessor is in progress (guaranteeing coalesced queuing), then
+  releases the barrier and asserts predecessor selected reads finished before
+  the replacement list was held. The assertion message was corrected from a
+  string-plus-list concatenation (which raised `TypeError`) to a structured
+  dict containing held URLs and lifecycle records. Test-harness
+  synchronization only; no product UI change, so no rendered before/after
+  evidence was required.
+- Verification (built worktree web bundle, isolated server env): the recovery
+  journey plus all four running/paused desktop/mobile refresh variants pass;
+  the checkpoint resume suite, Ruff on the changed paths, and `git diff
+  --check` are clean. Local validation only; publication, exact-SHA CI, and
+  live activation are verified separately by the coordinator.
+
 ## 2026-10-11 — Release CI resume regressions: route precedence and relocated provenance (checkpoint 1)
 
 - Repair of the three resume regressions blocking release

@@ -2761,6 +2761,24 @@ def _failed_worker_advanced_checklist_reviewer_step(
     snapshot = _resume_plan_snapshot(prev_run.get("last_snapshot"))
     if snapshot is None:
         _refuse("the saved last snapshot is missing, malformed, or not decodable")
+    scope = prev_run.get("active_implementation_scope")
+    if not isinstance(scope, Mapping) or scope.get("awaiting_review") is True:
+        return None
+    index = scope.get("checkpoint_index")
+    if not isinstance(index, int) or isinstance(index, bool) or index < 1:
+        return None
+    if snapshot.is_complete is True:
+        if (
+            snapshot.total_checkpoint_count is None
+            or index != snapshot.total_checkpoint_count
+        ):
+            return None
+    elif snapshot.current_checkpoint_index != index + 1:
+        # Not the proven one-checkpoint advance: a failed worker step alone
+        # does not prove the transport-advance shape, so the established
+        # cumulative route (same-scope retry, one-hop closure) remains
+        # authoritative and this source stays resumable.
+        return None
     # The validated worker condition: a mid-plan transport advance reports
     # DONE=False, a completed final checkpoint reports DONE=True.  The worker
     # success transition is evaluated with this proven state, never forced.
@@ -2775,12 +2793,6 @@ def _failed_worker_advanced_checklist_reviewer_step(
             "checkpoint scope cannot be safely closed"
         )
     if reviewer_step_name is None:
-        return None
-    scope = prev_run.get("active_implementation_scope")
-    if not isinstance(scope, Mapping) or scope.get("awaiting_review") is True:
-        return None
-    index = scope.get("checkpoint_index")
-    if not isinstance(index, int) or isinstance(index, bool) or index < 1:
         return None
     # A repair overlay is active: the scoped repair route owns this source,
     # not the failed-worker review route.  The owned worktree counterpart of
@@ -2797,16 +2809,6 @@ def _failed_worker_advanced_checklist_reviewer_step(
         or isinstance(active_turn, bool)
         or active_turn != turns_completed + 1
     ):
-        return None
-    if snapshot.is_complete is True:
-        if (
-            snapshot.total_checkpoint_count is None
-            or index != snapshot.total_checkpoint_count
-        ):
-            return None
-    elif snapshot.current_checkpoint_index != index + 1:
-        # Not the proven one-checkpoint advance: the established cumulative
-        # route (same-scope retry, one-hop closure) remains authoritative.
         return None
 
     turns_dir = run_dir / "turns"
@@ -4869,28 +4871,16 @@ def _reconcile_verified_resume_scope(
     # the logical primary is the execution layout, not an overlay.
     overlay_active = _active_plan_is_repair_overlay(prev_run)
     final_checkpoint = source_snapshot.is_complete is True
-    # The worker success transition is evaluated with the validated worker
-    # condition: DONE mirrors the proven checkpoint state, never forced True.
-    reviewer_step_name = _failed_worker_review_transition(
-        workflow_steps,
-        prev_run.get("current_step_name"),
-        done=final_checkpoint,
-    )
-    if reviewer_step_name is _UNRESOLVED_WORKER_TRANSITION:
-        raise ResumeScopeReconciliationError(
-            run_id,
-            "the worker success transition cannot be resolved, so the retained "
-            "checkpoint scope cannot be safely closed and no successor started",
-        )
+    # Establish the proven one-checkpoint advance (or a completed final
+    # checkpoint) before resolving the review transition.  A failed worker
+    # step alone does not prove the transport-advance shape: a source whose
+    # snapshot is not a proven advance keeps the established cumulative route
+    # authoritative and stays resumable, so it must return ``None`` before any
+    # transition refusal.  This mirrors the lightweight pre-classifier so the
+    # two stay in agreement.
     if final_checkpoint:
-        # The last-checkpoint variant is owned by this route only when a
-        # required checkpoint review is configured on the original plan; a
-        # source without that transition (or under a repair overlay) retains
-        # its prior cumulative behavior.
         if (
-            reviewer_step_name is None
-            or overlay_active
-            or source_snapshot.total_checkpoint_count is None
+            source_snapshot.total_checkpoint_count is None
             or scope.checkpoint_index != source_snapshot.total_checkpoint_count
         ):
             return None
@@ -4905,6 +4895,25 @@ def _reconcile_verified_resume_scope(
                 run_id,
                 "source snapshot skips more than one checkpoint after the active scope",
             )
+    # The worker success transition is evaluated with the validated worker
+    # condition: DONE mirrors the proven checkpoint state, never forced True.
+    reviewer_step_name = _failed_worker_review_transition(
+        workflow_steps,
+        prev_run.get("current_step_name"),
+        done=final_checkpoint,
+    )
+    if reviewer_step_name is _UNRESOLVED_WORKER_TRANSITION:
+        raise ResumeScopeReconciliationError(
+            run_id,
+            "the worker success transition cannot be resolved, so the retained "
+            "checkpoint scope cannot be safely closed and no successor started",
+        )
+    if final_checkpoint and (reviewer_step_name is None or overlay_active):
+        # The last-checkpoint variant is owned by this route only when a
+        # required checkpoint review is configured on the original plan; a
+        # source without that transition (or under a repair overlay) retains
+        # its prior cumulative behavior.
+        return None
 
     _resume_scope_routing_blocker(
         manager_fields,
