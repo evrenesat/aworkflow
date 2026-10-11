@@ -6,7 +6,12 @@ import re
 from typing import Mapping
 from unittest.mock import Mock
 from aflow.api.models import PreparedRun
-from aflow.config import ErrorHandlingConfig, ManagerConfig
+from aflow.config import (
+    ErrorHandlingConfig,
+    HarnessErrorRecoveryConfig,
+    HarnessErrorRecoveryRuleConfig,
+    ManagerConfig,
+)
 from aflow.repartition import create_envelope, derive_generation_id, write_envelope_atomic
 from aflow.status import BannerRenderer as RealBannerRenderer
 from aflow.workflow import _freeze_run_identity
@@ -7960,3 +7965,1473 @@ class TestFailedPendingReviewResumeRouting:
             classify(
                 run_dir, genuine_worker, workflow_steps=workflow_steps, plan_path=plan
             )
+
+    @staticmethod
+    def _recovery_failed_source(
+        tmp_path: Path,
+        *,
+        complete_checkpoint: bool = True,
+        failing_role: str = "reviewer",
+    ) -> tuple[Path, Path, WorkflowUserConfig]:
+        """Produce a genuine recovery-failed terminal source through the real controller.
+
+        The worker completes checkpoint 1 (with a checkpoint remaining) and
+        the configured step exits nonzero; the deterministic recovery rule
+        fails the run immediately, so the real producer finalizes the turn
+        with status ``recovery-failed`` and strict before/after snapshots.
+        The original-plan-complete shape is not producer-supported: when the
+        post-snapshot is already complete the producer treats the failure as
+        recovery progress and finalizes it as harness-failed instead, which
+        the existing failed-pending-review cases cover.  No harness-failed
+        result is relabeled to manufacture this shape.
+        """
+        repo_root = tmp_path / "repo"
+        repo_root.mkdir()
+        plan_path = repo_root / "plan.md"
+        remaining = "\n### [ ] Checkpoint 2: Next\n- [ ] next step\n"
+        plan_path.write_text(
+            "# Plan\n\n"
+            "### [ ] Checkpoint 1: First\n- [ ] step\n"
+            + remaining,
+            encoding="utf-8",
+        )
+        config_path = repo_root / "aflow.toml"
+        config_path.write_text("# recovery-failed pending review fixture\n", encoding="utf-8")
+        workflow_config = WorkflowUserConfig(
+            roles={"worker": "codex.high", "reviewer": "codex.high"},
+            harnesses={
+                "codex": WorkflowHarnessConfig(
+                    profiles={"high": HarnessProfileConfig(model="high-model")}
+                )
+            },
+            workflows={
+                "live": WorkflowConfig(
+                    steps={
+                        "implement": WorkflowStepConfig(
+                            role="worker",
+                            prompts=("implement",),
+                            go=(GoTransition(to="review"),),
+                        ),
+                        "review": WorkflowStepConfig(
+                            role="reviewer",
+                            prompts=("review",),
+                            go=(GoTransition(to="END"),),
+                        ),
+                    },
+                    first_step="implement",
+                )
+            },
+            prompts={
+                "implement": "Implement the checkpoint.",
+                "review": "Review the completed worker turn.",
+            },
+            error_handling=ErrorHandlingConfig(
+                harness_error_recovery=HarnessErrorRecoveryConfig(
+                    rules=(
+                        HarnessErrorRecoveryRuleConfig(
+                            action="fail_immediately",
+                            match=(f"{failing_role} provider failed",),
+                        ),
+                    ),
+                )
+            ),
+        )
+
+        def source_runner(
+            argv: list[str], **kwargs: object
+        ) -> subprocess.CompletedProcess[str]:
+            if "Implement" in str(kwargs.get("input", "")):
+                if failing_role == "worker":
+                    return subprocess.CompletedProcess(
+                        argv, 1, "", "worker provider failed\n"
+                    )
+                if complete_checkpoint:
+                    checkpoint_one = "### [x] Checkpoint 1: First"
+                else:
+                    checkpoint_one = "### [ ] Checkpoint 1: First"
+                plan_path.write_text(
+                    "# Plan\n"
+                    f"{checkpoint_one}\n"
+                    "- [x] step\n"
+                    + remaining,
+                    encoding="utf-8",
+                )
+                return subprocess.CompletedProcess(argv, 0, "worker output\n", "")
+            return subprocess.CompletedProcess(
+                argv, 3, "", "reviewer provider failed\n"
+            )
+
+        run_dir = None
+        try:
+            run_workflow(
+                ControllerConfig(
+                    repo_root=repo_root,
+                    plan_path=plan_path,
+                    max_turns=40,
+                    reserved_run_id="recovery-failed-pending-review-source",
+                    idempotency_key="source-key",
+                    caller_scope="project:one",
+                ),
+                workflow_config,
+                "live",
+                config_dir=repo_root,
+                snapshot_config=False,
+                runner=source_runner,
+            )
+        except WorkflowError as exc:
+            run_dir = exc.run_dir
+        if run_dir is None:
+            raise AssertionError("producer source did not fail")
+        metadata = json.loads((run_dir / "run.json").read_text(encoding="utf-8"))
+        assert metadata["status"] == "failed"
+        assert metadata.get("end_reason") is None
+        active_turn = metadata["active_turn"]
+        assert active_turn == metadata["turns_completed"] + 1
+        receipt = json.loads(
+            (run_dir / "turns" / f"turn-{active_turn:03d}" / "result.json").read_text(encoding="utf-8")
+        )
+        assert receipt["status"] == "recovery-failed"
+        assert receipt["step_role"] == failing_role
+        assert receipt["returncode"] in {1, 3}
+        assert receipt["snapshot_before"]
+        assert receipt["snapshot_after"]
+        if failing_role == "reviewer":
+            assert metadata["current_step_name"] == "review"
+            assert metadata["active_implementation_scope"]["awaiting_review"] is True
+        return repo_root, plan_path, workflow_config
+
+    def test_bootstrap_recovery_failed_review_selects_reviewer(
+        self, tmp_path: Path
+    ) -> None:
+        """A producer-finalized recovery-failed reviewer resumes at the pending review.
+
+        The real producer finalizes the reviewer turn as recovery-failed when
+        a checkpoint remains (the original-plan-complete shape is not
+        producer-supported and stays harness-failed, covered by the existing
+        failed-pending-review cases).  The failed recovery helper does not
+        invalidate the bound failed reviewer, and the bootstrap selects
+        review with the preserved budget40.
+        """
+        repo_root, _plan_path, workflow_config = self._recovery_failed_source(tmp_path)
+        bootstrap = self._bootstrap_for(
+            repo_root, workflow_config, "recovery-failed-pending-review-source"
+        )
+        assert bootstrap.start_step == "review"
+        assert bootstrap.resume_context.failed_pending_review_step == "review"
+        assert bootstrap.resume_context.interrupted_step_name == "review"
+        assert bootstrap.max_turns == 40
+
+    def test_bootstrap_recovery_failed_review_incomplete_original_selects_reviewer(
+        self, tmp_path: Path
+    ) -> None:
+        """A valid still-unchecked original survives the no-progress rule.
+
+        The producer leaves the original checkpoint unchecked when the
+        failed reviewer turn made no plan progress; the decoded before and
+        after snapshots are equal and incomplete, so the pending review
+        resumes at review with the preserved budget.
+        """
+        repo_root, _plan_path, workflow_config = self._recovery_failed_source(
+            tmp_path, complete_checkpoint=False
+        )
+        bootstrap = self._bootstrap_for(
+            repo_root, workflow_config, "recovery-failed-pending-review-source"
+        )
+        assert bootstrap.start_step == "review"
+        assert bootstrap.resume_context.failed_pending_review_step == "review"
+        assert bootstrap.resume_context.interrupted_step_name == "review"
+        assert bootstrap.max_turns == 40
+
+    @pytest.mark.parametrize(
+        "mutation",
+        [
+            "zero_returncode",
+            "missing_returncode",
+            "bool_returncode",
+            "missing_snapshot_before",
+            "empty_snapshot_before",
+            "malformed_snapshot_before",
+            "unequal_snapshot_before",
+            "missing_snapshot_after",
+            "mismatched_receipt_turn",
+            "mismatched_receipt_step",
+            "worker_receipt_role",
+            "invalid_post_snapshot",
+            "inconsistent_post_snapshot",
+            "absent_awaiting_scope",
+            "active_source",
+            "turn_dir_symlink",
+            "result_symlink",
+        ],
+    )
+    def test_bootstrap_recovery_failed_review_negatives(
+        self, tmp_path: Path, mutation: str
+    ) -> None:
+        """Contradictory or incomplete recovery-failed evidence refuses cleanly.
+
+        Zero/missing/bool returncode, incomplete finalization, an empty,
+        malformed, or contradictory pre-snapshot, wrong source/turn/step,
+        mutated post-snapshots, an absent awaiting scope, and active or
+        foreign ownership are all clean refusals before any successor is
+        allocated or provider dispatched.
+        """
+        repo_root, _plan_path, workflow_config = self._recovery_failed_source(tmp_path)
+        run_dir = repo_root / ".aflow" / "runs" / "recovery-failed-pending-review-source"
+        receipt_path = run_dir / "turns" / "turn-002" / "result.json"
+
+        def mutate_receipt() -> None:
+            receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+            if mutation == "zero_returncode":
+                receipt["returncode"] = 0
+            elif mutation == "missing_returncode":
+                receipt.pop("returncode")
+            elif mutation == "bool_returncode":
+                receipt["returncode"] = True
+            elif mutation == "missing_snapshot_before":
+                receipt.pop("snapshot_before")
+            elif mutation == "empty_snapshot_before":
+                receipt["snapshot_before"] = {}
+            elif mutation == "malformed_snapshot_before":
+                receipt["snapshot_before"] = {"bogus": True}
+            elif mutation == "unequal_snapshot_before":
+                # A valid decoded snapshot with a changed unchecked-step
+                # count: it contradicts the producer's no-progress rule.
+                before = dict(receipt["snapshot_before"])
+                before["current_checkpoint_unchecked_step_count"] += 1
+                receipt["snapshot_before"] = before
+            elif mutation == "missing_snapshot_after":
+                receipt.pop("snapshot_after")
+            elif mutation == "mismatched_receipt_turn":
+                receipt["turn_number"] = 1
+            elif mutation == "mismatched_receipt_step":
+                receipt["step_name"] = "implement"
+            elif mutation == "worker_receipt_role":
+                receipt["step_role"] = "worker"
+            elif mutation == "invalid_post_snapshot":
+                receipt["snapshot_after"] = {"bogus": True}
+            elif mutation == "inconsistent_post_snapshot":
+                receipt["snapshot_after"] = {
+                    "current_checkpoint_name": "Checkpoint 2: Next",
+                    "current_checkpoint_index": 2,
+                    "unchecked_checkpoint_count": 0,
+                    "current_checkpoint_unchecked_step_count": 0,
+                    "is_complete": True,
+                    "total_checkpoint_count": 2,
+                }
+            else:
+                raise AssertionError(f"unhandled mutation {mutation}")
+            receipt_path.write_text(json.dumps(receipt), encoding="utf-8")
+
+        if mutation in {
+            "zero_returncode",
+            "missing_returncode",
+            "bool_returncode",
+            "missing_snapshot_before",
+            "empty_snapshot_before",
+            "malformed_snapshot_before",
+            "unequal_snapshot_before",
+            "missing_snapshot_after",
+            "mismatched_receipt_turn",
+            "mismatched_receipt_step",
+            "worker_receipt_role",
+            "invalid_post_snapshot",
+            "inconsistent_post_snapshot",
+        }:
+            mutate_receipt()
+        elif mutation in {"absent_awaiting_scope", "active_source"}:
+            run_json_path = run_dir / "run.json"
+            payload = json.loads(run_json_path.read_text(encoding="utf-8"))
+            if mutation == "absent_awaiting_scope":
+                scope = dict(payload["active_implementation_scope"])
+                scope["awaiting_review"] = False
+                payload["active_implementation_scope"] = scope
+            else:
+                payload["status"] = "running"
+            run_json_path.write_text(
+                json.dumps(payload, sort_keys=True), encoding="utf-8"
+            )
+        elif mutation == "turn_dir_symlink":
+            turn_dir = receipt_path.parent
+            outside = tmp_path / "outside-turn"
+            outside.mkdir(exist_ok=True)
+            (outside / "result.json").write_text("{}", encoding="utf-8")
+            turn_dir.rename(turn_dir.with_name(turn_dir.name + ".bak"))
+            turn_dir.symlink_to(outside)
+        elif mutation == "result_symlink":
+            outside_file = tmp_path / "outside-result.json"
+            outside_file.write_text(
+                json.dumps(json.loads(receipt_path.read_text(encoding="utf-8"))),
+                encoding="utf-8",
+            )
+            receipt_path.unlink()
+            receipt_path.symlink_to(outside_file)
+
+        runs_root = repo_root / ".aflow" / "runs"
+        before_runs = sorted(path.name for path in runs_root.iterdir())
+        source_artifacts = {
+            path.relative_to(run_dir).as_posix(): path.read_bytes()
+            for path in sorted(run_dir.rglob("*"))
+            if path.is_file()
+        }
+        if mutation in {"absent_awaiting_scope", "active_source"}:
+            # The mutated source is outside the candidate shape, so the
+            # established recovery paths refuse instead of the review route.
+            with pytest.raises(ValueError):
+                self._bootstrap_for(
+                    repo_root, workflow_config, "recovery-failed-pending-review-source"
+                )
+        else:
+            # Candidate-shape evidence failures refuse cleanly before any
+            # successor is allocated or provider dispatched.
+            with pytest.raises(ValueError, match="pending-review evidence"):
+                self._bootstrap_for(
+                    repo_root, workflow_config, "recovery-failed-pending-review-source"
+                )
+        # No successor run directory was allocated.
+        assert sorted(p.name for p in runs_root.iterdir()) == before_runs
+        # The refusal rewrites no source artifact (append-only audit grows).
+        self._assert_source_preserved(run_dir, source_artifacts)
+
+    def test_bootstrap_recovery_failed_review_worker_role_refuses(self, tmp_path: Path) -> None:
+        """A worker-role recovery-failed turn never acquires the review route.
+
+        The real producer fails the worker turn and its recovery assistance;
+        the failed-reviewer candidate shape requires the configured reviewer
+        step, so the shared determination returns no review route and the
+        established recovery paths remain authoritative.
+        """
+        repo_root, _plan_path, workflow_config = self._recovery_failed_source(
+            tmp_path, failing_role="worker"
+        )
+        run_dir = repo_root / ".aflow" / "runs" / "recovery-failed-pending-review-source"
+        metadata = json.loads((run_dir / "run.json").read_text(encoding="utf-8"))
+        assert metadata["current_step_name"] == "implement"
+        receipt = json.loads(
+            (run_dir / "turns" / "turn-001" / "result.json").read_text(encoding="utf-8")
+        )
+        assert receipt["status"] == "recovery-failed"
+        assert receipt["step_role"] == "worker"
+        runs_root = repo_root / ".aflow" / "runs"
+        before_runs = sorted(path.name for path in runs_root.iterdir())
+        source_artifacts = {
+            path.relative_to(run_dir).as_posix(): path.read_bytes()
+            for path in sorted(run_dir.rglob("*"))
+            if path.is_file()
+        }
+        bootstrap = self._bootstrap_for(
+            repo_root, workflow_config, "recovery-failed-pending-review-source"
+        )
+        # The issue-79 route must not be acquired for a worker-role failure.
+        assert bootstrap.resume_context.failed_pending_review_step is None
+        assert sorted(p.name for p in runs_root.iterdir()) == before_runs
+        self._assert_source_preserved(run_dir, source_artifacts)
+
+    # --- issue #80: genuine rejection-owned repair overlay --------------
+
+    @staticmethod
+    def _overlay_review_source(
+        tmp_path: Path,
+        *,
+        recovery_failed: bool = False,
+        complete_checkpoint: bool = True,
+    ) -> tuple[Path, Path, Path, WorkflowUserConfig]:
+        """Produce a genuine rejection-overlay + repair-worker + failed-reviewer source.
+
+        Run A completes checkpoint 1 and fails at the reviewer.  Resuming A at
+        review, the reviewer rejects the original (writing a genuine repair
+        overlay), the repair worker completes the overlay, and the reviewer
+        fails again.  With ``preserve_active_plan`` on the repair transition
+        the source's active plan is the genuine rejection-owned overlay, so
+        the failed reviewer's ``active_plan_path`` is the overlay, not the
+        original.  Both failures are producer-backed; nothing is relabeled.
+        """
+        import aflow.cli as cli_module
+
+        repo_root = tmp_path / "repo"
+        repo_root.mkdir()
+        plan_path = repo_root / "plan.md"
+        plan_path.write_text(
+            "# Plan\n\n"
+            "### [ ] Checkpoint 1: First\n- [ ] step\n"
+            "### [ ] Checkpoint 2: Next\n- [ ] next step\n",
+            encoding="utf-8",
+        )
+        config_path = repo_root / "aflow.toml"
+        config_path.write_text("# failed overlay review fixture\n", encoding="utf-8")
+        workflow_config = WorkflowUserConfig(
+            roles={"worker": "codex.high", "reviewer": "codex.high"},
+            harnesses={
+                "codex": WorkflowHarnessConfig(
+                    profiles={"high": HarnessProfileConfig(model="high-model")}
+                )
+            },
+            workflows={
+                "live": WorkflowConfig(
+                    steps={
+                        "implement": WorkflowStepConfig(
+                            role="worker",
+                            prompts=("implement",),
+                            go=(GoTransition(to="review", preserve_active_plan=True),),
+                        ),
+                        "review": WorkflowStepConfig(
+                            role="reviewer",
+                            prompts=("review",),
+                            go=(
+                                GoTransition(to="implement", when="NEW_PLAN_EXISTS"),
+                                GoTransition(to="END", when="DONE"),
+                                GoTransition(to="implement"),
+                            ),
+                        ),
+                    },
+                    first_step="implement",
+                )
+            },
+            prompts={
+                "implement": "Implement {ACTIVE_PLAN_PATH}.",
+                "review": "Review; repair at {NEW_PLAN_PATH}.",
+            },
+        )
+        if recovery_failed:
+            workflow_config = replace(
+                workflow_config,
+                error_handling=ErrorHandlingConfig(
+                    harness_error_recovery=HarnessErrorRecoveryConfig(
+                        rules=(
+                            HarnessErrorRecoveryRuleConfig(
+                                action="fail_immediately",
+                                match=("reviewer provider failed",),
+                            ),
+                        )
+                    )
+                ),
+            )
+
+        def a_runner(argv, **kw):
+            if "Implement" in str(kw.get("input", "")):
+                checkpoint_one = (
+                    "### [x] Checkpoint 1: First"
+                    if complete_checkpoint
+                    else "### [ ] Checkpoint 1: First"
+                )
+                plan_path.write_text(
+                    f"# Plan\n{checkpoint_one}\n- [x] step\n"
+                    "### [ ] Checkpoint 2: Next\n- [ ] next step\n",
+                    encoding="utf-8",
+                )
+                return subprocess.CompletedProcess(argv, 0, "worker output\n", "")
+            return subprocess.CompletedProcess(argv, 3, "", "reviewer provider failed\n")
+
+        a_dir = None
+        try:
+            run_workflow(
+                ControllerConfig(
+                    repo_root=repo_root,
+                    plan_path=plan_path,
+                    max_turns=40,
+                    reserved_run_id="overlay-a",
+                    idempotency_key="overlay-a-key",
+                    caller_scope="project:one",
+                ),
+                workflow_config,
+                "live",
+                config_dir=repo_root,
+                snapshot_config=False,
+                runner=a_runner,
+            )
+        except WorkflowError as exc:
+            a_dir = exc.run_dir
+        if a_dir is None:
+            raise AssertionError("overlay source A did not fail at the reviewer")
+
+        a_boot = cli_module._bootstrap_resume_invocation(
+            repo_root=repo_root,
+            config_path=str(config_path),
+            config_path_is_explicit=True,
+            workflow_config=workflow_config,
+            requested_run_id="overlay-a",
+            workflow_arg=None,
+            plan_file_arg=None,
+            team_arg=None,
+            start_step_arg=None,
+            max_turns_arg=None,
+            extra_instructions_arg=(),
+            extra_instructions_provided=False,
+        )
+        state = {"calls": 0}
+
+        def b_runner(argv, **kw):
+            state["calls"] += 1
+            prompt = str(kw.get("input", ""))
+            if "Implement" in prompt:
+                active = Path(prompt.split("Implement ", 1)[1].rstrip("."))
+                active.write_text(
+                    active.read_text(encoding="utf-8").replace("[ ]", "[x]"),
+                    encoding="utf-8",
+                )
+                return subprocess.CompletedProcess(argv, 0, "worker output\n", "")
+            if state["calls"] == 1:
+                overlay = Path(prompt.split("repair at ", 1)[1].split()[0].rstrip("."))
+                overlay.write_text(
+                    "# Repair\n\n### [ ] Checkpoint 2: Next\n- [ ] next step\n",
+                    encoding="utf-8",
+                )
+                return subprocess.CompletedProcess(argv, 0, "reject: repair needed\n", "")
+            return subprocess.CompletedProcess(argv, 3, "", "reviewer provider failed\n")
+
+        b_dir = None
+        try:
+            run_workflow(
+                ControllerConfig(
+                    repo_root=repo_root,
+                    plan_path=plan_path,
+                    max_turns=40,
+                    start_step=a_boot.start_step,
+                    reserved_run_id="overlay-b",
+                    idempotency_key="overlay-b-key",
+                    caller_scope="project:one",
+                ),
+                workflow_config,
+                "live",
+                config_dir=repo_root,
+                snapshot_config=False,
+                runner=b_runner,
+                resume=a_boot.resume_context,
+            )
+        except WorkflowError as exc:
+            b_dir = exc.run_dir
+        if b_dir is None:
+            raise AssertionError("overlay source B did not fail at the reviewer")
+        metadata = json.loads((b_dir / "run.json").read_text(encoding="utf-8"))
+        assert metadata["status"] == "failed"
+        assert metadata["current_step_name"] == "review"
+        assert metadata["active_implementation_scope"]["awaiting_review"] is True
+        active_plan = Path(metadata["active_plan_path"])
+        # The source's active plan is the genuine repair overlay, not the
+        # original: this is the issue #80 shape the old validator refused.
+        assert active_plan != plan_path
+        assert active_plan.exists()
+        return repo_root, plan_path, active_plan, workflow_config
+
+    @staticmethod
+    def _overlay_source_identifiers(
+        tmp_path: Path, *, recovery_failed: bool = False
+    ) -> tuple[Path, dict, dict, Path]:
+        import aflow.cli as cli_module  # noqa: F401 - documents the unit under test
+        from types import SimpleNamespace
+
+        repo_root, plan_path, _overlay, _config = TestFailedPendingReviewResumeRouting._overlay_review_source(
+            tmp_path, recovery_failed=recovery_failed
+        )
+        run_dir = repo_root / ".aflow" / "runs" / "overlay-b"
+        prev_run = json.loads((run_dir / "run.json").read_text(encoding="utf-8"))
+        workflow_steps = {
+            "implement": SimpleNamespace(role="worker"),
+            "review": SimpleNamespace(role="reviewer"),
+        }
+        return run_dir, prev_run, workflow_steps, plan_path
+
+    def test_bootstrap_failed_overlay_review_selects_reviewer(self, tmp_path: Path) -> None:
+        """A genuine rejection-owned overlay with a failed reviewer resumes at review.
+
+        The source's ``active_plan_path`` is the repair overlay bound to the
+        selected worker's producing rejection, so the pending review is
+        recovered with the preserved budget and no preceding worker.
+        """
+        repo_root, _plan, overlay, workflow_config = self._overlay_review_source(tmp_path)
+        bootstrap = self._bootstrap_for(repo_root, workflow_config, "overlay-b")
+        assert bootstrap.start_step == "review"
+        assert bootstrap.resume_context.failed_pending_review_step == "review"
+        assert bootstrap.resume_context.interrupted_step_name == "review"
+        assert bootstrap.max_turns == 40
+        # The successor plans against the original plan; the overlay is the
+        # source's recorded active evidence, preserved read-only.
+        assert bootstrap.plan_path == repo_root / "plan.md"
+        assert overlay.exists()
+
+    def test_bootstrap_recovery_failed_overlay_review_selects_reviewer(
+        self, tmp_path: Path
+    ) -> None:
+        """A recovery-failed reviewer on a genuine overlay resumes at review.
+
+        The no-progress rule finalizes the failed reviewer turn as
+        ``recovery-failed`` and the pending review is recovered from the
+        genuine rejection-owned overlay with the preserved budget.
+        """
+        repo_root, _plan, overlay, workflow_config = self._overlay_review_source(
+            tmp_path, recovery_failed=True
+        )
+        run_dir = repo_root / ".aflow" / "runs" / "overlay-b"
+        receipt = json.loads(
+            (run_dir / "turns" / "turn-003" / "result.json").read_text(encoding="utf-8")
+        )
+        assert receipt["status"] == "recovery-failed"
+        bootstrap = self._bootstrap_for(repo_root, workflow_config, "overlay-b")
+        assert bootstrap.start_step == "review"
+        assert bootstrap.resume_context.failed_pending_review_step == "review"
+        assert bootstrap.resume_context.interrupted_step_name == "review"
+        assert bootstrap.max_turns == 40
+        assert overlay.exists()
+
+    def test_bootstrap_failed_overlay_review_incomplete_original_selects_reviewer(
+        self, tmp_path: Path
+    ) -> None:
+        """A genuine overlay whose original checkpoint is unchecked still resumes.
+
+        Approval is never inferred from the original checkpoint marker: the
+        pending review is recovered from the overlay, and the incomplete
+        original is accepted because it carries a complete checkpoint.
+        """
+        repo_root, _plan, overlay, workflow_config = self._overlay_review_source(
+            tmp_path, complete_checkpoint=False
+        )
+        bootstrap = self._bootstrap_for(repo_root, workflow_config, "overlay-b")
+        assert bootstrap.start_step == "review"
+        assert bootstrap.resume_context.failed_pending_review_step == "review"
+        assert bootstrap.max_turns == 40
+        assert overlay.exists()
+
+    @pytest.mark.parametrize(
+        "mutation",
+        [
+            "substituted_overlay",
+            "unrelated_overlay",
+            "foreign_active_plan",
+            "symlink_escape",
+            "blank_active_plan",
+            "nonstring_active_plan",
+            "missing_active_plan",
+            "wrong_checkpoint",
+            "wrong_rejection_owner",
+            "unbound_worker",
+            "hash_mutation",
+        ],
+    )
+    def test_bootstrap_failed_overlay_review_negatives(
+        self, tmp_path: Path, mutation: str
+    ) -> None:
+        """A real overlay succeeds while every substituted/foreign one refuses.
+
+        Only the selected worker's genuine producing-rejection overlay is
+        admitted.  A substituted or unrelated overlay, a foreign, blank,
+        nonstring, or missing active plan, a wrong checkpoint, a wrong
+        rejection owner, an unbound worker, a corrupted envelope digest, and a
+        symlink escape all refuse before any successor is allocated or
+        provider dispatched.
+        """
+        import copy
+
+        import aflow.cli as cli_module
+
+        run_dir, prev_run, workflow_steps, plan_path = self._overlay_source_identifiers(
+            tmp_path
+        )
+        repo_root = run_dir.parents[2]
+        # The genuine overlay succeeds before any mutation.
+        assert (
+            cli_module._failed_pending_review_step(
+                run_dir,
+                prev_run,
+                workflow_steps=workflow_steps,
+                relocation=None,
+                plan_path=plan_path,
+            )
+            == "review"
+        )
+        mutated = copy.deepcopy(prev_run)
+        if mutation == "substituted_overlay":
+            foreign_overlay = repo_root / "plan-cp02-v99.md"
+            foreign_overlay.write_text("# Substituted\n\n- [ ] x\n", encoding="utf-8")
+            mutated["active_plan_path"] = str(foreign_overlay)
+        elif mutation == "unrelated_overlay":
+            # The selected worker's producing rejection no longer binds the
+            # active overlay, so the overlay is unrelated to the worker.
+            mutated["review_rejection_history"][0]["repair_plan_path"] = str(
+                repo_root / "plan-cp02-unrelated.md"
+            )
+        elif mutation == "foreign_active_plan":
+            outside = tmp_path / "outside-plan.md"
+            outside.write_text("# Outside\n", encoding="utf-8")
+            mutated["active_plan_path"] = str(outside)
+        elif mutation == "symlink_escape":
+            outside = tmp_path / "outside-plan.md"
+            outside.write_text("# Outside\n", encoding="utf-8")
+            link = repo_root / "plan-escape.md"
+            link.symlink_to(outside)
+            mutated["active_plan_path"] = str(link)
+        elif mutation == "blank_active_plan":
+            mutated["active_plan_path"] = ""
+        elif mutation == "nonstring_active_plan":
+            mutated["active_plan_path"] = 42
+        elif mutation == "missing_active_plan":
+            mutated.pop("active_plan_path")
+        elif mutation == "wrong_checkpoint":
+            scope = dict(mutated["active_implementation_scope"])
+            scope["checkpoint_name"] = "Wrong Checkpoint"
+            mutated["active_implementation_scope"] = scope
+        elif mutation == "wrong_rejection_owner":
+            rejection = dict(mutated["review_rejection_history"][0])
+            rejection["scope_id"] = "other-scope"
+            mutated["review_rejection_history"] = [rejection]
+        elif mutation == "unbound_worker":
+            rejection = dict(mutated["review_rejection_history"][0])
+            rejection["repair_plan_path"] = None
+            mutated["review_rejection_history"] = [rejection]
+        elif mutation == "hash_mutation":
+            # Corrupt the immutable scope envelope hash the selected worker's
+            # owner must match; the on-disk owner scope keeps the true hash, so
+            # the corrupted reference no longer binds.
+            scope = dict(mutated["active_implementation_scope"])
+            scope["envelope_canonical_sha256"] = "0" * 64
+            mutated["active_implementation_scope"] = scope
+        else:
+            raise AssertionError(f"unhandled mutation {mutation}")
+        with pytest.raises(ValueError, match="pending-review evidence"):
+            cli_module._failed_pending_review_step(
+                run_dir,
+                mutated,
+                workflow_steps=workflow_steps,
+                relocation=None,
+                plan_path=plan_path,
+            )
+
+    @staticmethod
+    def _rehome_git(root: Path, *args: str) -> str:
+        return subprocess.check_output(
+            ["git", "-C", str(root), *args],
+            text=True,
+            stderr=subprocess.PIPE,
+        ).strip()
+
+    @staticmethod
+    def _rehome_overlay_source(
+        tmp_path: Path, *, recovery_failed: bool = False,
+        plan_subdir: str | None = None,
+    ) -> tuple[Path, Path, Path, dict, WorkflowUserConfig]:
+        """Produce a genuine linked-worktree rejection-overlay + failed-reviewer.
+
+        A real Git primary with a Git-Tracking plan and a ``worktree``/``branch``
+        lifecycle runs worker -> reviewer(reject, write overlay) -> repair
+        worker -> reviewer(fail).  The source's active plan is the genuine
+        rejection-owned overlay.  ``plan_subdir`` nests the original plan (and
+        therefore the derived overlay) under a dedicated directory so a
+        parent-level link test can escape that directory without linking the
+        worktree root itself.  Returns (repo_root, plan_path, source_dir,
+        source_metadata, workflow_config).
+        """
+        base = tmp_path / "rehome-base"
+        base.mkdir()
+        repo_root = base / "old-primary"
+        repo_root.mkdir()
+        TestFailedPendingReviewResumeRouting._rehome_git(repo_root, "init", "-b", "main")
+        TestFailedPendingReviewResumeRouting._rehome_git(repo_root, "config", "user.name", "Rehome")
+        TestFailedPendingReviewResumeRouting._rehome_git(repo_root, "config", "user.email", "rehome@example.invalid")
+        (repo_root / "README.md").write_text("Rehome fixture\n", encoding="utf-8")
+        (repo_root / ".gitignore").write_text(".aflow/\n", encoding="utf-8")
+        TestFailedPendingReviewResumeRouting._rehome_git(repo_root, "add", ".")
+        TestFailedPendingReviewResumeRouting._rehome_git(repo_root, "commit", "-m", "Initial")
+        plan_rel = Path(plan_subdir) / "plan.md" if plan_subdir else Path("plan.md")
+        plan_path = repo_root / plan_rel
+        plan_path.parent.mkdir(parents=True, exist_ok=True)
+        base_head = TestFailedPendingReviewResumeRouting._rehome_git(repo_root, "rev-parse", "HEAD")
+        plan_path.write_text(
+            "# Plan\n\n## Git Tracking\n\n"
+            f"- Pre-Handoff Base HEAD: `{base_head}`\n\n"
+            "### [ ] Checkpoint 1: First\n- [ ] step\n"
+            "### [ ] Checkpoint 2: Next\n- [ ] next step\n",
+            encoding="utf-8",
+        )
+        (repo_root / "aflow.toml").write_text("# rehome fixture\n", encoding="utf-8")
+        TestFailedPendingReviewResumeRouting._rehome_git(repo_root, "add", ".")
+        TestFailedPendingReviewResumeRouting._rehome_git(repo_root, "commit", "-m", "Plan")
+        workflow_config = WorkflowUserConfig(
+            aflow=AflowSection(worktree_root=str(base / "old-worktrees")),
+            roles={"worker": "codex.high", "reviewer": "codex.high"},
+            harnesses={
+                "codex": WorkflowHarnessConfig(
+                    profiles={"high": HarnessProfileConfig(model="high-model")}
+                )
+            },
+            prompts={
+                "implement": "Implement {ACTIVE_PLAN_PATH}.",
+                "review": "Review; repair at {NEW_PLAN_PATH}.",
+            },
+            workflows={
+                "live": WorkflowConfig(
+                    first_step="implement",
+                    setup=("worktree", "branch"),
+                    teardown=("merge", "rm_worktree"),
+                    main_branch="main",
+                    steps={
+                        "implement": WorkflowStepConfig(
+                            role="worker",
+                            prompts=("implement",),
+                            go=(GoTransition(to="review", preserve_active_plan=True),),
+                        ),
+                        "review": WorkflowStepConfig(
+                            role="reviewer",
+                            prompts=("review",),
+                            go=(
+                                GoTransition(to="implement", when="NEW_PLAN_EXISTS"),
+                                GoTransition(to="END", when="DONE"),
+                                GoTransition(to="implement"),
+                            ),
+                        ),
+                    },
+                )
+            },
+        )
+        if recovery_failed:
+            workflow_config = replace(
+                workflow_config,
+                error_handling=ErrorHandlingConfig(
+                    harness_error_recovery=HarnessErrorRecoveryConfig(
+                        rules=(
+                            HarnessErrorRecoveryRuleConfig(
+                                action="fail_immediately",
+                                match=("reviewer provider failed",),
+                            ),
+                        )
+                    )
+                ),
+            )
+        calls: list[str] = []
+
+        def runner(argv, **kw):
+            prompt = str(kw.get("input", ""))
+            role = "worker" if "Implement" in prompt else "reviewer"
+            calls.append(role)
+            if role == "worker":
+                active = Path(prompt.split("Implement ", 1)[1].rstrip("."))
+                text = active.read_text(encoding="utf-8")
+                if calls.count("worker") == 1:
+                    text = text.replace("### [ ] Checkpoint 1:", "### [x] Checkpoint 1:").replace("- [ ] step", "- [x] step")
+                else:
+                    text = text.replace("[ ]", "[x]")
+                active.write_text(text, encoding="utf-8")
+                return subprocess.CompletedProcess(argv, 0, "worker done\n", "")
+            if calls.count("reviewer") == 1:
+                overlay = Path(prompt.split("repair at ", 1)[1].split()[0].rstrip("."))
+                overlay.write_text("# Repair\n\n### [ ] Checkpoint 2: Next\n- [ ] next step\n", encoding="utf-8")
+                return subprocess.CompletedProcess(argv, 0, "repair needed\n", "")
+            return subprocess.CompletedProcess(argv, 3, "", "reviewer provider failed\n")
+
+        source_dir = None
+        captured = io.StringIO()
+        with redirect_stdout(captured), redirect_stderr(captured):
+            try:
+                run_workflow(
+                    ControllerConfig(
+                        repo_root=repo_root,
+                        plan_path=plan_path,
+                        max_turns=40,
+                        reserved_run_id="rehome-overlay",
+                        idempotency_key="rehome-overlay-key",
+                        caller_scope="project:one",
+                    ),
+                    workflow_config,
+                    "live",
+                    config_dir=repo_root,
+                    snapshot_config=False,
+                    runner=runner,
+                )
+            except WorkflowError as exc:
+                source_dir = exc.run_dir
+        if source_dir is None:
+            raise AssertionError("rehome source did not fail at the reviewer")
+        metadata = json.loads((source_dir / "run.json").read_text(encoding="utf-8"))
+        assert calls == ["worker", "reviewer", "worker", "reviewer"], calls
+        assert metadata["current_step_name"] == "review"
+        assert metadata["active_implementation_scope"]["awaiting_review"] is True
+        assert metadata["active_plan_path"] != metadata["original_plan_path"]
+        return repo_root, plan_path, source_dir, metadata, workflow_config
+
+    @pytest.mark.parametrize("recovery_failed", [False, True])
+    def test_bootstrap_failed_overlay_review_explicit_rehome(
+        self, tmp_path: Path, recovery_failed: bool
+    ) -> None:
+        """A real explicit rehome reaches the pending reviewer against the mapped overlay.
+
+        A genuine linked-worktree rejection-overlay source is copied to a new
+        Git primary with a registered feature worktree and a replacement
+        plan carrying matching Git Tracking.  The actual explicit rehome
+        bootstrap admits the pending review: it starts at ``review`` against
+        the original invocation plan with the mapped active overlay, retains
+        the awaiting scope and budget 40, allocates no successor, and leaves
+        the copied source bytes unchanged.
+        """
+        import aflow.cli as cli_module
+
+        base = tmp_path / "rehome"
+        base.mkdir()
+        repo_root, _plan, _source_dir, metadata, workflow_config = (
+            self._rehome_overlay_source(base, recovery_failed=recovery_failed)
+        )
+        feature = metadata["feature_branch"]
+        old_worktree = Path(metadata["worktree_path"])
+        new_root = base / "new-primary"
+        subprocess.run(
+            ["git", "clone", "--no-hardlinks", str(repo_root), str(new_root)],
+            check=True, text=True, capture_output=True,
+        )
+        self._rehome_git(new_root, "branch", feature, "origin/" + feature)
+        new_worktree = base / "new-worktree"
+        self._rehome_git(new_root, "worktree", "add", str(new_worktree), feature)
+        # Copy the intact worktree artifacts (including the genuine overlay) to
+        # the registered replacement worktree.
+        for path in old_worktree.rglob("*"):
+            if path.is_file() and ".git" not in path.parts:
+                destination = new_worktree / path.relative_to(old_worktree)
+                destination.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copyfile(path, destination)
+        # The replacement original carries the registered feature identity that
+        # explicit rehome requires; the immutable source stays untouched.
+        replacement_text = (old_worktree / "plan.md").read_text(encoding="utf-8")
+        if "- Plan Branch:" not in replacement_text:
+            replacement_text = replacement_text.replace(
+                "## Git Tracking\n",
+                f"## Git Tracking\n\n- Plan Branch: `{feature}`\n",
+            )
+        (new_root / "plan.md").write_text(replacement_text, encoding="utf-8")
+        shutil.copytree(repo_root / ".aflow", new_root / ".aflow")
+        copied_source = new_root / ".aflow" / "runs" / "rehome-overlay"
+        before = {
+            str(p.relative_to(copied_source)): p.read_bytes()
+            for p in copied_source.rglob("*")
+            if p.is_file()
+        }
+        bootstrap = cli_module._bootstrap_resume_invocation(
+            repo_root=new_root,
+            config_path=new_root / "aflow.toml",
+            config_path_is_explicit=True,
+            workflow_config=workflow_config,
+            requested_run_id="rehome-overlay",
+            workflow_arg=None,
+            plan_file_arg=None,
+            team_arg=None,
+            start_step_arg=None,
+            max_turns_arg=None,
+            extra_instructions_arg=(),
+            extra_instructions_provided=False,
+            rehome_worktree=new_worktree,
+        )
+        # The pending review is recovered against the mapped overlay.
+        assert bootstrap.start_step == "review"
+        assert bootstrap.max_turns == 40
+        assert bootstrap.relocation is not None
+        # The invocation plan is the original plan in the new primary root.
+        assert bootstrap.plan_path == new_root / "plan.md"
+        context = bootstrap.resume_context
+        assert context.failed_pending_review_step == "review"
+        assert context.active_plan_path is not None
+        assert context.active_plan_path != bootstrap.plan_path
+        # The mapped active overlay is the genuine rejection-owned overlay in
+        # the authorized current root, not the original plan.
+        assert str(context.active_plan_path).endswith(
+            Path(metadata["active_plan_path"]).name
+        )
+        assert context.active_plan_path.is_relative_to(
+            bootstrap.relocation.current_repo_root
+        )
+        assert context.active_implementation_scope is not None
+        assert context.active_implementation_scope.awaiting_review is True
+        # No successor is allocated by bootstrap; the copied source is intact.
+        assert len(list((new_root / ".aflow" / "runs").iterdir())) == 1
+        after = {
+            str(p.relative_to(copied_source)): p.read_bytes()
+            for p in copied_source.rglob("*")
+            if p.is_file()
+        }
+        assert after == before
+
+    @pytest.mark.parametrize("recovery_failed", [False, True])
+    def test_failed_overlay_review_rehome_runtime_reviewer_first_artifact_and_retry(
+        self, tmp_path: Path, recovery_failed: bool
+    ) -> None:
+        """A relocated pending review runs the reviewer first with a concrete artifact.
+
+        A real explicit rehome is executed through the actual controller body
+        with a failing reviewer provider.  The copied run chain's historical
+        receipts bind through the recorded relocation provenance, so the run
+        routes to the pending reviewer (never a harness failure or a worker
+        re-run), the reviewer prompt carries the concrete read location of
+        the selected worker artifact and the mapped physical execution
+        overlay, the retained awaiting checkpoint stays bound, the copied
+        source and the physical overlay stay byte-identical, the inherited
+        worker/producing-review owner survives ``keep_runs=1`` pruning
+        through the same strict binding that selected it, and a bootstrap of
+        the failed reviewer successor is admitted again at the review step.
+        """
+        import aflow.cli as cli_module
+        from aflow.workflow import _run_workflow_unchecked
+
+        base = tmp_path / "rehome"
+        base.mkdir()
+        repo_root, _plan, _source_dir, metadata, workflow_config = (
+            self._rehome_overlay_source(base, recovery_failed=recovery_failed)
+        )
+        feature = metadata["feature_branch"]
+        old_worktree = Path(metadata["worktree_path"])
+        new_root = base / "new-primary"
+        subprocess.run(
+            ["git", "clone", "--no-hardlinks", str(repo_root), str(new_root)],
+            check=True, text=True, capture_output=True,
+        )
+        self._rehome_git(new_root, "branch", feature, "origin/" + feature)
+        new_worktree = base / "new-worktree"
+        self._rehome_git(new_root, "worktree", "add", str(new_worktree), feature)
+        for path in old_worktree.rglob("*"):
+            if path.is_file() and ".git" not in path.parts:
+                destination = new_worktree / path.relative_to(old_worktree)
+                destination.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copyfile(path, destination)
+        replacement_text = (old_worktree / "plan.md").read_text(encoding="utf-8")
+        if "- Plan Branch:" not in replacement_text:
+            replacement_text = replacement_text.replace(
+                "## Git Tracking\n",
+                f"## Git Tracking\n\n- Plan Branch: `{feature}`\n",
+            )
+        (new_root / "plan.md").write_text(replacement_text, encoding="utf-8")
+        shutil.copytree(repo_root / ".aflow", new_root / ".aflow")
+        source = new_root / ".aflow" / "runs" / "rehome-overlay"
+        before = {
+            str(p.relative_to(source)): hashlib.sha256(p.read_bytes()).hexdigest()
+            for p in source.rglob("*") if p.is_file()
+        }
+        bootstrap = cli_module._bootstrap_resume_invocation(
+            repo_root=new_root,
+            config_path=new_root / "aflow.toml",
+            config_path_is_explicit=True,
+            workflow_config=workflow_config,
+            requested_run_id="rehome-overlay",
+            workflow_arg=None,
+            plan_file_arg=None,
+            team_arg=None,
+            start_step_arg=None,
+            max_turns_arg=None,
+            extra_instructions_arg=(),
+            extra_instructions_provided=False,
+            rehome_worktree=new_worktree,
+        )
+        # The pending review is retained with its original budget.
+        assert bootstrap.start_step == "review"
+        assert bootstrap.max_turns == 40
+        context = bootstrap.resume_context
+        physical_overlay = (
+            context.worktree_path / context.active_plan_path.relative_to(new_root)
+        )
+        overlay_before = physical_overlay.read_bytes()
+        calls: list[str] = []
+        prompts: list[str] = []
+
+        def runner(argv, **kwargs):
+            prompt = str(kwargs.get("input", ""))
+            calls.append("worker" if "Implement " in prompt else "reviewer")
+            prompts.append(prompt)
+            return subprocess.CompletedProcess(
+                argv, 3, "", "reviewer provider failed\n"
+            )
+
+        successor_dir = None
+        with redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
+            try:
+                _run_workflow_unchecked(
+                    ControllerConfig(
+                        repo_root=new_root,
+                        plan_path=bootstrap.plan_path,
+                        max_turns=bootstrap.max_turns,
+                        start_step=bootstrap.start_step,
+                        reserved_run_id="runtime-rehome",
+                        caller_scope="project:one",
+                        keep_runs=1,
+                    ),
+                    workflow_config,
+                    "live",
+                    config_dir=new_root,
+                    snapshot_config=False,
+                    runner=runner,
+                    resume=context,
+                )
+            except WorkflowError as exc:
+                successor_dir = exc.run_dir
+        # Reviewer-first routing: the pending review ran, no worker re-run
+        # and no harness-failure bootstrap before it.
+        assert calls == ["reviewer"], calls
+        assert successor_dir is not None
+        # The reviewer prompt carries the concrete read location of the
+        # selected worker artifact, never an unavailable placeholder.
+        review_prompt = prompts[0]
+        section = review_prompt[review_prompt.find("## Checkpoint under review"):]
+        assert "Worker artifact unavailable" not in section
+        marker = "Worker artifact path (read this exact file): "
+        assert marker in section
+        location = Path(section.split(marker, 1)[1].split(". ", 1)[0].strip())
+        assert location.is_file()
+        assert location == (
+            new_root / ".aflow" / "runs" / "rehome-overlay"
+            / "turns" / "turn-003" / "result.json"
+        )
+        # The retained awaiting checkpoint and the exact selected
+        # repair-worker artifact bytes are what the reviewer reads.
+        assert "#1 — Checkpoint 1: First" in section
+        # The prompt names the mapped physical execution overlay, the file
+        # the runtime actually opens in the execution worktree.
+        overlay_line = next(
+            line for line in section.splitlines()
+            if line.startswith("- Active plan/overlay: ")
+        )
+        assert overlay_line == f"- Active plan/overlay: {physical_overlay}"
+        assert location.read_bytes() == (
+            source / "turns" / "turn-003" / "result.json"
+        ).read_bytes()
+        # The successor receipt is the failed pending reviewer turn against
+        # the mapped overlay identity.
+        receipt = json.loads(
+            (successor_dir / "turns" / "turn-001" / "result.json").read_text(
+                encoding="utf-8"
+            )
+        )
+        assert receipt["step_name"] == "review"
+        assert receipt["status"] == (
+            "recovery-failed" if recovery_failed else "harness-failed"
+        )
+        assert receipt["active_plan_path"] in {
+            str(context.active_plan_path),
+            str(physical_overlay),
+        }
+        # The copied source and the physical overlay are byte-identical.
+        after = {
+            str(p.relative_to(source)): hashlib.sha256(p.read_bytes()).hexdigest()
+            for p in source.rglob("*") if p.is_file()
+        }
+        assert after == before
+        assert physical_overlay.read_bytes() == overlay_before
+        # Under keep_runs=1 the inherited worker/producing-review owner run
+        # survives pruning: retention preserves exactly the dependencies the
+        # strict binding selected for the prompt above.
+        assert (source / "run.json").is_file()
+        assert location.is_file()
+        # A bootstrap of the failed reviewer successor is admitted again at
+        # the review step (the retry of a relocated run is not a refusal).
+        def bootstrap_successor(run_id: str):
+            return cli_module._bootstrap_resume_invocation(
+                repo_root=new_root,
+                config_path=new_root / "aflow.toml",
+                config_path_is_explicit=True,
+                workflow_config=workflow_config,
+                requested_run_id=run_id,
+                workflow_arg=None,
+                plan_file_arg=None,
+                team_arg=None,
+                start_step_arg=None,
+                max_turns_arg=None,
+                extra_instructions_arg=(),
+                extra_instructions_provided=False,
+            )
+
+        retry = bootstrap_successor("runtime-rehome")
+        assert retry.start_step == "review"
+        assert retry.max_turns == 40
+        # The explicit-rehome successor persisted the proven relocation
+        # mapping into its own run metadata; ordinary successors must keep
+        # carrying exactly that record where the next admission consumes it.
+        provenance = json.loads(
+            (successor_dir / "run.json").read_text(encoding="utf-8")
+        ).get("resume_relocation")
+        assert isinstance(provenance, dict) and provenance
+        assert retry.resume_context.resume_relocation == provenance
+
+        def run_failed_reviewer_successor(
+            run_id: str, invocation
+        ) -> Path:
+            calls.clear()
+            prompts.clear()
+            successor_dir = None
+            with redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
+                try:
+                    _run_workflow_unchecked(
+                        ControllerConfig(
+                            repo_root=new_root,
+                            plan_path=invocation.plan_path,
+                            max_turns=invocation.max_turns,
+                            start_step=invocation.start_step,
+                            reserved_run_id=run_id,
+                            caller_scope="project:one",
+                            keep_runs=1,
+                        ),
+                        workflow_config,
+                        "live",
+                        config_dir=new_root,
+                        snapshot_config=False,
+                        runner=runner,
+                        resume=invocation.resume_context,
+                    )
+                except WorkflowError as exc:
+                    successor_dir = exc.run_dir
+            assert successor_dir is not None
+            # Reviewer first at every ordinary boundary: no worker re-run and
+            # no harness-failure bootstrap before the pending review.
+            assert calls == ["reviewer"], calls
+            section = prompts[0][prompts[0].find("## Checkpoint under review"):]
+            assert "Worker artifact unavailable" not in section
+            marker = "Worker artifact path (read this exact file): "
+            assert marker in section
+            artifact = Path(
+                section.split(marker, 1)[1].split(". ", 1)[0].strip()
+            )
+            # The same concrete readable selected repair-worker artifact.
+            assert artifact == (
+                new_root / ".aflow" / "runs" / "rehome-overlay"
+                / "turns" / "turn-003" / "result.json"
+            )
+            assert artifact.is_file()
+            # The mapped physical execution overlay and the retained awaiting
+            # checkpoint are unchanged at every boundary.
+            overlay_line = next(
+                line for line in section.splitlines()
+                if line.startswith("- Active plan/overlay: ")
+            )
+            assert overlay_line == f"- Active plan/overlay: {physical_overlay}"
+            assert "#1 — Checkpoint 1: First" in section
+            # The successor persists the proven mapping where the next
+            # admission, retention and prompt binding consume it.
+            assert json.loads(
+                (successor_dir / "run.json").read_text(encoding="utf-8")
+            )["resume_relocation"] == provenance
+            # Immutable source and overlay bytes remain unchanged, and the
+            # bound dependencies survive keep_runs=1 pruning.
+            after = {
+                str(p.relative_to(source)): hashlib.sha256(p.read_bytes()).hexdigest()
+                for p in source.rglob("*") if p.is_file()
+            }
+            assert after == before
+            assert physical_overlay.read_bytes() == overlay_before
+            assert (source / "run.json").is_file()
+            assert artifact.is_file()
+            return successor_dir
+
+        # Two further ordinary failed-review successors: the inherited
+        # provenance must survive any number of review-only intermediates.
+        first_retry_dir = run_failed_reviewer_successor("runtime-retry-1", retry)
+        second_retry = bootstrap_successor("runtime-retry-1")
+        assert second_retry.start_step == "review"
+        assert second_retry.max_turns == 40
+        assert second_retry.resume_context.resume_relocation == provenance
+        second_retry_dir = run_failed_reviewer_successor(
+            "runtime-retry-2", second_retry
+        )
+        final = bootstrap_successor("runtime-retry-2")
+        assert final.start_step == "review"
+        assert final.max_turns == 40
+        assert final.resume_context.resume_relocation == provenance
+        assert final.resume_context.failed_pending_review_step == "review"
+        # The final successor's context renders against the mapped overlay.
+        assert final.resume_context.active_plan_path is not None
+        assert final.resume_context.active_plan_path == context.active_plan_path
+        assert final.resume_context.active_implementation_scope is not None
+        assert (
+            final.resume_context.active_implementation_scope.awaiting_review
+            is True
+        )
+        # Both ordinary successors exist with the proven mapping persisted.
+        for run_id in ("runtime-retry-1", "runtime-retry-2"):
+            assert json.loads(
+                (new_root / ".aflow" / "runs" / run_id / "run.json").read_text(
+                    encoding="utf-8"
+                )
+            )["resume_relocation"] == provenance
+        assert first_retry_dir is not None
+        assert second_retry_dir is not None
+
+    def test_bootstrap_failed_overlay_review_valid_relocation(
+        self, tmp_path: Path
+    ) -> None:
+        """A relocated overlay source maps its repair overlay before comparison.
+
+        The genuine rejection-owned overlay recorded under the historical
+        worktree maps through the relocation to the current authorized overlay,
+        and the pending review is recovered.  Without relocation the
+        historical overlay is foreign, and a current plan outside the mapped
+        lineage is refused.  The mapping is a pure path transform on the owned
+        read-only source.
+        """
+        from types import SimpleNamespace
+
+        import aflow.cli as cli_module
+        from aflow.resume_relocation import ResumeRelocation
+
+        old_main = tmp_path / "old-main"
+        old_main.mkdir()
+        old_root = tmp_path / "old-worktree"
+        old_root.mkdir()
+        repo_root, _plan, _overlay, _config = self._overlay_review_source(old_root)
+        run_dir = repo_root / ".aflow" / "runs" / "overlay-b"
+        prev_run = json.loads((run_dir / "run.json").read_text(encoding="utf-8"))
+        workflow_steps = {
+            "implement": SimpleNamespace(role="worker"),
+            "review": SimpleNamespace(role="reviewer"),
+        }
+        current_main = tmp_path / "current-main"
+        current_main.mkdir()
+        current_root = tmp_path / "current-worktree"
+        current_root.mkdir()
+        current_plan = current_root / "plan.md"
+        current_plan.write_text(
+            "# Plan\n\n### [x] Checkpoint 1: First\n- [x] step\n"
+            "### [ ] Checkpoint 2: Next\n- [ ] next step\n",
+            encoding="utf-8",
+        )
+        relocation = ResumeRelocation(
+            "overlay-b", old_main, repo_root, current_main, current_root
+        )
+        assert (
+            cli_module._failed_pending_review_step(
+                run_dir,
+                prev_run,
+                workflow_steps=workflow_steps,
+                relocation=relocation,
+                plan_path=current_plan,
+            )
+            == "review"
+        )
+        # The real bootstrap caller supplies the already-remapped payload, not
+        # the raw run.json.  The classifier must bind the historical receipts
+        # against the owned source metadata (loaded separately) rather than the
+        # remapped original/rejection paths, so this caller shape admits the
+        # same pending review.
+        remapped_payload = relocation.payload(prev_run)
+        assert (
+            cli_module._failed_pending_review_step(
+                run_dir,
+                remapped_payload,
+                workflow_steps=workflow_steps,
+                relocation=relocation,
+                plan_path=current_plan,
+            )
+            == "review"
+        )
+        # Without relocation the historical overlay is foreign; the candidate
+        # is recognized and the refusal is clean, not a no-route fallback.
+        with pytest.raises(ValueError, match="pending-review evidence"):
+            cli_module._failed_pending_review_step(
+                run_dir,
+                prev_run,
+                workflow_steps=workflow_steps,
+                relocation=None,
+                plan_path=current_plan,
+            )
+        # A current authorized plan outside the mapped lineage is refused.
+        foreign = current_root / "other.md"
+        foreign.write_text("# Plan\n\n### [ ] Checkpoint 1\n- [ ] step\n", encoding="utf-8")
+        with pytest.raises(ValueError, match="pending-review evidence"):
+            cli_module._failed_pending_review_step(
+                run_dir,
+                prev_run,
+                workflow_steps=workflow_steps,
+                relocation=relocation,
+                plan_path=foreign,
+            )
+
+    def test_bootstrap_recovery_failed_overlay_stale_mapping_refuses(
+        self, tmp_path: Path
+    ) -> None:
+        """A stale or malformed recorded relocation mapping refuses cleanly.
+
+        The approved producer path admits the genuine recovery-failed
+        overlay source through the explicit relocation, but a recorded
+        provenance carried by a relocated run's successor must not grant
+        admission when it is stale (current roots that no longer match the
+        current authorized root) or malformed (missing required field):
+        each is a clean refusal.  Admission is a pure read-only transform
+        over the owned source: no provider dispatch and no source byte
+        change.
+        """
+        from types import SimpleNamespace
+
+        import aflow.cli as cli_module
+        from aflow.resume_relocation import ResumeRelocation
+
+        repo_root, _plan, _overlay, _config = self._overlay_review_source(
+            tmp_path, recovery_failed=True
+        )
+        run_dir = repo_root / ".aflow" / "runs" / "overlay-b"
+        prev_run = json.loads((run_dir / "run.json").read_text(encoding="utf-8"))
+        source_bytes = {
+            str(p.relative_to(run_dir)): p.read_bytes()
+            for p in run_dir.rglob("*")
+            if p.is_file()
+        }
+        workflow_steps = {
+            "implement": SimpleNamespace(role="worker"),
+            "review": SimpleNamespace(role="reviewer"),
+        }
+        old_main = tmp_path / "old-main"
+        old_main.mkdir()
+        current_main = tmp_path / "current-main"
+        current_main.mkdir()
+        current_root = tmp_path / "current-worktree"
+        current_root.mkdir()
+        current_plan = current_root / "plan.md"
+        current_plan.write_text(
+            "# Plan\n\n### [x] Checkpoint 1: First\n- [x] step\n"
+            "### [ ] Checkpoint 2: Next\n- [ ] next step\n",
+            encoding="utf-8",
+        )
+        relocation = ResumeRelocation(
+            "overlay-b", old_main, repo_root, current_main, current_root
+        )
+        provenance = relocation.provenance()
+
+        # The approved producer path: the explicit relocation admits the
+        # same pending review.
+        assert (
+            cli_module._failed_pending_review_step(
+                run_dir,
+                prev_run,
+                workflow_steps=workflow_steps,
+                relocation=relocation,
+                plan_path=current_plan,
+            )
+            == "review"
+        )
+
+        def refuse(recorded: dict[str, object]) -> None:
+            # A relocated run's successor carries its provenance in the
+            # recorded payload; admission must not be granted through a
+            # broken record.
+            mutated = dict(prev_run)
+            mutated["resume_relocation"] = recorded
+            with pytest.raises(ValueError, match="pending-review evidence"):
+                cli_module._failed_pending_review_step(
+                    run_dir,
+                    mutated,
+                    workflow_steps=workflow_steps,
+                    relocation=None,
+                    plan_path=current_plan,
+                )
+
+        # A stale mapping (current roots that no longer match the current
+        # authorized root) never maps the historical identities onto the
+        # current plan, so it refuses.
+        stale_main = tmp_path / "stale-main"
+        stale_main.mkdir()
+        stale_root = tmp_path / "stale-worktree"
+        stale_root.mkdir()
+        stale = dict(provenance)
+        stale["current_repo_root"] = str(stale_main)
+        stale["current_worktree_root"] = str(stale_root)
+        refuse(stale)
+
+        # A malformed record (missing required field) decodes to no mapping
+        # and never gains admission by propagation.
+        malformed = dict(provenance)
+        del malformed["source_repo_root"]
+        refuse(malformed)
+
+        # No provider dispatch and no source byte change: the refusals are
+        # pure read-only transforms over the owned source.
+        after = {
+            str(p.relative_to(run_dir)): p.read_bytes()
+            for p in run_dir.rglob("*")
+            if p.is_file()
+        }
+        assert after == source_bytes

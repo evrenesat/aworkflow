@@ -48,6 +48,28 @@ class ResumeRelocation:
     current_repo_root: Path
     current_worktree_root: Path
 
+    @classmethod
+    def from_provenance(
+        cls, provenance: Mapping[str, object]
+    ) -> "ResumeRelocation | None":
+        """Rebuild the validated mapping from a recorded provenance record.
+
+        The provenance is written only by an already validated relocation
+        (explicit rehome bootstrap or a successor of a relocated run).  A
+        missing or malformed record refuses the mapping instead of guessing
+        a source-root relationship.
+        """
+        try:
+            return cls(
+                source_run_id=str(provenance["source_run_id"]),
+                source_repo_root=Path(provenance["source_repo_root"]),
+                source_worktree_root=Path(provenance["source_worktree_root"]),
+                current_repo_root=Path(provenance["current_repo_root"]),
+                current_worktree_root=Path(provenance["current_worktree_root"]),
+            )
+        except (KeyError, TypeError, ValueError):
+            return None
+
     def map_path(self, value: str | Path, *, required: bool = True) -> Path:
         path = _absolute_path(value, "recorded path")
         matches: list[Path] = []

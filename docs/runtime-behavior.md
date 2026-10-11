@@ -175,13 +175,52 @@ Receipt binding enforces path ownership and identity: the `turns` directory
 and the selected turn directory must be owned directories (not symlink
 escapes), and `result.json` must be an owned regular file. The receipt's
 recorded `original_plan_path` and `active_plan_path` are both required
-evidence: each must be a nonempty string that, after relocation mapping,
-matches the current authorized plan. A missing, blank, non-string,
-unparseable, unmapped, or foreign identity is failed validation, never
-permission to skip the comparison. Once the candidate shape is recognized,
+evidence: the original plan must be a nonempty string that, after relocation
+mapping, matches the current authorized plan. The active plan must be a
+nonempty string that, after relocation mapping, is either the current
+authorized plan (the ordinary original=active case) or a genuine
+rejection-owned repair overlay: it must agree with the source's recorded
+`active_plan_path` and be the exact allowed active plan of the selected
+worker, whose producing rejection binds the overlay identity for this
+checkpoint's repair lineage. File naming, proximity, checked boxes, or the
+current disk path alone never grant that overlay authority, and a relocated
+source maps its recorded overlay through the same relocation before the
+comparison. A missing, blank, non-string, unparseable, unmapped, substituted,
+unrelated, or foreign identity is failed validation, never permission to skip
+the comparison. Once the candidate shape is recognized,
 every such evidence failure is a clean resume refusal before any successor
 is allocated, a unit is started, or a provider is dispatched; it is never
 an indistinguishable no-route value that falls through to implementation.
+
+Two identity contexts apply to that same evidence. Admission classifies the
+receipt in its historical source-root identity (the source's recorded
+roots). Retention of the worker artifact and the reviewer prompt reference
+re-run the same strict binding in the successor's current identity: the
+receipt's raw recorded identities are projected through the recorded
+relocation provenance (source run ID plus the source/current repo and
+worktree roots), so a relocated execution tree resolves the same selected
+receipt, overlay, and worker artifact without reinterpreting file names or
+proximity. A missing or malformed provenance record refuses the current
+binding instead of guessing a source-root relationship, and the strict
+binding's retention set is what keeps the selected worker and producing-
+rejection owner runs readable under `keep_runs` pruning. The provenance
+record is durable across ordinary successors: the explicit-rehome
+successor records it in its own run metadata, and each further ordinary
+failed-review retry reuses the source's already-proven record into its own
+`resume_relocation` field, so repeated provider failures resolve the same
+selected receipt, overlay, and worker artifact no matter how many
+review-only intermediates separate the successor from its historical
+worker. A newly validated explicit-rehome mapping retains its precedence
+over the inherited record, and a missing or malformed record decodes to no
+mapping and never gains admission by propagation.
+
+In a worktree/branch lifecycle the recorded overlay identity is the primary
+plan identity while the file physically exists in the execution worktree.
+Admission checks both the recorded identity and the mapped physical
+execution counterpart: each must resolve, without any symlink component,
+to a location contained under an authorized primary or execution root, so a
+symlinked, moved, or external execution counterpart cannot be admitted.
+
 The saved `last_snapshot` may describe the currently supported
 complete/next-checkpoint scope, or the same awaiting scope with the original
 checkpoint still unchecked; in the latter case the scope's checkpoint index
