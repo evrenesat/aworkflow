@@ -2410,7 +2410,7 @@ class TestRenderStarterDocuments:
 def test_parse_workflow_pair_matches_filesystem_loader_for_valid_pair(
     tmp_path: Path,
 ) -> None:
-    from aflow.config import ConfigError, load_workflow_config, parse_workflow_pair
+    from aflow.config import load_workflow_config, parse_workflow_pair
 
     pair_dir = tmp_path / "pair"
     pair_dir.mkdir()

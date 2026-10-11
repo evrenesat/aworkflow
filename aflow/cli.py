@@ -129,6 +129,7 @@ from .workflow import (
     WorkflowError,
     _bind_worker_receipt,
     _latest_approved_checkpoint_index,
+    _selected_worker_allowed_plans,
     _rebase_scope_envelope_evidence,
     _scope_envelope_reference,
     _validate_scope_envelope_bytes,
@@ -2328,6 +2329,58 @@ def _failed_pending_review_step(
             "successor."
         )
 
+    # When relocating, the in-memory payload already carries remapped
+    # paths, while the immutable producing receipts and the owner's
+    # recorded history still carry the source's historical identities.
+    # The owned source run.json is that separate historical view; its raw
+    # original/scope/rejection/attempt identities are used for the strict
+    # validators and are never guessed by reverse-mapping the payload.
+    historical_run: Mapping[str, object] | None = None
+    if relocation is not None:
+        metadata_path = run_dir / "run.json"
+        if metadata_path.is_symlink() or not metadata_path.is_file():
+            _refuse(
+                "the source run metadata is missing or is not an owned "
+                "regular file"
+            )
+        try:
+            historical_loaded = json.loads(
+                metadata_path.read_text(encoding="utf-8")
+            )
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+            _refuse(f"the source run metadata is unreadable: {exc}")
+        if not isinstance(historical_loaded, Mapping):
+            _refuse("the source run metadata is not a JSON object")
+        historical_run = historical_loaded
+    source_view = historical_run if historical_run is not None else prev_run
+    # Relative identities in the immutable receipts resolve against the
+    # source (historical) root when relocating; the run itself lives in the
+    # current root, which the validators keep for run-dir lookups. Without
+    # relocation the receipts and the run share one root, so no separate
+    # plan root is needed.
+    plan_root: Path | None = None
+    if relocation is not None:
+        plan_root = _resume_result_path(
+            source_view.get("repo_root"), relocation=None
+        )
+        if plan_root is None:
+            _refuse(
+                "the source run's recorded repository root is missing"
+            )
+    # A successor of a relocated run records the validated relocation
+    # provenance in its own run metadata while its run chain still holds
+    # immutable historical receipts at the source roots.  That provenance is
+    # the only accepted mapping for projecting those identities into the
+    # current authorized root; a missing or malformed record refuses the
+    # mapping (foreign or ambiguous mappings never admit).
+    inherited_relocation: ResumeRelocation | None = None
+    if relocation is None:
+        recorded_provenance = prev_run.get("resume_relocation")
+        if isinstance(recorded_provenance, Mapping):
+            inherited_relocation = ResumeRelocation.from_provenance(
+                recorded_provenance
+            )
+
     snapshot = _resume_plan_snapshot(prev_run.get("last_snapshot"))
     # A valid saved snapshot may describe the currently supported
     # complete/next-checkpoint scope, or the same awaiting scope the receipt
@@ -2391,19 +2444,80 @@ def _failed_pending_review_step(
             "the finalized reviewer receipt does not prove this exact turn, "
             "step, and role"
         )
+    # Resolve the resumed scope and its selected (last) worker attempt before
+    # validating plan identity: the failed reviewer's active plan is either
+    # the ordinary original=active identity or a genuine rejection-owned
+    # repair overlay, and only the selected worker's proven repair lineage
+    # establishes which overlay (if any) is admissible.
+    repo_root = run_dir.parent.parent.parent
+    attempts_map = source_view.get("implementation_attempts")
+    scope_data = source_view.get("active_implementation_scope")
+    scope_id = (
+        scope_data.get("scope_id")
+        if isinstance(scope_data, Mapping)
+        else None
+    )
+    scope_checkpoint_name: str | None = None
+    scope_original_plan: str | None = None
+    scope_envelope: tuple[str, str, str] | None = None
+    if isinstance(scope_data, Mapping):
+        cname = scope_data.get("checkpoint_name")
+        if isinstance(cname, str):
+            scope_checkpoint_name = cname
+        oplan = scope_data.get("original_plan_path")
+        if isinstance(oplan, str):
+            scope_original_plan = oplan
+        envelope_values = (
+            scope_data.get("envelope_artifact_path"),
+            scope_data.get("envelope_artifact_sha256"),
+            scope_data.get("envelope_canonical_sha256"),
+        )
+        if all(isinstance(v, str) and v for v in envelope_values):
+            scope_envelope = tuple(envelope_values)  # type: ignore[arg-type]
+    attempts = (
+        attempts_map.get(scope_id, [])
+        if isinstance(attempts_map, Mapping) and isinstance(scope_id, str)
+        else []
+    )
+    worker_attempts = [
+        a for a in attempts
+        if isinstance(a, Mapping) and a.get("role") == "worker"
+    ]
+    if not worker_attempts:
+        # A proven failed-review source must have its scope's worker recorded
+        # by the owner. No recorded worker attempt under the resumed scope
+        # means the owner's metadata does not establish this scope's ownership
+        # (for example the attempts were re-keyed to a foreign scope), so the
+        # lineage refuses rather than being admitted with no worker binding.
+        _refuse(
+            "the owner does not record a worker attempt under the resumed "
+            "scope; the scope ownership is not established"
+        )
+    last_worker = worker_attempts[-1]
+    worker_turn = last_worker.get("turn_number")
+    if not (isinstance(worker_turn, int) and not isinstance(worker_turn, bool)):
+        _refuse("the owner's recorded worker attempt has no usable local turn")
+    worker_step = last_worker.get("step_name")
+    worker_ordinal = last_worker.get("attempt_ordinal")
+
     # Validate plan identity: the receipt's recorded plan paths must match
     # the source's recorded plan (after relocation mapping).  Both identities
     # are required evidence; a missing, blank, non-string, unmapped, or
     # foreign value is a clean refusal, never permission to skip the
-    # comparison.
-    expected_plan = _resume_result_path(str(plan_path), relocation=relocation)
+    # comparison.  A successor of a relocated run validates its historical
+    # receipts through the recorded provenance mapping, so every identity
+    # compares in the current authorized root space.
+    binding_relocation = (
+        relocation if relocation is not None else inherited_relocation
+    )
+    expected_plan = _resume_result_path(str(plan_path), relocation=binding_relocation)
     if expected_plan is None:
         _refuse("the expected plan path is not usable")
     receipt_original = _resume_result_path(
-        result.get("original_plan_path"), relocation=relocation
+        result.get("original_plan_path"), relocation=binding_relocation
     )
     receipt_active = _resume_result_path(
-        result.get("active_plan_path"), relocation=relocation
+        result.get("active_plan_path"), relocation=binding_relocation
     )
     if receipt_original is None or not _resume_path_matches(
         receipt_original, expected_plan
@@ -2412,13 +2526,140 @@ def _failed_pending_review_step(
             "the receipt's original plan identity is missing, unmapped, or "
             "foreign"
         )
-    if receipt_active is None or not _resume_path_matches(
-        receipt_active, expected_plan
-    ):
+    if receipt_active is None:
         _refuse(
             "the receipt's active plan identity is missing, unmapped, or "
             "foreign"
         )
+    if not _resume_path_matches(receipt_active, expected_plan):
+        # The active plan is not the original plan: it may be a genuine
+        # rejection-owned repair overlay.  It must agree with the source's
+        # recorded active plan and be the exact allowed active plan of the
+        # selected worker, whose provenance binds the producing rejection,
+        # its overlay identity, and this checkpoint's repair lineage.  A
+        # substituted or unrelated overlay, or one the selected worker cannot
+        # claim, is a refusal before any successor allocation.  File naming,
+        # proximity, checked boxes, or the current disk path alone never
+        # grant this authority.
+        source_active = _resume_result_path(
+            prev_run.get("active_plan_path"), relocation=binding_relocation
+        )
+        if (
+            source_active is None
+            or not _resume_path_matches(receipt_active, source_active)
+        ):
+            _refuse(
+                "the receipt's active plan is not the original plan and does "
+                "not match the source's recorded active plan"
+            )
+        # Bind the overlay identity through the selected worker's producing
+        # rejection. The allowed-plan binding validates the producing review
+        # receipt against the source's recorded root, so it runs in the
+        # source-root context: the base original is the unrelocated source
+        # original when relocating, else the (already-equal) current plan. The
+        # resulting allowed plans are then mapped through the relocation to the
+        # current authorized root before comparison. Without relocation the
+        # mapping is a no-op and the recorded paths are used as-is.
+        base_original = str(expected_plan)
+        if relocation is not None:
+            # Bind the historical receipts with the source's raw recorded
+            # original, never a remapped current path.
+            source_original = _resume_result_path(
+                source_view.get("original_plan_path"), relocation=None
+            )
+            if source_original is not None:
+                base_original = str(source_original)
+        allowed_active_plans = _selected_worker_allowed_plans(
+            source_view,
+            repo_root,
+            expected_plan=base_original,
+            scope_id=scope_id,
+            attempt_ordinal=(
+                worker_ordinal
+                if (
+                    isinstance(worker_ordinal, int)
+                    and not isinstance(worker_ordinal, bool)
+                )
+                else None
+            ),
+            owner_run_id=run_id,
+            worker_turn_number=worker_turn,
+            scope_checkpoint_index=index,
+            scope_checkpoint_name=scope_checkpoint_name,
+            worker_step_name=(
+                worker_step
+                if isinstance(worker_step, str) and worker_step.strip()
+                else None
+            ),
+            scope_original_plan=base_original,
+            plan_root=plan_root,
+            relocation=inherited_relocation,
+        )
+        if allowed_active_plans is not None:
+            allowed_active_plans = {
+                mapped
+                for mapped in (
+                    _resume_result_path(str(plan), relocation=relocation)
+                    for plan in allowed_active_plans
+                )
+                if mapped is not None
+            }
+        if not allowed_active_plans or not any(
+            _resume_path_matches(receipt_active, allowed)
+            for allowed in allowed_active_plans
+        ):
+            _refuse(
+                "the receipt's active plan is not the original plan and is "
+                "not a genuine rejection-owned repair overlay for this "
+                "checkpoint's selected worker"
+            )
+        # A matching recorded identity is not enough for the physical
+        # overlay: the current active overlay must be an owned regular
+        # file under the authorized primary/execution roots with no
+        # symlink component.  A symlinked file or parent directory can
+        # resolve outside the authorized root while retaining the
+        # admitted identity, so resolved-path equality alone never grants
+        # admission.
+        if relocation is not None:
+            authorized_roots = (
+                relocation.current_repo_root,
+                relocation.current_worktree_root,
+            )
+        else:
+            authorized_roots = tuple(
+                Path(value).expanduser()
+                for value in (
+                    prev_run.get("repo_root"),
+                    prev_run.get("worktree_path"),
+                )
+                if isinstance(value, str) and value.strip()
+            )
+        # The recorded primary identity and the physical execution
+        # counterpart are distinct files in a linked-worktree lifecycle: the
+        # runtime opens the execution worktree's file, so the recorded
+        # primary path alone (which may not exist there at all) never
+        # validates the execution overlay.  Both identities are validated
+        # against the authorized roots without requiring either file to
+        # exist; a symlinked or escaping execution counterpart refuses
+        # before any successor, manifest, unit, or provider allocation.
+        execution_active = _resume_execution_overlay_path(
+            source_active, prev_run, relocation=binding_relocation
+        )
+        if (
+            not authorized_roots
+            or not _resume_owned_active_overlay(
+                source_active, authorized_roots=authorized_roots
+            )
+            or not _resume_owned_active_overlay(
+                execution_active, authorized_roots=authorized_roots
+            )
+        ):
+            _refuse(
+                "the active overlay or its physical execution counterpart "
+                "is not contained under the authorized primary/execution "
+                "roots without a symlink component; a symlinked or external "
+                "overlay cannot be admitted"
+            )
     status = result.get("status")
     if status == "harness-failed":
         if (
@@ -2501,56 +2742,22 @@ def _failed_pending_review_step(
     # checked first, then its owned resumed_from_run_id chain for an inherited
     # worker. A pruned, broken, foreign, cyclic, symlink-escaping, or
     # unbindable lineage refuses cleanly with no allocation.
-    attempts_map = prev_run.get("implementation_attempts")
-    scope_data = prev_run.get("active_implementation_scope")
-    scope_id = (
-        scope_data.get("scope_id")
-        if isinstance(scope_data, Mapping)
-        else None
-    )
-    scope_checkpoint_name: str | None = None
-    scope_original_plan: str | None = None
-    scope_envelope: tuple[str, str, str] | None = None
-    if isinstance(scope_data, Mapping):
-        cname = scope_data.get("checkpoint_name")
-        if isinstance(cname, str):
-            scope_checkpoint_name = cname
-        oplan = scope_data.get("original_plan_path")
-        if isinstance(oplan, str):
-            scope_original_plan = oplan
-        envelope_values = (
-            scope_data.get("envelope_artifact_path"),
-            scope_data.get("envelope_artifact_sha256"),
-            scope_data.get("envelope_canonical_sha256"),
+    # The selected worker's scope original must be in the same identity
+    # space as the projected receipts: a successor of a relocated run carries
+    # the historical recorded original, which the recorded provenance maps to
+    # the current authorized root.  An unprojectable identity keeps the
+    # recorded value, which the strict binding then refuses.
+    binding_scope_original = scope_original_plan
+    if (
+        inherited_relocation is not None
+        and isinstance(scope_original_plan, str)
+        and scope_original_plan.strip()
+    ):
+        projected_scope_original = _resume_result_path(
+            scope_original_plan, relocation=inherited_relocation
         )
-        if all(isinstance(v, str) and v for v in envelope_values):
-            scope_envelope = tuple(envelope_values)  # type: ignore[arg-type]
-    attempts = (
-        attempts_map.get(scope_id, [])
-        if isinstance(attempts_map, Mapping) and isinstance(scope_id, str)
-        else []
-    )
-    worker_attempts = [
-        a for a in attempts
-        if isinstance(a, Mapping) and a.get("role") == "worker"
-    ]
-    if not worker_attempts:
-        # A proven failed-review source must have its scope's worker recorded
-        # by the owner. No recorded worker attempt under the resumed scope
-        # means the owner's metadata does not establish this scope's ownership
-        # (for example the attempts were re-keyed to a foreign scope), so the
-        # lineage refuses rather than being admitted with no worker binding.
-        _refuse(
-            "the owner does not record a worker attempt under the resumed "
-            "scope; the scope ownership is not established"
-        )
-    last_worker = worker_attempts[-1]
-    worker_turn = last_worker.get("turn_number")
-    if not (isinstance(worker_turn, int) and not isinstance(worker_turn, bool)):
-        _refuse("the owner's recorded worker attempt has no usable local turn")
-    worker_step = last_worker.get("step_name")
-    worker_ordinal = last_worker.get("attempt_ordinal")
-    repo_root = run_dir.parent.parent.parent
+        if projected_scope_original is not None:
+            binding_scope_original = str(projected_scope_original)
     bound = _bind_worker_receipt(
         repo_root,
         run_id,
@@ -2571,9 +2778,11 @@ def _failed_pending_review_step(
         ),
         scope_checkpoint_index=index,
         scope_checkpoint_name=scope_checkpoint_name,
-        scope_original_plan=scope_original_plan,
+        scope_original_plan=binding_scope_original,
         scope_envelope=scope_envelope,
         strict=True,
+        plan_root=plan_root,
+        relocation=inherited_relocation,
     )
     if bound is None:
         _refuse(
@@ -3167,6 +3376,89 @@ def _resume_path_matches(value: object, expected: Path) -> bool:
         return Path(value).expanduser().resolve() == expected.resolve()
     except (OSError, RuntimeError, ValueError):
         return False
+
+
+def _resume_owned_active_overlay(
+    path: Path,
+    *,
+    authorized_roots: tuple[Path, ...],
+) -> bool:
+    """Validate the physical active overlay against the authorized roots.
+
+    The overlay must resolve under one of the authorized primary/execution
+    roots and carry no symlink component (file or parent directory).  A
+    symlinked file or parent directory can resolve outside the authorized
+    root while retaining an admitted recorded identity, so resolved-path
+    equality alone never grants admission.  Existence is not required here:
+    a missing (non-symlink, contained) overlay is a later clean failure, not
+    an escape; the check rejects only symlink/containment escapes.
+    """
+    candidate = Path(path).expanduser().absolute()
+    if not candidate.is_absolute():
+        return False
+    try:
+        resolved = candidate.resolve()
+    except (OSError, RuntimeError, ValueError):
+        return False
+    contained = False
+    for root in authorized_roots:
+        try:
+            resolved_root = Path(root).expanduser().absolute().resolve()
+        except (OSError, RuntimeError, ValueError):
+            return False
+        if resolved == resolved_root or resolved_root in resolved.parents:
+            contained = True
+            break
+    if not contained:
+        return False
+    current = Path(candidate.anchor)
+    for part in candidate.parts[1:]:
+        current = current / part
+        if current.is_symlink():
+            return False
+    return not candidate.is_symlink()
+
+
+def _resume_execution_overlay_path(
+    active: Path,
+    prev_run: Mapping[str, object],
+    *,
+    relocation: ResumeRelocation | None,
+) -> Path:
+    """Map the recorded primary overlay identity to its execution counterpart.
+
+    Workflows with a linked-worktree lifecycle record plan identities against
+    the primary repository while the execution worktree holds the physical
+    file, so the recorded identity maps to the execution root by relative
+    position.  Without a linked worktree the recorded path is the execution
+    path itself.  The mapping is a pure pathname transform: it never resolves
+    symlinks, which the ownership check validates component by component.
+    """
+    if relocation is not None:
+        primary = relocation.current_repo_root
+        execution = relocation.current_worktree_root
+    else:
+        lifecycle = prev_run.get("lifecycle_setup", ())
+        if not (isinstance(lifecycle, list) and "worktree" in lifecycle):
+            return active
+        repo_value = prev_run.get("repo_root")
+        worktree_value = prev_run.get("worktree_path")
+        if not all(
+            isinstance(value, str) and value.strip()
+            for value in (repo_value, worktree_value)
+        ):
+            return active
+        primary = Path(repo_value)
+        execution = Path(worktree_value)
+    normalized = Path(active).expanduser().absolute()
+    base = Path(primary).expanduser().absolute()
+    try:
+        relative = normalized.relative_to(base)
+    except ValueError:
+        # A recorded identity outside the primary root is its own execution
+        # path; the ownership check validates it against the authorized roots.
+        return normalized
+    return Path(execution).expanduser().absolute() / relative
 
 
 def _resume_result_path(
@@ -5176,6 +5468,29 @@ def _reconstruct_resume_context(
         # sessions must not take precedence over the target team's selectors.
         hotplug_fields["role_selectors"] = {}
         hotplug_fields["active_role_sessions"] = ()
+    if relocation is not None:
+        # A freshly validated explicit-rehome mapping retains its existing
+        # precedence over any inherited record.
+        effective_relocation_provenance: dict[str, object] | None = (
+            relocation.provenance()
+        )
+    else:
+        # An ordinary retry carries the source's already-proven relocation
+        # mapping into the successor's own run metadata, so every further
+        # failed-review successor admits, retains and renders prompts against
+        # the same single validated mapping.  A missing or malformed record
+        # decodes to no mapping and never gains admission by propagation.
+        recorded_relocation = prev_run.get("resume_relocation")
+        inherited_relocation = (
+            ResumeRelocation.from_provenance(recorded_relocation)
+            if isinstance(recorded_relocation, Mapping)
+            else None
+        )
+        effective_relocation_provenance = (
+            inherited_relocation.provenance()
+            if inherited_relocation is not None
+            else None
+        )
 
     return _mark_validated_resume_context(ResumeContext(
         resumed_from_run_id=run_id,
@@ -5288,7 +5603,7 @@ def _reconstruct_resume_context(
         scope_evidence_artifact_bytes=scope_evidence_artifact_bytes,
         resume_scope_reconciled=reconciled_scope,
         repartition_artifact_bytes=repartition_artifact_bytes,
-        resume_relocation=relocation.provenance() if relocation is not None else None,
+        resume_relocation=effective_relocation_provenance,
         resumed_from_team=resumed_from_team,
         resume_team_override=resume_team_override,
         budget_continuation=budget_boundary,

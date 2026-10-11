@@ -1,5 +1,108 @@
 # DEVLOG
 
+## 2026-10-11 — Preserve proven relocation provenance across ordinary reviewer retries (issue #80, checkpoint 2 repair overlay v02)
+
+- Defect: the explicit rehome and the first ordinary reviewer retry bound
+  the genuine overlay and selected worker correctly, but the ordinary retry
+  did not persist the inherited relocation provenance into its own
+  `run.json`. A second consecutive reviewer failure then refused the
+  genuine rejection-owned overlay, because admission reads only the
+  immediate source's `resume_relocation` record.
+- Fix: `aflow/cli.py::_reconstruct_resume_context` reuses the source's
+  already-proven `resume_relocation` record (via the existing
+  `ResumeRelocation.from_provenance` decoder) in
+  `ResumeContext.resume_relocation` for ordinary retries. The existing
+  metadata writer persists it into every successor, so admission,
+  retention, and prompt rendering consume one proven mapping across any
+  number of review-only intermediates. A newly validated explicit-rehome
+  mapping retains precedence over the inherited record, and a missing or
+  malformed record decodes to no mapping.
+- Tests: `tests/test_cli.py` extends the producer-backed explicit-rehome
+  runtime regression (both failure statuses) with two further ordinary
+  failed-review successors: each boundary is reviewer-first against the
+  same concrete readable selected repair-worker artifact and the mapped
+  physical execution overlay, with the awaiting checkpoint and budget 40
+  retained, the proven mapping persisted where the next admission consumes
+  it, byte-identical source/overlay bytes, and `keep_runs=1` dependency
+  retention.
+- Docs: `docs/runtime-behavior.md` and `ARCHITECTURE.md` record the durable
+  inheritance across ordinary successors.
+
+## 2026-10-10 — Carry the overlay binding through relocation and check the physical execution overlay (issue #80, checkpoint 2 repair)
+
+- Defect 1 (historical binding): admission classified the failed-review
+  evidence in the source-root identity, but the retention call and the
+  reviewer prompt re-ran the strict worker binding in the current identity
+  without the source-root context. After an explicit rehome, the relative
+  historical repair plan resolved against the current root, the allowed-plan
+  projection failed, and the reviewer prompt reported "Worker artifact
+  unavailable" while the first reviewer call failed.
+- Fix 1: `aflow/workflow.py` re-projects the same receipt through the
+  recorded relocation provenance for retention and prompt binding: the raw
+  recorded identities are mapped with the validated source/current root and
+  worktree relationship (`ResumeRelocation.from_provenance`), and a missing
+  or malformed provenance record refuses the current binding instead of
+  guessing. The retained dependencies are exactly the worker-owner and
+  producing-rejection-owner runs the binding selected.
+- Defect 2 (physical overlay): the recorded overlay identity is the primary
+  plan identity, while in a worktree/branch lifecycle the file physically
+  lives in the execution worktree. A symlinked execution counterpart pointed
+  outside the authorized roots and was admitted on the recorded identity
+  alone.
+- Fix 2: `aflow/cli.py` maps the recorded overlay to its physical execution
+  counterpart with the existing execution-path mapping and applies the
+  established containment/symlink check to both identities before any
+  successor is allocated; a symlinked, moved, or external execution
+  counterpart refuses with the same clean refusal as every other
+  pending-review evidence failure.
+- Tests: `tests/test_cli.py` extends the producer-backed explicit-rehome
+  runtime regression (both failure statuses, `failed_overlay_review` named)
+  to run the reviewer first against the mapped physical execution overlay
+  with the exact readable selected repair-worker artifact path and bytes,
+  the retained awaiting checkpoint, budget40, byte-identical
+  source/overlay, and a second review-first bootstrap after another reviewer
+  failure, with the inherited worker/producing-review owner surviving
+  `keep_runs=1` pruning. `tests/test_control_plane_resume.py` adds the
+  real worktree/branch physical-link admission cases.
+- Docs: `docs/runtime-behavior.md` and `ARCHITECTURE.md` explain the
+  historical-versus-current identity contexts and the physical execution
+  overlay ownership check.
+
+## 2026-10-10 — Bind the genuine repair-overlay identity in failed-review recovery (issue #80, checkpoint 2)
+
+- Defect: `_failed_pending_review_step` required the failed reviewer receipt's
+  `active_plan_path` to equal the original plan. A genuine repair overlay —
+  the reviewer rejected the original, a repair worker completed the overlay, and
+  the next reviewer failed while the run's recorded `active_plan_path` was the
+  overlay (the `preserve_active_plan` repair lineage, as in the transport
+  source) — was refused, so the pending review could not be recovered.
+- Fix: `aflow/cli.py` keeps the receipt's `original_plan_path` bound to the
+  original plan, and now admits the `active_plan_path` only when it is either
+  the original plan (the ordinary original=active case) or a genuine
+  rejection-owned repair overlay: it must agree with the source's recorded
+  `active_plan_path` and be the exact allowed active plan of the selected
+  worker, computed by the existing `_selected_worker_allowed_plans` shared
+  binding (producing rejection, overlay identity, checkpoint repair lineage).
+  The allowed-plan binding runs in the source-root context and its result is
+  mapped through the relocation, so a relocated execution tree maps its recorded
+  overlay before comparison; foreign, substituted, unrelated, blank,
+  nonstring, missing, wrong-checkpoint, wrong-owner, unbound-worker, and
+  hash-mutated evidence all refuse before any successor is allocated. File
+  naming, proximity, checked boxes, or the current disk path alone never grant
+  overlay authority.
+- Tests: `tests/test_cli.py` adds producer-backed overlay sources (genuine
+  rejection + repair overlay + repair worker + failed reviewer through the real
+  controller, both `harness-failed` and the checkpoint-1 `recovery-failed`
+  shape, with incomplete original-plan coverage) and a relocation case; the
+  managed daemon tests in `tests/test_control_plane_resume.py` prove review-
+  first continuation with budget40, same-key idempotency, and byte-identical
+  source/worker/overlay evidence. Negative mutations (substituted/unrelated
+  overlay, foreign/blank/nonstring/missing active plan, wrong checkpoint, wrong
+  rejection owner, unbound worker, envelope-hash mutation, symlink escape) must
+  not acquire the route. All new cases use `failed_overlay_review`.
+- Docs: `docs/runtime-behavior.md` documents the overlay active-plan binding and
+  its relocation mapping.
+
 ## 2026-10-09 — Rebound paused-reader fixture to the extracted pure parser (maintenance03 pair-lock CI repair)
 
 - Checkpoint 1 of the pair-lock fixture CI-repair plan. Maintenance03 moved

@@ -1155,7 +1155,28 @@ classifier while retaining its backup-plan and active-plan allowances.
    review resumes at that pending reviewer
    (`ResumeContext.failed_pending_review_step`), never re-running the completed
    implementation step first; the route yields to the repair, budget,
-   owner-stopped, and cumulative-review routes. Once the candidate shape is
+   owner-stopped, and cumulative-review routes. The failed reviewer's recorded
+   active plan is the original plan (the ordinary case) or a genuine
+   rejection-owned repair overlay that agrees with the source's recorded
+   active plan and is the exact allowed active plan of the selected worker's
+   producing rejection; a substituted, unrelated, foreign, blank, nonstring,
+   or missing active plan refuses before any successor is allocated. The
+   classifier binds that evidence in the historical source-root identity; the
+   retention and prompt consumers re-run the same strict binding in the
+   successor's current identity by projecting the raw recorded identities
+   through the recorded relocation provenance (a missing or malformed
+   provenance record refuses, never guesses), and a worktree-lifecycle
+   overlay is checked at both its recorded primary identity and its mapped
+   physical execution counterpart, each without symlink components, before
+   any successor is allocated. The provenance record is durable across
+   ordinary successors: the explicit-rehome successor records it in its own
+   run metadata, and each further ordinary failed-review retry reuses the
+   source's already-proven record into its own `resume_relocation` field, so
+   repeated provider failures keep the same admission, retention, and
+   prompt mapping no matter how many review-only intermediates precede
+   them; a newly validated explicit-rehome mapping retains precedence, and
+   a missing or malformed record never gains admission by propagation. Once the
+   candidate shape is
    recognized, missing, malformed, unreadable, or contradictory evidence is
    a clean resume refusal before any successor is allocated; sources outside
    the candidate shape keep the existing admission paths. The worker-owner

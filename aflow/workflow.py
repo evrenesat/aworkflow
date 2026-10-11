@@ -34,6 +34,7 @@ from .config import (
     resolve_team_config,
 )
 from .live_config import LiveConfigPairLockBusy, load_live_config
+from .resume_relocation import ResumeRelocation
 from .manager import (
     ManagerDecisionError,
     ManagerDecisionV1,
@@ -4810,6 +4811,73 @@ def _resolved_plan_identity(path: object, repo_root: Path) -> str | None:
     return os.path.normpath(str(candidate))
 
 
+def _project_relocated_identity(value: object, relocation: ResumeRelocation) -> str | None:
+    """Project one recorded absolute plan identity into the current root.
+
+    The validated relocation mapping is the only accepted transform: a
+    historical source-root identity maps to the authorized current root, an
+    identity already recorded at the current root stays unchanged, and a
+    relative, ambiguous, or unprojectable identity refuses instead of being
+    guessed.
+    """
+    if not (isinstance(value, str) and value.strip()):
+        return None
+    if not Path(value).is_absolute():
+        return None
+    try:
+        return str(relocation.map_path(value, required=False))
+    except ValueError:
+        return None
+
+
+def _project_relocated_receipt(
+    result: Mapping[str, object],
+    relocation: ResumeRelocation,
+) -> Mapping[str, object] | None:
+    """Project an immutable historical worker receipt's path identities.
+
+    The receipt bytes stay untouched; the returned view carries the same
+    identities mapped into the current authorized root so strict binding can
+    compare them against the current scope/rejection identities.  Absolute
+    historical identities must project; a present absolute identity that
+    cannot be projected is a refusal (``None``), never a fallback to the raw
+    historical spelling.  Relative identities stay unchanged: the validator
+    resolves them against its identity root, which is already in the current
+    root space when a relocation is supplied.
+    """
+    projected: dict[str, object] = dict(result)
+    for field in (
+        "original_plan_path",
+        "active_plan_path",
+        "new_plan_path",
+        "post_transition_active_plan_path",
+    ):
+        value = projected.get(field)
+        if value is None:
+            continue
+        if not isinstance(value, str) or not value.strip():
+            return None
+        if Path(value).is_absolute():
+            mapped = _project_relocated_identity(value, relocation)
+            if mapped is None:
+                return None
+            projected[field] = mapped
+    rejection = projected.get("review_rejection")
+    if isinstance(rejection, Mapping):
+        rejection_copy = dict(rejection)
+        repair = rejection_copy.get("repair_plan_path")
+        if repair is not None:
+            if not isinstance(repair, str) or not repair.strip():
+                return None
+            if Path(repair).is_absolute():
+                mapped = _project_relocated_identity(repair, relocation)
+                if mapped is None:
+                    return None
+                rejection_copy["repair_plan_path"] = mapped
+        projected["review_rejection"] = rejection_copy
+    return projected
+
+
 def _producing_rejection_review_validates(
     repo_root: Path,
     rejection: Mapping[str, object],
@@ -4822,6 +4890,8 @@ def _producing_rejection_review_validates(
     scope_original_plan: str | None = None,
     selected_rejection: Mapping[str, object] | None = None,
     predecessor_ordinal: int | None = None,
+    plan_root: Path | None = None,
+    relocation: ResumeRelocation | None = None,
 ) -> bool:
     """Bind a producing rejection to its actual owned reviewer receipt.
 
@@ -4912,6 +4982,14 @@ def _producing_rejection_review_validates(
         return False
     if not isinstance(result, dict):
         return False
+    if relocation is not None:
+        # The immutable producing receipt carries the source's historical
+        # path identities; project them through the validated mapping into
+        # the current authorized root before any identity comparison.
+        projected = _project_relocated_receipt(result, relocation)
+        if projected is None:
+            return False
+        result = projected
     returncode = result.get("returncode")
     if (
         result.get("turn_number") != review_turn
@@ -5021,11 +5099,25 @@ def _producing_rejection_review_validates(
         if result.get("selector") != reviewer_selector:
             # The actual receipt's selector must be the producing reviewer.
             return False
-    scope_original = _resolved_plan_identity(scope_original_plan, repo_root)
+    # Relative plan identities in the immutable receipts resolve against the
+    # historical (source) root when relocating; run-dir lookups above stay on
+    # the current root where the run physically lives.  When a validated
+    # relocation mapping is supplied, every identity is additionally projected
+    # through it so historical receipts and current scope/rejection identities
+    # compare in the same (current) identity space.
+    identity_root = plan_root if plan_root is not None else repo_root
+
+    def _identity(value: object) -> str | None:
+        resolved = _resolved_plan_identity(value, identity_root)
+        if resolved is None:
+            return None
+        if relocation is not None:
+            return _project_relocated_identity(resolved, relocation)
+        return resolved
+
+    scope_original = _identity(scope_original_plan)
     if scope_original is not None:
-        receipt_original = _resolved_plan_identity(
-            result.get("original_plan_path"), repo_root
-        )
+        receipt_original = _identity(result.get("original_plan_path"))
         if receipt_original is None or receipt_original != scope_original:
             # The actual receipt must review the immutable scope original
             # plan; a foreign original plan breaks the correlation.
@@ -5035,15 +5127,13 @@ def _producing_rejection_review_validates(
     # the same historical overlay, resolved against the repository (equivalent
     # relative/absolute spellings agree). The consumed overlay need not still
     # exist; the recorded path is the identity.
-    repair = _resolved_plan_identity(rejection.get("repair_plan_path"), repo_root)
+    repair = _identity(rejection.get("repair_plan_path"))
     if repair is None:
         return False
-    receipt_repair = _resolved_plan_identity(
-        receipt_rejection.get("repair_plan_path"), repo_root
-    )
+    receipt_repair = _identity(receipt_rejection.get("repair_plan_path"))
     if receipt_repair is None or receipt_repair != repair:
         return False
-    new_plan = _resolved_plan_identity(result.get("new_plan_path"), repo_root)
+    new_plan = _identity(result.get("new_plan_path"))
     if new_plan is None or new_plan != repair:
         return False
     if (
@@ -5072,6 +5162,8 @@ def _selected_worker_allowed_plans(
     worker_step_name: str | None = None,
     scope_original_plan: str | None = None,
     required_run_ids: set[str] | None = None,
+    plan_root: Path | None = None,
+    relocation: ResumeRelocation | None = None,
 ) -> set[Path] | None:
     """Return the exact plan identity allowed as the selected worker's active plan.
 
@@ -5245,6 +5337,8 @@ def _selected_worker_allowed_plans(
             and predecessor_ordinal_value >= 1
             else None
         ),
+        plan_root=plan_root,
+        relocation=relocation,
     ):
         return None
     if required_run_ids is not None:
@@ -5257,7 +5351,17 @@ def _selected_worker_allowed_plans(
             required_run_ids.add(source_run_id)
     candidate = Path(repair)
     if not candidate.is_absolute():
-        candidate = repo_root / candidate
+        # Resolve the historical overlay identity against the source root so
+        # the caller can map it through the relocation to the current root.
+        candidate = (plan_root if plan_root is not None else repo_root) / candidate
+    if relocation is not None:
+        # Project the historical overlay identity into the current authorized
+        # root so the caller compares it against current receipt identities;
+        # an unprojectable identity refuses.
+        projected = _project_relocated_identity(str(candidate), relocation)
+        if projected is None:
+            return None
+        candidate = Path(projected)
     return {candidate}
 
 
@@ -5269,6 +5373,7 @@ def _owner_scope_identity_matches(
     checkpoint_name: str | None,
     original_plan: str | None,
     envelope: tuple[str, str, str] | None,
+    relocation: ResumeRelocation | None = None,
 ) -> bool:
     """Bind the owner's active scope to the selected immutable awaiting scope.
 
@@ -5277,6 +5382,12 @@ def _owner_scope_identity_matches(
     and (when the selected scope carries one) the exact scope envelope
     reference. An attempts map key alone does not prove matching scope
     ownership; a contradictory owner scope identity is a refusal.
+
+    When a validated relocation mapping is supplied, the owner's recorded
+    original-plan identity is first projected through it into the current
+    authorized root so a historical owner and a newly written current
+    successor compare in the same identity space; an unprojectable identity
+    refuses.
     """
     if scope_id is None:
         return True
@@ -5297,11 +5408,14 @@ def _owner_scope_identity_matches(
         and data.get("checkpoint_name") != checkpoint_name
     ):
         return False
-    if (
-        original_plan is not None
-        and data.get("original_plan_path") != original_plan
-    ):
-        return False
+    if original_plan is not None:
+        owner_original = data.get("original_plan_path")
+        if relocation is not None:
+            owner_original = _project_relocated_identity(owner_original, relocation)
+            if owner_original is None:
+                return False
+        if owner_original != original_plan:
+            return False
     if envelope is not None:
         artifact_path, artifact_sha, canonical_sha = envelope
         if (
@@ -5377,6 +5491,8 @@ def _bind_worker_receipt(
     scope_envelope: tuple[str, str, str] | None = None,
     strict: bool = False,
     required_run_ids: set[str] | None = None,
+    plan_root: Path | None = None,
+    relocation: ResumeRelocation | None = None,
 ) -> tuple[str, Path] | None:
     """Source-first binding of the worker receipt owner for one local turn.
 
@@ -5471,6 +5587,18 @@ def _bind_worker_receipt(
             return None
         if result.get("step_role") == "worker":
             if strict:
+                if relocation is not None:
+                    # The immutable worker receipt carries the source's
+                    # historical path identities; project them through the
+                    # validated mapping into the current authorized root so
+                    # the strict comparisons below run in the same identity
+                    # space as the current scope/rejection identities.  A
+                    # candidate that cannot be projected is a refusal, never
+                    # a substitution with an older worker.
+                    projected = _project_relocated_receipt(result, relocation)
+                    if projected is None:
+                        return None
+                    result = projected
                 binding_plan = scope_original_plan or expected_plan
                 metadata_path = run_dir / "run.json"
                 owner_meta = (
@@ -5486,6 +5614,7 @@ def _bind_worker_receipt(
                     checkpoint_name=scope_checkpoint_name,
                     original_plan=scope_original_plan,
                     envelope=scope_envelope,
+                    relocation=relocation,
                 ):
                     return None
                 if scope_envelope is not None and not _owner_scope_envelope_validates(
@@ -5508,6 +5637,8 @@ def _bind_worker_receipt(
                     worker_step_name=step_name,
                     scope_original_plan=binding_plan,
                     required_run_ids=collected,
+                    plan_root=plan_root,
+                    relocation=relocation,
                 )
                 if allowed_active_plans is None:
                     # The selected attempt has no unique, non-contradictory
@@ -5558,6 +5689,33 @@ def _bind_worker_receipt(
     return None
 
 
+def _resume_binding_relocation(
+    repo_root: Path,
+    resume: ResumeContext,
+) -> ResumeRelocation | None:
+    """Recover the validated relocation provenance for strict receipt binding.
+
+    An explicit rehome records the provenance on the resume context; a
+    successor of a relocated run records the same provenance in its own run
+    metadata.  The recorded provenance is the only accepted mapping for
+    projecting the immutable historical receipt identities of the run chain
+    into the current authorized root; a missing or malformed record leaves
+    binding in the shared root space (no relocation was proven).
+    """
+    provenance = resume.resume_relocation
+    if provenance is None and resume.resumed_from_run_id:
+        recorded = load_run_json(
+            repo_root / ".aflow" / "runs" / resume.resumed_from_run_id
+        )
+        if isinstance(recorded, Mapping):
+            inherited = recorded.get("resume_relocation")
+            if isinstance(inherited, Mapping):
+                provenance = inherited
+    if provenance is None:
+        return None
+    return ResumeRelocation.from_provenance(provenance)
+
+
 def _review_worker_artifact_reference(
     state: ControllerState,
     *,
@@ -5571,6 +5729,7 @@ def _review_worker_artifact_reference(
     scope_original_plan: str | None = None,
     scope_envelope: tuple[str, str, str] | None = None,
     strict: bool = False,
+    relocation: ResumeRelocation | None = None,
 ) -> tuple[str, Path | None]:
     """Return the selected worker result's reference and its concrete location.
 
@@ -5618,6 +5777,7 @@ def _review_worker_artifact_reference(
         scope_original_plan=scope_original_plan,
         scope_envelope=scope_envelope,
         strict=strict,
+        relocation=relocation,
     )
     if bound is not None:
         owner, location = bound
@@ -5833,6 +5993,11 @@ def _render_checkpoint_review_context(
     scope = state.active_implementation_scope
     target: _CheckpointReviewPromptTarget | None = None
     attempts: list[ImplementationAttempt] = []
+    binding_relocation = (
+        _resume_binding_relocation(repo_root, resume)
+        if resume is not None
+        else None
+    )
     if (
         resume is not None
         and resume.pending_cumulative_review is not None
@@ -5877,6 +6042,7 @@ def _render_checkpoint_review_context(
                     resume is not None
                     and resume.failed_pending_review_step is not None
                 ),
+                relocation=binding_relocation,
             )
             target = _CheckpointReviewPromptTarget(
                 checkpoint_index=scope.checkpoint_index,
@@ -10217,6 +10383,9 @@ def _run_workflow_unchecked(
                     scope_envelope=_scope_envelope_tuple(scope),
                     strict=True,
                     required_run_ids=bound_dependencies,
+                    relocation=_resume_binding_relocation(
+                        config.repo_root, resume
+                    ),
                 )
                 if bound is not None:
                     # The validated dependency set already includes every owned
