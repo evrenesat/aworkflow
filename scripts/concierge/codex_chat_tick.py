@@ -32,6 +32,8 @@ ROOT = Path("/root/code/agent_flow")
 STATE = Path("/var/lib/aflowd/concierge")
 SOCKET = Path("/root/.codex/app-server-control/app-server-control.sock")
 CLI_FALLBACK = "/usr/local/bin/codex"
+# p100 is the canonical name; codex stays accepted until the host rename lands.
+CONTROLLER_HOSTS = frozenset({"p100", "codex"})
 
 TICK_DEADLINE_SECONDS = 780.0
 START_ADMISSION_CUTOFF_SECONDS = 600.0
@@ -724,7 +726,7 @@ def main() -> int:
     parser.add_argument("--effort", default="xhigh")
     parser.add_argument("--inspect-only", action="store_true")
     args = parser.parse_args()
-    if args.thread != THREAD or Path.cwd() != ROOT or os.uname().nodename != "codex":
+    if args.thread != THREAD or Path.cwd() != ROOT or os.uname().nodename not in CONTROLLER_HOSTS:
         raise RuntimeError("concierge host, checkout or pinned chat mismatch")
     started = _now()
     # Include uv/launcher startup in the scheduled service's deadline.
